@@ -1829,6 +1829,8 @@ tags:
   - name: Installed
     x-displayName: Installed Extensions
     description: PostgreSQL-style installed extension lifecycle.
+  - name: memory
+    description: Evidence-backed temporal agent memory
 security:
   - BasicAuth: []
   - ApiKeyAuth: []
@@ -14594,6 +14596,2014 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InstalledExtension'
+  /memory/v1/spaces:
+    post:
+      operationId: createMemorySpace
+      tags:
+        - memory
+      parameters:
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+          description: Catalog scope for this memory space.
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 256
+          description: Stable per-principal operation key. Conflicting reuse returns 409.
+      responses:
+        '201':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryCreateSpaceRequest'
+  /memory/v1/spaces/{space}:
+    get:
+      operationId: getMemorySpace
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+          description: Catalog scope for this memory space.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryInspection'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+    patch:
+      operationId: configureMemorySpace
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+          description: Catalog scope for this memory space.
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 256
+          description: Stable per-principal operation key. Conflicting reuse returns 409.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryConfigureRequest'
+  /memory/v1/spaces/{space}/embeddings:
+    post:
+      operationId: stageMemoryEmbeddings
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+          description: Catalog scope for this memory space.
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 256
+          description: Stable per-principal operation key. Conflicting reuse returns 409.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryEmbeddingBatch'
+  /memory/v1/spaces/{space}/observations:
+    post:
+      operationId: observeMemory
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+          description: Catalog scope for this memory space.
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 256
+          description: Stable per-principal operation key. Conflicting reuse returns 409.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryObservationRequest'
+  /memory/v1/spaces/{space}/assertions:
+    post:
+      operationId: storeMemoryAssertions
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+          description: Catalog scope for this memory space.
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 256
+          description: Stable per-principal operation key. Conflicting reuse returns 409.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryAssertionRequest'
+  /memory/v1/spaces/{space}/corrections:
+    post:
+      operationId: correctMemory
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+          description: Catalog scope for this memory space.
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 256
+          description: Stable per-principal operation key. Conflicting reuse returns 409.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryCorrection'
+  /memory/v1/spaces/{space}/forget:
+    post:
+      operationId: forgetMemory
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+          description: Catalog scope for this memory space.
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 256
+          description: Stable per-principal operation key. Conflicting reuse returns 409.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryForgetRequest'
+  /memory/v1/spaces/{space}/outcomes:
+    post:
+      operationId: recordMemoryOutcome
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+          description: Catalog scope for this memory space.
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 256
+          description: Stable per-principal operation key. Conflicting reuse returns 409.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryOutcome'
+  /memory/v1/spaces/{space}/recall:
+    post:
+      operationId: recallMemory
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+          description: Catalog scope for this memory space.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryRecallResult'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryRecallRequest'
+  /memory/v1/spaces/{space}/memories:
+    get:
+      operationId: listMemories
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+          description: Catalog scope for this memory space.
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 256
+        - name: subject
+          in: query
+          schema:
+            type: string
+        - name: predicate
+          in: query
+          schema:
+            type: string
+        - name: scope
+          in: query
+          schema:
+            type: string
+        - name: task
+          in: query
+          schema:
+            type: string
+        - name: environment
+          in: query
+          schema:
+            type: string
+        - name: kind
+          in: query
+          schema:
+            type: string
+        - name: relationship
+          in: query
+          schema:
+            type: string
+        - name: target_id
+          in: query
+          schema:
+            type: string
+        - name: missing_relationship
+          in: query
+          schema:
+            type: string
+        - name: include_history
+          in: query
+          schema:
+            type: boolean
+        - name: include_provisional
+          in: query
+          schema:
+            type: boolean
+        - name: valid_at
+          in: query
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryRecordPage'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+  /memory/v1/spaces/{space}/memories/{id}:
+    get:
+      operationId: getMemory
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+          description: Catalog scope for this memory space.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryRecord'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+  /memory/v1/spaces/{space}/memories/{id}/history:
+    get:
+      operationId: getMemoryHistory
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+          description: Catalog scope for this memory space.
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 256
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryRecordPage'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+  /memory/v1/spaces/{space}/operations/{id}:
+    get:
+      operationId: getMemoryOperation
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+          description: Catalog scope for this memory space.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+    post:
+      operationId: advanceMemoryOperation
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+          description: Catalog scope for this memory space.
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 256
+          description: Stable per-principal operation key. Conflicting reuse returns 409.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+  /memory/v1/spaces/{space}/maintenance:
+    post:
+      operationId: maintainMemorySpace
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+          description: Catalog scope for this memory space.
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 256
+          description: Stable per-principal operation key. Conflicting reuse returns 409.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+  /memory/v1/spaces/{space}/configurations/{id}:
+    get:
+      operationId: getMemoryConfiguration
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+          description: Catalog scope for this memory space.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemorySpaceConfig'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+  /memory/v1/spaces/{space}/evidence/{id}:
+    get:
+      operationId: getMemoryEvidence
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+          description: Catalog scope for this memory space.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryResult'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+  /memory/v1/spaces/{space}/entity-corrections:
+    post:
+      operationId: curateMemoryEntity
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+          description: Catalog scope for this memory space.
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 256
+          description: Stable per-principal operation key. Conflicting reuse returns 409.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryEntityCorrection'
+  /memory/v1/spaces/{space}/entities/{id}:
+    get:
+      operationId: resolveMemoryEntity
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+          description: Catalog scope for this memory space.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryResult'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+  /memory/v1/spaces/{space}/entities:
+    get:
+      operationId: listMemoryEntities
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+          description: Catalog scope for this memory space.
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 256
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryEntityPage'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
 components:
   securitySchemes:
     BasicAuth:
@@ -44665,6 +46675,2144 @@ components:
           type: string
       required:
         - error
+    MemorySpaceConfig:
+      type: object
+      properties:
+        version:
+          type: integer
+        generation:
+          type: integer
+        embedding_generation:
+          type: integer
+        processing:
+          type: string
+          enum:
+            - external
+            - managed
+            - hybrid
+        ontology_version:
+          type: string
+        policy_version:
+          type: string
+        features:
+          type: object
+          properties:
+            semantic_recall:
+              type: boolean
+            entity_extraction:
+              type: boolean
+            assertion_distillation:
+              type: boolean
+            summaries:
+              type: boolean
+            reconciliation:
+              type: string
+              enum:
+                - explicit
+                - deterministic
+                - model
+          additionalProperties: false
+        models:
+          type: object
+          properties:
+            embedder:
+              type: object
+              properties:
+                provider:
+                  type: string
+                model:
+                  type: string
+                revision:
+                  type: string
+                dimensions:
+                  type: integer
+                  nullable: true
+              required:
+                - provider
+                - model
+                - revision
+              additionalProperties: false
+              nullable: true
+            extractor:
+              type: object
+              properties:
+                provider:
+                  type: string
+                model:
+                  type: string
+                revision:
+                  type: string
+                dimensions:
+                  type: integer
+                  nullable: true
+              required:
+                - provider
+                - model
+                - revision
+              additionalProperties: false
+              nullable: true
+            generator:
+              type: object
+              properties:
+                provider:
+                  type: string
+                model:
+                  type: string
+                revision:
+                  type: string
+                dimensions:
+                  type: integer
+                  nullable: true
+              required:
+                - provider
+                - model
+                - revision
+              additionalProperties: false
+              nullable: true
+            decider:
+              type: object
+              properties:
+                provider:
+                  type: string
+                model:
+                  type: string
+                revision:
+                  type: string
+                dimensions:
+                  type: integer
+                  nullable: true
+              required:
+                - provider
+                - model
+                - revision
+              additionalProperties: false
+              nullable: true
+          additionalProperties: false
+        predicates:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              cardinality:
+                type: string
+                enum:
+                  - one
+                  - many
+              subject_type:
+                type: string
+                nullable: true
+              object_type:
+                type: string
+                nullable: true
+            required:
+              - name
+            additionalProperties: false
+        source_rules:
+          type: array
+          items:
+            type: object
+            properties:
+              source_id:
+                type: string
+              principal:
+                type: string
+                nullable: true
+              producer:
+                type: string
+                nullable: true
+              authority:
+                type: integer
+            required:
+              - source_id
+            additionalProperties: false
+        max_input_bytes:
+          type: integer
+        max_output_items:
+          type: integer
+        max_attempts:
+          type: integer
+        max_recall_tokens:
+          type: integer
+        retention_ms:
+          type: integer
+          nullable: true
+      additionalProperties: false
+    MemoryEvidence:
+      type: object
+      properties:
+        id:
+          type: string
+        source_id:
+          type: string
+        source_version:
+          type: string
+        text:
+          type: string
+        source_url:
+          type: string
+          nullable: true
+        author:
+          type: string
+          nullable: true
+        event_time:
+          type: integer
+          nullable: true
+        timezone:
+          type: string
+          nullable: true
+        thread_id:
+          type: string
+          nullable: true
+        turn_id:
+          type: string
+          nullable: true
+        ordinal:
+          type: integer
+          nullable: true
+        producer:
+          type: string
+        managed:
+          type: boolean
+        visibility:
+          type: string
+          enum:
+            - private
+            - team
+        expires_at:
+          type: integer
+          nullable: true
+      required:
+        - id
+        - source_id
+        - source_version
+        - text
+      additionalProperties: false
+    MemoryAssertion:
+      type: object
+      properties:
+        id:
+          type: string
+        subject:
+          type: string
+        predicate:
+          type: string
+        value:
+          type: string
+        statement:
+          type: string
+        kind:
+          type: string
+          enum:
+            - semantic
+            - episodic
+            - procedural
+            - decision
+            - rationale
+            - preference
+            - lesson
+            - constraint
+            - open_question
+            - alternative
+            - summary
+        scope:
+          type: string
+        task:
+          type: string
+          nullable: true
+        environment:
+          type: string
+          nullable: true
+        role:
+          type: string
+          enum:
+            - reported
+            - observed
+            - inferred
+            - hypothesized
+        modality:
+          type: string
+          enum:
+            - actual
+            - planned
+            - desired
+            - conditional
+            - hypothetical
+        stability:
+          type: string
+          enum:
+            - provisional
+            - settled
+        valid_from:
+          type: integer
+          nullable: true
+        valid_to:
+          type: integer
+          nullable: true
+        evidence:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              span:
+                type: object
+                properties:
+                  start:
+                    type: integer
+                  end:
+                    type: integer
+                required:
+                  - start
+                  - end
+                additionalProperties: false
+                nullable: true
+            required:
+              - id
+            additionalProperties: false
+        depends_on:
+          type: array
+          items:
+            type: string
+        support_sets:
+          type: array
+          items:
+            type: object
+            properties:
+              evidence:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                    span:
+                      type: object
+                      properties:
+                        start:
+                          type: integer
+                        end:
+                          type: integer
+                      required:
+                        - start
+                        - end
+                      additionalProperties: false
+                      nullable: true
+                  required:
+                    - id
+                  additionalProperties: false
+              depends_on:
+                type: array
+                items:
+                  type: string
+            required:
+              - evidence
+            additionalProperties: false
+        supersedes:
+          type: array
+          items:
+            type: string
+        motivates:
+          type: array
+          items:
+            type: string
+        rejected_in_favor_of:
+          type: array
+          items:
+            type: string
+        preconditions:
+          type: array
+          items:
+            type: string
+        steps:
+          type: array
+          items:
+            type: string
+        expected_outcome:
+          type: string
+          nullable: true
+        producer:
+          type: string
+        visibility:
+          type: string
+          enum:
+            - private
+            - team
+        embedding:
+          type: array
+          items:
+            type: number
+          nullable: true
+        embedding_model:
+          type: object
+          properties:
+            provider:
+              type: string
+            model:
+              type: string
+            revision:
+              type: string
+            dimensions:
+              type: integer
+              nullable: true
+          required:
+            - provider
+            - model
+            - revision
+          additionalProperties: false
+          nullable: true
+        reconciliation_reason:
+          type: string
+          nullable: true
+      required:
+        - id
+        - subject
+        - predicate
+        - value
+        - statement
+        - evidence
+      additionalProperties: false
+    MemoryObservationRequest:
+      type: object
+      properties:
+        context_evidence_ids:
+          type: array
+          items:
+            type: string
+        evidence:
+          type: array
+          items:
+            $ref: '#/components/schemas/MemoryEvidence'
+        assertions:
+          type: array
+          items:
+            $ref: '#/components/schemas/MemoryAssertion'
+        entities:
+          type: array
+          items:
+            type: object
+            properties:
+              visibility:
+                type: string
+                enum:
+                  - private
+                  - team
+              evidence:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                    span:
+                      type: object
+                      properties:
+                        start:
+                          type: integer
+                        end:
+                          type: integer
+                      required:
+                        - start
+                        - end
+                      additionalProperties: false
+                      nullable: true
+                  required:
+                    - id
+                  additionalProperties: false
+              id:
+                type: string
+              name:
+                type: string
+              type:
+                type: string
+              aliases:
+                type: array
+                items:
+                  type: string
+              distinct_from:
+                type: array
+                items:
+                  type: string
+            required:
+              - id
+              - name
+            additionalProperties: false
+      required:
+        - evidence
+      additionalProperties: false
+    MemoryAssertionRequest:
+      type: object
+      properties:
+        assertions:
+          type: array
+          items:
+            $ref: '#/components/schemas/MemoryAssertion'
+      required:
+        - assertions
+      additionalProperties: false
+    MemoryCorrection:
+      type: object
+      properties:
+        id:
+          type: string
+        expected_revision:
+          type: integer
+        lifecycle:
+          type: string
+          enum:
+            - active
+            - disputed
+            - superseded
+            - retracted
+        stability:
+          type: string
+          enum:
+            - provisional
+            - settled
+          nullable: true
+        reason:
+          type: string
+        evidence:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              span:
+                type: object
+                properties:
+                  start:
+                    type: integer
+                  end:
+                    type: integer
+                required:
+                  - start
+                  - end
+                additionalProperties: false
+                nullable: true
+            required:
+              - id
+            additionalProperties: false
+      required:
+        - id
+        - expected_revision
+        - lifecycle
+        - reason
+      additionalProperties: false
+    MemoryForgetRequest:
+      type: object
+      properties:
+        evidence_ids:
+          type: array
+          items:
+            type: string
+        assertion_ids:
+          type: array
+          items:
+            type: string
+        source_ids:
+          type: array
+          items:
+            type: string
+        all:
+          type: boolean
+      additionalProperties: false
+    MemoryOutcome:
+      type: object
+      properties:
+        id:
+          type: string
+        task_id:
+          type: string
+        success:
+          type: boolean
+        used_memory_ids:
+          type: array
+          items:
+            type: string
+        detail:
+          type: string
+      required:
+        - id
+        - task_id
+        - success
+        - used_memory_ids
+      additionalProperties: false
+    MemoryRecallRequest:
+      type: object
+      properties:
+        query:
+          type: string
+        relationship:
+          type: string
+          enum:
+            - depends_on
+            - supersedes
+            - motivates
+            - rejected_in_favor_of
+          nullable: true
+        target_id:
+          type: string
+          nullable: true
+        missing_relationship:
+          type: string
+          enum:
+            - depends_on
+            - supersedes
+            - motivates
+            - rejected_in_favor_of
+          nullable: true
+        subject:
+          type: string
+          nullable: true
+        predicate:
+          type: string
+          nullable: true
+        scope:
+          type: string
+          nullable: true
+        environment:
+          type: string
+          nullable: true
+        task:
+          type: string
+          nullable: true
+        kind:
+          type: string
+          enum:
+            - semantic
+            - episodic
+            - procedural
+            - decision
+            - rationale
+            - preference
+            - lesson
+            - constraint
+            - open_question
+            - alternative
+            - summary
+          nullable: true
+        valid_at:
+          type: integer
+          nullable: true
+        known_at:
+          type: integer
+          nullable: true
+        include_history:
+          type: boolean
+        include_provisional:
+          type: boolean
+        limit:
+          type: integer
+        token_budget:
+          type: integer
+        cursor:
+          type: string
+          nullable: true
+        embedding:
+          type: array
+          items:
+            type: number
+          nullable: true
+        embedding_model:
+          type: object
+          properties:
+            provider:
+              type: string
+            model:
+              type: string
+            revision:
+              type: string
+            dimensions:
+              type: integer
+              nullable: true
+          required:
+            - provider
+            - model
+            - revision
+          additionalProperties: false
+          nullable: true
+      additionalProperties: false
+    MemoryOperation:
+      type: object
+      properties:
+        id:
+          type: string
+        action:
+          type: string
+        request_hash:
+          type: string
+        owner:
+          type: string
+        revision:
+          type: integer
+        config_generation:
+          type: integer
+        created_at:
+          type: integer
+        phase:
+          type: string
+          enum:
+            - pending
+            - running
+            - succeeded
+            - failed
+            - cancelled
+        evidence_accepted:
+          type: boolean
+        assertions_ready:
+          type: boolean
+        attempts:
+          type: integer
+        error_code:
+          type: string
+          nullable: true
+        next_retry_at:
+          type: integer
+          nullable: true
+      required:
+        - id
+        - action
+        - request_hash
+        - owner
+        - revision
+        - config_generation
+        - created_at
+        - phase
+        - evidence_accepted
+        - assertions_ready
+        - attempts
+        - error_code
+        - next_retry_at
+      additionalProperties: false
+    MemoryRecord:
+      type: object
+      properties:
+        assertion:
+          type: object
+          properties:
+            id:
+              type: string
+            subject:
+              type: string
+            predicate:
+              type: string
+            value:
+              type: string
+            statement:
+              type: string
+            kind:
+              type: string
+              enum:
+                - semantic
+                - episodic
+                - procedural
+                - decision
+                - rationale
+                - preference
+                - lesson
+                - constraint
+                - open_question
+                - alternative
+                - summary
+            scope:
+              type: string
+            task:
+              type: string
+              nullable: true
+            environment:
+              type: string
+              nullable: true
+            role:
+              type: string
+              enum:
+                - reported
+                - observed
+                - inferred
+                - hypothesized
+            modality:
+              type: string
+              enum:
+                - actual
+                - planned
+                - desired
+                - conditional
+                - hypothetical
+            stability:
+              type: string
+              enum:
+                - provisional
+                - settled
+            valid_from:
+              type: integer
+              nullable: true
+            valid_to:
+              type: integer
+              nullable: true
+            evidence:
+              type: array
+              items:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  span:
+                    type: object
+                    properties:
+                      start:
+                        type: integer
+                      end:
+                        type: integer
+                    required:
+                      - start
+                      - end
+                    additionalProperties: false
+                    nullable: true
+                required:
+                  - id
+                additionalProperties: false
+            depends_on:
+              type: array
+              items:
+                type: string
+            support_sets:
+              type: array
+              items:
+                type: object
+                properties:
+                  evidence:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        span:
+                          type: object
+                          properties:
+                            start:
+                              type: integer
+                            end:
+                              type: integer
+                          required:
+                            - start
+                            - end
+                          additionalProperties: false
+                          nullable: true
+                      required:
+                        - id
+                      additionalProperties: false
+                  depends_on:
+                    type: array
+                    items:
+                      type: string
+                required:
+                  - evidence
+                additionalProperties: false
+            supersedes:
+              type: array
+              items:
+                type: string
+            motivates:
+              type: array
+              items:
+                type: string
+            rejected_in_favor_of:
+              type: array
+              items:
+                type: string
+            preconditions:
+              type: array
+              items:
+                type: string
+            steps:
+              type: array
+              items:
+                type: string
+            expected_outcome:
+              type: string
+              nullable: true
+            producer:
+              type: string
+            visibility:
+              type: string
+              enum:
+                - private
+                - team
+            embedding:
+              type: array
+              items:
+                type: number
+              nullable: true
+            embedding_model:
+              type: object
+              properties:
+                provider:
+                  type: string
+                model:
+                  type: string
+                revision:
+                  type: string
+                dimensions:
+                  type: integer
+                  nullable: true
+              required:
+                - provider
+                - model
+                - revision
+              additionalProperties: false
+              nullable: true
+            reconciliation_reason:
+              type: string
+              nullable: true
+          required:
+            - id
+            - subject
+            - predicate
+            - value
+            - statement
+            - evidence
+          additionalProperties: false
+        input_hash:
+          type: string
+        asserted_valid_to:
+          type: integer
+          nullable: true
+        owner:
+          type: string
+        recorded_from:
+          type: integer
+        recorded_at:
+          type: integer
+        revision:
+          type: integer
+        lifecycle:
+          type: string
+          enum:
+            - active
+            - disputed
+            - superseded
+            - retracted
+        stale:
+          type: boolean
+        reason:
+          type: string
+          nullable: true
+        conflicts_with:
+          type: array
+          items:
+            type: string
+        recorded_to:
+          type: integer
+          nullable: true
+        superseded_by:
+          type: string
+          nullable: true
+        config_generation:
+          type: integer
+        embedding_generation:
+          type: integer
+        next_embedding_generation:
+          type: integer
+          nullable: true
+        next_embedding:
+          type: array
+          items:
+            type: number
+          nullable: true
+      required:
+        - assertion
+        - owner
+        - recorded_from
+        - revision
+        - config_generation
+      additionalProperties: false
+    MemoryEntity:
+      type: object
+      properties:
+        visibility:
+          type: string
+          enum:
+            - private
+            - team
+        evidence:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              span:
+                type: object
+                properties:
+                  start:
+                    type: integer
+                  end:
+                    type: integer
+                required:
+                  - start
+                  - end
+                additionalProperties: false
+                nullable: true
+            required:
+              - id
+            additionalProperties: false
+        id:
+          type: string
+        name:
+          type: string
+        type:
+          type: string
+        aliases:
+          type: array
+          items:
+            type: string
+        distinct_from:
+          type: array
+          items:
+            type: string
+      required:
+        - id
+        - name
+      additionalProperties: false
+    MemoryEntityCorrection:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+            - merge
+            - unmerge
+            - suppress
+            - unsuppress
+        from:
+          type: string
+        to:
+          type: string
+          nullable: true
+        expected_revision:
+          type: integer
+        replace:
+          type: boolean
+        pin_distinct:
+          type: boolean
+      required:
+        - action
+        - from
+        - expected_revision
+      additionalProperties: false
+    MemoryEmbeddingBatch:
+      type: object
+      properties:
+        generation:
+          type: integer
+        model:
+          type: object
+          properties:
+            provider:
+              type: string
+            model:
+              type: string
+            revision:
+              type: string
+            dimensions:
+              type: integer
+              nullable: true
+          required:
+            - provider
+            - model
+            - revision
+          additionalProperties: false
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              embedding:
+                type: array
+                items:
+                  type: number
+            required:
+              - id
+              - embedding
+            additionalProperties: false
+      required:
+        - generation
+        - model
+        - items
+      additionalProperties: false
+    MemoryRecallResult:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              memory:
+                type: object
+                properties:
+                  assertion:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      subject:
+                        type: string
+                      predicate:
+                        type: string
+                      value:
+                        type: string
+                      statement:
+                        type: string
+                      kind:
+                        type: string
+                        enum:
+                          - semantic
+                          - episodic
+                          - procedural
+                          - decision
+                          - rationale
+                          - preference
+                          - lesson
+                          - constraint
+                          - open_question
+                          - alternative
+                          - summary
+                      scope:
+                        type: string
+                      task:
+                        type: string
+                        nullable: true
+                      environment:
+                        type: string
+                        nullable: true
+                      role:
+                        type: string
+                        enum:
+                          - reported
+                          - observed
+                          - inferred
+                          - hypothesized
+                      modality:
+                        type: string
+                        enum:
+                          - actual
+                          - planned
+                          - desired
+                          - conditional
+                          - hypothetical
+                      stability:
+                        type: string
+                        enum:
+                          - provisional
+                          - settled
+                      valid_from:
+                        type: integer
+                        nullable: true
+                      valid_to:
+                        type: integer
+                        nullable: true
+                      evidence:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id:
+                              type: string
+                            span:
+                              type: object
+                              properties:
+                                start:
+                                  type: integer
+                                end:
+                                  type: integer
+                              required:
+                                - start
+                                - end
+                              additionalProperties: false
+                              nullable: true
+                          required:
+                            - id
+                          additionalProperties: false
+                      depends_on:
+                        type: array
+                        items:
+                          type: string
+                      support_sets:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            evidence:
+                              type: array
+                              items:
+                                type: object
+                                properties:
+                                  id:
+                                    type: string
+                                  span:
+                                    type: object
+                                    properties:
+                                      start:
+                                        type: integer
+                                      end:
+                                        type: integer
+                                    required:
+                                      - start
+                                      - end
+                                    additionalProperties: false
+                                    nullable: true
+                                required:
+                                  - id
+                                additionalProperties: false
+                            depends_on:
+                              type: array
+                              items:
+                                type: string
+                          required:
+                            - evidence
+                          additionalProperties: false
+                      supersedes:
+                        type: array
+                        items:
+                          type: string
+                      motivates:
+                        type: array
+                        items:
+                          type: string
+                      rejected_in_favor_of:
+                        type: array
+                        items:
+                          type: string
+                      preconditions:
+                        type: array
+                        items:
+                          type: string
+                      steps:
+                        type: array
+                        items:
+                          type: string
+                      expected_outcome:
+                        type: string
+                        nullable: true
+                      producer:
+                        type: string
+                      visibility:
+                        type: string
+                        enum:
+                          - private
+                          - team
+                      embedding:
+                        type: array
+                        items:
+                          type: number
+                        nullable: true
+                      embedding_model:
+                        type: object
+                        properties:
+                          provider:
+                            type: string
+                          model:
+                            type: string
+                          revision:
+                            type: string
+                          dimensions:
+                            type: integer
+                            nullable: true
+                        required:
+                          - provider
+                          - model
+                          - revision
+                        additionalProperties: false
+                        nullable: true
+                      reconciliation_reason:
+                        type: string
+                        nullable: true
+                    required:
+                      - id
+                      - subject
+                      - predicate
+                      - value
+                      - statement
+                      - evidence
+                    additionalProperties: false
+                  input_hash:
+                    type: string
+                  asserted_valid_to:
+                    type: integer
+                    nullable: true
+                  owner:
+                    type: string
+                  recorded_from:
+                    type: integer
+                  recorded_at:
+                    type: integer
+                  revision:
+                    type: integer
+                  lifecycle:
+                    type: string
+                    enum:
+                      - active
+                      - disputed
+                      - superseded
+                      - retracted
+                  stale:
+                    type: boolean
+                  reason:
+                    type: string
+                    nullable: true
+                  conflicts_with:
+                    type: array
+                    items:
+                      type: string
+                  recorded_to:
+                    type: integer
+                    nullable: true
+                  superseded_by:
+                    type: string
+                    nullable: true
+                  config_generation:
+                    type: integer
+                  embedding_generation:
+                    type: integer
+                  next_embedding_generation:
+                    type: integer
+                    nullable: true
+                  next_embedding:
+                    type: array
+                    items:
+                      type: number
+                    nullable: true
+                required:
+                  - assertion
+                  - owner
+                  - recorded_from
+                  - revision
+                  - config_generation
+                additionalProperties: false
+              score:
+                type: number
+              historical:
+                type: boolean
+              citations:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                    span:
+                      type: object
+                      properties:
+                        start:
+                          type: integer
+                        end:
+                          type: integer
+                      required:
+                        - start
+                        - end
+                      additionalProperties: false
+                      nullable: true
+                  required:
+                    - id
+                  additionalProperties: false
+            required:
+              - memory
+              - score
+              - historical
+              - citations
+            additionalProperties: false
+        next_cursor:
+          type: string
+          nullable: true
+        complete:
+          type: boolean
+        truncated:
+          type: boolean
+        scanned:
+          type: integer
+        omitted:
+          type: integer
+        token_upper_bound:
+          type: integer
+        revision:
+          type: integer
+        config_generation:
+          type: integer
+        retrieval:
+          type: string
+          enum:
+            - lexical
+            - lexical_vector
+      required:
+        - items
+        - next_cursor
+        - complete
+        - truncated
+        - scanned
+        - omitted
+        - token_upper_bound
+        - revision
+        - config_generation
+        - retrieval
+      additionalProperties: false
+    MemoryRecordPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              assertion:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  subject:
+                    type: string
+                  predicate:
+                    type: string
+                  value:
+                    type: string
+                  statement:
+                    type: string
+                  kind:
+                    type: string
+                    enum:
+                      - semantic
+                      - episodic
+                      - procedural
+                      - decision
+                      - rationale
+                      - preference
+                      - lesson
+                      - constraint
+                      - open_question
+                      - alternative
+                      - summary
+                  scope:
+                    type: string
+                  task:
+                    type: string
+                    nullable: true
+                  environment:
+                    type: string
+                    nullable: true
+                  role:
+                    type: string
+                    enum:
+                      - reported
+                      - observed
+                      - inferred
+                      - hypothesized
+                  modality:
+                    type: string
+                    enum:
+                      - actual
+                      - planned
+                      - desired
+                      - conditional
+                      - hypothetical
+                  stability:
+                    type: string
+                    enum:
+                      - provisional
+                      - settled
+                  valid_from:
+                    type: integer
+                    nullable: true
+                  valid_to:
+                    type: integer
+                    nullable: true
+                  evidence:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        span:
+                          type: object
+                          properties:
+                            start:
+                              type: integer
+                            end:
+                              type: integer
+                          required:
+                            - start
+                            - end
+                          additionalProperties: false
+                          nullable: true
+                      required:
+                        - id
+                      additionalProperties: false
+                  depends_on:
+                    type: array
+                    items:
+                      type: string
+                  support_sets:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        evidence:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              id:
+                                type: string
+                              span:
+                                type: object
+                                properties:
+                                  start:
+                                    type: integer
+                                  end:
+                                    type: integer
+                                required:
+                                  - start
+                                  - end
+                                additionalProperties: false
+                                nullable: true
+                            required:
+                              - id
+                            additionalProperties: false
+                        depends_on:
+                          type: array
+                          items:
+                            type: string
+                      required:
+                        - evidence
+                      additionalProperties: false
+                  supersedes:
+                    type: array
+                    items:
+                      type: string
+                  motivates:
+                    type: array
+                    items:
+                      type: string
+                  rejected_in_favor_of:
+                    type: array
+                    items:
+                      type: string
+                  preconditions:
+                    type: array
+                    items:
+                      type: string
+                  steps:
+                    type: array
+                    items:
+                      type: string
+                  expected_outcome:
+                    type: string
+                    nullable: true
+                  producer:
+                    type: string
+                  visibility:
+                    type: string
+                    enum:
+                      - private
+                      - team
+                  embedding:
+                    type: array
+                    items:
+                      type: number
+                    nullable: true
+                  embedding_model:
+                    type: object
+                    properties:
+                      provider:
+                        type: string
+                      model:
+                        type: string
+                      revision:
+                        type: string
+                      dimensions:
+                        type: integer
+                        nullable: true
+                    required:
+                      - provider
+                      - model
+                      - revision
+                    additionalProperties: false
+                    nullable: true
+                  reconciliation_reason:
+                    type: string
+                    nullable: true
+                required:
+                  - id
+                  - subject
+                  - predicate
+                  - value
+                  - statement
+                  - evidence
+                additionalProperties: false
+              input_hash:
+                type: string
+              asserted_valid_to:
+                type: integer
+                nullable: true
+              owner:
+                type: string
+              recorded_from:
+                type: integer
+              recorded_at:
+                type: integer
+              revision:
+                type: integer
+              lifecycle:
+                type: string
+                enum:
+                  - active
+                  - disputed
+                  - superseded
+                  - retracted
+              stale:
+                type: boolean
+              reason:
+                type: string
+                nullable: true
+              conflicts_with:
+                type: array
+                items:
+                  type: string
+              recorded_to:
+                type: integer
+                nullable: true
+              superseded_by:
+                type: string
+                nullable: true
+              config_generation:
+                type: integer
+              embedding_generation:
+                type: integer
+              next_embedding_generation:
+                type: integer
+                nullable: true
+              next_embedding:
+                type: array
+                items:
+                  type: number
+                nullable: true
+            required:
+              - assertion
+              - owner
+              - recorded_from
+              - revision
+              - config_generation
+            additionalProperties: false
+        next_cursor:
+          type: string
+          nullable: true
+        complete:
+          type: boolean
+        revision:
+          type: integer
+      required:
+        - items
+        - next_cursor
+        - complete
+        - revision
+      additionalProperties: false
+    MemoryEntityPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              entity:
+                type: object
+                properties:
+                  visibility:
+                    type: string
+                    enum:
+                      - private
+                      - team
+                  evidence:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        span:
+                          type: object
+                          properties:
+                            start:
+                              type: integer
+                            end:
+                              type: integer
+                          required:
+                            - start
+                            - end
+                          additionalProperties: false
+                          nullable: true
+                      required:
+                        - id
+                      additionalProperties: false
+                  id:
+                    type: string
+                  name:
+                    type: string
+                  type:
+                    type: string
+                  aliases:
+                    type: array
+                    items:
+                      type: string
+                  distinct_from:
+                    type: array
+                    items:
+                      type: string
+                required:
+                  - id
+                  - name
+                additionalProperties: false
+              owner:
+                type: string
+            required:
+              - entity
+              - owner
+            additionalProperties: false
+        next_cursor:
+          type: string
+          nullable: true
+        complete:
+          type: boolean
+      required:
+        - items
+        - next_cursor
+        - complete
+      additionalProperties: false
+    MemoryInspection:
+      type: object
+      properties:
+        state:
+          type: object
+          properties:
+            database:
+              type: string
+            namespace:
+              type: string
+            space:
+              type: string
+            config:
+              type: object
+              properties:
+                version:
+                  type: integer
+                generation:
+                  type: integer
+                embedding_generation:
+                  type: integer
+                processing:
+                  type: string
+                  enum:
+                    - external
+                    - managed
+                    - hybrid
+                ontology_version:
+                  type: string
+                policy_version:
+                  type: string
+                features:
+                  type: object
+                  properties:
+                    semantic_recall:
+                      type: boolean
+                    entity_extraction:
+                      type: boolean
+                    assertion_distillation:
+                      type: boolean
+                    summaries:
+                      type: boolean
+                    reconciliation:
+                      type: string
+                      enum:
+                        - explicit
+                        - deterministic
+                        - model
+                  additionalProperties: false
+                models:
+                  type: object
+                  properties:
+                    embedder:
+                      type: object
+                      properties:
+                        provider:
+                          type: string
+                        model:
+                          type: string
+                        revision:
+                          type: string
+                        dimensions:
+                          type: integer
+                          nullable: true
+                      required:
+                        - provider
+                        - model
+                        - revision
+                      additionalProperties: false
+                      nullable: true
+                    extractor:
+                      type: object
+                      properties:
+                        provider:
+                          type: string
+                        model:
+                          type: string
+                        revision:
+                          type: string
+                        dimensions:
+                          type: integer
+                          nullable: true
+                      required:
+                        - provider
+                        - model
+                        - revision
+                      additionalProperties: false
+                      nullable: true
+                    generator:
+                      type: object
+                      properties:
+                        provider:
+                          type: string
+                        model:
+                          type: string
+                        revision:
+                          type: string
+                        dimensions:
+                          type: integer
+                          nullable: true
+                      required:
+                        - provider
+                        - model
+                        - revision
+                      additionalProperties: false
+                      nullable: true
+                    decider:
+                      type: object
+                      properties:
+                        provider:
+                          type: string
+                        model:
+                          type: string
+                        revision:
+                          type: string
+                        dimensions:
+                          type: integer
+                          nullable: true
+                      required:
+                        - provider
+                        - model
+                        - revision
+                      additionalProperties: false
+                      nullable: true
+                  additionalProperties: false
+                predicates:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+                      cardinality:
+                        type: string
+                        enum:
+                          - one
+                          - many
+                      subject_type:
+                        type: string
+                        nullable: true
+                      object_type:
+                        type: string
+                        nullable: true
+                    required:
+                      - name
+                    additionalProperties: false
+                source_rules:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      source_id:
+                        type: string
+                      principal:
+                        type: string
+                        nullable: true
+                      producer:
+                        type: string
+                        nullable: true
+                      authority:
+                        type: integer
+                    required:
+                      - source_id
+                    additionalProperties: false
+                max_input_bytes:
+                  type: integer
+                max_output_items:
+                  type: integer
+                max_attempts:
+                  type: integer
+                max_recall_tokens:
+                  type: integer
+                retention_ms:
+                  type: integer
+                  nullable: true
+              additionalProperties: false
+            pending_config:
+              type: object
+              properties:
+                version:
+                  type: integer
+                generation:
+                  type: integer
+                embedding_generation:
+                  type: integer
+                processing:
+                  type: string
+                  enum:
+                    - external
+                    - managed
+                    - hybrid
+                ontology_version:
+                  type: string
+                policy_version:
+                  type: string
+                features:
+                  type: object
+                  properties:
+                    semantic_recall:
+                      type: boolean
+                    entity_extraction:
+                      type: boolean
+                    assertion_distillation:
+                      type: boolean
+                    summaries:
+                      type: boolean
+                    reconciliation:
+                      type: string
+                      enum:
+                        - explicit
+                        - deterministic
+                        - model
+                  additionalProperties: false
+                models:
+                  type: object
+                  properties:
+                    embedder:
+                      type: object
+                      properties:
+                        provider:
+                          type: string
+                        model:
+                          type: string
+                        revision:
+                          type: string
+                        dimensions:
+                          type: integer
+                          nullable: true
+                      required:
+                        - provider
+                        - model
+                        - revision
+                      additionalProperties: false
+                      nullable: true
+                    extractor:
+                      type: object
+                      properties:
+                        provider:
+                          type: string
+                        model:
+                          type: string
+                        revision:
+                          type: string
+                        dimensions:
+                          type: integer
+                          nullable: true
+                      required:
+                        - provider
+                        - model
+                        - revision
+                      additionalProperties: false
+                      nullable: true
+                    generator:
+                      type: object
+                      properties:
+                        provider:
+                          type: string
+                        model:
+                          type: string
+                        revision:
+                          type: string
+                        dimensions:
+                          type: integer
+                          nullable: true
+                      required:
+                        - provider
+                        - model
+                        - revision
+                      additionalProperties: false
+                      nullable: true
+                    decider:
+                      type: object
+                      properties:
+                        provider:
+                          type: string
+                        model:
+                          type: string
+                        revision:
+                          type: string
+                        dimensions:
+                          type: integer
+                          nullable: true
+                      required:
+                        - provider
+                        - model
+                        - revision
+                      additionalProperties: false
+                      nullable: true
+                  additionalProperties: false
+                predicates:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+                      cardinality:
+                        type: string
+                        enum:
+                          - one
+                          - many
+                      subject_type:
+                        type: string
+                        nullable: true
+                      object_type:
+                        type: string
+                        nullable: true
+                    required:
+                      - name
+                    additionalProperties: false
+                source_rules:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      source_id:
+                        type: string
+                      principal:
+                        type: string
+                        nullable: true
+                      producer:
+                        type: string
+                        nullable: true
+                      authority:
+                        type: integer
+                    required:
+                      - source_id
+                    additionalProperties: false
+                max_input_bytes:
+                  type: integer
+                max_output_items:
+                  type: integer
+                max_attempts:
+                  type: integer
+                max_recall_tokens:
+                  type: integer
+                retention_ms:
+                  type: integer
+                  nullable: true
+              additionalProperties: false
+              nullable: true
+            revision:
+              type: integer
+            owner:
+              type: string
+            created_at:
+              type: integer
+          required:
+            - database
+            - namespace
+            - space
+            - config
+            - pending_config
+            - revision
+            - owner
+            - created_at
+          additionalProperties: false
+        capabilities:
+          type: object
+          properties:
+            native:
+              type: boolean
+            model_free:
+              type: boolean
+            generator_available:
+              type: boolean
+            embedder_available:
+              type: boolean
+          required:
+            - native
+            - model_free
+            - generator_available
+            - embedder_available
+          additionalProperties: false
+      required:
+        - state
+        - capabilities
+      additionalProperties: false
+    MemoryCreateSpaceRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - space
+      properties:
+        space:
+          type: string
+          maxLength: 128
+        config:
+          $ref: '#/components/schemas/MemorySpaceConfig'
+    MemoryConfigureRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - expected_revision
+        - config
+      properties:
+        expected_revision:
+          type: integer
+          format: int64
+        config:
+          $ref: '#/components/schemas/MemorySpaceConfig'
+    MemoryResult:
+      type: object
+      additionalProperties: true
+      description: Space state, a memory/history page, or recall with items, revision, completeness, token
+        bounds and cursor. Temporal status is authoritative, not inferred from retrieved candidates.
+    MemoryError:
+      type: object
+      required:
+        - code
+        - error
+        - retryable
+      properties:
+        code:
+          type: string
+        error:
+          type: string
+        retryable:
+          type: boolean
     ChunkSourceReference:
       type: object
       required:

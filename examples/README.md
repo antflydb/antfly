@@ -128,26 +128,14 @@ cd ../examples/antfly-lite-retrieval-go
 GOWORK=off go run . --reset
 ```
 
-### [memoryaf + docsaf](memoryaf/)
+### Native agent memory
 
-Turn documentation into `memoryaf` records from local files, Git, S3, Google Drive, or web sources, with local watch mode for filesystem sync.
-
-**Use cases:**
-- Searchable long-term memory built from docs
-- Markdown knowledge bases with stable source references
-- Live local-doc sync during authoring
-
-**Features:**
-- `docsaf` section extraction for Markdown, MDX, OpenAPI, and more
-- `memoryaf` source references (`source_id`, `source_path`, `section_path`, etc.)
-- One-shot sync across multiple `docsaf` backends plus `fsnotify` watch mode for local directories
-- Create/update/delete reconciliation against managed memories
-
-**Quick start:**
-```bash
-cd examples/memoryaf
-GOWORK=off go run . watch --dir ../../docs --project antfly-docs
-```
+Use the native `/memory/v1` API or the embedded SDK's memory operation interface.
+[The memory design](../zig/MEMORY.md) defines source evidence, external claims,
+managed processing, temporal recall, corrections and forgetting. `docsaf` remains
+responsible for document ingestion; map its section/version IDs to immutable
+memory evidence IDs. The standalone Go memory server and Rust memory extension
+have been retired.
 
 ## Comparison
 

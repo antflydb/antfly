@@ -3893,6 +3893,8 @@ pub const ApiHttpServer = struct {
     last_session_cleanup_ns: std.atomic.Value(u64) = .init(0),
     last_session_lease_renew_ns: std.atomic.Value(u64) = .init(0),
     last_session_maintenance_schedule_ns: std.atomic.Value(u64) = .init(0),
+    memory_in_flight: std.atomic.Value(bool) = .init(false),
+    memory_range_cursor: std.atomic.Value(usize) = .init(0),
     relational_activation_range_cursor: std.atomic.Value(usize) = .init(0),
     row_policy_publication_cursor: std.atomic.Value(u64) = .init(0),
     fk_generation_publication_cursor: std.atomic.Value(u64) = .init(0),
@@ -5230,6 +5232,10 @@ pub const ApiHttpServer = struct {
             error.UnsupportedOperation, error.Canceled, error.DeadlineExceeded => {},
             else => std.log.warn("backup cohort recovery deferred err={s}", .{@errorName(err)}),
         };
+        self.scheduleMemoryOnce() catch |err| switch (err) {
+            error.UnsupportedOperation, error.MemoryRevisionConflict, error.MemoryCommitPending, error.MemoryRetryNotReady, error.StoredDestinationAuthorizationRevoked, error.StoredDestinationCredentialUnsupported, error.GroupLeaderUnavailable, error.TableNotFound => {},
+            else => std.log.warn("native memory maintenance deferred err={s}", .{@errorName(err)}),
+        };
         self.advanceRelationalActivationOnce() catch |err| switch (err) {
             error.ConstraintActivationChanged,
             error.ConstraintActivationNotReady,
@@ -5311,6 +5317,120 @@ pub const ApiHttpServer = struct {
                 std.log.warn("failed to reap table repair background jobs err={s}", .{@errorName(err)});
             };
         }
+    }
+
+    const MemoryMaintenanceWork = struct {
+        server: *ApiHttpServer,
+        fn run(ptr: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.server.advanceMemoryOnce();
+        }
+        fn deinit(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.server.memory_in_flight.store(false, .release);
+            self.server.alloc.destroy(self);
+        }
+    };
+    fn scheduleMemoryOnce(self: *ApiHttpServer) !void {
+        const runtime = self.cfg.backend_runtime orelse return self.advanceMemoryOnce();
+        if (runtime.threaded_jobs == null or self.session_maintenance_owner_id == 0) return self.advanceMemoryOnce();
+        if (self.memory_in_flight.swap(true, .acq_rel)) return;
+        errdefer self.memory_in_flight.store(false, .release);
+        const work = try self.alloc.create(MemoryMaintenanceWork);
+        errdefer self.alloc.destroy(work);
+        work.* = .{ .server = self };
+        // Share the server's existing owner lifecycle; closing it joins both
+        // session cleanup and memory tasks before server resources are freed.
+        try runtime.durable_jobs.submit(.{ .owner_id = self.session_maintenance_owner_id, .class = .maintenance, .ptr = work, .run = MemoryMaintenanceWork.run, .deinit = MemoryMaintenanceWork.deinit });
+    }
+    fn advanceMemoryOnce(self: *ApiHttpServer) !void {
+        const module = @import("memory.zig");
+        const reader = self.table_reads orelse return;
+        const writer = self.table_writes orelse return;
+        var snapshot = (try self.controlAdminSnapshot()) orelse return;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        if (snapshot.ranges.len == 0) return;
+        const owner_range = snapshot.ranges[self.memory_range_cursor.fetchAdd(1, .monotonic) % snapshot.ranges.len];
+        if (self.cfg.relational_maintenance_leadership) |leadership| {
+            if (!leadership.isLocalLeader(owner_range.group_id)) return;
+        } else if (self.cfg.deployment_mode != .standalone) return;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const table = for (snapshot.tables) |entry| {
+            if (entry.table_id == owner_range.table_id) break entry.name;
+        } else return;
+        const control = (try reader.lookup(a, table, "control", .{}, .read_index)) orelse return;
+        const state = std.json.parseFromSliceLeaky(module.memory.types.State, a, control.json, .{}) catch return;
+        if (state.space.len == 0) return;
+        const Deadline = struct {
+            end: u64,
+            fn check(ptr: *anyopaque) !void {
+                const deadline_state: *@This() = @ptrCast(@alignCast(ptr));
+                if (platform_time.monotonicNs() >= deadline_state.end) return error.DeadlineExceeded;
+            }
+        };
+        var deadline: Deadline = .{ .end = platform_time.monotonicNs() +| 5 * std.time.ns_per_s };
+        var context: module.memory.Context = .{ .check_ptr = &deadline, .check_fn = Deadline.check, .principal = state.owner, .admin = false, .now_ms = @intCast(platform_time.realtimeNs() / std.time.ns_per_ms) };
+        var adapter: module.engine.Routed = .{ .table = table, .reads = reader, .writes = writer, .context = context };
+        const queue = try adapter.backend().scan(adapter.backend().ptr, a, "pending/", null, 64);
+        var pending: ?module.memory.types.Operation = null;
+        for (queue.rows) |row| {
+            const queued = try std.json.parseFromSliceLeaky(struct { id: []const u8 }, a, row.json, .{});
+            // Operation IDs are opaque receipt hashes; read through the policy
+            // only after authenticating the exact recorded execution binding.
+            var receipt_key_hash: [32]u8 = undefined;
+            const encoded_id = try std.json.Stringify.valueAlloc(a, queued.id, .{});
+            std.crypto.hash.sha2.Sha256.hash(encoded_id, &receipt_key_hash, .{});
+            const path = try std.fmt.allocPrint(a, "operation/{s}", .{std.fmt.bytesToHex(receipt_key_hash, .lower)});
+            const value = (try reader.lookup(a, table, path, .{}, .read_index)) orelse continue;
+            const item = try std.json.parseFromSliceLeaky(module.memory.types.Operation, a, value.json, .{});
+            if (item.phase != .pending) continue;
+            if (item.next_retry_at) |time| if (time > context.now_ms) continue;
+            pending = item;
+            break;
+        }
+        const work = if (pending != null) true else (try adapter.backend().scan(adapter.backend().ptr, a, "dependency/work/", null, 1)).rows.len > 0 or (try reader.lookup(a, table, "cleanup", .{}, .read_index)) != null or (state.next_expiry_at != null and state.next_expiry_at.? <= context.now_ms);
+        if (!work) return;
+        const executor = if (pending) |item| item.execution_principal else state.execution_principal;
+        const signature = if (pending) |item| item.execution_signature else state.execution_signature;
+        context.principal = if (pending) |item| item.owner else if (state.execution_owner.len > 0) state.execution_owner else state.owner;
+        const table_label = try std.fmt.allocPrint(a, "memory_{s}", .{state.space});
+        const logical = if (self.source.vtable.system_catalog != null) try (system_catalog.Target{ .database = state.database, .namespace = state.namespace, .table = table_label }).resourceNameAlloc(a) else table_label;
+        const bound_logical = (try self.logicalTableNamesInArena(a, .{}, &.{table}))[0];
+        if (!std.mem.eql(u8, logical, bound_logical)) return error.StoredDestinationAuthorizationInvalid;
+        const payload = try std.json.Stringify.valueAlloc(a, .{ .domain = "antfly.memory.execution.v1", .table = logical, .owner = context.principal }, .{});
+        const authority: stored_destination_authorization.Authorizer = .{ .manager = self.cfg.user_manager, .auth_enabled = self.cfg.auth_enabled };
+        try authority.authorize(a, executor, &.{logical}, payload, signature);
+        if (std.mem.eql(u8, executor, stored_destination_authorization.auth_disabled_principal)) {
+            context.admin = !self.cfg.auth_enabled;
+        } else {
+            const manager = self.cfg.user_manager orelse return error.StoredDestinationAuthorizationRevoked;
+            const permissions = if (std.mem.startsWith(u8, executor, "basic:")) try manager.getPermissionsForUser(executor[6..]) else if (std.mem.startsWith(u8, executor, "api-key:")) try manager.effectiveApiKeyPermissions(executor[8..]) else return error.StoredDestinationCredentialUnsupported;
+            defer {
+                for (permissions) |*permission| permission.deinit(manager.alloc);
+                manager.alloc.free(permissions);
+            }
+            if (!permissionsAllow(permissions, .table, logical, .read)) return error.StoredDestinationAuthorizationRevoked;
+            const filters = try manager.durableCredentialRowFilters(executor);
+            defer {
+                for (filters) |*filter| filter.deinit(manager.alloc);
+                manager.alloc.free(filters);
+            }
+            if (filters.len != 0) return error.MemoryRowPolicyUnsupported;
+            context.admin = permissionsAllow(permissions, .table, logical, .admin);
+        }
+        var publication: MemoryPublicationAuthority = .{ .server = self, .alloc = a, .executor = executor, .signature = signature, .payload = payload, .logical = logical, .table = table, .required = if (context.admin) .admin else .write };
+        context.final_check_ptr = &publication;
+        context.final_check_fn = MemoryPublicationAuthority.check;
+        adapter.context = context;
+        adapter.request = .{ .deadline_ns = deadline.end };
+        const Runtime = @import("antfly_local_sources").asset_producer_runtime.Runtime;
+        const runtime = try Runtime.createOwned(a, self.inferenceIo(), .{ .antfly_provider = self.antfly_provider, .inference_api_url = self.configuredInferenceAPIURL(), .secret_store = self.cfg.secret_store, .source_table = table });
+        defer runtime.deinit();
+        var bridge: @import("antfly_local_sources").memory_models.Bridge = .{ .base = adapter.backend(), .producer = runtime.producer().withInvocationContext(.{ .io = self.inferenceIo(), .deadline_ns = deadline.end, .max_response_bytes = state.config.max_input_bytes }), .alloc = a, .embedding_options = .{ .deadline_ns = deadline.end, .bounded_http_request = true, .antfly_provider = self.antfly_provider, .io = self.inferenceIo(), .secret_store = self.cfg.secret_store, .inference_api_url = self.configuredInferenceAPIURL(), .source_table = table } };
+        const token = try std.fmt.allocPrint(a, "worker:{d}:{s}", .{ state.revision, if (pending) |item| item.id else "maintenance" });
+        _ = try (module.memory.Service{ .backend = bridge.backend(), .context = context }).execute(a, .advance, if (pending) |item| item.id else "", "{}", token);
     }
 
     fn advanceRelationalActivationOnce(self: *ApiHttpServer) !void {
@@ -21213,6 +21333,134 @@ pub const ApiHttpServer = struct {
         if (table_id_out) |out| out.* = table.table_id;
         if (identity.*) |*value| try projectCatalogIdentity(self.alloc, value, logical, table.name);
         return alloc.dupe(u8, table.name);
+    }
+
+    const MemoryPublicationAuthority = struct {
+        server: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        executor: []const u8,
+        signature: []const u8,
+        payload: []const u8,
+        logical: []const u8,
+        table: []const u8,
+        identity: ?*const ?AuthenticatedIdentity = null,
+        request: ?*api_operation.RequestContext = null,
+        required: usermgr.PermissionType = .write,
+        fn check(ptr: *anyopaque) !void {
+            const authority: *@This() = @ptrCast(@alignCast(ptr));
+            const server = authority.server;
+            if (authority.identity) |identity| {
+                if (identity.* == null and server.cfg.auth_enabled) return error.Unauthorized;
+                if (!try tablePermissionCurrentlyAllowed(identity.*, authority.table, authority.required)) return error.Forbidden;
+                if (authority.request) |request| {
+                    const filter = try server.authorizedReadFilter(authority.alloc, request.*, authority.table);
+                    if (filter.len != 0) return error.MemoryRowPolicyUnsupported;
+                }
+            }
+            if (authority.signature.len == 0) return;
+            const verifier: stored_destination_authorization.Authorizer = .{ .manager = server.cfg.user_manager, .auth_enabled = server.cfg.auth_enabled };
+            try verifier.authorize(authority.alloc, authority.executor, if (authority.identity != null or authority.required == .read) &.{} else &.{authority.logical}, authority.payload, authority.signature);
+            if (std.mem.eql(u8, authority.executor, stored_destination_authorization.auth_disabled_principal)) return;
+            const manager = server.cfg.user_manager orelse return error.StoredDestinationAuthorizationRevoked;
+            const permissions = if (std.mem.startsWith(u8, authority.executor, "basic:")) try manager.getPermissionsForUser(authority.executor[6..]) else if (std.mem.startsWith(u8, authority.executor, "api-key:")) try manager.effectiveApiKeyPermissions(authority.executor[8..]) else return error.StoredDestinationCredentialUnsupported;
+            defer {
+                for (permissions) |*permission| permission.deinit(manager.alloc);
+                manager.alloc.free(permissions);
+            }
+            if (!permissionsAllow(permissions, .table, authority.logical, authority.required)) return error.StoredDestinationAuthorizationRevoked;
+            const filters = try manager.durableCredentialRowFilters(authority.executor);
+            defer {
+                for (filters) |*filter| filter.deinit(manager.alloc);
+                manager.alloc.free(filters);
+            }
+            if (filters.len != 0) return error.MemoryRowPolicyUnsupported;
+        }
+    };
+
+    /// Native memory ingress shared by HTTP and MCP. Authentication stays at
+    /// the ingress; catalog grants and provenance policy are enforced here.
+    pub fn executeMemoryService(self: *ApiHttpServer, space: []const u8, input: @import("memory.zig").Request, borrowed_identity: ?AuthenticatedIdentity, borrowed_context: api_operation.RequestContext) !contextual_operations.OwnedResponse {
+        return self.executeMemoryServiceInner(space, input, borrowed_identity, borrowed_context) catch |err| {
+            const status_code = @import("memory.zig").status(err);
+            return contextual_operations.jsonWithStatus(status_code, try std.json.Stringify.valueAlloc(self.alloc, .{ .code = @errorName(err), .@"error" = @errorName(err), .retryable = status_code == 503 or status_code == 429 }, .{}), false);
+        };
+    }
+    fn executeMemoryServiceInner(self: *ApiHttpServer, space: []const u8, input: @import("memory.zig").Request, borrowed_identity: ?AuthenticatedIdentity, borrowed_context: api_operation.RequestContext) !contextual_operations.OwnedResponse {
+        const module = @import("memory.zig");
+        try module.memory.types.validateId(space);
+        if (std.mem.indexOfAny(u8, space, "/.\\%") != null) return error.InvalidMemoryId;
+        if (borrowed_identity == null and self.cfg.auth_enabled) return error.Unauthorized;
+        if (module.memory.mutates(input.action) and (input.idempotency_key.len == 0 or input.idempotency_key.len > 256)) return error.MemoryIdempotencyKeyRequired;
+        const admitted = if (module.memory.mutates(input.action)) self.tryAcquireWrite() else self.tryAcquireQuery();
+        if (!admitted) return error.MemoryOverloaded;
+        defer if (module.memory.mutates(input.action)) self.releaseWrite() else self.releaseQuery();
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const table_label = try std.fmt.allocPrint(a, "memory_{s}", .{space});
+        const logical = if (self.source.vtable.system_catalog != null) try (system_catalog.Target{ .database = input.database, .namespace = input.namespace, .table = table_label }).resourceNameAlloc(a) else table_label;
+        var identity = try cloneCatalogIdentity(self.alloc, borrowed_identity);
+        defer if (identity) |*value| value.deinit(self.alloc);
+        var request = borrowed_context;
+        request.row_policy_credential = &identity;
+        request.principal = if (identity) |value| .{ .kind = .user, .subject = value.username } else null;
+        const required: usermgr.PermissionType = if (input.action == .create or input.action == .configure) .admin else if (module.memory.mutates(input.action)) .write else .read;
+        if (input.action == .create) {
+            const config = try std.json.parseFromSliceLeaky(module.memory.types.Config, a, try std.json.Stringify.valueAlloc(a, input.body, .{}), .{ .ignore_unknown_fields = false });
+            try config.validate();
+            if (identity) |value| if (!permissionsAllow(value.permissions, .table, logical, .admin)) return error.Forbidden;
+            const physical = if (self.source.vtable.system_catalog != null) try self.catalogStorageNameAlloc(a) else logical;
+            const create: tables_api.CreateTableRequest = .{ .num_shards = 1 };
+            var created = true;
+            self.createNativeOrLegacyTable(logical, physical, create, identity) catch |err| switch (err) {
+                error.TableAlreadyExists, error.AlreadyExists, error.ObjectAlreadyExists => created = false,
+                else => return err,
+            };
+            if (created) _ = self.materializeCommittedTableCreate(a, physical, create);
+        }
+        const table = try self.resolveCatalogKeyAlloc(a, .{}, logical, &identity, null);
+        if (identity) |value| if (!permissionsAllow(value.permissions, .table, table, required)) return error.Forbidden;
+        const row_filter = try self.authorizedReadFilter(a, request, table);
+        if (row_filter.len != 0) return error.MemoryRowPolicyUnsupported;
+        if (module.memory.mutates(input.action)) try self.authorizeIntegrityMutations(request, &.{.{ .table_name = table, .writes = &.{.{ .key = "control", .value = "{}" }} }});
+        const Check = struct {
+            fn call(ptr: *anyopaque) !void {
+                try (@as(*api_operation.RequestContext, @ptrCast(@alignCast(ptr)))).ensureActive();
+            }
+        };
+        const owner = if (identity) |value| value.username else "local";
+        const executor = storedDestinationPrincipal(identity);
+        const grant_payload = try std.json.Stringify.valueAlloc(a, .{ .domain = "antfly.memory.execution.v1", .table = logical, .owner = owner }, .{});
+        const signature = if (std.mem.eql(u8, executor, stored_destination_authorization.auth_disabled_principal))
+            "auth-disabled"
+        else if (self.cfg.user_manager) |manager| blk: {
+            const mac = manager.destinationGrantMac(executor, grant_payload) catch break :blk "";
+            break :blk try a.dupe(u8, &std.fmt.bytesToHex(mac, .lower));
+        } else "";
+        var publication: MemoryPublicationAuthority = .{ .server = self, .alloc = a, .executor = executor, .signature = signature, .payload = grant_payload, .logical = logical, .table = table, .identity = &identity, .request = &request, .required = if (identity) |value| if (permissionsAllow(value.permissions, .table, table, .admin)) .admin else required else required };
+        const context: module.memory.Context = .{
+            .final_check_ptr = &publication,
+            .final_check_fn = MemoryPublicationAuthority.check,
+            .database = input.database,
+            .namespace = input.namespace,
+            .space = space,
+            .execution_principal = executor,
+            .execution_signature = signature,
+            .durable_execution_required = true,
+            .principal = owner,
+            .admin = if (identity) |value| permissionsAllow(value.permissions, .table, table, .admin) else !self.cfg.auth_enabled,
+            .now_ms = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms),
+            .check_ptr = &request,
+            .check_fn = Check.call,
+        };
+        var adapter: module.engine.Routed = .{ .table = table, .reads = self.table_reads orelse return error.MemoryCapabilityUnavailable, .writes = self.table_writes orelse return error.MemoryCapabilityUnavailable, .context = context, .request = request };
+        const models = @import("antfly_local_sources").memory_models;
+        const Runtime = @import("antfly_local_sources").asset_producer_runtime.Runtime;
+        const runtime = try Runtime.createOwned(a, self.inferenceIo(), .{ .antfly_provider = self.antfly_provider, .inference_api_url = self.configuredInferenceAPIURL(), .secret_store = self.cfg.secret_store, .source_table = table });
+        defer runtime.deinit();
+        var bridge: models.Bridge = .{ .base = adapter.backend(), .producer = runtime.producer().withInvocationContext(.{ .io = self.inferenceIo(), .deadline_ns = request.deadline_ns, .cancellation = request.cancellation }), .alloc = a, .embedding_options = .{ .antfly_provider = self.antfly_provider, .io = self.inferenceIo(), .bounded_http_request = true, .deadline_ns = request.deadline_ns, .cancellation = request.cancellation, .secret_store = self.cfg.secret_store, .inference_api_url = self.configuredInferenceAPIURL(), .source_table = table } };
+        const result = try (module.memory.Service{ .backend = bridge.backend(), .context = context }).execute(self.alloc, input.action, input.id, try std.json.Stringify.valueAlloc(a, input.body, .{}), input.idempotency_key);
+        return contextual_operations.jsonWithStatus(if (input.action == .create) 201 else 200, result, false);
     }
 
     pub fn executeMcpApplicationOperation(

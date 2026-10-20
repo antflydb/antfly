@@ -112,6 +112,12 @@ func (c *Client) Antfly() *AntflyClient {
 	return c.antfly
 }
 
+// Memory returns the typed native memory API, sharing this client's auth and transport.
+// Mutations take generated parameter structs with an explicit IdempotencyKey.
+func (c *Client) Memory() *oapi.ClientWithResponses {
+	return &oapi.ClientWithResponses{ClientInterface: c.antfly.client}
+}
+
 // Inference returns the Antfly inference API surface.
 func (c *Client) Inference() *InferenceClient {
 	return c.inference

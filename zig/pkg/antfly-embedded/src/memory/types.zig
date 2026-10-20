@@ -1,0 +1,329 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Versioned memory contracts. No server, model runtime, or extension imports.
+const std = @import("std");
+
+pub const schema_version: u32 = 1;
+pub const max_items = 256;
+pub const max_text_bytes = 64 * 1024;
+pub const Mode = enum { external, managed, hybrid };
+pub const Role = enum { reported, observed, inferred, hypothesized };
+pub const Modality = enum { actual, planned, desired, conditional, hypothetical };
+pub const Lifecycle = enum { active, disputed, superseded, retracted };
+pub const Stability = enum { provisional, settled };
+pub const Kind = enum { semantic, episodic, procedural, decision, rationale, preference, lesson, constraint, open_question, alternative, summary };
+pub const Visibility = enum { private, team };
+pub const Reconciliation = enum { explicit, deterministic, model };
+pub const Predicate = struct {
+    name: []const u8,
+    cardinality: enum { one, many } = .many,
+    subject_type: ?[]const u8 = null,
+    object_type: ?[]const u8 = null,
+};
+pub const Model = struct {
+    provider: []const u8,
+    model: []const u8,
+    revision: []const u8,
+    dimensions: ?u32 = null,
+};
+pub const Models = struct {
+    embedder: ?Model = null,
+    extractor: ?Model = null,
+    generator: ?Model = null,
+    decider: ?Model = null,
+};
+pub const Features = struct {
+    semantic_recall: bool = false,
+    entity_extraction: bool = false,
+    assertion_distillation: bool = false,
+    summaries: bool = false,
+    reconciliation: Reconciliation = .explicit,
+};
+pub const SourceRule = struct { source_id: []const u8, principal: ?[]const u8 = null, producer: ?[]const u8 = null, authority: u16 = 0 };
+pub const Config = struct {
+    version: u32 = schema_version,
+    generation: u64 = 1,
+    embedding_generation: u64 = 1,
+    processing: Mode = .external,
+    ontology_version: []const u8 = "memory/v1",
+    policy_version: []const u8 = "memory/v1",
+    features: Features = .{},
+    models: Models = .{},
+    predicates: []const Predicate = &.{},
+    source_rules: []const SourceRule = &.{},
+    max_input_bytes: u32 = 256 * 1024,
+    max_output_items: u16 = 128,
+    max_attempts: u8 = 3,
+    max_recall_tokens: u32 = 8192,
+    retention_ms: ?u64 = null,
+
+    pub fn validate(self: Config) !void {
+        if (self.version != schema_version or self.generation == 0 or self.ontology_version.len == 0 or self.policy_version.len == 0) return error.InvalidMemoryConfig;
+        if (self.max_input_bytes == 0 or self.max_input_bytes > 4 * 1024 * 1024 or self.max_output_items == 0 or self.max_output_items > max_items or self.max_attempts == 0 or self.max_attempts > 16 or self.max_recall_tokens == 0 or self.max_recall_tokens > 65536) return error.InvalidMemoryConfig;
+        if (self.features.semantic_recall and self.models.embedder == null) return error.MemoryModelRequired;
+        if (self.features.entity_extraction and self.models.extractor == null and self.models.generator == null) return error.MemoryModelRequired;
+        if ((self.features.assertion_distillation or self.features.summaries) and self.models.generator == null) return error.MemoryModelRequired;
+        if (self.features.reconciliation == .model and self.models.decider == null and self.models.generator == null) return error.MemoryModelRequired;
+        if (self.processing == .external and self.features.assertion_distillation) return error.InvalidMemoryConfig;
+        if (self.processing == .managed and !(self.features.assertion_distillation or self.features.entity_extraction or self.features.summaries)) return error.InvalidMemoryConfig;
+        inline for (@typeInfo(Models).@"struct".field_names) |field| {
+            if (@field(self.models, field)) |model| {
+                if (model.provider.len == 0 or model.model.len == 0 or model.revision.len == 0 or std.mem.indexOf(u8, model.model, "${secret:") != null) return error.InvalidMemoryConfig;
+            }
+        }
+        if (self.models.embedder) |model| if (model.dimensions == null or model.dimensions.? == 0 or model.dimensions.? > 65536) return error.InvalidMemoryConfig;
+        if (self.source_rules.len > max_items) return error.InvalidMemoryConfig;
+        for (self.source_rules, 0..) |rule, i| {
+            try validateId(rule.source_id);
+            if (rule.authority > 0 and rule.principal == null) return error.InvalidMemoryConfig;
+            if (rule.principal) |principal| try validateId(principal);
+            for (self.source_rules[0..i]) |prior| if (std.mem.eql(u8, prior.source_id, rule.source_id)) return error.InvalidMemoryConfig;
+        }
+        if (self.predicates.len > max_items) return error.InvalidMemoryConfig;
+        for (self.predicates, 0..) |predicate, i| {
+            try validateId(predicate.name);
+            for (self.predicates[0..i]) |other| if (std.mem.eql(u8, other.name, predicate.name)) return error.InvalidMemoryConfig;
+        }
+    }
+};
+pub const Span = struct { start: u32, end: u32 };
+pub const Evidence = struct {
+    id: []const u8,
+    source_id: []const u8,
+    source_version: []const u8,
+    text: []const u8,
+    source_url: ?[]const u8 = null,
+    author: ?[]const u8 = null,
+    event_time: ?i64 = null,
+    timezone: ?[]const u8 = null,
+    thread_id: ?[]const u8 = null,
+    turn_id: ?[]const u8 = null,
+    ordinal: ?i64 = null,
+    producer: []const u8 = "external",
+    managed: bool = false,
+    visibility: Visibility = .private,
+    expires_at: ?i64 = null,
+};
+pub const EvidenceRef = struct { id: []const u8, span: ?Span = null };
+pub const Support = struct { evidence: []const EvidenceRef, depends_on: []const []const u8 = &.{} };
+pub const Assertion = struct {
+    id: []const u8,
+    subject: []const u8,
+    predicate: []const u8,
+    value: []const u8,
+    statement: []const u8,
+    kind: Kind = .semantic,
+    scope: []const u8 = "",
+    task: ?[]const u8 = null,
+    environment: ?[]const u8 = null,
+    role: Role = .reported,
+    modality: Modality = .actual,
+    stability: Stability = .settled,
+    valid_from: ?i64 = null,
+    valid_to: ?i64 = null,
+    evidence: []const EvidenceRef,
+    depends_on: []const []const u8 = &.{},
+    support_sets: []const Support = &.{},
+    supersedes: []const []const u8 = &.{},
+    motivates: []const []const u8 = &.{},
+    rejected_in_favor_of: []const []const u8 = &.{},
+    preconditions: []const []const u8 = &.{},
+    steps: []const []const u8 = &.{},
+    expected_outcome: ?[]const u8 = null,
+    producer: []const u8 = "external",
+    visibility: Visibility = .private,
+    embedding: ?[]const f32 = null,
+    embedding_model: ?Model = null,
+    reconciliation_reason: ?[]const u8 = null,
+};
+pub const ObservationRequest = struct { context_evidence_ids: []const []const u8 = &.{}, evidence: []const Evidence, assertions: []const Assertion = &.{}, entities: []const Entity = &.{} };
+pub const AssertionRequest = struct { assertions: []const Assertion };
+pub const Correction = struct {
+    id: []const u8,
+    expected_revision: u64,
+    lifecycle: Lifecycle,
+    stability: ?Stability = null,
+    reason: []const u8,
+    evidence: []const EvidenceRef = &.{},
+};
+pub const Forget = struct {
+    evidence_ids: []const []const u8 = &.{},
+    assertion_ids: []const []const u8 = &.{},
+    source_ids: []const []const u8 = &.{},
+    all: bool = false,
+};
+pub const Outcome = struct {
+    id: []const u8,
+    task_id: []const u8,
+    success: bool,
+    used_memory_ids: []const []const u8,
+    detail: []const u8 = "",
+};
+pub const Relationship = enum { depends_on, supersedes, motivates, rejected_in_favor_of };
+pub const Recall = struct {
+    query: []const u8 = "",
+    relationship: ?Relationship = null,
+    target_id: ?[]const u8 = null,
+    missing_relationship: ?Relationship = null,
+    subject: ?[]const u8 = null,
+    predicate: ?[]const u8 = null,
+    scope: ?[]const u8 = null,
+    environment: ?[]const u8 = null,
+    task: ?[]const u8 = null,
+    kind: ?Kind = null,
+    valid_at: ?i64 = null,
+    known_at: ?i64 = null,
+    include_history: bool = false,
+    include_provisional: bool = true,
+    limit: u16 = 20,
+    token_budget: u32 = 2048,
+    cursor: ?[]const u8 = null,
+    embedding: ?[]const f32 = null,
+    embedding_model: ?Model = null,
+};
+pub const State = struct {
+    database: []const u8 = "default",
+    namespace: []const u8 = "public",
+    space: []const u8 = "",
+    execution_owner: []const u8 = "",
+    execution_principal: []const u8 = "",
+    execution_signature: []const u8 = "",
+    config: Config,
+    pending_config: ?Config = null,
+    next_expiry_at: ?i64 = null,
+    revision: u64 = 1,
+    owner: []const u8,
+    created_at: i64,
+};
+pub const StoredEvidence = struct { context_only: bool = false, evidence: Evidence, owner: []const u8, recorded_at: i64, revision: u64, forgotten: bool = false };
+pub const StoredAssertion = struct {
+    assertion: Assertion,
+    input_hash: []const u8 = "",
+    asserted_valid_to: ?i64 = null,
+    owner: []const u8,
+    recorded_from: i64,
+    recorded_at: i64 = 0,
+    revision: u64,
+    lifecycle: Lifecycle = .active,
+    stale: bool = false,
+    reason: ?[]const u8 = null,
+    conflicts_with: []const []const u8 = &.{},
+    recorded_to: ?i64 = null,
+    superseded_by: ?[]const u8 = null,
+    config_generation: u64,
+    embedding_generation: u64 = 1,
+    next_embedding_generation: ?u64 = null,
+    next_embedding: ?[]const f32 = null,
+};
+pub const Stage = enum { pending, running, succeeded, failed, cancelled };
+pub const Operation = struct {
+    execution_principal: []const u8 = "",
+    execution_signature: []const u8 = "",
+    id: []const u8,
+    action: []const u8,
+    request_hash: []const u8,
+    owner: []const u8,
+    revision: u64,
+    config_generation: u64,
+    created_at: i64,
+    phase: Stage = .succeeded,
+    evidence_accepted: bool = true,
+    assertions_ready: bool = true,
+    attempts: u8 = 0,
+    error_code: ?[]const u8 = null,
+    next_retry_at: ?i64 = null,
+    inputs: []const []const u8 = &.{},
+    context_inputs: []const []const u8 = &.{},
+    cursor: ?[]const u8 = null,
+};
+pub const Entity = struct { visibility: Visibility = .private, evidence: []const EvidenceRef = &.{}, id: []const u8, name: []const u8, type: []const u8 = "concept", aliases: []const []const u8 = &.{}, distinct_from: []const []const u8 = &.{} };
+pub const ReconciliationDecision = struct { supersedes: []const []const u8 = &.{}, reason: []const u8 };
+pub const Generated = struct { assertions: []const Assertion = &.{}, entities: []const Entity = &.{} };
+
+pub fn validateId(value: []const u8) !void {
+    if (value.len == 0 or value.len > 256) return error.InvalidMemoryId;
+    for (value) |ch| if (ch < 0x20 or ch == 0x7f) return error.InvalidMemoryId;
+    if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidMemoryId;
+}
+
+test "memory model-free defaults and feature admission" {
+    try (Config{}).validate();
+    try std.testing.expectError(error.MemoryModelRequired, (Config{ .features = .{ .semantic_recall = true } }).validate());
+    const model: Model = .{ .provider = "antfly", .model = "qualified", .revision = "sha256:pinned" };
+    try (Config{ .processing = .managed, .features = .{ .assertion_distillation = true, .entity_extraction = true, .summaries = true, .reconciliation = .model }, .models = .{ .generator = model } }).validate();
+}
+
+pub const EntityCorrection = struct {
+    action: enum { merge, unmerge, suppress, unsuppress },
+    from: []const u8,
+    to: ?[]const u8 = null,
+    expected_revision: u64,
+    replace: bool = false,
+    pin_distinct: bool = false,
+};
+
+pub const EmbeddingBatch = struct {
+    generation: u64,
+    model: Model,
+    items: []const struct { id: []const u8, embedding: []const f32 },
+};
+
+/// Public receipts contain no durable execution grants or worker cursors.
+pub const OperationStatus = struct {
+    id: []const u8,
+    action: []const u8,
+    request_hash: []const u8,
+    owner: []const u8,
+    revision: u64,
+    config_generation: u64,
+    created_at: i64,
+    phase: Stage,
+    evidence_accepted: bool,
+    assertions_ready: bool,
+    attempts: u8,
+    error_code: ?[]const u8,
+    next_retry_at: ?i64,
+};
+pub const RecallHit = struct { memory: StoredAssertion, score: f64, historical: bool, citations: []const EvidenceRef };
+pub const RecallResult = struct {
+    items: []const RecallHit,
+    next_cursor: ?[]const u8,
+    complete: bool,
+    truncated: bool,
+    scanned: usize,
+    omitted: usize,
+    token_upper_bound: usize,
+    revision: u64,
+    config_generation: u64,
+    retrieval: enum { lexical, lexical_vector },
+};
+pub const RecordPage = struct { items: []const StoredAssertion, next_cursor: ?[]const u8, complete: bool, revision: u64 };
+pub const EntityRecord = struct { entity: Entity, owner: []const u8 };
+pub const EntityPage = struct { items: []const EntityRecord, next_cursor: ?[]const u8, complete: bool };
+pub const SpaceInfo = struct {
+    database: []const u8,
+    namespace: []const u8,
+    space: []const u8,
+    config: Config,
+    pending_config: ?Config,
+    revision: u64,
+    owner: []const u8,
+    created_at: i64,
+};
+pub const Inspection = struct {
+    state: SpaceInfo,
+    capabilities: struct { native: bool, model_free: bool, generator_available: bool, embedder_available: bool },
+};

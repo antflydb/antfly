@@ -27,6 +27,7 @@ const max_mcp_sample_documents_limit: i64 = 100;
 const mcp_tool_result_too_large_text = "Antfly produced more data than this MCP client can safely consume. Reduce limit and fields, avoid _chunks.*, or return direct matches with an explicit queryRequest.hierarchy object and bounded ancestor projections.";
 
 const McpToolKind = enum {
+    memory,
     create_table,
     drop_table,
     list_tables,
@@ -128,6 +129,10 @@ const mcp_capabilities_description_json =
 ;
 
 const mcp_tool_specs = [_]McpToolSpec{
+    .{ .kind = .memory, .name = "memory", .description = "Native evidence-backed temporal memory. Supply space and request with action, body, id, idempotency_key. Actions: create, inspect, configure, observe, assertions, recall, list, get, history, correct, forget, outcome, operation, advance, entities. Mutations require idempotency_key; permissions follow the selected action.", .permission = .read, .wildcard_table = true, .fields = &.{
+        .{ .name = "space", .schema_type = .string, .required = true },
+        .{ .name = "request", .schema_type = .object, .required = true },
+    } },
     .{
         .kind = .create_table,
         .name = "create_table",
@@ -358,6 +363,14 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
                 return mcpError(alloc, "permission denied");
             }
             return switch (ctx.spec.kind) {
+                .memory => blk: {
+                    const space = jsonStringArg(args, "space") orelse return mcpError(alloc, "missing space");
+                    const wire = jsonValueArg(args, "request") orelse return mcpError(alloc, "missing request");
+                    const input = std.json.parseFromSliceLeaky(@import("memory.zig").Request, alloc, try stringifyJsonValue(alloc, wire), .{ .ignore_unknown_fields = false }) catch return mcpError(alloc, "invalid memory request");
+                    var response = try ctx.server.executeMemoryService(space, input, ctx.authenticated_identity, .{});
+                    defer response.deinit(ctx.server.alloc);
+                    break :blk try mcpResultFromOwnedResponse(alloc, response);
+                },
                 .create_table => try ctx.createTable(alloc, args),
                 .drop_table => try ctx.tableOperation(alloc, args, "tableName", .drop_table),
                 .list_tables => try ctx.executeOperation(alloc, .list_tables),

@@ -1323,6 +1323,14 @@ pub const AntflyApiHandler = struct {
         try public_server.post("/tables/:table_name/lake/reconcile", httpx.Handler.bind(self, reconcileLakeSource));
         const usermgr_router = usermgr_server_openapi.server.ServerRouter(AntflyApiHandler).init(self);
         try usermgr_router.register(root_server);
+        const memory_handler = httpx.Handler.bind(self, memoryRoute);
+        try root_server.post("/memory/v1/spaces", memory_handler);
+        inline for (.{ "/memory/v1/spaces/:memory_space", "/memory/v1/spaces/:memory_space/*" }) |path| {
+            try root_server.get(path, memory_handler);
+            try root_server.post(path, memory_handler);
+            try root_server.put(path, memory_handler);
+            try root_server.patch(path, memory_handler);
+        }
         if (include_contextual) {
             try self.registerContextualRoutes(root_server, include_probes);
         } else if (include_probes) {
@@ -1704,6 +1712,56 @@ pub const AntflyApiHandler = struct {
         try ctx.setHeader("content-type", response.content_type);
         _ = ctx.response.body(response.body);
         return ctx.response.build();
+    }
+
+    fn memoryRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const module = @import("memory.zig");
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |denied| return denied;
+        var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const raw_body = (try ctx.body()) orelse "{}";
+        const Create = struct { space: []const u8, config: module.memory.types.Config = .{} };
+        const creating = std.mem.eql(u8, ctx.request.uri.path, "/memory/v1/spaces");
+        const create = if (creating) std.json.parseFromSliceLeaky(Create, a, raw_body, .{}) catch |err| return memoryFailure(ctx, err) else null;
+        const selected = if (create) |input| module.Route{ .space = input.space, .action = .create } else module.route(@tagName(ctx.request.method), ctx.request.uri.path) catch |err| return memoryFailure(ctx, err);
+        const name = (try decodePathParamOrBadRequest(ctx, selected.space)) orelse return ctx.text("invalid memory space");
+        defer ctx.allocator.free(name);
+        module.memory.types.validateId(name) catch |err| return memoryFailure(ctx, err);
+        var query_body: std.json.ObjectMap = .empty;
+        if (ctx.request.method == .GET) {
+            inline for (.{ "cursor", "subject", "predicate", "scope", "task", "environment", "kind", "relationship", "target_id", "missing_relationship" }) |field| if (try ctx.queryDecoded(field)) |decoded| {
+                try query_body.put(a, field, .{ .string = decoded });
+            };
+            inline for (.{ "limit", "valid_at", "known_at" }) |field| if (ctx.query(field)) |v| {
+                const number = std.fmt.parseInt(i64, v, 10) catch return memoryFailure(ctx, error.InvalidMemoryRequest);
+                try query_body.put(a, field, .{ .integer = number });
+            };
+            inline for (.{ "include_history", "include_provisional" }) |field| if (ctx.query(field)) |v| {
+                if (!std.mem.eql(u8, v, "true") and !std.mem.eql(u8, v, "false")) return memoryFailure(ctx, error.InvalidMemoryRequest);
+                try query_body.put(a, field, .{ .bool = std.mem.eql(u8, v, "true") });
+            };
+        }
+        const body = if (create) |input| try std.json.Stringify.valueAlloc(a, input.config, .{}) else if (ctx.request.method == .GET) try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = query_body }, .{}) else raw_body;
+        const identifier = (try decodePathParamOrBadRequest(ctx, selected.id)) orelse return ctx.text("invalid memory id");
+        defer ctx.allocator.free(identifier);
+        var response = try self.api_server.executeMemoryService(name, .{
+            .database = ctx.header("x-antfly-database") orelse "default",
+            .namespace = ctx.header("x-antfly-namespace") orelse "public",
+            .action = selected.action,
+            .id = identifier,
+            .body = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{}),
+            .idempotency_key = ctx.header("idempotency-key") orelse "",
+        }, identity, tableMutationContext(ctx, &identity));
+        defer response.deinit(self.api_server.alloc);
+        return jsonResponse(ctx, response.status, response.body);
+    }
+
+    fn memoryFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        const code = @import("memory.zig").status(err);
+        return jsonResponse(ctx, code, try std.json.Stringify.valueAlloc(ctx.allocator, .{ .code = @errorName(err), .retryable = code == 503 or code == 429, .@"error" = @errorName(err) }, .{}));
     }
 
     fn extensionRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -10403,6 +10461,7 @@ const LookupStatusSource = struct {
 
 /// Test metadata authority shared by direct and HTTP schema route regressions.
 pub const SchemaUpdateStatusSource = struct {
+    table_name: []const u8 = "docs",
     projection_wait_calls: std.atomic.Value(u32) = .init(0),
     schema_json: ?[]const u8 = null,
     owns_schema_json: bool = false,
@@ -10446,7 +10505,7 @@ pub const SchemaUpdateStatusSource = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.table_buf[0] = .{
             .table_id = 7,
-            .name = "docs",
+            .name = self.table_name,
             .schema_json = tables_api.effectiveSchemaJson(self.schema_json),
             .indexes_json = tables_api.default_indexes_json,
             .placement_role = "data",
@@ -17637,4 +17696,101 @@ test "public graph metric borrowed wire owned HTTP responses keep buffers throug
     try std.testing.expectEqual(@as(usize, 0), owner.freed_bytes);
     response.releaseBody();
     try std.testing.expectEqual(owner.allocated_bytes, owner.freed_bytes);
+}
+
+test "native memory HTTP validates route and space without loading a model" {
+    const a = std.testing.allocator;
+    var source = SchemaUpdateStatusSource{};
+    defer source.deinit(a);
+    var api = ApiHttpServer.init(a, .{}, source.iface(), null, null);
+    defer api.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.init(a, &api);
+    defer server.deinit();
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    var client = httpx.Client.initWithConfig(a, threaded.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try server.baseUrl(a);
+    defer a.free(base);
+    const url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/bad%2Fspace", .{base});
+    defer a.free(url);
+    var response = try requestWithRetry(&client, threaded.io(), .GET, url, "", &.{}, 20);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "InvalidMemoryId") != null);
+    const selected = try @import("memory.zig").route("GET", "/memory/v1/spaces/team/memories/a/history");
+    try std.testing.expectEqual(@import("memory.zig").memory.Action.history, selected.action);
+}
+
+test "native memory HTTP and MCP share persistent storage and private provenance" {
+    const a = std.testing.allocator;
+    const module = @import("memory.zig");
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("native-memory-http");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const context: module.memory.Context = .{ .principal = "local", .admin = true, .now_ms = 1, .space = "team" };
+    var native: module.engine.Native(db_mod.DB) = .{ .db = &db, .context = context };
+    const created = try (module.memory.Service{ .backend = native.backend(), .context = context }).execute(a, .create, "", "{}", "create");
+    a.free(created);
+    var reads = table_reads.BoundTableReadSource.init("memory_team", 7001, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
+    var writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("memory_team", &db);
+    var status_source = SchemaUpdateStatusSource{ .table_name = "memory_team" };
+    var api = ApiHttpServer.init(a, .{}, status_source.iface(), reads.source(), writes.source());
+    defer api.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.init(a, &api);
+    defer server.deinit();
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    var client = httpx.Client.initWithConfig(a, threaded.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try server.baseUrl(a);
+    defer a.free(base);
+    const url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/observations", .{base});
+    defer a.free(url);
+    const body =
+        \\{"evidence":[{"id":"e1","source_id":"note","source_version":"1","text":"Production uses Terraform"}],"assertions":[{"id":"a1","subject":"production","predicate":"deploys_with","value":"Terraform","statement":"Production uses Terraform","evidence":[{"id":"e1"}]}]}
+    ;
+    const headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ "idempotency-key", "observe" } };
+    var accepted = try requestWithRetry(&client, threaded.io(), .POST, url, body, &headers, 20);
+    defer accepted.deinit();
+    if (accepted.status.code != 200) std.debug.print("memory HTTP: {s}\n", .{accepted.body orelse ""});
+    try std.testing.expectEqual(@as(u16, 200), accepted.status.code);
+    var visible = try api.executeMemoryService("team", .{ .action = .get, .id = "a1" }, null, .{});
+    defer visible.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), visible.status);
+    try std.testing.expect(std.mem.indexOf(u8, visible.body, "Production uses Terraform") != null);
+    var initialized = try @import("protocol_adapters.zig").executeMcpRequest(&api, .{
+        .method = .post,
+        .endpoint_path = "/mcp/v1",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"memory-test\",\"version\":\"1\"}}}",
+    }, @as(?AuthenticatedIdentity, null));
+    defer initialized.deinit(a);
+    const session_id = for (initialized.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "mcp-session-id")) break header.value;
+    } else return error.TestExpectedEqual;
+    var mcp_response = try @import("protocol_adapters.zig").executeMcpRequest(&api, .{
+        .method = .post,
+        .endpoint_path = "/mcp/v1",
+        .session_id = session_id,
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"memory\",\"arguments\":{\"space\":\"team\",\"request\":{\"action\":\"get\",\"id\":\"a1\"}}}}",
+    }, @as(?AuthenticatedIdentity, null));
+    defer mcp_response.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), mcp_response.status);
+    try std.testing.expect(std.mem.indexOf(u8, mcp_response.body, "Production uses Terraform") != null);
+    const permission = [_]usermgr.Permission{.{ .resource_type = .table, .resource = @constCast("memory_team"), .type = .read }};
+    const bob: AuthenticatedIdentity = .{ .username = @constCast("bob"), .permissions = @constCast(&permission) };
+    var denied = try api.executeMemoryService("team", .{ .action = .get, .id = "a1" }, bob, .{});
+    defer denied.deinit(a);
+    try std.testing.expectEqual(@as(u16, 403), denied.status);
+    var forget_arena = std.heap.ArenaAllocator.init(a);
+    defer forget_arena.deinit();
+    var forgotten = try api.executeMemoryService("team", .{ .action = .forget, .body = try std.json.parseFromSliceLeaky(std.json.Value, forget_arena.allocator(), "{\"evidence_ids\":[\"e1\"]}", .{}), .idempotency_key = "forget" }, null, .{});
+    defer forgotten.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), forgotten.status);
+    var hidden = try api.executeMemoryService("team", .{ .action = .get, .id = "a1" }, null, .{});
+    defer hidden.deinit(a);
+    try std.testing.expectEqual(@as(u16, 404), hidden.status);
 }

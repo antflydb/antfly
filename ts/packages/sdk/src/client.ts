@@ -625,6 +625,59 @@ export class AntflyClient {
     return headers;
   }
 
+  /** Native temporal memory. All calls share the client's authenticated transport. */
+  readonly memory = {
+    create: (body: components["schemas"]["MemoryCreateSpaceRequest"], key: string) =>
+      this.client.POST("/memory/v1/spaces", {
+        body,
+        params: { header: { "Idempotency-Key": key } },
+      }),
+    inspect: (space: string) =>
+      this.client.GET("/memory/v1/spaces/{space}", { params: { path: { space } } }),
+    observe: (
+      space: string,
+      body: components["schemas"]["MemoryObservationRequest"],
+      key: string
+    ) =>
+      this.client.POST("/memory/v1/spaces/{space}/observations", {
+        body,
+        params: { path: { space }, header: { "Idempotency-Key": key } },
+      }),
+    assertions: (
+      space: string,
+      body: components["schemas"]["MemoryAssertionRequest"],
+      key: string
+    ) =>
+      this.client.POST("/memory/v1/spaces/{space}/assertions", {
+        body,
+        params: { path: { space }, header: { "Idempotency-Key": key } },
+      }),
+    recall: (space: string, body: components["schemas"]["MemoryRecallRequest"]) =>
+      this.client.POST("/memory/v1/spaces/{space}/recall", { body, params: { path: { space } } }),
+    get: (space: string, id: string) =>
+      this.client.GET("/memory/v1/spaces/{space}/memories/{id}", {
+        params: { path: { space, id } },
+      }),
+    correct: (space: string, body: components["schemas"]["MemoryCorrection"], key: string) =>
+      this.client.POST("/memory/v1/spaces/{space}/corrections", {
+        body,
+        params: { path: { space }, header: { "Idempotency-Key": key } },
+      }),
+    forget: (space: string, body: components["schemas"]["MemoryForgetRequest"], key: string) =>
+      this.client.POST("/memory/v1/spaces/{space}/forget", {
+        body,
+        params: { path: { space }, header: { "Idempotency-Key": key } },
+      }),
+    operation: (space: string, id: string) =>
+      this.client.GET("/memory/v1/spaces/{space}/operations/{id}", {
+        params: { path: { space, id } },
+      }),
+    advance: (space: string, id: string, key: string) =>
+      this.client.POST("/memory/v1/spaces/{space}/operations/{id}", {
+        params: { path: { space, id }, header: { "Idempotency-Key": key } },
+      }),
+  };
+
   /** Personal ChatGPT registrations. OAuth credentials never enter this client. */
   readonly chatgpt = {
     accounts: (signal?: AbortSignal) =>

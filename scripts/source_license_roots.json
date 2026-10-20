@@ -20,7 +20,6 @@
     "go/pkg/docsaf",
     "go/pkg/evalaf",
     "go/pkg/genkit",
-    "go/pkg/memoryaf",
     "go/pkg/operator",
     "go/pkg/proxy",
     "go/pkg/sdk",

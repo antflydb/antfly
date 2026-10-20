@@ -1113,6 +1113,200 @@ from .match_query import MatchQuery
 from .media_chunk_policy import MediaChunkPolicy
 from .media_content_part import MediaContentPart
 from .media_content_part_type import MediaContentPartType
+from .memory_assertion import MemoryAssertion
+from .memory_assertion_embedding_model_type_0 import MemoryAssertionEmbeddingModelType0
+from .memory_assertion_evidence_item import MemoryAssertionEvidenceItem
+from .memory_assertion_evidence_item_span_type_0 import MemoryAssertionEvidenceItemSpanType0
+from .memory_assertion_kind import MemoryAssertionKind
+from .memory_assertion_modality import MemoryAssertionModality
+from .memory_assertion_request import MemoryAssertionRequest
+from .memory_assertion_role import MemoryAssertionRole
+from .memory_assertion_stability import MemoryAssertionStability
+from .memory_assertion_support_sets_item import MemoryAssertionSupportSetsItem
+from .memory_assertion_support_sets_item_evidence_item import MemoryAssertionSupportSetsItemEvidenceItem
+from .memory_assertion_support_sets_item_evidence_item_span_type_0 import (
+    MemoryAssertionSupportSetsItemEvidenceItemSpanType0,
+)
+from .memory_assertion_visibility import MemoryAssertionVisibility
+from .memory_configure_request import MemoryConfigureRequest
+from .memory_correction import MemoryCorrection
+from .memory_correction_evidence_item import MemoryCorrectionEvidenceItem
+from .memory_correction_evidence_item_span_type_0 import MemoryCorrectionEvidenceItemSpanType0
+from .memory_correction_lifecycle import MemoryCorrectionLifecycle
+from .memory_correction_stability import MemoryCorrectionStability
+from .memory_create_space_request import MemoryCreateSpaceRequest
+from .memory_embedding_batch import MemoryEmbeddingBatch
+from .memory_embedding_batch_items_item import MemoryEmbeddingBatchItemsItem
+from .memory_embedding_batch_model import MemoryEmbeddingBatchModel
+from .memory_entity import MemoryEntity
+from .memory_entity_correction import MemoryEntityCorrection
+from .memory_entity_correction_action import MemoryEntityCorrectionAction
+from .memory_entity_evidence_item import MemoryEntityEvidenceItem
+from .memory_entity_evidence_item_span_type_0 import MemoryEntityEvidenceItemSpanType0
+from .memory_entity_page import MemoryEntityPage
+from .memory_entity_page_items_item import MemoryEntityPageItemsItem
+from .memory_entity_page_items_item_entity import MemoryEntityPageItemsItemEntity
+from .memory_entity_page_items_item_entity_evidence_item import MemoryEntityPageItemsItemEntityEvidenceItem
+from .memory_entity_page_items_item_entity_evidence_item_span_type_0 import (
+    MemoryEntityPageItemsItemEntityEvidenceItemSpanType0,
+)
+from .memory_entity_page_items_item_entity_visibility import MemoryEntityPageItemsItemEntityVisibility
+from .memory_entity_visibility import MemoryEntityVisibility
+from .memory_error import MemoryError_
+from .memory_evidence import MemoryEvidence
+from .memory_evidence_visibility import MemoryEvidenceVisibility
+from .memory_forget_request import MemoryForgetRequest
+from .memory_inspection import MemoryInspection
+from .memory_inspection_capabilities import MemoryInspectionCapabilities
+from .memory_inspection_state import MemoryInspectionState
+from .memory_inspection_state_config import MemoryInspectionStateConfig
+from .memory_inspection_state_config_features import MemoryInspectionStateConfigFeatures
+from .memory_inspection_state_config_features_reconciliation import MemoryInspectionStateConfigFeaturesReconciliation
+from .memory_inspection_state_config_models import MemoryInspectionStateConfigModels
+from .memory_inspection_state_config_models_decider_type_0 import MemoryInspectionStateConfigModelsDeciderType0
+from .memory_inspection_state_config_models_embedder_type_0 import MemoryInspectionStateConfigModelsEmbedderType0
+from .memory_inspection_state_config_models_extractor_type_0 import MemoryInspectionStateConfigModelsExtractorType0
+from .memory_inspection_state_config_models_generator_type_0 import MemoryInspectionStateConfigModelsGeneratorType0
+from .memory_inspection_state_config_predicates_item import MemoryInspectionStateConfigPredicatesItem
+from .memory_inspection_state_config_predicates_item_cardinality import (
+    MemoryInspectionStateConfigPredicatesItemCardinality,
+)
+from .memory_inspection_state_config_processing import MemoryInspectionStateConfigProcessing
+from .memory_inspection_state_config_source_rules_item import MemoryInspectionStateConfigSourceRulesItem
+from .memory_inspection_state_pending_config_type_0 import MemoryInspectionStatePendingConfigType0
+from .memory_inspection_state_pending_config_type_0_features import MemoryInspectionStatePendingConfigType0Features
+from .memory_inspection_state_pending_config_type_0_features_reconciliation import (
+    MemoryInspectionStatePendingConfigType0FeaturesReconciliation,
+)
+from .memory_inspection_state_pending_config_type_0_models import MemoryInspectionStatePendingConfigType0Models
+from .memory_inspection_state_pending_config_type_0_models_decider_type_0 import (
+    MemoryInspectionStatePendingConfigType0ModelsDeciderType0,
+)
+from .memory_inspection_state_pending_config_type_0_models_embedder_type_0 import (
+    MemoryInspectionStatePendingConfigType0ModelsEmbedderType0,
+)
+from .memory_inspection_state_pending_config_type_0_models_extractor_type_0 import (
+    MemoryInspectionStatePendingConfigType0ModelsExtractorType0,
+)
+from .memory_inspection_state_pending_config_type_0_models_generator_type_0 import (
+    MemoryInspectionStatePendingConfigType0ModelsGeneratorType0,
+)
+from .memory_inspection_state_pending_config_type_0_predicates_item import (
+    MemoryInspectionStatePendingConfigType0PredicatesItem,
+)
+from .memory_inspection_state_pending_config_type_0_predicates_item_cardinality import (
+    MemoryInspectionStatePendingConfigType0PredicatesItemCardinality,
+)
+from .memory_inspection_state_pending_config_type_0_processing import MemoryInspectionStatePendingConfigType0Processing
+from .memory_inspection_state_pending_config_type_0_source_rules_item import (
+    MemoryInspectionStatePendingConfigType0SourceRulesItem,
+)
+from .memory_observation_request import MemoryObservationRequest
+from .memory_observation_request_entities_item import MemoryObservationRequestEntitiesItem
+from .memory_observation_request_entities_item_evidence_item import MemoryObservationRequestEntitiesItemEvidenceItem
+from .memory_observation_request_entities_item_evidence_item_span_type_0 import (
+    MemoryObservationRequestEntitiesItemEvidenceItemSpanType0,
+)
+from .memory_observation_request_entities_item_visibility import MemoryObservationRequestEntitiesItemVisibility
+from .memory_operation import MemoryOperation
+from .memory_operation_phase import MemoryOperationPhase
+from .memory_outcome import MemoryOutcome
+from .memory_recall_request import MemoryRecallRequest
+from .memory_recall_request_embedding_model_type_0 import MemoryRecallRequestEmbeddingModelType0
+from .memory_recall_request_kind import MemoryRecallRequestKind
+from .memory_recall_request_missing_relationship import MemoryRecallRequestMissingRelationship
+from .memory_recall_request_relationship import MemoryRecallRequestRelationship
+from .memory_recall_result import MemoryRecallResult
+from .memory_recall_result_items_item import MemoryRecallResultItemsItem
+from .memory_recall_result_items_item_citations_item import MemoryRecallResultItemsItemCitationsItem
+from .memory_recall_result_items_item_citations_item_span_type_0 import (
+    MemoryRecallResultItemsItemCitationsItemSpanType0,
+)
+from .memory_recall_result_items_item_memory import MemoryRecallResultItemsItemMemory
+from .memory_recall_result_items_item_memory_assertion import MemoryRecallResultItemsItemMemoryAssertion
+from .memory_recall_result_items_item_memory_assertion_embedding_model_type_0 import (
+    MemoryRecallResultItemsItemMemoryAssertionEmbeddingModelType0,
+)
+from .memory_recall_result_items_item_memory_assertion_evidence_item import (
+    MemoryRecallResultItemsItemMemoryAssertionEvidenceItem,
+)
+from .memory_recall_result_items_item_memory_assertion_evidence_item_span_type_0 import (
+    MemoryRecallResultItemsItemMemoryAssertionEvidenceItemSpanType0,
+)
+from .memory_recall_result_items_item_memory_assertion_kind import MemoryRecallResultItemsItemMemoryAssertionKind
+from .memory_recall_result_items_item_memory_assertion_modality import (
+    MemoryRecallResultItemsItemMemoryAssertionModality,
+)
+from .memory_recall_result_items_item_memory_assertion_role import MemoryRecallResultItemsItemMemoryAssertionRole
+from .memory_recall_result_items_item_memory_assertion_stability import (
+    MemoryRecallResultItemsItemMemoryAssertionStability,
+)
+from .memory_recall_result_items_item_memory_assertion_support_sets_item import (
+    MemoryRecallResultItemsItemMemoryAssertionSupportSetsItem,
+)
+from .memory_recall_result_items_item_memory_assertion_support_sets_item_evidence_item import (
+    MemoryRecallResultItemsItemMemoryAssertionSupportSetsItemEvidenceItem,
+)
+from .memory_recall_result_items_item_memory_assertion_support_sets_item_evidence_item_span_type_0 import (
+    MemoryRecallResultItemsItemMemoryAssertionSupportSetsItemEvidenceItemSpanType0,
+)
+from .memory_recall_result_items_item_memory_assertion_visibility import (
+    MemoryRecallResultItemsItemMemoryAssertionVisibility,
+)
+from .memory_recall_result_items_item_memory_lifecycle import MemoryRecallResultItemsItemMemoryLifecycle
+from .memory_recall_result_retrieval import MemoryRecallResultRetrieval
+from .memory_record import MemoryRecord
+from .memory_record_assertion import MemoryRecordAssertion
+from .memory_record_assertion_embedding_model_type_0 import MemoryRecordAssertionEmbeddingModelType0
+from .memory_record_assertion_evidence_item import MemoryRecordAssertionEvidenceItem
+from .memory_record_assertion_evidence_item_span_type_0 import MemoryRecordAssertionEvidenceItemSpanType0
+from .memory_record_assertion_kind import MemoryRecordAssertionKind
+from .memory_record_assertion_modality import MemoryRecordAssertionModality
+from .memory_record_assertion_role import MemoryRecordAssertionRole
+from .memory_record_assertion_stability import MemoryRecordAssertionStability
+from .memory_record_assertion_support_sets_item import MemoryRecordAssertionSupportSetsItem
+from .memory_record_assertion_support_sets_item_evidence_item import MemoryRecordAssertionSupportSetsItemEvidenceItem
+from .memory_record_assertion_support_sets_item_evidence_item_span_type_0 import (
+    MemoryRecordAssertionSupportSetsItemEvidenceItemSpanType0,
+)
+from .memory_record_assertion_visibility import MemoryRecordAssertionVisibility
+from .memory_record_lifecycle import MemoryRecordLifecycle
+from .memory_record_page import MemoryRecordPage
+from .memory_record_page_items_item import MemoryRecordPageItemsItem
+from .memory_record_page_items_item_assertion import MemoryRecordPageItemsItemAssertion
+from .memory_record_page_items_item_assertion_embedding_model_type_0 import (
+    MemoryRecordPageItemsItemAssertionEmbeddingModelType0,
+)
+from .memory_record_page_items_item_assertion_evidence_item import MemoryRecordPageItemsItemAssertionEvidenceItem
+from .memory_record_page_items_item_assertion_evidence_item_span_type_0 import (
+    MemoryRecordPageItemsItemAssertionEvidenceItemSpanType0,
+)
+from .memory_record_page_items_item_assertion_kind import MemoryRecordPageItemsItemAssertionKind
+from .memory_record_page_items_item_assertion_modality import MemoryRecordPageItemsItemAssertionModality
+from .memory_record_page_items_item_assertion_role import MemoryRecordPageItemsItemAssertionRole
+from .memory_record_page_items_item_assertion_stability import MemoryRecordPageItemsItemAssertionStability
+from .memory_record_page_items_item_assertion_support_sets_item import MemoryRecordPageItemsItemAssertionSupportSetsItem
+from .memory_record_page_items_item_assertion_support_sets_item_evidence_item import (
+    MemoryRecordPageItemsItemAssertionSupportSetsItemEvidenceItem,
+)
+from .memory_record_page_items_item_assertion_support_sets_item_evidence_item_span_type_0 import (
+    MemoryRecordPageItemsItemAssertionSupportSetsItemEvidenceItemSpanType0,
+)
+from .memory_record_page_items_item_assertion_visibility import MemoryRecordPageItemsItemAssertionVisibility
+from .memory_record_page_items_item_lifecycle import MemoryRecordPageItemsItemLifecycle
+from .memory_result import MemoryResult
+from .memory_space_config import MemorySpaceConfig
+from .memory_space_config_features import MemorySpaceConfigFeatures
+from .memory_space_config_features_reconciliation import MemorySpaceConfigFeaturesReconciliation
+from .memory_space_config_models import MemorySpaceConfigModels
+from .memory_space_config_models_decider_type_0 import MemorySpaceConfigModelsDeciderType0
+from .memory_space_config_models_embedder_type_0 import MemorySpaceConfigModelsEmbedderType0
+from .memory_space_config_models_extractor_type_0 import MemorySpaceConfigModelsExtractorType0
+from .memory_space_config_models_generator_type_0 import MemorySpaceConfigModelsGeneratorType0
+from .memory_space_config_predicates_item import MemorySpaceConfigPredicatesItem
+from .memory_space_config_predicates_item_cardinality import MemorySpaceConfigPredicatesItemCardinality
+from .memory_space_config_processing import MemorySpaceConfigProcessing
+from .memory_space_config_source_rules_item import MemorySpaceConfigSourceRulesItem
 from .merge_config import MergeConfig
 from .merge_config_weights import MergeConfigWeights
 from .merge_profile import MergeProfile
@@ -2747,6 +2941,146 @@ __all__ = (
     "MediaChunkPolicy",
     "MediaContentPart",
     "MediaContentPartType",
+    "MemoryAssertion",
+    "MemoryAssertionEmbeddingModelType0",
+    "MemoryAssertionEvidenceItem",
+    "MemoryAssertionEvidenceItemSpanType0",
+    "MemoryAssertionKind",
+    "MemoryAssertionModality",
+    "MemoryAssertionRequest",
+    "MemoryAssertionRole",
+    "MemoryAssertionStability",
+    "MemoryAssertionSupportSetsItem",
+    "MemoryAssertionSupportSetsItemEvidenceItem",
+    "MemoryAssertionSupportSetsItemEvidenceItemSpanType0",
+    "MemoryAssertionVisibility",
+    "MemoryConfigureRequest",
+    "MemoryCorrection",
+    "MemoryCorrectionEvidenceItem",
+    "MemoryCorrectionEvidenceItemSpanType0",
+    "MemoryCorrectionLifecycle",
+    "MemoryCorrectionStability",
+    "MemoryCreateSpaceRequest",
+    "MemoryEmbeddingBatch",
+    "MemoryEmbeddingBatchItemsItem",
+    "MemoryEmbeddingBatchModel",
+    "MemoryEntity",
+    "MemoryEntityCorrection",
+    "MemoryEntityCorrectionAction",
+    "MemoryEntityEvidenceItem",
+    "MemoryEntityEvidenceItemSpanType0",
+    "MemoryEntityPage",
+    "MemoryEntityPageItemsItem",
+    "MemoryEntityPageItemsItemEntity",
+    "MemoryEntityPageItemsItemEntityEvidenceItem",
+    "MemoryEntityPageItemsItemEntityEvidenceItemSpanType0",
+    "MemoryEntityPageItemsItemEntityVisibility",
+    "MemoryEntityVisibility",
+    "MemoryError_",
+    "MemoryEvidence",
+    "MemoryEvidenceVisibility",
+    "MemoryForgetRequest",
+    "MemoryInspection",
+    "MemoryInspectionCapabilities",
+    "MemoryInspectionState",
+    "MemoryInspectionStateConfig",
+    "MemoryInspectionStateConfigFeatures",
+    "MemoryInspectionStateConfigFeaturesReconciliation",
+    "MemoryInspectionStateConfigModels",
+    "MemoryInspectionStateConfigModelsDeciderType0",
+    "MemoryInspectionStateConfigModelsEmbedderType0",
+    "MemoryInspectionStateConfigModelsExtractorType0",
+    "MemoryInspectionStateConfigModelsGeneratorType0",
+    "MemoryInspectionStateConfigPredicatesItem",
+    "MemoryInspectionStateConfigPredicatesItemCardinality",
+    "MemoryInspectionStateConfigProcessing",
+    "MemoryInspectionStateConfigSourceRulesItem",
+    "MemoryInspectionStatePendingConfigType0",
+    "MemoryInspectionStatePendingConfigType0Features",
+    "MemoryInspectionStatePendingConfigType0FeaturesReconciliation",
+    "MemoryInspectionStatePendingConfigType0Models",
+    "MemoryInspectionStatePendingConfigType0ModelsDeciderType0",
+    "MemoryInspectionStatePendingConfigType0ModelsEmbedderType0",
+    "MemoryInspectionStatePendingConfigType0ModelsExtractorType0",
+    "MemoryInspectionStatePendingConfigType0ModelsGeneratorType0",
+    "MemoryInspectionStatePendingConfigType0PredicatesItem",
+    "MemoryInspectionStatePendingConfigType0PredicatesItemCardinality",
+    "MemoryInspectionStatePendingConfigType0Processing",
+    "MemoryInspectionStatePendingConfigType0SourceRulesItem",
+    "MemoryObservationRequest",
+    "MemoryObservationRequestEntitiesItem",
+    "MemoryObservationRequestEntitiesItemEvidenceItem",
+    "MemoryObservationRequestEntitiesItemEvidenceItemSpanType0",
+    "MemoryObservationRequestEntitiesItemVisibility",
+    "MemoryOperation",
+    "MemoryOperationPhase",
+    "MemoryOutcome",
+    "MemoryRecallRequest",
+    "MemoryRecallRequestEmbeddingModelType0",
+    "MemoryRecallRequestKind",
+    "MemoryRecallRequestMissingRelationship",
+    "MemoryRecallRequestRelationship",
+    "MemoryRecallResult",
+    "MemoryRecallResultItemsItem",
+    "MemoryRecallResultItemsItemCitationsItem",
+    "MemoryRecallResultItemsItemCitationsItemSpanType0",
+    "MemoryRecallResultItemsItemMemory",
+    "MemoryRecallResultItemsItemMemoryAssertion",
+    "MemoryRecallResultItemsItemMemoryAssertionEmbeddingModelType0",
+    "MemoryRecallResultItemsItemMemoryAssertionEvidenceItem",
+    "MemoryRecallResultItemsItemMemoryAssertionEvidenceItemSpanType0",
+    "MemoryRecallResultItemsItemMemoryAssertionKind",
+    "MemoryRecallResultItemsItemMemoryAssertionModality",
+    "MemoryRecallResultItemsItemMemoryAssertionRole",
+    "MemoryRecallResultItemsItemMemoryAssertionStability",
+    "MemoryRecallResultItemsItemMemoryAssertionSupportSetsItem",
+    "MemoryRecallResultItemsItemMemoryAssertionSupportSetsItemEvidenceItem",
+    "MemoryRecallResultItemsItemMemoryAssertionSupportSetsItemEvidenceItemSpanType0",
+    "MemoryRecallResultItemsItemMemoryAssertionVisibility",
+    "MemoryRecallResultItemsItemMemoryLifecycle",
+    "MemoryRecallResultRetrieval",
+    "MemoryRecord",
+    "MemoryRecordAssertion",
+    "MemoryRecordAssertionEmbeddingModelType0",
+    "MemoryRecordAssertionEvidenceItem",
+    "MemoryRecordAssertionEvidenceItemSpanType0",
+    "MemoryRecordAssertionKind",
+    "MemoryRecordAssertionModality",
+    "MemoryRecordAssertionRole",
+    "MemoryRecordAssertionStability",
+    "MemoryRecordAssertionSupportSetsItem",
+    "MemoryRecordAssertionSupportSetsItemEvidenceItem",
+    "MemoryRecordAssertionSupportSetsItemEvidenceItemSpanType0",
+    "MemoryRecordAssertionVisibility",
+    "MemoryRecordLifecycle",
+    "MemoryRecordPage",
+    "MemoryRecordPageItemsItem",
+    "MemoryRecordPageItemsItemAssertion",
+    "MemoryRecordPageItemsItemAssertionEmbeddingModelType0",
+    "MemoryRecordPageItemsItemAssertionEvidenceItem",
+    "MemoryRecordPageItemsItemAssertionEvidenceItemSpanType0",
+    "MemoryRecordPageItemsItemAssertionKind",
+    "MemoryRecordPageItemsItemAssertionModality",
+    "MemoryRecordPageItemsItemAssertionRole",
+    "MemoryRecordPageItemsItemAssertionStability",
+    "MemoryRecordPageItemsItemAssertionSupportSetsItem",
+    "MemoryRecordPageItemsItemAssertionSupportSetsItemEvidenceItem",
+    "MemoryRecordPageItemsItemAssertionSupportSetsItemEvidenceItemSpanType0",
+    "MemoryRecordPageItemsItemAssertionVisibility",
+    "MemoryRecordPageItemsItemLifecycle",
+    "MemoryResult",
+    "MemorySpaceConfig",
+    "MemorySpaceConfigFeatures",
+    "MemorySpaceConfigFeaturesReconciliation",
+    "MemorySpaceConfigModels",
+    "MemorySpaceConfigModelsDeciderType0",
+    "MemorySpaceConfigModelsEmbedderType0",
+    "MemorySpaceConfigModelsExtractorType0",
+    "MemorySpaceConfigModelsGeneratorType0",
+    "MemorySpaceConfigPredicatesItem",
+    "MemorySpaceConfigPredicatesItemCardinality",
+    "MemorySpaceConfigProcessing",
+    "MemorySpaceConfigSourceRulesItem",
     "MergeConfig",
     "MergeConfigWeights",
     "MergeProfile",

@@ -767,6 +767,9 @@ pub const HandleGuard = struct {
         const root = connection.current.?;
         root.query_borrows += 1;
         self.suspended_query_root = root;
+        // Owned memory plans can release after catalog provisioning. Publish
+        // those already-committed primary changes before dropping the lease.
+        if (self.path_lease != null and root.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence != self.entry_sequence) connection.notifyMutation();
         connection.detach();
         if (self.path_lease) |lease| {
             var owned = lease;
@@ -779,9 +782,12 @@ pub const HandleGuard = struct {
     }
 
     pub fn resumeQuery(self: *HandleGuard, ptr: ?*anyopaque) bool {
+        return self.resumeAccess(ptr, .read);
+    }
+    pub fn resumeAccess(self: *HandleGuard, ptr: ?*anyopaque, access: HandleAccess) bool {
         if (self.suspended_query_root == null) return true;
         // Original registry references keep the connection/owner alive.
-        const next = enterHandle(ptr, .read) orelse return false;
+        const next = enterHandle(ptr, access) orelse return false;
         const connection = self.connection.?;
         if (!next.connection_gate_held) connection.gate.mutex.lockUncancelable(handleLockIo());
         self.suspended_query_root.?.query_borrows -= 1;
@@ -4585,6 +4591,31 @@ pub fn antfly_db_get_timestamp(
     defer guard.leave();
     const handle = guard.handle;
     out_timestamp.* = handle.database().*.getTimestamp(handle.alloc, key.bytes()) catch |err| return capi.mapError(err);
+    return .ok;
+}
+
+pub fn antfly_db_memory_json(
+    handle_ptr: ?*anyopaque,
+    space: capi.Slice,
+    request_json: capi.Slice,
+    out_buf: ?*capi.Buffer,
+) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_db_memory_json), .{ .name = "antfly_db_memory_json" }), .{ handle_ptr, space, request_json, out_buf });
+    capi.clearLastError();
+    const out = out_buf orelse return capi.mapErrorContext(error.InvalidArgument, "memory: output pointer must not be null");
+    out.* = .{};
+    var parsed = std.json.parseFromSlice(@import("memory.zig").Request, std.heap.c_allocator, request_json.bytes(), .{ .ignore_unknown_fields = false }) catch |err| return capi.mapError(err);
+    defer parsed.deinit();
+    const access: HandleAccess = if (@import("../memory/service.zig").mutates(parsed.value.action)) .exclusive else .read;
+    var guard = enterHandle(handle_ptr, access) orelse return capi.mapErrorContext(error.InvalidArgument, "memory: invalid database handle");
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return capi.ensureError(code, @src().fn_name);
+    }
+    defer guard.leave();
+    const result = @import("memory.zig").execute(&guard, handle_ptr, std.heap.c_allocator, space.bytes(), request_json.bytes()) catch |err| return capi.mapError(err);
+    out.* = .{ .ptr = result.ptr, .len = result.len };
     return .ok;
 }
 
@@ -8889,6 +8920,7 @@ test "capi resolver replacement public waits retain admission generation across 
 
 comptime {
     @import("exports.zig").publish(@This(), &.{
+        "antfly_db_memory_json",
         "antfly_db_open",
         "antfly_db_close",
         "antfly_threading_mode",
@@ -9053,4 +9085,46 @@ test "inline resolver replacement C API admits the same public name with fresh a
     }
     // Replaying the declarative config after activation remains idempotent.
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(id, .fromSlice(next)));
+}
+
+test "capi native memory persists receipts and forgetting across reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-memory-reopen");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    var id: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &id));
+    defer if (id != null) antfly_db_close(id);
+    const Call = struct {
+        fn call(handle: ?*anyopaque, body: []const u8) ![]u8 {
+            var output: capi.Buffer = .{};
+            const code = antfly_db_memory_json(handle, .fromSlice("personal"), .fromSlice(body), &output);
+            if (code != .ok) std.debug.print("memory C ABI: {s}\n", .{std.mem.span(capi.lastErrorDetail())});
+            try std.testing.expectEqual(capi.ErrorCode.ok, code);
+            defer std.heap.c_allocator.free(output.ptr.?[0..output.len]);
+            return std.testing.allocator.dupe(u8, output.ptr.?[0..output.len]);
+        }
+    };
+    const create = try Call.call(id, "{\"action\":\"create\",\"idempotency_key\":\"create\"}");
+    defer a.free(create);
+    const observe = try Call.call(id,
+        \\{"action":"observe","idempotency_key":"evidence","body":{"evidence":[{"id":"e1","source_id":"note","source_version":"1","text":"Use Terraform"}],"assertions":[{"id":"a1","subject":"deploy","predicate":"tool","value":"Terraform","statement":"Use Terraform","evidence":[{"id":"e1"}]}]}}
+    );
+    defer a.free(observe);
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    const recalled = try Call.call(id, "{\"action\":\"recall\",\"body\":{\"query\":\"Terraform\",\"token_budget\":8192}}");
+    defer a.free(recalled);
+    try std.testing.expect(std.mem.indexOf(u8, recalled, "Use Terraform") != null);
+    const forgotten = try Call.call(id, "{\"action\":\"forget\",\"idempotency_key\":\"forget\",\"body\":{\"evidence_ids\":[\"e1\"]}}");
+    defer a.free(forgotten);
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    const hidden = try Call.call(id, "{\"action\":\"recall\",\"body\":{\"query\":\"Terraform\",\"token_budget\":8192}}");
+    defer a.free(hidden);
+    try std.testing.expect(std.mem.indexOf(u8, hidden, "Use Terraform") == null);
 }

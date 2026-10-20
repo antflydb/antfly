@@ -645,6 +645,12 @@ unsafe extern "C" {
         mention_json: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
+    pub fn antfly_db_memory_json(
+        db: *mut antfly_db,
+        space: antfly_slice,
+        request_json: antfly_slice,
+        out_json: *mut antfly_buffer,
+    ) -> antfly_error_code;
     pub fn antfly_db_resolve_query_json(
         db: *mut antfly_db,
         resolver_name: antfly_slice,

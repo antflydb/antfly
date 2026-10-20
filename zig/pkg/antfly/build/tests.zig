@@ -1813,6 +1813,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "native memory",
         "httpx internal control routes call typed operations directly",
         "caller cancellation does not interrupt protected child work",
         "httpx SQL dispatch preserves imported executor authority including unavailable views",
@@ -2002,6 +2003,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-resolver-namespace-test", "Validate durable namespace dependencies, bounded replay and restart inheritance")
         .dependOn(&addFilteredTestRunArtifact(b, resolver_namespace_tests).step);
 
+    const memory_api_check = b.addTest(.{ .name = "memory-api-check", .root_module = api_http_runtime_test_mod, .filters = &.{"native memory"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("memory-api-check", "Compile native memory HTTP and MCP tests").dependOn(&memory_api_check.step);
+    const memory_api_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{"native memory"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("memory-api-test", "Verify native memory HTTP and MCP boundaries").dependOn(&addFilteredTestRunArtifact(b, memory_api_tests).step);
     const resolver_curation_api_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
         .filters = &.{ "resolver curation HTTP", "resolver curation progress", "resolver curation public policy", "DistributedEntitySink" },
