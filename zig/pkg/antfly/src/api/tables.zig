@@ -2606,7 +2606,7 @@ fn stringifyJsonValue(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
 }
 
 fn isReservedIndexMetadataEntry(name: []const u8) bool {
-    return std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments");
+    return @import("antfly_local_sources").api_local_indexes.isReservedIndexMetadataEntry(name);
 }
 
 fn encodeSingleTableIndex(

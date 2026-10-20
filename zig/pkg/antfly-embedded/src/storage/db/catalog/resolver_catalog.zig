@@ -70,7 +70,8 @@ pub const curation_reader_version: u32 = 6;
 pub const generated_producers_reader_version: u32 = 7;
 pub const grouped_sources_reader_version: u32 = 8;
 pub const namespace_curation_reader_version: u32 = 9;
-pub const supported_reader_version: u32 = namespace_curation_reader_version;
+pub const curation_provenance_reader_version: u32 = 10;
+pub const supported_reader_version: u32 = curation_provenance_reader_version;
 
 pub fn readerVersionBytes(version: u32) ![]const u8 {
     return switch (version) {
@@ -83,6 +84,7 @@ pub fn readerVersionBytes(version: u32) ![]const u8 {
         7 => "7",
         8 => "8",
         9 => "9",
+        10 => "10",
         else => error.UnsupportedDatabaseReaderVersion,
     };
 }
@@ -113,6 +115,13 @@ pub fn catalogReaderVersion(a: Allocator, data: []const u8) !u32 {
                 if (config.value == .object) if (config.value.object.get("decider")) |decider| if (decider == .object) if (decider.object.get("decision_method")) |method| {
                     if (method == .string and std.mem.eql(u8, method.string, "generated")) required = @max(required, generated_producers_reader_version);
                 };
+            }
+        }
+        if (entry.object.get("curation_json")) |curation| {
+            if (curation == .string and curation.string.len > 0) {
+                const state = try std.json.parseFromSlice(std.json.Value, a, curation.string, .{});
+                defer state.deinit();
+                if (state.value == .object and (state.value.object.contains("redirect_origins") or state.value.object.contains("proposals"))) required = @max(required, curation_provenance_reader_version);
             }
         }
         if (entry.object.contains("namespace_curation_generation")) required = @max(required, namespace_curation_reader_version);

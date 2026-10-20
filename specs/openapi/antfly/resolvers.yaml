@@ -10,18 +10,124 @@ components:
       properties:
         timeout_ms: {type: integer, format: uint32, minimum: 1, maximum: 300000, default: 1000}
       description: Wait for observed replay completion up to this timeout. A timeout returns accepted state with applied=false; it does not undo the mutation.
+    CurationOrigin:
+      type: object
+      description: Server-owned provenance. Clients supply actor and reason on writes. Zero time/revision denote legacy records whose creation is unknown.
+      properties:
+        origin: {type: string, enum: [manual, adjudicator, review, cascade, config]}
+        actor: {type: string, maxLength: 256, description: "UTF-8 client attribution, limited to 256 bytes."}
+        reason: {type: string, maxLength: 4096, description: "UTF-8 explanation, limited to 4096 bytes."}
+        created_at_ms: {type: integer, format: uint64}
+        revision: {type: integer, format: uint64}
+        proposal_id: {type: string, nullable: true}
+        cascade_from: {type: string, nullable: true}
+    CurationSuppressionEntry:
+      type: object
+      required: [key, origin]
+      properties:
+        key: {type: string}
+        origin: {$ref: '#/components/schemas/CurationOrigin'}
+    RuntimeResolverSuppression:
+      type: object
+      properties:
+        keys: {type: array, items: {type: string}}
+        texts: {type: array, items: {type: string}}
+        min_text_chars: {type: integer, format: uint32}
+        entries: {type: array, items: {$ref: '#/components/schemas/CurationSuppressionEntry'}}
+        text_entries: {type: array, items: {$ref: '#/components/schemas/CurationSuppressionEntry'}}
+    EntitySuppressRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        absorbed: {type: string, enum: [reject, release, suppress], default: reject, description: "Reject absorbed keys, release all transitive redirect sources, or suppress them with cascade provenance. Unsuppress never restores redirects."}
+        pin_distinct: {type: boolean, default: false, description: "With absorbed=release, pin each released source distinct from the target."}
+        actor: {type: string, maxLength: 256}
+        reason: {type: string, maxLength: 4096}
+        expected_revision: {type: integer, format: uint64, x-go-type-skip-optional-pointer: false}
+        wait: {$ref: '#/components/schemas/ResolverWait'}
+    EntityDistinctRequest:
+      type: object
+      additionalProperties: false
+      required: [into]
+      properties:
+        expected_revision: {type: integer, format: uint64, x-go-type-skip-optional-pointer: false}
+        into: {type: string}
+        actor: {type: string, maxLength: 256}
+        reason: {type: string, maxLength: 4096}
+        wait: {$ref: '#/components/schemas/ResolverWait'}
+    CurationProposalOptions:
+      type: object
+      additionalProperties: false
+      properties:
+        replace: {type: boolean, default: false}
+        pin_distinct: {type: boolean, default: false}
+        absorbed: {type: string, enum: [reject, release, suppress], default: reject}
+    CurationProposalRequest:
+      type: object
+      additionalProperties: false
+      required: [action, key]
+      properties:
+        action: {type: string, enum: [merge, unmerge, suppress, unsuppress, distinct]}
+        key: {type: string, minLength: 1, maxLength: 16384}
+        into: {type: string, nullable: true}
+        options: {$ref: '#/components/schemas/CurationProposalOptions'}
+        confidence: {type: number, format: double, minimum: 0, maximum: 1, nullable: true}
+        evidence: {type: object, additionalProperties: true, nullable: true, description: "At most 16 KiB, 4096 values and depth 32."}
+        actor: {type: string, maxLength: 256}
+        reason: {type: string, maxLength: 4096}
+    CurationProposal:
+      type: object
+      required: [id, action, key, state, origin]
+      properties:
+        id: {type: string}
+        action: {type: string, enum: [merge, unmerge, suppress, unsuppress, distinct]}
+        key: {type: string}
+        into: {type: string, nullable: true}
+        options: {$ref: '#/components/schemas/CurationProposalOptions'}
+        confidence: {type: number, format: double, nullable: true}
+        evidence: {type: object, additionalProperties: true, nullable: true}
+        origin: {$ref: '#/components/schemas/CurationOrigin'}
+        state: {type: string, enum: [open, accepted, rejected, superseded]}
+        decided: {nullable: true, allOf: [{$ref: '#/components/schemas/CurationOrigin'}]}
+    CurationProposalDecisionRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        options: {$ref: '#/components/schemas/CurationProposalOptions'}
+        pin_distinct: {type: boolean, default: false, description: "On rejection of a merge, pin the proposed pair distinct in the same commit."}
+        actor: {type: string, maxLength: 256}
+        reason: {type: string, maxLength: 4096}
+        expected_revision: {type: integer, format: uint64, x-go-type-skip-optional-pointer: false}
+        wait: {$ref: '#/components/schemas/ResolverWait'}
+    CurationProposalPage:
+      type: object
+      required: [proposals]
+      properties:
+        proposals: {type: array, items: {$ref: '#/components/schemas/CurationProposal'}}
+        next_cursor: {type: string, nullable: true}
+    CurationProposalDecisionResult:
+      type: object
+      properties:
+        proposal: {$ref: '#/components/schemas/CurationProposal'}
+        complete: {type: boolean}
+        changed: {type: boolean}
+        atomicity: {type: string, enum: [namespace, resolver]}
+        applied: {type: boolean}
+        results: {type: array, items: {type: object, additionalProperties: true}}
     ResolverRedirect:
       type: object
       required: [key, target]
       properties:
         key: {type: string}
         target: {type: string}
+        origin: {$ref: '#/components/schemas/CurationOrigin'}
     ResolverDistinctPair:
       type: object
       required: [from, to]
       properties:
         from: {type: string}
         to: {type: string}
+        origin: {$ref: '#/components/schemas/CurationOrigin'}
     ResolverSuppressionSelection:
       type: object
       additionalProperties: false
@@ -33,10 +139,12 @@ components:
       additionalProperties: false
       required: [from, to]
       properties:
+        actor: {type: string, maxLength: 256}
+        reason: {type: string, maxLength: 4096}
         from: {type: string, minLength: 1, maxLength: 16384}
         to: {type: string, minLength: 1, maxLength: 16384}
         replace: {type: boolean, default: false}
-        pin_distinct: {type: boolean, default: false, description: Pin the replaced former target distinct. Requires an existing different redirect and replace=true.}
+        pin_distinct: {type: boolean, default: false, description: "Pin the replaced former target distinct. Requires an existing different redirect and replace=true."}
         expected_revision:
           type: integer
           format: uint64
@@ -48,6 +156,8 @@ components:
       type: object
       additionalProperties: false
       properties:
+        actor: {type: string, maxLength: 256}
+        reason: {type: string, maxLength: 4096}
         pin_distinct: {type: boolean, default: false}
         expected_revision:
           type: integer
@@ -61,6 +171,8 @@ components:
       additionalProperties: false
       description: Add keys or normalized texts. The add/remove form updates both sets in one revision. Runtime removals do not override declarative suppression.
       properties:
+        actor: {type: string, maxLength: 256}
+        reason: {type: string, maxLength: 4096}
         keys: {type: array, maxItems: 100000, items: {type: string, minLength: 1, maxLength: 16384}}
         texts: {type: array, maxItems: 100000, items: {type: string, minLength: 1, maxLength: 16384}}
         add: {$ref: '#/components/schemas/ResolverSuppressionSelection'}
@@ -76,9 +188,9 @@ components:
       type: object
       properties:
         version: {type: integer, enum: [1]}
-        suppress: {$ref: 'indexes.yaml#/components/schemas/GraphResolverSuppressionConfig'}
+        suppress: {$ref: '#/components/schemas/RuntimeResolverSuppression'}
         distinct: {type: array, items: {$ref: '#/components/schemas/ResolverDistinctPair'}}
-        removed_aliases: {type: array, items: {type: string}, description: Explicitly restored identities; declarative aliases and promotion tombstones cannot recreate the removed redirect.}
+        removed_aliases: {type: array, items: {type: string}, description: "Explicitly restored identities; declarative aliases and promotion tombstones cannot recreate the removed redirect."}
     ResolverReplayStage:
       type: object
       properties:
@@ -146,7 +258,7 @@ components:
       required: [configured, runtime, revision]
       properties:
         configured: {$ref: 'indexes.yaml#/components/schemas/GraphResolverSuppressionConfig'}
-        runtime: {$ref: 'indexes.yaml#/components/schemas/GraphResolverSuppressionConfig'}
+        runtime: {$ref: '#/components/schemas/RuntimeResolverSuppression'}
         revision: {type: integer, format: uint64}
     ResolverMutationResult:
       type: object
@@ -240,7 +352,7 @@ components:
       type: object
       required: [id, source_key, local_id, label, surface_form, key, confidence]
       properties:
-        id: {type: string, description: Opaque revision-bound review identity; treat it as a single URL-encoded path component.}
+        id: {type: string, description: "Opaque revision-bound review identity; treat it as a single URL-encoded path component."}
         source_key: {type: string}
         local_id: {type: string}
         label: {type: string}
@@ -261,6 +373,8 @@ components:
       additionalProperties: false
       required: [decision]
       properties:
+        actor: {type: string, maxLength: 256}
+        reason: {type: string, maxLength: 4096}
         decision: {type: string, enum: [match, new, suppressed]}
         key: {type: string}
         table: {type: string}
@@ -289,6 +403,9 @@ components:
       additionalProperties: false
       required: [into]
       properties:
+        expected_revision: {type: integer, format: uint64, x-go-type-skip-optional-pointer: false}
+        actor: {type: string, maxLength: 256}
+        reason: {type: string, maxLength: 4096}
         into: {type: string, minLength: 1}
         replace: {type: boolean, default: false}
         pin_distinct: {type: boolean, default: false}
@@ -316,6 +433,14 @@ components:
               canonical_key: {type: string}
               curation: {type: object, additionalProperties: true}
               revision: {type: integer, format: uint64}
+              absorbed:
+                type: array
+                items:
+                  type: object
+                  required: [key, disposition]
+                  properties:
+                    key: {type: string}
+                    disposition: {type: string, enum: [release, suppress]}
               changed: {type: boolean}
               replay_sequence: {type: integer, format: uint64}
               applied: {type: boolean}

@@ -58428,6 +58428,65 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
     try std.testing.expect(std.mem.indexOf(u8, timed_out.body, "\"changed\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, timed_out.body, "\"applied\":false") != null);
     try Run.call(&server, .get, "source", "concepts", "", "", 200);
+    // Entity proposals share the destination CAS, preserving evidence and
+    // terminal history while queue-only edits leave policy revisions alone.
+    {
+        const before = source.commits;
+        var created = try resources.handle(&server, alloc, .proposal_create, "entities", "", "", "{\"action\":\"merge\",\"key\":\"concept/review-a\",\"into\":\"concept/review-b\",\"actor\":\"judge\",\"evidence\":{\"resolvers\":[{\"invalid\":true}]}}", "", .{});
+        defer created.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), created.status);
+        try std.testing.expectEqual(before + 1, source.commits);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, created.body, .{});
+        defer parsed.deinit();
+        const proposal_id = parsed.value.object.get("id").?.string;
+        const before_retry = source.commits;
+        try Run.call(&server, .proposal_create, "entities", "", "", "{\"action\":\"merge\",\"key\":\"concept/review-a\",\"into\":\"concept/review-b\"}", 200);
+        try std.testing.expectEqual(before_retry, source.commits);
+        var accepted = try resources.handle(&server, alloc, .proposal_accept, "entities", "", proposal_id, "{\"actor\":\"curator\",\"reason\":\"confirmed\"}", "", .{});
+        defer accepted.deinit(alloc);
+        if (accepted.status != 202) std.debug.print("proposal accept {d}: {s}\n", .{ accepted.status, accepted.body });
+        try std.testing.expectEqual(@as(u16, 202), accepted.status);
+        try std.testing.expectEqual(before_retry + 1, source.commits);
+        try std.testing.expect(std.mem.indexOf(u8, accepted.body, "\"state\":\"accepted\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source.tables[1].indexes_json, "\"origin\":\"review\"") != null);
+        try Run.call(&server, .entity_suppress, "entities", "", "concept/review-b", "{}", 400);
+        var cascade = try resources.handle(&server, alloc, .entity_suppress, "entities", "", "concept/review-b", "{\"absorbed\":\"suppress\",\"actor\":\"user\"}", "", .{});
+        defer cascade.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 202), cascade.status);
+        try std.testing.expect(std.mem.indexOf(u8, cascade.body, "\"disposition\":\"suppress\"") != null);
+        const before_terminal = source.commits;
+        try Run.call(&server, .proposal_accept, "entities", "", proposal_id, "{}", 200);
+        try std.testing.expectEqual(before_terminal, source.commits);
+        try Run.call(&server, .proposal_reject, "entities", "", proposal_id, "{}", 409);
+        var denied_proposal = try resources.handle(&server, alloc, .proposal_create, "entities", "", "", "{\"action\":\"suppress\",\"key\":\"concept/forbidden\"}", "", .{ .principal = .{ .kind = .user, .subject = "limited" }, .table_write_authorization = .{ .ptr = &authority_context, .allows = Denied.allows } });
+        defer denied_proposal.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 403), denied_proposal.status);
+        try std.testing.expectEqual(before_terminal, source.commits);
+        var screened = try resources.handle(&server, alloc, .proposal_create, "entities", "", "", "{\"action\":\"suppress\",\"key\":\"concept/screened\"}", "", .{});
+        defer screened.deinit(alloc);
+        const screening = try std.json.parseFromSlice(std.json.Value, alloc, screened.body, .{});
+        defer screening.deinit();
+        const screen_id = screening.value.object.get("id").?.string;
+        try Run.call(&server, .proposal_reject, "entities", "", screen_id, "{\"reason\":\"specific project term\"}", 200);
+        var repeated = try resources.handle(&server, alloc, .proposal_create, "entities", "", "", "{\"action\":\"suppress\",\"key\":\"concept/screened\"}", "", .{});
+        defer repeated.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, repeated.body, "\"state\":\"rejected\"") != null);
+        var proposed_direct = try resources.handle(&server, alloc, .proposal_create, "entities", "", "", "{\"action\":\"suppress\",\"key\":\"concept/direct\"}", "", .{});
+        defer proposed_direct.deinit(alloc);
+        const direct = try std.json.parseFromSlice(std.json.Value, alloc, proposed_direct.body, .{});
+        defer direct.deinit();
+        const direct_id = direct.value.object.get("id").?.string;
+        try Run.call(&server, .entity_suppress, "entities", "", "concept/direct", "{\"actor\":\"user\"}", 202);
+        var superseded = try resources.handle(&server, alloc, .proposal, "entities", "", direct_id, "", "", .{});
+        defer superseded.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, superseded.body, "\"state\":\"superseded\"") != null);
+        var listed = try resources.handle(&server, alloc, .proposals, "entities", "", "", "", "state=all&limit=1", .{});
+        defer listed.deinit(alloc);
+        const page = try std.json.parseFromSlice(std.json.Value, alloc, listed.body, .{});
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), page.value.object.get("proposals").?.array.items.len);
+        try std.testing.expect(page.value.object.get("next_cursor").? != .null);
+    }
     const retired = (try indexes_api.removeIndexFromTableIndexesJson(alloc, source.tables[0].indexes_json, "knowledge")).?;
     defer alloc.free(retired);
     _ = try Source.replace(&source, source.tables[0], blk: {

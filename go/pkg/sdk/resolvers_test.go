@@ -135,3 +135,33 @@ func TestResolverFirstEditRevisionFenceRejectsConcurrentRetry(t *testing.T) {
 		})
 	}
 }
+
+func TestCurationProposalAcceptReturnsPendingReplay(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.EscapedPath() != "/db/v1/databases/app/namespaces/private/tables/entities/curation/proposals/proposal%2Fone:accept" {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.EscapedPath())
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body["actor"] != "curator" {
+			t.Errorf("lost attribution: %+v", body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"proposal":{"id":"proposal/one","action":"suppress","key":"concept/noise","origin":{"origin":"manual"},"state":"accepted"},"complete":true,"applied":false,"results":[]}`))
+	}))
+	defer server.Close()
+	client, err := NewAntflyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := client.NamespaceAcceptCurationProposal(context.Background(), "app", "private", "entities", "proposal/one", NamespaceAcceptCurationProposalJSONRequestBody{Actor: "curator"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Applied || !result.Complete || result.Proposal.Id != "proposal/one" {
+		t.Fatalf("lost pending result: %+v", result)
+	}
+}

@@ -81,7 +81,7 @@ pub fn addIndexToTableIndexesJsonWithIo(
     index_name: []const u8,
     index_json: []const u8,
 ) ![]u8 {
-    if ((std.mem.eql(u8, index_name, "_resolver_curation") or std.mem.eql(u8, index_name, "_resolver_namespaces"))) return error.InvalidCreateIndexRequest;
+    if ((std.mem.eql(u8, index_name, "_resolver_curation") or std.mem.eql(u8, index_name, "_resolver_namespaces") or std.mem.eql(u8, index_name, "_curation_proposals"))) return error.InvalidCreateIndexRequest;
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
     var config = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
@@ -195,7 +195,7 @@ pub fn removeIndexFromTableIndexesJson(
     current_indexes_json: []const u8,
     index_name: []const u8,
 ) !?[]u8 {
-    if ((std.mem.eql(u8, index_name, "_resolver_curation") or std.mem.eql(u8, index_name, "_resolver_namespaces"))) return error.ExtensionOwnedObject;
+    if ((std.mem.eql(u8, index_name, "_resolver_curation") or std.mem.eql(u8, index_name, "_resolver_namespaces") or std.mem.eql(u8, index_name, "_curation_proposals"))) return error.ExtensionOwnedObject;
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
 

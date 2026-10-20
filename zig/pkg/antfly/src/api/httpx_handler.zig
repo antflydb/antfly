@@ -9208,6 +9208,66 @@ pub const AntflyApiHandler = struct {
         return self.reviewResolverMention(ctx, table_name, resolver_name, review_id);
     }
 
+    pub fn proposeCuration(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .proposal_create, table_name, "", "");
+    }
+
+    pub fn namespaceProposeCuration(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.proposeCuration(ctx, table_name);
+    }
+
+    pub fn listCurationProposals(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .proposals, table_name, "", "");
+    }
+
+    pub fn namespaceListCurationProposals(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.listCurationProposals(ctx, table_name);
+    }
+
+    pub fn getCurationProposal(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, proposal_id: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .proposal, table_name, "", proposal_id);
+    }
+
+    pub fn namespaceGetCurationProposal(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, proposal_id: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.getCurationProposal(ctx, table_name, proposal_id);
+    }
+
+    pub fn acceptCurationProposal(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, proposal_id: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .proposal_accept, table_name, "", proposal_id);
+    }
+
+    pub fn namespaceAcceptCurationProposal(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, proposal_id: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.acceptCurationProposal(ctx, table_name, proposal_id);
+    }
+
+    pub fn rejectCurationProposal(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, proposal_id: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .proposal_reject, table_name, "", proposal_id);
+    }
+
+    pub fn namespaceRejectCurationProposal(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, proposal_id: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.rejectCurationProposal(ctx, table_name, proposal_id);
+    }
+
+    pub fn pinEntitiesDistinct(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .entity_distinct, table_name, "", key);
+    }
+
+    pub fn namespacePinEntitiesDistinct(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.pinEntitiesDistinct(ctx, table_name, key);
+    }
+
     pub fn listEntityResolverState(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response {
         return self.resolverRequest(ctx, .entity_redirects, table_name, "", key);
     }

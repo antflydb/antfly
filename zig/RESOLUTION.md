@@ -1816,3 +1816,63 @@ bulk reads, generated adjudication, model revisions, descriptions, and caches
 survive the boundary. Batch leases and callback error identities retain their
 originating owner. Resolver review entry points dispatch through the storage
 engine rather than reading the control proxy's store.
+
+### Curation attribution and entity proposals
+
+Entity suppression accepts `absorbed: reject | release | suppress` (default
+`reject`). Release removes every transitive redirect into the selected target;
+`pin_distinct: true` also pins every released source against that target.
+Cascade suppression removes the same redirects and suppresses their source keys.
+The planner computes the component before changing any edge, then publishes one
+policy edit. Removed configured aliases stay masked. Unsuppression never restores
+a redirect or unsuppresses other keys implicitly.
+
+Curation writes accept UTF-8 `actor` (256 bytes) and `reason` (4096 bytes).
+The admission owner stamps origin, creation time and the committed policy
+revision; clients cannot supply a server origin through entity/redirect writes.
+Read projections attach provenance to redirects and distinct pairs. Runtime
+suppressions retain the compatible `keys`/`texts` sets and add attributed
+`entries`/`text_entries`. Cascades name their original target in `cascade_from`;
+review acceptance names its proposal in `proposal_id`. Legacy records have an
+unknown creation time/revision represented by zero. Persisting this extended
+curation format requires reader version 10.
+
+`/tables/{entity_table}/curation/proposals` is the entity-level review surface;
+it does not replace mention-level resolver reviews. Create a typed entity action
+(`merge`, `unmerge`, `suppress`, `unsuppress`, or `distinct`), inspect/list it, then
+accept or reject it. Both default and database/namespace-qualified routes are
+available. Accept uses the entity planner and returns its curation result. A
+merge rejection can atomically pin the proposed pair distinct. Accepted effects
+carry `origin: review`. Direct entity corrections supersede affected open
+proposals. Terminal proposals retain their identity: repeated screening does not
+reopen a rejection, and repeated acceptance does not override a later correction.
+
+The stable ID hashes the action and length-framed JSON keys, excluding confidence,
+evidence and options. Distinct-pair IDs are symmetric. Listing uses ordered IDs
+for keyset pagination, with a default open-state filter and pages of 1–256 records.
+Evidence is bounded at 16 KiB, 4096 JSON values and depth 32; confidence must be
+finite and between zero and one. Each table queue has a 4096-record, 4 MiB budget.
+Budget exhaustion is explicit; no existing decision is silently evicted. Queue
+records are metadata, never resolver declarations, and inference admission parses
+only execution policy, skipping proposal evidence and attribution history.
+
+HTTP stores proposals alongside destination namespace authority. Accept/reject
+and their policy effects share one destination-table metadata CAS, including
+catalog retries and Raft replay. Queue-only edits leave resolver policy revisions
+unchanged and do not enqueue resolver work. Lite retains the existing per-resolver
+atomicity of entity actions: each accepted effect and its decision receipt share
+one catalog publication. A durable pending decision fences competing decisions
+and supports resuming a partial fanout after reopening. `complete: false` means
+the caller should retry the same decision. Ordered/HA maintenance is rejected by
+the raw embedded queue path rather than bypassing ordered mutation admission.
+
+The C ABI and Rust embedded crate expose `propose_curation_json`,
+`list_curation_proposals_json`, `get_curation_proposal_json`, and
+`decide_curation_proposal_json`. Lite decisions include `accept: true | false`;
+HTTP uses the `:accept` and `:reject` resources. Public HTTP SDKs are generated from
+`specs/openapi/antfly/resolvers.yaml` and `metadata.yaml`.
+
+The HTTP convenience clients expose Go `ProposeCuration` / scoped variants,
+TypeScript `curationProposals` / `namespaceCurationProposals`, and Python
+`curation_proposals` with `in_namespace`. Entity suppression uses the typed
+`EntitySuppressRequest` in each SDK, including its absorbed-key disposition.

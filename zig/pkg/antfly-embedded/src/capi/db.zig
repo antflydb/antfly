@@ -7661,12 +7661,14 @@ pub fn antfly_db_curate_entity_json(handle_ptr: ?*anyopaque, entity_table: capi.
     const a = arena.allocator();
     const curation = @import("../storage/db/resolver_curation.zig");
     const pure = @import("antfly_resolver");
-    const Input = struct { action: enum { redirects, merge, unmerge, suppress, unsuppress }, into: ?[]const u8 = null, replace: bool = false, pin_distinct: bool = false, wait: ?pure.curation.Wait = null };
+    const Input = struct { action: enum { redirects, merge, unmerge, suppress, unsuppress, distinct }, into: ?[]const u8 = null, replace: bool = false, pin_distinct: bool = false, absorbed: pure.curation.Absorbed = .reject, actor: []const u8 = "", reason: []const u8 = "", expected_revision: ?u64 = null, wait: ?pure.curation.Wait = null };
     const input = std.json.parseFromSliceLeaky(Input, a, request_json.bytes(), .{}) catch |err| return capi.mapError(err);
     const tables = @import("tables.zig");
     tables.load(handle) catch |err| return capi.mapError(err);
-    _ = tables.get(handle, entity_table.bytes()) catch |err| return capi.mapError(err);
-    const Pending = struct { db: *db_mod.DB, source: []const u8, cfg: db_mod.ResolverConfig, request: pure.curation.Request };
+    const entity_db = tables.get(handle, entity_table.bytes()) catch |err| return capi.mapError(err);
+    var manifest = proposalManifest(a, entity_db) catch |err| return capi.mapError(err);
+    if (input.action != .redirects and manifest.pending_id != null) return capi.mapError(error.ResolverCurationConflict);
+    const Pending = struct { db: *db_mod.DB, source: []const u8, cfg: db_mod.ResolverConfig, request: pure.curation.Request, edit: pure.curation.Plan };
     var pending: std.ArrayListUnmanaged(Pending) = .empty;
     var sources: std.ArrayListUnmanaged(struct { db: *db_mod.DB, name: []const u8 }) = .empty;
     sources.append(a, .{ .db = &handle.db, .name = "default" }) catch |err| return capi.mapError(err);
@@ -7682,7 +7684,7 @@ pub fn antfly_db_curate_entity_json(handle_ptr: ?*anyopaque, entity_table: capi.
                 const state = pure.curation.parseState(a, cfg.curation_json) catch |err| return capi.mapError(err);
                 const aliases = cfg.effectiveAliasesAlloc(a) catch |err| return capi.mapError(err);
                 const scoped = pure.curation.entityState(a, state, aliases, entity_key.bytes()) catch |err| return capi.mapError(err);
-                const raw = std.json.Stringify.valueAlloc(a, .{ .source_table = source.name, .resolver = cfg.name, .revision = cfg.curation_revision, .redirects = scoped.redirects, .canonical_key = scoped.canonical_key, .curation = scoped.curation }, .{}) catch |err| return capi.mapError(err);
+                const raw = std.json.Stringify.valueAlloc(a, .{ .source_table = source.name, .resolver = cfg.name, .revision = cfg.curation_revision, .redirects = pure.curation.redirectsWithOrigins(a, scoped.redirects, scoped.curation, cfg.merges) catch |err| return capi.mapError(err), .canonical_key = scoped.canonical_key, .curation = scoped.curation }, .{}) catch |err| return capi.mapError(err);
                 results.append(std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch |err| return capi.mapError(err)) catch |err| return capi.mapError(err);
                 continue;
             }
@@ -7691,36 +7693,314 @@ pub fn antfly_db_curate_entity_json(handle_ptr: ?*anyopaque, entity_table: capi.
                 .unmerge => .unmerge,
                 .suppress => .suppress,
                 .unsuppress => .unsuppress,
+                .distinct => .distinct,
                 .redirects => unreachable,
             };
-            const intent: pure.curation.Request = .{ .action = action, .key = entity_key.bytes(), .to = input.into, .replace = input.replace, .pin_distinct = input.pin_distinct, .wait = input.wait, .expected_revision = cfg.curation_revision };
-            const edit = pure.curation.plan(a, cfg.curation_json, cfg.merges, cfg.effectiveAliasesAlloc(a) catch |err| return capi.mapError(err), intent) catch |err| return capi.mapError(err);
+            const intent: pure.curation.Request = .{ .action = action, .key = entity_key.bytes(), .to = input.into, .absorbed = input.absorbed, .actor = input.actor, .reason = input.reason, .replace = input.replace, .pin_distinct = input.pin_distinct, .wait = input.wait, .expected_revision = cfg.curation_revision };
+            if (input.expected_revision) |revision| if (revision != cfg.curation_revision) return capi.mapError(error.ResolverCurationConflict);
+            const stamp = curation.manualOrigin(intent, std.math.add(u64, cfg.curation_revision, 1) catch |err| return capi.mapError(err));
+            var edit = pure.curation.planWithOrigin(a, cfg.curation_json, cfg.merges, cfg.effectiveAliasesAlloc(a) catch |err| return capi.mapError(err), intent, stamp) catch |err| return capi.mapError(err);
+            _ = pure.curation.recordSupersessions(a, &edit, manifest.queue.proposals, intent, stamp) catch |err| return capi.mapError(err);
             var next = cfg;
             next.merges = edit.merges;
             next.curation_json = std.json.Stringify.valueAlloc(a, edit.state, .{}) catch |err| return capi.mapError(err);
             next.validate() catch |err| return capi.mapError(err);
-            pending.append(a, .{ .db = source.db, .source = source.name, .cfg = cfg, .request = intent }) catch |err| return capi.mapError(err);
+            pending.append(a, .{ .db = source.db, .source = source.name, .cfg = cfg, .request = intent, .edit = edit }) catch |err| return capi.mapError(err);
         }
     }
     if (input.action != .redirects and pending.items.len == 0) return capi.mapError(error.ResolverNotFound);
+    var prospective = manifest.queue;
+    for (pending.items) |item| prospective.proposals = pure.curation.projectReceipts(a, prospective.proposals, item.edit.state.proposals) catch |err| return capi.mapError(err);
+    _ = pure.curation.parseState(a, std.json.Stringify.valueAlloc(a, prospective, .{}) catch |err| return capi.mapError(err)) catch |err| return capi.mapError(err);
     var complete = true;
+    if (pending.items.len > 0 and manifest.queue.proposals.len > 0) {
+        manifest.refresh_required = true;
+        saveProposalManifest(a, entity_db, manifest) catch |err| return capi.mapError(err);
+    }
     for (pending.items) |item| {
-        const bytes = std.json.Stringify.valueAlloc(a, item.request, .{}) catch |err| return capi.mapError(err);
-        const raw = curation.mutate(item.db, a, item.cfg.name, bytes) catch |err| {
+        const raw = curation.publishPlan(item.db, a, item.cfg, item.edit) catch |err| {
             complete = false;
             const failed = std.json.Stringify.valueAlloc(a, .{ .source_table = item.source, .resolver = item.cfg.name, .accepted = false, .error_message = @errorName(err) }, .{}) catch |failure| return capi.mapError(failure);
             results.append(std.json.parseFromSliceLeaky(std.json.Value, a, failed, .{}) catch |failure| return capi.mapError(failure)) catch |failure| return capi.mapError(failure);
             continue;
         };
+        if (manifest.queue.proposals.len > 0) {
+            const records = a.dupe(pure.curation.Proposal, manifest.queue.proposals) catch |err| return capi.mapError(err);
+            for (records) |*proposal| if (proposal.state == .open) {
+                for (item.edit.state.proposals) |receipt| if (std.mem.eql(u8, proposal.id, receipt.id) and receipt.state == .superseded) {
+                    proposal.state = .superseded;
+                    proposal.decided = receipt.decided;
+                    break;
+                };
+            };
+            manifest.queue.proposals = records;
+        }
         var value = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch |err| return capi.mapError(err);
         value.object.put(a, "source_table", .{ .string = item.source }) catch |err| return capi.mapError(err);
         results.append(value) catch |err| return capi.mapError(err);
     }
+    manifest.refresh_required = !complete;
+    if (input.action != .redirects and manifest.queue.proposals.len > 0) saveProposalManifest(a, entity_db, manifest) catch |err| return capi.mapError(err);
     const response = std.json.Stringify.valueAlloc(a, .{ .entity_table = entity_table.bytes(), .key = entity_key.bytes(), .atomicity = "resolver", .complete = complete, .results = std.json.Value{ .array = results } }, .{}) catch |err| return capi.mapError(err);
     out.* = copyJsonBuffer(response) catch |err| return capi.mapError(err);
     admitted = false;
     guard.leave();
     return waitResolverCurationResponse(handle_ptr, if (input.wait) |wait| wait.timeout_ms else 0, out);
+}
+
+const proposal_store_key = @import("antfly_resolver").curation.proposal_store_key;
+const ProposalManifest = @import("antfly_resolver").curation.ProposalManifest;
+fn saveProposalManifest(a: std.mem.Allocator, db: *db_mod.DB, manifest: ProposalManifest) !void {
+    var lease = try db.local_execution.row_policy_gate.enterRaw();
+    defer lease.release();
+    if (try db.maintenanceRequiresOrderedApply()) return error.OrderedResolverReviewRequired;
+    const catalog = @import("../storage/db/catalog/resolver_catalog.zig");
+    const version = @max(catalog.curation_provenance_reader_version, db.core.index_manager.minimum_reader_version.load(.acquire));
+    _ = try @import("antfly_resolver").curation.parseState(a, try std.json.Stringify.valueAlloc(a, manifest.queue, .{}));
+    const bytes = try std.json.Stringify.valueAlloc(a, manifest, .{});
+    // Queue budgets exclude only the fixed pending-decision envelope.
+    if (bytes.len > 4 * 1024 * 1024 + 16384) return error.ResolverCurationLimitExceeded;
+    try db.core.store.putBatch(&.{ .{ .key = proposal_store_key, .value = bytes }, .{ .key = catalog.minimum_reader_key, .value = try catalog.readerVersionBytes(version) } }, &.{});
+    db.core.index_manager.minimum_reader_version.store(version, .release);
+}
+fn proposalManifest(a: std.mem.Allocator, db: *db_mod.DB) !ProposalManifest {
+    const bytes = db.core.store.get(a, proposal_store_key) catch |err| return if (err == error.NotFound) .{} else err;
+    return @import("antfly_resolver").curation.parseProposalManifest(a, bytes);
+}
+/// The root table owns queue admission. Accepted actions use per-resolver
+/// receipts, so a partial fanout can resume after process restart without
+/// applying an already accepted action again.
+fn proposalOperation(handle_ptr: ?*anyopaque, table: capi.Slice, id: capi.Slice, request: capi.Slice, out_buf: ?*capi.Buffer, operation_name: enum { create, list, get, decide }) capi.ErrorCode {
+    capi.clearLastError();
+    const out = resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
+    if (request.len > 4 * 1024 * 1024) return capi.mapError(error.ResolverCurationLimitExceeded);
+    const guard = enterHandle(handle_ptr, if (operation_name == .list or operation_name == .get) .read else .exclusive) orelse return capi.mapError(error.InvalidArgument);
+    defer guard.leave();
+    if (guard.entry_error) |value| return capi.ensureError(value, @src().fn_name);
+    const handle = guard.handle.parent_handle orelse guard.handle;
+    var arena = std.heap.ArenaAllocator.init(handle.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pure = @import("antfly_resolver").curation;
+    const owner = @import("../storage/db/resolver_curation.zig");
+    const tables = @import("tables.zig");
+    (if (operation_name == .list or operation_name == .get) tables.loadCatalog(handle) else tables.load(handle)) catch |err| return capi.mapError(err);
+    const db = tables.get(handle, table.bytes()) catch |err| return capi.mapError(err);
+    var policy_lease = (if (operation_name == .list or operation_name == .get) db.local_execution.row_policy_gate.enterRawRead() else db.local_execution.row_policy_gate.enterRaw()) catch |err| return capi.mapError(err);
+    defer policy_lease.release();
+    if (operation_name != .list and operation_name != .get) {
+        if (db.maintenanceRequiresOrderedApply() catch |err| return capi.mapError(err)) return capi.mapError(error.OrderedResolverReviewRequired);
+    }
+    var manifest = proposalManifest(a, db) catch |err| return capi.mapError(err);
+    const queue_records = a.dupe(pure.Proposal, manifest.queue.proposals) catch |err| return capi.mapError(err);
+    var open_ids: std.StringHashMapUnmanaged(usize) = .empty;
+    for (queue_records, 0..) |proposal, i| if (proposal.state == .open) {
+        open_ids.put(a, proposal.id, i) catch |err| return capi.mapError(err);
+    };
+    if (manifest.refresh_required and open_ids.count() > 0) {
+        tables.load(handle) catch |err| return capi.mapError(err);
+        var owners: std.ArrayListUnmanaged(*db_mod.DB) = .empty;
+        owners.append(a, &handle.db) catch |err| return capi.mapError(err);
+        var owner_it = handle.embedded_tables.valueIterator();
+        while (owner_it.next()) |entry| owners.append(a, &entry.*.db) catch |err| return capi.mapError(err);
+        for (owners.items) |source| {
+            const configs = source.core.index_manager.listResolverIdentities(a) catch |err| return capi.mapError(err);
+            for (configs) |cfg| {
+                if (!std.mem.eql(u8, cfg.table, table.bytes())) continue;
+                const state = pure.parseState(a, cfg.curation_json) catch |err| return capi.mapError(err);
+                for (state.proposals) |receipt| if (receipt.state == .superseded) {
+                    if (open_ids.get(receipt.id)) |i| {
+                        queue_records[i].state = .superseded;
+                        queue_records[i].decided = receipt.decided;
+                    }
+                };
+            }
+        }
+        manifest.queue.proposals = queue_records;
+        manifest.refresh_required = false;
+    }
+    if (operation_name == .list) {
+        // JSON options are converted to the same keyset query used by HTTP.
+        const Query = struct { state: enum { open, accepted, rejected, superseded, all } = .open, action: ?pure.EntityAction = null, cursor: []const u8 = "", limit: u16 = 64 };
+        const query = std.json.parseFromSliceLeaky(Query, a, if (request.len == 0) "{}" else request.bytes(), .{}) catch |err| return capi.mapError(err);
+        const bytes = std.fmt.allocPrint(a, "state={s}&cursor={s}&limit={d}{s}", .{ @tagName(query.state), query.cursor, query.limit, if (query.action) |action| std.fmt.allocPrint(a, "&action={s}", .{@tagName(action)}) catch |err| return capi.mapError(err) else "" }) catch |err| return capi.mapError(err);
+        policy_lease.checkAt(@intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s))) catch |err| return capi.mapError(err);
+        out.* = stringifyJson(pure.proposalPage(a, manifest.queue, bytes) catch |err| return capi.mapError(err)) catch |err| return capi.mapError(err);
+        return .ok;
+    }
+    var proposal_id = id.bytes();
+    var creation: ?pure.ProposalRequest = null;
+    if (operation_name == .create) {
+        const input = std.json.parseFromSliceLeaky(pure.ProposalRequest, a, request.bytes(), .{}) catch |err| return capi.mapError(err);
+        proposal_id = pure.proposalId(a, input) catch |err| return capi.mapError(err);
+        creation = input;
+    }
+    var selected: ?usize = null;
+    for (manifest.queue.proposals, 0..) |proposal, i| if (std.mem.eql(u8, proposal.id, proposal_id)) {
+        selected = i;
+        break;
+    };
+    if (operation_name == .get or (operation_name == .create and selected != null)) {
+        const proposal = manifest.queue.proposals[selected orelse return capi.mapError(error.NotFound)];
+        policy_lease.checkAt(@intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s))) catch |err| return capi.mapError(err);
+        out.* = stringifyJson(proposal) catch |err| return capi.mapError(err);
+        return .ok;
+    }
+    if (manifest.pending_id) |pending| if (!std.mem.eql(u8, pending, proposal_id)) return capi.mapError(error.ResolverCurationConflict);
+    const input_decision = if (operation_name == .decide) std.json.parseFromSliceLeaky(pure.ProposalDecision, a, request.bytes(), .{}) catch |err| return capi.mapError(err) else pure.ProposalDecision{ .accept = false };
+    const proposal = if (selected) |i| manifest.queue.proposals[i] else if (creation) |input| blk: {
+        const plan = pure.propose(a, manifest.queue, &.{}, input, owner.manualOrigin(.{ .action = .suppress, .actor = input.actor, .reason = input.reason }, 0)) catch |err| return capi.mapError(err);
+        manifest.queue = plan.state;
+        selected = manifest.queue.proposals.len - 1;
+        break :blk manifest.queue.proposals[selected.?];
+    } else return capi.mapError(error.NotFound);
+    if (operation_name == .decide and proposal.state != .open) {
+        const wanted: pure.ProposalState = if (input_decision.accept) .accepted else .rejected;
+        if (proposal.state != wanted) return capi.mapError(error.ResolverCurationConflict);
+        out.* = stringifyJson(.{ .proposal = proposal, .changed = false, .complete = true }) catch |err| return capi.mapError(err);
+        return .ok;
+    }
+    if (!input_decision.accept and (input_decision.options != null or (input_decision.pin_distinct and proposal.action != .merge))) return capi.mapError(error.InvalidResolverCurationRequest);
+    if (input_decision.wait) |wait| if (wait.timeout_ms == 0 or wait.timeout_ms > 300000) return capi.mapError(error.InvalidResolverCurationRequest);
+    const decision = manifest.pending_decision orelse input_decision;
+    if (manifest.pending_decision) |old| {
+        if (input_decision.pin_distinct != old.pin_distinct) return capi.mapError(error.ResolverCurationConflict);
+        if (input_decision.options) |options| if (!std.meta.eql(options, old.options orelse proposal.options)) return capi.mapError(error.ResolverCurationConflict);
+    }
+    if (manifest.pending_decision != null and (input_decision.accept != decision.accept)) return capi.mapError(error.ResolverCurationConflict);
+    const stamp = manifest.pending_origin orelse owner.manualOrigin(.{ .action = .suppress, .actor = decision.actor, .reason = decision.reason }, 0);
+    stamp.validate() catch |err| return capi.mapError(err);
+    const Pending = struct { db: *db_mod.DB, source: []const u8, cfg: db_mod.ResolverConfig, edit: pure.Plan };
+    var pending: std.ArrayListUnmanaged(Pending) = .empty;
+    var sources: std.ArrayListUnmanaged(struct { db: *db_mod.DB, name: []const u8 }) = .empty;
+    sources.append(a, .{ .db = &handle.db, .name = "default" }) catch |err| return capi.mapError(err);
+    var it = handle.embedded_tables.iterator();
+    while (it.next()) |entry| sources.append(a, .{ .db = &entry.value_ptr.*.db, .name = entry.key_ptr.* }) catch |err| return capi.mapError(err);
+    for (sources.items) |source| {
+        const configs = source.db.core.index_manager.listResolverIdentities(a) catch |err| return capi.mapError(err);
+        for (configs) |cfg| {
+            if (!std.mem.eql(u8, cfg.table, table.bytes()) or !owner.keyInNamespace(cfg.key_template, proposal.key)) continue;
+            if (proposal.into) |into| if (!owner.keyInNamespace(cfg.key_template, into)) return capi.mapError(error.InvalidResolverCurationRequest);
+            if (operation_name == .create) {
+                pending.append(a, .{ .db = source.db, .source = source.name, .cfg = cfg, .edit = .{ .state = .{}, .merges = &.{}, .changed = false } }) catch |err| return capi.mapError(err);
+                continue;
+            }
+            if (!decision.accept and !decision.pin_distinct) continue;
+            var state = pure.parseState(a, cfg.curation_json) catch |err| return capi.mapError(err);
+            // A receipt makes retries independent of subsequent direct edits.
+            var found = false;
+            for (state.proposals) |old| if (std.mem.eql(u8, old.id, proposal.id)) {
+                found = true;
+                break;
+            };
+            if (!found) {
+                const entries = a.alloc(pure.Proposal, state.proposals.len + 1) catch |err| return capi.mapError(err);
+                @memcpy(entries[0..state.proposals.len], state.proposals);
+                entries[state.proposals.len] = proposal;
+                entries[state.proposals.len].evidence = null;
+                state.proposals = entries;
+            }
+            const has_receipt = for (state.proposals) |old| {
+                if (std.mem.eql(u8, old.id, proposal.id) and old.state != .open) break true;
+            } else false;
+            if (!has_receipt) if (decision.expected_revision) |revision| if (revision != cfg.curation_revision) return capi.mapError(error.ResolverCurationConflict);
+            var origin = stamp;
+            origin.revision = std.math.add(u64, cfg.curation_revision, 1) catch |err| return capi.mapError(err);
+            if (source.db.maintenanceRequiresOrderedApply() catch |err| return capi.mapError(err)) return capi.mapError(error.OrderedResolverReviewRequired);
+            var edit = pure.decide(a, state, cfg.merges, cfg.effectiveAliasesAlloc(a) catch |err| return capi.mapError(err), proposal.id, decision, origin) catch |err| return capi.mapError(err);
+            var review_origin = origin;
+            review_origin.origin = .review;
+            review_origin.proposal_id = proposal.id;
+            _ = pure.recordSupersessions(a, &edit, manifest.queue.proposals, pure.decisionRequest(proposal, decision), review_origin) catch |err| return capi.mapError(err);
+            const receipts = a.dupe(pure.Proposal, edit.state.proposals) catch |err| return capi.mapError(err);
+            for (receipts) |*receipt| if (std.mem.eql(u8, receipt.id, proposal.id)) {
+                receipt.state = if (decision.accept) .accepted else .rejected;
+                receipt.decided = review_origin;
+            };
+            edit.state.proposals = receipts;
+            var next = cfg;
+            next.merges = edit.merges;
+            next.curation_json = std.json.Stringify.valueAlloc(a, edit.state, .{}) catch |err| return capi.mapError(err);
+            next.validate() catch |err| return capi.mapError(err);
+            pending.append(a, .{ .db = source.db, .source = source.name, .cfg = cfg, .edit = edit }) catch |err| return capi.mapError(err);
+        }
+    }
+    if ((operation_name == .create or decision.accept or decision.pin_distinct) and pending.items.len == 0) return capi.mapError(error.ResolverNotFound);
+    if (operation_name == .decide) {
+        var prospective = manifest.queue;
+        for (pending.items) |item| prospective.proposals = pure.projectReceipts(a, prospective.proposals, item.edit.state.proposals) catch |err| return capi.mapError(err);
+        const records = a.dupe(pure.Proposal, prospective.proposals) catch |err| return capi.mapError(err);
+        records[selected.?].state = if (decision.accept) .accepted else .rejected;
+        var origin = stamp;
+        origin.origin = .review;
+        origin.proposal_id = proposal.id;
+        records[selected.?].decided = origin;
+        prospective.proposals = records;
+        _ = pure.parseState(a, std.json.Stringify.valueAlloc(a, prospective, .{}) catch |err| return capi.mapError(err)) catch |err| return capi.mapError(err);
+    }
+    var results = std.json.Array.init(a);
+    var complete = true;
+    if (operation_name == .decide and (decision.accept or decision.pin_distinct)) {
+        manifest.refresh_required = true;
+        manifest.pending_id = proposal.id;
+        manifest.pending_decision = decision;
+        manifest.pending_origin = stamp;
+        saveProposalManifest(a, db, manifest) catch |err| return capi.mapError(err);
+        policy_lease.release();
+        for (pending.items) |item| {
+            const raw = owner.publishPlan(item.db, a, item.cfg, item.edit) catch |err| {
+                complete = false;
+                results.append(std.json.parseFromSliceLeaky(std.json.Value, a, std.json.Stringify.valueAlloc(a, .{ .source_table = item.source, .resolver = item.cfg.name, .accepted = false, .@"error" = @errorName(err) }, .{}) catch |failure| return capi.mapError(failure), .{}) catch |failure| return capi.mapError(failure)) catch |failure| return capi.mapError(failure);
+                continue;
+            };
+            const projected = a.dupe(pure.Proposal, manifest.queue.proposals) catch |err| return capi.mapError(err);
+            for (projected) |*record| if (record.state == .open and !std.mem.eql(u8, record.id, proposal.id)) {
+                for (item.edit.state.proposals) |receipt| if (receipt.state == .superseded and std.mem.eql(u8, record.id, receipt.id)) {
+                    record.state = .superseded;
+                    record.decided = receipt.decided;
+                    break;
+                };
+            };
+            manifest.queue.proposals = projected;
+            var value = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch |err| return capi.mapError(err);
+            value.object.put(a, "source_table", .{ .string = item.source }) catch |err| return capi.mapError(err);
+            results.append(value) catch |err| return capi.mapError(err);
+        }
+    }
+    if (operation_name == .decide and complete) {
+        const entries = a.dupe(pure.Proposal, manifest.queue.proposals) catch |err| return capi.mapError(err);
+        entries[selected.?].state = if (decision.accept) .accepted else .rejected;
+        var origin = stamp;
+        origin.origin = .review;
+        origin.proposal_id = proposal.id;
+        entries[selected.?].decided = origin;
+        manifest.queue.proposals = entries;
+        manifest.refresh_required = false;
+        manifest.pending_id = null;
+        manifest.pending_decision = null;
+        manifest.pending_origin = null;
+    }
+    policy_lease.release();
+    policy_lease = db.local_execution.row_policy_gate.enterRaw() catch |err| return capi.mapError(err);
+    saveProposalManifest(a, db, manifest) catch |err| return capi.mapError(err);
+    out.* = if (operation_name == .create) stringifyJson(manifest.queue.proposals[selected.?]) catch |err| return capi.mapError(err) else stringifyJson(.{ .proposal = manifest.queue.proposals[selected.?], .atomicity = "resolver", .complete = complete, .results = std.json.Value{ .array = results } }) catch |err| return capi.mapError(err);
+    return .ok;
+}
+pub fn antfly_db_propose_curation_json(handle: ?*anyopaque, table: capi.Slice, request: capi.Slice, out: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled) return @call(.auto, @extern(*const @TypeOf(antfly_db_propose_curation_json), .{ .name = "antfly_db_propose_curation_json" }), .{ handle, table, request, out });
+    return proposalOperation(handle, table, .fromSlice(""), request, out, .create);
+}
+pub fn antfly_db_list_curation_proposals_json(handle: ?*anyopaque, table: capi.Slice, request: capi.Slice, out: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled) return @call(.auto, @extern(*const @TypeOf(antfly_db_list_curation_proposals_json), .{ .name = "antfly_db_list_curation_proposals_json" }), .{ handle, table, request, out });
+    return proposalOperation(handle, table, .fromSlice(""), request, out, .list);
+}
+pub fn antfly_db_get_curation_proposal_json(handle: ?*anyopaque, table: capi.Slice, id: capi.Slice, out: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled) return @call(.auto, @extern(*const @TypeOf(antfly_db_get_curation_proposal_json), .{ .name = "antfly_db_get_curation_proposal_json" }), .{ handle, table, id, out });
+    return proposalOperation(handle, table, id, .fromSlice(""), out, .get);
+}
+pub fn antfly_db_decide_curation_proposal_json(handle: ?*anyopaque, table: capi.Slice, id: capi.Slice, request: capi.Slice, out: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled) return @call(.auto, @extern(*const @TypeOf(antfly_db_decide_curation_proposal_json), .{ .name = "antfly_db_decide_curation_proposal_json" }), .{ handle, table, id, request, out });
+    return proposalOperation(handle, table, id, request, out, .decide);
 }
 
 /// Bounded review page or revision-bound review decision; operation is part
@@ -8984,6 +9264,10 @@ comptime {
         "antfly_db_resolver_curation_json",
         "antfly_db_resolver_reviews_json",
         "antfly_db_curate_entity_json",
+        "antfly_db_propose_curation_json",
+        "antfly_db_list_curation_proposals_json",
+        "antfly_db_get_curation_proposal_json",
+        "antfly_db_decide_curation_proposal_json",
         "antfly_db_entity_merge_json",
         "antfly_db_entity_unmerge_json",
         "antfly_db_entity_suppress_json",

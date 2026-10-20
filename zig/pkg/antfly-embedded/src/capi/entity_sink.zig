@@ -2281,3 +2281,100 @@ test "capi resolver curation suppression replays mention and relation edge contr
     try Edges.count(id, "source", "mentions", 2);
     try Edges.count(id, "concept/alpha", "uses", 1);
 }
+
+test "capi resolver curation proposals persist decisions and resume per resolver receipts" {
+    const api = @import("db.zig");
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("resolver-curation-proposals");
+    defer tmp.cleanup();
+    const root = try api.openDefaultDirectoryHandle(std.mem.span(tmp.path().ptr));
+    const id = try api.publishHandle(root);
+    var closed = false;
+    defer if (!closed) api.antfly_db_close(id);
+    try root.db.addResolver(.{ .name = "concepts", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "concept/{{uslug _entity.text}}", .promote = false });
+    var out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&out);
+    const create = "{\"action\":\"merge\",\"key\":\"concept/a\",\"into\":\"concept/b\",\"actor\":\"screen\",\"reason\":\"same concept\"}";
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_propose_curation_json(id, .fromSlice("default"), .fromSlice(create), &out));
+    const proposal = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
+    defer proposal.deinit();
+    const proposal_id = proposal.value.object.get("id").?.string;
+    api.antfly_buffer_free(&out);
+    const manifest_before = try root.db.core.store.get(a, @import("antfly_resolver").curation.proposal_store_key);
+    defer a.free(manifest_before);
+
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_decide_curation_proposal_json(id, .fromSlice("default"), .fromSlice(proposal_id), .fromSlice("{\"accept\":true,\"actor\":\"curator\",\"reason\":\"confirmed\"}"), &out));
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"complete\":true") != null);
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolver_curation_json(id, .fromSlice("concepts"), &out));
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"origin\":\"review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"actor\":\"curator\"") != null);
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.invalid_argument, api.antfly_db_entity_suppress_json(id, .fromSlice("default"), .fromSlice("concept/b"), .fromSlice("{}"), &out));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_suppress_json(id, .fromSlice("default"), .fromSlice("concept/b"), .fromSlice("{\"absorbed\":\"suppress\",\"actor\":\"user\"}"), &out));
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"disposition\":\"suppress\"") != null);
+    api.antfly_buffer_free(&out);
+    // An already accepted proposal must never undo a later direct correction.
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_decide_curation_proposal_json(id, .fromSlice("default"), .fromSlice(proposal_id), .fromSlice("{\"accept\":true}"), &out));
+    api.antfly_buffer_free(&out);
+    // Simulate a crash after a resolver committed its receipt and before
+    // the root fanout record was finalized. Later direct policy stays intact.
+    var unfinished = try std.json.parseFromSlice(std.json.Value, a, manifest_before, .{});
+    defer unfinished.deinit();
+    const scratch = unfinished.arena.allocator();
+    try unfinished.value.object.put(scratch, "pending_id", .{ .string = proposal_id });
+    try unfinished.value.object.put(scratch, "pending_decision", try std.json.parseFromSliceLeaky(std.json.Value, scratch, "{\"accept\":true,\"actor\":\"curator\",\"reason\":\"confirmed\"}", .{}));
+    try unfinished.value.object.put(scratch, "pending_origin", try std.json.parseFromSliceLeaky(std.json.Value, scratch, "{\"actor\":\"curator\",\"reason\":\"confirmed\",\"created_at_ms\":1}", .{}));
+    const pending_bytes = try std.json.Stringify.valueAlloc(a, unfinished.value, .{});
+    defer a.free(pending_bytes);
+    try root.db.core.store.put(@import("antfly_resolver").curation.proposal_store_key, pending_bytes);
+    api.antfly_db_close(id);
+    closed = true;
+    const reopened = try api.openDefaultDirectoryHandle(std.mem.span(tmp.path().ptr));
+    const reopened_id = try api.publishHandle(reopened);
+    defer api.antfly_db_close(reopened_id);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_decide_curation_proposal_json(reopened_id, .fromSlice("default"), .fromSlice(proposal_id), .fromSlice("{\"accept\":true,\"actor\":\"curator\",\"reason\":\"confirmed\"}"), &out));
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"complete\":true") != null);
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolver_curation_json(reopened_id, .fromSlice("concepts"), &out));
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"origin\":\"cascade\"") != null);
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_get_curation_proposal_json(reopened_id, .fromSlice("default"), .fromSlice(proposal_id), &out));
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"state\":\"accepted\"") != null);
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_propose_curation_json(reopened_id, .fromSlice("default"), .fromSlice("{\"action\":\"suppress\",\"key\":\"concept/noise\"}"), &out));
+    const suppression = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
+    defer suppression.deinit();
+    const suppression_id = suppression.value.object.get("id").?.string;
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_decide_curation_proposal_json(reopened_id, .fromSlice("default"), .fromSlice(suppression_id), .fromSlice("{\"accept\":false}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_propose_curation_json(reopened_id, .fromSlice("default"), .fromSlice("{\"action\":\"suppress\",\"key\":\"concept/noise\"}"), &out));
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"state\":\"rejected\"") != null);
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_list_curation_proposals_json(reopened_id, .fromSlice("default"), .fromSlice("{\"state\":\"all\",\"limit\":1}"), &out));
+    const page = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.value.object.get("proposals").?.array.items.len);
+    try std.testing.expect(page.value.object.get("next_cursor").? != .null);
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_propose_curation_json(reopened_id, .fromSlice("default"), .fromSlice("{\"action\":\"suppress\",\"key\":\"concept/later\"}"), &out));
+    const later = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
+    defer later.deinit();
+    const later_id = later.value.object.get("id").?.string;
+    api.antfly_buffer_free(&out);
+    const before_direct = try reopened.db.core.store.get(a, @import("antfly_resolver").curation.proposal_store_key);
+    defer a.free(before_direct);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_suppress_json(reopened_id, .fromSlice("default"), .fromSlice("concept/later"), .fromSlice("{\"actor\":\"user\"}"), &out));
+    api.antfly_buffer_free(&out);
+    // A crash before the root queue update leaves a dirty marker. Inspection
+    // recovers the supersession from the resolver's atomic receipt.
+    var interrupted = try std.json.parseFromSlice(std.json.Value, a, before_direct, .{});
+    defer interrupted.deinit();
+    try interrupted.value.object.put(interrupted.arena.allocator(), "refresh_required", .{ .bool = true });
+    const interrupted_bytes = try std.json.Stringify.valueAlloc(a, interrupted.value, .{});
+    defer a.free(interrupted_bytes);
+    try reopened.db.core.store.put(@import("antfly_resolver").curation.proposal_store_key, interrupted_bytes);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_get_curation_proposal_json(reopened_id, .fromSlice("default"), .fromSlice(later_id), &out));
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"state\":\"superseded\"") != null);
+}

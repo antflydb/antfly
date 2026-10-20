@@ -45,6 +45,12 @@ pub const Operation = enum {
     entity_unmerge,
     entity_suppress,
     entity_unsuppress,
+    entity_distinct,
+    proposals,
+    proposal,
+    proposal_create,
+    proposal_accept,
+    proposal_reject,
 };
 pub const Route = struct { table_name: []const u8 = "", resolver_name: []const u8 = "", key: []const u8 = "", op: Operation };
 
@@ -59,6 +65,15 @@ pub fn matchTablePath(path: []const u8) ?Route {
     return route;
 }
 pub fn matchSuffix(suffix: []const u8) ?Route {
+    if (std.mem.eql(u8, suffix, "curation/proposals")) return .{ .op = .proposals };
+    if (std.mem.startsWith(u8, suffix, "curation/proposals/")) {
+        const tail = suffix["curation/proposals/".len..];
+        if (std.mem.indexOfScalar(u8, tail, '/')) |_| return null;
+        if (std.mem.endsWith(u8, tail, ":accept")) return .{ .op = .proposal_accept, .key = tail[0 .. tail.len - 7] };
+        if (std.mem.endsWith(u8, tail, ":reject")) return .{ .op = .proposal_reject, .key = tail[0 .. tail.len - 7] };
+        if (tail.len == 0) return null;
+        return .{ .op = .proposal, .key = tail };
+    }
     if (std.mem.eql(u8, suffix, "resolvers")) return .{ .op = .list };
     if (std.mem.startsWith(u8, suffix, "resolvers/")) {
         const rest = suffix["resolvers/".len..];
@@ -97,12 +112,13 @@ pub fn matchSuffix(suffix: []const u8) ?Route {
         const colon = std.mem.lastIndexOfScalar(u8, rest, ':') orelse return null;
         if (colon == 0 or std.mem.indexOfScalar(u8, rest[0..colon], '/') != null) return null;
         const action = rest[colon + 1 ..];
-        const op: Operation = if (std.mem.eql(u8, action, "merge")) .entity_merge else if (std.mem.eql(u8, action, "unmerge")) .entity_unmerge else if (std.mem.eql(u8, action, "suppress")) .entity_suppress else if (std.mem.eql(u8, action, "unsuppress")) .entity_unsuppress else return null;
+        const op: Operation = if (std.mem.eql(u8, action, "merge")) .entity_merge else if (std.mem.eql(u8, action, "unmerge")) .entity_unmerge else if (std.mem.eql(u8, action, "suppress")) .entity_suppress else if (std.mem.eql(u8, action, "unsuppress")) .entity_unsuppress else if (std.mem.eql(u8, action, "distinct")) .entity_distinct else return null;
         return .{ .key = rest[0..colon], .op = op };
     }
     return null;
 }
 pub fn readOnly(op: Operation) bool {
+    if (op == .proposals or op == .proposal) return true;
     return op == .render or op == .resolve;
 }
 pub const GroupProgress = struct {
@@ -345,7 +361,7 @@ fn collectOwners(a: std.mem.Allocator, value: std.json.Value, parent: []const u8
             };
             var it = object.iterator();
             while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, curation.metadata_key) or std.mem.eql(u8, entry.key_ptr.*, "resolvers")) continue;
+                if (std.mem.eql(u8, entry.key_ptr.*, proposals_key) or std.mem.eql(u8, entry.key_ptr.*, curation.metadata_key) or std.mem.eql(u8, entry.key_ptr.*, "resolvers")) continue;
                 try collectOwners(a, entry.value_ptr.*, entry.key_ptr.*, name, out);
             }
         },
@@ -365,7 +381,7 @@ fn summary(a: std.mem.Allocator, table: anytype, cfg: Config, observation: Sampl
         .config = if (cfg.retired) std.json.Value.null else try publicConfig(a, cfg),
         .revision = cfg.curation_revision,
         .namespace_generation = cfg.namespace_generation,
-        .redirects = try cfg.effectiveAliasesAlloc(a),
+        .redirects = try resolver.curation.redirectsWithOrigins(a, try cfg.effectiveAliasesAlloc(a), state, cfg.merges),
         .curation = state,
         .progress = try observation.progress(a, ObservationTarget.fromConfig(cfg), cfg.curation_revision),
     });
@@ -383,7 +399,7 @@ pub fn handle(server: anytype, alloc: std.mem.Allocator, op: Operation, table_na
 }
 
 fn executeWithRetry(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name: []const u8, resolver_name: []const u8, key: []const u8, body: []const u8, query: []const u8, request: operation.RequestContext) !@import("public_table_http.zig").OwnedResponse {
-    const entity_request = op == .entity_redirects or op == .entity_merge or op == .entity_unmerge or op == .entity_suppress or op == .entity_unsuppress;
+    const entity_request = op == .proposal_create or op == .proposal_accept or op == .proposal_reject or op == .entity_redirects or op == .entity_merge or op == .entity_unmerge or op == .entity_suppress or op == .entity_unsuppress or op == .entity_distinct;
     var attempts: u8 = 0;
     while (true) {
         return execute(server, alloc, op, table_name, resolver_name, key, body, query, request) catch |err| {
@@ -427,7 +443,7 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
-    const entity_mutation = op == .entity_merge or op == .entity_unmerge or op == .entity_suppress or op == .entity_unsuppress;
+    const entity_mutation = op == .proposal_create or op == .proposal_accept or op == .proposal_reject or op == .entity_merge or op == .entity_unmerge or op == .entity_suppress or op == .entity_unsuppress or op == .entity_distinct;
     // All resolver resources use the same scoped source cut. Full snapshots
     // remain only for sources without the private catalog-read capability.
     const page: ?catalog_read.Page = if (server.source.vtable.supports_resolver_catalog_read)
@@ -442,8 +458,10 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
     var snapshot = if (page) |*value| value.snapshot() else (try server.source.linearizableSnapshot(request)) orelse return error.TableNotFound;
     defer if (page == null) server.source.freeAdminSnapshot(&snapshot);
     const table = try tableByName(&snapshot, table_name);
-    if (op == .entity_redirects or op == .entity_merge or op == .entity_unmerge or op == .entity_suppress or op == .entity_unsuppress)
-        return entityOperation(server, alloc, a, &snapshot, table, op, key, body, request, adoption_revision);
+    if (op == .proposals or op == .proposal or op == .proposal_create or op == .proposal_accept or op == .proposal_reject)
+        return proposalOperation(server, alloc, a, &snapshot, table, op, key, body, query, request, adoption_revision);
+    if (op == .entity_redirects or op == .entity_merge or op == .entity_unmerge or op == .entity_suppress or op == .entity_unsuppress or op == .entity_distinct)
+        return entityOperation(server, alloc, a, &snapshot, table, op, key, body, request, adoption_revision, null);
     const all = try configs(a, table.indexes_json);
     if (op == .list) {
         const observation = try sample(server, a, &snapshot, table, request, true);
@@ -466,7 +484,7 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
         .get => return response(alloc, 200, try summary(a, table, cfg, try sample(server, a, &snapshot, table, request, true))),
         .redirects => {
             const state = try resolver.curation.parseState(a, cfg.curation_json);
-            return response(alloc, 200, .{ .redirects = try cfg.effectiveAliasesAlloc(a), .distinct = state.distinct, .revision = cfg.curation_revision });
+            return response(alloc, 200, .{ .redirects = try resolver.curation.redirectsWithOrigins(a, try cfg.effectiveAliasesAlloc(a), state, cfg.merges), .distinct = state.distinct, .revision = cfg.curation_revision });
         },
         .suppressions => return response(alloc, 200, .{
             .configured = if (cfg.suppress_json.len > 0) try std.json.parseFromSliceLeaky(resolver.curation.Suppression, a, cfg.suppress_json, .{}) else resolver.curation.Suppression{},
@@ -697,13 +715,78 @@ fn scanEntityConsumers(server: anytype, owner: std.mem.Allocator, snapshot: anyt
     }
 }
 
+const proposals_key = "_curation_proposals";
+const ProposalEdit = struct { id: []const u8, decision: resolver.curation.ProposalDecision };
+fn proposalQueue(a: std.mem.Allocator, root: std.json.Value) !resolver.curation.State {
+    const value = root.object.get(proposals_key) orelse return .{};
+    return resolver.curation.parseState(a, try std.json.Stringify.valueAlloc(a, value, .{}));
+}
+fn findProposal(state: resolver.curation.State, id: []const u8) !resolver.curation.Proposal {
+    for (state.proposals) |proposal| if (std.mem.eql(u8, proposal.id, id)) return proposal;
+    return error.NotFound;
+}
+fn proposalOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator, snapshot: anytype, table: anytype, op: Operation, id: []const u8, body: []const u8, query: []const u8, request: operation.RequestContext, adoption_revision: ?u64) !@import("public_table_http.zig").OwnedResponse {
+    if (readOnly(op)) try server.authorizeTableReads(a, request, &.{table.name}) else try server.authorizeIntegrityMutations(request, &.{.{ .table_name = table.name, .deletes = &.{id} }});
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, a, if (table.indexes_json.len == 0) "{}" else table.indexes_json, .{});
+    var state = try proposalQueue(a, root);
+    if (op == .proposal) return response(alloc, 200, try findProposal(state, id));
+    if (op == .proposals) {
+        const page = try resolver.curation.proposalPage(a, state, query);
+        return response(alloc, 200, page);
+    }
+    if (op == .proposal_create) {
+        const input = try std.json.parseFromSliceLeaky(resolver.curation.ProposalRequest, a, body, .{});
+        // Creation must prove the same namespace and authorization as an entity
+        // action, without changing policy or scheduling model work.
+        const stored = try curation.namespacesFromValue(a, root);
+        var namespaces: std.StringArrayHashMapUnmanaged(curation.Namespace) = .empty;
+        var discovery: EntityDiscovery = .{ .a = a, .owner = alloc, .namespaces = &namespaces, .stored = stored, .adoption_revision = adoption_revision, .standalone = server.cfg.deployment_mode == .standalone, .key = input.key, .observations = false, .aliases = false };
+        defer discovery.deinit();
+        for (stored.namespaces) |namespace| if (curation.keyInNamespace(namespace.key_template, input.key)) try namespaces.put(a, namespace.key_template, namespace);
+        try scanEntityConsumers(server, alloc, snapshot, table, input.key, request, adoption_revision, stored, &discovery);
+        if (namespaces.count() == 0) return error.ResolverNotFound;
+        if (input.into) |into| for (namespaces.values()) |namespace| if (!curation.keyInNamespace(namespace.key_template, into)) return error.InvalidResolverCurationRequest;
+        const stamp = curation.manualOrigin(.{ .action = .suppress, .actor = input.actor, .reason = input.reason }, 0);
+        const plan = try resolver.curation.propose(a, state, &.{}, input, stamp);
+        if (!plan.changed) return response(alloc, 200, try findProposal(state, try resolver.curation.proposalId(a, input)));
+        state = plan.state;
+    } else {
+        const Input = struct { options: ?resolver.curation.Options = null, pin_distinct: bool = false, actor: []const u8 = "", reason: []const u8 = "", expected_revision: ?u64 = null, wait: ?resolver.curation.Wait = null };
+        const input = try std.json.parseFromSliceLeaky(Input, a, if (body.len == 0) "{}" else body, .{});
+        const decision: resolver.curation.ProposalDecision = .{ .accept = op == .proposal_accept, .options = input.options, .pin_distinct = input.pin_distinct, .actor = input.actor, .reason = input.reason, .expected_revision = input.expected_revision, .wait = input.wait };
+        const proposal = try findProposal(state, id);
+        const wanted: resolver.curation.ProposalState = if (decision.accept) .accepted else .rejected;
+        if (proposal.state == wanted) return response(alloc, 200, .{ .proposal = proposal, .changed = false, .complete = true, .atomicity = "namespace" });
+        if (proposal.state != .open) return error.ResolverCurationConflict;
+        if (decision.accept or decision.pin_distinct) {
+            const options = input.options orelse proposal.options;
+            const action: Operation = if (!decision.accept) .entity_distinct else switch (proposal.action) {
+                .merge => .entity_merge,
+                .unmerge => .entity_unmerge,
+                .suppress => .entity_suppress,
+                .unsuppress => .entity_unsuppress,
+                .distinct => .entity_distinct,
+            };
+            const bytes = try std.json.Stringify.valueAlloc(a, .{ .into = proposal.into, .replace = options.replace, .pin_distinct = options.pin_distinct, .absorbed = options.absorbed, .actor = input.actor, .reason = input.reason, .expected_revision = input.expected_revision, .wait = input.wait }, .{});
+            return entityOperation(server, alloc, a, snapshot, table, action, proposal.key, bytes, request, adoption_revision, .{ .id = id, .decision = decision });
+        }
+        state = (try resolver.curation.decide(a, state, &.{}, &.{}, id, decision, curation.manualOrigin(.{ .action = .suppress, .actor = input.actor, .reason = input.reason }, 0))).state;
+    }
+    try root.object.put(a, proposals_key, try json(a, state));
+    var replacement = table.*;
+    replacement.indexes_json = try std.json.Stringify.valueAlloc(a, root, .{});
+    try request.ensureActive();
+    _ = try server.source.replaceTableDefinitionStamped(table.*, replacement);
+    return response(alloc, 200, if (op == .proposal_create) try findProposal(state, try resolver.curation.proposalId(a, try std.json.parseFromSliceLeaky(resolver.curation.ProposalRequest, a, body, .{}))) else try findProposal(state, id));
+}
+
 /// One destination-table CAS owns every matching exact-template namespace.
 /// Sources are observations of asynchronous replay, never curation authorities.
-fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator, snapshot: anytype, entity_table: anytype, op: Operation, key: []const u8, body: []const u8, request: operation.RequestContext, adoption_revision: ?u64) !@import("public_table_http.zig").OwnedResponse {
+fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator, snapshot: anytype, entity_table: anytype, op: Operation, key: []const u8, body: []const u8, request: operation.RequestContext, adoption_revision: ?u64, proposal_edit: ?ProposalEdit) !@import("public_table_http.zig").OwnedResponse {
     if (op == .entity_redirects) {
         try server.authorizeTableReads(a, request, &.{entity_table.name});
     } else try server.authorizeIntegrityMutations(request, &.{.{ .table_name = entity_table.name, .deletes = &.{key} }});
-    const Input = struct { into: ?[]const u8 = null, replace: bool = false, pin_distinct: bool = false, expected_revision: ?u64 = null, wait: ?resolver.curation.Wait = null };
+    const Input = struct { into: ?[]const u8 = null, replace: bool = false, pin_distinct: bool = false, absorbed: resolver.curation.Absorbed = .reject, actor: []const u8 = "", reason: []const u8 = "", expected_revision: ?u64 = null, wait: ?resolver.curation.Wait = null };
     const input = try std.json.parseFromSliceLeaky(Input, a, if (body.len == 0) "{}" else body, .{});
     if (key.len == 0 or (op == .entity_merge and input.into == null)) return error.InvalidResolverCurationRequest;
     if (input.wait) |wait| if (wait.timeout_ms == 0 or wait.timeout_ms > 300000) return error.InvalidResolverCurationRequest;
@@ -719,7 +802,7 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
         var states = std.json.Array.init(a);
         for (namespaces.values()) |namespace| {
             const state = try resolver.curation.entityState(a, namespace.state, namespace.merges, key);
-            try states.append(try json(a, .{ .source_table = entity_table.name, .resolver = "", .key_template = namespace.key_template, .revision = namespace.revision, .redirects = state.redirects, .canonical_key = state.canonical_key, .curation = state.curation }));
+            try states.append(try json(a, .{ .source_table = entity_table.name, .resolver = "", .key_template = namespace.key_template, .revision = namespace.revision, .redirects = try resolver.curation.redirectsWithOrigins(a, state.redirects, state.curation, namespace.merges), .canonical_key = state.canonical_key, .curation = state.curation }));
         }
         return response(alloc, 200, .{ .entity_table = entity_table.name, .key = key, .complete = true, .atomicity = "namespace", .results = std.json.Value{ .array = states } });
     }
@@ -728,10 +811,14 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
         .entity_unmerge => .unmerge,
         .entity_suppress => .suppress,
         .entity_unsuppress => .unsuppress,
+        .entity_distinct => .distinct,
         else => unreachable,
     };
-    const intent: resolver.curation.Request = .{ .action = action, .key = key, .to = input.into, .replace = input.replace, .pin_distinct = input.pin_distinct, .expected_revision = input.expected_revision, .wait = input.wait };
+    const intent: resolver.curation.Request = .{ .action = action, .key = key, .to = input.into, .absorbed = input.absorbed, .actor = input.actor, .reason = input.reason, .replace = input.replace, .pin_distinct = input.pin_distinct, .expected_revision = input.expected_revision, .wait = input.wait };
     var changed = false;
+    var proposal_state = try proposalQueue(a, root);
+    const original_proposals = proposal_state.proposals;
+    var absorbed_results: std.StringHashMapUnmanaged([]const resolver.curation.AbsorbedResult) = .empty;
     for (namespaces.values()) |*namespace| {
         if (input.into) |target| if (!curation.keyInNamespace(namespace.key_template, target)) return error.InvalidResolverCurationRequest;
         if (input.expected_revision) |expected| if (expected != namespace.revision) return error.ResolverCurationConflict;
@@ -755,10 +842,40 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
                 }
             }
         }
-        const plan = try resolver.curation.plan(a, try std.json.Stringify.valueAlloc(a, namespace.state, .{}), policy_merges, effective.items, intent);
+        var planning_state = namespace.state;
+        const stamp = curation.manualOrigin(intent, try std.math.add(u64, namespace.revision, 1));
+        if (proposal_edit) |edit| {
+            var proposal = try findProposal(.{ .proposals = original_proposals }, edit.id);
+            proposal.evidence = null;
+            planning_state.proposals = try a.dupe(resolver.curation.Proposal, &.{proposal});
+        }
+        var plan = if (proposal_edit) |edit|
+            try resolver.curation.decide(a, planning_state, policy_merges, effective.items, edit.id, edit.decision, stamp)
+        else
+            try resolver.curation.planWithOrigin(a, try std.json.Stringify.valueAlloc(a, planning_state, .{}), policy_merges, effective.items, intent, stamp);
+        const local_decision = if (proposal_edit != null) plan.state.proposals[0] else @as(?resolver.curation.Proposal, null);
+        plan.state.proposals = namespace.state.proposals;
+        const policy_changed = !Config.aliasesEqual(namespace.merges, plan.merges) or !std.mem.eql(u8, try std.json.Stringify.valueAlloc(a, namespace.state, .{}), try std.json.Stringify.valueAlloc(a, plan.state, .{}));
+        if (policy_changed or proposal_edit != null) {
+            const record_origin = if (local_decision) |proposal| proposal.decided.? else stamp;
+            const actual_intent = if (proposal_edit) |edit| resolver.curation.decisionRequest(try findProposal(.{ .proposals = original_proposals }, edit.id), edit.decision) else intent;
+            proposal_state.proposals = try resolver.curation.supersede(a, proposal_state.proposals, actual_intent, plan.absorbed, record_origin);
+            if (local_decision) |proposal| {
+                const records = try a.dupe(resolver.curation.Proposal, proposal_state.proposals);
+                for (records) |*record| if (std.mem.eql(u8, record.id, proposal.id)) {
+                    record.state = proposal.state;
+                    record.decided = proposal.decided;
+                    if (!policy_changed) record.decided.?.revision = namespace.revision;
+                };
+                proposal_state.proposals = records;
+                changed = true;
+            }
+        }
+        for (plan.absorbed) |absorbed| try server.authorizeIntegrityMutations(request, &.{.{ .table_name = entity_table.name, .deletes = &.{absorbed.key} }});
+        try absorbed_results.put(a, namespace.key_template, plan.absorbed);
         const check: Config = .{ .name = "namespace", .table = entity_table.name, .source_artifact = "metadata", .resolution_artifact = "resolved", .key_template = namespace.key_template, .merges = plan.merges, .curation_json = try std.json.Stringify.valueAlloc(a, plan.state, .{}) };
         try check.validate();
-        if (plan.changed or materialized_alias or !namespaceAdopted(stored, namespace.key_template)) {
+        if (policy_changed or materialized_alias or !namespaceAdopted(stored, namespace.key_template)) {
             namespace.adoption_revision = adoption_revision;
             namespace.adoption_standalone = server.cfg.deployment_mode == .standalone;
             namespace.state = plan.state;
@@ -770,6 +887,10 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
     }
     var validation: EntityValidation = .{ .namespaces = &namespaces };
     try scanEntityConsumers(server, alloc, snapshot, entity_table, key, request, adoption_revision, stored, &validation);
+    if (changed) {
+        _ = try resolver.curation.parseState(a, try std.json.Stringify.valueAlloc(a, proposal_state, .{}));
+        try root.object.put(a, proposals_key, try json(a, proposal_state));
+    }
     var replacement = entity_table.*;
     replacement.indexes_json = try std.json.Stringify.valueAlloc(a, root, .{});
     try request.ensureActive();
@@ -782,9 +903,9 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
         const remaining = (deadline -| @import("antfly_platform").time.monotonicNs()) / std.time.ns_per_ms;
         const progress = try observeAccepted(server, a, consumer.table_name, consumer.target, namespace.revision, if (remaining > 0) .{ .timeout_ms = @intCast(remaining) } else null, request);
         applied = applied and progress.applied;
-        try results.append(try json(a, .{ .source_table = consumer.table_name, .resolver = consumer.target.name, .changed = changed, .revision = namespace.revision, .replay_sequence = namespace.revision, .replay_sequence_kind = "resolver_revision", .accepted = true, .@"error" = progress.observation_error, .applied = progress.applied, .progress = progress }));
+        try results.append(try json(a, .{ .source_table = consumer.table_name, .resolver = consumer.target.name, .absorbed = absorbed_results.get(consumer.key_template) orelse &.{}, .changed = changed, .revision = namespace.revision, .replay_sequence = namespace.revision, .replay_sequence_kind = "resolver_revision", .accepted = true, .@"error" = progress.observation_error, .applied = progress.applied, .progress = progress }));
     }
-    return response(alloc, if (applied) 200 else 202, .{ .entity_table = entity_table.name, .key = key, .atomicity = "namespace", .complete = true, .changed = changed, .metadata_commit = stamp, .applied = applied, .results = std.json.Value{ .array = results } });
+    return response(alloc, if (applied) 200 else 202, .{ .entity_table = entity_table.name, .key = key, .atomicity = "namespace", .complete = true, .changed = changed, .proposal = if (proposal_edit) |edit| try findProposal(proposal_state, edit.id) else @as(?resolver.curation.Proposal, null), .metadata_commit = stamp, .applied = applied, .results = std.json.Value{ .array = results } });
 }
 
 /// Waiting observes detached workers and yields between samples; it never
@@ -859,9 +980,9 @@ fn reviewsOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Alloca
         if (query.len > 0) return error.InvalidResolverCurationRequest;
         const token = try curation.decodeToken(GroupReviewToken, a, id);
         if (!groups.contains(token.group)) return error.ResolverCurationConflict;
-        const Input = struct { decision: resolver.Decision, key: ?[]const u8 = null, table: ?[]const u8 = null, wait: ?resolver.curation.Wait = null };
+        const Input = struct { actor: []const u8 = "", reason: []const u8 = "", decision: resolver.Decision, key: ?[]const u8 = null, table: ?[]const u8 = null, wait: ?resolver.curation.Wait = null };
         const input = try std.json.parseFromSliceLeaky(Input, a, body, .{});
-        const bytes = try std.json.Stringify.valueAlloc(a, curation.ReviewRequest{ .operation = .review, .resolver = cfg.name, .expected_revision = cfg.curation_revision, .id = token.value, .decision = input.decision, .key = input.key, .table = input.table }, .{});
+        const bytes = try std.json.Stringify.valueAlloc(a, curation.ReviewRequest{ .actor = input.actor, .reason = input.reason, .operation = .review, .resolver = cfg.name, .expected_revision = cfg.curation_revision, .id = token.value, .decision = input.decision, .key = input.key, .table = input.table }, .{});
         if (input.wait) |wait| if (wait.timeout_ms == 0 or wait.timeout_ms > 300000) return error.InvalidResolverCurationRequest;
         const reply = try server.executeResolverOperation(a, table.name, token.group, bytes, request);
         var value = try std.json.parseFromSliceLeaky(std.json.Value, a, reply, .{});

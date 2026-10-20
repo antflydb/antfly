@@ -729,7 +729,7 @@ pub fn collectDesiredResolvers(
             }
             var it = object.iterator();
             while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, "resolvers")) continue;
+                if (std.mem.eql(u8, entry.key_ptr.*, "resolvers") or std.mem.eql(u8, entry.key_ptr.*, "_curation_proposals")) continue;
                 try collectDesiredResolvers(alloc, entry.value_ptr.*, out);
             }
         },
