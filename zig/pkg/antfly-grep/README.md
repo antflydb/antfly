@@ -3954,3 +3954,9 @@ zig/e2e/antfly/.venv/bin/python zig/pkg/antfly-grep/bench/logical_sources.py \
   --grep /path/to/antfly-grep --output output/logical-source-comparison \
   --rounds 2 --clients 1,4 --controls
 ```
+
+On Linux, `--advise-file-cache` optionally advises eviction of the fixture's own
+files before restart. The report records advised files and startup/query process
+I/O. It leaves global caches alone; advice and restart do not guarantee cold
+storage, and startup can warm data again. Use this with the concurrent or both
+suites, including inside CPU/memory constrained Linux containers.

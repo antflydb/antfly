@@ -54,7 +54,16 @@ def main():
         action="store_true",
         help="also measure candidate full reads, scalar and fixed batch sizes",
     )
+    parser.add_argument(
+        "--advise-file-cache",
+        action="store_true",
+        help="Linux only: advise eviction of fixture files before process restarts",
+    )
     args = parser.parse_args()
+    if args.advise_file_cache and platform.system() != "Linux":
+        parser.error("--advise-file-cache requires Linux")
+    if args.advise_file_cache and args.suite == "scalable":
+        parser.error("--advise-file-cache requires the concurrency or both suites")
     assert args.rounds >= 1
     root = Path(__file__).resolve().parents[4]
     args.output = args.output.resolve()
@@ -67,12 +76,13 @@ def main():
         "protocol": 1,
         "host": platform.platform(),
         "logical_cpus": os.cpu_count(),
+        "file_cache_advice_requested": args.advise_file_cache,
         "driver_sha256": digest(__file__),
         "fixture_sha256": digest(root / "zig/e2e/antfly/test_grep_indexed.py"),
         "artifacts": {
             k: {"path": str(v), "sha256": digest(v)} for k, v in binaries.items()
         },
-        "scope": "Native ISA as executed; uncontrolled filesystem caches. CPU/RSS includes background work. Process restart is not cold storage.",
+        "scope": "Native ISA as executed; optional fixture-file cache advice is recorded per restart and cannot guarantee cold storage. CPU/RSS includes background work.",
         "experiments": [],
     }
     # Clear inherited controls, so one experiment cannot contaminate the next.
@@ -118,6 +128,9 @@ def main():
                     "ANTFLY_GREP_BIN": str(args.grep.resolve()),
                     control_key: str(destination),
                     "ANTFLY_LOGICAL_CLIENTS": args.clients,
+                    "ANTFLY_LOGICAL_EVICT_FILE_CACHE": "1"
+                    if args.advise_file_cache
+                    else "0",
                 }
                 command = [
                     args.python,
@@ -142,13 +155,16 @@ def main():
                 }
                 if destination.exists():
                     entry["raw"] = json.loads(destination.read_text())
+                elif result.returncode == 0:
+                    entry["exit_code"] = 3
+                    entry["error"] = "fixture produced no benchmark report"
                 report["experiments"].append(entry)
                 (args.output / "report.json").write_text(
                     json.dumps(report, separators=(",", ":")) + "\n"
                 )
                 print(name, "exit", result.returncode, flush=True)
-                if result.returncode:
-                    raise SystemExit(result.returncode)
+                if entry["exit_code"]:
+                    raise SystemExit(entry["exit_code"])
 
 
 if __name__ == "__main__":

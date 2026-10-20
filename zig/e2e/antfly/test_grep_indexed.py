@@ -1606,11 +1606,67 @@ def test_logical_source_concurrency_profile(stateful_api):
             "max_bytes": 64 * 1024 * 1024,
         },
     }
+
+    def io_stats(pid):
+        path = Path(f"/proc/{pid}/io")
+        if not path.is_file():
+            return None
+        counters = dict(line.split(":", 1) for line in path.read_text().splitlines())
+        return {
+            name: int(counters[name])
+            for name in ("rchar", "syscr", "read_bytes", "write_bytes")
+        }
+
+    def restart_for_measurement():
+        if os.environ.get("ANTFLY_LOGICAL_EVICT_FILE_CACHE") != "1":
+            api.restart_server()
+            return {"mode": "process_restart"}
+        assert platform.system() == "Linux" and hasattr(os, "posix_fadvise"), (
+            "file-cache advice requires Linux"
+        )
+        server = api._server
+        # Only the freshly allocated fixture root is eligible. Never advise a
+        # caller-supplied data directory or follow links outside that root.
+        root = Path(server.root).resolve()
+        assert root == Path(server.tempdir.name).resolve()
+        assert root.name.startswith("antfly-zig-")
+        advice = {
+            "mode": "process_restart_with_file_cache_advice",
+            "advised_files": 0,
+            "advised_file_bytes": 0,
+            "errors": [],
+        }
+        api.pause_server()
+        try:
+            for path in root.rglob("*"):
+                if path.is_symlink() or not path.is_file():
+                    continue
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                    advice["advised_files"] += 1
+                    advice["advised_file_bytes"] += os.fstat(fd).st_size
+                except OSError as error:
+                    advice["errors"].append(
+                        {"file": str(path.relative_to(root)), "errno": error.errno}
+                    )
+                finally:
+                    os.close(fd)
+        finally:
+            api.resume_server()
+        assert not advice["errors"], advice
+        assert advice["advised_files"] > 0, advice
+        # This is an advisory OS request. It cannot evict device caches and
+        # startup may reload pages; actual process I/O is recorded below.
+        return advice
+
     records = []
     for concurrency in clients:
-        api.restart_server()
+        cache_advice = restart_for_measurement()
         pid = api._server.proc.pid
         read_process = logical_process_reader(pid)
+        restart_io = io_stats(pid)
 
         def request(barrier=None):
             if barrier is not None:
@@ -1635,7 +1691,19 @@ def test_logical_source_concurrency_profile(stateful_api):
                 "profile": profile,
             }
 
+        cold_before = read_process()
+        cold_io_before = io_stats(pid)
         cold_process = request()
+        cold_after = read_process()
+        cold_process.update(
+            {
+                "cpu_ms": (cold_after["cpu_ns"] - cold_before["cpu_ns"]) / 1e6,
+                "process_before": cold_before,
+                "process_after": cold_after,
+                "io_before": cold_io_before,
+                "io_after": io_stats(pid),
+            }
+        )
         runs = []
         # Create client workers before timing; synchronize each request group.
         with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
@@ -1644,6 +1712,7 @@ def test_logical_source_concurrency_profile(stateful_api):
                 futures = [pool.submit(request, barrier) for _ in range(concurrency)]
                 host_load = os.getloadavg() if hasattr(os, "getloadavg") else None
                 before = read_process()
+                io_before = io_stats(pid)
                 started = time.perf_counter_ns()
                 barrier.wait(timeout=30)
                 responses = [future.result(timeout=100) for future in futures]
@@ -1657,6 +1726,8 @@ def test_logical_source_concurrency_profile(stateful_api):
                         "cpu_ms": (after["cpu_ns"] - before["cpu_ns"]) / 1e6,
                         "process_before": before,
                         "process_after": after,
+                        "io_before": io_before,
+                        "io_after": io_stats(pid),
                         "responses": responses,
                     }
                 )
@@ -1664,6 +1735,8 @@ def test_logical_source_concurrency_profile(stateful_api):
         records.append(
             {
                 "clients": concurrency,
+                "cache_advice": cache_advice,
+                "restart_io": restart_io,
                 "cold_process": cold_process,
                 "runs": runs,
                 "median_request_ms": statistics.median(latencies),
@@ -1702,7 +1775,7 @@ def test_logical_source_concurrency_profile(stateful_api):
                         "ANTFLY_BENCH_VALUE_SOURCE_ROWS",
                     )
                 },
-                "scope": "Same-host native ISA; cold process after restart, uncontrolled filesystem caches; process CPU includes background work; endpoint RSS samples are not a peak bound.",
+                "scope": "Same-host native ISA; cold process after restart. Optional file-cache advice is limited to fixture files and is not a guarantee of cold storage; startup may reload pages. Process I/O counters accompany trials. Process CPU includes background work; endpoint RSS samples are not a peak bound.",
                 "records": records,
             },
             indent=2,
