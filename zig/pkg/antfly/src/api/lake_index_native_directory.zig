@@ -47,7 +47,7 @@ pub const Access = struct {
         return artifacts.readArtifact(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, self.cached);
     }
 };
-fn key(ordinal: usize) [8]u8 {
+pub fn key(ordinal: usize) [8]u8 {
     var result: [8]u8 = undefined;
     std.mem.writeInt(u64, &result, ordinal, .big);
     return result;

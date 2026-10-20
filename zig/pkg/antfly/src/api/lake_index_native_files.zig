@@ -221,6 +221,94 @@ pub fn publishPrefix(a: A, out: A, source: Storage, physical: []const u8, relati
     }
     return .{ .path = try out.dupe(u8, relative), .bytes = size, .chunks = chunks };
 }
+/// Exact membership from a pinned native cut. Paths and sizes are local native
+/// metadata; retained objects need no remote descriptor census. Controls carry
+/// their pinned bytes, while immutable runs carry their exact storage paths.
+pub const Extent = struct {
+    path: []const u8,
+    bytes: u64,
+    physical: ?[]const u8 = null,
+    data: ?[]const u8 = null,
+    append_only: bool = false,
+};
+pub fn checkpointExtents(out: A, checkpoint: *const local.storage_lsm_backend.Backend.NativeCheckpoint, prefix: []const u8) ![]Extent {
+    if (checkpoint.run_paths.len != checkpoint.run_ids.len or checkpoint.run_sizes.len != checkpoint.run_ids.len) return error.InvalidNativeLakeFiles;
+    const result = try out.alloc(Extent, checkpoint.run_ids.len + 1);
+    result[0] = .{ .path = try std.fmt.allocPrint(out, "{s}manifest.bin", .{prefix}), .bytes = checkpoint.manifest_bytes.len, .data = checkpoint.manifest_bytes };
+    for (checkpoint.run_paths, checkpoint.run_ids, checkpoint.run_sizes, result[1..]) |physical, id, size, *extent| {
+        extent.* = .{ .path = try std.fmt.allocPrint(out, "{s}runs/{d}.tbl", .{ prefix, id }), .physical = physical, .bytes = size };
+    }
+    sortExtents(result);
+    return result;
+}
+pub fn sortExtents(extents: []Extent) void {
+    std.mem.sort(Extent, extents, {}, struct {
+        fn less(_: void, l: Extent, r: Extent) bool {
+            return std.mem.lessThan(u8, l.path, r.path);
+        }
+    }.less);
+}
+fn validateExtents(extents: []const Extent) !void {
+    if (extents.len > 8192) return error.InvalidNativeLakeFiles;
+    for (extents, 0..) |extent, i| {
+        if (!validPath(extent.path) or (i != 0 and !std.mem.lessThan(u8, extents[i - 1].path, extent.path))) return error.InvalidNativeLakeFiles;
+        if (extent.data) |data| if (data.len != extent.bytes) return error.InvalidNativeLakeFiles;
+    }
+}
+/// Callers capture both cuts from the same authenticated private candidate.
+/// Obsolete physical files are deliberately absent: retention and publication
+/// membership are independent. Deletions are explicit, including compaction.
+pub fn publishExtentDelta(a: A, out: A, source: Storage, before: []const Extent, after: []const Extent, prior: Root, store: *stores.ArtifactStore, token: Cancellation, output_budget: anytype) !Root {
+    try prior.validate();
+    try validateExtents(before);
+    try validateExtents(after);
+    if (prior.version != 2 or prior.file_count != before.len) return error.InvalidNativeLakeFiles;
+    const budget = OutputBudget.from(output_budget);
+    var navigation: native_directory.Navigation = .{ .allocator = a };
+    defer navigation.deinit();
+    const reuse: Reuse = .{ .root = prior, .navigation = &navigation };
+    var changes: std.ArrayList(native_directory.FileChange) = .empty;
+    defer changes.deinit(a);
+    var old: usize = 0;
+    for (after) |extent| {
+        try token.check();
+        while (old < before.len and std.mem.lessThan(u8, before[old].path, extent.path)) : (old += 1) try changes.append(a, .{ .path = before[old].path, .file = null });
+        const previous: ?Extent = if (old < before.len and std.mem.eql(u8, before[old].path, extent.path)) blk: {
+            const value = before[old];
+            old += 1;
+            break :blk value;
+        } else null;
+        if (previous) |value| {
+            if (value.append_only != extent.append_only or ((value.data == null) != (extent.data == null))) return error.InvalidNativeLakeFiles;
+            if (extent.data == null and (if (extent.append_only) extent.bytes < value.bytes else extent.bytes != value.bytes)) return error.InvalidNativeLakeFiles;
+        }
+        if (previous) |value| if (value.bytes == extent.bytes and ((extent.data == null and value.data == null) or (extent.data != null and value.data != null and std.mem.eql(u8, extent.data.?, value.data.?)))) {
+            try stores.chargeReadBudget(budget.generation, extent.bytes);
+            continue;
+        };
+        var file = if (extent.data) |data|
+            try publishBytes(out, extent.path, data, store, token, budget, reuse)
+        else
+            try publishPrefix(a, out, source, extent.physical orelse return error.InvalidNativeLakeFiles, extent.path, extent.bytes, store, token, budget, reuse);
+        // Only changed chunk maps are constructed. Their old descriptor is
+        // authenticated once and retained in the navigation cache.
+        if (file.chunks.len != 0) {
+            const edits = try out.alloc(native_directory.tree.Mutation, file.chunks.len);
+            for (file.chunks, edits, 0..) |chunk_ref, *edit, ordinal| edit.* = .{ .key = try out.dupe(u8, &native_directory.key(ordinal)), .value = try std.json.Stringify.valueAlloc(out, chunk_ref, .{}) };
+            var access: native_directory.Access = undefined;
+            access.init(store.*, prior.domain, token, null);
+            access.work = budget.work;
+            file.chunk_root = try native_directory.tree.apply(a, access.backing(), null, edits);
+            file.chunks = &.{};
+        }
+        try changes.append(a, .{ .path = extent.path, .file = file });
+    }
+    for (before[old..]) |extent| try changes.append(a, .{ .path = extent.path, .file = null });
+    const result = try native_directory.applyChanges(a, store, prior, changes.items, token, budget.work);
+    if (result.file_count != after.len) return error.InvalidNativeLakeFiles;
+    return result;
+}
+
 /// Capture the retained manifest bytes and only its pinned immutable runs.
 /// A live manifest pathname may already describe a different generation.
 pub fn publishCheckpoint(a: A, out: A, checkpoint: *const local.storage_lsm_backend.Backend.NativeCheckpoint, store: *stores.ArtifactStore, cancellation: Cancellation, output_budget: anytype, reuse: ?Reuse) !Root {
@@ -668,6 +756,67 @@ test "external lake immutable native files reopen sparse checkpoints through aut
     var foreign = range_root;
     foreign.domain = @splat(9);
     try std.testing.expectError(error.InvalidNativeLakeFiles, foreign.validate());
+    const paged = try native_directory.persist(a, ca, &store, root, null, .none, null);
+    try index.batchWithOptions(&.{.{ .doc_id = "physical-c", .vec = .{ .indices = &.{1}, .values = &.{10} } }}, &.{"physical-a"}, .{});
+    var current = try index.pinNativeCheckpoint();
+    defer current.deinit();
+    const delta = try publishExtentDelta(a, ca, current.storage, try checkpointExtents(ca, &checkpoint, ""), try checkpointExtents(ca, &current, ""), paged, &store, .none, &budget);
+    var delta_reader: Reader = .{ .root = delta, .prefix = "/delta-publication", .store = store, .context = .{}, .scratch = a };
+    defer delta_reader.deinit();
+    var delta_index = try sparse.SparseIndex.open(a, "/delta-publication", .{ .lsm_storage = delta_reader.storage(), .lsm_options = .{ .backend = .{ .read_only = true, .create_if_missing = false } } });
+    defer delta_index.close();
+    const delta_hits = try delta_index.search(a, &query, 10);
+    defer {
+        for (delta_hits) |hit| a.free(hit.doc_id);
+        a.free(delta_hits);
+    }
+    try std.testing.expectEqual(@as(usize, 2), delta_hits.len);
+    try std.testing.expectEqualStrings("physical-c", delta_hits[0].doc_id);
+    try std.testing.expectEqualStrings("physical-b", delta_hits[1].doc_id);
+    try std.testing.expectApproxEqAbs(@as(f32, 20), delta_hits[0].score, 0.001);
+
+    // A tiny delta over a wide native cut must not point-look up every
+    // retained descriptor. None of these retained physical files exist.
+    const sample = try publishBytes(ca, "runs/000000.tbl", "retained", &store, .none, &budget, null);
+    const wide = try ca.alloc(File, 1024);
+    const before = try ca.alloc(Extent, wide.len);
+    for (wide, before, 0..) |*file, *extent, i| {
+        file.* = sample;
+        file.path = try std.fmt.allocPrint(ca, "runs/{d:0>6}.tbl", .{i});
+        extent.* = .{ .path = file.path, .bytes = sample.bytes };
+    }
+    const wide_root = try native_directory.persist(a, ca, &store, .{ .domain = root.domain, .files = wide }, null, .none, null);
+    before[1].data = "retained";
+    const after = try ca.dupe(Extent, before[1..]);
+    after[0] = .{ .path = before[1].path, .bytes = 7, .data = "changed" };
+    const Counter = struct {
+        var underlying: stores.ArtifactStore = undefined;
+        var gets: usize = 0;
+        fn read(_: *anyopaque, alloc: A, id: []const u8, offset: u64, length: usize, token: Cancellation) ![]u8 {
+            gets += 1;
+            return underlying.getRangeAllocWithCancellationUsingAllocator(alloc, id, offset, length, token);
+        }
+    };
+    Counter.underlying = store;
+    var counted = store;
+    var counted_vtable = store.vtable.*;
+    counted_vtable.get_range_alloc_with_cancellation = Counter.read;
+    counted.vtable = &counted_vtable;
+    var retained_budget: u64 = 1024 * 1024;
+    var no_work: u64 = 0;
+    const unchanged = try publishExtentDelta(a, ca, checkpoint.storage, before, before, wide_root, &counted, .none, OutputBudget{ .generation = &retained_budget, .work = &no_work });
+    try std.testing.expectEqual(@as(usize, 0), Counter.gets);
+    try std.testing.expect(unchanged.directory.?.eql(wide_root.directory.?));
+    var delta_budget: u64 = 1024 * 1024;
+    const changed_root = try publishExtentDelta(a, ca, checkpoint.storage, before, after, wide_root, &counted, .none, &delta_budget);
+    try std.testing.expect(Counter.gets < 64);
+    try std.testing.expectEqual(@as(u32, 1023), changed_root.file_count);
+    try std.testing.expect((try native_directory.lookup(changed_root, store, before[0].path, .none, null)) == null);
+    try std.testing.expectEqual(@as(u64, 7), (try native_directory.lookup(changed_root, store, before[1].path, .none, null)).?.bytes);
+    try std.testing.expect((try native_directory.lookup(wide_root, store, before[0].path, .none, null)) != null);
+    const resized = try ca.dupe(Extent, before);
+    resized[2].bytes -= 1;
+    try std.testing.expectError(error.InvalidNativeLakeFiles, publishExtentDelta(a, ca, checkpoint.storage, before, resized, wide_root, &store, .none, &delta_budget));
     reader.context.deadline_ns = 1;
     try std.testing.expectError(error.DeadlineExceeded, reader.storage().fileSize("/immutable-publication/manifest.bin"));
 }

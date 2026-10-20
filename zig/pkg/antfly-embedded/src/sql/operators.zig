@@ -775,6 +775,7 @@ pub const GroupResult = struct {
         ptr: *const anyopaque,
         count: usize,
         read: *const fn (*const anyopaque, Allocator, usize) anyerror!Aggregate,
+        finish: ?*const fn (*const anyopaque, Allocator, usize, AggregateSpec) anyerror!Datum = null,
     };
     /// In-process partials borrow typed reducers from the page arena. Durable
     /// and backend interchange continues to use versioned aggregate cells.
@@ -1490,6 +1491,7 @@ pub const Grouped = struct {
         count: usize,
         exact_count: bool = true,
         ordered: bool = false,
+        batch_rows: usize = 4096,
         next: *const fn (*anyopaque, Allocator, usize, bool) anyerror!?GroupBatch,
         close: *const fn (*anyopaque) void,
     };
@@ -1512,8 +1514,7 @@ pub const Grouped = struct {
     key_count: ?usize = null,
 
     finalized: ?Finalized = null,
-    finalized_pages: usize = 0,
-    finalized_page_limit: usize = 0,
+    finalized_quota: @import("native_scan_quota.zig").Quota = .{ .capacity = 1, .row_limit = 0, .page_limit = 0 },
     external: ?*@import("spill_grouped.zig").Grouped = null,
     result_cursor: usize = 0,
     reducers: ?Reducers = null,
@@ -1527,9 +1528,10 @@ pub const Grouped = struct {
     }
     pub fn adoptFinalized(self: *Grouped, source: Finalized, page_limit: usize) !void {
         if (self.failed or self.finished or self.finalized != null or self.external != null or self.reducers != null or self.rows_seen != 0 or self.groups.items.len > 1 or (self.groups.items.len == 1 and self.key_count != 0)) return error.InvalidSqlBackendResponse;
+        if (source.batch_rows == 0) return error.InvalidSqlBackendResponse;
         self.clearGroups(); // Retire the initial empty global group, if present.
         self.finalized = source;
-        self.finalized_page_limit = page_limit;
+        self.finalized_quota = .{ .capacity = source.batch_rows, .row_limit = self.limits.groups, .page_limit = page_limit };
         self.finished = true;
     }
     fn nextFinalized(self: *Grouped, a: Allocator, maximum: usize, exact: bool) !?GroupBatch {
@@ -1537,8 +1539,8 @@ pub const Grouped = struct {
         const result = try source.next(source.ptr, a, maximum, exact);
         if (result) |batch| {
             if (batch.ordinals.len == 0 or batch.ordinals.len > maximum or batch.keys.len() != batch.ordinals.len or batch.aggregates.len() != batch.ordinals.len or batch.aggregates.width() != self.specs.len) return error.InvalidSqlBackendResponse;
-            self.finalized_pages += 1;
-            if (self.finalized_pages > self.finalized_page_limit or batch.ordinals.len > source.count -| self.output_count or batch.ordinals.len > self.limits.groups -| self.output_count) return error.SqlProgramLimitExceeded;
+            try self.finalized_quota.admit(batch.ordinals.len, false);
+            if (batch.ordinals.len > source.count -| self.output_count) return error.SqlProgramLimitExceeded;
             self.output_count += batch.ordinals.len;
         } else if (source.exact_count and self.output_count != source.count) return error.InvalidSqlBackendResponse;
         return result;
@@ -5381,7 +5383,7 @@ test "SQL finalized aggregate streams bypass hash retention and fence ownership 
         defer group.deinit();
         try group.ensureGlobalGroup();
         try std.testing.expectEqual(@as(usize, 0), source.closes);
-        try group.adoptFinalized(.{ .ptr = &source, .count = 50_000_000, .exact_count = false, .next = Source.next, .close = Source.close }, 1);
+        try group.adoptFinalized(.{ .ptr = &source, .count = 50_000_000, .exact_count = false, .batch_rows = 2, .next = Source.next, .close = Source.close }, 1);
         var page = std.heap.ArenaAllocator.init(a);
         defer page.deinit();
         _ = try group.nextResultBatch(page.allocator(), 2, false);

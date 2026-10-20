@@ -959,8 +959,7 @@ pub const Adapter = struct {
         final_rows: []const @import("antfly_local_sources").sql_operators.GroupResult = &.{},
         final_positions: []const usize = &.{},
         final_position: usize = 0,
-        visited_pages: usize = 0,
-        visited_groups: usize = 0,
+        scan_quota: catalog.ScanQuota = .{ .capacity = 4096, .row_limit = std.math.maxInt(usize), .page_limit = std.math.maxInt(usize) },
         final_ordered: bool = false,
         fn canceled(raw: *const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(raw));
@@ -1000,10 +999,12 @@ pub const Adapter = struct {
             var selection = request.selection;
             selection.row_limit = request.row_limit;
             selection.page_limit = request.page_limit;
+            selection.batch_rows = request.batch_rows;
             const ordered = if (first.select_keys) |select| try select(first.ptr, selection) else false;
             self.final_ordered = ordered;
             self.final_request = request;
-            try grouped.adoptFinalized(.{ .ptr = self, .count = std.math.cast(usize, proof.count) orelse return error.SqlProgramLimitExceeded, .exact_count = request.predicate == null and request.point == null and !ordered, .ordered = ordered, .next = nextFinal, .close = close }, request.page_limit);
+            self.scan_quota = .{ .capacity = request.batch_rows, .row_limit = request.row_limit, .page_limit = request.page_limit };
+            try grouped.adoptFinalized(.{ .ptr = self, .count = std.math.cast(usize, proof.count) orelse return error.SqlProgramLimitExceeded, .exact_count = request.predicate == null and request.point == null and !ordered, .ordered = ordered, .batch_rows = request.batch_rows, .next = nextFinal, .close = close }, request.page_limit);
             self.transferred = true;
             return true;
         }
@@ -1012,16 +1013,14 @@ pub const Adapter = struct {
             const local = @import("antfly_local_sources");
             const request = self.final_request.?;
             // Retain one bounded provider page while small result pulls consume it.
-            // Quotas count provider pages, independent of LIMIT and result framing.
+            // Scan credit counts logical batches, independent of result framing.
             var scratch = std.heap.ArenaAllocator.init(self.a);
             defer scratch.deinit();
             while (self.final_position == self.final_positions.len) {
                 _ = self.final_page.reset(.free_all);
                 const pa = self.final_page.allocator();
                 const rows = (try next(raw, pa, if (self.final_ordered) @intCast(@min(maximum, request.batch_rows)) else request.batch_rows)) orelse return null;
-                self.visited_pages += 1;
-                if (self.visited_pages > request.page_limit or rows.len > request.row_limit -| self.visited_groups) return error.SqlProgramLimitExceeded;
-                self.visited_groups += rows.len;
+                try self.scan_quota.admit(rows.len, false);
                 const positions = try pa.alloc(usize, rows.len);
                 var accepted: usize = 0;
                 for (rows, 0..) |row, index| {
@@ -1037,28 +1036,26 @@ pub const Adapter = struct {
             }
             const count = @min(maximum, self.final_positions.len - self.final_position);
             const keys = try a.alloc([]const local.sql_scalar.Datum, count);
-            const values = try a.alloc([]const local.sql_scalar.Datum, count);
+            const values = try a.alloc([]const local.sql_scalar.Datum, self.recipe.inputs.len);
+            for (values) |*column| column.* = try a.alloc(local.sql_scalar.Datum, count);
             const ordinals = try a.alloc(u64, count);
             for (self.final_positions[self.final_position..][0..count], 0..) |index, output| {
                 const row = self.final_rows[index];
-                const cells = try a.alloc(local.sql_scalar.Datum, self.recipe.inputs.len);
                 var populated: [256]bool = @splat(false);
                 _ = scratch.reset(.free_all);
-                for (0..cells.len) |logical| {
+                for (0..values.len) |logical| {
                     const slot = if (row.aggregate_slots) |map| map[logical] else logical;
-                    if (slot >= cells.len or populated[slot]) return error.InvalidSqlBackendResponse;
+                    if (slot >= values.len or populated[slot]) return error.InvalidSqlBackendResponse;
                     populated[slot] = true;
-                    const state = try local.sql_aggregate_partial.read(scratch.allocator(), row, logical, self.recipe.inputs[slot].spec);
-                    cells[slot] = if (exact) try local.sql_aggregate_partial.cell(a, state) else try local.sql_aggregate_partial.finishBorrowed(a, state);
+                    @constCast(values[slot])[output] = if (exact) try local.sql_aggregate_partial.cell(a, try local.sql_aggregate_partial.read(scratch.allocator(), row, logical, self.recipe.inputs[slot].spec)) else try local.sql_aggregate_partial.finish(a, scratch.allocator(), row, logical, self.recipe.inputs[slot].spec);
                 }
                 const key_cells = try a.alloc(local.sql_scalar.Datum, row.keys.len);
                 for (key_cells, row.keys) |*cell, input| cell.* = try local.sql_operators.cloneDatum(a, input);
                 keys[output] = key_cells;
-                values[output] = cells;
                 ordinals[output] = row.ordinal;
             }
             self.final_position += count;
-            return .{ .keys = .{ .rows = keys }, .aggregates = .{ .rows = values }, .ordinals = ordinals };
+            return .{ .keys = .{ .rows = keys }, .aggregates = .{ .vectors = .{ .values = values, .count = count } }, .ordinals = ordinals };
         }
 
         fn close(raw: *anyopaque) void {
@@ -1172,8 +1169,7 @@ pub const Adapter = struct {
         owner.final_rows = &.{};
         owner.final_positions = &.{};
         owner.final_position = 0;
-        owner.visited_pages = 0;
-        owner.visited_groups = 0;
+        owner.scan_quota = .{ .capacity = 4096, .row_limit = std.math.maxInt(usize), .page_limit = std.math.maxInt(usize) };
         owner.final_ordered = false;
         owner.a = a;
         owner.adapter = self;

@@ -5241,6 +5241,39 @@ test "SQL finalized aggregate runtime stops unordered limits after filtering and
         try std.testing.expectEqual(case.emitted, driver.emitted);
         try std.testing.expectEqual(@as(usize, 1), driver.closes);
     }
+
+    const Sink = struct {
+        rows: usize = 0,
+        batches: usize = 0,
+        fn row(_: *anyopaque, _: []const Datum) !void {
+            return error.TestUnexpectedResult;
+        }
+        fn batch(raw: *anyopaque, cells: @import("execution_batch.zig").Batch) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (cells != .vectors) return error.TestUnexpectedResult;
+            for (0..cells.len()) |i| {
+                try std.testing.expectEqual(@as(i64, @intCast(51 + self.rows)), (try cells.cell(std.testing.allocator, i, 0)).value.integer);
+                self.rows += 1;
+            }
+            self.batches += 1;
+        }
+    };
+    var driver: Driver = .{};
+    var sink: Sink = .{};
+    var compiled = try compiler.compile(a, "SELECT id, COUNT(*) FROM docs GROUP BY id HAVING id >= 50 LIMIT 9 OFFSET 1", .{});
+    defer compiled.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    _ = try runBound(a, arena.allocator(), driver.backend(), &compiled, &.{}, .{ .execution_batch_rows = 7 }, .{ .ptr = &sink, .append = Sink.row, .append_batch = Sink.batch });
+    try std.testing.expectEqual(@as(usize, 9), sink.rows);
+    try std.testing.expectEqual(@as(usize, 2), sink.batches);
+    try std.testing.expectEqual(@as(usize, 1), driver.closes);
+    var overflow: Driver = .{};
+    var unbounded = try compiler.compile(a, "SELECT id, COUNT(*) FROM docs GROUP BY id", .{});
+    defer unbounded.deinit();
+    try std.testing.expectError(error.SqlResultTooLarge, execute(a, overflow.backend(), &unbounded, &.{}, .{ .result_rows = 3 }));
+    try std.testing.expectEqual(@as(usize, 4), overflow.emitted);
+    try std.testing.expectEqual(@as(usize, 1), overflow.closes);
 }
 
 test "SQL filtered LIMIT hints require a complete bound predicate and remain advisory" {
@@ -6069,4 +6102,94 @@ test "SQL REAL pushed comparisons preserve declared float8 parameter operands" {
     var real = try execute(a, real_backend, &equality, &.{.{ .float = 0.1 }}, .{});
     defer real.deinit();
     try std.testing.expectEqual(@as(usize, 1), real.output.rows.len);
+}
+
+test "SQL finalized materialization page quota stays independent of decision output fragmentation" {
+    const a = std.testing.allocator;
+    const Driver = struct {
+        base: TestBackend = .{},
+        position: usize = 0,
+        emitted: usize = 0,
+        closes: usize = 0,
+        transferred: bool = false,
+        request: catalog.FinalGroupRequest = undefined,
+        fn from(raw: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn resolve(raw: *anyopaque, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
+            return TestBackend.resolve(&from(raw).base, alloc, name, action);
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+            return error.TestUnexpectedResult;
+        }
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+            return error.TestUnexpectedResult;
+        }
+        fn load(raw: *anyopaque, _: std.mem.Allocator, _: catalog.Table, recipe: @import("aggregate_materialization.zig").Recipe) !?catalog.AggregatePartialCursor {
+            if (recipe.keys.len != 1 or recipe.inputs.len != 1 or recipe.inputs[0].spec.kind != .count) return error.TestUnexpectedResult;
+            return .{ .ptr = raw, .next = nextPartial, .close = closeCursor, .adopt_final_groups = adopt };
+        }
+        fn nextPartial(_: *anyopaque, _: std.mem.Allocator, _: u32) !?[]const operators.GroupResult {
+            return error.TestUnexpectedResult;
+        }
+        fn checkpoint(raw: *anyopaque) !void {
+            try TestBackend.checkpoint(&from(raw).base);
+        }
+        fn closeCursor(raw: *anyopaque) void {
+            if (!from(raw).transferred) close(raw);
+        }
+        fn close(raw: *anyopaque) void {
+            from(raw).closes += 1;
+        }
+        fn adopt(raw: *anyopaque, grouped: *operators.Grouped, request: catalog.FinalGroupRequest) !bool {
+            const self = from(raw);
+            self.request = request;
+            try grouped.adoptFinalized(.{ .ptr = raw, .count = 10, .exact_count = request.predicate == null, .ordered = request.selection.order.len != 0, .batch_rows = request.batch_rows, .next = next, .close = close }, request.page_limit);
+            self.transferred = true;
+            return true;
+        }
+        fn next(raw: *anyopaque, out: std.mem.Allocator, maximum: usize, _: bool) !?operators.GroupBatch {
+            const self = from(raw);
+            var scratch = std.heap.ArenaAllocator.init(out);
+            defer scratch.deinit();
+            const keys = try out.alloc([]const Datum, maximum);
+            const values = try out.alloc([]const Datum, maximum);
+            const ordinals = try out.alloc(u64, maximum);
+            var count: usize = 0;
+            while (count < maximum and self.position < 10) {
+                const row = self.position;
+                self.position += 1;
+                const key = [_]Datum{Datum.json(.{ .integer = @intCast(row) })};
+                _ = scratch.reset(.free_all);
+                if (self.request.predicate) |predicate| if (!try predicate.matches(predicate.ptr, scratch.allocator(), &key)) continue;
+                keys[count] = try out.dupe(Datum, &key);
+                values[count] = try out.dupe(Datum, &.{Datum.json(.{ .integer = 1 })});
+                ordinals[count] = row;
+                count += 1;
+            }
+            if (count == 0) return null;
+            self.emitted += count;
+            return .{ .keys = .{ .rows = keys[0..count] }, .aggregates = .{ .rows = values[0..count] }, .ordinals = ordinals[0..count] };
+        }
+        fn backend(self: *@This()) catalog.Backend {
+            return .{ .ptr = self, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint, .aggregate_partials = load } };
+        }
+    };
+    for ([_][]const u8{
+        "SELECT id, COUNT(*) FROM docs GROUP BY id LIMIT 3",
+        "SELECT id, COUNT(*), ai_probability(CAST(id AS TEXT),'Refund?','local') FROM docs GROUP BY id LIMIT 3",
+        "SELECT id, COUNT(*), ai_probability(CAST(id AS TEXT),'Refund?','local') FROM docs GROUP BY id",
+        "SELECT id, COUNT(*), ai_probability(CAST(id AS TEXT),'Refund?','local') FROM docs GROUP BY id ORDER BY id LIMIT 9",
+    }) |query| {
+        var driver: Driver = .{};
+        var provider: @import("decision_eval.zig").testing.Provider = .{};
+        var backend = driver.backend();
+        backend.decision_provider = provider.provider();
+        var compiled = try compiler.compile(a, query, .{});
+        defer compiled.deinit();
+        var result = try execute(a, backend, &compiled, &.{}, .{ .execution_batch_rows = 8, .scan_pages = 2 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, if (std.mem.indexOf(u8, query, "LIMIT") == null) 10 else if (std.mem.indexOf(u8, query, "LIMIT 9") != null) 9 else 3), result.output.rows.len);
+        try std.testing.expectEqual(@as(usize, 1), driver.closes);
+    }
 }

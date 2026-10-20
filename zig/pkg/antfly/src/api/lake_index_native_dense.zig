@@ -146,6 +146,10 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             try index.activateExperimentalPostingReads(0);
             try index.enableNativePostingMutationStore();
         }
+        var baseline_vectors = if (seed != null) try vectors.pinNativeCheckpoint() else null;
+        defer if (baseline_vectors) |*cut| cut.deinit();
+        var baseline_postings = if (seed != null) (try index.nativeBackupGeneration(a, 0)) orelse return error.InvalidNativeLakeDenseRoot else null;
+        defer if (baseline_postings) |*cut| cut.deinit();
         if (seed == null) try index.beginBulkIngestSession();
         var finished = false;
         defer if (!finished and seed == null) index.abortBulkIngestSession();
@@ -259,12 +263,18 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         const output_bytes: files.OutputBudget = .{ .generation = &output_remaining, .work = if (provider.resume_work) |work| &work.native_output_left else null };
         var navigation: @import("lake_index_native_directory.zig").Navigation = .{ .allocator = a };
         defer navigation.deinit();
-        const posting_generation = try publishGeneration(a, ca, &checkpoint, store, cancellation, output_bytes, if (seed) |root| .{ .root = root.generation, .navigation = &navigation } else null);
         var vector_checkpoint = try vectors.pinNativeCheckpoint();
         defer vector_checkpoint.deinit();
-        const vector_generation = try files.publishCheckpoint(a, ca, &vector_checkpoint, store, cancellation, output_bytes, if (seed) |root| .{ .root = root.generation, .prefix = "vectors/", .navigation = &navigation } else null);
-        const staging_generation = try combineVectors(ca, posting_generation, vector_generation);
-        const generation = try @import("lake_index_native_directory.zig").persist(a, ca, store, staging_generation, if (seed) |root| root.generation else null, cancellation, if (provider.resume_work) |work| &work.native_output_left else null);
+        const generation = if (seed != null and seed.?.generation.version == 2) delta: {
+            const before = try combineExtents(ca, try generationExtents(ca, &baseline_postings.?), try files.checkpointExtents(ca, &baseline_vectors.?, "vectors/"));
+            const after = try combineExtents(ca, try generationExtents(ca, &checkpoint), try files.checkpointExtents(ca, &vector_checkpoint, "vectors/"));
+            break :delta try files.publishExtentDelta(a, ca, checkpoint.storage, before, after, seed.?.generation, store, cancellation, output_bytes);
+        } else full: {
+            const posting_generation = try publishGeneration(a, ca, &checkpoint, store, cancellation, output_bytes, if (seed) |root| .{ .root = root.generation, .navigation = &navigation } else null);
+            const vector_generation = try files.publishCheckpoint(a, ca, &vector_checkpoint, store, cancellation, output_bytes, if (seed) |root| .{ .root = root.generation, .prefix = "vectors/", .navigation = &navigation } else null);
+            const staging_generation = try combineVectors(ca, posting_generation, vector_generation);
+            break :full try @import("lake_index_native_directory.zig").persist(a, ca, store, staging_generation, if (seed) |root| root.generation else null, cancellation, if (provider.resume_work) |work| &work.native_output_left else null);
+        };
         const root: Root = .{ .binding = binding, .config_json = config.config_json, .dims = dims, .metric = metric, .generation = generation, .recipe = recipe, .file_states = if (!plan.isPaged()) plan.files else &.{}, .file_directory = if (plan.isPaged()) try plan.publishDirectory(a, store, generation.domain, cancellation) else null };
         const bytes = try std.json.Stringify.valueAlloc(ca, root, .{});
         if (bytes.len > files.max_root_bytes) return error.NativeLakeFilesTooLarge;
@@ -288,6 +298,33 @@ pub fn vectorId(key: []const u8) u64 {
     hash.final(&digest);
     return std.mem.readInt(u64, digest[0..8], .little);
 }
+fn combineExtents(out: A, postings: []const files.Extent, vectors: []const files.Extent) ![]files.Extent {
+    const result = try out.alloc(files.Extent, postings.len + vectors.len);
+    @memcpy(result[0..postings.len], postings);
+    @memcpy(result[postings.len..], vectors);
+    files.sortExtents(result);
+    return result;
+}
+fn generationExtents(out: A, checkpoint: *const local.storage_hbc_adapter.HBCIndex.NativeBackupGeneration) ![]files.Extent {
+    const posting = local.storage_posting_segment_store;
+    const result = try out.alloc(files.Extent, 3 + checkpoint.segment_generations.len + checkpoint.sealed_wal_count);
+    result[0] = .{ .path = "posting-segments/CURRENT", .bytes = checkpoint.current_bytes.len, .data = checkpoint.current_bytes };
+    result[1] = .{ .path = "posting-segments/" ++ posting.authority_name, .bytes = posting.authority_value.len, .data = posting.authority_value };
+    var n: usize = 2;
+    for (checkpoint.segment_generations) |generation| {
+        const physical = try posting.checkpointSegmentPathAlloc(out, checkpoint.root_dir, generation);
+        result[n] = .{ .path = try std.fmt.allocPrint(out, "posting-segments/segment-{d}.afps", .{generation}), .physical = physical, .bytes = try checkpoint.storage.fileSize(physical) };
+        n += 1;
+    }
+    for (checkpoint.sealed_wals[0..checkpoint.sealed_wal_count]) |extent| {
+        result[n] = .{ .path = try std.fmt.allocPrint(out, "posting-segments/wal-{d}.afpw", .{extent.generation}), .physical = try posting.checkpointWalPathAlloc(out, checkpoint.root_dir, extent.generation), .bytes = extent.committed_bytes, .append_only = true };
+        n += 1;
+    }
+    result[n] = .{ .path = try std.fmt.allocPrint(out, "posting-segments/wal-{d}.afpw", .{checkpoint.wal_generation}), .physical = try posting.checkpointWalPathAlloc(out, checkpoint.root_dir, checkpoint.wal_generation), .bytes = checkpoint.wal_committed_bytes, .append_only = true };
+    files.sortExtents(result);
+    return result;
+}
+
 pub fn publishGeneration(a: A, out: A, checkpoint: *const local.storage_hbc_adapter.HBCIndex.NativeBackupGeneration, store: *stores.ArtifactStore, cancellation: Cancellation, budget: anytype, reuse: ?files.Reuse) !files.Root {
     var result: std.ArrayList(files.File) = .empty;
     const posting = local.storage_posting_segment_store;

@@ -720,7 +720,7 @@ pub const Reader = struct {
     selection_memory: usize = 8 * 1024 * 1024,
     selection_started: bool = false,
     selection_rows_left: usize = std.math.maxInt(usize),
-    selection_pages_left: usize = std.math.maxInt(usize),
+    selection_quota: local.sql_catalog.ScanQuota = .{ .capacity = 4096, .row_limit = std.math.maxInt(usize), .page_limit = std.math.maxInt(usize) },
 
     /// The caller selects an authorized publication first. Errors after that
     /// selection abort the query, never combine partials with a fresh scan.
@@ -886,7 +886,8 @@ pub const Reader = struct {
         self.selection_spill = request.spill;
         self.selection_memory = request.memory_bytes;
         self.selection_rows_left = request.row_limit;
-        self.selection_pages_left = request.page_limit;
+        if (request.batch_rows == 0) return error.InvalidSqlLimit;
+        self.selection_quota = .{ .capacity = request.batch_rows, .row_limit = request.row_limit, .page_limit = request.page_limit };
         self.key_range = try group_keys.range(self.control.allocator(), self.root.recipe, request.conditions);
         if (request.memory_bytes < 64 * 1024 or request.order.len == 0 or request.order.len > self.root.recipe.keys.len or self.root.bounds == null) return false;
         const reverse = request.order[0].descending;
@@ -895,7 +896,7 @@ pub const Reader = struct {
         }
         for (self.root.recipe.inputs) |input| if (input.spec.distinct or input.spec.kind == .pattern_set) return false;
         self.reverse = reverse;
-        self.ordered_plan = (try ordered_keys.Plan(Reader).prepare(self, request.memory_bytes)) orelse return false;
+        self.ordered_plan = (try ordered_keys.Plan(Reader).prepare(self, request.memory_bytes, request.maximum_groups)) orelse return false;
         self.ordered_scan = true;
         return true;
     }
@@ -1027,7 +1028,7 @@ pub const Reader = struct {
             if (native_layout and states == null) {
                 const view = try a.create(PhysicalRow);
                 view.* = .{ .reader = self, .block = block, .row = self.position, .width = width };
-                state_reader = .{ .ptr = view, .count = width, .read = PhysicalRow.read };
+                state_reader = .{ .ptr = view, .count = width, .read = PhysicalRow.read, .finish = PhysicalRow.finish };
             }
             row.* = .{ .keys = keys, .aggregates = cells, .typed_states = states, .state_reader = state_reader, .ordinal = block.ordinals[self.position], .aggregate_slots = self.output_slots };
             self.position += 1;
@@ -1040,6 +1041,14 @@ pub const Reader = struct {
         block: spill.ColumnarBlock,
         row: usize,
         width: usize,
+        fn finish(raw: *const anyopaque, a: A, logical: usize, spec: operators.AggregateSpec) anyerror!local.sql_scalar.Datum {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (logical >= self.width) return error.InvalidSqlBackendResponse;
+            const inputs = (self.reader.root.state_recipe orelse self.reader.root.recipe).inputs;
+            const physical = self.reader.physicalSlot(logical);
+            if (!std.meta.eql(spec, inputs[physical].spec)) return error.InvalidSqlBackendResponse;
+            return native_partial.finishPhysical(a, self.block, self.row, native_partial.physicalOffset(inputs, physical), spec);
+        }
         fn read(raw: *const anyopaque, a: A, logical: usize) anyerror!operators.Aggregate {
             const self: *const @This() = @ptrCast(@alignCast(raw));
             if (logical >= self.width) return error.InvalidSqlBackendResponse;
@@ -2248,7 +2257,7 @@ test "external lake aggregate ordered frontiers prune payloads and page both dir
     for ([_]bool{ false, true }) |reverse| {
         const reader = try Reader.open(a, store, refs[0], recipe, .none);
         defer reader.cursor().close(reader);
-        try std.testing.expect(try reader.cursor().select_keys.?(reader, .{ .order = &.{.{ .column = "k", .descending = reverse, .nulls_first = reverse }} }));
+        try std.testing.expect(try reader.cursor().select_keys.?(reader, .{ .maximum_groups = 9, .order = &.{.{ .column = "k", .descending = reverse, .nulls_first = reverse }} }));
         for (0..3) |page_index| {
             var page = std.heap.ArenaAllocator.init(a);
             defer page.deinit();
@@ -2261,6 +2270,19 @@ test "external lake aggregate ordered frontiers prune payloads and page both dir
             }
         }
         try std.testing.expect(reader.blocks_decoded < 24);
+        try std.testing.expect(reader.ordered_plan.?.bounded);
+        try std.testing.expect(reader.ordered_plan.?.leaves.items.len < reader.root.partitions.len / 2);
+        try std.testing.expect((try reader.cursor().next(reader, out, 3)) == null);
+    }
+    for ([_]bool{ false, true }) |reverse| {
+        const fragmented = try Reader.open(a, store, refs[0], recipe, .none);
+        defer fragmented.cursor().close(fragmented);
+        try std.testing.expect(try fragmented.cursor().select_keys.?(fragmented, .{ .maximum_groups = 10, .batch_rows = 8, .page_limit = 2, .order = &.{.{ .column = "k", .descending = reverse, .nulls_first = reverse }} }));
+        for (0..10) |i| {
+            const row = (try fragmented.cursor().next(fragmented, out, 1)).?[0];
+            if (reverse and i == 0) try std.testing.expect(row.keys[0].sql_null) else try std.testing.expectEqual(@as(i64, @intCast(if (reverse) 1024 - i else i)), row.keys[0].value.integer);
+        }
+        try std.testing.expect((try fragmented.cursor().next(fragmented, out, 1)) == null);
     }
     const reader = try Reader.open(a, store, refs[0], recipe, .none);
     defer reader.cursor().close(reader);
@@ -2347,7 +2369,7 @@ test "external lake aggregate ordered frontiers prune payloads and page both dir
     }
     const declined = try Reader.open(a, store, wide_refs[0], wide_recipe, .none);
     defer declined.cursor().close(declined);
-    const denied = try ordered_keys.Plan(Reader).prepare(declined, 1);
+    const denied = try ordered_keys.Plan(Reader).prepare(declined, 1, null);
     defer if (denied) |plan| plan.deinit();
     try std.testing.expect(denied == null);
     try std.testing.expect(!try declined.cursor().select_keys.?(declined, .{ .memory_bytes = 32 * 1024, .order = &.{.{ .column = "text" }} }));
@@ -2356,11 +2378,13 @@ test "external lake aggregate ordered frontiers prune payloads and page both dir
     try std.testing.expectEqual(@as(usize, 256), (try declined.cursor().next(declined, out, 256)).?.len);
 }
 fn orderedFaultScenario(a: A, store: stores.ArtifactStore, ref: Ref, recipe: recipes.Recipe) !void {
-    const reader = try Reader.open(a, store, ref, recipe, .none);
-    defer reader.cursor().close(reader);
-    _ = try reader.cursor().select_keys.?(reader, .{ .order = &.{.{ .column = "category" }} });
-    var page = std.heap.ArenaAllocator.init(a);
-    defer page.deinit();
-    const rows = (try reader.cursor().next(reader, page.allocator(), 3)).?;
-    try std.testing.expectEqual(@as(usize, 3), rows.len);
+    for ([_]?usize{ null, 3 }) |maximum| {
+        const reader = try Reader.open(a, store, ref, recipe, .none);
+        defer reader.cursor().close(reader);
+        _ = try reader.cursor().select_keys.?(reader, .{ .maximum_groups = maximum, .order = &.{.{ .column = "category" }} });
+        var page = std.heap.ArenaAllocator.init(a);
+        defer page.deinit();
+        const rows = (try reader.cursor().next(reader, page.allocator(), 3)).?;
+        try std.testing.expectEqual(@as(usize, 3), rows.len);
+    }
 }

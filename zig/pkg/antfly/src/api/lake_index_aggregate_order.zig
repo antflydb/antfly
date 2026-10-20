@@ -180,23 +180,123 @@ pub fn Plan(comptime Reader: type) type {
             const order = std.mem.order(u8, l.record.?.key, r.record.?.key);
             return if (reverse) order.invert() else order;
         }
+        const Coordinate = struct { leaf: *Leaf, key: []const u8, value: [6]u8 };
         a: A,
         root: *Reader,
         budget: local.sql_memory_budget,
         leaves: std.ArrayList(*Leaf) = .empty,
         queue: std.PriorityQueue(*Leaf, bool, compare),
+        coordinates: std.ArrayList(Coordinate) = .empty,
+        coordinate_index: usize = 0,
+        bounded: bool = false,
         current: ?*Leaf = null,
         emitted: u64 = 0,
-        pub fn prepare(root: *Reader, bytes: usize) !?*Self {
+        pub fn prepare(root: *Reader, bytes: usize, maximum: ?usize) !?*Self {
             const self = try root.a.create(Self);
             self.* = .{ .a = root.a, .root = root, .budget = .{ .backing = local.sql_memory_budget.reclaimingAllocator(root.a), .limit = bytes }, .queue = .initContext(root.reverse) };
-            self.collect(root, true) catch |err| {
+            self.admit(maximum) catch |err| {
                 const decline = err == error.AggregateOrderedIndexUnavailable or (err == error.OutOfMemory and self.budget.isLocallyExhausted());
                 self.deinit();
                 if (decline) return null;
                 return err;
             };
             return self;
+        }
+        fn admit(self: *Self, maximum: ?usize) !void {
+            if (maximum) |count| {
+                self.bounded = true;
+                try self.collectPrefix(count);
+            } else try self.collect(self.root, true);
+        }
+        // Fixed fences are conservative navigation hints. Truncation can make
+        // preflight open more leaves, but never licenses skipping a better key.
+        // All navigation and prefix coordinates are admitted before SQL trusts
+        // this ordering; a budget denial can still select the external sort.
+        const Pending = struct {
+            parent: *Reader,
+            index: usize,
+            fn fence(self: @This(), reverse: bool) ?[]const u8 {
+                if (self.parent.root.partitions[self.index].bounds) |*bounds| {
+                    return if (reverse) if (bounds.upper) |*upper| upper.slice() else null else bounds.lower.slice();
+                }
+                return null;
+            }
+        };
+        fn pendingLess(reverse: bool, l: Pending, r: Pending) std.math.Order {
+            const left = l.fence(reverse);
+            const right = r.fence(reverse);
+            if (left == null) return if (right == null) .eq else .lt;
+            if (right == null) return .gt;
+            const order = std.mem.order(u8, left.?, right.?);
+            return if (reverse) order.invert() else order;
+        }
+        fn enqueue(self: *Self, pending: *std.PriorityQueue(Pending, bool, pendingLess), reader: *Reader) !void {
+            for (reader.root.partitions, 0..) |part, index| {
+                if (self.root.key_range) |range| if (!range.overlaps(part.bounds)) continue;
+                if (reader.point_hash) |hash| {
+                    const depth = reader.root.radix_depth;
+                    const shift: u6 = if (depth == 0) 0 else @intCast(6 + (depth - 1) * 2);
+                    if (part.bucket != (hash >> shift) % (if (depth == 0) @as(u64, 64) else 4)) continue;
+                }
+                try pending.push(self.budget.allocator(), .{ .parent = reader, .index = index });
+            }
+        }
+        fn collectPrefix(self: *Self, maximum: usize) !void {
+            const a = self.budget.allocator();
+            var pending: std.PriorityQueue(Pending, bool, pendingLess) = .initContext(self.root.reverse);
+            defer pending.deinit(a);
+            var directories: std.ArrayList(struct { reader: *Reader, leased: usize }) = .empty;
+            defer {
+                for (directories.items) |entry| {
+                    entry.reader.cursor().close(entry.reader);
+                    self.budget.limit += entry.leased;
+                }
+                directories.deinit(a);
+            }
+            if (self.root.root.partitions.len == 0) try self.collect(self.root, true) else try self.enqueue(&pending, self.root);
+            while (self.coordinates.items.len < maximum) {
+                const open = if (pending.peek()) |candidate| blk: {
+                    const head = self.queue.peek() orelse break :blk true;
+                    const fence = candidate.fence(self.root.reverse) orelse break :blk true;
+                    const order = std.mem.order(u8, fence, head.record.?.key);
+                    break :blk if (self.root.reverse) order != .lt else order != .gt;
+                } else false;
+                if (open) {
+                    const candidate = pending.pop().?;
+                    const reader = try candidate.parent.partitionReaderAllocated(candidate.index, a);
+                    if (reader.root.partitions.len == 0) {
+                        try self.collect(reader, false);
+                    } else {
+                        var retained = false;
+                        defer if (!retained) reader.cursor().close(reader);
+                        const leased = if (reader.pack_metadata) |owner| owner.lease.item.budget.live else if (reader.metadata) |owner| owner.lease.item.budget.live else 0;
+                        if (leased > self.budget.limit -| self.budget.live) return error.AggregateOrderedIndexUnavailable;
+                        try directories.append(a, .{ .reader = reader, .leased = leased });
+                        self.budget.limit -= leased;
+                        retained = true;
+                        try self.enqueue(&pending, reader);
+                    }
+                    continue;
+                }
+                const leaf = self.queue.pop() orelse break;
+                const record = leaf.record.?;
+                if (record.value.len != 6) return error.InvalidNativeAggregateArtifact;
+                const key = try a.dupe(u8, record.key);
+                self.coordinates.append(a, .{ .leaf = leaf, .key = key, .value = record.value[0..6].* }) catch |err| {
+                    a.free(key);
+                    return err;
+                };
+                leaf.record = try leaf.cursor.?.next();
+                if (leaf.record != null) try self.queue.push(a, leaf);
+            }
+            // The selected prefix is now complete and immutable. Delivery
+            // needs only admitted coordinates and lazily decoded payloads.
+            self.queue.items.len = 0;
+            for (self.leaves.items) |leaf| {
+                leaf.cursor.?.deinit();
+                leaf.cursor = null;
+                leaf.record = null;
+            }
         }
         fn collect(self: *Self, reader: *Reader, borrowed: bool) anyerror!void {
             var retained = borrowed;
@@ -256,21 +356,25 @@ pub fn Plan(comptime Reader: type) type {
             try self.root.cancellation.check();
             if (self.root.cached) |cached| try cached.context.ensureActive();
             if (maximum == 0) return error.InvalidSqlLimit;
-            if (self.queue.items.len == 0) return null;
-            if (self.root.selection_pages_left == 0) return error.SqlProgramLimitExceeded;
-            self.root.selection_pages_left -= 1;
+            if (if (self.bounded) self.coordinate_index == self.coordinates.items.len else self.queue.items.len == 0) return null;
             const count = @min(maximum, 256);
             const result = try a.alloc(local.sql_operators.GroupResult, count);
             var n: usize = 0;
             while (n < count) {
-                const leaf = self.queue.pop() orelse break;
+                const coordinate = if (self.bounded) blk: {
+                    if (self.coordinate_index == self.coordinates.items.len) break;
+                    const position = self.coordinate_index;
+                    self.coordinate_index += 1;
+                    break :blk &self.coordinates.items[position];
+                } else null;
+                const leaf = if (coordinate) |value| value.leaf else self.queue.pop() orelse break;
                 if (self.root.selection_rows_left == 0) return error.SqlProgramLimitExceeded;
                 self.root.selection_rows_left -= 1;
                 if (self.current != leaf) {
                     if (self.current) |old| old.reader.discardBlock();
                     self.current = leaf;
                 }
-                const record = leaf.record.?;
+                const record: tree.Cursor.Record = if (coordinate) |value| .{ .key = value.key, .value = &value.value } else leaf.record.?;
                 if (record.value.len != 6) return error.InvalidNativeAggregateArtifact;
                 const block = std.mem.readInt(u32, record.value[0..4], .big);
                 const row = std.mem.readInt(u16, record.value[4..6], .big);
@@ -293,14 +397,19 @@ pub fn Plan(comptime Reader: type) type {
                 result[n] = .{ .keys = key_cells, .aggregates = &.{}, .typed_states = states, .aggregate_slots = self.root.output_slots, .ordinal = self.emitted };
                 n += 1;
                 self.emitted += 1;
-                leaf.record = try leaf.cursor.?.next();
-                if (leaf.record != null) try self.queue.push(self.budget.allocator(), leaf);
+                if (!self.bounded) {
+                    leaf.record = try leaf.cursor.?.next();
+                    if (leaf.record != null) try self.queue.push(self.budget.allocator(), leaf);
+                }
             }
+            try self.root.selection_quota.admit(n, false);
             return result[0..n];
         }
         pub fn deinit(self: *Self) void {
             const a = self.budget.allocator();
             self.queue.deinit(a);
+            for (self.coordinates.items) |coordinate| a.free(coordinate.key);
+            self.coordinates.deinit(a);
             for (self.leaves.items) |leaf| {
                 if (leaf.cursor) |*cursor| cursor.deinit();
                 leaf.reader.raw_states = leaf.previous_raw;

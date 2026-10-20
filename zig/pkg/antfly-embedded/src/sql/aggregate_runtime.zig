@@ -186,9 +186,10 @@ fn scalarBatch(context: anytype, bound: *const binding.Bound, a: std.mem.Allocat
     return .{ .vectors = .{ .values = try a.dupe([]const Datum, &.{try columnValues(context, bound, a, page, program)}), .count = page.selection.len } };
 }
 
-fn addGroupedDecisionPages(context: anytype, bound: *const binding.Bound, grouped: *@import("ordered_grouped.zig").Collector, top: *operators.TopK, projection: @import("decision_eval.zig").SortedProjection) !void {
+fn addGroupedDecisionPages(context: anytype, bound: *const binding.Bound, grouped: *@import("ordered_grouped.zig").Collector, top: *operators.TopK, projection: @import("decision_eval.zig").SortedProjection, goal: ?usize) !void {
     const decision = @import("decision_eval.zig");
     var exhausted = false;
+    var delivered: usize = 0;
     while (!exhausted) {
         try context.checkpoint();
         var arena = std.heap.ArenaAllocator.init(context.alloc);
@@ -197,7 +198,8 @@ fn addGroupedDecisionPages(context: anytype, bound: *const binding.Bound, groupe
         var cells: std.ArrayList([]const Datum) = .empty;
         var ordinals: std.ArrayList(u64) = .empty;
         var bytes: usize = 0;
-        while (cells.items.len < context.limits.page_rows) {
+        const maximum = if (goal != null and bound.having == null) @min(context.limits.page_rows, goal.? - delivered) else context.limits.page_rows;
+        while (cells.items.len < maximum) {
             const group = (try grouped.nextResult(context, a)) orelse {
                 exhausted = true;
                 break;
@@ -221,12 +223,15 @@ fn addGroupedDecisionPages(context: anytype, bound: *const binding.Bound, groupe
                 if (values[index].value != .bool) return error.SqlTypeMismatch;
                 if (!values[index].value.bool) continue;
             }
+            if (goal) |limit| if (accepted.items.len == limit - delivered) break;
             try accepted.append(a, row);
             try positions.append(a, index);
         }
         const accepted_ordinals = try a.alloc(u64, positions.items.len);
         for (positions.items, accepted_ordinals) |index, *ordinal| ordinal.* = ordinals.items[index];
         try projection.add(context, a, top, accepted.items, accepted_ordinals);
+        delivered += accepted.items.len;
+        if (goal != null and delivered == goal.?) break;
     }
 }
 
@@ -265,7 +270,7 @@ fn materializedOrder(a: std.mem.Allocator, bound: *const binding.Bound, recipe: 
     return result;
 }
 
-fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped_owner: **operators.Grouped, table: catalog.Table, conditions: []const catalog.Condition, ordering: []const ast.Order) !bool {
+fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped_owner: **operators.Grouped, table: catalog.Table, conditions: []const catalog.Condition, ordering: []const ast.Order, maximum_groups: ?usize) !bool {
     const open = context.backend.vtable.aggregate_partials orelse return false;
     const reuse = (try @import("aggregate_materialization.zig").reuseFromBound(context.arena, table, bound.*)) orelse return false;
     const recipe = reuse.recipe;
@@ -288,7 +293,7 @@ fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped_owner
                     return self.bound.input.matchesWithLimits(a, cells, self.context.parameters, self.context.backend.decision_provider, @import("decision_eval.zig").limitsFor(self.context.backend));
                 }
             };
-            var request: catalog.FinalGroupRequest = .{ .page_limit = context.limits.scan_pages, .row_limit = context.limits.scan_rows, .batch_rows = context.limits.executionRows(), .selection = .{ .conditions = conditions, .order = try materializedOrder(context.arena, bound, recipe, ordering), .spill = context.spill, .memory_bytes = context.limits.retained_bytes / 4 } };
+            var request: catalog.FinalGroupRequest = .{ .page_limit = context.limits.scan_pages, .row_limit = context.limits.scan_rows, .batch_rows = context.limits.executionRows(), .selection = .{ .maximum_groups = if (bound.input.predicate == null and bound.having == null) maximum_groups else null, .conditions = conditions, .order = try materializedOrder(context.arena, bound, recipe, ordering), .spill = context.spill, .memory_bytes = context.limits.retained_bytes / 4 } };
             if (bound.input.predicate != null) {
                 const predicate = try context.arena.create(Predicate);
                 predicate.* = .{ .context = context, .bound = bound, .columns = reuse.key_columns };
@@ -410,7 +415,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         var pages: usize = 0;
         var visited: usize = 0;
         var native_quota: @import("native_scan_quota.zig").Quota = .{ .capacity = context.limits.executionRows(), .row_limit = context.limits.scan_rows, .page_limit = context.limits.scan_pages };
-        var aggregate_loaded = if (!predicates.empty) try loadMaterialized(context, bound, &grouped, table, predicates.terms.items, statement.order_by) else false;
+        var aggregate_loaded = if (!predicates.empty) try loadMaterialized(context, bound, &grouped, table, predicates.terms.items, statement.order_by, if (statement.limit != null) std.math.add(usize, offset, limit) catch return error.SqlProgramLimitExceeded else null) else false;
         collector.grouped = grouped;
         const count_only = bound.group_count == 0 and bound.input.predicate == null and predicates.terms.items.len == 0 and predicates.primary_key == null and for (bound.specs, bound.inputs, bound.filters) |spec, input, filter| {
             if (spec.kind != .count or spec.distinct or input != null or filter != null) break false;
@@ -478,17 +483,22 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
     // Grouping is complete here: allocating for the requested limit when only
     // a few groups exist wastes memory (especially for scalar subqueries in a
     // large INSERT source) without changing which rows can be returned.
-    var top = try operators.TopK.initWithSpill(context.alloc, @min(capacity, grouped.groupCount()), orders, context.limits.retained_bytes, context.spill);
-    defer top.deinit();
     const decision = @import("decision_eval.zig");
     const external_results = decision.hasExternalPrograms(bound.outputs) or decision.hasExternalPrograms(bound.orders) or
         (if (bound.having) |*program| decision.hasExternal(program) else false);
+    const source_ordered = grouped.finalized != null and bound.ordered.len == 0 and (statement.order_by.len == 0 or grouped.finalized.?.ordered);
+    const direct_delivery = source_ordered and !external_results;
+    var top: ?operators.TopK = if (direct_delivery) null else try operators.TopK.initWithSpill(context.alloc, @min(capacity, grouped.groupCount()), orders, context.limits.retained_bytes, context.spill);
+    defer if (top) |*owner| owner.deinit();
+    var direct: std.ArrayList(operators.Row) = .empty;
+    var direct_emitted: usize = 0;
     if (external_results) {
         const projection = try decision.SortedProjection.init(context.arena, bound.outputs, bound.orders, bound.order_outputs);
-        try addGroupedDecisionPages(context, bound, &collector, &top, projection);
-        return projection.finish(context, &top, offset, limit, statement.limit == null);
+        const goal = if (source_ordered and !decision.hasExternalPrograms(bound.orders) and statement.limit != null) capacity else null;
+        try addGroupedDecisionPages(context, bound, &collector, &top.?, projection, goal);
+        return projection.finish(context, &top.?, offset, limit, statement.limit == null);
     }
-    const early_limit = grouped.finalized != null and bound.ordered.len == 0 and (statement.order_by.len == 0 or grouped.finalized.?.ordered) and statement.limit != null;
+    const early_limit = direct_delivery;
     var delivered: usize = 0;
     result_pages: while (true) {
         try context.checkpoint();
@@ -532,26 +542,47 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
             }
             try selected.append(alloc, row);
         }
+        if (direct_delivery) {
+            const skipped = @min(selected.items.len, offset -| delivered);
+            const count = @min(selected.items.len - skipped, (limit + @intFromBool(statement.limit == null)) - direct_emitted);
+            delivered += selected.items.len;
+            selected.items = selected.items[skipped..][0..count];
+            if (statement.limit == null and count > limit - direct_emitted) return error.SqlResultTooLarge;
+        }
         reader.selection = selected.items;
         batch.reader.count = selected.items.len;
         const outputs = try alloc.alloc([]const Datum, bound.outputs.len);
-        const ordering = try alloc.alloc([]const Datum, bound.orders.len);
+        const ordering = try alloc.alloc([]const Datum, if (direct_delivery) 0 else bound.orders.len);
         for (bound.outputs, outputs) |*program, *values| values.* = try resultValues(context, alloc, program, batch);
-        for (bound.orders, ordering) |*program, *values| values.* = try resultValues(context, alloc, program, batch);
+        if (!direct_delivery) {
+            for (bound.orders, ordering) |*program, *values| values.* = try resultValues(context, alloc, program, batch);
+        }
+        if (direct_delivery) if (context.sink) |sink| if (sink.append_batch) |append| {
+            if (selected.items.len != 0) try append(sink.ptr, .{ .vectors = .{ .values = outputs, .count = selected.items.len } });
+            direct_emitted += selected.items.len;
+            if (delivered >= capacity) break :result_pages;
+            continue;
+        };
         // TopK owns admitted rows; reuse these small boundary slices rather
         // than allocating each group's input/output/key row matrix.
         const values = try alloc.alloc(Datum, bound.outputs.len);
-        const keys = try alloc.alloc(Datum, bound.orders.len);
+        const keys = try alloc.alloc(Datum, ordering.len);
         for (selected.items, 0..) |physical, row| {
             for (outputs, values) |column, *value| value.* = column[row];
             for (ordering, keys) |column, *key| key.* = column[row];
-            try top.add(.{ .values = values, .keys = keys, .ordinal = groups.ordinals[physical] });
-            delivered += 1;
-            if (early_limit and delivered == capacity) break :result_pages;
+            if (direct_delivery) {
+                if (context.sink) |sink| try sink.append(sink.ptr, values) else {
+                    const owned = try context.arena.alloc(Datum, values.len);
+                    for (owned, values) |*out, value| out.* = try operators.cloneDatum(context.arena, value);
+                    try direct.append(context.arena, .{ .values = owned, .keys = &.{}, .ordinal = groups.ordinals[physical] });
+                }
+                direct_emitted += 1;
+            } else try top.?.add(.{ .values = values, .keys = keys, .ordinal = groups.ordinals[physical] });
         }
+        if (early_limit and delivered >= capacity) break :result_pages;
     }
-    if (context.sink != null) return context.emitTop(&top, offset, limit, statement.limit == null);
-    const ordered = try top.finishPage(context.arena, offset, limit + @intFromBool(statement.limit == null));
+    if (context.sink != null) return if (direct_delivery) .{ .columns = context.binding.columns, .command_tag = "SELECT" } else context.emitTop(&top.?, offset, limit, statement.limit == null);
+    const ordered = if (direct_delivery) direct.items else try top.?.finishPage(context.arena, offset, limit + @intFromBool(statement.limit == null));
     const remaining = ordered.len;
     if (statement.limit == null and remaining > limit) return error.SqlResultTooLarge;
     const selected = ordered[0..@min(remaining, limit)];

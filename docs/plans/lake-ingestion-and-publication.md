@@ -2948,3 +2948,40 @@ shrink the next session and retain the single-file streaming fallback. Two windo
 still divide the original memory/disk allowance; their descriptor storage is heap
 allocated and included in shared retained admission. The real nine-file fixture
 now needs two sessions instead of three, with one capture per source file.
+
+
+### Bounded ordered prefixes and native checkpoint deltas
+
+For an explicit aggregate LIMIT without a residual key predicate or HAVING, SQL
+passes the required prefix length, including OFFSET, to the native reader.
+Preflight keeps a priority queue of authenticated directory fences and exact
+leaf-cursor heads. It opens a child only when its conservative fence could precede
+the best complete key. The chosen coordinates and navigation owners are admitted
+before ordering is attested, so memory denial still falls back to one external
+sort before output. Reverse ordering uses exclusive upper fences. Missing or
+truncated fences widen preflight; they never permit dropping a candidate. Broad
+or unbounded queries retain the complete cursor-merge plan. This avoids opening
+all hash leaves for ordinary small LIMITs without publishing a second global
+ordered copy or rebuilding historical navigation after a small change.
+
+Finalized aggregate page credit counts logical provider batches rather than
+consumer fragments. One-row decision projections cannot multiply scan-page
+charges. Native COUNT, integer SUM and boolean transition columns finish directly;
+complex NUMERIC/extrema/floating states retain their validated immutable reducer
+path. Finalization returns aggregate vectors. An already ordered (or unordered)
+final-group source delivers vectors straight to a batch sink, or retains only the
+visible rows for buffered delivery, without TopK. SQL still evaluates residuals,
+HAVING, OFFSET and result limits. Ordered decision projections stop after their
+required accepted prefix when final ordering is already proved.
+
+Dense and sparse incremental publishers compare two exact local native cuts.
+LSM checkpoints retain their manifested run sizes alongside IDs and pinned paths;
+dense cuts additionally include the posting manifest, immutable segments and
+committed WAL extents. Publication emits explicit added, replaced and removed
+file descriptors and path-copies only changed file/chunk maps. Retained runs are
+charged to the logical generation allowance without remote descriptor lookups or
+payload uploads. Physical obsolete files do not define membership: a compacted
+run absent from the new native cut is removed even if an old reader still pins
+it. Legacy inline generations migrate through the existing full publication
+path. Native manifests still encode their complete bounded run set; this removes
+the remote retained-file census, not that local serialization cost.

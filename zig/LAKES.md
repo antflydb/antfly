@@ -1403,3 +1403,21 @@ Cold file-major construction keeps builders open over adaptive sessions of up to
 the two capture lanes retain their original shared quotas. Descriptor residency
 also participates in admission. Session boundaries, rather than every fixed four
 files, determine private checkpoint/reopen frequency.
+
+
+Finalized aggregate delivery accounts scan pages by logical provider batches,
+independent of decision/result fragmentation. Primitive native transitions finish
+directly into aggregate vectors. Compatible final-group streams bypass TopK and
+deliver result batches after HAVING/OFFSET/LIMIT. An explicit LIMIT with no residual
+predicate or HAVING also bounds ordered-index preflight: a best-first queue opens
+only leaves whose authenticated conservative fences can precede the next exact
+key, and admits the selected coordinates before any output. Truncated or missing
+fences widen work; memory denial retains the external-sort fallback.
+
+Sparse and dense incremental native checkpoints compare exact local before/after
+file cuts, publish explicit added/replaced/deleted descriptors, and path-copy only
+changed file and chunk maps. Retained immutable runs need no individual remote
+descriptor lookup. Pinned LSM run sizes preserve logical generation accounting;
+posting cuts retain exact committed WAL extents. Old reader pins keep bytes alive
+without retaining obsolete files in the new serving generation. The native
+manifest's bounded full run-set serialization remains local work.

@@ -52,6 +52,40 @@ pub fn finishBorrowed(a: A, state: operators.Aggregate) !Datum {
     return operators.cloneDatum(a, try state.finish());
 }
 
+/// Providers finish primitive native transitions without constructing reducers.
+pub fn finish(a: A, scratch: A, group: operators.GroupResult, index: usize, spec: operators.AggregateSpec) !Datum {
+    if (index >= try partialCount(group)) return error.InvalidSqlBackendResponse;
+    if (group.state_reader) |reader| if (reader.finish) |kernel| return kernel(reader.ptr, a, index, spec);
+    return finishBorrowed(a, try read(scratch, group, index, spec));
+}
+fn integerLane(block: @import("spill.zig").ColumnarBlock, row: usize, column: usize) !i64 {
+    const value = try block.cell(row, column);
+    if (value.sql_null or value.value != .integer or value.numeric != null) return error.InvalidSqlSpill;
+    return value.value.integer;
+}
+pub fn finishPhysical(a: A, block: @import("spill.zig").ColumnarBlock, row: usize, column: usize, spec: operators.AggregateSpec) !Datum {
+    if (!physicalEligible(spec) or column > block.values.len or physicalColumns(spec).len > block.values.len - column) return error.InvalidSqlSpill;
+    const count = try integerLane(block, row, column);
+    if (count < 0) return error.InvalidSqlSpill;
+    if (spec.kind == .count) return Datum.json(.{ .integer = count });
+    if (spec.kind == .sum and spec.input_type == .integer) {
+        const low: u64 = @bitCast(try integerLane(block, row, column + 1));
+        const high: u64 = @bitCast(try integerLane(block, row, column + 2));
+        const sum: i128 = @bitCast(@as(u128, high) << 64 | low);
+        return if (count == 0) .{} else Datum.json(.{ .integer = std.math.cast(i64, sum) orelse return error.SqlNumericOutOfRange });
+    }
+    if (spec.kind == .bool_and or spec.kind == .bool_or) {
+        const value = try block.cell(row, column + 1);
+        if (value.sql_null or value.value != .bool) return error.InvalidSqlSpill;
+        return if (count == 0) .{} else value;
+    }
+    // Variable coefficients, extrema and floating validation preserve the
+    // established exact semantics and immutable cache ownership.
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    return finishBorrowed(a, try readPhysical(scratch.allocator(), block, row, column, spec));
+}
+
 /// Native aggregate block layout. Fixed counters and transition bits are
 /// independent physical columns; extrema use the existing typed scalar codec,
 /// and exact NUMERIC keeps its portable coefficient buffer. No AGS row envelope
@@ -881,4 +915,46 @@ test "SQL borrowed numeric aggregate finalization leaves shared memo immutable" 
         try std.testing.expectEqual(std.math.Order.eq, try numeric.order(&context, result.numeric.?.*, value.value));
         try std.testing.expect(source.numeric.?.result == null);
     }
+}
+
+test "SQL native transition finalizers match reducer results for empty signed boolean and overflow states" {
+    const spilling = @import("spill.zig");
+    const a = std.testing.allocator;
+    for ([_]operators.AggregateSpec{
+        .{ .kind = .count },
+        .{ .kind = .sum, .input_type = .integer },
+        .{ .kind = .bool_and, .input_type = .boolean },
+        .{ .kind = .bool_or, .input_type = .boolean },
+        .{ .kind = .min, .input_type = .integer },
+    }) |spec| for (0..3) |count| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const out = arena.allocator();
+        var state = try operators.Aggregate.initTyped(a, spec.kind, spec.input_type, spec.input_element);
+        defer state.deinit();
+        for (0..count) |i| try state.update(if (spec.input_type == .boolean) Datum.json(.{ .bool = i == 0 }) else Datum.json(.{ .integer = -123 }));
+        const physical = try physicalCells(out, state);
+        const columns = physicalColumns(spec);
+        const values = try out.alloc(Datum, columns.len);
+        for (values, columns) |*value, column| value.* = physical[column];
+        const rows = [_]operators.Row{.{ .values = values, .keys = &.{}, .ordinal = 0 }};
+        const bytes = try spilling.encodeColumnarBlockAlloc(out, &rows, 64 * 1024);
+        const block = try spilling.decodeColumnarBlockInArena(out, bytes, 64 * 1024);
+        defer block.deinit();
+        try std.testing.expectEqualDeep(try finishBorrowed(out, state), try finishPhysical(out, block, 0, 0, spec));
+    };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    const spec: operators.AggregateSpec = .{ .kind = .sum, .input_type = .integer };
+    var state = try operators.Aggregate.init(a, .sum, .integer);
+    defer state.deinit();
+    try state.update(Datum.json(.{ .integer = std.math.maxInt(i64) }));
+    try state.update(Datum.json(.{ .integer = std.math.maxInt(i64) }));
+    const physical = try physicalCells(out, state);
+    const rows = [_]operators.Row{.{ .values = physical[0..3], .keys = &.{}, .ordinal = 0 }};
+    const bytes = try spilling.encodeColumnarBlockAlloc(out, &rows, 64 * 1024);
+    const block = try spilling.decodeColumnarBlockInArena(out, bytes, 64 * 1024);
+    defer block.deinit();
+    try std.testing.expectError(error.SqlNumericOutOfRange, finishPhysical(out, block, 0, 0, spec));
 }

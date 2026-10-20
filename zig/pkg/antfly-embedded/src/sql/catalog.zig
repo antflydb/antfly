@@ -757,6 +757,8 @@ pub const DdlAllocators = struct { result: std.mem.Allocator, scratch: std.mem.A
 
 pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed, receipt: ?DdlReceipt = null };
 
+pub const ScanQuota = @import("native_scan_quota.zig").Quota;
+
 /// Complete, authorized aggregate states for one pinned table and recipe.
 /// Keys and versioned aggregate cells borrow the supplied page allocator until the next pull.
 /// A provider must return null before opening if it cannot prove equivalence;
@@ -768,6 +770,10 @@ pub const GroupSelection = struct {
     page_limit: usize = std.math.maxInt(usize),
     conditions: []const Condition = &.{},
     order: []const Scan.Order = &.{},
+    /// Proven upper bound on the consumed ordered prefix, including OFFSET.
+    /// Absent when SQL still needs residual filtering or an unbounded result.
+    maximum_groups: ?usize = null,
+    batch_rows: u32 = 4096,
 };
 pub const FinalGroupRequest = struct {
     page_limit: usize,

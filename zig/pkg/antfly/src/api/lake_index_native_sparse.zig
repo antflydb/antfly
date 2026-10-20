@@ -122,6 +122,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var budget: local.sql_memory_budget = .{ .backing = a, .limit = 256 * 1024 * 1024 };
         var index = try local.sparse_sparse.SparseIndex.open(budget.allocator(), path, .{ .lsm_storage = candidate_storage, .lsm_options = .{ .flush_threshold = 8 * 1024 * 1024 } });
         defer index.close();
+        var baseline = if (seed != null) try index.pinNativeCheckpoint() else null;
+        defer if (baseline) |*cut| cut.deinit();
         if (seed == null) try index.beginBulkIngestSession();
         var finished = false;
         defer if (!finished and seed == null) index.abortBulkIngestSession();
@@ -213,8 +215,11 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         const output_bytes: files.OutputBudget = .{ .generation = &output_remaining, .work = if (provider.resume_work) |work| &work.native_output_left else null };
         var navigation: @import("lake_index_native_directory.zig").Navigation = .{ .allocator = a };
         defer navigation.deinit();
-        const staging_generation = try files.publishCheckpoint(a, ca, &checkpoint, store, cancellation, output_bytes, if (seed) |root| .{ .root = root.generation, .navigation = &navigation } else null);
-        const generation = try @import("lake_index_native_directory.zig").persist(a, ca, store, staging_generation, if (seed) |root| root.generation else null, cancellation, if (provider.resume_work) |work| &work.native_output_left else null);
+        const staging_generation = if (seed != null and seed.?.generation.version == 2) null else try files.publishCheckpoint(a, ca, &checkpoint, store, cancellation, output_bytes, if (seed) |root| .{ .root = root.generation, .navigation = &navigation } else null);
+        const generation = if (staging_generation == null)
+            try files.publishExtentDelta(a, ca, checkpoint.storage, try files.checkpointExtents(ca, &baseline.?, ""), try files.checkpointExtents(ca, &checkpoint, ""), seed.?.generation, store, cancellation, output_bytes)
+        else
+            try @import("lake_index_native_directory.zig").persist(a, ca, store, staging_generation.?, if (seed) |root| root.generation else null, cancellation, if (provider.resume_work) |work| &work.native_output_left else null);
         const root: Root = .{ .binding = binding, .config_json = try std.json.Stringify.valueAlloc(ca, configs.object.get(wanted.name) orelse return error.InvalidTableIndexMetadata, .{}), .generation = generation, .recipe = recipe, .file_states = if (!plan.isPaged()) plan.files else &.{}, .file_directory = if (plan.isPaged()) try plan.publishDirectory(a, store, generation.domain, cancellation) else null };
         const bytes = try std.json.Stringify.valueAlloc(ca, root, .{});
         if (bytes.len > files.max_root_bytes) return error.NativeLakeFilesTooLarge;
