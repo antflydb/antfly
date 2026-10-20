@@ -27439,11 +27439,25 @@ fn parseArtifactReprocessJobId(encoded_job_id: []const u8) !u64 {
     return std.fmt.parseUnsigned(u64, encoded_job_id, 10);
 }
 
-pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_common.Method, path: []const u8) !?RequiredPermission {
+/// HTTP methods as seen by RBAC. This is deliberately separate from the
+/// transport method enum so every routed verb, including HEAD and PATCH, needs
+/// an explicit permission decision in each `switch` below. A verb that is not
+/// routed on a path should fail closed rather than inherit another verb's
+/// "no permission required" arm.
+pub const AuthorizationMethod = enum { GET, HEAD, POST, PUT, PATCH, DELETE };
+
+fn isReadMethod(method: AuthorizationMethod) bool {
+    return switch (method) {
+        .GET, .HEAD => true,
+        .POST, .PUT, .PATCH, .DELETE => false,
+    };
+}
+
+pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: AuthorizationMethod, path: []const u8) !?RequiredPermission {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     if (try system_catalog_routes.parseAlloc(arena.allocator(), path)) |route| {
-        if (route.kind == .table and route.name == null and method == .GET) return null;
+        if (route.kind == .table and route.name == null and isReadMethod(method)) return null;
         const resource_type: usermgr.ResourceType = switch (route.kind) {
             .query_source => .table,
             .database => .database,
@@ -27451,7 +27465,7 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
             .table => .table,
             .tablespace => .tablespace,
         };
-        const permission: usermgr.PermissionType = if (method == .GET or (route.kind == .table and (std.mem.eql(u8, route.suffix, "query") or std.mem.eql(u8, route.suffix, "rows/query")))) .read else if (route.kind == .table and (std.mem.eql(u8, route.suffix, "batch") or std.mem.eql(u8, route.suffix, "rows/mutate"))) .write else .admin;
+        const permission: usermgr.PermissionType = if (isReadMethod(method) or (route.kind == .table and (std.mem.eql(u8, route.suffix, "query") or std.mem.eql(u8, route.suffix, "rows/query")))) .read else if (route.kind == .table and (std.mem.eql(u8, route.suffix, "batch") or std.mem.eql(u8, route.suffix, "rows/mutate"))) .write else .admin;
         return .{ .resource_type = resource_type, .resource = try system_catalog_routes.resourceNameAlloc(alloc, route), .permission_type = permission, .owns_resource = true };
     }
 
@@ -27461,14 +27475,15 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
         .permission_type = .write,
     };
     if (std.mem.eql(u8, path, routes.Routes.tables)) return switch (method) {
-        .GET, .POST, .PUT, .DELETE => null,
+        .GET, .HEAD, .POST, .PUT, .DELETE => null,
+        .PATCH => .{ .resource_type = .table, .resource = "*", .permission_type = .admin },
     };
     if (std.mem.startsWith(u8, path, "/tables/")) {
         const remainder = path["/tables/".len..];
         if (std.mem.indexOfScalar(u8, remainder, '/')) |separator| {
             const suffix = remainder[separator + 1 ..];
             if (std.mem.eql(u8, suffix, "lake/catalog") or std.mem.eql(u8, suffix, "lake/changes") or std.mem.eql(u8, suffix, "lake/maintenance") or std.mem.eql(u8, suffix, "lake/commits") or std.mem.startsWith(u8, suffix, "lake/commits/")) {
-                if (method == .GET or method == .POST) return try tablePermission(alloc, remainder[0..separator], if (method == .GET) .read else .admin);
+                if (isReadMethod(method) or method == .POST) return try tablePermission(alloc, remainder[0..separator], if (isReadMethod(method)) .read else .admin);
             }
         }
     }
@@ -27482,99 +27497,142 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
     if (routes.Routes.matchRelationalConstraintRecovery(path)) |recovery| return try tablePermission(alloc, recovery.table_name, .admin);
     if (routes.Routes.matchTableIndexMaintenance(path)) |maintenance| return try tablePermission(alloc, maintenance.table_name, .admin);
     if (routes.Routes.matchTableDocumentArtifacts(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
-        .GET => .read,
+        .GET, .HEAD => .read,
+        .PATCH => .admin,
         .POST, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableDocumentArtifact(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
-        .GET => .read,
+        .GET, .HEAD => .read,
+        .PATCH => .admin,
         .POST, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableDocumentArtifactReprocess(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
-        .POST => .admin,
-        .GET, .PUT, .DELETE => return null,
+        .POST, .PATCH => .admin,
+        .GET, .HEAD, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableArtifactReprocessJobs(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
-        .POST => .admin,
-        .GET, .PUT, .DELETE => return null,
+        .POST, .PATCH => .admin,
+        .GET, .HEAD, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableArtifactReprocessJob(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
-        .GET => .read,
+        .GET, .HEAD => .read,
+        .PATCH => .admin,
         .POST, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableArtifactReprocessJobAdvance(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
-        .POST => .admin,
-        .GET, .PUT, .DELETE => return null,
+        .POST, .PATCH => .admin,
+        .GET, .HEAD, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableArtifactReprocessJobCancel(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
-        .POST => .admin,
-        .GET, .PUT, .DELETE => return null,
+        .POST, .PATCH => .admin,
+        .GET, .HEAD, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableArtifactReprocess(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
-        .POST => .admin,
-        .GET, .PUT, .DELETE => return null,
+        .POST, .PATCH => .admin,
+        .GET, .HEAD, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableArtifactRepair(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
-        .POST => .admin,
-        .GET, .PUT, .DELETE => return null,
+        .POST, .PATCH => .admin,
+        .GET, .HEAD, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableStorageMigration(path)) |table| return try tablePermission(alloc, table.table_name, .admin);
     if (routes.Routes.matchTableStorageMigrationJob(path)) |job| return try tablePermission(alloc, job.table_name, .admin);
     if (routes.Routes.matchTableArtifactRepairRun(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
-        .POST => .admin,
-        .GET, .PUT, .DELETE => return null,
+        .POST, .PATCH => .admin,
+        .GET, .HEAD, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableRepairJobs(path) orelse routes.Routes.matchTableRepairControlJobs(path)) |repair_job| return try tablePermission(alloc, repair_job.table_name, switch (method) {
-        .POST => .admin,
-        .GET, .PUT, .DELETE => return null,
+        .POST, .PATCH => .admin,
+        .GET, .HEAD, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableRepairJob(path)) |repair_job| return try tablePermission(alloc, repair_job.table_name, switch (method) {
-        .GET => .read,
+        .GET, .HEAD => .read,
+        .PATCH => .admin,
         .POST, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableRepairJobAdvance(path)) |repair_job| return try tablePermission(alloc, repair_job.table_name, switch (method) {
-        .POST => .admin,
-        .GET, .PUT, .DELETE => return null,
+        .POST, .PATCH => .admin,
+        .GET, .HEAD, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableRepairJobCancel(path)) |repair_job| return try tablePermission(alloc, repair_job.table_name, switch (method) {
-        .POST => .admin,
-        .GET, .PUT, .DELETE => return null,
+        .POST, .PATCH => .admin,
+        .GET, .HEAD, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableArtifacts(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
-        .GET => .read,
+        .GET, .HEAD => .read,
+        .PATCH => .admin,
         .POST, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableArtifactEnrichment(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
-        .PUT, .DELETE => .admin,
-        .GET, .POST => return null,
+        .PUT, .PATCH, .DELETE => .admin,
+        .GET, .HEAD, .POST => return null,
     });
     if (routes.Routes.matchTablePath(path)) |table_path| {
         return try tablePermission(alloc, table_path.table_name, switch (method) {
-            .GET => .read,
-            .POST, .PUT, .DELETE => .admin,
+            .GET, .HEAD => .read,
+            .POST, .PUT, .PATCH, .DELETE => .admin,
         });
     }
     if (routes.Routes.matchTableBatch(path)) |batch| return try tablePermission(alloc, batch.table_name, .write);
     if (routes.Routes.matchTableMerge(path)) |merge| return try tablePermission(alloc, merge.table_name, .write);
     if (routes.Routes.matchTableSchema(path)) |schema| return try tablePermission(alloc, schema.table_name, .admin);
     if (routes.Routes.matchTableGraphMetricAction(path)) |metric_action| return switch (method) {
-        .POST => try tablePermission(alloc, metric_action.table_name, .admin),
-        .GET, .PUT, .DELETE => null,
+        .POST, .PATCH => try tablePermission(alloc, metric_action.table_name, .admin),
+        .GET, .HEAD, .PUT, .DELETE => null,
     };
     if (routes.Routes.matchTableIndexes(path)) |indexes| return try tablePermission(alloc, indexes.table_name, switch (method) {
-        .GET => .read,
-        .POST => .admin,
+        .GET, .HEAD => .read,
+        .POST, .PATCH => .admin,
         .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableIndex(path)) |index| return try tablePermission(alloc, index.table_name, switch (method) {
-        .GET => .read,
+        .GET, .HEAD => .read,
         .DELETE => .admin,
-        .POST => .admin,
+        .POST, .PATCH => .admin,
         .PUT => return null,
     });
     if (routes.Routes.matchTableBackup(path)) |table_backup| return try tablePermission(alloc, table_backup.table_name, .admin);
     if (routes.Routes.matchTableRestore(path)) |table_restore| return try tablePermission(alloc, table_restore.table_name, .admin);
     if (tableNameForGraphPath(path)) |table_name| return try tablePermission(alloc, table_name, .read);
     return null;
+}
+
+test "PATCH fails closed and HEAD mirrors GET table permissions" {
+    const alloc = std.testing.allocator;
+    const paths = [_][]const u8{
+        "/tables/docs",
+        "/tables/docs/schema",
+        "/tables/docs/indexes",
+        "/tables/docs/indexes/title",
+        "/tables/docs/artifacts",
+        "/tables/docs/repair/jobs",
+        "/tables/docs/repair/jobs/42",
+        "/tables/docs/documents/doc%2Fa/artifacts/document_units_v1",
+        "/databases/analytics/namespaces/public/tables/docs/schema",
+    };
+    for (paths) |path| {
+        const patch = (try requiredPermissionForRequest(alloc, .PATCH, path)) orelse {
+            std.debug.print("PATCH {s} required no permission\n", .{path});
+            return error.TestUnexpectedResult;
+        };
+        defer patch.deinit(alloc);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, patch.permission_type);
+
+        const get = try requiredPermissionForRequest(alloc, .GET, path);
+        defer if (get) |required| required.deinit(alloc);
+        const head = try requiredPermissionForRequest(alloc, .HEAD, path);
+        defer if (head) |required| required.deinit(alloc);
+        try std.testing.expectEqual(get == null, head == null);
+        if (get) |get_required| {
+            try std.testing.expectEqualStrings(get_required.resource, head.?.resource);
+            try std.testing.expectEqual(get_required.permission_type, head.?.permission_type);
+        }
+    }
+
+    const tables_patch = (try requiredPermissionForRequest(alloc, .PATCH, routes.Routes.tables)).?;
+    defer tables_patch.deinit(alloc);
+    try std.testing.expectEqualStrings("*", tables_patch.resource);
+    try std.testing.expectEqual(usermgr.PermissionType.admin, tables_patch.permission_type);
 }
 
 test "destination authorization adoption requires source table admin" {
@@ -28317,7 +28375,7 @@ test "document artifact routes declare read and admin permissions" {
         try std.testing.expectEqualStrings("docs", required.resource);
         try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
     }
-    inline for (.{ http_common.Method.GET, http_common.Method.POST }) |method| {
+    inline for (.{ AuthorizationMethod.GET, AuthorizationMethod.POST }) |method| {
         const required = (try requiredPermissionForRequest(std.testing.allocator, method, "/tables/docs/storage/migrations/job")).?;
         defer required.deinit(std.testing.allocator);
         try std.testing.expectEqualStrings("docs", required.resource);

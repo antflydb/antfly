@@ -3814,11 +3814,13 @@ pub const AntflyApiHandler = struct {
         return identity;
     }
 
-    fn requestMethod(ctx: *httpx.Context) ?http_common.Method {
+    fn requestMethod(ctx: *httpx.Context) ?http_server_mod.AuthorizationMethod {
         return switch (ctx.request.method) {
-            .GET, .HEAD => .GET,
+            .GET => .GET,
+            .HEAD => .HEAD,
             .POST => .POST,
-            .PUT, .PATCH => .PUT,
+            .PUT => .PUT,
+            .PATCH => .PATCH,
             .DELETE => .DELETE,
             else => null,
         };
