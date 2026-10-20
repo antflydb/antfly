@@ -124,5 +124,119 @@ test "required replicated begin codec rejects stripped phase missing mode and pu
     var decoded = try raft_batch.decode(std.testing.allocator, barrier);
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(?u16, 23), decoded.protocol_barrier_version);
-    try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, raft_batch.decode(std.testing.allocator, "{\"table\":\"docs\",\"protocol_barrier\":24,\"batch\":null}"));
+    try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, raft_batch.decode(std.testing.allocator, "{\"table\":\"docs\",\"protocol_barrier\":25,\"batch\":null}"));
+}
+
+test "required replicated begin prepare and final seal persist accepted effects before decision" {
+    const a = std.testing.allocator;
+    for (std.meta.tags(codec.Mode)) |mode| {
+        var directory = try sources.common_test_directory.TestDirectory.init("required-raft-seal");
+        defer directory.cleanup();
+        const id = request(mode).transaction.?.begin.txn_id;
+        {
+            var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+            defer db.close();
+            try db.enablePreparedTransactionProtocol();
+            try dispatch.applyReplicatedTransactionMutationAtRaftEntry(a, &db, "docs", 7, request(mode), .{ .term = 1, .index = 1 });
+            const prepare: db_mod.types.BatchRequest = .{
+                .writes = &.{.{ .key = "doc:sealed", .value = "{}" }},
+                .transaction = .{ .prepare = .{ .txn_id = id, .topology_epoch = 3, .preparation_requirement = .{ .mode = mode } } },
+            };
+            var wrong = prepare;
+            wrong.transaction.?.prepare.preparation_requirement = .{ .mode = if (mode == .deferred) .synchronous else .deferred };
+            try std.testing.expectError(error.PreparationContractConflict, dispatch.applyReplicatedTransactionMutationAtRaftEntry(a, &db, "docs", 7, wrong, .{ .term = 1, .index = 2 }));
+            try std.testing.expectEqual(@as(u64, 1), (try sources.storage_db_apply_receipts.readOrderedApplyReceipt(a, db.core.store)).?.index);
+            const bytes = try raft_batch.encode(a, "docs", prepare);
+            defer a.free(bytes);
+            var parsed = try raft_batch.decode(a, bytes);
+            defer parsed.deinit(a);
+            try std.testing.expectEqual(@as(u16, 24), @import("data/runtime.zig").DataServer.requiredRaftBatchProtocolVersion(parsed.batch.req));
+            try std.testing.expectError(error.PreparedTransactionMigrationRequired, @import("data/runtime.zig").DataServer.ensurePreparedTransactionProposalSupported(parsed.batch.req));
+            try dispatch.applyReplicatedTransactionMutationAtRaftEntry(a, &db, "docs", 7, parsed.batch.req, .{ .term = 1, .index = 2 });
+            var manager = try db.core.initTxnManager();
+            defer manager.deinit();
+            const contract = try manager.preparedEffectsContract(id, try db.core.preparedEffectsCatalogDigest(null), mode, null);
+            var stale = contract;
+            stale.intent_revision += 1;
+            const bad = try codec.encode(a, .{ .contract = stale, .effects = .{} }, null);
+            defer a.free(bad);
+            try std.testing.expectError(error.PreparedEffectsMismatch, db.sealReplicatedTransactionEffectsAtOrderedReceipt(id, bad, mode, .{ .term = 1, .index = 3 }, null));
+            try std.testing.expectEqual(@as(u64, 2), (try sources.storage_db_apply_receipts.readOrderedApplyReceipt(a, db.core.store)).?.index);
+            const frame = try codec.encode(a, .{ .contract = contract, .effects = .{} }, null);
+            defer a.free(frame);
+            const seal: db_mod.types.BatchRequest = .{ .transaction = .{ .prepare = .{ .txn_id = id, .topology_epoch = 3, .preparation_requirement = .{ .mode = mode }, .sealed_effects = frame } } };
+            const encoded = try raft_batch.encode(a, "docs", seal);
+            defer a.free(encoded);
+            var decoded = try raft_batch.decode(a, encoded);
+            defer decoded.deinit(a);
+            try std.testing.expectEqualSlices(u8, frame, decoded.batch.req.transaction.?.prepare.sealed_effects.?);
+            try std.testing.expectError(error.PreparedTransactionProtocolUnavailable, dispatch.applyReplicatedTransactionMutation(a, &db, "docs", 7, decoded.batch.req));
+            try dispatch.applyReplicatedTransactionMutationAtRaftEntry(a, &db, "docs", 7, decoded.batch.req, .{ .term = 1, .index = 3 });
+            try std.testing.expect(try manager.hasPreparedEffects(id));
+            try std.testing.expect((try db.get(a, "doc:sealed")) == null);
+            // A different result can never replace the first accepted frame.
+            const other = try codec.encode(a, .{ .contract = contract, .effects = .{ .artifact_writes = @constCast(&[_]db_mod.types.BatchWrite{.{ .key = "artifact:other", .value = "other" }}) } }, null);
+            defer a.free(other);
+            try std.testing.expectError(error.PreparedEffectsConflict, db.sealReplicatedTransactionEffectsAtOrderedReceipt(id, other, mode, .{ .term = 1, .index = 4 }, null));
+            try std.testing.expectEqual(@as(u64, 3), (try sources.storage_db_apply_receipts.readOrderedApplyReceipt(a, db.core.store)).?.index);
+            // Same accepted bytes may advance a later ordered retry without
+            // reacquiring the frame's durable grant.
+            try db.sealReplicatedTransactionEffectsAtOrderedReceipt(id, frame, mode, .{ .term = 1, .index = 4 }, null);
+        }
+        var reopened = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+        defer reopened.close();
+        var manager = try reopened.core.initTxnManager();
+        defer manager.deinit();
+        var plan = (try manager.loadPreparedEffects(a, id, null)).?;
+        defer plan.deinit();
+        try std.testing.expectEqual(mode, plan.decoded.plan.contract.mode);
+        // Replaying PREPARE after the seal must not try to rewrite frozen intents.
+        try reopened.writeReplicatedTransactionWithRequirementAtOrderedReceipt(id, .{}, .{ .term = 1, .index = 2 }, .{ .mode = mode });
+        try reopened.sealReplicatedTransactionEffectsAtOrderedReceipt(id, "replay ignores retired command bytes", mode, .{ .term = 1, .index = 3 }, null);
+        try reopened.resolveReplicatedTransactionAtOrderedReceipt(id, .committed, 100, .write, .none, .{ .term = 1, .index = 5 }, null);
+        try std.testing.expect(!try manager.hasPreparedEffects(id));
+        try std.testing.expectEqual(mode, (try manager.getPreparationDecision(id, null)).requirement.?.mode);
+        const value = (try reopened.get(a, "doc:sealed")).?;
+        defer a.free(value);
+        try std.testing.expectEqualStrings("{}", value);
+        try reopened.sealReplicatedTransactionEffectsAtOrderedReceipt(id, "already resolved", mode, .{ .term = 1, .index = 4 }, null);
+    }
+}
+
+test "required replicated begin seal codec rejects downgrade and damaged frames under allocation failure" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const id: db_mod.types.TxnId = @splat(0xe5);
+            for (std.meta.tags(codec.Mode)) |mode| {
+                const frame = try codec.encode(a, .{ .contract = .{ .txn_id = id, .intent_revision = 1, .intent_digest = @splat(1), .catalog_digest = @splat(2), .mode = mode }, .effects = .{} }, null);
+                defer a.free(frame);
+                const req: db_mod.types.BatchRequest = .{ .transaction = .{ .prepare = .{ .txn_id = id, .topology_epoch = 3, .preparation_requirement = .{ .mode = mode }, .sealed_effects = frame } } };
+                var mixed = req;
+                mixed.relational_repair = true;
+                try std.testing.expectError(error.InvalidBatchRequest, batch.encodeBatchRequest(a, mixed));
+                try std.testing.expectError(error.InvalidBatchRequest, dispatch.applyReplicatedTransactionMutationAtRaftEntry(a, undefined, "docs", 7, mixed, .{ .term = 1, .index = 1 }));
+                const encoded = try batch.encodeBatchRequest(a, req);
+                defer a.free(encoded);
+                var decoded = try batch.parseInternalBatchRequest(a, encoded);
+                defer decoded.deinit(a);
+                try std.testing.expectEqualSlices(u8, frame, decoded.req.transaction.?.prepare.sealed_effects.?);
+                try rejected(a, batch.parseBatchRequest(a, encoded));
+                const with_control = try std.fmt.allocPrint(a, "{{\"_relational_repair\":true,{s}", .{encoded[1..]});
+                defer a.free(with_control);
+                try rejected(a, batch.parseInternalBatchRequest(a, with_control));
+                const stripped = try std.mem.replaceOwned(u8, a, encoded, "seal_required_v1", "prepare");
+                defer a.free(stripped);
+                try rejected(a, batch.parseInternalBatchRequest(a, stripped));
+                const missing = try std.mem.replaceOwned(u8, a, encoded, "prepared_effects_base64", "stripped_effects");
+                defer a.free(missing);
+                try rejected(a, batch.parseInternalBatchRequest(a, missing));
+                const corrupt = try a.dupe(u8, encoded);
+                defer a.free(corrupt);
+                const prefix = "\"prepared_effects_base64\":\"";
+                corrupt[(std.mem.indexOf(u8, corrupt, prefix) orelse return error.TestUnexpectedResult) + prefix.len] = '!';
+                try rejected(a, batch.parseInternalBatchRequest(a, corrupt));
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

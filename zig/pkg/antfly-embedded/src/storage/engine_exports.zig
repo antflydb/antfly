@@ -1405,8 +1405,8 @@ fn beginTransactionWithParticipants(self: *DB, timestamp_ns: u64, participants: 
     return .{ .value = self.beginTransactionWithParticipants(timestamp_ns, participants) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn writeReplicatedTransactionAtOrderedReceipt(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, identity: db.OrderedApplyReceipt) engine.Outcome(void) {
-    return .{ .value = self.writeReplicatedTransactionAtOrderedReceipt(txn_id, req, identity) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn writeReplicatedTransactionWithRequirementAtOrderedReceipt(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, identity: db.OrderedApplyReceipt, requirement: ?@import("db/prepared_transaction_effects.zig").Requirement) engine.Outcome(void) {
+    return .{ .value = self.writeReplicatedTransactionWithRequirementAtOrderedReceipt(txn_id, req, identity, requirement) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn getTransactionStatus(self: *DB, txn_id: @import("transactions.zig").TxnId) engine.Outcome(@import("transactions.zig").TxnStatus) {
@@ -2132,4 +2132,12 @@ fn relationalSessionRangeProofsWithAdmission(session: *@import("db/relational_re
 
 fn relationalSessionNormalizeRowsWithAdmission(session: *@import("db/relational_read_session.zig").Session, alloc: Allocator, writes: []const types.BatchWrite, control: @import("../common/read_admission.zig").Port) engine.Outcome([]types.BatchWrite) {
     return .{ .value = session.normalizeRowsWithAdmission(alloc, writes, control) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn sealReplicatedTransactionEffectsAtOrderedReceipt(self: *DB, txn_id: types.TxnId, frame: []const u8, mode: @import("db/prepared_transaction_effects.zig").Mode, identity: db.OrderedApplyReceipt, scope: ?[32]u8) engine.Outcome(void) {
+    return .{ .value = self.sealReplicatedTransactionEffectsAtOrderedReceipt(txn_id, frame, mode, identity, scope) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn writeReplicatedTransactionAtOrderedReceipt(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, identity: db.OrderedApplyReceipt) engine.Outcome(void) {
+    return .{ .value = self.writeReplicatedTransactionAtOrderedReceipt(txn_id, req, identity) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

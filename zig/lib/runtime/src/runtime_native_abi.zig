@@ -72,7 +72,8 @@ const builtin = @import("builtin");
 // Participant workers carry negotiated preparation and seal callbacks.
 // Transaction records retain their original required-preparation contract.
 // Replicated BEGIN carries an explicit required-preparation contract.
-pub const abi_version: u32 = 38;
+// Accepted effect seals can atomically publish an ordered apply receipt.
+pub const abi_version: u32 = 39;
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 
 pub const TypeContract = extern struct {

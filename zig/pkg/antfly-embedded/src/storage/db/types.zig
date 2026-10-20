@@ -321,6 +321,9 @@ pub const TransactionMutation = union(enum) {
     prepare: struct {
         txn_id: TxnId,
         topology_epoch: u64,
+        preparation_requirement: ?@import("prepared_transaction_effects.zig").Requirement = null,
+        /// Final seal command carries immutable precomputed output, no rows.
+        sealed_effects: ?[]const u8 = null,
     },
     resolve: struct {
         txn_id: TxnId,

@@ -12642,11 +12642,14 @@ pub const DataServer = struct {
     /// coordinated migration owns that proof, no direct/private route may
     /// append a required BEGIN or activate its protocol barrier.
     pub fn ensurePreparedTransactionProposalSupported(req: antfly.db.types.BatchRequest) !void {
-        if (req.transaction) |mutation| if (mutation == .begin and mutation.begin.preparation_requirement != null)
+        if (req.transaction) |mutation| if ((mutation == .begin and mutation.begin.preparation_requirement != null) or
+            (mutation == .prepare and (mutation.prepare.preparation_requirement != null or mutation.prepare.sealed_effects != null)))
             return error.PreparedTransactionMigrationRequired;
     }
 
     pub fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        if (req.transaction) |mutation| if (mutation == .prepare and (mutation.prepare.preparation_requirement != null or mutation.prepare.sealed_effects != null))
+            return @import("../common/data_raft_protocol.zig").batch_required_seal_protocol_version;
         if (req.transaction) |mutation| if (mutation == .begin and mutation.begin.preparation_requirement != null)
             return @import("../common/data_raft_protocol.zig").batch_required_preparation_protocol_version;
         if (antfly.db.types.requiresGraphRelationshipProtocol(req)) return @import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version;

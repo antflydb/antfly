@@ -1571,18 +1571,35 @@ pub const TxnManager = struct {
     /// transaction with its size/aggregate accounting. Failed admission leaves
     /// the existing revision mutable; accepted seals freeze subsequent writes.
     pub fn sealPreparedEffects(self: *TxnManager, txn_id: TxnId, frame: []const u8, catalog_digest: [32]u8, mode: prepared_effects.Mode, original: ?read_control.Port) !void {
-        var trace: MutationAdmissionTrace = .{};
-        return self.sealPreparedEffectsInner(txn_id, frame, catalog_digest, mode, trace.bind(original)) catch |err| return trace.failure orelse err;
+        return self.sealPreparedEffectsWithExtraBatch(txn_id, frame, catalog_digest, mode, .{}, original);
     }
 
-    fn sealPreparedEffectsInner(self: *TxnManager, txn_id: TxnId, frame: []const u8, catalog_digest: [32]u8, mode: prepared_effects.Mode, control: ?read_control.Port) !void {
+    /// Publish an ordered receipt in the same transaction as the immutable
+    /// frame and its backlog grant. A retry preserves the first accepted frame.
+    pub fn sealPreparedEffectsWithExtraBatch(self: *TxnManager, txn_id: TxnId, frame: []const u8, catalog_digest: [32]u8, mode: prepared_effects.Mode, extra_batch: MutationExtraBatch, original: ?read_control.Port) !void {
+        var trace: MutationAdmissionTrace = .{};
+        self.sealPreparedEffectsInner(txn_id, frame, catalog_digest, mode, extra_batch, trace.bind(original)) catch |err| return trace.failure orelse err;
+        if (trace.failure) |cause| return cause;
+    }
+
+    fn sealPreparedEffectsInner(self: *TxnManager, txn_id: TxnId, frame: []const u8, catalog_digest: [32]u8, mode: prepared_effects.Mode, extra_batch: MutationExtraBatch, control: ?read_control.Port) !void {
+        const key = makePreparedEffectsKey(txn_id);
+        const requirement_key = makePreparationRequirementKey(txn_id);
+        const record_key = makeRecordKey(txn_id);
+        for (extra_batch.writes) |write| {
+            if (control) |owner| try owner.checkpoint();
+            if (std.mem.eql(u8, write.key, &key) or std.mem.eql(u8, write.key, &requirement_key) or std.mem.eql(u8, write.key, &record_key)) return error.InvalidPreparationRequirement;
+        }
+        for (extra_batch.deletes) |deleted| {
+            if (control) |owner| try owner.checkpoint();
+            if (std.mem.eql(u8, deleted, &key) or std.mem.eql(u8, deleted, &requirement_key) or std.mem.eql(u8, deleted, &record_key)) return error.InvalidPreparationRequirement;
+        }
         const record = try self.loadTransactionRecordWithAdmission(txn_id, control);
         if (record.status != .pending) return TxnError.DecisionConflict;
         if (try self.loadPreparationRequirementInner(txn_id, control)) |required| if (required.mode != mode) return error.PreparationContractConflict;
         const inspection = try prepared_effects.inspect(frame, control);
         const expected = try self.preparedEffectsContractInner(txn_id, catalog_digest, mode, control);
         if (!std.meta.eql(expected, inspection.contract)) return error.PreparedEffectsMismatch;
-        const key = makePreparedEffectsKey(txn_id);
         const previous = self.getAllocWithAdmission(self.alloc, &key, control) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
@@ -1599,9 +1616,14 @@ pub const TxnManager = struct {
                 if (!std.mem.eql(u8, bytes[offset..end], frame[offset..end])) return error.PreparedEffectsConflict;
                 offset = end;
             }
+            try self.applyMutationExtraBatchWithAdmission(extra_batch, control);
             return;
         }
-        try self.applyBatchWithAdmission(&.{.{ .key = &key, .value = frame }}, &.{}, null, control);
+        var writes: std.ArrayListUnmanaged(docstore.KVPair) = .empty;
+        defer writes.deinit(self.alloc);
+        try writes.append(self.alloc, .{ .key = &key, .value = frame });
+        try writes.appendSlice(self.alloc, extra_batch.writes);
+        try self.applyBatchWithAdmission(writes.items, extra_batch.deletes, null, control);
     }
 
     /// Reopen/recovery owns both this decoded slab and any separately staged
@@ -7229,4 +7251,38 @@ test "prepared transaction effects retained decision preserves original admissio
             try std.testing.expectError(cause, manager.getPreparationDecision(id, read_control.Port.init(&payload)));
         }
     }
+}
+
+test "prepared transaction effects ordered seal publishes frame grant and receipt atomically at every allocation" {
+    const Case = struct {
+        fn run(failing: Allocator) !void {
+            const a = std.testing.allocator;
+            var backend = mem_backend.Backend.init(a, .{});
+            defer backend.close();
+            var runtime = try backend.runtimeStore(a, .{});
+            defer runtime.deinit();
+            var manager = try TxnManager.init(a, &runtime);
+            defer manager.deinit();
+            const id: TxnId = @splat(0xe6);
+            try manager.initTransactionRequiringPreparedEffects(id, 1, 1, &.{}, false, true, .{ .mode = .synchronous }, .{}, null);
+            try manager.writeIntents(id, &.{}, &.{});
+            const contract = try manager.preparedEffectsContract(id, @splat(1), .synchronous, null);
+            const frame = try prepared_effects.encode(a, .{ .contract = contract, .effects = .{} }, null);
+            defer a.free(frame);
+            manager.alloc = failing;
+            const result = manager.sealPreparedEffectsWithExtraBatch(id, frame, @splat(1), .synchronous, .{ .writes = &.{.{ .key = "ordered-seal-receipt", .value = "accepted" }} }, null);
+            manager.alloc = a;
+            if (result) |_| {
+                try std.testing.expect(try manager.hasPreparedEffects(id));
+                const value = try manager.getAlloc(a, "ordered-seal-receipt");
+                defer a.free(value);
+                try std.testing.expectEqualStrings("accepted", value);
+            } else |err| {
+                try std.testing.expect(!try manager.hasPreparedEffects(id));
+                try std.testing.expectError(error.NotFound, manager.getAlloc(a, "ordered-seal-receipt"));
+                return err;
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

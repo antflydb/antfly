@@ -23917,6 +23917,36 @@ pub const DB = struct {
         );
     }
 
+    /// Accepted output is prepared before this ordered command. Apply only
+    /// verifies/binds immutable bytes; it never invokes a producer.
+    pub fn sealReplicatedTransactionEffectsAtOrderedReceipt(self: *DB, txn_id: types.TxnId, frame: []const u8, mode: @import("prepared_transaction_effects.zig").Mode, identity: OrderedApplyReceipt, scope: ?[32]u8) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("sealReplicatedTransactionEffectsAtOrderedReceipt", .{ self, txn_id, frame, mode, identity, scope });
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        lockApply(self);
+        defer self.core.unlockApply();
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
+            .already_applied => return,
+            .apply => {},
+        }
+        if (self.local_execution.restore_staging_required.load(.acquire) or scope != null) {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            try @import("restore_staging.zig").requireMutableScope(self.alloc, &read, scope);
+        }
+        try self.core.requirePreparedTransactionProtocol(null);
+        var manager = try self.core.initTxnManager();
+        defer manager.deinit();
+        const decision = try manager.getPreparationDecision(txn_id, null);
+        if (decision.status != .pending) return error.DecisionConflict;
+        const agreed = decision.requirement orelse return error.PreparationContractConflict;
+        if (agreed.mode != mode) return error.PreparationContractConflict;
+        const catalog = try self.core.preparedEffectsCatalogDigest(null);
+        var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = orderedApplyReceiptWrite(identity, &value_buf);
+        try manager.sealPreparedEffectsWithExtraBatch(txn_id, frame, catalog, mode, .{ .writes = &.{marker} }, null);
+    }
+
     pub fn writeIntents(
         self: *DB,
         txn_id: transactions_mod.TxnId,
@@ -24022,18 +24052,37 @@ pub const DB = struct {
         var replication_mutation = try admission.acquireReplicationMutationSharedPreDecisionScoped(self, controls, admission.receiverMutationRoot(self));
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
-        try self.writeTransactionInternal(txn_id, req, null, if (replication_mutation != null) admission.retainedLeaseControls(controls) else controls);
+        try self.writeTransactionInternal(txn_id, req, null, if (replication_mutation != null) admission.retainedLeaseControls(controls) else controls, null);
     }
 
-    pub fn writeReplicatedTransactionAtOrderedReceipt(
+    pub fn writeReplicatedTransactionAtOrderedReceipt(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, identity: OrderedApplyReceipt) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("writeReplicatedTransactionAtOrderedReceipt", .{ self, txn_id, req, identity });
+        return self.writeReplicatedTransactionWithRequirementAtOrderedReceipt(txn_id, req, identity, null);
+    }
+
+    pub fn writeReplicatedTransactionWithRequirementAtOrderedReceipt(
         self: *DB,
         txn_id: types.TxnId,
         req: types.TransactionIntentRequest,
         identity: OrderedApplyReceipt,
+        requirement: ?@import("prepared_transaction_effects.zig").Requirement,
     ) !void {
-        if (comptime storage_engine.enabled) return storage_engine.call("writeReplicatedTransactionAtOrderedReceipt", .{ self, txn_id, req, identity });
+        if (comptime storage_engine.enabled) return storage_engine.call("writeReplicatedTransactionWithRequirementAtOrderedReceipt", .{ self, txn_id, req, identity, requirement });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        try self.writeTransactionInternal(txn_id, req, identity, null);
+        if (requirement != null) {
+            if (req.transforms.len != 0) return error.InvalidBatchRequest;
+            lockApply(self);
+            defer self.core.unlockApply();
+            if (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity) == .already_applied) return;
+            try self.core.requirePreparedTransactionProtocol(null);
+            var manager = try self.core.initTxnManager();
+            defer manager.deinit();
+            const decision = try manager.getPreparationDecision(txn_id, null);
+            if (decision.status != .pending) return error.DecisionConflict;
+            const agreed = decision.requirement orelse return error.PreparationContractConflict;
+            if (agreed.mode != requirement.?.mode) return error.PreparationContractConflict;
+        }
+        try self.writeTransactionInternal(txn_id, req, identity, null, requirement);
     }
 
     fn writeTransactionInternal(
@@ -24042,6 +24091,7 @@ pub const DB = struct {
         req: types.TransactionIntentRequest,
         ordered_receipt: ?OrderedApplyReceipt,
         controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition,
+        requirement: ?@import("prepared_transaction_effects.zig").Requirement,
     ) !void {
         if (ordered_receipt == null) try self.maybeFinalizePendingRowPolicyPublication();
         var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
@@ -24077,7 +24127,7 @@ pub const DB = struct {
                 @import("mutation_admission.zig").retainedLeaseControls(controls)
             else
                 controls;
-            self.writeTransactionInternalOnce(txn_id, req, ordered_receipt, preparation.guard.allocator(), if (verified_principal) |*principal| &principal.value else null, if (row_policy_lease) |*lease| lease else null, prepared_controls) catch |err| switch (err) {
+            self.writeTransactionInternalOnce(txn_id, req, ordered_receipt, preparation.guard.allocator(), if (verified_principal) |*principal| &principal.value else null, if (row_policy_lease) |*lease| lease else null, prepared_controls, requirement) catch |err| switch (err) {
                 error.PreparedGenerationChanged, error.PreparedReadSetChanged => {
                     if (retries >= max_prepared_retries) return err;
                     retries += 1;
@@ -24098,6 +24148,7 @@ pub const DB = struct {
         row_policy_principal: ?*const row_policy_authority_mod.Payload,
         row_policy_lease: ?*const row_policy_gate_mod.Gate.Lease,
         controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition,
+        requirement: ?@import("prepared_transaction_effects.zig").Requirement,
     ) !void {
         if (req.relational_index_maintenance != null and
             (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
@@ -24428,6 +24479,13 @@ pub const DB = struct {
             switch (try orderedApplyDisposition(try readOrderedApplyReceipt(preparation_alloc, self.core.store), identity)) {
                 .already_applied => return,
                 .apply => {},
+            }
+            if (requirement) |required| {
+                try self.core.requirePreparedTransactionProtocol(null);
+                const decision = try topology_manager.getPreparationDecision(txn_id, null);
+                if (decision.status != .pending) return error.DecisionConflict;
+                const agreed = decision.requirement orelse return error.PreparationContractConflict;
+                if (agreed.mode != required.mode) return error.PreparationContractConflict;
             }
             var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
             const marker = orderedApplyReceiptWrite(identity, &value_buf);

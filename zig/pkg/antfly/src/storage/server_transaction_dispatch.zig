@@ -132,6 +132,14 @@ pub fn applyReplicatedTransactionMutationInternalWithExecution(
             );
         },
         .prepare => |prepare| {
+            if (prepare.sealed_effects) |frame| {
+                try @import("antfly_local_sources").api_batch.validatePreparedSealRequest(req);
+                const required = prepare.preparation_requirement orelse return error.InvalidBatchRequest;
+                const entry = raft_entry orelse return error.PreparedTransactionProtocolUnavailable;
+                try db.sealReplicatedTransactionEffectsAtOrderedReceipt(prepare.txn_id, frame, required.mode, entry, req.restore_staging_scope);
+                return;
+            }
+            if (prepare.preparation_requirement != null and raft_entry == null) return error.PreparedTransactionProtocolUnavailable;
             const intents: db_mod.types.TransactionIntentRequest = .{
                 .writes = batchWritesAsTransactionWrites(req.writes),
                 .deletes = req.deletes,
@@ -151,7 +159,7 @@ pub fn applyReplicatedTransactionMutationInternalWithExecution(
                 .relational_repair = req.relational_repair,
             };
             if (raft_entry) |entry|
-                try db.writeReplicatedTransactionAtOrderedReceipt(prepare.txn_id, intents, entry)
+                try db.writeReplicatedTransactionWithRequirementAtOrderedReceipt(prepare.txn_id, intents, entry, prepare.preparation_requirement)
             else if (execution) |original| {
                 var borrow: @import("transaction_execution_admission.zig").Borrow = .{};
                 try db.writeTransactionWithAdmissionControls(prepare.txn_id, intents, try borrow.bind(original));
