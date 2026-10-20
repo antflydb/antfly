@@ -1784,3 +1784,46 @@ test "video H264 continuation preserves separate-plane and dynamic epoch selecti
         try std.testing.expect(compared >= 2);
     }
 }
+
+test "video H264 sparse continuation delivers selections crossed by interleaved field assembly" {
+    const fixture = @embedFile("../testdata/h264-paff-interleaved-8-1.mp4");
+    const oracle = @embedFile("../testdata/h264-paff-interleaved-8-1.nv12");
+    var original_source = media.source.Source{ .allocator = a, .identity = "sparse-fields", .storage = .{ .borrowed = fixture } };
+    var original = try media.mp4.Reader.init(a, &original_source, .{});
+    defer original.deinit();
+    try std.testing.expectEqual(@as(u3, 4), original.track.nal_length_bytes);
+    const data = try std.mem.concat(a, u8, &.{ fixture, &.{ 0, 0, 0, 2, 0x09, 0xf0 } });
+    defer a.free(data);
+    var input = media.source.Source{ .allocator = a, .identity = "sparse-fields-padded", .storage = .{ .borrowed = data } };
+    const packets = try a.alloc(media.mp4.Packet, original.packets.len + 70);
+    defer a.free(packets);
+    packets[0] = original.packets[0];
+    for (packets[1..71]) |*packet| {
+        packet.* = original.packets[1];
+        packet.offset = fixture.len;
+        packet.size = 6;
+        packet.duration = 0;
+        packet.sync = false;
+    }
+    @memcpy(packets[71..], original.packets[1..]);
+    var reader = original;
+    reader.input = &input;
+    reader.packets = packets;
+    const decoder = try video.h264.Incremental.init(a, &reader, .{});
+    defer decoder.deinit();
+    const Capture = struct {
+        seen: [3]bool = @splat(false),
+        fn accept(raw: *anyopaque, slot: usize, frame: *const video.h264.Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const order = [_]usize{ 2, 0, 1 };
+            const size = oracle.len / 3;
+            try std.testing.expect(!self.seen[slot]);
+            try std.testing.expectEqualSlices(u8, oracle[order[slot] * size ..][0..size], frame.nv12);
+            self.seen[slot] = true;
+        }
+    };
+    var capture = Capture{};
+    const stats = try decoder.decodeSelected(&reader, &.{ 72, 0, 71 }, &capture, Capture.accept);
+    for (capture.seen) |seen| try std.testing.expect(seen);
+    try std.testing.expectEqual(packets.len, stats.decoded_packets);
+}
