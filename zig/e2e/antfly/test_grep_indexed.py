@@ -1239,19 +1239,31 @@ def test_logical_scalable_work_profile(stateful_api):
         settling = []
         quiet = 0
         settle_started = time.monotonic()
+        previous_time = settle_started
+        tick_ms = 1000 / os.sysconf("SC_CLK_TCK") if platform.system() == "Linux" else 0
         previous = read_process()
         while quiet < 3 and time.monotonic() - settle_started < 15:
             time.sleep(0.2)
             current = read_process()
+            current_time = time.monotonic()
             cpu_ms = (current["cpu_ns"] - previous["cpu_ns"]) / 1000000
+            # Account for actual scheduling delay and one CPU-accounting tick.
+            # Linux commonly reports CPU in 10 ms steps, not nanoseconds.
+            cpu_limit_ms = (current_time - previous_time) * 1000 * 0.05 + tick_ms
             settling.append(
                 {
-                    "elapsed_ms": (time.monotonic() - settle_started) * 1000,
+                    "elapsed_ms": (current_time - settle_started) * 1000,
                     "cpu_ms": cpu_ms,
+                    "cpu_limit_ms": cpu_limit_ms,
                 }
             )
-            quiet = quiet + 1 if cpu_ms <= 10 else 0
+            quiet = quiet + 1 if cpu_ms <= cpu_limit_ms else 0
             previous = current
+            previous_time = current_time
+        if quiet != 3:
+            Path(destination).with_suffix(".failed.json").write_text(
+                json.dumps({"workload": name, "settling": settling}, indent=2) + "\n"
+            )
         assert quiet == 3, ("server ingestion CPU did not settle", settling)
         runs = []
         initial_process = read_process()
@@ -1383,8 +1395,11 @@ def test_logical_scalable_work_profile(stateful_api):
     Path(destination).write_text(
         json.dumps(
             {
-                "benchmark_protocol_version": 2,
-                "settling_rule": "three consecutive 200 ms process-CPU windows at or below 10 ms, before timed queries; deadline 15 s",
+                "benchmark_protocol_version": 3,
+                "benchmark_driver_sha256": hashlib.sha256(
+                    Path(__file__).read_bytes()
+                ).hexdigest(),
+                "settling_rule": "three consecutive approximately 200 ms windows below 5% of one core plus one CPU-accounting tick, before timed queries; deadline 15 s",
                 "platform": platform.platform(),
                 "machine": platform.machine(),
                 "logical_cpus": os.cpu_count(),
