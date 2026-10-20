@@ -144751,3 +144751,117 @@ test "required replicated begin controlled acknowledgement refuses the retained 
     defer transactions_mod.freeParticipantList(a, resolved);
     try std.testing.expectEqual(@as(usize, 2), resolved.len);
 }
+
+test "db change journal inventory retirement bound includes duplicate lanes and graph endpoints" {
+    const a = std.testing.allocator;
+    const inventory = @import("../artifact_replay_inventory.zig");
+    const owner = "owner\x00fact";
+    const source = "source\x00node";
+    const target = "target\x00node";
+    var tmp = try TestDirectory.init("inventory-replay-bound");
+    defer tmp.cleanup();
+    var db = try DB.open(a, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+    try @import("../artifact_footprint.zig").initializeEmpty(db.core.store);
+    try inventory.initialize(db.core.store);
+    try db.core.index_manager.enrichments.append(a, try @import("catalog/enrichment_catalog.zig").EnrichmentConfig.clone(a, .{
+        .name = "context",
+        .kind = .asset,
+        .source_field = "body",
+        .neighbor_context_json = "{\"graph_index\":\"g\",\"direction\":\"both\"}",
+    }));
+    try db.core.store.put(internal_keys.graph_owning_table_key, "facts");
+    const graph_key = try internal_keys.graphRelationshipArtifactKeyAlloc(a, owner, "g", "R", target, source, "edge\x00id");
+    defer a.free(graph_key);
+    const legacy_graph_key = try internal_keys.graphRelationshipArtifactKeyAlloc(a, owner, "g", "R", "legacy", owner, "");
+    defer a.free(legacy_graph_key);
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(a, owner, "asset", "extract");
+    defer a.free(asset_key);
+    const chunk_key = try internal_keys.chunkArtifactKeyAlloc(a, owner, "chunks", 7);
+    defer a.free(chunk_key);
+    const vector_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, chunk_key, "vectors");
+    defer a.free(vector_key);
+    const graph_value = try enrichment_artifact_codec.encodeGraphEdgeAlloc(a, null, 0, 1, 0, 0, "{}");
+    defer a.free(graph_value);
+    const vector_value = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, null, &.{ 1, 2, 3 });
+    defer a.free(vector_value);
+    try db.core.store.put(graph_key, graph_value);
+    try db.core.store.put(legacy_graph_key, graph_value);
+    try db.core.store.put(asset_key, "{}");
+    try db.core.store.put(chunk_key, "{\"text\":\"piece\"}");
+    try db.core.store.put(vector_key, vector_value);
+    // Low-level fixture seeding must publish the same durable presence marker
+    // as the normal artifact owner, rather than leave its cached absence proof.
+    var presence: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
+    defer presence.deinit(a);
+    try db.core.appendArtifactPresenceMarker(&presence);
+    for (presence.items) |write| try db.core.store.put(write.key, write.value);
+
+    const physical = try internal_keys.documentKeyAlloc(a, owner);
+    defer a.free(physical);
+    const Before = struct {
+        fn load(store: *docstore_mod.DocStore, key: []const u8) !inventory.State {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            return (try inventory.loadDocument(&read, key)) orelse error.InvalidArtifactReplayInventory;
+        }
+    };
+    const initial = try Before.load(db.core.store, physical);
+    try std.testing.expect(initial.count >= 5);
+    // Value growth changes no physical key inventory or retirement wire bound.
+    try db.core.store.put(asset_key, "{\"larger\":\"replacement value\"}");
+    try std.testing.expectEqualDeep(initial, try Before.load(db.core.store, physical));
+    var bound = try initial.retirementReplayShape();
+    // The original public request key is separate from existing artifacts.
+    try bound.deleted_doc_keys.addKey(owner.len);
+    try bound.changed_doc_keys.addKey(owner.len);
+    const removals = [_][]const u8{ graph_key, legacy_graph_key, asset_key, chunk_key, vector_key };
+    const mutable_removals = [_][]u8{ graph_key, legacy_graph_key, asset_key, chunk_key, vector_key };
+    const request: types.BatchRequest = .{ .deletes = &.{owner} };
+    const graph_deletes = [_]types.GraphEdgeDelete{
+        .{ .index_name = "g", .source = source, .target = target, .edge_type = "R", .edge_id = "edge\x00id", .owner_document = owner },
+        .{ .index_name = "g", .source = owner, .target = "legacy", .edge_type = "R", .owner_document = owner },
+    };
+    // Verify both encoder families against the same physical fact. Only the
+    // thin family duplicates each removal in its deleted-document lane.
+    for ([_]bool{ false, true }) |thin| {
+        var targets: ManagedSyncTargets = .{};
+        defer targets.deinit(a);
+        const payload = if (thin)
+            try encodeThinReplayRecordPayload(a, request, &.{}, &mutable_removals, &.{}, &.{}, &.{}, 1, false, db.core.index_manager, &targets, "facts")
+        else
+            try encodeDirectChangeRecordPayload(&db.batchContext(), .{ .deleted_keys = &removals, .changed_artifact_keys = &removals, .graph_deletes = &graph_deletes }, 1, request, "facts");
+        defer a.free(payload);
+        try std.testing.expect(payload.len <= try bound.encodedBytes());
+        var decoded = try change_journal_mod.decodeRecord(a, payload);
+        defer decoded.deinit();
+        for (removals) |key| {
+            var deleted = false;
+            var changed = false;
+            for (decoded.record.deleted_doc_keys) |item| deleted = deleted or std.mem.eql(u8, item, key);
+            for (decoded.record.changed_artifact_keys) |item| changed = changed or std.mem.eql(u8, item, key);
+            try std.testing.expect(deleted and changed);
+        }
+    }
+    const before = replay_stream_mod.lastSequence(db.core.store, 0);
+    try db.batch(.{ .deletes = &.{owner}, .sync_level = .write });
+    const entries = try replay_stream_mod.iterateFrom(a, db.core.store, before + 1);
+    defer {
+        for (entries) |*entry| entry.deinit(a);
+        a.free(entries);
+    }
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expect(entries[0].payload.len <= try bound.encodedBytes());
+    var record = try change_journal_mod.decodeRecord(a, entries[0].payload);
+    defer record.deinit();
+    var owner_deleted = false;
+    for (record.record.deleted_doc_keys) |key| owner_deleted = owner_deleted or std.mem.eql(u8, key, owner);
+    try std.testing.expect(owner_deleted);
+    for (removals) |key| try std.testing.expectError(error.NotFound, db.core.store.get(a, key));
+    for ([_][]const u8{ source, target }) |endpoint| {
+        var found = false;
+        for (record.record.changed_doc_keys) |item| found = found or std.mem.eql(u8, item, endpoint);
+        try std.testing.expect(found);
+    }
+}

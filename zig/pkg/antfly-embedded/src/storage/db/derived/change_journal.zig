@@ -173,7 +173,8 @@ pub const BorrowedBinaryRecordScratch = struct {
     }
 };
 
-const binary_magic = "CJ2\x00";
+pub const wire_shape = @import("../../replay_record_shape.zig");
+const binary_magic = wire_shape.magic;
 const FieldMask = packed struct(u8) {
     changed_doc_keys: bool = false,
     deleted_doc_keys: bool = false,
@@ -380,19 +381,17 @@ pub fn encodeRecord(alloc: Allocator, record: Record) ![]u8 {
 /// It does not predict which artifact keys a later mutation will produce.
 pub fn encodedRecordSize(record: Record, control: ?read_control.Port) !usize {
     if (control) |port| try port.checkpoint();
-    var size: usize = binary_magic.len + 2 + 8 + 1 + 1;
-    inline for (.{ record.changed_doc_keys, record.deleted_doc_keys, record.overwritten_doc_keys, record.changed_artifact_keys }) |keys| {
+    var shape: wire_shape.Record = .{};
+    inline for (comptime std.meta.fieldNames(wire_shape.Record)) |name| {
+        const keys = @field(record, name);
         if (keys.len > std.math.maxInt(u32)) return error.RecordTooLarge;
-        if (keys.len != 0) size = std.math.add(usize, size, 4) catch return error.RecordTooLarge;
         for (keys, 0..) |key, index| {
             if (index % 64 == 0) if (control) |port| try port.checkpoint();
-            if (key.len > std.math.maxInt(u32)) return error.RecordTooLarge;
-            size = std.math.add(usize, size, 4) catch return error.RecordTooLarge;
-            size = std.math.add(usize, size, key.len) catch return error.RecordTooLarge;
+            try @field(shape, name).addKey(key.len);
         }
     }
     if (control) |port| try port.checkpoint();
-    return size;
+    return std.math.cast(usize, try shape.encodedBytes()) orelse error.RecordTooLarge;
 }
 
 /// Fund one exact buffer before copying. Checks bound key copying to 4 KiB and

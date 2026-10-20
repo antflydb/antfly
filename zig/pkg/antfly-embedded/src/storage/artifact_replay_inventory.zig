@@ -50,6 +50,25 @@ pub const State = struct {
         if (!result.valid()) return error.InvalidArtifactReplayInventory;
         return result;
     }
+    /// Conservative CJ2 contribution of retiring this physical inventory.
+    /// A removed key can occupy both deleted_doc_keys and changed_artifact_keys.
+    /// Graph removals can also name owner/source/target in changed_doc_keys;
+    /// their combined decoded lengths fit inside the encoded relationship key.
+    /// Charging every physical key for these lanes safely includes non-graph
+    /// metadata too. Deduplication may only reduce the actual record.
+    /// Request keys, new generated effects and persistence envelopes are extra.
+    /// Missing/invalidated inventory must be reconciled, never passed as zero.
+    pub fn retirementReplayShape(self: State) !@import("replay_record_shape.zig").Record {
+        if (!self.valid()) return error.InvalidArtifactReplayInventory;
+        const shape: @import("replay_record_shape.zig").Record = .{
+            .changed_doc_keys = .{ .count = std.math.mul(u64, self.count, 3) catch return error.RecordTooLarge, .key_bytes = self.key_bytes },
+            .deleted_doc_keys = .{ .count = self.count, .key_bytes = self.key_bytes },
+            .changed_artifact_keys = .{ .count = self.count, .key_bytes = self.key_bytes },
+        };
+        _ = try shape.encodedBytes();
+        return shape;
+    }
+
     fn change(self: State, len: usize, present: bool) !State {
         const result: State = if (present) .{
             .count = std.math.add(u64, self.count, 1) catch return error.InvalidArtifactReplayInventory,
@@ -479,4 +498,18 @@ test "artifact replay inventory capture owns all allocation failures and refuses
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "artifact replay inventory retirement shape preserves additive growth and rejects overflow" {
+    const first: State = .{ .count = 2, .key_bytes = 20 };
+    const second: State = .{ .count = 3, .key_bytes = 45 };
+    const combined: State = .{ .count = 5, .key_bytes = 65 };
+    const shape = try (try first.retirementReplayShape()).plus(try second.retirementReplayShape());
+    try std.testing.expectEqualDeep(try combined.retirementReplayShape(), shape);
+    try std.testing.expect((try shape.encodedBytes()) > (try (try first.retirementReplayShape()).encodedBytes()));
+    try std.testing.expectEqual(@as(u64, 16), try (try (State{}).retirementReplayShape()).encodedBytes());
+    try std.testing.expectError(error.InvalidArtifactReplayInventory, (State{ .key_bytes = 1 }).retirementReplayShape());
+    const too_many = @as(u64, std.math.maxInt(u32)) / 3 + 1;
+    try std.testing.expectError(error.RecordTooLarge, (State{ .count = too_many, .key_bytes = too_many }).retirementReplayShape());
+    try std.testing.expectError(error.RecordTooLarge, (State{ .count = 1, .key_bytes = std.math.maxInt(u64) }).retirementReplayShape());
 }
