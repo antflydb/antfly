@@ -1871,6 +1871,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "table contract admits and preserves multi-source index requests",
         "table contract enforces stable graph source identities and numeric targets",
         "table contract admits and projects explicit embedding vector space",
+        "table contract retains pinned embedding identity through table and index admission and responses",
         "create index request defers upstream artifact resolution to merged catalog",
         "table contract rejects malformed multi-source members",
         "table contract rejects ambiguous index source spellings",

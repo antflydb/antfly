@@ -41,11 +41,21 @@ const DenseJsonEmbeddingObject = struct {
 
 const JsonEmbeddingResponse = struct {
     data: []const DenseJsonEmbeddingObject,
+    model_identity: ?[]const u8 = null,
 };
 
-fn parseDenseJsonResponseAlloc(alloc: std.mem.Allocator, body: []const u8) !inference.EmbedResult {
-    var parsed = try std.json.parseFromSlice(JsonEmbeddingResponse, alloc, body, .{ .ignore_unknown_fields = true });
+fn parseDenseJsonResponseAlloc(alloc: std.mem.Allocator, body: []const u8, expected_identity: ?[]const u8) !inference.EmbedResult {
+    var parsed = std.json.parseFromSlice(JsonEmbeddingResponse, alloc, body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidEmbeddingResponse,
+    };
     defer parsed.deinit();
+    // Validate in the typed vector decode, before acquiring output ownership.
+    // A second Value parse would allocate a JSON node for every vector element.
+    if (expected_identity) |expected| {
+        const actual = parsed.value.model_identity orelse return error.InvalidEmbeddingIdentity;
+        if (!std.mem.eql(u8, actual, expected)) return error.EmbeddingIdentityMismatch;
+    }
     if (parsed.value.data.len == 0) return error.EmptyResponse;
 
     const vectors = try alloc.alloc([]const f32, parsed.value.data.len);
@@ -585,7 +595,12 @@ pub const Provider = struct {
     fn numericRequestOptions(self: *Provider, options: httpx.RequestOptions) httpx.RequestOptions {
         var result = options;
         const count = if (options.headers) |headers| headers.len else 0;
-        self.request_header_storage[count] = .{ "Accept", if (self.numeric_dense_dimensions != null) httpx.numeric_response.content_type else httpx.numeric_response.accept };
+        self.request_header_storage[count] = .{ "Accept", if (self.model_identity != null)
+            "application/json"
+        else if (self.numeric_dense_dimensions != null)
+            httpx.numeric_response.content_type
+        else
+            httpx.numeric_response.accept };
         result.headers = self.request_header_storage[0 .. count + 1];
         return result;
     }
@@ -799,20 +814,16 @@ pub const Provider = struct {
         }
 
         const body = resp.body orelse return error.EmptyResponse;
-        if (self.model_identity) |expected| {
-            const parsed_identity = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
-            defer parsed_identity.deinit();
-            if (parsed_identity.value != .object) return error.InvalidEmbeddingIdentity;
-            const actual = parsed_identity.value.object.get("model_identity") orelse return error.InvalidEmbeddingIdentity;
-            if (actual != .string or !std.mem.eql(u8, actual.string, expected)) return error.EmbeddingIdentityMismatch;
-        }
         if (resp.contentType()) |ct| if (std.ascii.eqlIgnoreCase(ct, httpx.numeric_response.content_type)) {
+            // Numeric frames carry no model identity. A server ignoring JSON
+            // negotiation must not bypass a caller's pinned vector space.
+            if (self.model_identity != null) return error.InvalidEmbeddingIdentity;
             const view = try httpx.numeric_response.parse(body, .dense, expected_count, self.numeric_dense_dimensions);
             return .{ .vectors = try view.denseAlloc(alloc), .dimension = view.columns, .allocator = alloc };
         };
 
         if (self.numeric_dense_dimensions != null) return error.InferenceCapabilitiesStale;
-        var result = try parseDenseJsonResponseAlloc(alloc, body);
+        var result = try parseDenseJsonResponseAlloc(alloc, body, self.model_identity);
         errdefer result.deinit();
         if (result.vectors.len != expected_count) return error.InvalidEmbeddingResponse;
         return result;
@@ -1173,6 +1184,7 @@ test "antfly dense JSON response cleanup is allocation-failure safe" {
             var result = try parseDenseJsonResponseAlloc(
                 alloc,
                 "{\"data\":[{\"embedding\":[1,2,3]},{\"embedding\":[4,5,6]}]}",
+                null,
             );
             result.deinit();
         }
@@ -1180,8 +1192,41 @@ test "antfly dense JSON response cleanup is allocation-failure safe" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
+test "antfly dense JSON response validates model identity before returning vectors" {
+    const a = std.testing.allocator;
+    const body = "{\"data\":[{\"embedding\":[1,2,3]}],\"model_identity\":\"pinned\"}";
+    var result = try parseDenseJsonResponseAlloc(a, body, "pinned");
+    defer result.deinit();
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3 }, result.vectors[0]);
+    try std.testing.expectError(error.EmbeddingIdentityMismatch, parseDenseJsonResponseAlloc(a, body, "changed"));
+    // Invalid JSON shapes stay in the provider's stable response error domain;
+    // parser-private errors must not kill a foreign enrichment worker.
+    try std.testing.expectError(error.InvalidEmbeddingResponse, parseDenseJsonResponseAlloc(a, "{\"data\":[{\"embedding\":[1,2,3]}],\"model_identity\":7}", "pinned"));
+    inline for (.{ "{\"data\":[{\"embedding\":[1,2,3]}]}", "{\"data\":[{\"embedding\":[1,2,3]}],\"model_identity\":null}" }) |missing| {
+        try std.testing.expectError(error.InvalidEmbeddingIdentity, parseDenseJsonResponseAlloc(a, missing, "pinned"));
+    }
+}
+
+test "antfly pinned dense decode stays within the typed vector memory budget" {
+    const a = std.testing.allocator;
+    var vector: [1024]f32 = @splat(0.5);
+    const body = try std.json.Stringify.valueAlloc(a, .{
+        .model_identity = "pinned",
+        .data = [_]DenseJsonEmbeddingObject{ .{ .embedding = &vector }, .{ .embedding = &vector } },
+    }, .{});
+    defer a.free(body);
+    // Includes temporary typed decoding and the owned output vectors. Parsing
+    // each scalar into a Value tree would exceed this budget before decoding.
+    var scratch: [64 * 1024]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&scratch);
+    var result = try parseDenseJsonResponseAlloc(bounded.allocator(), body, "pinned");
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.vectors.len);
+    try std.testing.expectEqualSlices(f32, &vector, result.vectors[1]);
+}
+
 test "antfly embed parts uses the framed attachment transport" {
-    return testEmbedPartsRequestRoundTrip(false, false);
+    return testEmbedPartsRequestRoundTrip(false, false, false);
 }
 
 test "antfly embed request carries retrieval task and instruction" {
@@ -1203,19 +1248,24 @@ test "antfly embed request carries retrieval task and instruction" {
 }
 
 test "antfly embed parts lends raw binary through its request envelope" {
-    return testEmbedPartsRequestRoundTrip(false, false);
+    return testEmbedPartsRequestRoundTrip(false, false, false);
 }
 
 test "antfly numeric responses negotiate dense and score frames with JSON fallback" {
-    try testEmbedPartsRequestRoundTrip(false, false);
-    try testEmbedPartsRequestRoundTrip(true, false);
-    try testEmbedPartsRequestRoundTrip(true, true);
-    try testEmbedPartsRequestRoundTrip(false, true);
+    try testEmbedPartsRequestRoundTrip(false, false, false);
+    try testEmbedPartsRequestRoundTrip(true, false, false);
+    try testEmbedPartsRequestRoundTrip(true, true, false);
+    try testEmbedPartsRequestRoundTrip(false, true, false);
     try testRerankScoresResponse(false);
     try testRerankScoresResponse(true);
 }
 
-fn testEmbedPartsRequestRoundTrip(comptime binary_response: bool, comptime required: bool) !void {
+test "antfly pinned embeddings negotiate JSON and reject identity-free numeric frames" {
+    try testEmbedPartsRequestRoundTrip(false, true, true);
+    try testEmbedPartsRequestRoundTrip(true, true, true);
+}
+
+fn testEmbedPartsRequestRoundTrip(comptime binary_response: bool, comptime required: bool, comptime pinned: bool) !void {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -1225,7 +1275,7 @@ fn testEmbedPartsRequestRoundTrip(comptime binary_response: bool, comptime requi
         fn request(req: httpx.testing_mod.RequestInfo) !void {
             try std.testing.expectEqual(httpx.Method.POST, req.method);
             try std.testing.expectEqualStrings("/embed", req.path);
-            try std.testing.expectEqualStrings(if (required) httpx.numeric_response.content_type else httpx.numeric_response.accept, req.header("Accept") orelse return error.TestExpectedAccept);
+            try std.testing.expectEqualStrings(if (pinned) "application/json" else if (required) httpx.numeric_response.content_type else httpx.numeric_response.accept, req.header("Accept") orelse return error.TestExpectedAccept);
             try std.testing.expectEqualStrings(
                 httpx.attachment_envelope.content_type,
                 req.header("Content-Type") orelse return error.TestExpectedContentType,
@@ -1245,7 +1295,7 @@ fn testEmbedPartsRequestRoundTrip(comptime binary_response: bool, comptime requi
     for ([_]f32{ 0.25, 0.5, 0.75 }, 0..) |value, i| try httpx.numeric_response.setValue(frame, i, value);
     var ts = try httpx.TestServer.start(alloc, io, &.{
         .{ .method = .POST, .path = "/embed", .assert_request = Assert.request, .respond = .{
-            .body = if (binary_response) frame else "{\"data\":[{\"embedding\":[0.25,0.5,0.75]}]}",
+            .body = if (binary_response) frame else "{\"model_identity\":\"pinned\",\"data\":[{\"embedding\":[0.25,0.5,0.75]}]}",
             .content_type = if (binary_response) httpx.numeric_response.content_type else "application/json",
         } },
     });
@@ -1267,6 +1317,7 @@ fn testEmbedPartsRequestRoundTrip(comptime binary_response: bool, comptime requi
             var provider = Provider.init(request_alloc, &client, base);
             defer provider.deinit();
             provider.setFramedAttachments(true);
+            if (pinned) provider.model_identity = "pinned";
             if (required) {
                 provider.numeric_dense_dimensions = 3;
                 provider.setMaxResponseBytes(4096);
@@ -1290,7 +1341,12 @@ fn testEmbedPartsRequestRoundTrip(comptime binary_response: bool, comptime requi
     try ts.handleOne();
     group.await(io) catch {};
 
-    if (required and !binary_response) {
+    if (pinned and binary_response) {
+        try std.testing.expect(!result_ok);
+        try std.testing.expectEqual(error.InvalidEmbeddingIdentity, result_err);
+        return;
+    }
+    if (required and !binary_response and !pinned) {
         try std.testing.expect(!result_ok);
         try std.testing.expectEqual(error.InferenceCapabilitiesStale, result_err);
         return;
