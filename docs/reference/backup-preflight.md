@@ -92,11 +92,22 @@ templates. Their named retained artifacts are inspected as single values,
 arrays, or `items` envelopes using the execution path's collection selection.
 Unsupported helpers remain uninspectable even when no prior artifact exists.
 
+Grouped chunk and embedding consumers follow the execution planner's upstream
+group resolution, including dependencies declared before their group. The
+inspector selects synthesized unit text from retained group assets and private
+unit documents. Grouped model evidence also binds the group source definition,
+including its source field, filtering, ordering and window policy.
+
 Simple field paths, simple substitutions and static `media`, `remoteMedia`,
-`remoteText` and `remotePDF` URL arguments are analyzed without execution.
-Unsupported helper syntax, composed locators and custom loaders are reported as
-`dependency_uninspectable`. This deliberately does not claim to interpret all
-Handlebars programs. Unsupported schemes and structured locators are
+`remoteText` and `remotePDF` URL arguments are analyzed without helper execution.
+The inspector uses the runtime's Handlebars parser and path lookup, and combines
+supported literal/substitution output before scanning media directives. No helper
+is called. Remote helpers use `credentials="name"` (or a supported field reference); quoting and argument
+order follow the runtime parser.
+
+Unsupported helper syntax, opaque helper output composed into locators, and
+custom loaders are reported as `dependency_uninspectable`. This deliberately
+does not claim to interpret all Handlebars programs. Unsupported schemes and structured locators are
 `source_unresolved`. Local paths/gateways and credential-bearing or expiring
 URLs block compatibility. Archive-member and page/fragment selection generate
 separate destination retrieval requirements. No resolver or URL rewrite occurs.

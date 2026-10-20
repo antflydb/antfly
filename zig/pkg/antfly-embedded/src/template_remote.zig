@@ -490,7 +490,7 @@ fn remotePdfHelperImpl(ctx: hbs.HelperContext) anyerror!hbs.Value {
 }
 
 fn credentialName(ctx: hbs.HelperContext) !?[]const u8 {
-    const value = ctx.hash.get("credentials") orelse return null;
+    const value = ctx.hash.get(template_mod.remote_credentials_argument) orelse return null;
     return switch (value) {
         .string => |text| if (text.len > 0) text else error.InvalidCredentialName,
         else => error.InvalidCredentialName,

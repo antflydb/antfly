@@ -881,7 +881,8 @@ pub const Eval = struct {
     // Path resolution
     // ---------------------------------------------------------------
 
-    fn resolvePath(self: *Eval, path: *const ast.Path) Value {
+    /// Borrow a path value without evaluating an expression or calling helpers.
+    pub fn resolvePath(self: *Eval, path: *const ast.Path) Value {
         // Data references (@index, @key, @root, etc.)
         if (path.data) {
             return self.resolveDataPath(path);

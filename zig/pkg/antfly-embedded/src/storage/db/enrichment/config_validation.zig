@@ -350,20 +350,7 @@ pub fn requiredReaderVersion(alloc: Allocator, cfg: @import("../catalog/enrichme
 }
 
 pub fn priorSharesGroup(configs: anytype, name: []const u8, prior: []const u8) bool {
-    const current_root = groupRoot(configs, name) orelse return false;
-    const prior_root = groupRoot(configs, prior) orelse return false;
+    const current_root = @import("enrichment_types.zig").groupRoot(configs, name) orelse return false;
+    const prior_root = @import("enrichment_types.zig").groupRoot(configs, prior) orelse return false;
     return std.mem.eql(u8, current_root, prior_root);
-}
-fn groupRoot(configs: anytype, name: []const u8) ?[]const u8 {
-    var current = name;
-    for (0..configs.len + 1) |_| {
-        const entry = for (configs) |cfg| {
-            if (std.mem.eql(u8, cfg.name, current)) break cfg;
-        } else return null;
-        const is_group = if (@hasField(@TypeOf(entry), "group_source_json")) entry.group_source_json.len > 0 else entry.kind == .group;
-        if (is_group) return entry.name;
-        current = entry.source_artifact_name;
-        if (current.len == 0) return null;
-    }
-    return null;
 }

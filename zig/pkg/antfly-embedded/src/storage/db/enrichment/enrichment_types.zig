@@ -16,12 +16,30 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+/// The grouped planner replaces declared selectors with this synthetic input.
+pub const grouped_source_field = "_group_unit.text";
+
+/// Resolve the same upstream group for public, durable, and inspection catalogs.
+pub fn groupRoot(configs: anytype, name: []const u8) ?[]const u8 {
+    var current = name;
+    for (0..configs.len + 1) |_| {
+        const entry = for (configs) |cfg| {
+            if (std.mem.eql(u8, cfg.name, current)) break cfg;
+        } else return null;
+        const is_group = if (@hasField(@TypeOf(entry), "group_source_json")) entry.group_source_json.len > 0 else entry.kind == .group;
+        if (is_group) return entry.name;
+        current = entry.source_artifact_name;
+        if (current.len == 0) return null;
+    }
+    return null;
+}
+
 /// Borrowed runtime source-field selection. Public field names are literal
 /// object keys; only grouped execution supplies the synthetic group unit path.
 /// Template paths are interpreted separately by the template engine.
 pub fn sourceFieldValue(root: std.json.Value, field: []const u8, grouped: bool) std.json.Value {
     if (root != .object) return .null;
-    if (grouped and std.mem.eql(u8, field, "_group_unit.text")) {
+    if (grouped and std.mem.eql(u8, field, grouped_source_field)) {
         const unit = root.object.get("_group_unit") orelse return .null;
         if (unit != .object) return .null;
         return unit.object.get("text") orelse .null;

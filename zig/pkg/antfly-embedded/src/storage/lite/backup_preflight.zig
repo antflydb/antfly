@@ -26,6 +26,8 @@ const staging = @import("restore_staging.zig");
 const resolver_catalog = @import("../db/catalog/resolver_catalog.zig");
 const ProducerType = @import("../db/enrichment/asset_producer.zig").ProducerType;
 const enrichment_types = @import("../db/enrichment/enrichment_types.zig");
+const hbs = @import("handlebars");
+const template_runtime = @import("../../template.zig");
 const chunking_types = @import("../../chunking/types.zig");
 
 pub const report_version = 1;
@@ -294,7 +296,7 @@ fn modelBackedProducer(producer: Value) bool {
 }
 
 const SourceInput = enum { text, locator, model_chunk, prior_context };
-const Selector = struct { field: []const u8, template: []const u8, artifact: []const u8, input: SourceInput, dynamic: bool };
+const Selector = struct { field: []const u8, template: []const u8, program: ?hbs.Template = null, artifact: []const u8, input: SourceInput, dynamic: bool, grouped: bool };
 pub const Inspector = struct {
     allocator: Allocator,
     report: *Report,
@@ -303,14 +305,25 @@ pub const Inspector = struct {
     definition_bytes: usize = 0,
     model_names: std.ArrayListUnmanaged(Digest) = .empty,
     decoder: portable.InspectionDocumentDecoder = .{},
+    sources: std.ArrayListUnmanaged(SourceBinding) = .empty,
+    source_bytes: usize = 0,
+
+    const SourceBinding = struct { name: []const u8, source_artifact_name: []const u8, group_source_json: []const u8 };
 
     pub fn deinit(self: *@This()) void {
-        for (self.definitions.items) |s| {
+        for (self.definitions.items) |*s| {
+            if (s.program) |*program| program.deinit();
             self.allocator.free(s.field);
             self.allocator.free(s.template);
             self.allocator.free(s.artifact);
         }
         self.definitions.deinit(self.allocator);
+        for (self.sources.items) |source| {
+            self.allocator.free(source.name);
+            self.allocator.free(source.source_artifact_name);
+            self.allocator.free(source.group_source_json);
+        }
+        self.sources.deinit(self.allocator);
         self.decoder.deinit(self.allocator);
         self.model_names.deinit(self.allocator);
     }
@@ -406,6 +419,7 @@ pub const Inspector = struct {
         if (bytes.len > self.options.max_metadata_bytes) return error.PreflightLimitExceeded;
         var parsed = try std.json.parseFromSlice(Value, self.allocator, bytes, .{});
         defer parsed.deinit();
+        try self.collectSources(parsed.value, 0);
         try self.config(parsed.value, 0, "");
     }
 
@@ -417,12 +431,70 @@ pub const Inspector = struct {
         defer parsed.deinit();
         switch (parsed.value) {
             .object => |object| {
+                var sources = object.iterator();
+                while (sources.next()) |entry| try self.collectSources(entry.value_ptr.*, 0);
                 var it = object.iterator();
                 while (it.next()) |entry| try self.config(entry.value_ptr.*, 0, entry.key_ptr.*);
             },
-            .array => try self.config(parsed.value, 0, ""),
+            .array => {
+                try self.collectSources(parsed.value, 0);
+                try self.config(parsed.value, 0, "");
+            },
             else => return error.InvalidBackupRequest,
         }
+    }
+
+    // Prime the whole catalog before selectors are compiled: consumers may
+    // precede their upstream group, or reach it through multiple artifacts.
+    fn collectSources(self: *@This(), value: Value, depth: usize) anyerror!void {
+        if (depth > 32) return error.PreflightLimitExceeded;
+        try self.options.cancellation.check();
+        if (value == .array) {
+            for (value.array.items) |item| try self.collectSources(item, depth + 1);
+            return;
+        }
+        if (value != .object) return;
+        const kind = str(get(value, "kind"));
+        const name = str(get(value, "name"));
+        if (name.len > 0 and (eq(kind, "asset") or eq(kind, "chunk") or eq(kind, "embedding") or eq(kind, "group"))) {
+            var public_group: ?[]u8 = null;
+            defer if (public_group) |json| self.allocator.free(json);
+            if (eq(kind, "group")) public_group = try std.json.Stringify.valueAlloc(self.allocator, get(value, "source"), .{});
+            const raw_group = public_group orelse str(get(value, "group_source_json"));
+            var normalized_group: ?[]u8 = null;
+            defer if (normalized_group) |json| self.allocator.free(json);
+            if (raw_group.len > 0) {
+                const parsed = try std.json.parseFromSlice(@import("../db/group_sources.zig").Config, self.allocator, raw_group, .{});
+                defer parsed.deinit();
+                try parsed.value.validate();
+                const json = try std.json.Stringify.valueAlloc(self.allocator, parsed.value, .{});
+                defer self.allocator.free(json);
+                const value_json = try std.json.parseFromSlice(Value, self.allocator, json, .{});
+                defer value_json.deinit();
+                normalized_group = try canonical.canonicalJsonValueAlloc(self.allocator, value_json.value);
+            }
+            const group = normalized_group orelse "";
+            const upstream = str(get(value, "source_artifact_name"));
+            const exists = for (self.sources.items) |prior| {
+                if (eq(prior.name, name)) {
+                    if (!eq(prior.source_artifact_name, upstream) or !eq(prior.group_source_json, group)) return error.InvalidBackupRequest;
+                    break true;
+                }
+            } else false;
+            if (!exists) {
+                const bytes = name.len + upstream.len + group.len;
+                if (self.sources.items.len >= self.options.max_definitions or bytes > self.options.max_metadata_bytes -| self.source_bytes -| self.definition_bytes) return error.PreflightLimitExceeded;
+                const owned_name = try self.allocator.dupe(u8, name);
+                errdefer self.allocator.free(owned_name);
+                const owned_upstream = try self.allocator.dupe(u8, upstream);
+                errdefer self.allocator.free(owned_upstream);
+                const owned_group = try self.allocator.dupe(u8, group);
+                errdefer self.allocator.free(owned_group);
+                try self.sources.append(self.allocator, .{ .name = owned_name, .source_artifact_name = owned_upstream, .group_source_json = owned_group });
+                self.source_bytes += bytes;
+            }
+        }
+        if (get(value, "enrichments") != .null) try self.collectSources(get(value, "enrichments"), depth + 1);
     }
 
     pub fn replicationSourcesJson(self: *@This(), bytes: []const u8) !void {
@@ -453,7 +525,24 @@ pub const Inspector = struct {
         const parsed = try std.json.parseFromValue(@import("../db/group_sources.zig").PriorContext, self.allocator, value, .{});
         defer parsed.deinit();
         try parsed.value.validate();
-        try self.selector("prior_context.render", parsed.value.render, parsed.value.artifact, .prior_context, false);
+        try self.selector("prior_context.render", parsed.value.render, parsed.value.artifact, .prior_context, false, false);
+    }
+
+    fn definitionIdentity(self: *@This(), value: Value, group: ?[]const u8) ![]u8 {
+        if (group) |name| {
+            for (self.sources.items) |source| if (eq(source.name, name)) {
+                const parsed = try std.json.parseFromSlice(Value, self.allocator, source.group_source_json, .{});
+                defer parsed.deinit();
+                var identity: std.json.ObjectMap = .empty;
+                defer identity.deinit(self.allocator);
+                try identity.put(self.allocator, "definition", value);
+                try identity.put(self.allocator, "group_source", parsed.value);
+                try identity.put(self.allocator, "group_artifact", .{ .string = name });
+                return canonical.canonicalJsonValueAlloc(self.allocator, .{ .object = identity });
+            };
+            return error.InvalidBackupRequest;
+        }
+        return canonical.canonicalJsonValueAlloc(self.allocator, value);
     }
 
     fn config(self: *@This(), value: Value, depth: usize, catalog_name: []const u8) anyerror!void {
@@ -505,15 +594,16 @@ pub const Inspector = struct {
         if (producer_json.len > 0) producer_parsed = try std.json.parseFromSlice(Value, self.allocator, producer_json, .{});
         const producer = if (producer_parsed) |p| p.value else get(value, "producer");
         const producer_type = str(get(producer, "type"));
-        const field = blk: {
+        const group = if (eq(kind, "chunk") or eq(kind, "embedding")) enrichment_types.groupRoot(self.sources.items, str(get(value, "name"))) else null;
+        const field = if (group != null) enrichment_types.grouped_source_field else blk: {
             const f = str(get(value, "source_field"));
             break :blk if (f.len > 0) f else str(get(value, "field"));
         };
-        const template = blk: {
+        const template = if (group != null) "" else blk: {
             const t = str(get(value, "source_template"));
             break :blk if (t.len > 0) t else str(get(value, "template"));
         };
-        const artifact = str(get(value, "source_artifact_name"));
+        const artifact = group orelse str(get(value, "source_artifact_name"));
         var model_chunk = false;
         const chunker_json = str(get(value, "chunker_json"));
         if (eq(kind, "chunk") and chunker_json.len > 0) {
@@ -521,7 +611,7 @@ pub const Inspector = struct {
             defer chunk_config.deinit(self.allocator);
             if (chunk_config.embedding) |target| {
                 model_chunk = true;
-                const identity = try canonical.canonicalJsonValueAlloc(self.allocator, value);
+                const identity = try self.definitionIdentity(value, group);
                 defer self.allocator.free(identity);
                 const dims: u32 = if (target.dimensions) |d| if (d > 0 and d <= std.math.maxInt(u32)) @intCast(d) else 0 else 0;
                 try self.report.add(self.options, .model, identity, "", field, dims);
@@ -533,7 +623,7 @@ pub const Inspector = struct {
         if (!known) try self.report.add(self.options, .dynamic_loader, "producer", "", field, 0);
         if (is_definition and (field.len > 0 or template.len > 0 or artifact.len > 0)) {
             const locator_mode = eq(producer_type, "reader") or eq(producer_type, "transcriber") or eq(producer_type, "document_extraction") or eq(str(get(value, "embedding_input")), "pdf_page_images") or eq(str(get(value, "input")), "pdf_page_images") or eq(str(get(value, "embedding_input")), "image") or eq(str(get(value, "embedding_input")), "audio") or eq(str(get(value, "embedding_input")), "video") or get(value, "transcriber") != .null;
-            try self.selector(field, template, artifact, if (model_chunk) .model_chunk else if (locator_mode) .locator else .text, !known);
+            try self.selector(field, template, artifact, if (model_chunk) .model_chunk else if (locator_mode) .locator else .text, !known, group != null);
         }
         if (is_embedding) {
             const name = if (str(get(value, "name")).len > 0) str(get(value, "name")) else catalog_name;
@@ -550,7 +640,7 @@ pub const Inspector = struct {
             if (!try self.hasModelIdentity(value, 0)) dims = 0;
             // The whole semantic definition binds model/version, preprocessing,
             // template, input modality, dimensions and vector-space assertion.
-            const identity = try canonical.canonicalJsonValueAlloc(self.allocator, value);
+            const identity = try self.definitionIdentity(value, group);
             defer self.allocator.free(identity);
             try self.report.add(self.options, .model, identity, "", str(get(value, "name")), dims);
         }
@@ -558,7 +648,7 @@ pub const Inspector = struct {
         // explicit model). Bind the enclosing producer definition, including
         // its source and template, rather than certifying it from model names.
         if (modelBackedProducer(producer) or get(value, "transcriber") != .null or str(get(value, "model")).len > 0) {
-            const identity = try canonical.canonicalJsonValueAlloc(self.allocator, value);
+            const identity = try self.definitionIdentity(value, group);
             defer self.allocator.free(identity);
             try self.report.add(self.options, .producer_model, identity, "", "model", 0);
         }
@@ -629,21 +719,27 @@ pub const Inspector = struct {
         return false;
     }
 
-    fn selector(self: *@This(), field: []const u8, template: []const u8, artifact: []const u8, input: SourceInput, dynamic: bool) !void {
-        if (self.definitions.items.len >= self.options.max_definitions or field.len + template.len + artifact.len > self.options.max_metadata_bytes -| self.definition_bytes) return error.PreflightLimitExceeded;
-        for (self.definitions.items) |prior| if (eq(prior.field, field) and eq(prior.template, template) and eq(prior.artifact, artifact) and prior.input == input and prior.dynamic == dynamic) return;
+    fn selector(self: *@This(), field: []const u8, template: []const u8, artifact: []const u8, input: SourceInput, dynamic: bool, grouped: bool) !void {
+        if (self.definitions.items.len >= self.options.max_definitions or field.len + template.len + artifact.len > self.options.max_metadata_bytes -| self.definition_bytes -| self.source_bytes) return error.PreflightLimitExceeded;
+        for (self.definitions.items) |prior| if (eq(prior.field, field) and eq(prior.template, template) and eq(prior.artifact, artifact) and prior.input == input and prior.dynamic == dynamic and prior.grouped == grouped) return;
         const a = self.allocator;
+        var appended = false;
         const f = try a.dupe(u8, field);
-        errdefer a.free(f);
+        errdefer if (!appended) a.free(f);
         const t = try a.dupe(u8, template);
-        errdefer a.free(t);
+        errdefer if (!appended) a.free(t);
         const ar = try a.dupe(u8, artifact);
-        errdefer a.free(ar);
-        try self.definitions.append(a, .{ .field = f, .template = t, .artifact = ar, .input = input, .dynamic = dynamic });
+        errdefer if (!appended) a.free(ar);
+        var program = if (template.len > 0) try self.compileTemplate(t, field) else null;
+        errdefer if (!appended) {
+            if (program) |*parsed| parsed.deinit();
+        };
+        try self.definitions.append(a, .{ .field = f, .template = t, .program = program, .artifact = ar, .input = input, .dynamic = dynamic, .grouped = grouped });
+        appended = true;
         self.definition_bytes += field.len + template.len + artifact.len;
         // Empty tables still carry a future-ingestion dependency.
         if (dynamic) try self.report.add(self.options, .dynamic_loader, "loader", "", field, 0);
-        if (template.len > 0) try self.templateSources(template, .null, "", field, input == .locator, true);
+        if (program) |parsed| try self.templateSources(parsed.program, .null, "", field, input == .locator, true);
     }
 
     pub fn document(self: *@This(), id: []const u8, bytes: []const u8, artifact: []const u8) !void {
@@ -654,7 +750,9 @@ pub const Inspector = struct {
             else => {
                 if (artifact.len > 0) {
                     for (self.definitions.items) |s| if (eq(s.artifact, artifact)) {
-                        if (s.input == .prior_context) {
+                        if (s.grouped) {
+                            try self.report.add(self.options, .source_unresolved, "group_unit_text", id, s.field, 0);
+                        } else if (s.input == .prior_context) {
                             try self.report.add(self.options, .source_unresolved, "prior_context_artifact", id, s.field, 0);
                         } else try self.consumeValue(.{ .string = bytes }, id, s.field, s.input == .locator, 0);
                     };
@@ -665,16 +763,28 @@ pub const Inspector = struct {
         };
         defer parsed.deinit();
         for (self.definitions.items) |s| {
+            if (s.grouped) {
+                // Retained group assets and private unit documents are the two
+                // runtime representations of the same synthesized source text.
+                const selected: Value = if (artifact.len == 0 and eq(str(get(parsed.value, "_group_artifact")), s.artifact))
+                    enrichment_types.sourceFieldValue(parsed.value, enrichment_types.grouped_source_field, true)
+                else if (eq(artifact, s.artifact)) get(parsed.value, "text") else continue;
+                if (selected != .string) {
+                    try self.report.add(self.options, .source_unresolved, "group_unit_text", id, s.field, 0);
+                } else if (s.input == .model_chunk) try self.modelChunkSource(selected, id, s.field) else try self.consumeValue(selected, id, s.field, s.input == .locator, 0);
+                continue;
+            }
             if (!eq(s.artifact, artifact)) continue;
             if (s.dynamic) {
                 try self.report.add(self.options, .dynamic_loader, "loader", id, s.field, 0);
                 continue;
             }
             if (s.template.len > 0) {
+                const program = s.program orelse continue; // Unsupported syntax was recorded at definition time.
                 const root = if (s.input == .prior_context) @import("../db/group_prior_context.zig").artifactCollection(parsed.value) else parsed.value;
                 if (s.input == .prior_context and root == .array) {
-                    for (root.array.items) |item| try self.templateSources(s.template, item, id, s.field, false, false);
-                } else try self.templateSources(s.template, root, id, s.field, s.input == .locator, false);
+                    for (root.array.items) |item| try self.templateSources(program.program, item, id, s.field, false, false);
+                } else try self.templateSources(program.program, root, id, s.field, s.input == .locator, false);
             } else if (artifact.len > 0 and eq(s.field, "text")) {
                 // Reuse runtime chunk payload selection, including historical
                 // _source_field provenance, instead of guessing stored layouts.
@@ -700,27 +810,6 @@ pub const Inspector = struct {
             .source => |reference| try self.locator(reference.uri, doc, field),
             .media => try self.report.add(self.options, .embedded, "inline", doc, field, 0),
         }
-    }
-
-    fn selectedField(self: *@This(), root: Value, path: []const u8, doc: []const u8) !Value {
-        return fieldValue(root, path) catch {
-            try self.report.add(self.options, .dynamic_loader, "array_field_path", doc, path, 0);
-            return .null;
-        };
-    }
-
-    fn fieldValue(root: Value, path: []const u8) !Value {
-        if (path.len == 0 or eq(path, "this")) return root;
-        var parts = std.mem.splitScalar(u8, path, '.');
-        var value = root;
-        while (parts.next()) |p| {
-            if (value == .object) value = value.object.get(p) orelse return .null else if (value == .array) {
-                const index = std.fmt.parseUnsigned(usize, p, 10) catch return error.UnsupportedFieldPath;
-                if (index >= value.array.items.len) return .null;
-                value = value.array.items[index];
-            } else return .null;
-        }
-        return value;
     }
 
     fn consumeValue(self: *@This(), v: Value, doc: []const u8, field: []const u8, locator_mode: bool, depth: usize) anyerror!void {
@@ -751,63 +840,157 @@ pub const Inspector = struct {
                 try self.report.add(self.options, .source_unresolved, "media_directive", doc, field, 0);
                 return;
             };
-            try self.locator(text[begin..end], doc, field);
+            const reference = text[begin..end];
+            if (std.mem.indexOfScalar(u8, reference, 0) != null) {
+                try self.report.add(self.options, .dynamic_loader, "composed_media", doc, field, 0);
+            } else try self.locator(reference, doc, field);
             pos = end + 3;
         }
     }
 
-    fn templateSources(self: *@This(), text: []const u8, root: Value, doc: []const u8, field: []const u8, locator_mode: bool, definition: bool) !void {
-        var pos: usize = 0;
-        var expressions: usize = 0;
-        while (std.mem.indexOfPos(u8, text, pos, "{{")) |start| {
-            const end = std.mem.indexOfPos(u8, text, start + 2, "}}") orelse {
-                try self.report.add(self.options, .dynamic_loader, "template", doc, field, 0);
-                return;
-            };
-            const expr = std.mem.trim(u8, text[start + 2 .. end], " \t\r\n");
-            expressions += 1;
-            if (simplePath(expr)) {
-                if (!definition) try self.consumeValue(try self.selectedField(root, expr, doc), doc, expr, locator_mode, 0);
-            } else blk: {
-                var tokens = std.mem.tokenizeAny(u8, expr, " \t\r\n");
-                const helper = tokens.next() orelse break :blk;
-                if (!(eq(helper, "media") or eq(helper, "remoteMedia") or eq(helper, "remoteText") or eq(helper, "remotePDF"))) {
-                    try self.report.add(self.options, .dynamic_loader, "template", doc, field, 0);
-                    break :blk;
-                }
-                const arg = tokens.next() orelse {
-                    try self.report.add(self.options, .dynamic_loader, "template", doc, field, 0);
-                    break :blk;
-                };
-                const credential = tokens.next();
-                if (credential) |binding| {
-                    if (!std.mem.startsWith(u8, binding, "credential=") or tokens.next() != null) {
-                        try self.report.add(self.options, .dynamic_loader, "template_credential", doc, field, 0);
-                        break :blk;
-                    }
-                    const ref = binding["credential=".len..];
-                    if (ref.len < 2 or (ref[0] != '"' and ref[0] != '\'') or ref[ref.len - 1] != ref[0]) {
-                        try self.report.add(self.options, .dynamic_loader, "template_credential", doc, field, 0);
-                        break :blk;
-                    }
-                    try self.report.add(self.options, .connection, ref[1 .. ref.len - 1], doc, field, 0);
-                }
-                if (!std.mem.startsWith(u8, arg, "url=")) {
-                    try self.report.add(self.options, .dynamic_loader, "template", doc, field, 0);
-                    break :blk;
-                }
-                const source = arg[4..];
-                if (source.len >= 2 and (source[0] == '"' or source[0] == '\'') and source[source.len - 1] == source[0]) {
-                    try self.locator(source[1 .. source.len - 1], doc, field);
-                } else if (simplePath(source)) {
-                    if (!definition) try self.consumeValue(try self.selectedField(root, source, doc), doc, source, true, 0);
-                } else try self.report.add(self.options, .dynamic_loader, "template", doc, field, 0);
-            }
-            pos = end + 2;
+    fn templatePathSupported(path: hbs.Node) bool {
+        return path == .path and path.path.depth == 0 and !path.path.data and simplePath(path.path.original);
+    }
+
+    fn templateArgument(self: *@This(), eval: *hbs.Eval, node: *const hbs.Node, doc: []const u8, field: []const u8, definition: bool) !?[]const u8 {
+        if (node.* == .string_literal) return node.string_literal.value;
+        if (!templatePathSupported(node.*)) {
+            try self.report.add(self.options, .dynamic_loader, "template_argument", doc, field, 0);
+            return null;
         }
-        if (locator_mode and expressions > 0 and !(expressions == 1 and std.mem.startsWith(u8, text, "{{") and std.mem.endsWith(u8, text, "}}"))) try self.report.add(self.options, .dynamic_loader, "composed_locator", doc, field, 0);
-        if (definition) {
-            if (locator_mode and expressions == 0) try self.locator(text, doc, field) else try self.directives(text, doc, field);
+        if (definition) return null;
+        const value = eval.resolvePath(&node.path);
+        return switch (value) {
+            .string => |text| text,
+            .undefined, .null => null,
+            else => blk: {
+                try self.report.add(self.options, .source_unresolved, "template_argument", doc, field, 0);
+                break :blk null;
+            },
+        };
+    }
+
+    fn templateHelper(self: *@This(), eval: *hbs.Eval, expression: *const hbs.Node, doc: []const u8, field: []const u8, definition: bool) !bool {
+        const expr = expression.expression;
+        const name = expr.path.path.original;
+        if (!(eq(name, "media") or eq(name, "remoteMedia") or eq(name, "remoteText") or eq(name, "remotePDF"))) return false;
+        if (expr.params.len != 0) return false;
+        var url: ?*const hbs.Node = null;
+        var credential: ?*const hbs.Node = null;
+        if (expr.hash) |hash_node| for (hash_node.hash.pairs) |pair_node| {
+            const pair = pair_node.hash_pair;
+            if (eq(pair.key, "url")) {
+                url = pair.value;
+            } else if (!eq(name, "media") and eq(pair.key, template_runtime.remote_credentials_argument)) {
+                credential = pair.value;
+            } else return false;
+        };
+        // Match runtime: no URL means the helper returns an empty value.
+        const source = url orelse return true;
+        if (credential) |binding| {
+            if (try self.templateArgument(eval, binding, doc, field, definition)) |reference| {
+                if (reference.len == 0) {
+                    try self.report.add(self.options, .source_unresolved, "template_credential", doc, field, 0);
+                } else try self.report.add(self.options, .connection, reference, doc, field, 0);
+            } else if (!definition) try self.report.add(self.options, .source_unresolved, "template_credential", doc, field, 0);
+        }
+        if (try self.templateArgument(eval, source, doc, field, definition)) |reference| try self.locator(reference, doc, field);
+        return true;
+    }
+
+    fn compileTemplate(self: *@This(), text: []const u8, field: []const u8) !?hbs.Template {
+        // Use the execution parser, but admit only flat references and known
+        // remote-helper argument shapes. Reject nesting before recursive parsing.
+        var lexer = hbs.Lexer.init(text);
+        var tokens: usize = 0;
+        while (true) {
+            const token = lexer.next();
+            if (token.kind == .eof) break;
+            tokens += 1;
+            if (tokens / 16 > self.options.max_definitions) return error.PreflightLimitExceeded;
+            switch (token.kind) {
+                .open_block, .open_inverse, .open_partial, .open_partial_block, .open_inline, .open_sexpr => {
+                    try self.report.add(self.options, .dynamic_loader, "template", "", field, 0);
+                    return null;
+                },
+                else => {},
+            }
+        }
+        return hbs.Template.init(self.allocator, text) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            try self.report.add(self.options, .dynamic_loader, "template", "", field, 0);
+            return null;
+        };
+    }
+
+    fn templateSources(self: *@This(), program: *const hbs.Node, root: Value, doc: []const u8, field: []const u8, locator_mode: bool, definition: bool) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const helpers: hbs.HelperMap = .{};
+        const partials: std.StringArrayHashMapUnmanaged([]const u8) = .{};
+        var eval = hbs.Eval.init(a, try template_runtime.jsonToValue(a, root), &helpers, &partials);
+        var output: std.ArrayListUnmanaged(u8) = .empty;
+        defer output.deinit(self.allocator);
+        var strip_next = false;
+        var has_helper = false;
+        for (program.program.body) |node| {
+            try self.options.cancellation.check();
+            var safe_node = node.*;
+            switch (node.*) {
+                .content, .comment => {},
+                .mustache => |mustache| {
+                    const expression = mustache.expression;
+                    if (expression.* != .expression or !templatePathSupported(expression.expression.path.*)) {
+                        try self.report.add(self.options, .dynamic_loader, "template", doc, field, 0);
+                        return;
+                    }
+                    const expr = expression.expression;
+                    const name = expr.path.path.original;
+                    const known_helper = eq(name, "media") or eq(name, "remoteMedia") or eq(name, "remoteText") or eq(name, "remotePDF");
+                    if (known_helper or expr.params.len > 0 or expr.hash != null) {
+                        if (!try self.templateHelper(&eval, expression, doc, field, definition)) {
+                            try self.report.add(self.options, .dynamic_loader, "template", doc, field, 0);
+                            return;
+                        }
+                        has_helper = true;
+                        // Preserve boundaries and whitespace without running any
+                        // helper. Unknown fetched output cannot join literals.
+                        const literal = try a.create(hbs.Node);
+                        literal.* = .{ .string_literal = .{ .value = "\x00" } };
+                        const inert = try a.create(hbs.Node);
+                        inert.* = .{ .expression = .{ .path = literal } };
+                        safe_node.mustache.expression = inert;
+                        safe_node.mustache.unescaped = true;
+                    }
+                },
+                else => {
+                    try self.report.add(self.options, .dynamic_loader, "template", doc, field, 0);
+                    return;
+                },
+            }
+            const strip: @TypeOf(node.mustache.strip) = switch (safe_node) {
+                .mustache => |m| m.strip,
+                .comment => |c| c.strip,
+                else => .{},
+            };
+            if (strip.open) output.shrinkRetainingCapacity(std.mem.trimEnd(u8, output.items, " \t\r\n").len);
+            const body = [_]*hbs.Node{&safe_node};
+            var single: hbs.Node = .{ .program = .{ .body = &body } };
+            const rendered = try eval.exec(&single);
+            const fragment = if (strip_next) std.mem.trimStart(u8, rendered, " \t\r\n") else rendered;
+            if (fragment.len > self.options.max_document_bytes -| output.items.len) return error.PreflightLimitExceeded;
+            try output.appendSlice(self.allocator, fragment);
+            strip_next = strip.close;
+        }
+        if (locator_mode and has_helper) {
+            if (program.program.body.len != 1) try self.report.add(self.options, .dynamic_loader, "composed_locator", doc, field, 0);
+        } else if (locator_mode) {
+            try self.locator(output.items, doc, field);
+        } else {
+            // Scan the complete known output, including markers assembled from
+            // several literals/references, with no producer or helper execution.
+            try self.directives(output.items, doc, field);
         }
     }
 
@@ -1403,7 +1586,7 @@ test "backup preflight rejects unsupported selectors and reports template connec
     defer report.deinit();
     var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
     defer inspector.deinit();
-    try inspector.metadataJson("[{\"kind\":\"embedding\",\"source_template\":\"{{remoteMedia url=image credential=\\\"private-media\\\"}}\"}]");
+    try inspector.metadataJson("[{\"kind\":\"embedding\",\"source_template\":\"{{remoteMedia url=image credentials=\\\"private-media\\\"}}\"}]");
     try std.testing.expectEqual(@as(u64, 1), count(report, .connection));
     try inspector.metadataJson("[{\"kind\":\"asset\",\"source_template\":\"{{media[*].url}}\",\"producer\":{\"type\":\"reader\"}}]");
     try std.testing.expect(!report.analysis_complete);
@@ -1461,4 +1644,200 @@ test "backup preflight configured credentials are active but schema examples are
     defer a.free(output);
     try std.testing.expect(std.mem.indexOf(u8, output, "private-connection") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "/private") == null);
+}
+
+test "backup preflight grouped PDF embedding uses runtime unit text" {
+    const a = std.testing.allocator;
+    const group = @import("../db/group_sources.zig").Config{ .group_by = "thread", .order_by = "ordinal", .field = "body" };
+    try @import("../db/enrichment/config_validation.zig").validatePublicConfig(a, .{ .name = "turns", .kind = .group, .source = group });
+    const group_json = try std.json.Stringify.valueAlloc(a, group, .{});
+    defer a.free(group_json);
+    const producer = "{\"version\":2,\"provider\":\"antfly\",\"model\":\"mock\",\"endpoint\":\"antfly:embedded\",\"sparse\":false}";
+    try @import("../db/enrichment/config_validation.zig").validatePublicConfig(a, .{ .name = "pages", .kind = .embedding, .field = "body", .source_artifact_name = "chunks", .embedding_input = .pdf_page_images, .expected_dims = 3, .producer_json = producer });
+    const projected = try std.json.parseFromSlice(Value, a, "{\"_group_unit\":{\"text\":\"file:///private/group.pdf\"}}", .{});
+    defer projected.deinit();
+    try std.testing.expectEqualStrings("file:///private/group.pdf", enrichment_types.sourceFieldValue(projected.value, "_group_unit.text", true).string);
+    const metadata = try @import("../db/catalog/enrichment_catalog.zig").serializeCatalog(a, &.{
+        .{ .name = "pages", .kind = .embedding, .source_field = "body", .source_artifact_name = "chunks", .embedding_input = .pdf_page_images, .expected_dims = 3, .producer_json = producer },
+        .{ .name = "chunks", .kind = .chunk, .source_field = "ignored", .source_artifact_name = "turns", .chunk_size = 32 },
+        .{ .name = "turns", .kind = .asset, .source_field = "_group_unit", .group_source_json = group_json, .producer_json = "{\"type\":\"copy\"}" },
+    });
+    defer a.free(metadata);
+    var report: Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    try inspector.metadataJson(metadata);
+    try inspector.document("anchor", "{\"text\":\"file:///private/group.pdf\"}", "turns");
+    const caps = try a.alloc(Capability, report.requirements.items.len);
+    defer a.free(caps);
+    for (report.requirements.items, caps) |*r, *cap| cap.* = .{ .requirement_sha256 = &r.sha256, .supported = true, .future_ingestion = true, .model_revision_verified = true, .query_embedding = true, .preprocessing_verified = true, .vector_space_verified = true, .dimensions = r.dimensions };
+    const evidence = try std.json.Stringify.valueAlloc(a, Destination{ .version = 1, .configuration_id = "model-only", .requirements = caps }, .{});
+    defer a.free(evidence);
+    const json = try report.jsonAlloc(evidence);
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verdict\":\"blocked\"") != null);
+    try std.testing.expectEqual(@as(u64, 1), count(report, .source_local));
+    try std.testing.expect(report.analysis_complete);
+    try inspector.document("anchor", "{\"_group_artifact\":\"turns\",\"_group_unit\":{\"text\":\"file:///private/group.pdf\"}}", "");
+    try std.testing.expectEqual(@as(u64, 2), count(report, .source_local));
+    try inspector.document("anchor", "invalid group asset", "turns");
+    try std.testing.expect(!report.analysis_complete);
+    try std.testing.expect(count(report, .source_unresolved) > 0);
+}
+
+test "backup preflight composed media marker is not certifiable" {
+    const a = std.testing.allocator;
+    const template = "<<<dotprompt:media:{{kind}} {{uri}}>>>";
+    const raw = "{\"kind\":\"url\",\"uri\":\"file:///private/composed.pdf\"}";
+    const rendered = try @import("../../template.zig").renderDocument(a, template, raw);
+    defer a.free(rendered);
+    try std.testing.expectEqualStrings("<<<dotprompt:media:url file:///private/composed.pdf>>>", rendered);
+    const parts = try @import("../../template.zig").textToParts(a, rendered);
+    defer @import("../../template.zig").freeContentParts(a, parts);
+    try std.testing.expectEqual(@as(usize, 1), parts.len);
+    try std.testing.expectEqualStrings("file:///private/composed.pdf", parts[0].media_url);
+    const producer = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"mock\"}}";
+    try @import("../db/enrichment/config_validation.zig").validatePublicConfig(a, .{ .name = "summary", .kind = .asset, .template = template, .producer_json = producer });
+    const metadata = try @import("../db/catalog/enrichment_catalog.zig").serializeCatalog(a, &.{.{ .name = "summary", .kind = .asset, .source_field = "", .source_template = template, .producer_json = producer }});
+    defer a.free(metadata);
+    var report: Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    try inspector.metadataJson(metadata);
+    try inspector.document("doc", raw, "");
+    const caps = try a.alloc(Capability, report.requirements.items.len);
+    defer a.free(caps);
+    for (report.requirements.items, caps) |*r, *cap| cap.* = .{ .requirement_sha256 = &r.sha256, .supported = true, .future_ingestion = true, .model_revision_verified = true };
+    const evidence = try std.json.Stringify.valueAlloc(a, Destination{ .version = 1, .configuration_id = "model-only", .requirements = caps }, .{});
+    defer a.free(evidence);
+    const json = try report.jsonAlloc(evidence);
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verdict\":\"blocked\"") != null);
+    try std.testing.expectEqual(@as(u64, 1), count(report, .source_local));
+    try std.testing.expect(report.analysis_complete);
+}
+
+test "backup preflight runtime credentials keyword is inspectable" {
+    const a = std.testing.allocator;
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    try inspector.metadataJson("{\"kind\":\"asset\",\"source_template\":\"{{remoteText url=\\\"https://example.org/private\\\" credentials=\\\"my-credential\\\"}}\",\"producer\":{\"type\":\"copy\"}}");
+    const json = try report.jsonAlloc(null);
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "my-credential") == null);
+    try std.testing.expectEqual(@as(u64, 1), count(report, .connection));
+    try std.testing.expect(report.analysis_complete);
+}
+
+test "backup preflight template AST respects argument order quoting and runtime path lookup" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "{{remoteText credentials='team media' url=media.uri}}",
+        "{{remoteMedia url=media.uri credentials=credential}}",
+        "{{remotePDF credentials=credential url=media.uri}}",
+    }) |source| {
+        var report: Report = .{ .allocator = a };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        const metadata = try std.json.Stringify.valueAlloc(a, .{ .kind = "asset", .source_template = source, .producer = .{ .type = "copy" } }, .{});
+        defer a.free(metadata);
+        try inspector.metadataJson(metadata);
+        try inspector.document("doc", "{\"media\":{\"uri\":\"https://example.org/private\"},\"media.uri\":\"file:///decoy\",\"credential\":\"team media\"}", "");
+        try std.testing.expect(report.analysis_complete);
+        try std.testing.expectEqual(@as(u64, 1), count(report, .source_external));
+        try std.testing.expectEqual(@as(u64, 0), count(report, .source_local));
+        try std.testing.expect(count(report, .connection) > 0);
+    }
+}
+
+test "backup preflight unknown template syntax never invokes helpers" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "{{remoteText url=(lookup this 'url')}}",
+        "{{#each urls}}{{remoteText url=this}}{{/each}}",
+        "{{> remotePartial}}",
+        "{{remoteText url=url credential='wrong-keyword'}}",
+    }) |source| {
+        var report: Report = .{ .allocator = a };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        const metadata = try std.json.Stringify.valueAlloc(a, .{ .kind = "asset", .source_template = source, .producer = .{ .type = "copy" } }, .{});
+        defer a.free(metadata);
+        try inspector.metadataJson(metadata);
+        try std.testing.expect(!report.analysis_complete);
+        try std.testing.expect(count(report, .dynamic_loader) > 0);
+    }
+}
+
+test "backup preflight combined substitutions respect escaping and rendered size limits" {
+    const a = std.testing.allocator;
+    const raw = "{\"prefix\":\"<<<dotprompt:media:ur\",\"suffix\":\"l file:///private/parts.pdf>>>\"}";
+    for ([_][]const u8{ "{{{prefix}}}{{{suffix}}}", "{{prefix}}{{suffix}}" }, 0..) |source, i| {
+        var report: Report = .{ .allocator = a };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        const metadata = try std.json.Stringify.valueAlloc(a, .{ .kind = "asset", .source_template = source, .producer = .{ .type = "copy" } }, .{});
+        defer a.free(metadata);
+        try inspector.metadataJson(metadata);
+        try inspector.document("doc", raw, "");
+        try std.testing.expectEqual(@as(u64, if (i == 0) 1 else 0), count(report, .source_local));
+        try std.testing.expect(report.analysis_complete);
+    }
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{ .max_document_bytes = raw.len } };
+    defer inspector.deinit();
+    try inspector.metadataJson("{\"kind\":\"asset\",\"source_template\":\"{{{prefix}}}{{{prefix}}}{{{prefix}}}{{{prefix}}}{{{prefix}}}{{{prefix}}}\",\"producer\":{\"type\":\"copy\"}}");
+    try std.testing.expectError(error.PreflightLimitExceeded, inspector.document("doc", raw, ""));
+}
+
+test "backup preflight grouped model evidence binds normalized source preprocessing" {
+    const a = std.testing.allocator;
+    var original: Digest = undefined;
+    for ([_][]const u8{ "body", "other" }, 0..) |field, i| {
+        const group_json = try std.json.Stringify.valueAlloc(a, .{ .group_by = "thread", .order_by = "ordinal", .field = field }, .{});
+        defer a.free(group_json);
+        const metadata = try @import("../db/catalog/enrichment_catalog.zig").serializeCatalog(a, &.{
+            .{ .name = "pages", .kind = .embedding, .source_field = "ignored", .source_artifact_name = "turns", .embedding_input = .pdf_page_images, .expected_dims = 3, .producer_json = "{\"version\":2,\"provider\":\"antfly\",\"model\":\"mock\",\"endpoint\":\"antfly:embedded\",\"sparse\":false}" },
+            .{ .name = "turns", .kind = .asset, .source_field = "_group_unit", .group_source_json = group_json, .producer_json = "{\"type\":\"copy\"}" },
+        });
+        defer a.free(metadata);
+        var report: Report = .{ .allocator = a };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        try inspector.metadataJson(metadata);
+        // The public manifest and durable catalog spell defaults differently.
+        // They must resolve to the same group rather than conflict by JSON order.
+        const public = try std.json.Stringify.valueAlloc(a, .{ .kind = "group", .name = "turns", .source = .{ .field = field, .order_by = "ordinal", .group_by = "thread" } }, .{});
+        defer a.free(public);
+        try inspector.metadataJson(public);
+        try std.testing.expectEqual(@as(u64, 1), count(report, .model));
+        for (report.requirements.items) |*requirement| {
+            if (requirement.kind != .model) continue;
+            if (i == 0) {
+                original = requirement.sha256;
+            } else {
+                const caps = [_]Capability{.{ .requirement_sha256 = &original, .supported = true, .future_ingestion = true, .query_embedding = true, .model_revision_verified = true, .preprocessing_verified = true, .vector_space_verified = true, .dimensions = 3 }};
+                try std.testing.expect(!eq(&original, &requirement.sha256));
+                try std.testing.expectEqual(Verdict.unknown, evaluate(requirement, .{ .version = 1, .configuration_id = "original-group", .requirements = &caps }).verdict);
+            }
+        }
+    }
+}
+
+test "backup preflight template inventory limits preserve selector ownership" {
+    const a = std.testing.allocator;
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{ .max_requirements = 1 } };
+    defer inspector.deinit();
+    try std.testing.expectError(error.PreflightLimitExceeded, inspector.metadataJson("{\"kind\":\"asset\",\"source_template\":\"{{remoteText url='https://one.example/a'}}{{remoteText url='https://two.example/b'}}\",\"producer\":{\"type\":\"copy\"}}"));
 }

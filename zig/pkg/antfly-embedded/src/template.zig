@@ -38,6 +38,9 @@ const Helper = hbs.Helper;
 const HelperContext = hbs.HelperContext;
 const HelperMap = hbs.HelperMap;
 
+/// Named credential argument consumed by the remote-content helpers.
+pub const remote_credentials_argument = "credentials";
+
 /// Render a Handlebars template against a JSON document.
 /// The document is parsed as JSON and its top-level fields become template variables.
 /// Internal fields starting with "_" (like _embeddings) are excluded.
@@ -646,7 +649,7 @@ fn transcribeAudioHelper(ctx: HelperContext) anyerror!Value {
 // ============================================================================
 
 /// Convert JSON without consuming the call stack for nested model output.
-fn jsonToValue(arena: Allocator, json: std.json.Value) Allocator.Error!Value {
+pub fn jsonToValue(arena: Allocator, json: std.json.Value) Allocator.Error!Value {
     const Work = struct { source: std.json.Value, target: *Value };
     var result: Value = undefined;
     var pending: std.ArrayList(Work) = .empty;
