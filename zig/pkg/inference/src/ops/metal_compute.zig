@@ -1873,7 +1873,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     pub fn gatherVideoInputs(cb: *const ops.ComputeBackend, sources: []const VideoGatherInput, rows: usize, cols: usize) !CT {
         if (cb.kind() != .metal or sources.len == 0 or sources.len > 8 or rows == 0 or cols == 0) return error.InvalidTensorShape;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
-        if (self.decoderWorkspaceBusy()) return error.EmbeddingStageBusy;
+        if (cb.decoderRuntimeHasSubmittedFrame()) return error.EmbeddingStageBusy;
         const values = try std.math.mul(usize, rows, cols);
         const bytes = try std.math.mul(usize, values, @sizeOf(f32));
         var spans: [8]metal_runtime_mod.BufferGatherSource = undefined;
@@ -1897,6 +1897,57 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         errdefer cb.free(output);
         const target = toBuf(output).metal_tensor.?;
         if (metal_runtime_mod.termite_metal_buffer_gather(self.provider_impl.raw_decode_runtime, target.deviceHandle().?, &spans, sources.len) != 0) return error.MetalBufferCopyFailed;
+        return output;
+    }
+
+    /// Prepare cold immutable snapshots before opening the input frame. Warm
+    /// calls reuse the canonical linear slot and runtime embedding-table cache.
+    pub fn prepareVideoInput(cb: *const ops.ComputeBackend, weight: CT, positions: CT, axis: usize) !void {
+        if (cb.kind() != .metal or cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame()) return;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const buf = toBuf(weight);
+        if (canonicalProjectionEligible(buf)) {
+            if (try self.canonicalProjectionSpan(buf.lazy_entry.?.tensor_ref.name) == null) {
+                const bias = try self.cachedZeroBiasBuf(768);
+                defer freeOp(self, bias);
+                _ = try self.ensureDynamicLinearSlot(weight, bias, 768, 768);
+            }
+        } else {
+            const bias = try self.cachedZeroBiasBuf(768);
+            defer freeOp(self, bias);
+            _ = try self.ensureDynamicLinearSlot(weight, bias, 768, 768);
+        }
+        _ = try self.prepareVideoPositions(positions, axis);
+    }
+    fn prepareVideoPositions(self: *MetalCompute, positions: CT, axis: usize) !bool {
+        const buf = toBuf(positions);
+        if (bufHasAnyQuantizedStorage(buf) or buf.native_dense_bytes != null) return false;
+        var table = try self.ownedMetalTensorFromCt(positions);
+        defer table.deinit();
+        const runtime = self.provider_impl.raw_decode_runtime;
+        const status = if (table.isDevice())
+            metal_runtime_mod.termite_metal_decode_runtime_prepare_embedding_table_device(runtime, table.deviceHandle(), table.deviceByteOffset(), axis * 2, 768)
+        else if (immutableTable(buf))
+            metal_runtime_mod.termite_metal_decode_runtime_prepare_embedding_table(runtime, table.data, axis * 2, 768)
+        else
+            return false;
+        if (status != 0) return error.MetalKernelDispatchFailed;
+        return true;
+    }
+    pub fn videoPosition(cb: *const ops.ComputeBackend, input: CT, positions: CT, rows: usize, grid_x: usize, grid_y: usize, axis: usize) !?CT {
+        if (cb.kind() != .metal) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const x = denseDeviceF32(input) orelse return null;
+        if (!try self.prepareVideoPositions(positions, axis)) return null;
+        const output = (try cb.allocUninitF32Shape(&.{ @intCast(rows), 768 })) orelse return error.UnsupportedPrimitiveOp;
+        errdefer cb.free(output);
+        const target = denseDeviceF32(output).?;
+        const status = metal_runtime_mod.antfly_metal_video_position(self.provider_impl.raw_decode_runtime, x.deviceHandle(), x.deviceByteOffset(), target.deviceHandle(), target.deviceByteOffset(), @intCast(rows), @intCast(grid_x), @intCast(grid_y), @intCast(axis));
+        if (status == -1) {
+            cb.free(output);
+            return null;
+        }
+        if (status != 0) return error.MetalKernelDispatchFailed;
         return output;
     }
 
@@ -16675,13 +16726,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         p.embedding_vision_clock += 1;
         const clock = p.embedding_vision_clock;
         var victim: usize = 0;
+        var best: ?*@import("metal_embedding_bindings.zig").VisionWorkspace = null;
         for (p.embedding_vision_workspaces, 0..) |entry, i| {
-            if (entry) |workspace| if (std.meta.eql(workspace.spec, spec)) {
-                workspace.stamp = clock;
-                self.embedding_vision_workspace = workspace;
-                return;
+            if (entry) |workspace| if (workspace.capacity_rows >= spec.rows and
+                workspace.spec.hidden == spec.hidden and workspace.spec.intermediate == spec.intermediate)
+            {
+                if (best == null or workspace.capacity_rows < best.?.capacity_rows) best = workspace;
             };
             if (entry == null or (p.embedding_vision_workspaces[victim] != null and entry.?.stamp < p.embedding_vision_workspaces[victim].?.stamp)) victim = i;
+        }
+        if (best) |workspace| {
+            try bindVisionWorkspace(workspace, spec);
+            workspace.stamp = clock;
+            self.embedding_vision_workspace = workspace;
+            return;
         }
         if (clock < p.embedding_vision_retry) return;
         const fresh = self.prepareVisionWorkspace(spec, clock) catch |first| retry: {
@@ -16707,6 +16765,25 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         p.embedding_vision_workspaces[victim] = fresh;
         self.embedding_vision_workspace = fresh;
     }
+    /// Rebind only at a completed phase boundary. Each range retains its
+    /// original capacity/offset; smaller logical shapes never overlap peers.
+    fn bindVisionWorkspace(workspace: *@import("metal_embedding_bindings.zig").VisionWorkspace, spec: ops.EmbeddingVisionSpec) !void {
+        if (std.meta.eql(workspace.spec, spec)) return;
+        std.debug.assert(spec.rows <= workspace.capacity_rows);
+        const tile = @min(spec.rows, 512);
+        for (workspace.views[0..11], 0..) |ct, i| {
+            const rows = if (i == 8 or i == 9) tile else spec.rows;
+            const width = if (i == 4) 3 * spec.hidden else if (i == 8) 2 * spec.intermediate else if (i == 9) spec.intermediate else spec.hidden;
+            const buf = toBuf(ct.?);
+            const view = try buf.metal_tensor.?.retainedStorageView(0, rows * width * 4, &.{ @intCast(rows), @intCast(width) });
+            buf.metal_tensor.?.deinit();
+            buf.metal_tensor = view;
+            buf.logical_shape.?[0] = @intCast(rows);
+            buf.logical_shape.?[1] = @intCast(width);
+        }
+        workspace.spec = spec;
+        workspace.tile = tile;
+    }
     fn prepareVisionWorkspace(self: *MetalCompute, spec: ops.EmbeddingVisionSpec, clock: u64) !*@import("metal_embedding_bindings.zig").VisionWorkspace {
         const Workspace = @import("metal_embedding_bindings.zig").VisionWorkspace;
         const tile: usize = @min(spec.rows, 512);
@@ -16727,8 +16804,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             self.data.prefetch.unlock();
             return err;
         };
-        workspace.* = .{ .spec = spec, .stamp = clock, .tile = tile };
-        workspace.owner.outputs = &workspace.views;
+        workspace.* = .{ .spec = spec, .capacity_rows = spec.rows, .stamp = clock, .tile = tile };
+        workspace.owner.outputs = workspace.views[0..11];
         errdefer {
             self.dropVisionWorkspace(workspace);
         }
@@ -16747,6 +16824,38 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             toBuf(ct).persistent_model = true;
             dest.* = ct;
         }
+        const coefficients = try self.prepareVisionCoefficients();
+        @memcpy(workspace.views[11..], &coefficients.views);
+        self.provider_impl.embedding_vision_workspace_builds += 1;
+        return workspace;
+    }
+    fn prepareVisionCoefficients(self: *MetalCompute) !*@import("metal_embedding_bindings.zig").VisionCoefficients {
+        const p = self.provider_impl;
+        if (p.embedding_vision_coefficients) |coefficients| return coefficients;
+        const Coefficients = @import("metal_embedding_bindings.zig").VisionCoefficients;
+        const cache = if (self.data.tier_cache) |*v| v else return error.AudioScheduleAdmission;
+        self.data.prefetch.lock();
+        cache.reserve(.host, @sizeOf(Coefficients)) catch |err| {
+            self.data.prefetch.unlock();
+            return err;
+        };
+        self.data.prefetch.unlock();
+        const owner = std.heap.c_allocator.create(Coefficients) catch |err| {
+            self.data.prefetch.lock();
+            cache.noteRelease(.host, @sizeOf(Coefficients));
+            self.data.prefetch.unlock();
+            return err;
+        };
+        owner.* = .{};
+        owner.owner.outputs = &owner.views;
+        errdefer {
+            owner.owner.deinit();
+            self.data.prefetch.lock();
+            cache.noteRelease(.host, owner.owner.host_bytes);
+            cache.noteRelease(.backend, owner.owner.backend_bytes);
+            self.data.prefetch.unlock();
+            std.heap.c_allocator.destroy(owner);
+        }
         // Snapshot immutable normalization coefficients once. No request handles,
         // lazy pins or allocator pointers survive in the retained workspace.
         const suffixes = [_][]const u8{ "input_layernorm.weight", "post_attention_layernorm.weight", "pre_feedforward_layernorm.weight", "post_feedforward_layernorm.weight", "self_attn.q_norm.weight", "self_attn.k_norm.weight" };
@@ -16760,25 +16869,28 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             defer freeOp(self, ct);
             const values = try toFloat32Op(self, ct, self.allocator);
             defer self.allocator.free(values);
-            if (values.len != (if (kind < 4) spec.hidden else spec.hidden / 12)) return error.InvalidTensorShape;
+            if (values.len != (if (kind < 4) @as(usize, 768) else @as(usize, 768) / 12)) return error.InvalidTensorShape;
             const index = layer * 6 + kind;
             offsets[index] = coefficients.items.len;
             counts[index] = values.len;
             try coefficients.appendSlice(self.allocator, values);
         };
-        var weights = (try self.audioPlanBuffer(&workspace.owner, coefficients.items.len * 4, true)) orelse return error.AudioScheduleAdmission;
+        var weights = (try self.audioPlanBuffer(&owner.owner, coefficients.items.len * 4, true)) orelse return error.AudioScheduleAdmission;
         defer weights.deinit();
         try weights.uploadBytes(std.mem.sliceAsBytes(coefficients.items));
         for (counts, offsets, 0..) |count, start, i| {
             var view = try weights.retainedView(start * 4, count * 4, &.{@intCast(count)});
-            const ct = self.audioPersistentCt(&workspace.owner, view) catch |err| {
+            const ct = self.audioPersistentCt(&owner.owner, view) catch |err| {
                 view.deinit();
                 return err;
             };
             toBuf(ct).persistent_model = true;
-            workspace.views[11 + i] = ct;
+            owner.views[i] = ct;
         }
-        return workspace;
+        p.embeddinggemma2_cache_admission = cache;
+        p.embedding_vision_coefficients = owner;
+        p.embedding_vision_coefficient_builds += 1;
+        return owner;
     }
     fn visionOutput(workspace: *@import("metal_embedding_bindings.zig").VisionWorkspace, index: usize) CT {
         const ct = workspace.views[index].?;
@@ -36134,6 +36246,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     pub fn videoDevice(_: *const ops.ComputeBackend) !*anyopaque {
         return error.UnsupportedVideoBackend;
     }
+    pub fn prepareVideoInput(_: *const ops.ComputeBackend, _: CT, _: CT, _: usize) !void {}
+    pub fn videoPosition(_: *const ops.ComputeBackend, _: CT, _: CT, _: usize, _: usize, _: usize, _: usize) !?CT {
+        return null;
+    }
     pub fn gatherVideoInputs(_: *const ops.ComputeBackend, _: []const VideoGatherInput, _: usize, _: usize) !CT {
         return error.UnsupportedVideoBackend;
     }
@@ -47382,6 +47498,30 @@ test "embeddinggemma2 Metal vision workspace survives wrappers bounds retention 
             };
             try std.testing.expectEqual(@as(usize, 2), retained);
             try std.testing.expectEqual(@as(usize, 512), compute.embedding_vision_workspace.?.tile);
+            const provider = compute.provider_impl;
+            try std.testing.expectEqual(@as(u64, 1), provider.embedding_vision_coefficient_builds);
+            const builds = provider.embedding_vision_workspace_builds;
+            const charged = store.tier_cache.?.backend_bytes;
+            const coefficient = compute.embedding_vision_workspace.?.views[11].?;
+            // More than two exact shapes reuse the existing admitted capacities,
+            // including growing again after binding a smaller logical view.
+            for ([_]usize{ 300, 7, 513, 12, 2, 400, 3 }) |rows| {
+                var no_allocations = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+                compute.allocator = no_allocations.allocator();
+                cb.vtable.embeddingVisionWorkspace.?(cb.ptr, .{ .rows = rows, .hidden = 768, .intermediate = 3072 }) catch |err| {
+                    compute.allocator = a;
+                    return err;
+                };
+                compute.allocator = a;
+                try std.testing.expectEqual(@as(usize, 0), no_allocations.alloc_index);
+                try std.testing.expectEqual(builds, provider.embedding_vision_workspace_builds);
+                try std.testing.expectEqual(charged, store.tier_cache.?.backend_bytes);
+                const bound = compute.embedding_vision_workspace.?;
+                try std.testing.expectEqual(coefficient, bound.views[11].?);
+                try std.testing.expectEqual(rows, bound.spec.rows);
+                try std.testing.expectEqual(rows * 768, MetalCompute.denseDeviceF32(bound.views[0].?).?.elemCount());
+                try std.testing.expectEqual(@as(usize, @min(rows, 512)) * 6144, MetalCompute.denseDeviceF32(bound.views[8].?).?.elemCount());
+            }
             try cb.vtable.embeddingVisionWorkspace.?(cb.ptr, null);
         }
     }
@@ -47877,6 +48017,73 @@ test "embeddinggemma2 video Metal gather fences host device and mixed spans once
     try std.testing.expectEqual(before_invalid, telemetry.snapshot(true)[6]);
     try std.testing.expect(try cb.decoderRuntimeBeginFrame());
     errdefer cb.decoderRuntimeCancelFrame() catch {};
-    try std.testing.expectError(error.EmbeddingStageBusy, MetalCompute.gatherVideoInputs(&cb, &.{host}, 1, 2));
+    const framed = try MetalCompute.gatherVideoInputs(&cb, &.{host}, 1, 2);
+    defer cb.free(framed);
+    try std.testing.expect(cb.decoderRuntimeHasActiveFrame());
     try cb.decoderRuntimeSubmitAndWaitFrame();
+    const framed_values = try cb.toFloat32(framed, a);
+    defer a.free(framed_values);
+    try std.testing.expectEqualSlices(f32, &.{ 91, -17 }, framed_values);
+}
+
+test "embeddinggemma2 video Metal input frame gathers projects and positions with one completion" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer {
+        deinitSharedNativeProvider(&store);
+        store.lazy_weights.deinit(a);
+    }
+    var compute = try MetalCompute.initWithIo(a, &store, null, std.testing.io);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const rows = 9;
+    const axis = 5;
+    const patches = try a.alloc(f32, rows * 768);
+    defer a.free(patches);
+    const positions = try a.alloc(f32, 2 * axis * 768);
+    defer a.free(positions);
+    const weights = try a.alloc(f32, 768 * 768);
+    defer a.free(weights);
+    @memset(weights, 0);
+    for (0..768) |i| weights[i * 768 + i] = 1;
+    for (patches, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 11)) / 8;
+    for (positions, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 17)) / 16;
+    const weight = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(weights, &.{ 768, 768 }));
+    defer cb.free(weight);
+    const table = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(positions, &.{ 2, axis, 768 }));
+    defer cb.free(table);
+    try MetalCompute.prepareVideoInput(&cb, weight, table, axis);
+    // Warm the exact linear dispatch; only completed work is compared below.
+    const warm = try MetalCompute.gatherVideoInputs(&cb, &.{.{ .host = patches }}, rows, 768);
+    defer cb.free(warm);
+    const warm_output = try cb.linearNoBias(warm, weight, rows, 768, 768);
+    defer cb.free(warm_output);
+    const telemetry = @import("../backends/metal_telemetry.zig");
+    const before = telemetry.snapshot(true)[6];
+    try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+    errdefer cb.decoderRuntimeCancelFrame() catch {};
+    const input = try MetalCompute.gatherVideoInputs(&cb, &.{ .{ .host = patches }, .{ .host = patches } }, rows, 768);
+    const projected = try cb.linearNoBias(input, weight, 2 * rows, 768, 768);
+    const result = (try MetalCompute.videoPosition(&cb, projected, table, 2 * rows, 3, 3, axis)).?;
+    defer cb.free(result);
+    cb.free(input);
+    cb.free(projected);
+    try std.testing.expect(cb.decoderRuntimeHasActiveFrame());
+    // A host upload is independently staged before the caller changes storage.
+    @memset(patches, -1000);
+    try cb.decoderRuntimeSubmitAndWaitFrame();
+    var polls: usize = 0;
+    while (telemetry.snapshot(true)[6] == before and polls < 2000) : (polls += 1) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    try std.testing.expectEqual(before + 1, telemetry.snapshot(true)[6]);
+    const actual = try cb.toFloat32(result, a);
+    defer a.free(actual);
+    for (actual, 0..) |v, i| {
+        const row = i / 768;
+        const h = i % 768;
+        const expected = @as(f32, @floatFromInt((i % (rows * 768)) % 11)) / 8 +
+            (positions[(row % 3) * 768 + h] + positions[(axis + (row / 3) % 3) * 768 + h]);
+        try std.testing.expectApproxEqAbs(expected, v, 1e-6);
+    }
 }

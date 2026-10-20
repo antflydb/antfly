@@ -1075,13 +1075,42 @@ handoff. Empty ready sets still retire the provider before waiting, and memory
 reclamation retains its explicit retirement boundary. Already-published headers
 do not force a retirement. Composition uses the same contention-aware boundary.
 Host-only, mixed and noncontiguous device batches gather directly into their
-admitted private input in one GPU command/fence. Native Shared staging owns each
-host span until completion, avoiding a concatenated CPU patch table and per-frame
-upload/copy waits. The existing vision transient envelope covers patch staging;
-all source preparations remain owned until the gather completes. Contiguous
-all-device spans retain their direct import. Native CPU batching consumes all
-currently ready compatible work and flushes a partial batch before waiting for
-another producer, so a completed row can compose without a batch-fill delay.
+admitted private input. Gathering joins the owned input frame with patch
+projection and positional addition, using one submission and completion fence.
+Input-only weight pins, gathered patches and temporary patch projections are
+released before the tower begins; this also prevents a CPU position table from
+remaining pinned through layer scratch allocation. Cold immutable linear/table
+preparation precedes the input frame. Native Shared
+staging copies host spans once and remains retained, with source and destination
+buffers, until completion or cancellation. Standalone gather callers retain a
+synchronous fence; caller-owned input frames remain owned by their caller.
+A precise F32 Metal position kernel adds both table axes directly to patch
+projections, avoiding index uploads and intermediate lookup/add tensors; other
+table formats keep the existing staged lookup path in the same input frame.
+The existing vision transient envelope covers patch staging. Contiguous
+all-device spans retain their direct import.
+
+Prepared Metal vision owns one immutable normalization snapshot across arena
+capacities. Up to two admitted arenas serve the smallest fitting capacity;
+smaller batches rebind logical views at completed boundaries, preserving each
+range's physical offset and capacity without allocating or uploading again.
+The retained capacity keeps its full admission until reclamation. The 96
+coefficient views have a separate model owner and admission, released with the
+vision cache after all dependent arenas drain. Admission denial retains the
+existing fallback/retry policy.
+
+Native CPU batching transfers owned prepared patches through producer queues and
+pending batches. Each buffer carries its original allocator, including ahead
+producers with separate bounded budgets; the producer owner outlives all pending
+consumers, and success/error cleanup returns storage to that allocator. A
+singleton borrows its input; a cohort packs once directly into
+owned tensor storage. Read-only host views expose completed projection values
+without copying; writable access rejects borrowed, shared, strided and immutable
+storage. Callers keep borrowed memory alive through every operation and free the
+tensor before its source. Positional addition writes directly to its output with
+portable Zig SIMD and preserves reference addition order. CPU batching consumes
+all currently ready compatible work and flushes a partial batch before waiting
+for another producer, so a completed row can compose without a batch-fill delay.
 No end-to-end speedup is implied without paired completed-time measurements.
 
 Live validation optionally accepts a model preparation policy with a versioned

@@ -953,9 +953,13 @@ Only shared decoder continuations impose producer ordering; validated inputs and
 independent sources can publish ahead. Ready geometry-compatible host and device
 frames share tower calls while unfinished preparations remain pending.
 Uncontended ready Metal waves keep warm bindings; queued execution peers and
-idle/reclaim boundaries still release the provider. Patch gathering uses one
-bounded GPU command with owned host staging, and CPU partial batches execute
-before the consumer waits for another source. Persistent
+idle/reclaim boundaries still release the provider. Metal vision arenas reuse
+admitted capacity across smaller batches and share immutable normalization
+coefficients. Patch gathering, projection and positioning share one input frame;
+owned staging and source buffers survive its completion or cancellation. CPU
+queues transfer patch ownership, cohorts pack directly into tensor storage, and
+host views avoid copied readbacks while protecting shared/immutable storage.
+Partial CPU batches execute before the consumer waits for another source. Persistent
 projection outputs provide retained frame views without stage escape copies.
 See `../video/VIDEO.md` for ownership, policy matching,
 scratch admission and fallback behavior.

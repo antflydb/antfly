@@ -2805,6 +2805,14 @@ pub const ComputeBackend = struct {
         /// Backends that are shape-agnostic may ignore `shape`.
         fromFloat32Shape: *const fn (ctx: *anyopaque, data: []const f32, shape: []const i32) anyerror!CT,
 
+        /// A read-only host borrow. The caller retains storage through every
+        /// operation and frees the tensor before releasing the source memory.
+        fromBorrowedFloat32Shape: ?*const fn (*anyopaque, []const f32, []const i32) anyerror!CT = null,
+        /// Synchronous contiguous host views, valid only while the tensor lives.
+        /// Write access must reject immutable, strided or shared storage.
+        hostFloat32Read: ?*const fn (*anyopaque, CT) anyerror!?[]const f32 = null,
+        hostFloat32Write: ?*const fn (*anyopaque, CT) anyerror!?[]f32 = null,
+
         /// Create a tensor from raw i32 data with an explicit logical shape.
         /// Backends may leave this null when they do not support integer tensors.
         fromInt32Shape: ?*const fn (ctx: *anyopaque, data: []const i32, shape: []const i32) anyerror!?CT = null,
@@ -5140,6 +5148,25 @@ pub const ComputeBackend = struct {
         }
         if (elem_count != data.len) return error.InvalidShape;
         return self.vtable.fromFloat32Shape(self.ptr, data, shape);
+    }
+
+    pub fn fromBorrowedFloat32Shape(self: *const ComputeBackend, data: []const f32, shape: []const i32) !CT {
+        var count: usize = 1;
+        for (shape) |dim| {
+            if (dim < 0) return error.InvalidShape;
+            count = std.math.mul(usize, count, @intCast(dim)) catch return error.InvalidShape;
+        }
+        if (count != data.len) return error.InvalidShape;
+        if (self.vtable.fromBorrowedFloat32Shape) |run| return run(self.ptr, data, shape);
+        return self.fromFloat32Shape(data, shape);
+    }
+    pub fn hostFloat32Read(self: *const ComputeBackend, tensor: CT) !?[]const f32 {
+        if (self.vtable.hostFloat32Read) |run| return run(self.ptr, tensor);
+        return null;
+    }
+    pub fn hostFloat32Write(self: *const ComputeBackend, tensor: CT) !?[]f32 {
+        if (self.vtable.hostFloat32Write) |run| return run(self.ptr, tensor);
+        return null;
     }
 
     pub fn fromInt32Shape(self: *const ComputeBackend, data: []const i32, shape: []const i32) !?CT {

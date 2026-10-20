@@ -49614,3 +49614,5 @@ test "embeddinggemma2 Metal multiplication plans retain full tiles tails and des
 }
 
 pub extern fn antfly_metal_rotary_table(runtime: ?*RawMetalDecodeRuntime, output: ?*anyopaque, offset: usize, dim: u32, x: u32, y: u32, theta: f32, vision: u32) c_int;
+
+pub extern fn antfly_metal_video_position(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, output: ?*anyopaque, output_offset: usize, rows: u32, grid_x: u32, grid_y: u32, axis: u32) c_int;

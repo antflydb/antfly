@@ -735,10 +735,21 @@ pub fn encodeEmbeddingGemma2VideoBatchTensorWithPlan(cb: *const ComputeBackend, 
 
 /// An optional output is borrowed; the caller owns it on success and failure.
 pub fn encodeEmbeddingGemma2VideoBatchTensorInto(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, width: u32, height: u32, frames: usize, required: bool, output: ?CT) !EncodedDeviceImage {
+    return encodeVideoBatchInput(cb, allocator, .{ .tensor = input }, width, height, frames, required, output);
+}
+
+pub const VideoBatchInput = union(enum) {
+    tensor: CT,
+    gather: []const @import("../ops/metal_compute.zig").VideoGatherInput,
+};
+/// Preparation/weight setup precedes the owned input frame. Gather, patch
+/// projection and precise positional addition share one submission and fence.
+pub fn encodeVideoBatchInput(cb: *const ComputeBackend, allocator: std.mem.Allocator, source: VideoBatchInput, width: u32, height: u32, frames: usize, required: bool, output: ?CT) !EncodedDeviceImage {
     var cfg = embeddingGemma2ImageConfig();
     cfg.max_image_tokens = 140;
     cfg.require_prepared_vision = required;
     if (frames == 0 or frames > 8) return error.InvalidTensorShape;
+    if (source == .gather and source.gather.len != frames) return error.InvalidTensorShape;
     if (width == 0 or height == 0 or width % 48 != 0 or height % 48 != 0) return error.InvalidTensorShape;
     const g = Geometry{ .batches = frames, .width = width, .height = height, .grid_x = width / 16, .grid_y = height / 16, .pooled_x = width / 48, .pooled_y = height / 48 };
     if (g.tokenCount() / frames > 140) return error.InvalidTensorShape;
@@ -747,23 +758,38 @@ pub fn encodeEmbeddingGemma2VideoBatchTensorInto(cb: *const ComputeBackend, allo
     }
     var store = ProjectorWeights.initHuggingFace(cb, allocator);
     defer store.deinit();
-    const weight = try store.linearCt("v.patch_embd.weight", 768, cfg.vision_hidden);
-    defer cb.free(weight);
-    const projected = try cb.linearNoBias(input, weight, frames * g.grid_x * g.grid_y, 768, cfg.vision_hidden);
-    defer cb.free(projected);
-    if (cb.kind() == .metal) {
+    // Input-only weights and temporaries must drain before the tower: a CPU
+    // position table can otherwise stay pinned through every layer's scratch.
+    const positioned = input_phase: {
+        const weight = try store.linearCt("v.patch_embd.weight", 768, cfg.vision_hidden);
+        defer cb.free(weight);
         const positions = try store.weightCt("v.position_embd.weight");
         defer cb.free(positions);
+        if (cb.kind() == .metal) {
+            const shape = try cb.tensorShape(positions, allocator);
+            defer allocator.free(shape);
+            if (shape.len != 3 or shape[0] != 2 or shape[1] <= 0 or shape[2] != 768) return error.InvalidPositionEmbeddingShape;
+            try @import("../ops/metal_compute.zig").MetalCompute.prepareVideoInput(cb, weight, positions, @intCast(shape[1]));
+        }
+        var input_frame = if (cb.kind() == .metal) try beginVisionBoundary(cb, &store, cfg) else false;
+        defer if (input_frame) cb.decoderRuntimeCancelFrame() catch {};
+        const input = switch (source) {
+            .tensor => |ct| ct,
+            .gather => |sources| try @import("../ops/metal_compute.zig").MetalCompute.gatherVideoInputs(cb, sources, g.grid_x * g.grid_y, 768),
+        };
+        defer if (source == .gather) cb.free(input);
+        const projected = try cb.linearNoBias(input, weight, frames * g.grid_x * g.grid_y, 768, cfg.vision_hidden);
+        defer cb.free(projected);
         const positioned = try addPositionEmbeddingsDevice(cb, allocator, projected, positions, cfg.vision_hidden, g);
-        const result = try encodePositionedBatchResidentInto(cb, allocator, &store, cfg, positioned, singleGeometry(g), frames, output);
-        return .{ .tensor = result.embeddings, .tokens = frames * result.tokens };
-    }
-    const data = try cb.toFloat32(projected, allocator);
-    defer allocator.free(data);
-    const positioned = try addPositionEmbeddings(allocator, &store, cfg, data, g);
-    defer allocator.free(positioned);
-    const hidden = try cb.fromFloat32Shape(positioned, &.{ @intCast(frames * g.grid_x * g.grid_y), @intCast(cfg.vision_hidden) });
-    const result = try encodePositionedBatchResidentInto(cb, allocator, &store, cfg, hidden, singleGeometry(g), frames, output);
+        errdefer cb.free(positioned);
+        if (input_frame) {
+            try cb.decoderRuntimeSubmitAndWaitFrame();
+            input_frame = false;
+            try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+        }
+        break :input_phase positioned;
+    };
+    const result = try encodePositionedBatchResidentInto(cb, allocator, &store, cfg, positioned, singleGeometry(g), frames, output);
     return .{ .tensor = result.embeddings, .tokens = frames * result.tokens };
 }
 
@@ -4990,6 +5016,28 @@ fn addPositionEmbeddingsDevice(cb: *const ComputeBackend, allocator: std.mem.All
     if (geometry.grid_x > per_axis or geometry.grid_y > per_axis) return error.InvalidPositionEmbeddingShape;
     const rows = geometry.batches * geometry.grid_x * geometry.grid_y;
     if (!(try cb.tensorShapeMatches(patches, &.{ @intCast(rows), @intCast(hidden) }) orelse false)) return error.InvalidPositionEmbeddingShape;
+    if (cb.kind() == .native) if (try cb.hostFloat32Read(patches)) |input| if (try cb.hostFloat32Read(positions)) |table| {
+        if (input.len != rows * hidden or table.len != 2 * per_axis * hidden) return error.InvalidPositionEmbeddingShape;
+        const result = (try cb.allocUninitF32Shape(&.{ @intCast(rows), @intCast(hidden) })) orelse return error.UnsupportedPrimitiveOp;
+        errdefer cb.free(result);
+        const target = (try cb.hostFloat32Write(result)) orelse return error.UnsupportedPrimitiveOp;
+        // Portable SIMD preserves the reference's (x + y) + patch ordering.
+        for (0..rows) |row| {
+            const xbase = (row % geometry.grid_x) * hidden;
+            const ybase = (per_axis + (row / geometry.grid_x) % geometry.grid_y) * hidden;
+            const base = row * hidden;
+            var h: usize = 0;
+            while (h + 8 <= hidden) : (h += 8) {
+                const x: @Vector(8, f32) = table[xbase + h ..][0..8].*;
+                const y: @Vector(8, f32) = table[ybase + h ..][0..8].*;
+                const patch: @Vector(8, f32) = input[base + h ..][0..8].*;
+                target[base + h ..][0..8].* = patch + (x + y);
+            }
+            for (h..hidden) |tail| target[base + tail] = input[base + tail] + (table[xbase + tail] + table[ybase + tail]);
+        }
+        return result;
+    };
+    if (hidden == 768) if (try @import("../ops/metal_compute.zig").MetalCompute.videoPosition(cb, patches, positions, rows, geometry.grid_x, geometry.grid_y, per_axis)) |result| return result;
     const x = try allocator.alloc(i64, rows);
     defer allocator.free(x);
     const y = try allocator.alloc(i64, rows);

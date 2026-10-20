@@ -1312,7 +1312,7 @@ pub const Prefetch = struct {
     fn discard(self: *Prefetch, job: *Job) void {
         switch (job.*) {
             .header => {},
-            .native => |value| self.a.free(value.patches),
+            .native => |value| (value.allocator orelse self.a).free(value.patches),
             .metal => |*value| value.prepared.deinit(),
             .cached => |value| if (!value.pinned) self.cache.?.restore(value.ticket),
         }
@@ -1688,7 +1688,8 @@ pub const Prefetch = struct {
                 try capture.projectReadyBatchNow(batch[0..take]);
             } else {
                 const value = jobs[first].native;
-                try capture.project(value.slot, value.patches, value.options);
+                owned[first] = false;
+                try capture.projectOwned(value.slot, value.patches, value.options, value.allocator orelse owners[first].a);
             }
             var kept: usize = 0;
             for (0..count) |index| {
@@ -2268,7 +2269,13 @@ const ProjectionScheduler = struct {
     }
 };
 
-const NativeProjectionJob = struct { slot: usize, patches: []f32, options: video.preparation.Options };
+const NativeProjectionJob = struct {
+    slot: usize,
+    patches: []f32,
+    options: video.preparation.Options,
+    /// Ahead producers may have a different bounded allocator from consumers.
+    allocator: ?std.mem.Allocator = null,
+};
 
 const Capture = struct {
     a: std.mem.Allocator,
@@ -2357,7 +2364,7 @@ const Capture = struct {
         return true;
     }
     fn discardNativePending(self: *Capture) void {
-        for (self.native_pending[0..self.native_count]) |pending| self.a.free(pending.patches);
+        for (self.native_pending[0..self.native_count]) |pending| (pending.allocator orelse self.a).free(pending.patches);
         self.native_count = 0;
     }
     fn commitNative(self: *Capture, slot: usize, embeddings: []const f32, tokens: usize) !void {
@@ -2379,22 +2386,22 @@ const Capture = struct {
         const started = batch_clock.monotonicNs();
         const pending = self.native_pending[0];
         try self.control.check();
-        if (count == 1) {
-            const encoded = try projector.encodeEmbeddingGemma2VideoPatches(self.cb, self.a, pending.patches, pending.options.width, pending.options.height);
-            defer self.a.free(encoded.embeddings);
-            try self.commitNative(pending.slot, encoded.embeddings, encoded.tokens);
-            batch_policy.completed(false, pending.options.width, pending.options.height, count, batch_clock.monotonicNs() -| started);
-            return;
-        }
-        const combined = try self.a.alloc(f32, pending.patches.len * count);
-        defer self.a.free(combined);
-        for (self.native_pending[0..count], 0..) |job, i| @memcpy(combined[i * pending.patches.len ..][0..pending.patches.len], job.patches);
-        const input = try self.cb.fromFloat32Shape(combined, &.{ @intCast(combined.len / 768), 768 });
+        const rows = pending.patches.len / 768;
+        const input = if (count == 1)
+            try self.cb.fromBorrowedFloat32Shape(pending.patches, &.{ @intCast(rows), 768 })
+        else blk: {
+            const tensor = (try self.cb.allocUninitF32Shape(&.{ @intCast(rows * count), 768 })) orelse return error.UnsupportedPrimitiveOp;
+            errdefer self.cb.free(tensor);
+            const target = (try self.cb.hostFloat32Write(tensor)) orelse return error.UnsupportedPrimitiveOp;
+            for (self.native_pending[0..count], 0..) |job, i| @memcpy(target[i * pending.patches.len ..][0..pending.patches.len], job.patches);
+            break :blk tensor;
+        };
         defer self.cb.free(input);
         const encoded = try projector.encodeEmbeddingGemma2VideoBatchTensorResident(self.cb, self.a, input, pending.options.width, pending.options.height, count);
         defer self.cb.free(encoded.tensor);
-        const embeddings = try self.cb.toFloat32(encoded.tensor, self.a);
-        defer self.a.free(embeddings);
+        const view = try self.cb.hostFloat32Read(encoded.tensor);
+        const embeddings = view orelse try self.cb.toFloat32(encoded.tensor, self.a);
+        defer if (view == null) self.a.free(embeddings);
         if (encoded.tokens % count != 0 or embeddings.len != encoded.tokens * 512) return error.InvalidTensorShape;
         const per_frame = encoded.tokens / count;
         self.recordCohort(self.native_pending[0..count]);
@@ -2411,6 +2418,12 @@ const Capture = struct {
         return count;
     }
     fn projectNativeBatch(self: *Capture, slot: usize, patches: []const f32, options: video.preparation.Options) !void {
+        return self.projectNativeOwned(slot, try self.a.dupe(f32, patches), options, self.a);
+    }
+    /// Consumes source storage on success and failure, including a flush error.
+    fn projectNativeOwned(self: *Capture, slot: usize, patches: []f32, options: video.preparation.Options, allocator: std.mem.Allocator) !void {
+        var adopted = false;
+        errdefer if (!adopted) allocator.free(patches);
         if (self.native_count != 0) {
             const pending = self.native_pending[0];
             if (pending.options.width != options.width or pending.options.height != options.height or pending.patches.len != patches.len) try self.flushNativePending();
@@ -2422,10 +2435,26 @@ const Capture = struct {
             // that singleton projection is faster than a paired CPU tower.
             self.native_limit = batch_policy.capacity(false, options.width, options.height, @min(geometry_limit, @max(1, self.remainingSelections())));
         }
-        self.native_pending[self.native_count] = .{ .slot = slot, .patches = try self.a.dupe(f32, patches), .options = options };
+        self.native_pending[self.native_count] = .{ .slot = slot, .patches = patches, .options = options, .allocator = allocator };
+        adopted = true;
         self.native_count += 1;
         self.claimed[slot] = true;
         if (self.native_count >= self.native_limit) try self.flushNativePending();
+    }
+    /// Prepared patches can enter the queue/pending batch without a copy.
+    /// Borrowed cache entries continue using project(), preserving their owner.
+    fn projectOwned(self: *Capture, slot: usize, patches: []f32, options: video.preparation.Options, allocator: std.mem.Allocator) !void {
+        if (self.prefetch) |producer| {
+            errdefer allocator.free(patches);
+            try self.control.check();
+            try producer.put(.{ .native = .{ .slot = slot, .patches = patches, .options = options, .allocator = allocator } });
+            self.claimed[slot] = true;
+        } else if (self.native_batching) {
+            try self.projectNativeOwned(slot, patches, options, allocator);
+        } else {
+            defer allocator.free(patches);
+            try self.project(slot, patches, options);
+        }
     }
     fn project(self: *Capture, slot: usize, patches: []const f32, options: video.preparation.Options) !void {
         try self.control.check();
@@ -2490,6 +2519,9 @@ const Capture = struct {
         return self.encodeGpuAdmitted(input, options, frames, false);
     }
     fn encodeGpuAdmitted(self: *Capture, input: CT, options: video.preparation.Options, frames: usize, admitted: bool) !projector.EncodedDeviceImage {
+        return self.encodeGpuInput(.{ .tensor = input }, options, frames, admitted);
+    }
+    fn encodeGpuInput(self: *Capture, input: projector.VideoBatchInput, options: video.preparation.Options, frames: usize, admitted: bool) !projector.EncodedDeviceImage {
         const required = self.preparedVision();
         self.last_prepared = required;
         if (!admitted) {
@@ -2499,14 +2531,19 @@ const Capture = struct {
         const tokens = frames * @as(usize, options.width / 48) * (options.height / 48);
         const output = (try self.cb.allocUninitF32Shape(&.{ @intCast(tokens), 512 })) orelse return error.UnsupportedPrimitiveOp;
         errdefer self.cb.free(output);
-        _ = projector.encodeEmbeddingGemma2VideoBatchTensorInto(self.cb, self.a, input, options.width, options.height, frames, required, output) catch |err| fallback: {
+        _ = projector.encodeVideoBatchInput(self.cb, self.a, input, options.width, options.height, frames, required, output) catch |err| fallback: {
             if (err != error.PreparedVisionUnavailable or !required) return err;
             // The failed required plan has fenced every command. The original
             // input is still live; no producer job is consumed a second time.
             if (self.cb.decoderRuntimeHasActiveFrame() or self.cb.decoderRuntimeHasSubmittedFrame()) return error.PreparedVisionFallbackBusy;
             try self.control.check();
             self.last_prepared = false;
-            try self.encodeLegacyGpu(input, options, frames, output);
+            const original = switch (input) {
+                .tensor => |ct| ct,
+                .gather => |sources| try MetalCompute.gatherVideoInputs(self.cb, sources, @as(usize, options.width / 16) * (options.height / 16), 768),
+            };
+            defer if (input == .gather) self.cb.free(original);
+            try self.encodeLegacyGpu(original, options, frames, output);
             break :fallback .{ .tensor = output, .tokens = tokens };
         };
         return .{ .tensor = output, .tokens = tokens };
@@ -2557,7 +2594,6 @@ const Capture = struct {
         if (gpu_count == 0) return self.projectHostBatchNow(host[0..host_count]);
         defer for (jobs) |*job| if (job.* == .metal) job.metal.prepared.deinit();
         const options = Prefetch.jobOptions(jobs[0]);
-        const rows = @as(usize, options.width / 16) * (options.height / 16);
         var first: usize = 0;
         while (first < jobs.len) {
             const required = self.preparedVision();
@@ -2584,9 +2620,7 @@ const Capture = struct {
                     else => unreachable,
                 }, .patches = &.{}, .options = options };
             }
-            const input = try MetalCompute.gatherVideoInputs(self.cb, inputs[0..take], rows, 768);
-            defer self.cb.free(input);
-            const encoded = try self.encodeGpuAdmitted(input, options, take, true);
+            const encoded = try self.encodeGpuInput(.{ .gather = inputs[0..take] }, options, take, true);
             defer self.cb.free(encoded.tensor);
             try self.saveResidentBatch(encoded, destinations[0..take]);
             if (!required or self.last_prepared) batch_policy.completedForPlan(true, options.width, options.height, take, batch_clock.monotonicNs() -| started, self.last_prepared);
@@ -2645,20 +2679,18 @@ const Capture = struct {
                 buffers[i] = try job.prepared.buffer();
                 offsets[i] = job.prepared.output_byte_offset;
             }
-            const input = if (contiguousPreparationSpans(buffers[0..jobs.len], offsets[0..jobs.len], span))
-                try MetalCompute.importVideoBufferSpan(self.cb, buffers[0], offsets[0], rows * jobs.len * 768)
-            else blk: {
-                var inputs: [8]@import("../ops/metal_compute.zig").VideoGatherInput = undefined;
-                for (jobs, 0..) |job, i| inputs[i] = .{ .device = .{ .buffer = buffers[i], .offset = offsets[i], .values = job.prepared.geometry.values() } };
-                break :blk try MetalCompute.gatherVideoInputs(self.cb, inputs[0..jobs.len], rows, 768);
-            };
-            defer self.cb.free(input);
+            var inputs: [8]@import("../ops/metal_compute.zig").VideoGatherInput = undefined;
+            const contiguous = contiguousPreparationSpans(buffers[0..jobs.len], offsets[0..jobs.len], span);
+            const imported = if (contiguous) try MetalCompute.importVideoBufferSpan(self.cb, buffers[0], offsets[0], rows * jobs.len * 768) else null;
+            defer if (imported) |ct| self.cb.free(ct);
+            for (jobs, 0..) |job, i| inputs[i] = .{ .device = .{ .buffer = buffers[i], .offset = offsets[i], .values = job.prepared.geometry.values() } };
+            const source: projector.VideoBatchInput = if (imported) |ct| .{ .tensor = ct } else .{ .gather = inputs[0..jobs.len] };
+            const encoded = try self.encodeGpuInput(source, options, jobs.len, true);
+            defer self.cb.free(encoded.tensor);
             for (jobs, 0..) |*job, i| {
                 job.prepared.deinit();
                 live[i] = false;
             }
-            const encoded = try self.encodeGpuAdmitted(input, options, jobs.len, true);
-            defer self.cb.free(encoded.tensor);
             try self.saveResidentBatch(encoded, jobs);
             if (!self.preparedVision() or self.last_prepared) batch_policy.completedForPlan(true, options.width, options.height, jobs.len, batch_clock.monotonicNs() -| started, self.last_prepared);
         } else return error.UnsupportedVideoBackend;
@@ -2701,12 +2733,9 @@ const Capture = struct {
                 ceiling = admitted;
             };
             const started = batch_clock.monotonicNs();
-            const patches = jobs[first].patches.len;
             var inputs: [8]@import("../ops/metal_compute.zig").VideoGatherInput = undefined;
             for (jobs[first..][0..count], 0..) |job, index| inputs[index] = .{ .host = job.patches };
-            const input = try MetalCompute.gatherVideoInputs(self.cb, inputs[0..count], patches / 768, 768);
-            defer self.cb.free(input);
-            const encoded = try self.encodeGpuAdmitted(input, options, count, true);
+            const encoded = try self.encodeGpuInput(.{ .gather = inputs[0..count] }, options, count, true);
             defer self.cb.free(encoded.tensor);
             try self.saveResidentBatch(encoded, jobs[first..][0..count]);
             if (!required or self.last_prepared) batch_policy.completedForPlan(true, options.width, options.height, count, batch_clock.monotonicNs() -| started, self.last_prepared);
@@ -2771,8 +2800,7 @@ const Capture = struct {
             return self.projectGpu(slot, prepared, options);
         }
         const patches = try video.preparation.referenceHost(self.a, host, options, self.control);
-        defer self.a.free(patches);
-        try self.project(slot, patches, options);
+        try self.projectOwned(slot, patches, options, self.a);
     }
     fn publishAppleWebm(raw: *anyopaque, id: usize, surface: *const video.apple.Surface, picture: video.webm_pictures.Picture) !void {
         const self: *Capture = @ptrCast(@alignCast(raw));
@@ -2792,8 +2820,7 @@ const Capture = struct {
             return self.projectGpu(slot, prepared, options);
         }
         const patches = try video.preparation.reference(self.a, surface, options, self.control);
-        defer self.a.free(patches);
-        try self.project(slot, patches, options);
+        try self.projectOwned(slot, patches, options, self.a);
     }
     fn publishApple(raw: *anyopaque, frame: *const video.apple.Frame) !void {
         const self: *Capture = @ptrCast(@alignCast(raw));
@@ -2809,8 +2836,7 @@ const Capture = struct {
             try self.projectGpu(first, prepared, options);
         } else {
             const patches = try video.preparation.reference(self.a, &frame.surface, options, self.control);
-            defer self.a.free(patches);
-            try self.project(first, patches, options);
+            try self.projectOwned(first, patches, options, self.a);
         }
         if (self.prefetch != null or self.scheduler != null) return;
         const n = self.frame_tokens[first] * 512;
@@ -2834,8 +2860,7 @@ const Capture = struct {
             return self.projectGpu(slot, prepared, options);
         }
         const patches = try video.preparation.referenceHost(self.a, frame.host(), options, self.control);
-        defer self.a.free(patches);
-        try self.project(slot, patches, options);
+        try self.projectOwned(slot, patches, options, self.a);
     }
 };
 
@@ -5261,6 +5286,7 @@ test "embeddinggemma2 video idle CPU batch executes without waiting for another 
     };
     var vtable: ComputeBackend.VTable = undefined;
     vtable.fromFloat32Shape = Fake.upload;
+    vtable.fromBorrowedFloat32Shape = null;
     var marker: u8 = 0;
     const cb = ComputeBackend{ .ptr = &marker, .vtable = &vtable };
     var counts = [_]usize{ 0, 0 };
@@ -5272,4 +5298,27 @@ test "embeddinggemma2 video idle CPU batch executes without waiting for another 
     // before any queue wait, despite the desired paired width of two.
     try std.testing.expectError(error.ReadyCpuProjectionExecuted, capture.flushNativeBeforeWait());
     try std.testing.expectEqual(@as(usize, 0), capture.native_count);
+}
+
+test "embeddinggemma2 video owned CPU patches preserve producer allocator through failed projection" {
+    const Budget = @import("../runtime/bounded_allocator.zig").BoundedAllocator;
+    var producer = Budget{ .backing = std.testing.allocator, .limit = 128 * 1024 };
+    var consumer = Budget{ .backing = std.testing.allocator, .limit = 128 * 1024 };
+    const Fake = struct {
+        fn upload(_: *anyopaque, _: []const f32, _: []const i32) !CT {
+            return error.ReadyCpuProjectionExecuted;
+        }
+    };
+    var vtable: ComputeBackend.VTable = undefined;
+    vtable.fromFloat32Shape = Fake.upload;
+    vtable.fromBorrowedFloat32Shape = null;
+    var marker: u8 = 0;
+    const cb = ComputeBackend{ .ptr = &marker, .vtable = &vtable };
+    var counts = [_]usize{0};
+    var capture = Capture{ .a = consumer.allocator(), .cb = &cb, .track = undefined, .control = .{}, .output = &.{}, .frame_tokens = &counts, .selected = &.{0}, .native_batching = true };
+    const patches = try producer.allocator().alloc(f32, 48 * 48 * 3);
+    try std.testing.expectError(error.ReadyCpuProjectionExecuted, capture.projectNativeOwned(0, patches, .{ .width = 48, .height = 48, .matrix = .bt601 }, producer.allocator()));
+    try std.testing.expectEqual(@as(usize, 0), capture.native_count);
+    try std.testing.expectEqual(@as(usize, 0), producer.live);
+    try std.testing.expectEqual(@as(usize, 0), consumer.live);
 }
