@@ -3464,3 +3464,77 @@ test "lake SQL typed floating masks preserve SIMD narrowing NaN order and NULL l
     try std.testing.expect(try @import("lake_predicate_kernel.zig").apply(a, null_batch, table, .{ .column = "n", .op = .eq, .value = .{ .string = "invalid" } }, &mask));
     try std.testing.expectEqualSlices(bool, &.{ false, false, false, false, false, false }, &mask);
 }
+
+test "lake SQL compact encodings scan independent nullable Parquet and project selected rows" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        @embedFile("../serverless/query/testdata/pyarrow_encoded_v1.parquet"),
+        @embedFile("../serverless/query/testdata/pyarrow_encoded_v2.parquet"),
+    }) |data| for ([_]enum { all, amount, decimal }{ .all, .amount, .decimal }) |mode| {
+        var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+        try lake.populateData(a, 1, data);
+        defer lake.deinit(a);
+        lake.table.columns = &.{
+            .{ .name = "amount", .path = "amount", .type = .integer },
+            .{ .name = "small", .path = "small", .type = .integer },
+            .{ .name = "n", .path = "n", .type = .number },
+            .{ .name = "real", .path = "real", .type = .number },
+            .{ .name = "label", .path = "label", .type = .string },
+            .{ .name = "short", .path = "short", .type = .string },
+            .{ .name = "bsint", .path = "bsint", .type = .integer },
+            .{ .name = "exact", .path = "exact", .type = .number, .element_type = .numeric },
+        };
+        const conditions = [_]catalog.Condition{if (mode == .decimal) .{ .column = "exact", .op = .gte, .value = .{ .number_string = "1.88" } } else .{ .column = "amount", .op = .gte, .value = .{ .integer = 288 } }};
+        const cursor = try openPinned(a, lake.table, .{ .fields = &.{ "small", "n", "real", "label", "short", "bsint", "exact" }, .conditions = if (mode != .all) &conditions else &.{}, .limit = 7 }, .{}, &lake.source);
+        defer cursor.close(cursor.ptr);
+        var expected: usize = if (mode != .all) 288 else 0;
+        var count: usize = 0;
+        while (true) {
+            const result = try cursor.next(cursor.ptr, a, 7);
+            defer result.deinit();
+            for (result.rows) |row| {
+                while (mode == .amount and expected % 17 == 0) expected += 1;
+                const value = row.value.object;
+                try std.testing.expectEqual(@as(i64, @intCast(expected)) - 150, value.get("small").?.integer);
+                try std.testing.expectEqual(@as(i64, @intCast(expected * 13)) - 1000, value.get("bsint").?.integer);
+                try std.testing.expectEqual(@as(f64, @floatFromInt(expected)) + 0.5, value.get("real").?.float);
+                if (expected % 11 == 0) try std.testing.expect(value.get("n").? == .null) else try std.testing.expectEqual(@as(f64, @floatFromInt(expected)) + 0.25, value.get("n").?.float);
+                var text: [32]u8 = undefined;
+                if (expected % 13 == 0) try std.testing.expect(value.get("label").? == .null) else try std.testing.expectEqualStrings(try std.fmt.bufPrint(&text, "prefix-{d:0>5}", .{expected}), value.get("label").?.string);
+                if (expected % 19 == 0) try std.testing.expect(value.get("short").? == .null) else try std.testing.expectEqualStrings(try std.fmt.bufPrint(&text, "{d}", .{expected}), value.get("short").?.string);
+                const decimal_text = try @import("../common/decimal128.zig").formatAlloc(a, @as(i128, @intCast(expected)) - 100, 12, 2);
+                defer a.free(decimal_text);
+                try std.testing.expectEqualStrings(decimal_text, value.get("exact").?.string);
+                count += 1;
+                expected += 1;
+            }
+            if (result.after == null) break;
+        }
+        try std.testing.expectEqual(@as(usize, if (mode == .amount) 11 else if (mode == .decimal) 12 else 300), count);
+    };
+}
+
+test "lake SQL compact encodings accept all-null delta headers in full and selective scans" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        @embedFile("../serverless/query/testdata/pyarrow_null_encoded_v1.parquet"),
+        @embedFile("../serverless/query/testdata/pyarrow_null_encoded_v2.parquet"),
+    }) |data| for ([_]bool{ false, true }) |selective| {
+        var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+        try lake.populateData(a, 1, data);
+        defer lake.deinit(a);
+        lake.table.columns = &.{
+            .{ .name = "row", .path = "row", .type = .integer },
+            .{ .name = "v", .path = "v", .type = .integer },
+            .{ .name = "lengths", .path = "lengths", .type = .string },
+            .{ .name = "prefixes", .path = "prefixes", .type = .string },
+        };
+        const conditions = [_]catalog.Condition{.{ .column = "row", .op = .eq, .value = .{ .integer = 3 } }};
+        const cursor = try openPinned(a, lake.table, .{ .fields = &.{ "v", "lengths", "prefixes" }, .conditions = if (selective) &conditions else &.{}, .limit = 7 }, .{}, &lake.source);
+        defer cursor.close(cursor.ptr);
+        const result = try cursor.next(cursor.ptr, a, 7);
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, if (selective) 1 else 4), result.rows.len);
+        for (result.rows) |row| for ([_][]const u8{ "v", "lengths", "prefixes" }) |field| try std.testing.expect(row.value.object.get(field).? == .null);
+    };
+}

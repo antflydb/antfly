@@ -1508,6 +1508,16 @@ pub const Adapter = struct {
         child: catalog.AggregatePartialCursor,
         execution: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution = null,
         fused: [256]bool = @splat(false),
+        composition: ?*@import("lake_index_aggregate_composition.zig").Composition = null,
+        transferred: bool = false,
+        started: bool = false,
+        final_request: ?catalog.FinalGroupRequest = null,
+        final_page: std.heap.ArenaAllocator,
+        final_rows: []const @import("antfly_local_sources").sql_operators.GroupResult = &.{},
+        final_positions: []const usize = &.{},
+        final_position: usize = 0,
+        scan_quota: catalog.ScanQuota = .{ .capacity = 4096, .row_limit = std.math.maxInt(usize), .page_limit = std.math.maxInt(usize) },
+        final_ordered: bool = false,
         fn canceled(raw: *const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(raw));
             self.adapter.context.ensureActive() catch return true;
@@ -1525,6 +1535,7 @@ pub const Adapter = struct {
         }
         fn next(raw: *anyopaque, a: std.mem.Allocator, maximum: u32) !?[]const @import("antfly_local_sources").sql_operators.GroupResult {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            self.started = true;
             try self.adapter.verify(a, self.table);
             const cursor = self.child;
             const result = cursor.nextFor(self.execution, a, maximum) catch |err| {
@@ -1534,6 +1545,101 @@ pub const Adapter = struct {
             try self.adapter.context.ensureActive();
             return result;
         }
+        fn closeCursor(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.transferred) close(raw);
+        }
+        fn adoptFinal(raw: *anyopaque, grouped: *@import("antfly_local_sources").sql_operators.Grouped, request: catalog.FinalGroupRequest) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.started or self.transferred) return error.InvalidSqlBackendResponse;
+            const execution = if (self.adapter.cpuScope()) |scope| scope.execution else null;
+            if (execution) |owner| try bindExecution(raw, owner);
+            defer if (execution != null) releaseExecution(raw);
+            const first = if (self.composition) |composition| prime: {
+                const cursor = composition.cursor();
+                const capability = cursor.coordinator_execution;
+                if (execution != null and capability != null) try capability.?.bind(cursor.ptr, execution.?);
+                defer if (execution != null and capability != null) capability.?.release(cursor.ptr);
+                break :prime try composition.prime();
+            } else self.child;
+            const capability = first.coordinator_execution;
+            if (execution != null and capability != null) try capability.?.bind(first.ptr, execution.?);
+            defer if (execution != null and capability != null) capability.?.release(first.ptr);
+            const proof = first.final_group_proof orelse return false;
+            if (proof.slots.len != self.recipe.inputs.len or grouped.specs.len != self.recipe.inputs.len) return false;
+            var covered: [256]bool = @splat(false);
+            for (proof.slots) |slot| {
+                if (slot >= self.recipe.inputs.len or covered[slot]) return error.InvalidSqlBackendResponse;
+                covered[slot] = true;
+            }
+            for (grouped.specs, self.recipe.inputs) |spec, input| if (!std.meta.eql(spec, input.spec)) return error.InvalidSqlBackendResponse;
+            try self.adapter.verify(self.a, self.table);
+            if (request.point) |point| if (first.select_point) |select| try select(first.ptr, point);
+            var selection = request.selection;
+            selection.row_limit = request.row_limit;
+            selection.page_limit = request.page_limit;
+            selection.batch_rows = request.batch_rows;
+            const ordered = if (first.select_keys) |select| try select(first.ptr, selection) else false;
+            self.final_ordered = ordered;
+            self.final_request = request;
+            self.scan_quota = .{ .capacity = request.batch_rows, .row_limit = request.row_limit, .page_limit = request.page_limit };
+            try grouped.adoptFinalized(.{ .ptr = self, .count = std.math.cast(usize, proof.count) orelse return error.SqlProgramLimitExceeded, .exact_count = request.predicate == null and request.point == null and !ordered, .ordered = ordered, .batch_rows = request.batch_rows, .next = nextFinal, .close = close }, request.page_limit);
+            self.transferred = true;
+            return true;
+        }
+        fn nextFinal(raw: *anyopaque, a: std.mem.Allocator, maximum: usize, exact: bool) anyerror!?@import("antfly_local_sources").sql_operators.GroupBatch {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const local = @import("antfly_local_sources");
+            const execution = if (self.adapter.cpuScope()) |scope| scope.execution else null;
+            if (execution) |owner| try bindExecution(raw, owner);
+            defer if (execution != null) releaseExecution(raw);
+            const request = self.final_request.?;
+            // Retain one bounded provider page while small result pulls consume it.
+            // Scan credit counts logical batches, independent of result framing.
+            var scratch = std.heap.ArenaAllocator.init(self.a);
+            defer scratch.deinit();
+            while (self.final_position == self.final_positions.len) {
+                _ = self.final_page.reset(.free_all);
+                const pa = self.final_page.allocator();
+                const rows = (try next(raw, pa, if ((self.final_ordered and request.selection.maximum_groups == null) or (request.selection.unordered_prefix and request.predicate == null and request.selection.maximum_groups != null)) @intCast(@min(maximum, request.batch_rows)) else request.batch_rows)) orelse return null;
+                try self.scan_quota.admit(rows.len, false);
+                const positions = try pa.alloc(usize, rows.len);
+                var accepted: usize = 0;
+                for (rows, 0..) |row, index| {
+                    if (row.keys.len != self.recipe.keys.len or try local.sql_aggregate_partial.partialCount(row) != self.recipe.inputs.len) return error.InvalidSqlBackendResponse;
+                    _ = scratch.reset(.free_all);
+                    if (request.predicate) |predicate| if (!try predicate.matches(predicate.ptr, scratch.allocator(), row.keys)) continue;
+                    positions[accepted] = index;
+                    accepted += 1;
+                }
+                self.final_rows = rows;
+                self.final_positions = positions[0..accepted];
+                self.final_position = 0;
+            }
+            const count = @min(maximum, self.final_positions.len - self.final_position);
+            const keys = try a.alloc([]const local.sql_scalar.Datum, count);
+            const values = try a.alloc([]const local.sql_scalar.Datum, self.recipe.inputs.len);
+            for (values) |*column| column.* = try a.alloc(local.sql_scalar.Datum, count);
+            const ordinals = try a.alloc(u64, count);
+            for (self.final_positions[self.final_position..][0..count], 0..) |index, output| {
+                const row = self.final_rows[index];
+                var populated: [256]bool = @splat(false);
+                _ = scratch.reset(.free_all);
+                for (0..values.len) |logical| {
+                    const slot = if (row.aggregate_slots) |map| map[logical] else logical;
+                    if (slot >= values.len or populated[slot]) return error.InvalidSqlBackendResponse;
+                    populated[slot] = true;
+                    @constCast(values[slot])[output] = if (exact) try local.sql_aggregate_partial.cell(a, try local.sql_aggregate_partial.read(scratch.allocator(), row, logical, self.recipe.inputs[slot].spec)) else try local.sql_aggregate_partial.finish(a, scratch.allocator(), row, logical, self.recipe.inputs[slot].spec);
+                }
+                const key_cells = try a.alloc(local.sql_scalar.Datum, row.keys.len);
+                for (key_cells, row.keys) |*cell, input| cell.* = try local.sql_operators.cloneDatum(a, input);
+                keys[output] = key_cells;
+                ordinals[output] = row.ordinal;
+            }
+            self.final_position += count;
+            return .{ .keys = .{ .rows = keys }, .aggregates = .{ .vectors = .{ .values = values, .count = count } }, .ordinals = ordinals };
+        }
+
         fn close(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const cursor = self.child;
@@ -1546,6 +1652,7 @@ pub const Adapter = struct {
         fn destroyControl(self: *@This()) void {
             const a = self.a;
             if (self.reader_lease) |lease| lease.deinit();
+            self.final_page.deinit();
             self.arena.deinit();
             a.destroy(self);
         }
@@ -1607,6 +1714,7 @@ pub const Adapter = struct {
         owner.a = a;
         owner.reader_lease = null;
         owner.arena = .init(a);
+        owner.final_page = .init(a);
         var keep_owner = false;
         defer if (!keep_owner) owner.destroyControl();
         owner.store = @import("lake_index_store.zig").Store.openNativeFor(a, self.server.cfg.node_config, self.server.cfg.secret_store, true, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir, try self.lakeReadContext(null)) catch |err| {
@@ -1643,6 +1751,15 @@ pub const Adapter = struct {
         // From this point errors propagate: selected immutable state cannot be
         // replaced with a fresh scan halfway through consumption.
         owner.fused = @splat(false);
+        owner.composition = null;
+        owner.transferred = false;
+        owner.started = false;
+        owner.final_request = null;
+        owner.final_rows = &.{};
+        owner.final_positions = &.{};
+        owner.final_position = 0;
+        owner.scan_quota = .{ .capacity = 4096, .row_limit = std.math.maxInt(usize), .page_limit = std.math.maxInt(usize) };
+        owner.final_ordered = false;
         owner.a = a;
         owner.adapter = self;
         owner.table = table;
@@ -1653,6 +1770,7 @@ pub const Adapter = struct {
         defer owner.execution = null;
         owner.child = (if (recipe.inputs.len == 1) AggregateArtifactCursor.openMember(owner, 0) else composed: {
             const composition = try @import("lake_index_aggregate_composition.zig").Composition.create(a, recipe, .{ .ptr = owner, .open = AggregateArtifactCursor.openMember, .open_for = AggregateArtifactCursor.openMemberFor });
+            owner.composition = composition;
             break :composed composition.cursor();
         }) catch |err| {
             try self.context.ensureActive();
@@ -1662,7 +1780,7 @@ pub const Adapter = struct {
         if (opening_execution) |execution| try execution.checkpoint();
         keep_store = true;
         keep_owner = true;
-        return .{ .ptr = owner, .next = AggregateArtifactCursor.next, .close = AggregateArtifactCursor.close, .coordinator_execution = .{ .bind = AggregateArtifactCursor.bindExecution, .release = AggregateArtifactCursor.releaseExecution } };
+        return .{ .ptr = owner, .next = AggregateArtifactCursor.next, .close = AggregateArtifactCursor.closeCursor, .adopt_final_groups = AggregateArtifactCursor.adoptFinal, .coordinator_execution = .{ .bind = AggregateArtifactCursor.bindExecution, .release = AggregateArtifactCursor.releaseExecution } };
     }
 
     pub fn openLakeScan(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Cursor {
@@ -4858,6 +4976,7 @@ test "lake SQL failed aggregate admission releases control before its descriptor
             owner.a = a;
             owner.reader_lease = null;
             owner.arena = .init(a);
+            owner.final_page = .init(a);
             defer owner.destroyControl();
             _ = try owner.arena.allocator().alloc(u8, 128);
             return error.NativeArtifactStorageRequired;

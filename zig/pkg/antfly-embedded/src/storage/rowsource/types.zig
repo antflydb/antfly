@@ -47,6 +47,14 @@ pub const Source = struct {
     ctx: *anyopaque,
     next_batch: NextBatchFn,
     deinit_fn: ?DeinitFn = null,
+    /// Optional immutable payload ownership for the last returned batch.
+    /// Callers must copy descriptors, identities and null maps before pulling
+    /// again. Encoded/mutable sources decline and retain ordinary borrowing.
+    retain_columns: ?*const fn (*anyopaque, Allocator) anyerror!?ColumnOwner = null,
+
+    pub fn retainColumns(self: Source, alloc: Allocator) !?ColumnOwner {
+        return if (self.retain_columns) |retain| retain(self.ctx, alloc) else null;
+    }
 
     pub fn next(self: Source, alloc: Allocator) !?ColumnBatch {
         const batch = try self.next_batch(self.ctx, alloc);

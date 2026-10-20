@@ -1,0 +1,59 @@
+{
+  "base_commit": "671057472446fc29830f25b3bb6510cb8de9e4a9",
+  "merged_main": "833e2ffa40959498707390fe10ab5f92bf1bf68a",
+  "zig_version": "0.17.0",
+  "build": "Debug",
+  "scope": "Deterministic regression observations; no archive-scale latency, RSS or DuckDB parity claim.",
+  "numeric_finalization": {
+    "exact_input": "9007199254740993.1200",
+    "output_budget_bytes": 4194304,
+    "requested_results": 16384,
+    "before": {
+      "completed_results": 5031,
+      "peak_bytes": 4166628,
+      "remaining_results": "output budget exhausted"
+    },
+    "after": {
+      "completed_results": 16384,
+      "peak_bytes": 871334
+    }
+  },
+  "text_statistics_single_term_update": {
+    "vocabulary_terms": 16000,
+    "before_written_bytes": 548080,
+    "after_written_bytes": 262362,
+    "main_tree_written_bytes": 296613,
+    "scope": "Same branch/fixture; main comparison substitutes only the original main page-tree implementation."
+  },
+  "compact_merge": {
+    "counter_slots": 64,
+    "output_allocations": 1,
+    "output_record_bytes": 542,
+    "selected_counter_finalization_allocations": 0,
+    "equivalence_cases": 14,
+    "semantics": "COUNT, checked wide SUM, booleans, typed extrema including NaN, floating SUM/AVG and exact NUMERIC; shared reducer equivalence and allocation failure checks."
+  },
+  "incremental_batches": {
+    "changed_keys": 4352,
+    "old_groups": 4096,
+    "result_groups": 3328,
+    "max_batch_edits": 1024,
+    "target_batch_bytes": 524288,
+    "verified": "Missing/present successors across batches, insertions, deletions, exact count results and old snapshot readability."
+  },
+  "navigation": {
+    "cold_keys": 2,
+    "readers": 4,
+    "canceled_readers": 1,
+    "provider_reads": 2,
+    "independent_loads_overlap": true,
+    "warm_hit_rechecks_authority": true,
+    "max_resident_bytes": 4194304,
+    "max_loading_bytes": 8388608,
+    "max_loaders": 4
+  },
+  "archive_comparison": {
+    "status": "not_run",
+    "reason": "The 142577-row HN fixture is not on this machine. Live-provider retention qualification remains deferred."
+  }
+}

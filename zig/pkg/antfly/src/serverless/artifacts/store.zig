@@ -191,6 +191,34 @@ pub const ArtifactMetadata = struct {
 /// Backend evidence must change after namespace deletion, replacement or restore.
 pub const RetentionWitness = struct { scope: UploadScope, stamp: [32]u8 };
 
+/// Operation-owned scheduling capability; never installed on a shared backend.
+/// A batch reserves its full fan-out before starting children. Children borrow
+/// a copy with this capability removed and drain before the owner resumes CPU.
+pub const IoPhase = struct {
+    ptr: *anyopaque,
+    max_parallel: usize,
+    begin: *const fn (*anyopaque, usize) anyerror!void,
+    finish: *const fn (*anyopaque) anyerror!void,
+    abort: *const fn (*anyopaque) void,
+};
+pub const IoGuard = struct {
+    phase: ?*const IoPhase = null,
+    pub fn abort(self: *IoGuard) void {
+        if (self.phase) |phase| phase.abort(phase.ptr);
+        self.phase = null;
+    }
+    /// Restore CPU admission before callers handle recoverable backend errors.
+    /// Cancellation may still end resumption without retaining any I/O permit.
+    pub fn failed(self: *IoGuard, failure: anyerror) anyerror {
+        self.finish() catch |err| return err;
+        return failure;
+    }
+    pub fn finish(self: *IoGuard) !void {
+        const phase = self.phase orelse return;
+        self.phase = null;
+        try phase.finish(phase.ptr);
+    }
+};
 pub const ArtifactStore = struct {
     allocator: Allocator,
     ptr: *anyopaque,
@@ -199,6 +227,13 @@ pub const ArtifactStore = struct {
     /// including flat/search segments, belong to this fenced attempt. Reused
     /// immutable references keep their original identities.
     upload_scope: ?UploadScope = null,
+    // A serial publication's write/retention capability. Reads may escape to
+    // independently admitted prefetch owners and never borrow its CPU callback.
+    io_phase: ?*const IoPhase = null,
+    pub fn beginIo(self: *const ArtifactStore, count: usize) !IoGuard {
+        if (self.io_phase) |phase| try phase.begin(phase.ptr, count);
+        return .{ .phase = self.io_phase };
+    }
 
     pub const VTable = struct {
         object_store: ?*const fn (*anyopaque) *@import("object_store.zig").ObjectStore = null,
@@ -237,23 +272,48 @@ pub const ArtifactStore = struct {
     pub fn retentionWitness(self: *ArtifactStore, scope: UploadScope, cancellation: CancellationToken) !?RetentionWitness {
         try scope.validate();
         try cancellation.check();
-        return if (self.vtable.retention_witness) |call| call(self.ptr, scope, cancellation) else null;
+        const call = self.vtable.retention_witness orelse return null;
+        var phase = try self.beginIo(1);
+        defer phase.abort();
+        const result = call(self.ptr, scope, cancellation) catch |err| return phase.failed(err);
+        try phase.finish();
+        return result;
     }
     pub fn retainedClosure(self: *ArtifactStore, id: []const u8, cancellation: CancellationToken) !bool {
         try cancellation.check();
-        return if (self.vtable.retained_closure) |call| call(self.ptr, id, cancellation) else false;
+        const call = self.vtable.retained_closure orelse return false;
+        var phase = try self.beginIo(1);
+        defer phase.abort();
+        const result = call(self.ptr, id, cancellation) catch |err| return phase.failed(err);
+        try phase.finish();
+        return result;
     }
     pub fn rememberClosure(self: *ArtifactStore, id: []const u8, witnesses: []const RetentionWitness, cancellation: CancellationToken) !void {
         try cancellation.check();
-        if (self.vtable.remember_closure) |call| try call(self.ptr, id, witnesses, cancellation);
+        if (self.vtable.remember_closure) |call| {
+            var phase = try self.beginIo(1);
+            defer phase.abort();
+            call(self.ptr, id, witnesses, cancellation) catch |err| return phase.failed(err);
+            try phase.finish();
+        }
     }
     pub fn inheritClosure(self: *ArtifactStore, id: []const u8, previous: ?[]const u8, cancellation: CancellationToken) !void {
         try cancellation.check();
-        if (self.vtable.inherit_closure) |call| try call(self.ptr, id, previous, self.upload_scope orelse return error.InvalidArtifactUploadScope, cancellation);
+        if (self.vtable.inherit_closure) |call| {
+            var phase = try self.beginIo(1);
+            defer phase.abort();
+            call(self.ptr, id, previous, self.upload_scope orelse return error.InvalidArtifactUploadScope, cancellation) catch |err| return phase.failed(err);
+            try phase.finish();
+        }
     }
     pub fn sealClosures(self: *ArtifactStore, cancellation: CancellationToken) !void {
         try cancellation.check();
-        if (self.vtable.seal_closures) |call| try call(self.ptr, cancellation);
+        if (self.vtable.seal_closures) |call| {
+            var phase = try self.beginIo(1);
+            defer phase.abort();
+            call(self.ptr, cancellation) catch |err| return phase.failed(err);
+            try phase.finish();
+        }
     }
 
     pub fn deinit(self: *ArtifactStore) void {
@@ -273,8 +333,11 @@ pub const ArtifactStore = struct {
         }
         try cancellation.check();
         const put_scoped = self.vtable.put_scoped orelse return error.ArtifactUploadScopesUnsupported;
-        var metadata = try put_scoped(self.ptr, self.allocator, scope, contents, cancellation);
+        var phase = try self.beginIo(1);
+        defer phase.abort();
+        var metadata = put_scoped(self.ptr, self.allocator, scope, contents, cancellation) catch |err| return phase.failed(err);
         errdefer metadata.deinit(self.allocator);
+        try phase.finish();
         const expected = try scope.artifactId(metadata.checksum);
         if (metadata.byte_len != contents.len or !std.mem.eql(u8, &expected, metadata.artifact_id)) return error.ArtifactIntegrityMismatch;
         try cancellation.check();
@@ -313,11 +376,14 @@ pub const ArtifactStore = struct {
     pub fn putWithCancellation(self: *ArtifactStore, contents: []const u8, cancellation: CancellationToken) !ArtifactMetadata {
         if (self.upload_scope) |scope| return self.putScoped(scope, contents, cancellation);
         try cancellation.check();
-        var metadata = if (self.vtable.put_with_cancellation) |put_with_cancellation|
-            try put_with_cancellation(self.ptr, self.allocator, contents, cancellation)
+        var phase = try self.beginIo(1);
+        defer phase.abort();
+        var metadata = (if (self.vtable.put_with_cancellation) |put_with_cancellation|
+            put_with_cancellation(self.ptr, self.allocator, contents, cancellation)
         else
-            try self.vtable.put(self.ptr, self.allocator, contents);
+            self.vtable.put(self.ptr, self.allocator, contents)) catch |err| return phase.failed(err);
         errdefer metadata.deinit(self.allocator);
+        try phase.finish();
         try cancellation.check();
         return metadata;
     }

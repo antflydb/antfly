@@ -3241,6 +3241,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     graph_page_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const graph_page_tests = b.addTest(.{
         .root_module = graph_page_test_mod,
+        .filters = selectTestFilters(b, &.{ "serverless.graph_segment.", "serverless.artifacts.fs_store.", "serverless.build.lake_build_limits." }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const graph_test_step = b.step("antfly-graph-test", "Run graph algorithms, topology, pages, query and recovery tests");
@@ -3267,7 +3268,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const workload_main_merge_tests = b.addTest(.{
         .root_module = serverless_manifest_test_mod,
-        .filters = selectTestFilters(b, &.{ "lake SQL statement capture", "SQL scoped", "SQL grouped coordinator", "SQL prepared numeric coordinator", "SQL exact NUMERIC raw", "SQL partitioned native checkpoints", "SQL partitioned join block", "external lake metadata navigation", "external lake evaluation limits", "SQL native spill decimal", "controlled datum byte accounting" }),
+        .filters = selectTestFilters(b, &.{ "lake SQL statement capture", "SQL scoped", "SQL grouped coordinator", "SQL prepared numeric coordinator", "SQL exact NUMERIC raw", "SQL partitioned native checkpoints", "SQL partitioned join block", "external lake metadata navigation", "external lake evaluation limits", "SQL native spill decimal", "controlled datum byte accounting", "SQL finalized", "SQL shared radix", "SQL native JSON lease" }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const workload_main_merge_run = b.addRunArtifact(workload_main_merge_tests);

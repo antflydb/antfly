@@ -182,12 +182,16 @@ pub const Cache = struct {
         var metadata_budget: local.sql_memory_budget = .{ .backing = self.inventory_budget.allocator(), .limit = self.inventory_budget.limit };
         var metadata_arena = std.heap.ArenaAllocator.init(metadata_budget.allocator());
         defer metadata_arena.deinit();
-        const inventory = (if (selection) |files|
-            corpus.admitSelectedServingInventory(metadata_arena.allocator(), self.inventory_budget.allocator(), directory, store, cached, cancellation, files)
-        else
-            corpus.admitServingInventory(metadata_arena.allocator(), self.inventory_budget.allocator(), directory, store, cached, cancellation)) catch |err| {
-            if (err == error.OutOfMemory and (self.inventory_budget.isExhausted() or metadata_budget.isExhausted())) return error.NativeLakeTextCacheBusy;
-            return err;
+        const inventory = inventory: {
+            const started = platform.time.monotonicNs();
+            defer if (cached.metrics) |metrics| metrics.record(.text_inventory, started);
+            break :inventory (if (selection) |files|
+                corpus.admitSelectedServingInventory(metadata_arena.allocator(), self.inventory_budget.allocator(), directory, store, cached, cancellation, files)
+            else
+                corpus.admitServingInventory(metadata_arena.allocator(), self.inventory_budget.allocator(), directory, store, cached, cancellation)) catch |err| {
+                if (err == error.OutOfMemory and (self.inventory_budget.isExhausted() or metadata_budget.isExhausted())) return error.NativeLakeTextCacheBusy;
+                return err;
+            };
         };
         defer inventory.deinit();
         const root = inventory.root;
@@ -427,6 +431,8 @@ const Entry = struct {
     allocator: A,
     resource_manager: ?*local.storage_resource_manager.ResourceManager = null,
     fn build(self: *Entry, io: std.Io, store: stores.ArtifactStore, root: corpus.Root, name: []const u8, schema_json: []const u8, cached: artifacts.CachedRead, cancellation: Cancellation, base: ?*Entry, peers: []const *Entry) !void {
+        const started = platform.time.monotonicNs();
+        defer if (cached.metrics) |metrics| metrics.record(.text_opening, started);
         self.seekable = root.seekable;
         self.statistics_version = root.statistics_version;
         self.term_statistics = root.term_statistics;

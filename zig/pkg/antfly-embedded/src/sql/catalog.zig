@@ -830,10 +830,40 @@ pub const DdlAllocators = struct { result: std.mem.Allocator, scratch: std.mem.A
 
 pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed, receipt: ?DdlReceipt = null };
 
+pub const ScanQuota = @import("native_scan_quota.zig").Quota;
+
 /// Complete, authorized aggregate states for one pinned table and recipe.
 /// Keys and versioned aggregate cells borrow the supplied page allocator until the next pull.
 /// A provider must return null before opening if it cannot prove equivalence;
 /// errors after selection abort execution rather than mixing source snapshots.
+pub const GroupSelection = struct {
+    spill: ?*@import("spill.zig").Manager = null,
+    memory_bytes: usize = 8 * 1024 * 1024,
+    row_limit: usize = std.math.maxInt(usize),
+    page_limit: usize = std.math.maxInt(usize),
+    conditions: []const Condition = &.{},
+    order: []const Scan.Order = &.{},
+    /// The caller accepts any source prefix (SQL has no ORDER BY).
+    unordered_prefix: bool = false,
+    /// Proven upper bound on the consumed prefix, including OFFSET.
+    /// Absent when SQL still needs residual filtering or an unbounded result.
+    maximum_groups: ?usize = null,
+    batch_rows: u32 = 4096,
+};
+pub const FinalGroupRequest = struct {
+    page_limit: usize,
+    row_limit: usize = std.math.maxInt(usize),
+    selection: GroupSelection = .{},
+    /// Input batch size is independent of the requested result fragment.
+    batch_rows: u32 = 4096,
+    /// Complete, exactly typed grouping key for native hash/range pruning.
+    point: ?[]const @import("scalar.zig").Datum = null,
+    predicate: ?struct {
+        ptr: *anyopaque,
+        matches: *const fn (*anyopaque, std.mem.Allocator, []const @import("scalar.zig").Datum) anyerror!bool,
+    } = null,
+};
+
 pub const AggregatePartialCursor = struct {
     /// Pages are borrowed from this cursor or allocated in the caller's page
     /// arena. Failed authority never publishes them; the caller unwinds its arena.
@@ -841,6 +871,14 @@ pub const AggregatePartialCursor = struct {
         bind: *const fn (*anyopaque, *@import("../common/runnable_scheduler.zig").Execution) anyerror!void,
         release: *const fn (*anyopaque) void,
     } = null,
+    /// Providers may prove a unique complete cohort before the first pull.
+    /// Slots refer to the requested recipe, independent of physical order.
+    final_group_proof: ?struct { count: u64, slots: []const u16 } = null,
+    select_keys: ?*const fn (*anyopaque, GroupSelection) anyerror!bool = null,
+    select_point: ?*const fn (*anyopaque, []const @import("scalar.zig").Datum) anyerror!void = null,
+    /// Transfer the cursor's ownership into an empty result operator. False
+    /// preserves the ordinary partial path; a successful transfer is streamed.
+    adopt_final_groups: ?*const fn (*anyopaque, *@import("operators.zig").Grouped, FinalGroupRequest) anyerror!bool = null,
     /// Optional ownership transfer before the first pull. The provider proves
     /// one state per final recipe key, with the exact recipe slots and limits.
     /// A successful transfer leaves close responsible only for cursor resources.
