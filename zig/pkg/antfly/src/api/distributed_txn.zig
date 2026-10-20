@@ -1530,6 +1530,7 @@ pub const ExecuteOptions = struct {
     // Derive once from the original request with forSyncLevel, then retain it
     // independently of later acknowledgement/visibility levels.
     preparation_requirement: ?preparation_protocol.Requirement = null,
+    participant_plan_store: ?contract.ParticipantPlanStore = null,
     /// Preserve the terminal coordinator decision for an externally supplied
     /// transaction ID's retry window.
     retain_terminal: bool = false,
@@ -1746,37 +1747,107 @@ pub fn executeMultiTableCommitWithOptions(
     return executeMultiTableCommitOnce(alloc, catalog, worker, txn_id, begin_timestamp, commit_version, tables, sync_level, trace_writer, options);
 }
 
-fn executeMultiTableCommitOnce(
-    alloc: std.mem.Allocator,
-    catalog: table_catalog.CatalogSource,
-    original_worker: ParticipantWorker,
+const RoutedParticipant = struct {
+    table: TableCommitRequest,
+    group_id: u64,
+    topology_epoch: u64,
+    route_fence: ?@import("../metadata/api.zig").CatalogRouteFence = null,
+    range_guards: []const @import("antfly_local_sources").storage_range_protection.Proof = &.{},
+};
+
+const RoutedPlan = struct {
+    version: u32 = 1,
     txn_id: db_mod.types.TxnId,
     begin_timestamp: u64,
-    commit_version: u64,
-    tables: []const TableCommitRequest,
-    sync_level: db_mod.types.SyncLevel,
-    trace_writer: ?tracing.AntflyTraceWriter,
-    requested_options: ExecuteOptions,
-) !CommitOutcome {
-    var options = requested_options;
-    var worker = original_worker;
-    worker.preparation = options.preparation_requirement;
-    worker.preparation_context = options.pre_decision_context;
-    worker.preparation_context.execution_runnable = null;
-    if (worker.preparation != null) {
-        if (worker.execution_runnable == null) worker.execution_runnable = options.pre_decision_context.execution_runnable;
-        try worker.checkExecution();
-    }
-    options.independent_participants = false;
-    options.participant_owners = null;
-    options.reusable_participants = false;
-    var participants = std.ArrayListUnmanaged(ParticipantTxn).empty;
-    defer {
-        for (participants.items) |*participant| participant.deinit(alloc);
-        participants.deinit(alloc);
-    }
+    requirement: ?preparation_protocol.Requirement,
+    participants: []const RoutedParticipant,
+};
 
-    const routing_budget: table_catalog.RoutingBudget = .{ .deadline_ns = options.pre_decision_context.deadline_ns, .io = options.pre_decision_context.deadline_io, .cancellation = options.pre_decision_context.cancellation };
+fn parseRoutedPlan(alloc: std.mem.Allocator, bytes: []const u8, txn_id: db_mod.types.TxnId, timestamp: u64, requirement: ?preparation_protocol.Requirement) !std.json.Parsed(RoutedPlan) {
+    var parsed = try std.json.parseFromSlice(RoutedPlan, alloc, bytes, .{ .allocate = .alloc_always });
+    errdefer parsed.deinit();
+    if (parsed.value.version != 1 or !std.mem.eql(u8, &txn_id, &parsed.value.txn_id) or parsed.value.begin_timestamp != timestamp or !std.meta.eql(parsed.value.requirement, requirement)) return error.InvalidTxnRequest;
+    for (parsed.value.participants, 0..) |entry, index| {
+        if (entry.group_id == 0 or entry.table.table_name.len == 0 or entry.table.range_guards.len != 0) return error.InvalidTxnRequest;
+        try validateRestorePlan(entry.table.restore_staging_scope, entry.table.restore_staging_plan_id);
+        if (entry.route_fence) |fence| {
+            try fence.validate();
+            if (fence.route.group_id != entry.group_id or fence.topology_epoch != entry.topology_epoch) return error.InvalidTxnRequest;
+        }
+        if (requirement != null and entry.route_fence == null) return error.InvalidTxnRequest;
+        for (parsed.value.participants[0..index]) |prior| {
+            if (prior.group_id == entry.group_id and std.mem.eql(u8, prior.table.table_name, entry.table.table_name)) return error.InvalidTxnRequest;
+        }
+    }
+    return parsed;
+}
+
+fn encodeRoutedPlan(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, timestamp: u64, requirement: ?preparation_protocol.Requirement, participants: []const ParticipantTxn) ![]u8 {
+    const entries = try alloc.alloc(RoutedParticipant, participants.len);
+    defer alloc.free(entries);
+    for (participants, entries) |participant, *entry| {
+        var table: TableCommitRequest = .{ .table_name = participant.table_name };
+        inline for (@typeInfo(TableCommitRequest).@"struct".field_names) |name| {
+            if (comptime !std.mem.eql(u8, name, "range_guards")) {
+                if (comptime @TypeOf(@field(participant, name)) == @TypeOf(@field(table, name))) {
+                    @field(table, name) = @field(participant, name);
+                } else @field(table, name) = @field(participant, name).items;
+            }
+        }
+        entry.* = .{ .table = table, .group_id = participant.group_id, .topology_epoch = participant.topology_epoch, .route_fence = participant.route_fence, .range_guards = participant.range_guards.items };
+    }
+    const Wire = struct {
+        plan: RoutedPlan,
+        pub fn jsonStringify(self: @This(), stream: anytype) !void {
+            try @import("antfly_local_sources").storage_db_relational_integrity_json.write(self.plan, stream);
+        }
+    };
+    return std.json.Stringify.valueAlloc(alloc, Wire{ .plan = .{ .txn_id = txn_id, .begin_timestamp = timestamp, .requirement = requirement, .participants = entries } }, .{});
+}
+
+// CommitOutcome borrows its table/key labels from the caller's sealed request,
+// not from the temporary decoded cohort. Keep that lifetime contract on retries.
+const OriginalPlanKeys = std.StringHashMapUnmanaged([]const u8);
+
+fn originalPlanKeys(alloc: std.mem.Allocator, tables: []const TableCommitRequest, budget: table_catalog.RoutingBudget) !OriginalPlanKeys {
+    var keys: OriginalPlanKeys = .empty;
+    errdefer keys.deinit(alloc);
+    var index: usize = 0;
+    for (tables) |table| {
+        inline for (.{ "writes", "predicates", "deletes" }) |field| {
+            for (@field(table, field)) |item| {
+                try budget.checkpointIndex(index);
+                index += 1;
+                const key = if (comptime std.mem.eql(u8, field, "deletes")) item else item.key;
+                try keys.put(alloc, key, key);
+            }
+        }
+    }
+    try budget.checkpoint();
+    return keys;
+}
+
+fn appendRoutedParticipant(alloc: std.mem.Allocator, participants: *std.ArrayListUnmanaged(ParticipantTxn), entry: RoutedParticipant, tables: []const TableCommitRequest, keys: *const OriginalPlanKeys) !void {
+    const name = for (tables) |table| {
+        if (std.mem.eql(u8, table.table_name, entry.table.table_name)) break table.table_name;
+    } else return error.InvalidTxnRequest;
+    var participant: ParticipantTxn = .{ .table_name = name, .group_id = entry.group_id, .topology_epoch = entry.topology_epoch, .route_fence = entry.route_fence };
+    errdefer participant.deinit(alloc);
+    inline for (@typeInfo(TableCommitRequest).@"struct".field_names) |field| {
+        if (comptime !std.mem.eql(u8, field, "range_guards") and !std.mem.eql(u8, field, "table_name")) {
+            if (comptime @TypeOf(@field(participant, field)) == @TypeOf(@field(entry.table, field))) {
+                @field(participant, field) = @field(entry.table, field);
+            } else try @field(participant, field).appendSlice(alloc, @field(entry.table, field));
+        }
+    }
+    try participant.range_guards.appendSlice(alloc, entry.range_guards);
+    for (participant.writes.items) |*write| write.key = keys.get(write.key) orelse return error.InvalidTxnRequest;
+    for (participant.predicates.items) |*predicate| predicate.key = keys.get(predicate.key) orelse return error.InvalidTxnRequest;
+    for (participant.deletes.items) |*key| key.* = keys.get(key.*) orelse return error.InvalidTxnRequest;
+    try participants.append(alloc, participant);
+}
+
+fn routeCommitParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, worker: ParticipantWorker, tables: []const TableCommitRequest, routing_budget: table_catalog.RoutingBudget, participants: *std.ArrayListUnmanaged(ParticipantTxn)) !void {
     var routing_work_index: usize = 0;
     for (tables) |table| {
         try routing_budget.checkpoint();
@@ -1801,7 +1872,7 @@ fn executeMultiTableCommitOnce(
                 fence.route.identity_namespace.table_id != range.table_id or
                 fence.route.identity_namespace.shard_id != manager.rangeDocIdentityShardId(range.*) or
                 fence.route.identity_namespace.range_id != manager.rangeDocIdentityRangeId(range.*)) return error.TopologyChanged;
-            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, fence.route.group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, participants, table.table_name, fence.route.group_id, topology_epoch);
             participant.route_fence = fence;
             for (owner.proofs) |proof| try participant.range_guards.append(alloc, proof);
         }
@@ -1810,60 +1881,60 @@ fn executeMultiTableCommitOnce(
             try routing_budget.checkpointIndex(routing_work_index);
             routing_work_index += 1;
             const group_id = routing.resolveGroupForKey(write.key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, participants, table.table_name, group_id, topology_epoch);
             try participant.writes.append(alloc, write);
         }
         for (table.deletes) |key| {
             try routing_budget.checkpointIndex(routing_work_index);
             routing_work_index += 1;
             const group_id = routing.resolveGroupForKey(key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, participants, table.table_name, group_id, topology_epoch);
             try participant.deletes.append(alloc, key);
         }
         for (table.predicates) |predicate| {
             try routing_budget.checkpointIndex(routing_work_index);
             routing_work_index += 1;
             const group_id = routing.resolveGroupForKey(predicate.key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, participants, table.table_name, group_id, topology_epoch);
             try participant.predicates.append(alloc, predicate);
         }
         for (table.transforms) |transform| {
             try routing_budget.checkpointIndex(routing_work_index);
             routing_work_index += 1;
             const group_id = routing.resolveGroupForKey(transform.key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, participants, table.table_name, group_id, topology_epoch);
             try participant.transforms.append(alloc, transform);
         }
         for (table.integrity) |operation| {
             try routing_budget.checkpointIndex(routing_work_index);
             routing_work_index += 1;
             const group_id = routing.resolveGroupForKey(operation.routing_key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, participants, table.table_name, group_id, topology_epoch);
             try participant.integrity.append(alloc, operation);
         }
         for (table.integrity_commands) |command| {
             try routing_budget.checkpointIndex(routing_work_index);
             routing_work_index += 1;
             const group_id = routing.resolveGroupForKey(&command.address.routing) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, participants, table.table_name, group_id, topology_epoch);
             try participant.integrity_commands.append(alloc, command);
         }
         if (table.relational_activation) |command| {
             const group_id = routing.resolveGroupForKey(command.routing_key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, participants, table.table_name, group_id, topology_epoch);
             if (participant.relational_activation != null) return error.InvalidTxnRequest;
             participant.relational_activation = command;
         }
         if (table.relational_retirement) |command| {
             const group_id = routing.resolveGroupForKey(command.routing_key) orelse return error.UnknownGroup;
-            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, participants, table.table_name, group_id, topology_epoch);
             if (participant.relational_retirement != null) return error.InvalidTxnRequest;
             participant.relational_retirement = command;
         }
         if (table.relational_index_maintenance) |command| {
             const group_id = routing.resolveGroupForKey(command.routing_key) orelse return error.UnknownGroup;
             if (group_id != command.owner_group_id) return error.PreparedGenerationChanged;
-            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
+            const participant = try ensureParticipantTxn(alloc, participants, table.table_name, group_id, topology_epoch);
             if (participant.relational_index_maintenance != null) return error.InvalidTxnRequest;
             participant.relational_index_maintenance = command;
         }
@@ -1926,6 +1997,74 @@ fn executeMultiTableCommitOnce(
             try validateRestorePlan(participant.restore_staging_scope, participant.restore_staging_plan_id);
         }
     }
+}
+
+fn executeMultiTableCommitOnce(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    original_worker: ParticipantWorker,
+    txn_id: db_mod.types.TxnId,
+    begin_timestamp: u64,
+    commit_version: u64,
+    tables: []const TableCommitRequest,
+    sync_level: db_mod.types.SyncLevel,
+    trace_writer: ?tracing.AntflyTraceWriter,
+    requested_options: ExecuteOptions,
+) !CommitOutcome {
+    var options = requested_options;
+    var worker = original_worker;
+    worker.preparation = options.preparation_requirement;
+    worker.preparation_context = options.pre_decision_context;
+    worker.preparation_context.execution_runnable = null;
+    if (worker.preparation != null) {
+        if (worker.execution_runnable == null) worker.execution_runnable = options.pre_decision_context.execution_runnable;
+        try worker.checkExecution();
+    }
+    options.independent_participants = false;
+    options.participant_owners = null;
+    options.reusable_participants = false;
+    var participants = std.ArrayListUnmanaged(ParticipantTxn).empty;
+    defer {
+        for (participants.items) |*participant| participant.deinit(alloc);
+        participants.deinit(alloc);
+    }
+
+    const routing_budget: table_catalog.RoutingBudget = .{ .deadline_ns = options.pre_decision_context.deadline_ns, .io = options.pre_decision_context.deadline_io, .cancellation = options.pre_decision_context.cancellation };
+    var retained_plan: ?std.json.Parsed(RoutedPlan) = null;
+    defer if (retained_plan) |*plan| plan.deinit();
+    var plan_store = options.participant_plan_store;
+    if (plan_store != null and !options.retain_terminal) return error.InvalidTxnRequest;
+    try routing_budget.checkpoint();
+    if (plan_store) |store| switch (try store.load(store.ptr, alloc, txn_id)) {
+        .legacy => plan_store = null,
+        .unplanned => {},
+        .planned => |bytes| {
+            defer alloc.free(bytes);
+            retained_plan = try parseRoutedPlan(alloc, bytes, txn_id, begin_timestamp, worker.preparation);
+        },
+    };
+    if (retained_plan == null) {
+        try routeCommitParticipants(alloc, catalog, worker, tables, routing_budget, &participants);
+        if (plan_store) |store| {
+            const bytes = try encodeRoutedPlan(alloc, txn_id, begin_timestamp, worker.preparation, participants.items);
+            defer alloc.free(bytes);
+            const selected = try store.seal(store.ptr, alloc, txn_id, bytes);
+            defer alloc.free(selected);
+            // A concurrent publisher may have won with different routing.
+            // Discard our speculative grouping before any participant contact.
+            retained_plan = try parseRoutedPlan(alloc, selected, txn_id, begin_timestamp, worker.preparation);
+            for (participants.items) |*participant| participant.deinit(alloc);
+            participants.clearRetainingCapacity();
+        }
+    }
+    if (retained_plan) |plan| {
+        var keys = try originalPlanKeys(alloc, tables, routing_budget);
+        defer keys.deinit(alloc);
+        for (plan.value.participants, 0..) |entry, index| {
+            try routing_budget.checkpointIndex(index);
+            try appendRoutedParticipant(alloc, &participants, entry, tables, &keys);
+        }
+    }
 
     const participant_ids = try alloc.alloc([]const u8, participants.items.len);
     var participant_ids_initialized: usize = 0;
@@ -1980,7 +2119,7 @@ fn executeMultiTableCommitOnce(
     var begun_count: usize = 0;
     var abort_on_error = true;
     var resume_committed = false;
-    if (worker.preparation != null) {
+    if (worker.preparation != null or retained_plan != null) {
         // A retained retry must establish the durable contract before asking
         // for fresh admission. Matching committed decisions propagate even if
         // a participant can no longer admit a new required transaction.
@@ -2003,7 +2142,7 @@ fn executeMultiTableCommitOnce(
                 .pending => {},
             };
         }
-        if (!resume_committed) for (participants.items) |participant| {
+        if (!resume_committed and worker.preparation != null) for (participants.items) |participant| {
             try routing_budget.checkpoint();
             if (participant.route_fence == null) return error.PreparedTransactionProtocolUnavailable;
             try worker.forPreparationParticipant(&participant).negotiatePreparation(alloc, participant.group_id, participant.table_name);
@@ -8459,6 +8598,8 @@ const PreparedCoordinatorFixture = struct {
     mismatch_seal: bool = false,
     mode: preparation_protocol.Mode = .synchronous,
     decision: ?ParticipantWorker.PreparationDecision = null,
+    plan_store: ?contract.ParticipantPlanStore = null,
+    catalog_override: ?table_catalog.CatalogSource = null,
     fn event(self: *@This(), e: Event) void {
         self.events[self.count] = e;
         self.count += 1;
@@ -8573,7 +8714,7 @@ const PreparedCoordinatorFixture = struct {
         return .{ .ptr = self, .vtable = &.{ .begin_group = beginLegacy, .prepare_group = prepareLegacy, .resolve_group = resolve, .status_group = status, .acknowledge_group = acknowledge, .resolve_group_until = resolveUntil, .status_group_until = statusUntil, .resolve_group_with_execution = resolveExecution, .resolve_group_until_with_execution = resolveUntilExecution, .preparation_capabilities = capability, .required_begin_group = begin, .required_prepare_group = prepare, .seal_group = seal, .preparation_status_group = preparedStatus } };
     }
     fn run(self: *@This(), level: db_mod.types.SyncLevel, retained: bool) !CommitOutcome {
-        return executeMultiTableCommitWithOptions(std.testing.allocator, catalog(), self.worker(), @splat(1), 10000, 10001, &.{.{ .table_name = "docs", .writes = &.{ .{ .key = "doc:a", .value = "{}" }, .{ .key = "doc:z", .value = "{}" } } }}, level, null, .{ .preparation_requirement = .{ .mode = self.mode }, .retain_terminal = retained, .report_post_commit_failure = false });
+        return executeMultiTableCommitWithOptions(std.testing.allocator, self.catalog_override orelse catalog(), self.worker(), @splat(1), 10000, 10001, &.{.{ .table_name = "docs", .writes = &.{ .{ .key = "doc:a", .value = "{}" }, .{ .key = "doc:z", .value = "{}" } } }}, level, null, .{ .preparation_requirement = .{ .mode = self.mode }, .participant_plan_store = self.plan_store, .retain_terminal = retained, .report_post_commit_failure = false });
     }
 };
 
@@ -8787,5 +8928,129 @@ test "distributed txn prepared protocol ambiguous begin cannot recover through l
     try std.testing.expectEqual(@as(usize, 1), fixture.begins);
     try std.testing.expectEqual(@as(usize, 0), fixture.prepares);
     try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+    try std.testing.expectEqual(@as(usize, 0), fixture.aborts);
+}
+
+test "distributed txn original cohort survives routing loss and failed publication never begins" {
+    const Store = struct {
+        bytes: ?[]u8 = null,
+        fail: bool = false,
+        reads: usize = 0,
+        writes: usize = 0,
+        fn load(raw: *anyopaque, alloc: std.mem.Allocator, _: db_mod.types.TxnId) !contract.ParticipantPlanStore.Loaded {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            return if (self.bytes) |bytes| .{ .planned = try alloc.dupe(u8, bytes) } else .unplanned;
+        }
+        fn seal(raw: *anyopaque, alloc: std.mem.Allocator, _: db_mod.types.TxnId, bytes: []const u8) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.writes += 1;
+            if (self.fail) return error.TestPlanStoreFailed;
+            if (self.bytes == null) self.bytes = try std.testing.allocator.dupe(u8, bytes);
+            return alloc.dupe(u8, self.bytes.?);
+        }
+        fn port(self: *@This()) contract.ParticipantPlanStore {
+            return .{ .ptr = self, .load = load, .seal = seal };
+        }
+        fn unavailable(_: *anyopaque) !@import("../metadata/api.zig").AdminSnapshot {
+            return error.TestCatalogUnavailable;
+        }
+    };
+    for (std.meta.tags(preparation_protocol.Mode)) |mode| {
+        var store: Store = .{ .fail = true };
+        defer if (store.bytes) |bytes| std.testing.allocator.free(bytes);
+        var first: PreparedCoordinatorFixture = .{ .mode = mode, .plan_store = store.port() };
+        try std.testing.expectError(error.TestPlanStoreFailed, first.run(.write, true));
+        try std.testing.expectEqual(@as(usize, 0), first.begins);
+        store.fail = false;
+        try std.testing.expect((try first.run(.write, true)) == .committed);
+        try std.testing.expectEqual(@as(usize, 2), first.begins);
+        const durable = try parseRoutedPlan(std.testing.allocator, store.bytes.?, @splat(1), 10000, .{ .mode = mode });
+        defer durable.deinit();
+        try std.testing.expectEqual(@as(usize, 2), durable.value.participants.len);
+        try std.testing.expectEqual(@as(u64, 7001), durable.value.participants[0].group_id);
+        try std.testing.expectEqual(@as(u64, 7002), durable.value.participants[1].group_id);
+        const unavailable: table_catalog.CatalogSource = .{ .ptr = &store, .vtable = &.{ .admin_snapshot = Store.unavailable, .free_admin_snapshot = PreparedCoordinatorFixture.freeSnapshot } };
+        var retry: PreparedCoordinatorFixture = .{ .mode = mode, .plan_store = store.port(), .catalog_override = unavailable, .blocked = 7001, .decision = .{ .status = .committed, .requirement = .{ .mode = mode } } };
+        const result = try retry.run(.write, true);
+        try std.testing.expect(result == .committed);
+        // The returned label still borrows the caller's request after the
+        // temporary decoded cohort and its arena have been destroyed.
+        try std.testing.expectEqualStrings("docs", result.committed.coordinator_table_name.?);
+        try std.testing.expectEqual(@as(u64, 7001), result.committed.coordinator_group_id.?);
+        try std.testing.expectEqual(@as(usize, 0), retry.begins);
+        try std.testing.expectEqual(@as(usize, 0), retry.prepares);
+        try std.testing.expectEqual(@as(usize, 2), retry.commits);
+        try std.testing.expectEqual(@as(usize, 2), store.writes);
+        var aborted: PreparedCoordinatorFixture = .{ .mode = mode, .plan_store = store.port(), .catalog_override = unavailable, .decision = .{ .status = .aborted, .requirement = null } };
+        try std.testing.expect((try aborted.run(.write, true)) == .conflict);
+        try std.testing.expectEqual(@as(usize, 0), aborted.begins);
+        const other: preparation_protocol.Requirement = .{ .mode = if (mode == .synchronous) .deferred else .synchronous };
+        try std.testing.expectError(error.InvalidTxnRequest, parseRoutedPlan(std.testing.allocator, store.bytes.?, @splat(2), 10000, .{ .mode = mode }));
+        try std.testing.expectError(error.InvalidTxnRequest, parseRoutedPlan(std.testing.allocator, store.bytes.?, @splat(1), 10001, .{ .mode = mode }));
+        try std.testing.expectError(error.InvalidTxnRequest, parseRoutedPlan(std.testing.allocator, store.bytes.?, @splat(1), 10000, other));
+    }
+}
+
+test "distributed txn original cohort binary codec retires every allocation and preserves hidden identity" {
+    const Harness = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var participant: ParticipantTxn = .{ .table_name = "docs", .group_id = 7001, .topology_epoch = 9, .restore_staging_scope = @splat(1), .restore_staging_plan_id = @splat(2), .schema_version = 3, .row_policy_principal_proof = "\x00\xffproof", .row_policy_database = "default", .route_fence = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 4, .table_id = 7, .topology_epoch = 9, .route = .{ .group_id = 7001, .range_id = 7001, .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 } }, .admission_deadline_ns = 17 } };
+            defer participant.deinit(alloc);
+            const table: TableCommitRequest = .{ .table_name = "docs", .writes = &.{.{ .key = "\x00\xffkey", .value = "{}" }}, .predicates = &.{.{ .key = "\x00\xffkey", .expected_version = 5, .expected_content_digest = @splat(6) }}, .deletes = &.{"\x00\xffdeleted"} };
+            try participant.writes.appendSlice(alloc, table.writes);
+            try participant.predicates.appendSlice(alloc, table.predicates);
+            try participant.deletes.appendSlice(alloc, table.deletes);
+            try participant.range_guards.append(alloc, .{ .bucket = 0, .generation = 8 });
+            const bytes = try encodeRoutedPlan(alloc, @splat(1), 10000, .{ .mode = .deferred }, &.{participant});
+            defer alloc.free(bytes);
+            var decoded = try parseRoutedPlan(alloc, bytes, @splat(1), 10000, .{ .mode = .deferred });
+            defer decoded.deinit();
+            try std.testing.expectEqual(@as(?u64, null), decoded.value.participants[0].route_fence.?.admission_deadline_ns);
+            var restored = std.ArrayListUnmanaged(ParticipantTxn).empty;
+            defer {
+                for (restored.items) |*entry| entry.deinit(alloc);
+                restored.deinit(alloc);
+            }
+            var keys = try originalPlanKeys(alloc, &.{table}, .{});
+            defer keys.deinit(alloc);
+            try appendRoutedParticipant(alloc, &restored, decoded.value.participants[0], &.{table}, &keys);
+            const value = restored.items[0];
+            try std.testing.expectEqual(participant.restore_staging_scope, value.restore_staging_scope);
+            try std.testing.expectEqual(participant.restore_staging_plan_id, value.restore_staging_plan_id);
+            try std.testing.expectEqualStrings(participant.row_policy_principal_proof, value.row_policy_principal_proof);
+            try std.testing.expectEqualDeep(participant.range_guards.items, value.range_guards.items);
+            try std.testing.expectEqualStrings(table.writes[0].key, value.writes.items[0].key);
+            try std.testing.expectEqual(table.predicates[0].expected_content_digest, value.predicates.items[0].expected_content_digest);
+            try std.testing.expect(value.writes.items[0].key.ptr == table.writes[0].key.ptr);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "distributed txn original cohort resumes legacy commits without fresh admission" {
+    const Store = struct {
+        bytes: []const u8,
+        fn load(raw: *anyopaque, alloc: std.mem.Allocator, _: db_mod.types.TxnId) !contract.ParticipantPlanStore.Loaded {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .planned = try alloc.dupe(u8, self.bytes) };
+        }
+        fn seal(_: *anyopaque, _: std.mem.Allocator, _: db_mod.types.TxnId, _: []const u8) ![]u8 {
+            return error.TestUnexpectedSeal;
+        }
+        fn unavailable(_: *anyopaque) !@import("../metadata/api.zig").AdminSnapshot {
+            return error.TestCatalogUnavailable;
+        }
+    };
+    const alloc = std.testing.allocator;
+    const bytes = try encodeRoutedPlan(alloc, @splat(1), 10000, null, &.{ .{ .table_name = "docs", .group_id = 7001, .topology_epoch = 17 }, .{ .table_name = "docs", .group_id = 7002, .topology_epoch = 17 } });
+    defer alloc.free(bytes);
+    var store: Store = .{ .bytes = bytes };
+    var fixture: PreparedCoordinatorFixture = .{ .decision = .{ .status = .committed, .requirement = null } };
+    const unavailable: table_catalog.CatalogSource = .{ .ptr = &store, .vtable = &.{ .admin_snapshot = Store.unavailable, .free_admin_snapshot = PreparedCoordinatorFixture.freeSnapshot } };
+    const result = try executeMultiTableCommitWithOptions(alloc, unavailable, fixture.worker(), @splat(1), 10000, 10001, &.{.{ .table_name = "docs" }}, .write, null, .{ .retain_terminal = true, .participant_plan_store = .{ .ptr = &store, .load = Store.load, .seal = Store.seal } });
+    try std.testing.expect(result == .committed);
+    try std.testing.expectEqual(@as(usize, 2), fixture.commits);
+    try std.testing.expectEqual(@as(usize, 0), fixture.begins);
     try std.testing.expectEqual(@as(usize, 0), fixture.aborts);
 }

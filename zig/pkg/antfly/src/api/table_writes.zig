@@ -22510,6 +22510,7 @@ pub const ProvisionedTableWriteSource = struct {
             if (comptime build_options.with_tla) tracing.stderrAntflyTraceWriter() else null,
             .{
                 .retain_terminal = retain_terminal,
+                .participant_plan_store = control.participant_plan_store,
                 .report_post_commit_failure = false,
                 .fanout_io = self.tableActivityIo(),
                 .post_commit_cancellation = cancellation,
@@ -26733,6 +26734,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             if (comptime build_options.with_tla) tracing.stderrAntflyTraceWriter() else null,
             .{
                 .retain_terminal = retain_terminal,
+                .participant_plan_store = control.participant_plan_store,
                 .report_post_commit_failure = false,
                 .fanout_io = if (self.backend_runtime) |runtime| runtime.apiIo() else null,
                 .post_commit_cancellation = cancellation,

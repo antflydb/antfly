@@ -68,7 +68,8 @@ pub const Coordinator = struct {
         const signed = try server.signCurrentRowPolicyMutationParticipants(proof_arena.allocator(), prepared.tables, self.context);
         // Refuse an unsupported execution capability before sealing durable
         // recovery debt; never silently switch to unaccounted fanout.
-        const commit_control = distributed_txn.CommitControl.fromRequest(self.context);
+        var commit_control = distributed_txn.CommitControl.fromRequest(self.context);
+        commit_control.participant_plan_store = server.txn_sessions.participantPlanStore();
         if (!source.supportsTransactionControl(commit_control)) return error.ExecutionWaitUnsupported;
         return self.completePrepared(id, info.begin_timestamp, info.sync_level, signed);
     }
@@ -383,7 +384,9 @@ test "SQL prepared completion reserves before sealing and preserves original pro
         }
         fn commit(raw: *anyopaque, alloc: std.mem.Allocator, id: types.TxnId, _: u64, tables: []const distributed_txn.TableCommitRequest, _: types.SyncLevel, _: types.CancellationToken, control: distributed_txn.CommitControl) !?distributed_txn.CommitOutcome {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            try std.testing.expectEqualDeep(self.expected, control);
+            var expected = self.expected;
+            expected.participant_plan_store = self.registry.participantPlanStore();
+            try std.testing.expectEqualDeep(expected, control);
             try std.testing.expectEqualDeep(self.id, id);
             try std.testing.expectEqualStrings("docs", tables[0].table_name);
             var plan = (try self.registry.getExecutionPlan(alloc, id)) orelse return error.ExpectedSealedPlan;

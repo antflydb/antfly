@@ -6765,7 +6765,7 @@ pub const ApiHttpServer = struct {
                         continue;
                     } else null;
                     defer if (execution_plan) |*plan| plan.deinit();
-                    const outcome = (source.commitTransactionWithId(
+                    const outcome = (source.commitTransactionWithIdAndControl(
                         self.alloc,
                         txn_id,
                         commit.begin_timestamp,
@@ -6778,6 +6778,8 @@ pub const ApiHttpServer = struct {
                             .write
                         else
                             commit.sync_level,
+                        .none,
+                        .{ .participant_plan_store = self.txn_sessions.participantPlanStore() },
                     ) catch |err| switch (err) {
                         error.EnrichmentWorkerFailed => {
                             // Older records and third-party sources may expose a
@@ -44454,7 +44456,7 @@ test "api http server retries stable terminal commits without replaying writes" 
         fn source(self: *@This()) table_writes.TableWriteSource {
             return .{ .ptr = self, .vtable = &.{
                 .batch = batch,
-                .commit_transaction_with_id = commitTransactionWithId,
+                .commit_transaction_with_id_with_control = commitTransactionWithId,
                 .acknowledge_transaction_commit = acknowledgeTransactionCommit,
             } };
         }
@@ -44470,7 +44472,10 @@ test "api http server retries stable terminal commits without replaying writes" 
             _: u64,
             tables: []const distributed_txn.TableCommitRequest,
             sync_level: db_mod.types.SyncLevel,
+            _: db_mod.types.CancellationToken,
+            control: distributed_txn.CommitControl,
         ) anyerror!?distributed_txn.CommitOutcome {
+            try std.testing.expect(control.participant_plan_store != null);
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.commit_calls += 1;
             try std.testing.expectEqual(@as(usize, 1), tables.len);
@@ -44597,7 +44602,7 @@ test "api session maintenance recovers crash window after durable 2pc commit" {
         fn source(self: *@This()) table_writes.TableWriteSource {
             return .{ .ptr = self, .vtable = &.{
                 .batch = batch,
-                .commit_transaction_with_id = commitTransactionWithId,
+                .commit_transaction_with_id_with_control = commitTransactionWithId,
                 .acknowledge_transaction_commit = acknowledgeTransactionCommit,
             } };
         }
@@ -44611,7 +44616,10 @@ test "api session maintenance recovers crash window after durable 2pc commit" {
             _: u64,
             _: []const distributed_txn.TableCommitRequest,
             _: db_mod.types.SyncLevel,
+            _: db_mod.types.CancellationToken,
+            control: distributed_txn.CommitControl,
         ) anyerror!?distributed_txn.CommitOutcome {
+            try std.testing.expect(control.participant_plan_store != null);
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.commit_calls += 1;
             if (self.commit_calls == 1) self.durable.?.fail_writes_for_test = true;
@@ -44711,7 +44719,7 @@ test "api session maintenance skips live commit execution and acknowledgement" {
         fn source(self: *@This()) table_writes.TableWriteSource {
             return .{ .ptr = self, .vtable = &.{
                 .batch = batch,
-                .commit_transaction_with_id = commitTransactionWithId,
+                .commit_transaction_with_id_with_control = commitTransactionWithId,
                 .acknowledge_transaction_commit = acknowledgeTransactionCommit,
             } };
         }
@@ -44725,7 +44733,10 @@ test "api session maintenance skips live commit execution and acknowledgement" {
             _: u64,
             _: []const distributed_txn.TableCommitRequest,
             _: db_mod.types.SyncLevel,
+            _: db_mod.types.CancellationToken,
+            control: distributed_txn.CommitControl,
         ) anyerror!?distributed_txn.CommitOutcome {
+            try std.testing.expect(control.participant_plan_store != null);
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.commit_calls += 1;
             // Force maintenance into the interval after the recovery index is

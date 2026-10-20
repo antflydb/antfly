@@ -73,15 +73,26 @@ pub const PreDecisionContext = struct {
     }
 };
 
+/// Lease-fenced session storage for the original routed cohort. Bytes are
+/// private, versioned coordinator data, never a caller-supplied routing hint.
+/// Returned buffers belong to the invocation allocator.
+pub const ParticipantPlanStore = struct {
+    pub const Loaded = union(enum) { legacy, unplanned, planned: []u8 };
+    ptr: *anyopaque,
+    load: *const fn (*anyopaque, @import("std").mem.Allocator, db_types.TxnId) anyerror!Loaded,
+    seal: *const fn (*anyopaque, @import("std").mem.Allocator, db_types.TxnId, []const u8) anyerror![]u8,
+};
+
 /// Invocation-owned commit authority. The original pre-decision fences are
 /// separate from post-commit response cancellation; neither may replace the
 /// independent authority needed to finish or recover accepted mutations.
 pub const CommitControl = struct {
     team: ?*@import("antfly_runtime_abi").runnable_abi.Team = null,
     pre_decision: PreDecisionContext = .{},
+    participant_plan_store: ?ParticipantPlanStore = null,
 
     pub fn requiresAwareCallback(self: CommitControl) bool {
-        return self.team != null or self.pre_decision.requiresAwareCallback();
+        return self.team != null or self.participant_plan_store != null or self.pre_decision.requiresAwareCallback();
     }
 
     pub fn fromRequest(request: @import("operation.zig").RequestContext) CommitControl {

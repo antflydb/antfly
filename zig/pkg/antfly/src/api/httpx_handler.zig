@@ -5856,13 +5856,14 @@ pub const AntflyApiHandler = struct {
             execution_plan = (self.api_server.txn_sessions.sealExecutionPlan(alloc, txn_id, prepared.tables) catch |err|
                 return self.transactionPreparationError(ctx, err)) orelse return textResponse(ctx, 404, "not found");
         }
-        const outcome = (source.commitTransactionWithIdAndCancellation(
+        const outcome = (source.commitTransactionWithIdAndControl(
             alloc,
             txn_id,
             session.begin_timestamp,
             execution_plan.?.value,
             session.sync_level,
             commit_request.cancellation,
+            .{ .pre_decision = distributed_txn.CommitControl.fromRequest(commit_request).pre_decision, .participant_plan_store = self.api_server.txn_sessions.participantPlanStore() },
         ) catch |err| switch (err) {
             error.TransactionTooLarge => {
                 _ = self.api_server.txn_sessions.remove(alloc, txn_id);
@@ -12179,7 +12180,7 @@ test "httpx stable transaction commit durably hands off recovery before acknowle
             return .{ .ptr = self, .vtable = &.{
                 .batch = batch,
                 .commit_transaction_with_id = commitTransactionWithId,
-                .commit_transaction_with_id_with_cancellation = commitTransactionWithIdAndCancellation,
+                .commit_transaction_with_id_with_control = commitTransactionWithIdAndCancellation,
                 .acknowledge_transaction_commit = acknowledgeTransactionCommit,
             } };
         }
@@ -12222,7 +12223,9 @@ test "httpx stable transaction commit durably hands off recovery before acknowle
             tables: []const distributed_txn.TableCommitRequest,
             sync_level: db_mod.types.SyncLevel,
             cancellation: db_mod.types.CancellationToken,
+            control: distributed_txn.CommitControl,
         ) anyerror!?distributed_txn.CommitOutcome {
+            try std.testing.expect(control.participant_plan_store != null);
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.cancellation_commit_calls += 1;
             try std.testing.expect(cancellation.ptr != null);
