@@ -33,7 +33,7 @@ fn rangeProducer(expression: *const ast.Expr) bool {
     return expression.value == .call and std.ascii.eqlIgnoreCase(expression.value.call.name, "range") and !expression.value.call.star and !expression.value.call.distinct and (expression.value.call.args.len == 2 or expression.value.call.args.len == 3);
 }
 fn producer(expression: *const ast.Expr) bool {
-    return collectProducer(expression) or rangeProducer(expression) or expression.value == .comprehension or expression.value == .pattern_comprehension;
+    return collectProducer(expression) or rangeProducer(expression) or expression.value == .comprehension or expression.value == .pattern_comprehension or @import("reduction.zig").reversedList(expression) != null;
 }
 fn directRange(expression: *const ast.Expr) ?*const ast.Expr {
     const input = switch (expression.value) {

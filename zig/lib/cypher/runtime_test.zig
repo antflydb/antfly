@@ -4148,6 +4148,8 @@ test "scalar row seeds stream UNWIND aggregates windows and intermediate barrier
     try check("UNWIND range(1,4) AS x WITH x ORDER BY x DESC LIMIT 2 UNWIND [x,x] AS y RETURN sum(y),count(*)", "[[14,4]]");
     try check("UNWIND [2,2,1] AS x WITH DISTINCT x RETURN sum(x),count(*)", "[[3,2]]");
     try check("UNWIND range(1,3) AS x RETURN x,count(*) ORDER BY x", "[[1,1],[2,1],[3,1]]");
+    try check("UNWIND range(1,3) AS x UNWIND [1,2] AS y RETURN collect(y)", "[[[1,2,1,2,1,2]]]");
+    try check("UNWIND [v IN range(1,3)|v] AS x UNWIND [1,2] AS y RETURN collect(y)", "[[[1,2,1,2,1,2]]]");
     var diagnostic: c.Diagnostic = .{};
     var compiled = try c.compile(std.testing.allocator, "UNWIND range(1,300000) AS x RETURN x LIMIT 1", .{}, &diagnostic);
     defer compiled.deinit();
@@ -4178,6 +4180,11 @@ test "producer summaries and scalar seeds release every failed allocation" {
         "MATCH(a:Document {id:'a'}) RETURN any(x IN [(a)-[:CITES]->(b)|b.title] WHERE size(x)>1),reduce(s='',x IN [(a)-[:CITES]->(b)|b.title]|s+x)",
         "UNWIND range(1,3) AS x UNWIND [x,x] AS y RETURN y,count(*) ORDER BY y DESC LIMIT 2",
         "UNWIND [1,0] AS x RETURN CASE WHEN true THEN count(*) ELSE sum(1/x) END",
+        "UNWIND [y IN range(1,3)|toString(y)] AS x RETURN collect(x)",
+        "WITH reverse([x IN range(1,3)|toString(x)]) AS xs RETURN head(xs),last(xs),size(xs)",
+        "UNWIND range(1,3) AS x RETURN EXISTS { MATCH(n:Document) WHERE n.rank=x },head([(a:Document {rank:x})-[:CITES]->(b)|b.title]) ORDER BY x DESC LIMIT 2",
+        "UNWIND range(1,1000000000) AS x RETURN count(*)",
+        "MATCH(a:Document {id:'a'}) RETURN [(a)-[:CITES]->(b)|[(b)-[:CITES]->(d)|d.title]]",
     }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{@as([]const u8, text)});
 }
 
@@ -4190,4 +4197,68 @@ test "direct range consumers retain sparse work alongside generic producer plans
     defer result.deinit();
     try std.testing.expectEqual(@as(i64, 300000), result.rows[0][2].integer);
     try std.testing.expectEqual(@as(usize, 2), result.rows[0][3].list.len);
+}
+
+test "streamed UNWIND producers preserve eager phases nulls lexical scope and bags" {
+    try check("UNWIND [y IN range(1,3)|y*2] AS x RETURN x ORDER BY x DESC", "[[6],[4],[2]]");
+    try check("UNWIND [y IN null|y] AS x RETURN count(*)", "[[0]]");
+    try check("UNWIND [y IN [1,null,2]|y] AS x RETURN count(*),count(x)", "[[3,2]]");
+    try check("WITH 9 AS y UNWIND [y IN range(1,3)|y] AS x RETURN y,sum(x)", "[[9,6]]");
+    try check("MATCH(a:Document {id:'a'}) UNWIND [(a)-[:CITES]->(b)|b.title] AS title RETURN title,count(*) ORDER BY title", "[[\"Beta\",2]]");
+    try check("UNWIND [y IN range(1,3)|toString(y)] AS x UNWIND [x,x] AS y RETURN reduce(s='',v IN collect(y)|s+v)", "[[\"112233\"]]");
+    for ([_][]const u8{
+        "UNWIND [y IN [1,0]|1/y] AS x RETURN x LIMIT 1",
+        "UNWIND [y IN [1,0]|1/y] AS x RETURN x+'bad' LIMIT 1",
+        "UNWIND [y IN [1,0]|1/y] AS x RETURN count(*)",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}
+
+test "list reversal propagates windows cardinality aliases and preserves string overload" {
+    try check("RETURN head(reverse([x IN range(1,5)|x])),last(reverse([x IN range(1,5)|x])),reverse([x IN range(1,5)|x])[1..3],reverse([x IN range(1,5)|x])[-2..]", "[[5,1,[4,3],[2,1]]]");
+    try check("WITH reverse([x IN range(1,5)|x]) AS xs WITH xs AS ys RETURN head(ys),last(ys),size(ys),ys[1..3],ys[-2..]", "[[5,1,5,[4,3],[2,1]]]");
+    try check("RETURN head(reverse(reverse([x IN range(1,5)|x]))),size(reverse([x IN [null,1]|x])),size(reverse([x IN []|x]))", "[[1,2,0]]");
+    try check("RETURN head(reverse([x IN null|x])),size(reverse([x IN null|x])),reverse([x IN null|x])[0],reverse([x IN null|x])[0..1]", "[[null,null,null,null]]");
+    try check("RETURN reverse('abc'),head(reverse([null,2])),reduce(s='',x IN reverse([y IN range(1,3)|toString(y)])|s+x)", "[[\"cba\",2,\"321\"]]");
+    try check("WITH reverse([x IN range(1,3)|x]) AS xs RETURN head(xs),reduce(s='',x IN xs|s+toString(x))", "[[3,\"321\"]]");
+    try check("MATCH(a:Document {id:'a'}) RETURN head(reverse([(a)-[:CITES]->(b)|b.id])),size(reverse([(a)-[:CITES]->(b)|b.id]))", "[[\"b\",2]]");
+}
+
+test "graph expression consumers preserve outer streaming scopes and owned results" {
+    try check("MATCH(a:Document {id:'a'}) RETURN [(a)-[:CITES]->(b)|[(b)-[:CITES]->(d)|d.title]]", "[[[[\"Alpha\",\"Gamma\"],[\"Alpha\",\"Gamma\"]]]]");
+    try check("UNWIND range(1,3) AS x RETURN EXISTS { MATCH(n:Document) WHERE n.rank=x },x ORDER BY x DESC LIMIT 2", "[[true,3],[true,2]]");
+    try check("UNWIND range(1,3) AS x WITH x,EXISTS { MATCH(n:Document) WHERE n.rank=x } AS ok WHERE ok RETURN sum(x)", "[[6]]");
+    try check("UNWIND range(1,3) AS x RETURN head([(n:Document {rank:x})-[:CITES]->(b)|b.id]),x ORDER BY x DESC LIMIT 2", "[[null,3],[\"a\",2]]");
+    try check("UNWIND range(1,3) AS x RETURN size([(n:Document {rank:x})-[:CITES]->(b)|b]),count(*) ORDER BY size([(n:Document {rank:x})-[:CITES]->(b)|b])", "[[0,1],[2,2]]");
+    try check("MATCH(a:Document) RETURN EXISTS { MATCH(b:Document) WHERE b.id=a.id },a.id ORDER BY a.id LIMIT 2", "[[true,\"a\"],[true,\"b\"]]");
+    try check("UNWIND range(1,3) AS x UNWIND [(n:Document {rank:x})-[:CITES]->(b)|b.id] AS id RETURN collect(id)", "[[[\"b\",\"b\",\"a\",\"c\"]]]");
+}
+
+test "unobserved range axes reduce arithmetic multiplicity with checked lazy results" {
+    try check("UNWIND range(1,0) AS x RETURN count(*)", "[[0]]");
+    try check("UNWIND range(3,1,-1) AS x RETURN count(*),count(1),count(null),count(DISTINCT 1),sum(2)", "[[3,3,0,1,6]]");
+    try check("UNWIND range(1,3) AS x WITH DISTINCT 7 AS y RETURN count(*)", "[[1]]");
+    try check("UNWIND range(1,3) AS x RETURN x,count(*) ORDER BY x", "[[1,1],[2,1],[3,1]]");
+    try check("UNWIND range(1,3) AS x UNWIND [1,2] AS y RETURN collect(y)", "[[[1,2,1,2,1,2]]]");
+    try check("UNWIND [v IN range(1,3)|v] AS x UNWIND [1,2] AS y RETURN collect(y)", "[[[1,2,1,2,1,2]]]");
+    for ([_][]const u8{
+        "UNWIND range(1,1000000000) AS x RETURN count(*)",
+        "UNWIND range(1,1000) AS x UNWIND range(1,1000000) AS y RETURN count(*)",
+        "RETURN head(reverse(range(-9223372036854775808,9223372036854775807))),last(reverse(range(-9223372036854775808,9223372036854775807)))",
+        "UNWIND range(1,100000) AS x RETURN EXISTS { MATCH(n:Document) } LIMIT 1",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 1000, .memory_bytes = 1 << 20 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+        if (std.mem.indexOf(u8, text, "count(*)") != null) try std.testing.expectEqual(@as(i64, 1000000000), result.rows[0][0].integer);
+    }
 }

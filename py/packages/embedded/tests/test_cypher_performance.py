@@ -5084,3 +5084,70 @@ def test_range_aliases_preserve_full_domain_windows_and_cardinality(graph_db):
     assert [cell["value"] for cell in cells[:2]] == [str(-(1 << 63)), str((1 << 63) - 1)]
     assert [cell["value"] for cell in cells[2]["value"]] == [str((1 << 63) - 2), str((1 << 63) - 1)]
     assert cells[3]["value"] is True
+
+
+def test_unwind_projected_sources_release_discarded_values_and_validate_eagerly(graph_db):
+    word = "A" * 4096
+    mapped = "[y IN range(1,2000)|$word+toString(y)]"
+    for tail, expected in (("RETURN count(*)", "2000"), ("RETURN x LIMIT 1", word + "1")):
+        response = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"UNWIND {mapped} AS x {tail}",
+                "parameters": {"word": word},
+                "limits": {"memory_bytes": 1 << 20},
+            },
+        )
+        assert response["rows"][0][0]["value"] == expected
+    with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
+        graph_db.cypher_json("g", {"query": "UNWIND [y IN [1,0]|1/y] AS x RETURN x LIMIT 1"})
+
+
+def test_reverse_transfers_list_cardinality_and_window_demands(graph_db):
+    word = "A" * 4096
+    mapped = "[y IN range(1,2000)|$word+toString(y)]"
+    for query, expected in (
+        (f"RETURN head(reverse({mapped}))", word + "2000"),
+        (f"RETURN size(reverse({mapped}))", "2000"),
+        (f"WITH reverse({mapped}) AS xs RETURN head(xs),last(xs),size(xs)", word + "2000"),
+        (f"RETURN head(reverse(reverse({mapped})))", word + "1"),
+    ):
+        response = graph_db.cypher_json(
+            "g", {"query": query, "parameters": {"word": word}, "limits": {"memory_bytes": 1 << 20}}
+        )
+        assert response["rows"][0][0]["value"] == expected
+
+
+def test_graph_expression_projections_keep_upstream_unwind_streaming(graph_db):
+    for projection, expected in (
+        ("EXISTS { MATCH(n:D) }", False),
+        ("size([(a:D)-[:R]->(b:D)|b])", "0"),
+    ):
+        response = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"UNWIND range(1,100000) AS x RETURN {projection} LIMIT 1",
+                "limits": {"memory_bytes": 1 << 20, "intermediate_states": 1000},
+            },
+        )
+        assert response["rows"][0][0]["value"] == expected
+
+
+def test_unobserved_range_axes_use_exact_arithmetic_bag_counts(graph_db):
+    for query in (
+        "UNWIND range(1,1000000000) AS x RETURN count(*)",
+        "UNWIND range(1,1000) AS x UNWIND range(1,1000000) AS y RETURN count(*)",
+        "UNWIND range(1000000000,1,-1) AS x WITH 1 AS y RETURN count(y)",
+    ):
+        response = graph_db.cypher_json(
+            "g", {"query": query, "limits": {"memory_bytes": 1 << 20, "intermediate_states": 1000}}
+        )
+        assert response["rows"][0][0]["value"] == "1000000000"
+    # A compact axis must preserve both sequential floating rounding and the
+    # interleaving of a later axis when the observer retains encounter order.
+    for tail in ("RETURN sum(0.1),avg(0.1)", "UNWIND [1,2] AS y RETURN collect(y)"):
+        optimized = graph_db.cypher_json("g", {"query": f"UNWIND range(1,1000) AS x {tail}"})
+        explicit = graph_db.cypher_json(
+            "g", {"query": f"UNWIND $xs AS x {tail}", "parameters": {"xs": list(range(1, 1001))}}
+        )
+        assert optimized["rows"] == explicit["rows"]

@@ -155,6 +155,22 @@ pub const Bounds = struct {
     }
 };
 pub const CollectionDemand = struct { input: *const ast.Expr, bounds: Bounds };
+/// Only statically list-valued reversals participate in list demand planning.
+/// REVERSE also accepts strings; unknown variables and parameters retain that
+/// overload's ordinary evaluation and type errors.
+pub fn reversedList(expression: *const ast.Expr) ?*const ast.Expr {
+    if (expression.value != .call) return null;
+    const c = expression.value.call;
+    if (c.star or c.distinct or c.args.len != 1 or !std.ascii.eqlIgnoreCase(c.name, "reverse")) return null;
+    return if (knownList(c.args[0])) c.args[0] else null;
+}
+fn knownList(expression: *const ast.Expr) bool {
+    return switch (expression.value) {
+        .list, .comprehension, .pattern_comprehension => true,
+        .call => |c| reversedList(expression) != null or (!c.star and !c.distinct and (c.args.len == 2 or c.args.len == 3) and std.ascii.eqlIgnoreCase(c.name, "range")),
+        else => false,
+    };
+}
 fn nonnegative(expression: *const ast.Expr) ?usize {
     if (expression.execution_integer) |integer| return std.math.cast(usize, integer);
     if (expression.value != .literal or expression.value.literal != .integer) return null;

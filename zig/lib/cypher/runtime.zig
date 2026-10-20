@@ -1149,6 +1149,7 @@ const Engine = struct {
     shortest_fast: bool = false,
     stream_fold: ?*StreamFold = null,
     expression_memo: ?CallMemo = null,
+    expression_memo_scoped: bool = false,
     moment_targets: []const SummaryTarget = &.{},
     external_summary: ?[]const u8 = null,
     external_linear_summary: bool = false,
@@ -2316,6 +2317,32 @@ const Engine = struct {
             try self.rows.append(retained, row);
         }
     };
+    fn independentExpressions(value: anytype, alias: []const u8) bool {
+        const T = @TypeOf(value);
+        if (T == *const ast.Expr) return @import("expressions.zig").rowLocal(value, struct {
+            alias: []const u8,
+            pub fn permits(scope: @This(), name: []const u8) bool {
+                return !std.mem.eql(u8, scope.alias, name);
+            }
+        }{ .alias = alias });
+        return switch (@typeInfo(T)) {
+            .pointer => |p| blk: {
+                if (p.size == .slice and p.child != u8) for (value) |child| {
+                    if (!independentExpressions(child, alias)) break :blk false;
+                };
+                break :blk true;
+            },
+            .@"struct" => |s| blk: {
+                inline for (s.field_names) |name| if (!independentExpressions(@field(value, name), alias)) break :blk false;
+                break :blk true;
+            },
+            .@"union" => switch (value) {
+                inline else => |payload| independentExpressions(payload, alias),
+            },
+            .optional => if (value) |child| independentExpressions(child, alias) else true,
+            else => true,
+        };
+    }
     const StreamFold = struct {
         retained: A,
         middle: []const ast.Clause,
@@ -2356,7 +2383,30 @@ const Engine = struct {
                 const clause = fold.middle[index];
                 switch (clause.operation) {
                     .unwind => |unwind| {
+                        if (projectedSource(unwind.expression)) {
+                            const independent = fold.independentTail(unwind.alias, index + 1);
+                            var consumer: UnwindReceiver = .{ .fold = fold, .row = row, .index = index, .owner = engine.local_invariants, .locals = engine.projection_locals, .weighted = independent };
+                            var receiver: ListReceiver = .{ .ptr = &consumer, .emit = UnwindReceiver.add, .destination = fold.retained, .observer = .{ .name = "collect", .args = &.{}, .collect_limit = if (independent) 0 else null } };
+                            _ = try engine.produceList(unwind.expression, row, null, &receiver);
+                            try receiver.check();
+                            if (consumer.complete) |err| return err;
+                            return;
+                        }
                         var source = (try engine.unwindSource(unwind.expression, row)) orelse return;
+                        // An unobserved arithmetic axis is a bag multiplicity,
+                        // not a sequence of concrete rows. The proof covers
+                        // every remaining binding and consumer before collapsing.
+                        if (source.values == .range and fold.independentTail(unwind.alias, index + 1)) {
+                            const length = source.values.range.length;
+                            if (length == 0) return;
+                            const cardinality = if (std.math.cast(u64, length)) |n| Count.init(n) else try Count.init(std.math.maxInt(u64)).add(engine.a, Count.one);
+                            const previous = fold.weight;
+                            fold.weight = try previous.multiply(engine.a, cardinality);
+                            defer fold.weight = previous;
+                            try engine.state();
+                            if (fold.record_rows) fold.stage_counts[index + 1] +|= @intCast(fold.weight.cap(std.math.maxInt(usize)));
+                            return fold.expand(engine, try engine.replace(row, unwind.alias, source.values.range.at(0)), index + 1);
+                        }
                         var arena = std.heap.ArenaAllocator.init(engine.scratch_allocator);
                         defer arena.deinit();
                         while (source.next()) |item| {
@@ -2577,6 +2627,35 @@ const Engine = struct {
             if (fold.continuation) |next| return next.parent.unorderedGoal(engine);
             if ((fold.top.* == null and fold.distinct_goal == null) or fold.projection.order.len != 0) return null;
             return engine.windowGoal(fold.projection);
+        }
+        fn independentTail(fold: *@This(), alias: []const u8, index: usize) bool {
+            if (fold.consumer != null or fold.continuation != null) return false;
+            // Even a homogeneous floating axis must retain sequential
+            // rounding. Weighted multiplication is not repeated addition.
+            for (fold.calls) |call_value| {
+                const name = call_value.value.call.name;
+                if (std.ascii.eqlIgnoreCase(name, "sum") or std.ascii.eqlIgnoreCase(name, "avg")) return false;
+            }
+            var fanout = false;
+            for (fold.middle[index..]) |clause| switch (clause.operation) {
+                .project => |p| if (p.value.wildcard or !independentExpressions(p.value, alias)) return false,
+                .unwind => |u| {
+                    if (!independentExpressions(u.expression, alias)) return false;
+                    fanout = true;
+                },
+                else => return false,
+            };
+            if (fanout) {
+                // Multiplicity distributes through another axis only for
+                // commutative observers. COLLECT/top-k must retain XYXY order,
+                // and floating SUM/AVG retain contribution order and errors.
+                if (fold.top.* != null or fold.calls.len == 0) return false;
+                for (fold.calls) |call_value| {
+                    const name = call_value.value.call.name;
+                    if (!std.ascii.eqlIgnoreCase(name, "count") and !std.ascii.eqlIgnoreCase(name, "min") and !std.ascii.eqlIgnoreCase(name, "max")) return false;
+                }
+            }
+            return !fold.projection.wildcard and independentExpressions(fold.projection, alias);
         }
         fn progress(fold: *@This()) usize {
             if (fold.continuation) |next| return next.parent.progress();
@@ -3299,11 +3378,22 @@ const Engine = struct {
         var grouped = projection.distinct;
         for (projection.items) |item| {
             grouped = grouped or aggregates(item.expression);
-            if (@import("expressions.zig").containsPattern(item.expression)) return null;
         }
-        for (projection.order) |order| if (@import("expressions.zig").containsPattern(order.expression)) return null;
-        if (projection.predicate) |predicate| if (@import("expressions.zig").containsPattern(predicate)) return null;
         const consumer_goal = if (continuation) |next| next.parent.unorderedGoal(self) else self.windowGoal(projection);
+        // Scalar graph expressions can run in recyclable row scopes. A
+        // multihop producer with an unbounded observer must still negotiate
+        // symbolic path dependencies through the weighted stage executor;
+        // admitting it here would enumerate an exponential route bag merely
+        // because its endpoint consumer contains EXISTS/a comprehension.
+        var nested_graph = hasCorrelatedBoundary(projection);
+        for (middle) |clause| switch (clause.operation) {
+            .project => |p| nested_graph = nested_graph or hasCorrelatedBoundary(p.value),
+            .unwind => |u| nested_graph = nested_graph or hasCorrelatedBoundary(u.expression),
+            else => {},
+        };
+        const finite_pull = !grouped and projection.order.len == 0 and consumer_goal != null and consumer_goal.? <= self.limits.intermediate_states -| self.stats.intermediate_states;
+        const fixed_hop = path.edges.len == 1 and path.edges[0].min_hops == 1 and path.edges[0].max_hops == 1;
+        if (nested_graph and !scalar_seed and path.edges.len != 0 and !fixed_hop and !finite_pull) return null;
         const has_match = for (middle) |clause| {
             if (clause.operation == .match or (clause.operation == .subquery and !scalarReturningCall(clause.operation.subquery))) break true;
         } else false;
@@ -3319,14 +3409,12 @@ const Engine = struct {
                 continue;
             }
             if (clause.operation == .unwind) {
-                if (@import("expressions.zig").containsPattern(clause.operation.unwind.expression)) return null;
                 continue;
             }
             if (clause.operation != .project) return null;
             const p = clause.operation.project.value;
             if (p.order.len != 0 or p.skip != null or p.limit != null) return null;
-            for (p.items) |item| if (aggregates(item.expression) or @import("expressions.zig").containsPattern(item.expression)) return null;
-            if (p.predicate) |predicate| if (@import("expressions.zig").containsPattern(predicate)) return null;
+            for (p.items) |item| if (aggregates(item.expression)) return null;
         }
         // This pipeline contains only reads and row-local expressions. Writes
         // remain barriers in run(); no entity cache may cross such a barrier.
@@ -4340,6 +4428,30 @@ const Engine = struct {
                     bags = .{ .rows = rows.items, .weights = weights.items };
                 },
                 .unwind => |u| {
+                    var fused = false;
+                    for (clauses[clause_index + 1 ..], clause_index + 1..) |following, index| {
+                        if (following.operation == .unwind or following.operation == .match or (following.operation == .subquery and pureReturningCall(following.operation.subquery))) continue;
+                        if (following.operation != .project) break;
+                        const projection = following.operation.project.value;
+                        var reduction = false;
+                        for (projection.items) |item| reduction = reduction or aggregates(item.expression);
+                        if (!following.operation.project.final and !reduction and projection.limit == null and projection.order.len == 0 and !projection.distinct) continue;
+                        self.retain_windows = (retain_final and index + 1 == clauses.len) or (!following.operation.project.final and self.weightedTail(clauses[index + 1 ..]));
+                        if (try self.streamMatchProjectionWeighted(bags.rows, bags.weights, .{ .paths = &.{} }, projection, clauses[clause_index..index], .{}, following.span)) |output| {
+                            if (self.pending_window) |window| {
+                                bags = window;
+                                self.pending_window = null;
+                            } else {
+                                const weights = try self.a.alloc(Count, output.len);
+                                @memset(weights, Count.one);
+                                bags = .{ .rows = output, .weights = weights };
+                            }
+                            clause_index = index;
+                            fused = true;
+                        }
+                        break;
+                    }
+                    if (fused) continue;
                     var rows: std.ArrayList(Row) = .empty;
                     var weights: std.ArrayList(Count) = .empty;
                     for (bags.rows, bags.weights) |row, weight| {
@@ -8285,7 +8397,13 @@ const Engine = struct {
             var captured: std.ArrayList(v.Entry) = .empty;
             for (row) |entry| if (references.contains(entry.name)) try captured.append(self.a, entry);
             key = captured.items;
-            if (try self.expression_memo.?.find(self, key, @intFromPtr(expression))) |cached| return cached.rows[0][0].value;
+            if (try self.expression_memo.?.find(self, key, @intFromPtr(expression))) |cached| {
+                const value = cached.rows[0][0].value;
+                // A nested memo is destroyed when its pattern invocation
+                // returns. Values exposed to a containing list/row must own
+                // their payloads in that caller's allocation epoch first.
+                return if (self.expression_memo_scoped) self.cloneScoped(value, self.a) else value;
+            }
         }
         const invariant = (self.read_only or self.local_invariants != null) and expression.execution_invariant != null;
         const previous_strings = self.scalar_strings;
@@ -8460,6 +8578,50 @@ const Engine = struct {
         }
         fn check(self: @This()) !void {
             if (self.failure) |err| return err;
+        }
+    };
+    const UnwindReceiver = struct {
+        fold: *StreamFold,
+        row: Row,
+        index: usize,
+        owner: ?*Invariants,
+        locals: ?*const @import("expressions.zig").Local,
+        complete: ?anyerror = null,
+        weighted: bool,
+        fn add(ptr: *anyopaque, engine: *Engine, value: v.Value, weight: Count, _: ?*const value_work.Work) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const copies = if (self.weighted) 1 else std.math.cast(usize, weight.exact() orelse return error.CypherStateBudgetExceeded) orelse return error.CypherStateBudgetExceeded;
+            var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+            defer scratch.deinit();
+            for (0..copies) |_| {
+                if (self.complete != null) return;
+                _ = scratch.reset(.retain_capacity);
+                const scope = EvalScope.enter(engine, scratch.allocator());
+                defer scope.leave(engine);
+                try self.addValue(engine, value, if (self.weighted) weight else Count.one);
+            }
+        }
+        fn addValue(self: *@This(), engine: *Engine, value: v.Value, weight: Count) !void {
+            // A source comprehension owns temporary lexical bindings and
+            // invariant caches. The continuation belongs to its caller.
+            const previous_owner = engine.local_invariants;
+            const previous_locals = engine.projection_locals;
+            engine.local_invariants = self.owner;
+            engine.projection_locals = self.locals;
+            defer engine.local_invariants = previous_owner;
+            defer engine.projection_locals = previous_locals;
+            const previous_weight = self.fold.weight;
+            self.fold.weight = try previous_weight.multiply(engine.a, weight);
+            defer self.fold.weight = previous_weight;
+            try engine.state();
+            if (self.fold.record_rows) self.fold.stage_counts[self.index + 1] +|= @intCast(self.fold.weight.cap(std.math.maxInt(usize)));
+            const unwind = self.fold.middle[self.index].operation.unwind;
+            self.fold.expand(engine, try engine.replace(self.row, unwind.alias, value), self.index + 1) catch |err| {
+                // LIMIT/admission stops the consumer, but eager source
+                // validation must still reach every remaining projection.
+                if (err != error.CypherStreamComplete and err != error.CypherAdmissionFound) return err;
+                self.complete = err;
+            };
         }
     };
     const ListMapper = struct {
@@ -8656,7 +8818,7 @@ const Engine = struct {
         }
     };
     fn projectedSource(expression: *const ast.Expr) bool {
-        return expression.value == .comprehension or expression.value == .pattern_comprehension;
+        return expression.value == .comprehension or expression.value == .pattern_comprehension or reduction_plan.reversedList(expression) != null;
     }
     fn rangeSummary(self: *Engine, call_value: ast.Function, row: Row, group: ?[]const Row) !v.Value {
         const sequence = try self.rangeInput(call_value.args[0], row, group);
@@ -8699,6 +8861,23 @@ const Engine = struct {
     }
     fn listSummary(self: *Engine, call_value: ast.Function, row: Row, group: ?[]const Row) !v.Value {
         if (isRange(call_value.args[0])) return self.rangeSummary(call_value, row, group);
+        if (call_value.collect_filters.len == 0) if (reduction_plan.reversedList(call_value.args[0])) |input| {
+            // Reversal preserves cardinality and exchanges front/back demand.
+            // Only the compact owned window changes encounter order. Ordered
+            // predicates/folds retain full reversal until independently proved.
+            var inner = call_value;
+            inner.args = &.{input};
+            inner.collect_limit = if (call_value.collect_limit != null) call_value.collect_suffix else null;
+            inner.collect_suffix = call_value.collect_limit orelse 0;
+            const summary = try self.listSummary(inner, row, group);
+            const window = summary.list[2..];
+            const reversed = try self.a.dupe(v.Value, window);
+            std.mem.reverse(v.Value, reversed);
+            const output = try self.a.alloc(v.Value, 2 + reversed.len);
+            @memcpy(output[0..2], summary.list[0..2]);
+            @memcpy(output[2..], reversed);
+            return .{ .list = output };
+        };
         var reducer: StreamingAggregate = .{ .function = call_value, .consumer_row = row, .arena = std.heap.ArenaAllocator.init(self.scratch_allocator), .distinct_arena = std.heap.ArenaAllocator.init(self.scratch_allocator) };
         defer reducer.deinit();
         reducer.function.name = "collect";
@@ -8829,6 +9008,20 @@ const Engine = struct {
         if (expression.value == .call and expression.value.call.execution_list) return self.listSummary(expression.value.call, row, group);
         if (try self.rangeConsumer(expression, row, group)) |result| return result;
         if (try self.projectedConsumer(expression, row, group)) |result| return result;
+        if (expression.value == .call) {
+            const c = expression.value.call;
+            if (!c.star and !c.distinct and c.args.len == 1 and std.ascii.eqlIgnoreCase(c.name, "size") and reduction_plan.reversedList(c.args[0]) != null) {
+                const summary = try self.listSummary(.{ .name = "collect", .args = c.args, .collect_limit = 0, .collect_summary = true }, row, group);
+                return self.collectionExtract(.cardinality, summary);
+            }
+        }
+        if (reduction_plan.collectionConsumer(expression)) |demand| if (reduction_plan.reversedList(demand.input) != null) {
+            const summary = try self.listSummary(.{ .name = "collect", .args = &.{demand.input}, .collect_limit = demand.bounds.prefix, .collect_suffix = demand.bounds.suffix, .collect_summary = true }, row, group);
+            const window = try self.collectionExtract(.{ .window = 1 }, summary);
+            // Bounds and NULL are handled by the ordinary consumer, after the
+            // source has finished evaluating and validating its projections.
+            return self.listWindowConsumer(expression, window, row, group);
+        };
         if (expression.value == .call) {
             const call_value = expression.value.call;
             if (!call_value.star and !call_value.distinct and call_value.args.len == 1 and std.ascii.eqlIgnoreCase(call_value.name, "size") and call_value.args[0].value == .comprehension)
@@ -9161,18 +9354,18 @@ const Engine = struct {
     }
     fn listWindowConsumer(self: *Engine, expression: *const ast.Expr, value: v.Value, row: Row, group: ?[]const Row) !v.Value {
         return switch (expression.value) {
-            .call => |call_value| if (value.list.len == 0) .null else if (std.ascii.eqlIgnoreCase(call_value.name, "head")) value.list[0] else value.list[value.list.len - 1],
+            .call => |call_value| if (value == .null or value.list.len == 0) .null else if (std.ascii.eqlIgnoreCase(call_value.name, "head")) value.list[0] else value.list[value.list.len - 1],
             .index => |index| blk: {
                 const position = try self.eval(index.index, row, group);
-                if (position == .null) break :blk .null;
+                if (value == .null or position == .null) break :blk .null;
                 if (position != .integer) return error.CypherTypeMismatch;
                 const ordinal: i128 = if (position.integer < 0) @as(i128, value.list.len) + position.integer else position.integer;
                 break :blk if (ordinal < 0 or ordinal >= value.list.len) .null else value.list[@intCast(ordinal)];
             },
             .slice => |slice| blk: {
                 const first = if (slice.start) |bound| try self.eval(bound, row, group) else v.Value{ .integer = 0 };
-                const last = if (slice.end) |bound| try self.eval(bound, row, group) else v.Value{ .integer = @intCast(value.list.len) };
-                if (first == .null or last == .null) break :blk .null;
+                const last = if (slice.end) |bound| try self.eval(bound, row, group) else v.Value{ .integer = if (value == .null) 0 else @intCast(value.list.len) };
+                if (value == .null or first == .null or last == .null) break :blk .null;
                 if (first != .integer or last != .integer) return error.CypherTypeMismatch;
                 const length: i128 = value.list.len;
                 const begin: usize = @intCast(std.math.clamp(if (first.integer < 0) length + first.integer else first.integer, 0, length));
@@ -9588,8 +9781,10 @@ const Engine = struct {
         terminal_weight_demand: ?Multiplicity,
         summary_tail: ?*const SummaryTail,
         pending_window: ?WeightedRows,
+        expression_memo: ?CallMemo,
+        expression_memo_scoped: bool,
         fn enter(engine: *Engine) PatternScope {
-            const scope: PatternScope = .{ .columns = engine.columns, .stages = engine.stages, .retain_windows = engine.retain_windows, .match_weight_demand = engine.match_weight_demand, .terminal_weight_demand = engine.terminal_weight_demand, .summary_tail = engine.summary_tail, .pending_window = engine.pending_window };
+            const scope: PatternScope = .{ .columns = engine.columns, .stages = engine.stages, .retain_windows = engine.retain_windows, .match_weight_demand = engine.match_weight_demand, .terminal_weight_demand = engine.terminal_weight_demand, .summary_tail = engine.summary_tail, .pending_window = engine.pending_window, .expression_memo = engine.expression_memo, .expression_memo_scoped = engine.expression_memo_scoped };
             // A correlated query owns its result/profiling buffers and must
             // produce ordinary expression values. Its caller may itself be
             // retaining a weighted window in a temporary evaluation arena.
@@ -9599,6 +9794,11 @@ const Engine = struct {
             engine.terminal_weight_demand = null;
             engine.summary_tail = null;
             engine.pending_window = null;
+            // Nested rewrites may allocate AST nodes in a recyclable row arena.
+            // Their pointer-based memo identities cannot escape this invocation.
+            // The caller still memoizes the original expression's owned result.
+            engine.expression_memo = null;
+            engine.expression_memo_scoped = true;
             return scope;
         }
         fn leave(scope: PatternScope, engine: *Engine) void {
@@ -9609,6 +9809,9 @@ const Engine = struct {
             engine.terminal_weight_demand = scope.terminal_weight_demand;
             engine.summary_tail = scope.summary_tail;
             engine.pending_window = scope.pending_window;
+            if (engine.expression_memo) |*memo| memo.deinit();
+            engine.expression_memo = scope.expression_memo;
+            engine.expression_memo_scoped = scope.expression_memo_scoped;
         }
     };
     const EvalScope = struct {
@@ -9892,12 +10095,7 @@ const Engine = struct {
             if (try GroupWindow.init(self, projection, true)) |window| return self.projectBoundedCountGroups(rows, projection, final, window);
         }
         if (!grouped and !projection.distinct and projection.order.len == 0) return self.projectUnordered(rows, projection, final);
-        if (!grouped and !projection.distinct and projection.limit != null and projection.order.len != 0) top_k: {
-            // Pattern/subquery evaluation retains nested execution plans and
-            // must use the general scope until it has a streaming operator.
-            for (projection.items) |item| if (@import("expressions.zig").containsPattern(item.expression)) break :top_k;
-            for (projection.order) |order| if (@import("expressions.zig").containsPattern(order.expression)) break :top_k;
-            if (projection.predicate) |predicate| if (@import("expressions.zig").containsPattern(predicate)) break :top_k;
+        if (!grouped and !projection.distinct and projection.limit != null and projection.order.len != 0) {
             return self.orderedTopK(rows, projection, final);
         }
 
