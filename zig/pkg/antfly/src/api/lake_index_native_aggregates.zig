@@ -1169,7 +1169,7 @@ test "external lake native algebraic publication reads real Parquet into exact S
     const partials = (try cursor.next(cursor.ptr, page.allocator(), 32)).?;
     const group = try operators.Grouped.create(a, &.{spec}, .{});
     defer group.deinit();
-    try group.importPartial(partials[0].keys, partials[0].aggregates, partials[0].ordinal);
+    try group.importPartialBatch(partials);
     const result = (try group.nextResult(page.allocator())).?;
     try std.testing.expectEqual(@as(i64, 18014398509481985), result.aggregates[0].value.integer);
     try std.testing.expect((try cursor.next(cursor.ptr, page.allocator(), 32)) == null);
