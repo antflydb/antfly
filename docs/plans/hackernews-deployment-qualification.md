@@ -1079,3 +1079,114 @@ recorded in the local request log. The historical failed warm matrix remains
 above rather than being replaced by this passing run. These bounded shared-host
 measurements do not prove the historical outlier's cause or qualify full-archive,
 concurrent-ingestion or Antfly Cloud service latency.
+
+
+### Matched comparison and RC handoff, October 20
+
+Work proceeds from `origin/main` at `51cfaa8f6ef8ccc8b14f7c7b3201b84a36863449`
+in `.worktrees/perf-hn-rc-search-comparison`. The published `v0.3.0-rc.1`
+runtime is a separate qualification target at
+`408644a86163292366dc54d5306f4a4657e4e755`; it contains #1128, while main
+has additional retained-query recovery and publication fixes. Its optimized
+build is still running; no latest-main runtime measurements are recorded in this
+section yet. Latest-main results must not be represented as release-candidate
+results.
+
+The original local fixture was gone. A surviving bounded sample was downloaded
+from the existing import bucket without another export or cloud compute job.
+Its 142,577 rows and Parquet SHA-256
+`e568043355dd35700f29e9a6c055f3e4dd541724e4c844db3436f409d38b5a52`
+match the October 12 comparison exactly. Both engines use these source bytes.
+DuckDB 1.5.6 builds a local FTS index with four threads; extension loading and
+construction precede query timing. Antfly includes HTTP transport, uses default
+native scheduling, and declares the same metadata indexes with stored source.
+The shared macOS ARM64 host remains uncontrolled; OS caches are not flushed.
+The initial RC/DuckDB diagnostic runs overlap the optimized main build, so their
+latency differences are not controlled attribution to code or layout alone.
+Serving-cache reset and fresh process do not imply cold OS pages, and Antfly's
+readiness/profiling interval permits background warming.
+
+The RC archive was verified against the published artifact checksum
+`d784eb630cddd36ae0892eef9f361473b79337724ab6c6101cad5882bb431165`.
+Unhighlighted, highlighted and composed results are recorded separately; raw
+reports and logs remain outside the repository. No cross-engine score or order
+identity is asserted because analyzers and scoring differ.
+
+[Colony PR #795](https://github.com/antflydb/colony/pull/795) registers the RC as a
+candidate with automatic upgrades disabled, pinned to Artifact Registry digest
+`sha256:d686ce3bcda6a0d30f3617a99a5ea2ae83b8d720bb761e7d862c9dc9c3d69a77`.
+Catalog delivery is separate from a Colony application release. The existing
+manual instance-update target can select a pinned runtime for a disposable
+ready development instance without making it an automatic target. No catalog
+apply, managed instance upgrade, infrastructure apply or public route was run.
+
+Next, qualify the exact release through an organization-owned development Cloud
+instance and authenticated route, using durable tenant-scoped object storage.
+Verify operator/storage compatibility, publication, current updates, composed
+search, cursors, credential refresh, replacement recovery and restore behavior.
+Reconcile the existing budget before an archive-scale reservation. Promote the
+catalog only after environment evidence, and add the ongoing producer, public
+route and operational limits after managed acceptance. The optional standalone
+foundation in Colony #762 and its 20 GiB disk are not prerequisites. If required
+main fixes are absent from RC1 or RC qualification fails, publish and qualify a
+new RC before that rollout.
+
+#### Published RC1 results
+
+All RC matrices pass the harness correctness checks, including exact filters,
+projected highlights where requested, stable IDs/scores, 1,408 unique cursor hits
+and mutable composed cursor replay after restart. Each warm p95 uses 20 samples.
+Construction is measured separately from searches.
+
+| Measurement | DuckDB FTS, one file | RC1 plain, one file | RC1 highlighted, one file | RC1 highlighted, 1,024 files |
+| --- | ---: | ---: | ---: | ---: |
+| First archive search | 31–46 ms | 273 ms | 82 ms | 542 ms |
+| Warm archive p95 | 13–16 ms | 16 ms | 13 ms | 192 ms |
+| Archive search after restart | Not measured | 80 ms | 118 ms | 324 ms |
+| Cold union | Not measured | Not measured | 131 ms | 343 ms |
+| Warm union p95 | Not measured | Not measured | 36 ms | 196 ms |
+| Cold saved overlay | Not measured | Not measured | 580 ms | 671 ms |
+| Warm saved-overlay p95 | Not measured | Not measured | 43 ms | 240 ms |
+| Antfly publication readiness | Not comparable | 50 s | Reuses publication | 610 s |
+
+The unhighlighted RC `database`, `postgres`, `sqlite` and `AI` workload p95s
+are 18, 20, 16 and 28 ms; DuckDB's corresponding p95 ranges across two fresh
+processes are 13–16, 11–14, 11–12 and 13–14 ms. These are functional workload
+comparisons, not identical analyzers or relevance rankings. An individual cold
+highlighted run being faster than its unhighlighted predecessor does not prove
+highlighting reduces work; these are separate shared-host runs.
+
+The fragmented fixture preserves all rows but uses contiguous equal-count splits
+into 1,024 DataPageV2/Snappy files, totaling 68,995,609 bytes. Its canonical
+name/size/content-hash inventory digest is
+`c3fcf4a5e0ec1e8985332008e2a2327abc0e772dec7246aa8f7d3ef6c57c0498`.
+This is a newly generated layout, not an assertion of byte identity with the
+October 14 split files. During construction, a local artifact scan observed
+297,615 object files totaling 11,376,019,063 bytes across 65 attempt directories;
+large object names did not repeat in that scan. This is a construction-time
+observation, not retained live bytes after GC. Archive qualification must include
+construction duration, object counts and GC, rather than only foreground latency.
+The 1,024-file union and overlay still pass the 2,000 ms cold and 750 ms warm gates;
+neither retains a composed request above 750 ms and diagnostic drops are zero.
+
+
+Three additional RC1 restarts clear the serving cache and issue the saved-overlay
+query immediately after the readiness probe, with no profiling sleep. First
+requests take 979, 414 and 378 ms. The following 20 warm requests per cycle have
+p95 267, 257 and 213 ms; none exceeds 293 ms. Table identities, IDs and scores
+match the full-matrix result and each hit has a body highlight. These direct
+checks cover the previously unmeasured immediate-readiness window, while still
+retaining OS pages and using the shared host. They are not pod cold-start or
+managed scale-to-zero measurements.
+
+
+RC1's 273 ms plain cold request spends 239 ms in the lake search phase,
+28 ms afterward and under 1 ms before search; about 5 ms is outside lake
+execution. The cold gap to DuckDB is therefore mostly engine work in this sample,
+not HTTP transport. These coarse phases do not isolate reader opening from
+ranking, so they do not identify the precise optimization on their own.
+
+PR #1196 coverage and suggested qualification are recorded in the
+[review comment](https://github.com/antflydb/antfly/pull/1196#issuecomment-6296069184).
+Its head is absent from both the RC and pinned main baseline; this evidence does
+not measure that PR's performance improvement.
