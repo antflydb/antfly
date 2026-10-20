@@ -17,22 +17,23 @@ branch, `codex/workload-scheduling`, in `.worktrees/workload-scheduling`, and
 implementation evidence are recorded in the implementation ledger.
 The current merge includes `origin/main` at `fc9bea9f20194754644605d796c00beeb1f325d0`.
 
-Native ABI 43, storage-owner ABI 102, engine descriptor 28, file floor 7 and
+Native ABI 43, storage-owner ABI 103, engine descriptor 28, file floor 7 and
 Raft protocol 25 fence persistent binding, original cohort handoff and typed
 recovery status. New stable SQL/HTTP sessions retain their original routed
 cohort before BEGIN. Required status compares actual saved mode and binding and
 represents successful absence explicitly; read errors cannot authorize a fresh
 BEGIN or follower cleanup. Legacy terminal aborts remain final.
 
-Source `d56003bd208e325e09d0c81e1370ec50efd46389` adds native owner status and
-fixed-size private RPC delivery. Read admission/deadlines and quorum/owner
-checks surround the snapshot. Status borrows existing residency and releases
-without blocking on owner transitions. Existing production routing ignores
-budgets, so hosted required status refuses that path until bounded capture is
-qualified. Six native runtime targets, the owner analysis check and 25
-public-package consumer checks pass; full owner archive runtime qualification
-remains unrun and full Linux qualification remains waived. Required mutation
-providers, funded original producers and cold-owner preparation, fresh route
+Source `d906d4039744dd5fc0fa7649143e7a6bf88ae340` adds coherent bounded
+production batch routing. Original admission and deadlines cover retained
+metadata capture, selected report reads, caller-owned allocation, C delivery and
+route selection. Missing derived indexes are rejected without request-path
+repair. The provider now advertises bounded batch capture; legacy scalar route
+callbacks remain unqualified. Selection uses committed group facts rather than
+runtime-only diagnostics. Six focused build targets and 25 public-package
+consumer steps pass; complete storage-owner archive runtime qualification
+remains unrun, and full Linux qualification remains waived. Required mutation
+providers, funded original producers, cold-owner preparation, fresh route
 authority, large-frame transport and coordinated migration still gate
 activation. The broader scheduler design and distributed fault/restart
 qualification remain open.

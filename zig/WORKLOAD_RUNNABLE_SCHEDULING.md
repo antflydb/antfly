@@ -19,6 +19,53 @@ The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
 session semantics, correctness, durability and control progress under overload.
 
+## Bounded production metadata routing (2026-10-20)
+
+Source `d906d4039744dd5fc0fa7649143e7a6bf88ae340` replaces the production
+data-bearing batch router's separate unbounded projected-store and placement
+reads with one retained metadata read transaction. It captures endpoints,
+health, selected indexed group reports and placements coherently. It does not
+repair missing derived indexes on a request path; an absent or incompatible
+marker returns InvalidDerivedCatalogIndex.
+
+The original route budget and admission reach storage acquisition, checked
+cursor traversal, selected report reads, decoding, endpoint copying,
+serialization, client decoding and route selection. Memory belongs to the
+caller. Copying checks admission in 4096-byte chunks. The minimal placement view
+skips bootstrap strings without allocating them, and routing avoids
+runtime/index diagnostics. Selection uses committed group facts, retaining
+leader preference and placement visibility, including the draining-source rule.
+It no longer uses runtime-only diagnostic observations to establish a
+data-bearing candidate.
+
+The additive storage-owner C operation has its own versioned request and resets
+output before validation. Caller rejection traces retain arbitrary original
+errors before C status translation, including NotFound and TxnNotFound. Native
+ABI remains 43; storage-owner ABI is 103, engine descriptor 28, API kernel 53,
+file floor 7 and Raft protocol 25. The production batch provider now advertises
+bounded_group_routes. Other legacy scalar routing callbacks are unchanged and
+are not qualified as bounded providers by this delivery.
+
+`native-controlled-routing-v7-verified.json` records six focused build targets:
+controlled routing, production route-provider analysis, API transactions,
+participant control fanout, session maintenance and required replicated BEGIN.
+The routing suite exercises actual persistent storage, the production C entry
+and opaque client, every original rejection checkpoint, caller allocation
+failures, minimal codec agreement with durable encoders, missing-index behavior,
+leader/draining policy and coherent snapshots during concurrent publication. The
+analysis target instantiates the actual production batch callback and the opaque
+metadata client. The immutable public source package has 4483 matching sources
+and passes all 25 ReleaseSafe consumer build steps. Error generation and storage
+control-catalog checks pass. The complete storage-owner archive runtime and full
+Linux qualification remain unrun; the latter is waived by the user.
+
+The full design remains incomplete. Required mutation callbacks, independently
+funded original producers and cold-owner preparation, fresh route authority,
+large-frame transport and coordinated migration still gate activation. Bounded
+capture is not a fresh quorum route certificate, and this delivery does not
+activate required distributed mutation or qualify overload/fault behavior for
+the whole scheduler.
+
 ## Typed owner and RPC recovery status (2026-10-19)
 
 Source `d56003bd208e325e09d0c81e1370ec50efd46389` adds explicit successful
