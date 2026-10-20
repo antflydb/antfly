@@ -164,7 +164,7 @@ fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight
                 // per-shard catalogs. Inspect it independently before all shards.
                 var inspector: preflight.Inspector = .{ .allocator = allocator, .report = report, .options = options };
                 defer inspector.deinit();
-                try inspector.metadataJson(manifest.indexes_json);
+                try inspector.indexCatalogJson(manifest.indexes_json);
                 try inspector.replicationSourcesJson(manifest.replication_sources_json);
                 for (manifest.shards) |shard| {
                     try options.cancellation.check();
@@ -234,7 +234,7 @@ fn inspectStore(allocator: Allocator, io: std.Io, store: *@import("../docstore.z
 fn inspectPortable(allocator: Allocator, io: std.Io, file: std.Io.File, options: preflight.Options, report: *preflight.Report, catalog: ?[]const u8) !void {
     var inspector: preflight.Inspector = .{ .allocator = allocator, .report = report, .options = options };
     defer inspector.deinit();
-    if (catalog) |json| try inspector.metadataJson(json);
+    if (catalog) |json| try inspector.indexCatalogJson(json);
     _ = try portable_backup.inspectPortableFileBlocks(allocator, io, file, .{ .metadata_first = true, .max_input_bytes = options.max_input_bytes, .max_logical_bytes = options.max_expanded_bytes, .cancellation = options.cancellation }, &inspector, preflight.Inspector.visit);
 }
 
@@ -2355,7 +2355,7 @@ test "backup preflight native multishard scans later shards and table producers"
         .schema_json = "{}",
         .read_schema_json = "",
         .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"${secret:replication.pg}\",\"postgres_table\":\"public.documents\"}]",
-        .indexes_json = "{\"enrichments\":[{\"name\":\"pdf\",\"kind\":\"asset\",\"field\":\"media\",\"producer\":{\"type\":\"reader\"}}]}",
+        .indexes_json = "{\"default\":{\"type\":\"embeddings\",\"field\":\"media\",\"dimension\":3,\"embedder\":{\"model\":\"mock\"}},\"enrichments\":[{\"name\":\"pdf\",\"kind\":\"asset\",\"field\":\"media\",\"producer\":{\"type\":\"reader\"}}]}",
         .shards = &shards,
     };
     try backups_api.writeManifest(a, root, &manifest);
@@ -2375,6 +2375,7 @@ test "backup preflight native multishard scans later shards and table producers"
     try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("inventory").?.object.get("documents").?.integer);
     try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("inventory").?.object.get("shards").?.integer);
     try std.testing.expect(std.mem.indexOf(u8, json, "source_local") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"model\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"connection\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "replication.pg") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"document_id\":\"z\"") != null);

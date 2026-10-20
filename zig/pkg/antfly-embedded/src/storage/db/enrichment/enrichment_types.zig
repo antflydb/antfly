@@ -16,6 +16,19 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+/// Borrowed runtime source-field selection. Public field names are literal
+/// object keys; only grouped execution supplies the synthetic group unit path.
+/// Template paths are interpreted separately by the template engine.
+pub fn sourceFieldValue(root: std.json.Value, field: []const u8, grouped: bool) std.json.Value {
+    if (root != .object) return .null;
+    if (grouped and std.mem.eql(u8, field, "_group_unit.text")) {
+        const unit = root.object.get("_group_unit") orelse return .null;
+        if (unit != .object) return .null;
+        return unit.object.get("text") orelse .null;
+    }
+    return root.object.get(field) orelse .null;
+}
+
 /// Process-wide count of query-time embeds currently executing (a public
 /// query whose text is being embedded into a vector right now). The query
 /// layers increment it around the embed call itself — not the whole query —

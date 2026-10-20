@@ -24,6 +24,8 @@ const artifact_ids = @import("../db/artifact_ids.zig");
 const canonical = @import("../db/document_content_hash.zig");
 const staging = @import("restore_staging.zig");
 const resolver_catalog = @import("../db/catalog/resolver_catalog.zig");
+const ProducerType = @import("../db/enrichment/asset_producer.zig").ProducerType;
+const enrichment_types = @import("../db/enrichment/enrichment_types.zig");
 const chunking_types = @import("../../chunking/types.zig");
 
 pub const report_version = 1;
@@ -276,18 +278,19 @@ fn producerEnabled(value: Value, fallback: bool) bool {
 }
 
 fn modelBackedProducer(producer: Value) bool {
-    const typ = str(get(producer, "type"));
-    if (eq(typ, "generator") or eq(typ, "extractor") or eq(typ, "transcriber")) return true;
+    const producer_type = ProducerType.parse(str(get(producer, "type"))) orelse return false;
     const config = get(producer, "config");
-    if (eq(typ, "document_extraction")) {
+    const provider = str(get(config, "provider"));
+    // Exhaust the runtime enum so a new built-in requires an explicit policy.
+    return switch (producer_type) {
+        .generator, .extractor, .transcriber, .decision => true,
         // Extraction uses the default OCR model for PDF fallback unless
         // explicitly disabled; transcription is separately opt-in.
-        return producerEnabled(get(config, "ocr"), producerEnabled(get(config, "ocr_fallback"), true)) or
-            producerEnabled(get(config, "transcription"), producerEnabled(get(config, "transcribe_audio"), false));
-    }
-    if (!eq(typ, "reader")) return false;
-    const provider = str(get(config, "provider"));
-    return str(get(config, "model")).len > 0 or eq(provider, "antfly") or eq(provider, "openai") or eq(provider, "vertex") or eq(provider, "apple");
+        .document_extraction => producerEnabled(get(config, "ocr"), producerEnabled(get(config, "ocr_fallback"), true)) or
+            producerEnabled(get(config, "transcription"), producerEnabled(get(config, "transcribe_audio"), false)),
+        .reader => str(get(config, "model")).len > 0 or eq(provider, "antfly") or eq(provider, "openai") or eq(provider, "vertex") or eq(provider, "apple"),
+        .copy => false,
+    };
 }
 
 const SourceInput = enum { text, locator, model_chunk, prior_context };
@@ -331,7 +334,7 @@ pub const Inspector = struct {
                     if (std.mem.endsWith(u8, e.key, ":indexes")) {
                         const json = try staging.tableIndexesJsonFromPortableMetadata(self.allocator, e.value, null);
                         defer self.allocator.free(json);
-                        try self.metadataJson(json);
+                        try self.indexCatalogJson(json);
                     } else if (std.mem.endsWith(u8, e.key, ":replication_sources")) {
                         try self.replicationSourcesJson(e.value);
                     } else if (std.mem.endsWith(u8, e.key, ":enrichments") or std.mem.endsWith(u8, e.key, ":resolvers")) try self.metadataJson(e.value);
@@ -404,6 +407,22 @@ pub const Inspector = struct {
         var parsed = try std.json.parseFromSlice(Value, self.allocator, bytes, .{});
         defer parsed.deinit();
         try self.config(parsed.value, 0, "");
+    }
+
+    /// Index names are opaque catalog keys, never configuration properties.
+    /// Collection entries (such as enrichments) are traversed as definitions.
+    pub fn indexCatalogJson(self: *@This(), bytes: []const u8) !void {
+        if (bytes.len > self.options.max_metadata_bytes) return error.PreflightLimitExceeded;
+        var parsed = try std.json.parseFromSlice(Value, self.allocator, bytes, .{});
+        defer parsed.deinit();
+        switch (parsed.value) {
+            .object => |object| {
+                var it = object.iterator();
+                while (it.next()) |entry| try self.config(entry.value_ptr.*, 0, entry.key_ptr.*);
+            },
+            .array => try self.config(parsed.value, 0, ""),
+            else => return error.InvalidBackupRequest,
+        }
     }
 
     pub fn replicationSourcesJson(self: *@This(), bytes: []const u8) !void {
@@ -510,11 +529,11 @@ pub const Inspector = struct {
         }
         const is_embedding = eq(kind, "embedding") or eq(kind, "dense_vector") or eq(kind, "sparse_vector") or eq(typ, "embeddings") or get(value, "embedder") != .null or get(value, "semantic_producer") != .null;
         const is_definition = is_embedding or producer != .null or eq(kind, "asset") or eq(kind, "chunk") or get(value, "transcriber") != .null;
-        const known = producer_type.len == 0 or eq(producer_type, "copy") or eq(producer_type, "reader") or eq(producer_type, "transcriber") or eq(producer_type, "document_extraction") or eq(producer_type, "generator") or eq(producer_type, "extractor");
+        const known = producer_type.len == 0 or ProducerType.parse(producer_type) != null;
         if (!known) try self.report.add(self.options, .dynamic_loader, "producer", "", field, 0);
         if (is_definition and (field.len > 0 or template.len > 0 or artifact.len > 0)) {
             const locator_mode = eq(producer_type, "reader") or eq(producer_type, "transcriber") or eq(producer_type, "document_extraction") or eq(str(get(value, "embedding_input")), "pdf_page_images") or eq(str(get(value, "input")), "pdf_page_images") or eq(str(get(value, "embedding_input")), "image") or eq(str(get(value, "embedding_input")), "audio") or eq(str(get(value, "embedding_input")), "video") or get(value, "transcriber") != .null;
-            try self.selector(field, template, artifact, if (model_chunk) .model_chunk else if (locator_mode) .locator else .text, !known or (field.len > 0 and !simplePath(field)));
+            try self.selector(field, template, artifact, if (model_chunk) .model_chunk else if (locator_mode) .locator else .text, !known);
         }
         if (is_embedding) {
             const name = if (str(get(value, "name")).len > 0) str(get(value, "name")) else catalog_name;
@@ -664,7 +683,7 @@ pub const Inspector = struct {
                     try self.consumeValue(.{ .string = text }, id, s.field, s.input == .locator, 0);
                 }
             } else {
-                const selected = if (s.field.len == 0) parsed.value else try self.selectedField(parsed.value, s.field, id);
+                const selected = if (s.field.len == 0) parsed.value else enrichment_types.sourceFieldValue(parsed.value, s.field, false);
                 if (s.input == .model_chunk) try self.modelChunkSource(selected, id, s.field) else try self.consumeValue(selected, id, s.field, s.input == .locator, 0);
             }
         }
@@ -869,6 +888,87 @@ fn count(report: Report, kind: Kind) u64 {
     return n;
 }
 
+test "backup preflight catalog names do not hide dependencies" {
+    const a = std.testing.allocator;
+    const config = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"mock\"}}";
+    for ([_][]const u8{ "normal", "default", "schema", "url", "api_key", "enrichments", "loader", "config_json" }) |name| {
+        const metadata = try std.fmt.allocPrint(a, "{{\"{s}\":{s}}}", .{ name, config });
+        defer a.free(metadata);
+        var report: Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        try inspector.indexCatalogJson(metadata);
+        try inspector.document("doc", "{\"body\":\"<<<dotprompt:media:url file:///private/active.pdf>>>\"}", "");
+        const json = try report.jsonAlloc("{\"version\":1,\"configuration_id\":\"empty-destination\"}");
+        defer a.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"verdict\":\"blocked\"") != null);
+        try std.testing.expectEqual(@as(u64, 1), count(report, .model));
+        try std.testing.expectEqual(@as(u64, 1), count(report, .source_local));
+    }
+}
+
+test "backup preflight source fields are literal and template paths are nested" {
+    const a = std.testing.allocator;
+    const raw = "{\"media.uri\":\"file:///private/literal.pdf\",\"this\":\"file:///private/this.pdf\",\"media[*].uri\":\"file:///private/brackets.pdf\",\"media\":{\"uri\":\"https://example.org/nested.pdf\"}}";
+    for ([_][]const u8{ "media.uri", "this", "media[*].uri" }) |field| {
+        var report: Report = .{ .allocator = a };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        const metadata = try std.json.Stringify.valueAlloc(a, .{ .kind = "asset", .source_field = field, .producer = .{ .type = "reader" } }, .{});
+        defer a.free(metadata);
+        try inspector.metadataJson(metadata);
+        try inspector.document("doc", raw, "");
+        try std.testing.expectEqual(@as(u64, 1), count(report, .source_local));
+        try std.testing.expectEqual(@as(u64, 0), count(report, .source_external));
+        try std.testing.expect(report.analysis_complete);
+    }
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    try inspector.metadataJson("{\"kind\":\"asset\",\"source_template\":\"{{remoteMedia url=media.uri}}\",\"producer\":{\"type\":\"reader\"}}");
+    try inspector.document("doc", raw, "");
+    try std.testing.expectEqual(@as(u64, 0), count(report, .source_local));
+    try std.testing.expectEqual(@as(u64, 1), count(report, .source_external));
+}
+
+test "backup preflight built in decision is inspectable" {
+    const a = std.testing.allocator;
+    const producer = "{\"type\":\"decision\",\"config\":{\"version\":\"v1\",\"decider\":{\"provider\":\"antfly\",\"model\":\"mock\"},\"questions\":[{\"name\":\"refund\",\"type\":\"predicate\",\"instructions\":\"Refund?\"}]}}";
+    try @import("../db/enrichment/config_validation.zig").validatePublicConfig(a, .{ .name = "decision", .kind = .asset, .field = "body", .producer_json = producer });
+    const catalog = try @import("../db/catalog/enrichment_catalog.zig").serializeCatalog(a, &.{.{ .name = "decision", .kind = .asset, .source_field = "body", .producer_json = producer }});
+    defer a.free(catalog);
+    var report: Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    try inspector.metadataJson(catalog);
+    try inspector.document("doc", "{\"body\":\"refund request\"}", "");
+    const caps = try a.alloc(Capability, report.requirements.items.len);
+    defer a.free(caps);
+    for (report.requirements.items, caps) |*r, *cap| cap.* = .{ .requirement_sha256 = &r.sha256, .supported = true, .future_ingestion = true, .model_revision_verified = true };
+    const evidence = try std.json.Stringify.valueAlloc(a, Destination{ .version = 1, .configuration_id = "decision-model", .requirements = caps }, .{});
+    defer a.free(evidence);
+    const json = try report.jsonAlloc(evidence);
+    defer a.free(json);
+    try std.testing.expectEqual(@as(u64, 0), count(report, .dynamic_loader));
+    try std.testing.expectEqual(@as(u64, 2), count(report, .producer_model));
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verdict\":\"compatible\"") != null);
+    try std.testing.expect(report.analysis_complete);
+    const changed = try @import("../db/catalog/enrichment_catalog.zig").serializeCatalog(a, &.{.{ .name = "decision", .kind = .asset, .source_field = "other", .producer_json = producer }});
+    defer a.free(changed);
+    try inspector.metadataJson(changed);
+    const destination = try std.json.parseFromSlice(Destination, a, evidence, .{});
+    defer destination.deinit();
+    var unknown: usize = 0;
+    for (report.requirements.items) |*r| {
+        if (r.kind == .producer_model and evaluate(r, destination.value).verdict == .unknown) unknown += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), unknown);
+}
+
 test "backup preflight replication sources require exact destination connection evidence" {
     const a = std.testing.allocator;
     const bytes = "[{\"type\":\"postgres\",\"dsn\":\"postgresql://user:TOPSECRET@db.example/database\",\"postgres_table\":\"public.documents\",\"slot_name\":\"source_slot\"}]";
@@ -976,7 +1076,7 @@ test "backup preflight context property names remain valid index catalog names" 
     defer report.deinit();
     var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
     defer inspector.deinit();
-    try inspector.metadataJson(
+    try inspector.indexCatalogJson(
         \\{"prior_context":{"type":"embeddings","dimension":3,"embedder":{"model":"exact-model"}},"replication_sources":{"type":"embeddings","dimension":3,"embedder":{"model":"exact-model"}}}
     );
     try std.testing.expectEqual(@as(u64, 2), count(report, .model));
@@ -1305,7 +1405,7 @@ test "backup preflight rejects unsupported selectors and reports template connec
     defer inspector.deinit();
     try inspector.metadataJson("[{\"kind\":\"embedding\",\"source_template\":\"{{remoteMedia url=image credential=\\\"private-media\\\"}}\"}]");
     try std.testing.expectEqual(@as(u64, 1), count(report, .connection));
-    try inspector.metadataJson("[{\"kind\":\"asset\",\"field\":\"media[*].url\",\"producer\":{\"type\":\"reader\"}}]");
+    try inspector.metadataJson("[{\"kind\":\"asset\",\"source_template\":\"{{media[*].url}}\",\"producer\":{\"type\":\"reader\"}}]");
     try std.testing.expect(!report.analysis_complete);
     try inspector.locator("https://example.org/a?%58-Amz-%53ignature=secret", "d", "media");
     try std.testing.expect(count(report, .source_expiring) > 0);
@@ -1320,7 +1420,7 @@ test "backup preflight stored vectors alone cannot establish a model contract" {
     defer report.deinit();
     var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
     defer inspector.deinit();
-    try inspector.metadataJson("{\"known\":{\"type\":\"embeddings\",\"dimension\":3,\"embedder\":{\"model\":\"exact-model\"}}}");
+    try inspector.indexCatalogJson("{\"known\":{\"type\":\"embeddings\",\"dimension\":3,\"embedder\":{\"model\":\"exact-model\"}}}");
     const before = count(report, .model);
     try inspector.storedModel("known", "d");
     try std.testing.expectEqual(before, count(report, .model));

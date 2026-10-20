@@ -32144,11 +32144,7 @@ fn extractModelChunkSource(a: Allocator, config: Config, raw: []const u8, reques
     var parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return .{};
-    const field = if (request.group_artifact_name.len > 0 and std.mem.eql(u8, request.source_field, "_group_unit.text")) blk: {
-        const unit = parsed.value.object.get("_group_unit") orelse return .{};
-        if (unit != .object) return .{};
-        break :blk unit.object.get("text") orelse return .{};
-    } else parsed.value.object.get(request.source_field) orelse return .{};
+    const field = enrichment_types.sourceFieldValue(parsed.value, request.source_field, request.group_artifact_name.len > 0);
     const source = try @import("../../../chunking/chunk.zig").modelSourceFromValue(field);
     switch (source) {
         .none => return .{},
@@ -32206,11 +32202,7 @@ fn extractSourceText(
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw_doc, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return null;
-    const source = if (request.group_artifact_name.len > 0 and std.mem.eql(u8, request.source_field, "_group_unit.text")) blk: {
-        const unit = parsed.value.object.get("_group_unit") orelse return null;
-        if (unit != .object) return null;
-        break :blk unit.object.get("text") orelse return null;
-    } else parsed.value.object.get(request.source_field) orelse return null;
+    const source = enrichment_types.sourceFieldValue(parsed.value, request.source_field, request.group_artifact_name.len > 0);
     if (source != .string) return null;
     return try alloc.dupe(u8, source.string);
 }
@@ -32259,11 +32251,7 @@ fn extractAssetSourceValue(
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw_doc, .{ .parse_numbers = false });
     defer parsed.deinit();
     if (parsed.value != .object) return null;
-    const source = if (request.group_artifact_name.len > 0 and std.mem.eql(u8, request.source_field, "_group_unit.text")) blk: {
-        const unit = parsed.value.object.get("_group_unit") orelse return null;
-        if (unit != .object) return null;
-        break :blk unit.object.get("text") orelse return null;
-    } else parsed.value.object.get(request.source_field) orelse return null;
+    const source = enrichment_types.sourceFieldValue(parsed.value, request.source_field, request.group_artifact_name.len > 0);
     return switch (source) {
         .null => null,
         .string => |value| blk: {
@@ -35808,6 +35796,29 @@ test "model aware media forced requests cannot reuse an earlier worker vector co
     const forced = try workerChunkCacheKey(a, request);
     defer a.free(forced);
     try std.testing.expect(!std.mem.eql(u8, ordinary, forced));
+}
+
+test "backup preflight literal fields match enrichment execution" {
+    const a = std.testing.allocator;
+    const raw = "{\"media.uri\":\"file:///private/active.pdf\"}";
+    const producer = "{\"type\":\"reader\",\"config\":{}}";
+    try @import("config_validation.zig").validatePublicConfig(a, .{ .name = "reader", .kind = .asset, .field = "media.uri", .producer_json = producer });
+    const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .asset, .index_name = "reader", .artifact_name = "reader", .doc_key = "doc", .source_field = "media.uri", .producer_json = producer };
+    const actual = (try extractAssetSourceValue(a, .{}, raw, request)).?;
+    defer a.free(actual);
+    try std.testing.expectEqualStrings("file:///private/active.pdf", actual);
+    const preflight = @import("../../lite/backup_preflight.zig");
+    var report: preflight.Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+    defer report.deinit();
+    var inspector: preflight.Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    const catalog = try @import("../catalog/enrichment_catalog.zig").serializeCatalog(a, &.{.{ .name = "reader", .kind = .asset, .source_field = "media.uri", .producer_json = producer }});
+    defer a.free(catalog);
+    try inspector.metadataJson(catalog);
+    try inspector.document("doc", raw, "");
+    const json = try report.jsonAlloc("{\"version\":1,\"configuration_id\":\"empty-destination\"}");
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "source_local") != null);
 }
 
 test "model aware media retained source recipes own their immutable object reference" {
