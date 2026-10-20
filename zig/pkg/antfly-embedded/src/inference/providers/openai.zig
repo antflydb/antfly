@@ -238,7 +238,7 @@ pub const Provider = struct {
             .messages = wire_messages,
             .tools = if (parsed.value.object.get("tools")) |tools| tools.array.items else null,
             .tool_choice = parsed.value.object.get("tool_choice"),
-            .response_format = if (self.response_format_json) |raw| try @import("antfly-json").parseValueLosslessLeaky(alloc, raw) else null,
+            .response_format = parsed.value.object.get("response_format"),
             .logprobs = if (self.logprobs) .{ .value = true } else .absent,
             .top_logprobs = if (self.logprobs) .{ .integer = 20 } else null,
         };
