@@ -6145,6 +6145,32 @@ func (r *AntflyClusterReconciler) reconcileServiceMeshStatus(ctx context.Context
 	return nil
 }
 
+// A zero desired count is a request, not evidence that the writer stopped.
+// Only current, controller-owned workload status and an empty live Pod list
+// establish suspension. Pending and terminating Pods must also be absent.
+func standaloneSuspensionObserved(cluster *antflyv1.AntflyCluster, sts *appsv1.StatefulSet, pods *corev1.PodList) bool {
+	return sts.UID != "" && sts.Generation > 0 && sts.DeletionTimestamp == nil && metav1.IsControlledBy(sts, cluster) &&
+		sts.Spec.Replicas != nil && *sts.Spec.Replicas == 0 && sts.Status.ObservedGeneration >= sts.Generation &&
+		sts.Status.Replicas == 0 && sts.Status.ReadyReplicas == 0 && sts.Status.CurrentReplicas == 0 && sts.Status.UpdatedReplicas == 0 && sts.Status.AvailableReplicas == 0 &&
+		len(pods.Items) == 0
+}
+
+func listStandalonePodsForSuspension(ctx context.Context, reader client.Reader, cluster *antflyv1.AntflyCluster, sts *appsv1.StatefulSet) (*corev1.PodList, error) {
+	var namespacePods corev1.PodList
+	if err := reader.List(ctx, &namespacePods, client.InNamespace(cluster.Namespace)); err != nil {
+		return nil, err
+	}
+	pods := &corev1.PodList{ListMeta: namespacePods.ListMeta}
+	for i := range namespacePods.Items {
+		pod := &namespacePods.Items[i]
+		owner := metav1.GetControllerOf(pod)
+		if (sts.UID != "" && owner != nil && owner.UID == sts.UID) || statefulSetOrdinalPodName(standaloneStatefulSetName(cluster), pod.Name) {
+			pods.Items = append(pods.Items, *pod.DeepCopy())
+		}
+	}
+	return pods, nil
+}
+
 func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
 	return r.updateStatusFrom(ctx, cluster, nil)
 }
@@ -6179,8 +6205,14 @@ func (r *AntflyClusterReconciler) updateStatusFrom(
 			return fmt.Errorf("spec.standalone is required when spec.mode=Standalone")
 		}
 
+		// Suspension is a quiescence observation, so it cannot rely on the
+		// controller cache for either the workload or its remaining Pods.
+		var reader client.Reader = r.Client
+		if standalone.Suspend {
+			reader = r.haBoundaryReader()
+		}
 		standaloneSts := &appsv1.StatefulSet{}
-		if err := r.Get(ctx, types.NamespacedName{Name: standaloneStatefulSetName(cluster), Namespace: cluster.Namespace}, standaloneSts); err != nil && !errors.IsNotFound(err) {
+		if err := reader.Get(ctx, types.NamespacedName{Name: standaloneStatefulSetName(cluster), Namespace: cluster.Namespace}, standaloneSts); err != nil && !errors.IsNotFound(err) {
 			return err
 		}
 
@@ -6196,9 +6228,6 @@ func (r *AntflyClusterReconciler) updateStatusFrom(
 			cluster.Status.Phase = "Pending"
 		}
 
-		if standalone.Suspend && standaloneSts.Spec.Replicas != nil && *standaloneSts.Spec.Replicas == 0 && standaloneSts.Status.Replicas == 0 {
-			cluster.Status.Phase = "Suspended"
-		}
 		if cluster.Status.StandaloneStatus == nil {
 			cluster.Status.StandaloneStatus = &antflyv1.StandaloneStatus{}
 		}
@@ -6216,9 +6245,22 @@ func (r *AntflyClusterReconciler) updateStatusFrom(
 		}
 
 		var podList corev1.PodList
-		if err := r.List(ctx, &podList, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, standaloneComponent(cluster)))); err != nil {
+		if standalone.Suspend {
+			// Names and controller ownership survive selector-label changes.
+			// Keep terminating and terminal Pods until Kubernetes removes them.
+			pods, err := listStandalonePodsForSuspension(ctx, reader, cluster, standaloneSts)
+			if err != nil {
+				return err
+			}
+			podList = *pods
+			if standaloneSuspensionObserved(cluster, standaloneSts, &podList) {
+				cluster.Status.Phase = "Suspended"
+			}
+		} else if err := reader.List(ctx, &podList, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, standaloneComponent(cluster)))); err != nil {
 			return err
 		}
+		cluster.Status.StandaloneStatus.PodName = ""
+		cluster.Status.StandaloneStatus.PodIP = ""
 		for _, pod := range podList.Items {
 			if pod.Status.Phase == corev1.PodRunning || pod.Status.Phase == corev1.PodPending {
 				cluster.Status.StandaloneStatus.PodName = pod.Name
@@ -6249,11 +6291,15 @@ func (r *AntflyClusterReconciler) updateStatusFrom(
 		}
 
 		r.updateRolloutCondition(cluster, standaloneSts)
-		r.setComponentCondition(cluster, antflyv1.TypeStandaloneReady, readyReplicas, standalone.Replicas, standaloneFindings, "standalone")
-		r.setComponentCondition(cluster, antflyv1.TypeMetadataReady, readyReplicas, standalone.Replicas, standaloneFindings, "standalone metadata")
-		r.setComponentCondition(cluster, antflyv1.TypeDataReady, readyReplicas, standalone.Replicas, standaloneFindings, "standalone store")
+		componentReadyReplicas := readyReplicas
+		if standalone.Suspend {
+			componentReadyReplicas = 0
+		}
+		r.setComponentCondition(cluster, antflyv1.TypeStandaloneReady, componentReadyReplicas, standalone.Replicas, standaloneFindings, "standalone")
+		r.setComponentCondition(cluster, antflyv1.TypeMetadataReady, componentReadyReplicas, standalone.Replicas, standaloneFindings, "standalone metadata")
+		r.setComponentCondition(cluster, antflyv1.TypeDataReady, componentReadyReplicas, standalone.Replicas, standaloneFindings, "standalone store")
 		if inferenceEnabled {
-			r.setComponentCondition(cluster, antflyv1.TypeInferenceReady, readyReplicas, standalone.Replicas, standaloneFindings, "standalone inference")
+			r.setComponentCondition(cluster, antflyv1.TypeInferenceReady, componentReadyReplicas, standalone.Replicas, standaloneFindings, "standalone inference")
 		} else {
 			meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
 				Type:               antflyv1.TypeInferenceReady,

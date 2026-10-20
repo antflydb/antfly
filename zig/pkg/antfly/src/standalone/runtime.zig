@@ -2185,6 +2185,15 @@ const LocalStandaloneMetadata = struct {
         return true;
     }
 
+    /// Schema cleanup may use FK publication authority already acquired by
+    /// admission, but must never acquire it. In particular, a plain Lite
+    /// migration must not introduce a dependency on a directory-owned root.
+    /// Revalidate existing authority against the physical root on every use.
+    fn currentNativeOwnerProofLocked(self: *LocalStandaloneMetadata) !?@import("../metadata/standalone_native_owner.zig").Binding {
+        if (self.native_owner_binding == null) return null;
+        return try self.physicalNativeOwnerBinding();
+    }
+
     /// First registration is a standalone catalog CAS before any FK plan is
     /// accepted. Reopens prove the same physical root; a seed or replacement
     /// root cannot acquire the predecessor's hidden-owner authority.
@@ -4035,7 +4044,7 @@ const LocalStandaloneMetadata = struct {
         }
         if (ready_progress.items.len == 0) return;
         const native_owner_proof = if (self.localFkPublicationSupported())
-            try self.ensureNativeOwnerBindingLocked()
+            try self.currentNativeOwnerProofLocked()
         else
             null;
         if (self.lifecycle_store != null) {
@@ -13555,6 +13564,69 @@ test "standalone metadata rejects corrupt catalog without double-freeing owned p
         defer metadata.deinit();
         return error.TestUnexpectedResult;
     } else |_| {}
+}
+
+test "standalone ordinary schema migration never acquires native FK ownership" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrint(alloc, "{s}/catalog.json", .{root});
+    defer alloc.free(path);
+    var runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer runtime.deinit();
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, runtime.ptr(), null, .local);
+    defer metadata.deinit();
+    var server = antfly.data.runtime.DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = root,
+        .replica_catalog_path = path,
+        .backend_runtime = runtime.ptr(),
+        .store_registration = .{ .node_id = 1, .store_id = 1, .api_url = "http://localhost", .role = "data" },
+        .api_server_cfg = .{ .deployment_mode = .standalone },
+    }, metadata.catalogSource(), metadata.statusSource());
+    defer server.deinit();
+    metadata.data_server = &server;
+    try std.testing.expect(metadata.localFkPublicationSupported());
+    {
+        var setup = try metadata.beginCatalogMutationLocked();
+        defer setup.deinit(&metadata);
+        try setup.upsertTable(&metadata, .{
+            .table_id = 7,
+            .name = "docs",
+            .desired_replica_count = 1,
+            .schema_json = "{\"version\":1}",
+            .read_schema_json = "{\"version\":0}",
+            .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"full_text_index_v1\":{\"type\":\"full_text\"}}",
+        });
+        try setup.upsertRange(&metadata, .{ .group_id = 70, .range_id = 70, .table_id = 7, .start_key = "", .doc_identity_shard_id = 70, .doc_identity_range_id = 70 });
+        try setup.commit(&metadata);
+    }
+    const Provider = struct {
+        fn collect(_: *anyopaque, a: std.mem.Allocator, _: []const antfly.metadata.TableRecord, _: []const antfly.metadata.RangeRecord) !antfly.data.runtime.DataServer.LocalSchemaProgressSnapshot {
+            const records = try a.alloc(antfly.metadata.SchemaProgressRecord, 1);
+            records[0] = .{ .table_id = 7, .node_id = 1, .schema_version = 1 };
+            return .{ .records = records, .runtime_coverage_complete = true };
+        }
+    };
+    metadata.local_schema_progress_provider = .{ .ptr = undefined, .collect = Provider.collect };
+    try metadata.finalizeReadySchemaMigrations();
+    try std.testing.expectEqualStrings("", metadata.findTableByNameLocked("docs").?.read_schema_json);
+    try std.testing.expect(metadata.native_owner_binding == null);
+    try std.testing.expect(try metadata.currentNativeOwnerProofLocked() == null);
+    // Publication admission still acquires durable authority, and cleanup
+    // must validate it instead of trusting a cached proof after a root change.
+    const binding = try metadata.ensureNativeOwnerBindingLocked();
+    try std.testing.expect(binding.eql((try metadata.currentNativeOwnerProofLocked()).?));
+    const replacement = try std.fmt.allocPrint(alloc, "{s}/replacement", .{root});
+    defer alloc.free(replacement);
+    const io = runtime.ptr().filesystemIo().?;
+    try std.Io.Dir.cwd().createDirPath(io, replacement);
+    _ = try @import("antfly_local_sources").storage_db_root_identity.loadOrCreate(alloc, io, replacement);
+    const previous_root = metadata.replica_root_dir;
+    metadata.replica_root_dir = replacement;
+    defer metadata.replica_root_dir = previous_root;
+    try std.testing.expectError(error.StoreRootEnrollmentChanged, metadata.currentNativeOwnerProofLocked());
 }
 
 test "standalone metadata finalizes schema migration from resident runtime evidence" {

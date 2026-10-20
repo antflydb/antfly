@@ -174,6 +174,13 @@ documents offline, but definition changes must go through the standalone API.
 This rule also applies to SQL DDL and persists in physical snapshots, keeping
 one catalog authoritative when a returned file is served again.
 
+Ordinary schema migrations preserve single-file handoff: stop the writer, copy
+the file, and reopen it with a fresh standalone data directory. Schema cleanup
+reuses and validates FK publication authority only when publication admission
+already acquired it. Files with that directory-bound FK authority still require
+the associated physical root; copying the file alone does not transfer hidden
+owner authority.
+
 
 ## Backups, Snapshots, and Imports
 
