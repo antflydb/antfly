@@ -6,62 +6,64 @@ Baseline: `e4d707de5634a8d758c606b4432037e1a1682052`. Design:
 
 ## Current verification status (2026-10-19)
 
-The full design remains in progress. The branch now contains `origin/main` at
-`fc9bea9f20194754644605d796c00beeb1f325d0`, merged in
-`75c470fc1953918e422a6e13dd4d24675cef5f7c`. This follows the initial main
-merge `332fd12e2ffa05213e3455be09b8051fa56e116a` and checkpoint
-`b004e8700c07e96a63b906af4366a3f48f29d8d4`. The additional merge preserves
-both upstream video-cache cleanup and session device-budget retirement after
-metadata release; the generated error table includes incoming inference errors.
-Native ABI is 34; storage owner ABI remains 101. The native ABI fences the combined inference
-callback dispatch and CUDA ownership layout. No prepared-effects wire activation
-is implied by this merge.
+The full design remains in progress. Required prepared-transaction BEGIN now
+checks a validated catalog witness instead of fetching and parsing the complete
+resolver catalog. Commits `cdaa1d06e54674f56b0298581e00abb13533943d` and
+`6683d34283f1edfb5e8c70b8651352d9aba229a4` implement this step on the existing
+branch. Native ABI is 35, fencing changed transaction and publication-stamp layouts;
+storage owner ABI remains 101. The branch retains the main merge at
+`fc9bea9f20194754644605d796c00beeb1f325d0` and the pgwire held-cursor completion fix.
 
-Commit `737098cfd7e24b7265c5e586676ada70f20adf7e` preserves internal
-completion authority while pgwire COMMIT drains an existing held cursor's immutable
-page. Both delivery worker selection and runnable CPU admission use control capacity;
-the original statement remains SELECT. Fresh SELECT and mixed statements retain
-ordinary execution admission. The integration fixture now funds the default guarded
-worker-stack floor and shares one runtime and storage parent across DB, server and
-SQL memory banks. It still exhausts every remaining storage credit.
+The witness binds the validated DocStore owner, its resolver-catalog revision and
+its portable-import generation. Ordinary writes and aborted catalog staging retain
+eligibility. Transaction, batch and append/delete catalog commits invalidate the
+old witness, including ambiguous commit outcomes. Active writers and saturated
+revisions cannot attest eligibility. Full validation happens on load or authorized
+catalog publication; a failed partial reload cannot publish an attestation. Equal
+numeric revisions from another store grant no authority. There is no full-catalog
+parse fallback on required BEGIN.
 
-All 16 focused native targets pass on source commit
-`75c470fc1953918e422a6e13dd4d24675cef5f7c`: 166 build steps succeed,
-with 28 standard tests passing and cached results reused where inputs are unchanged. The real mixed HTTP/pgwire/H2 scenario
-covers held-cursor completion under foreground worker, preparation and storage
-saturation. The imported-executor routing regression and six CUDA physical-credit
-mock cases pass; these are not real-GPU qualification. The dedicated SQL budget
-owner target has 12 passing standard tests on unchanged sources. Generated error
-and source catalogs are current. All 67 inference-host tests pass. A separate
-inference-unit invocation selects the two architecture teardown tests directly:
-both pass with zero skips, including device-budget retirement after actual session
-metadata release. The frozen public package from merge commit
-`75c470fc1953918e422a6e13dd4d24675cef5f7c` passes 25 ReleaseSafe compile checks;
-4,482 exported source files match the current branch exactly. License policy
-and packaging checks pass 11 and seven tests respectively. Source hashes, actual
-exit statuses and archive identity are recorded in `native-latest-main-v1-verified.json`
-under the receipt directory below. Build-step and cached-test counts do not describe
-a fresh full-suite run.
+The durable minimum reader floor and permanent baseline are still read through
+the original admission trace.
+The required-protocol probe rejects sidecars longer than the ten decimal bytes
+needed for a writer-owned u32 before numeric parsing. Original callback rejections
+remain authoritative, including errors named like missing-key results. Local
+activation remains explicit through `DB.enablePreparedTransactionProtocol()` and
+permanently publishes reader floor/catalog envelope version 5. Ordered authority
+and unfenced preparation metadata still require migration. No durable wire format
+changes or normal distributed required-preparation activation occur in this step.
 
-Explicit local activation of the required prepared-transaction file format remains
-implemented through `DB.enablePreparedTransactionProtocol()`: it permanently raises
-the reader floor and resolver catalog envelope to version 5 before DB-owned required
-BEGIN can create a record. It refuses unfenced requirement/frame metadata and ordered
-catalog authority. Commit, abort, catalog rewrites, replacement cancellation and
-restart must retain the floor. Earlier `native-prepared-file-gate-v2-verified.json`
-retains its ABI-33 source scope, including the current/previous reader-source checks;
-that receipt is not an ABI-34 or full old-binary qualification claim.
+All ten focused native targets pass on source commit
+`6683d34283f1edfb5e8c70b8651352d9aba229a4`: 147 build steps succeed, with 39
+standard tests and 49 named custom cases passing; cached results are reused where
+inputs are unchanged. All 20 required-preparation cases pass, including allocator
+refusal, all raw catalog mutation paths, both lost-reply outcomes, partial reload,
+import-generation changes, store identity and existing permanent-file/recovery
+contracts. Independent native ownership and execution-service checks pass, as do
+the existing real HTTP/pgwire/H2 saturation scenario and imported-executor routing
+regression. Generated error and source catalogs are current.
 
-The next gate is bounding the eligibility check before normal activation: required
-BEGIN currently parses the full resolver catalog under apply. A cached attestation
-must remain coherent with durable publication, replacement and restart, preserving
-original admission failures. Distributed capability negotiation, strict versioned
-BEGIN/PREPARE/final-seal envelopes, ordered-catalog/import migration and final sealing
-by every participant before the global decision remain open. So do eligible
-predecision producers, future replay/output credit, minimum completion RAM/CPU/I/O
-bundles, whole-node/per-tenant policy and the remaining original scheduler work.
+The immutable public source package from the same commit passes 25 ReleaseSafe
+consumer compile checks. 4,482 exported source files match current sources, excluding the exporter's
+intentional root-file transformations. Exact inputs, actual
+native exit status, public archive identity and scoped source delta are recorded in
+`native-prepared-catalog-witness-v3-verified.json` under the receipt directory below.
+These results do not constitute a fresh full-suite or full Linux qualification run.
+Full Linux qualification remains waived; Linux work continues to use pinned
+Nix/glibc Zig.
+
+The earlier main integration remains recorded at ABI 34 in
+`native-latest-main-v1-verified.json`, including its 16-target scope, inference-host
+and architecture-teardown checks. The initial file gate remains recorded at ABI 33
+in `native-prepared-file-gate-v2-verified.json`, including the earlier reader-source
+compatibility checks. Those receipts retain their original source identities.
+
+Next are strict versioned distributed BEGIN/PREPARE/final-seal envelopes, explicit
+peer capability negotiation, ordered-catalog/import migration and final sealing by
+every participant before the global decision. Eligible predecision producers,
+future replay/output credit, minimum completion RAM/CPU/I/O bundles,
+whole-node/per-tenant policy and the remaining original scheduler work stay open.
 Normal distributed BEGIN and PREPARE have not activated required preparation.
-Full Linux qualification remains waived. Earlier receipts retain their named scope.
 
 Historical receipts below retain their named source and ABI identities. The
 service-telemetry receipt covers coherent native/API snapshots, opaque reads and

@@ -16,11 +16,14 @@ branch, `codex/workload-scheduling`, in `.worktrees/workload-scheduling`, and
 [PR #849](https://github.com/antflydb/antfly/pull/849). Subsequent main merges and
 implementation evidence are recorded in the implementation ledger.
 The current merge includes `origin/main` at `fc9bea9f20194754644605d796c00beeb1f325d0`.
-Native ABI 34 combines upstream inference/CUDA changes with the existing bounded
-owners; storage owner ABI remains 101. The subsequent pgwire fix preserves
-completion authority through immutable page delivery during held-cursor COMMIT.
-The 16 focused native targets pass, including real socket overload coverage;
-this does not activate distributed required preparation or qualify the full design.
+Native ABI 35 also fences the catalog-revision witness carried by transactions
+and catalog publication. Required BEGIN checks validated store/revision/import
+identity and durable reader floors without parsing the full resolver catalog.
+Storage owner ABI remains 101. Ten focused native targets pass on
+`6683d34283f1edfb5e8c70b8651352d9aba229a4`, including all 20 required-preparation
+cases and real socket overload coverage. The retained pgwire fix preserves
+completion authority through held-cursor COMMIT. Distributed required preparation
+and the full design remain in progress.
 
 The full goal remains safe, bounded execution sharing across many connections
 by default, with fair scheduling and bounded waiting, preserving session
@@ -482,13 +485,17 @@ rechecks the actual catalog/namespace digest under apply before publishing the
 frame; a stale attempt leaves no pin. Serving mutation paths reject an existing
 lease before pausing dependent workers and recheck before publication. Unchanged
 producer/resolver refreshes and exact ordered alignment continue to work.
-Native ABI 33 and storage owner ABI 101 cover explicit local activation through
+The initial native-ABI-33/storage-owner-ABI-101 implementation added local activation through
 `DB.enablePreparedTransactionProtocol()`. It atomically publishes permanent reader
 floor and catalog-envelope version 5. DB-owned required BEGIN checks both and the
 permanent replacement baseline before creating a record. Older readers reject
 that format. Activation refuses unfenced preparation records and ordered catalog
 authority; it does not constitute a peer capability vote or coordinated migration.
-Commit/abort and later catalog changes retain the floor. Full peer negotiation,
+Commit/abort and later catalog changes retain the floor. Native ABI 35 adds a
+validated owner/revision/import witness: required BEGIN reads both scalar floors
+and checks that witness without hydrating the resolver document. Aborted catalog
+staging leaves it valid; raw or ambiguous catalog commits and physical-generation
+adoption require validation before eligibility can resume. Full peer negotiation,
 ordered/import migration and predecision completion reservations remain open.
 
 Existing producer eligibility remains authoritative:

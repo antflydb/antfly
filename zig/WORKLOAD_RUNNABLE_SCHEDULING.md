@@ -30,10 +30,28 @@ regression pass on the current main merge
 `75c470fc1953918e422a6e13dd4d24675cef5f7c`, retaining the delivery fix from
 `737098cfd7e24b7265c5e586676ada70f20adf7e`. The fixture funds the default worker-stack floors and installs both runtime and SQL
 memory parents from the same storage manager, as production does. Remaining storage
-credit is exhausted during the test; no lane ceiling is reduced. Native ABI is 34
-and storage owner ABI is 101 after merging main; the delivery fix changes no ABI.
+credit is exhausted during the test; no lane ceiling is reduced. That main merge used native ABI 34
+and storage owner ABI 101; the delivery fix changed no ABI.
 See `native-latest-main-v1-verified.json` in the implementation ledger's receipt
 directory for the 16-target scope and unchanged exported-package proof.
+
+## Bounded required-BEGIN file eligibility (2026-10-19)
+
+The future required-preparation path no longer reparses the full resolver catalog
+while holding apply. It reads the permanent reader floors through the original
+control, bounds scalar parsing and checks a validated store/revision/import witness.
+Catalog commit attempts, including ambiguous outcomes, and physical generation
+adoption invalidate old authority; ordinary writes and aborted staging do not.
+Publication or successful load establishes the next witness. Active writers,
+revision saturation, incomplete loads and equal revisions from another store fail
+closed. BEGIN does not launch unbounded catalog repair as a fallback.
+
+Native ABI 35 fences the new transaction and publication-stamp layouts; storage
+owner ABI remains 101. The ten-target native check passes at
+`6683d34283f1edfb5e8c70b8651352d9aba229a4`, including 20 required-preparation
+cases and the existing actual HTTP/pgwire saturation regression. This completes the
+local catalog-check step, while distributed capability negotiation, participant
+sealing and the remaining minimum-completion resource policy stay open.
 
 ## Read execution lanes
 
