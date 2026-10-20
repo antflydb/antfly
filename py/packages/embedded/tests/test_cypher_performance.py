@@ -4368,14 +4368,18 @@ def test_distinct_reducers_share_wide_membership_values(graph_db):
             "definition": {"labels": [{"name": "W", "table": "payloads"}], "relationships": []},
         }
     )
-    result = db.cypher_json(
-        "payloads",
-        {
-            "query": "MATCH(n:W) RETURN count(DISTINCT n.payload),size(head(collect(DISTINCT n.payload)))",
-            "limits": {"memory_bytes": 48 << 20, "intermediate_states": 600000},
-        },
-    )
-    assert [int(cell["value"]) for cell in result["rows"][0]] == [count, 4092]
+    for expressions, expected in (
+        ("count(DISTINCT n.payload),size(head(collect(DISTINCT n.payload)))", [count, 4092]),
+        ("size(head(collect(DISTINCT n.payload))),size(collect(DISTINCT n.payload))", [4092, count]),
+    ):
+        result = db.cypher_json(
+            "payloads",
+            {
+                "query": "MATCH(n:W) RETURN " + expressions,
+                "limits": {"memory_bytes": 24 << 20, "intermediate_states": 600000},
+            },
+        )
+        assert [int(cell["value"]) for cell in result["rows"][0]] == expected
 
 
 def test_group_key_window_retains_only_selected_count_groups(graph_db):
@@ -4525,6 +4529,17 @@ def test_wide_heap_keys_compare_decisive_prefixes_with_bounded_work(graph_db):
             },
         )
         assert [int(row[0]["value"]) for row in result["rows"]] == list(range(100))
+    # The projected payload is also the ordering key, including when nested
+    # inside a projected container. Each retained pick owns that allocation once.
+    for value in ("n.payload", "[n.payload]", "{key:n.payload}"):
+        result = db.cypher_json(
+            "payloads",
+            {
+                "query": f"MATCH(n:W) RETURN {value} AS p ORDER BY n.payload SKIP 2999 LIMIT 1",
+                "limits": {"memory_bytes": 24 << 20},
+            },
+        )
+        assert len(result["rows"]) == 1
     distinct = db.cypher_json(
         "payloads",
         {
@@ -4533,3 +4548,42 @@ def test_wide_heap_keys_compare_decisive_prefixes_with_bounded_work(graph_db):
         },
     )
     assert int(distinct["rows"][0][0]["value"]) == count
+
+
+def test_bounded_collection_consumers_do_not_retain_discarded_payloads(graph_db):
+    db = graph_db
+    _populate_payload_graph(db, 3000, 4092)
+    for tail in (
+        "RETURN head(collect(n.payload))",
+        "RETURN collect(n.payload)[0..1]",
+        "RETURN collect(n.payload)[0]",
+        "RETURN head(collect(DISTINCT n.payload))",
+        "WITH collect(n.payload) AS xs WITH xs AS ys RETURN head(ys)",
+        "WITH collect(n.payload) AS xs RETURN xs[0..1]",
+    ):
+        result = db.cypher_json(
+            "payloads",
+            {
+                "query": "MATCH(n:W) " + tail,
+                "limits": {"memory_bytes": 8 << 20},
+            },
+        )
+        cell = result["rows"][0][0]
+        if cell["type"] == "list":
+            cell = cell["value"][0]
+        assert cell["value"] == "x" * 4092
+
+
+def test_distinct_entity_keys_discard_properties_needed_by_siblings(graph_db):
+    db = graph_db
+    _populate_payload_graph(db, 3000, 4092)
+    for expression in ("n", "[n]", "{entity:n}"):
+        result = db.cypher_json(
+            "payloads",
+            {
+                "query": f"MATCH(n:W) RETURN count(DISTINCT {expression}),min(n.payload)",
+                "limits": {"memory_bytes": 8 << 20},
+            },
+        )
+        assert int(result["rows"][0][0]["value"]) == 3000
+        assert result["rows"][0][1]["value"] == "x" * 4092

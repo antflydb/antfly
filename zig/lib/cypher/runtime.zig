@@ -1276,9 +1276,15 @@ const Engine = struct {
         arena: std.heap.ArenaAllocator,
         values: std.ArrayList(v.Value) = .empty,
         index: value_work.Index = .{},
+        retain_payload: bool = true,
+        bytes: ?*v.BytePool = null,
         last_token: ?usize = null,
         last_ordinal: usize = 0,
         last_created: bool = false,
+        fn deinit(self: *@This()) void {
+            if (self.bytes) |pool| pool.deinit();
+            self.arena.deinit();
+        }
         fn remember(self: *@This(), engine: *Engine, ordinal_value: usize, created: bool) usize {
             self.last_token = engine.distinct_input_token;
             self.last_ordinal = ordinal_value;
@@ -1287,7 +1293,8 @@ const Engine = struct {
         }
         fn ordinal(self: *@This(), engine: *Engine, value: v.Value) !usize {
             if (engine.distinct_input_token) |token| if (self.last_token == token) return self.last_ordinal;
-            const hash = (try engine.values.info(value)).hash;
+            const info = try engine.values.info(value);
+            const hash = info.hash;
             var candidate = self.index.head(hash);
             while (candidate) |position| {
                 const link = self.index.links.items[position];
@@ -1295,7 +1302,7 @@ const Engine = struct {
                 candidate = link.next;
             }
             const a = self.arena.allocator();
-            const owned = try value.clone(a);
+            const owned = try v.cloneMembership(value, a, engine.scratch_allocator, &self.bytes, self.retain_payload);
             const position = self.values.items.len;
             try self.index.insert(a, hash, position);
             try self.values.append(a, owned);
@@ -1312,6 +1319,7 @@ const Engine = struct {
         arena: std.heap.ArenaAllocator,
         distinct_arena: std.heap.ArenaAllocator,
         distinct_values: std.ArrayList(v.Value) = .empty,
+        distinct_bytes: ?*v.BytePool = null,
         distinct_index: value_work.Index = .{},
         distinct_support: ?*Statistic.SupportSet = null,
         cohort: ?*DistinctConsumer = null,
@@ -1342,8 +1350,9 @@ const Engine = struct {
         }
         fn deinit(self: *@This()) void {
             self.arena.deinit();
+            if (self.distinct_bytes) |pool| pool.deinit();
             self.distinct_arena.deinit();
-            if (self.cohort) |cohort| if (cohort.owner) cohort.membership.arena.deinit();
+            if (self.cohort) |cohort| if (cohort.owner) cohort.membership.deinit();
         }
         fn add(self: *StreamingAggregate, engine: *Engine, row: Row) !void {
             return self.addWeighted(engine, row, Count.one);
@@ -1385,6 +1394,9 @@ const Engine = struct {
         fn addWeighted(self: *StreamingAggregate, engine: *Engine, row: Row, multiplicity: Count) !void {
             const value = if (self.function.star) v.Value{ .integer = 1 } else try engine.eval(self.function.args[0], row, null);
             if (value == .null) return;
+            // Retention is bounded, evaluation is not: every argument above
+            // still runs, even after this consumer has received its prefix.
+            if (self.function.collect_limit) |limit| if (self.collected.items.len >= limit) return;
             // MIN/MAX are duplicate insensitive and need no distinct set.
             // Other DISTINCT reducers retain only unique arguments, using the
             // same equality and hashing as GROUP BY.
@@ -1401,25 +1413,30 @@ const Engine = struct {
                     // Equality canonicalizes numeric representations. A consumer
                     // activated later must keep its own first representation.
                     if (std.ascii.eqlIgnoreCase(self.function.name, "collect")) {
-                        const canonical = distinct_owned.?;
-                        // A value first cloned during this emission came from
-                        // this very argument, including its nested representation.
-                        const fresh = membership.last_created and engine.distinct_input_token != null and membership.last_token == engine.distinct_input_token;
-                        const same_representation = if (fresh) true else if (std.meta.activeTag(value) != std.meta.activeTag(canonical)) false else switch (value) {
-                            // Equality has already proved their exact value.
-                            .null, .boolean, .integer, .string => true,
-                            .number => @as(u64, @bitCast(value.number)) == @as(u64, @bitCast(canonical.number)),
-                            else => blk: {
-                                var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
-                                defer scratch.deinit();
-                                var identity: value_work.Work = .{ .a = scratch.allocator(), .ptr = engine, .charge = chargeWork, .binding_identity = true };
-                                break :blk try identity.eql(value, canonical);
-                            },
-                        };
-                        if (!same_representation) distinct_owned = try value.clone(self.arena.allocator());
+                        if (!membership.retain_payload) {
+                            distinct_owned = try value.clone(self.arena.allocator());
+                        } else {
+                            const canonical = distinct_owned.?;
+                            // A value first cloned during this emission came from
+                            // this very argument, including its nested representation.
+                            const fresh = membership.last_created and engine.distinct_input_token != null and membership.last_token == engine.distinct_input_token;
+                            const same_representation = if (fresh) true else if (std.meta.activeTag(value) != std.meta.activeTag(canonical)) false else switch (value) {
+                                // Equality has already proved their exact value.
+                                .null, .boolean, .integer, .string => true,
+                                .number => @as(u64, @bitCast(value.number)) == @as(u64, @bitCast(canonical.number)),
+                                else => blk: {
+                                    var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+                                    defer scratch.deinit();
+                                    var identity: value_work.Work = .{ .a = scratch.allocator(), .ptr = engine, .charge = chargeWork, .binding_identity = true };
+                                    break :blk try identity.eql(value, canonical);
+                                },
+                            };
+                            if (!same_representation) distinct_owned = try value.clone(self.arena.allocator());
+                        }
                     }
                 } else {
-                    const hash = (try engine.values.info(value)).hash;
+                    const info = try engine.values.info(value);
+                    const hash = info.hash;
                     var candidate = self.distinct_index.head(hash);
                     while (candidate) |position| {
                         const link = self.distinct_index.links.items[position];
@@ -1427,7 +1444,7 @@ const Engine = struct {
                         candidate = link.next;
                     }
                     const retained = self.distinct_arena.allocator();
-                    const owned = try value.clone(retained);
+                    const owned = try v.cloneMembership(value, retained, engine.scratch_allocator, &self.distinct_bytes, std.ascii.eqlIgnoreCase(self.function.name, "collect"));
                     try self.distinct_index.insert(retained, hash, self.distinct_values.items.len);
                     try self.distinct_values.append(retained, owned);
                 }
@@ -1442,9 +1459,11 @@ const Engine = struct {
             if (std.ascii.eqlIgnoreCase(self.function.name, "collect")) {
                 const retained = self.arena.allocator();
                 const owned = if (self.function.distinct) distinct_owned orelse self.distinct_values.items[self.distinct_values.items.len - 1] else try value.clone(retained);
-                try Engine.chargeWork(engine, std.math.cast(usize, weight.exact() orelse return error.CypherStateBudgetExceeded) orelse return error.CypherStateBudgetExceeded);
-                try self.collected.ensureUnusedCapacity(retained, @intCast(weight.exact().?));
-                for (0..@intCast(weight.exact().?)) |_| self.collected.appendAssumeCapacity(owned);
+                const remaining = if (self.function.collect_limit) |limit| limit - self.collected.items.len else std.math.maxInt(usize);
+                const copies = if (self.function.collect_limit != null) std.math.cast(usize, weight.cap(remaining)).? else std.math.cast(usize, weight.exact() orelse return error.CypherStateBudgetExceeded) orelse return error.CypherStateBudgetExceeded;
+                try Engine.chargeWork(engine, copies);
+                try self.collected.ensureUnusedCapacity(retained, copies);
+                for (0..copies) |_| self.collected.appendAssumeCapacity(owned);
                 return;
             }
             if (std.ascii.eqlIgnoreCase(self.function.name, "sum")) {
@@ -1772,10 +1791,15 @@ const Engine = struct {
             if ((plan.all or plan.fields.contains(entry.name)) and lookup(source.items, entry.name) == null)
                 try source.append(a, .{ .name = try a.dupe(u8, entry.name), .value = try entry.value.clone(a) });
         };
+        const retain_payloads = try a.alloc(bool, calls.len);
+        @memset(retain_payloads, false);
+        for (calls, leaders) |cohort_call, leader| {
+            if (std.ascii.eqlIgnoreCase(cohort_call.value.call.name, "collect") and cohort_call.value.call.collect_limit == null) retain_payloads[leader] = true;
+        }
         for (leaders, 0..) |leader, index| if (leader != index) {
             if (states[leader].cohort == null) {
                 const membership = try a.create(DistinctMembership);
-                membership.* = .{ .arena = std.heap.ArenaAllocator.init(self.scratch_allocator) };
+                membership.* = .{ .arena = std.heap.ArenaAllocator.init(self.scratch_allocator), .retain_payload = retain_payloads[leader] };
                 const consumer = try a.create(DistinctConsumer);
                 consumer.* = .{ .membership = membership, .owner = true };
                 states[leader].cohort = consumer;
@@ -8384,6 +8408,15 @@ const Engine = struct {
     }
     fn aggregate(self: *Engine, call_value: ast.Function, group: []const Row, prepared: ?[]const v.Value) !v.Value {
         if (call_value.args.len != (if (call_value.star) @as(usize, 0) else 1)) return error.CypherFunctionArity;
+        if (call_value.collect_limit) |limit| {
+            if (prepared) |values| return .{ .list = values[0..@min(limit, values.len)] };
+            var reducer: StreamingAggregate = .{ .function = call_value, .arena = std.heap.ArenaAllocator.init(self.scratch_allocator), .distinct_arena = std.heap.ArenaAllocator.init(self.scratch_allocator) };
+            defer reducer.deinit();
+            for (group) |row| try reducer.add(self, row);
+            // The temporary collection is an execution container. Its cells
+            // can be valid at depth 64 even when HEAD removes the outer list.
+            return .{ .list = try cloneValues(self.a, reducer.result().list) };
+        }
         if (!call_value.distinct and !std.ascii.eqlIgnoreCase(call_value.name, "collect")) {
             var count_values: usize = 0;
             var best: v.Value = .null;
@@ -8538,8 +8571,13 @@ const Engine = struct {
         var arena = std.heap.ArenaAllocator.init(self.scratch_allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
-        const row = try cloneRow(a, candidate.row);
-        const keys = try cloneValues(a, candidate.keys);
+        var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
+        defer scratch.deinit();
+        var context: v.CloneContext = .{ .a = a, .scratch = scratch.allocator() };
+        const row = try a.alloc(v.Entry, candidate.row.len);
+        for (candidate.row, row) |entry, *out| out.* = .{ .name = try a.dupe(u8, entry.name), .value = try context.clone(entry.value) };
+        const keys = try a.alloc(v.Value, candidate.keys.len);
+        for (candidate.keys, keys) |key, *out| out.* = try context.clone(key);
         return .{ .arena = arena, .value = .{ .row = row, .source = &.{}, .group = null, .keys = keys, .sequence = candidate.sequence, .weight = candidate.weight, .multiplicity = if (candidate.multiplicity) |weight| try weight.clone(a) else null } };
     }
     const TopK = struct {
@@ -9388,7 +9426,7 @@ test "shared DISTINCT membership keeps independent consumer ordinals and numeric
     engine.values = .{ .a = engine.a, .ptr = &engine, .charge = Engine.chargeWork };
     var operand: ast.Expr = .{ .span = .{}, .value = .{ .variable = "x" } };
     var membership: Engine.DistinctMembership = .{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
-    defer membership.arena.deinit();
+    defer membership.deinit();
     var counter_consumer: Engine.DistinctConsumer = .{ .membership = &membership };
     var collector_consumer: Engine.DistinctConsumer = .{ .membership = &membership };
     var counter: Engine.StreamingAggregate = .{ .function = .{ .name = "count", .args = &.{&operand}, .distinct = true }, .arena = std.heap.ArenaAllocator.init(std.testing.allocator), .distinct_arena = std.heap.ArenaAllocator.init(std.testing.allocator), .cohort = &counter_consumer };
@@ -9405,4 +9443,24 @@ test "shared DISTINCT membership keeps independent consumer ordinals and numeric
     try std.testing.expectEqual(@as(usize, 2), collector.result().list.len);
     try std.testing.expect(collector.result().list[0] == .number);
     try std.testing.expectEqual(@as(i64, 2), collector.result().list[1].integer);
+}
+
+test "bounded collection retention caps promoted bag weights without losing evaluation" {
+    const Noop = struct {
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var dummy: u8 = 0;
+    var engine: Engine = .{ .a = arena.allocator(), .scratch_allocator = std.testing.allocator, .regex = undefined, .backend = .{ .ptr = &dummy, .vtable = &.{ .bind = undefined, .checkpoint = Noop.checkpoint, .scan = undefined, .get = undefined, .expand = undefined } }, .graph = undefined, .source = "", .parameters = &.{}, .limits = .{} };
+    engine.values = .{ .a = engine.a, .ptr = &engine, .charge = Engine.chargeWork };
+    const operand: ast.Expr = .{ .span = .{}, .value = .{ .variable = "x" } };
+    var collector: Engine.StreamingAggregate = .{ .function = .{ .name = "collect", .args = &.{&operand}, .collect_limit = 3 }, .arena = std.heap.ArenaAllocator.init(std.testing.allocator), .distinct_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    defer collector.deinit();
+    const weight = try Count.parse(engine.a, "1180591620717411303424");
+    try collector.addWeighted(&engine, &.{.{ .name = "x", .value = .{ .integer = 7 } }}, weight);
+    try std.testing.expectEqual(@as(usize, 3), collector.result().list.len);
+    for (collector.result().list) |item| try std.testing.expectEqual(@as(i64, 7), item.integer);
+    // Reaching the retention limit cannot suppress a subsequent binding error.
+    try std.testing.expectError(error.UnboundCypherVariable, collector.addWeighted(&engine, &.{}, weight));
 }

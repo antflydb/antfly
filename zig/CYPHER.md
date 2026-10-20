@@ -1889,6 +1889,19 @@ for projection and ordering and independent ownership for selected rows. Every
 group still evaluates its projection and predicates, including losing candidates
 and LIMIT 0, so selection cannot suppress arithmetic errors. Unknown or invalid
 window expressions retain their original late evaluation order.
+Retained sort entries share immutable allocations between projected cells and
+ordering keys, including nested payloads. The clone memo belongs to one entry's
+ownership transfer and never survives source recycling. Allocation identity,
+rather than Cypher equality, preserves numeric representations and entity
+snapshots; cached subtree heights enforce the same value-depth limit.
+
+Proved HEAD, nonnegative literal index, and bounded prefix-slice consumers of
+COLLECT retain only their required prefix. Compatible demands use the largest
+prefix and follow transparent WITH aliases. Every input argument still evaluates,
+including after the prefix fills and for an empty prefix. NULL exclusion,
+first-seen DISTINCT order, weighted multiplicity and lazy branches retain their
+ordinary semantics. A full consumer, unknown/negative bound, scope barrier or
+mixed cardinality/prefix alias demand conservatively retains the complete list.
 
 Compatible repeatable DISTINCT arguments also share a collision-checked value
 store across different reducers (for example COUNT and COLLECT). Ordinary row
@@ -1899,6 +1912,14 @@ statistic cohorts preserve their first contribution and COLLECT order. Compresse
 integer supports remain per consumer and import only that consumer's observed
 ordinary values. Materialized scopes cache distinct argument sequences lazily,
 without evaluating an unused CASE branch or merging effectful inputs.
+Membership that has no full-payload consumer retains compact entity equality
+keys: table plus document key for nodes, and physical identity plus index for
+relationships. This pruning also applies inside containers and paths. Bounded
+collection consumers own their observed prefix payloads separately; an unbounded
+COLLECT cohort still shares full values and preserves each consumer's first
+representation. Small scalar keys stay in their metadata arena. Large string payloads use
+bounded byte slabs with exact allocations for oversized values, preventing
+allocator-dependent metadata arena growth from retaining extra payload space.
 
 A scalar COUNT projection ordered directly by grouping keys can retain just
 SKIP + LIMIT groups while consuming the input. Its stable max heap owns each

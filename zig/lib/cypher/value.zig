@@ -133,25 +133,40 @@ pub const Value = union(enum) {
         return self.cloneDepth(a, 0);
     }
     fn cloneDepth(self: Value, a: std.mem.Allocator, depth: usize) CloneError!Value {
+        return self.cloneOwned(a, depth, null);
+    }
+    fn cloneOwned(self: Value, a: std.mem.Allocator, depth: usize, context: ?*CloneContext) CloneError!Value {
         if (depth > 64) return error.CypherValueDepthExceeded;
-        return switch (self) {
+        // Equality keys prune entities and do not need an allocation-identity
+        // memo per input. Keep that path free of scratch allocation churn.
+        const key = if (context != null and context.?.share_allocations) CloneContext.key(self) else null;
+        if (context) |ctx| {
+            if (key) |k| if (ctx.memo.get(k)) |owned| {
+                if (depth + owned.height > 64) return error.CypherValueDepthExceeded;
+                if (depth != 0) ctx.heights[depth - 1] = @max(ctx.heights[depth - 1], owned.height + 1);
+                return owned.value;
+            };
+            ctx.heights[depth] = 0;
+        }
+        const result: Value = switch (self) {
             .null, .boolean, .integer, .number => self,
-            .string => |s| .{ .string = try a.dupe(u8, s) },
+            .string => |s| .{ .string = if (context) |ctx| try ctx.cloneBytes(s) else try a.dupe(u8, s) },
             .list => |items| blk: {
                 const output = try a.alloc(Value, items.len);
-                for (items, output) |item, *out| out.* = try item.cloneDepth(a, depth + 1);
+                for (items, output) |item, *out| out.* = try item.cloneOwned(a, depth + 1, context);
                 break :blk .{ .list = output };
             },
             .map => |items| blk: {
                 const output = try a.alloc(Entry, items.len);
-                for (items, output) |item, *out| out.* = .{ .name = try a.dupe(u8, item.name), .value = try item.value.cloneDepth(a, depth + 1) };
+                for (items, output) |item, *out| out.* = .{ .name = try a.dupe(u8, item.name), .value = try item.value.cloneOwned(a, depth + 1, context) };
                 break :blk .{ .map = output };
             },
             .node => |n| blk: {
                 const copy = try a.create(Node);
-                const labels = try a.alloc([]const u8, n.labels.len);
-                for (n.labels, labels) |label, *out| out.* = try a.dupe(u8, label);
-                copy.* = .{ .identity = .{ .table = try a.dupe(u8, n.identity.table), .key = try a.dupe(u8, n.identity.key) }, .labels = labels, .properties = (try (Value{ .map = n.properties }).cloneDepth(a, depth + 1)).map };
+                const identity_only = if (context) |ctx| ctx.identity_only else false;
+                const labels = try a.alloc([]const u8, if (identity_only) 0 else n.labels.len);
+                for (n.labels[0..labels.len], labels) |label, *out| out.* = try a.dupe(u8, label);
+                copy.* = .{ .identity = .{ .table = try a.dupe(u8, n.identity.table), .key = try a.dupe(u8, n.identity.key) }, .labels = labels, .properties = if (identity_only) &.{} else (try (Value{ .map = n.properties }).cloneOwned(a, depth + 1, context)).map };
                 break :blk .{ .node = copy };
             },
             .relationship => |r| blk: {
@@ -159,21 +174,35 @@ pub const Value = union(enum) {
                 copy.* = r.*;
                 copy.identity = .{ .table = try a.dupe(u8, r.identity.table), .key = try a.dupe(u8, r.identity.key) };
                 copy.index = try a.dupe(u8, r.index);
+                if (context) |ctx| if (ctx.identity_only) {
+                    copy.type = "";
+                    copy.source = .{ .table = "", .key = "" };
+                    copy.target = copy.source;
+                    copy.producer = null;
+                    copy.properties = &.{};
+                    break :blk .{ .relationship = copy };
+                };
                 copy.type = try a.dupe(u8, r.type);
                 copy.source = .{ .table = try a.dupe(u8, r.source.table), .key = try a.dupe(u8, r.source.key) };
                 copy.target = .{ .table = try a.dupe(u8, r.target.table), .key = try a.dupe(u8, r.target.key) };
                 if (r.producer) |producer| copy.producer = .{ .table = try a.dupe(u8, producer.table), .key = try a.dupe(u8, producer.key) };
-                copy.properties = (try (Value{ .map = r.properties }).cloneDepth(a, depth + 1)).map;
+                copy.properties = (try (Value{ .map = r.properties }).cloneOwned(a, depth + 1, context)).map;
                 break :blk .{ .relationship = copy };
             },
             .path => |p| blk: {
                 const nodes = try a.alloc(*const Node, p.nodes.len);
                 const relationships = try a.alloc(*const Relationship, p.relationships.len);
-                for (p.nodes, nodes) |node, *out| out.* = (try (Value{ .node = node }).cloneDepth(a, depth + 1)).node;
-                for (p.relationships, relationships) |relationship, *out| out.* = (try (Value{ .relationship = relationship }).cloneDepth(a, depth + 1)).relationship;
+                for (p.nodes, nodes) |node, *out| out.* = (try (Value{ .node = node }).cloneOwned(a, depth + 1, context)).node;
+                for (p.relationships, relationships) |relationship, *out| out.* = (try (Value{ .relationship = relationship }).cloneOwned(a, depth + 1, context)).relationship;
                 break :blk .{ .path = .{ .nodes = nodes, .relationships = relationships } };
             },
         };
+        if (context) |ctx| {
+            const height = ctx.heights[depth];
+            if (key) |k| try ctx.memo.put(ctx.scratch, k, .{ .value = result, .height = height });
+            if (depth != 0) ctx.heights[depth - 1] = @max(ctx.heights[depth - 1], height + 1);
+        }
+        return result;
     }
     pub fn truth(self: Value) !?bool {
         return switch (self) {
@@ -516,3 +545,175 @@ pub fn EntityMap(comptime T: type) type {
     return std.HashMapUnmanaged(EntityIdentity, T, EntityIdentity.Context, std.hash_map.default_max_load_percentage);
 }
 pub const EntitySet = EntityMap(void);
+
+/// Allocation-identity sharing within one immutable ownership boundary. Memo
+/// storage is scratch and must not outlive (or be reused across) source values.
+/// Cached subtree heights preserve the recursion limit even when an allocation
+/// is shared between different nesting depths.
+pub const CloneContext = struct {
+    const Key = struct { tag: std.meta.Tag(Value), pointer: usize, length: usize };
+    a: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    identity_only: bool = false,
+    share_allocations: bool = true,
+    byte_pool: ?*?*BytePool = null,
+    byte_allocator: ?std.mem.Allocator = null,
+    memo: std.AutoHashMapUnmanaged(Key, struct { value: Value, height: usize }) = .empty,
+    heights: [65]usize = @splat(0),
+    fn key(value: Value) ?Key {
+        return switch (value) {
+            .string => |x| .{ .tag = .string, .pointer = @intFromPtr(x.ptr), .length = x.len },
+            .list => |x| .{ .tag = .list, .pointer = @intFromPtr(x.ptr), .length = x.len },
+            .map => |x| .{ .tag = .map, .pointer = @intFromPtr(x.ptr), .length = x.len },
+            .node => |x| .{ .tag = .node, .pointer = @intFromPtr(x), .length = 0 },
+            .relationship => |x| .{ .tag = .relationship, .pointer = @intFromPtr(x), .length = 0 },
+            else => null,
+        };
+    }
+    fn cloneBytes(self: *@This(), bytes: []const u8) std.mem.Allocator.Error![]const u8 {
+        // Small values stay with their metadata, avoiding a pool per tiny group.
+        if (bytes.len >= 256) if (self.byte_pool) |slot| {
+            if (slot.* == null) {
+                const pool = try self.a.create(BytePool);
+                pool.* = .{ .backing = self.byte_allocator.? };
+                slot.* = pool;
+            }
+            return slot.*.?.dupe(self.a, bytes);
+        };
+        return self.a.dupe(u8, bytes);
+    }
+    pub fn clone(self: *@This(), value: Value) Value.CloneError!Value {
+        return value.cloneOwned(self.a, 0, self);
+    }
+};
+/// Equality-only ownership. Entity properties and physical attributes do not
+/// participate in grouping equality, including inside containers and paths.
+pub fn cloneEquality(value: Value, a: std.mem.Allocator) Value.CloneError!Value {
+    var context: CloneContext = .{ .a = a, .scratch = a, .identity_only = true, .share_allocations = false };
+    return context.clone(value);
+}
+
+/// Byte slabs keep large membership payloads out of geometrically growing
+/// metadata arenas. Slab growth stops at 64 KiB; oversized strings own an
+/// exact allocation without disturbing the current slab.
+pub const BytePool = struct {
+    backing: std.mem.Allocator,
+    blocks: std.ArrayList([]u8) = .empty,
+    remaining: []u8 = &.{},
+    next_size: usize = 8192,
+    fn block(self: *@This(), metadata: std.mem.Allocator, size: usize) ![]u8 {
+        const bytes = try self.backing.alloc(u8, size);
+        errdefer self.backing.free(bytes);
+        try self.blocks.append(metadata, bytes);
+        return bytes;
+    }
+    fn dupe(self: *@This(), metadata: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+        if (bytes.len > 65536) {
+            const output = try self.block(metadata, bytes.len);
+            @memcpy(output, bytes);
+            return output;
+        }
+        if (self.remaining.len < bytes.len) {
+            self.remaining = try self.block(metadata, @max(bytes.len, self.next_size));
+            self.next_size = @min(65536, self.remaining.len * 2);
+        }
+        const output = self.remaining[0..bytes.len];
+        @memcpy(output, bytes);
+        self.remaining = self.remaining[bytes.len..];
+        return output;
+    }
+    pub fn deinit(self: *@This()) void {
+        for (self.blocks.items) |bytes| self.backing.free(bytes);
+    }
+};
+/// Membership metadata owns the pool descriptor; its owner must release the
+/// pool's backing slabs before destroying that metadata arena.
+pub fn cloneMembership(value: Value, a: std.mem.Allocator, backing: std.mem.Allocator, pool: *?*BytePool, retain_payload: bool) Value.CloneError!Value {
+    var context: CloneContext = .{ .a = a, .scratch = a, .identity_only = !retain_payload, .share_allocations = false, .byte_pool = pool, .byte_allocator = backing };
+    return context.clone(value);
+}
+
+test "owned cloning shares allocation identity without merging representations or depth checks" {
+    var owned_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer owned_arena.deinit();
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    const a = owned_arena.allocator();
+    var context: CloneContext = .{ .a = a, .scratch = scratch.allocator() };
+    const original: Value = .{ .list = &.{ .{ .string = "payload" }, .{ .number = 1.0 } } };
+    const first = try context.clone(original);
+    const second = try context.clone(original);
+    try std.testing.expect(first.list.ptr == second.list.ptr);
+    try std.testing.expect(first.list.ptr != original.list.ptr);
+    try std.testing.expect(first.list[1] == .number);
+    const string = try context.clone(original.list[0]);
+    try std.testing.expect(string.string.ptr == first.list[0].string.ptr);
+    const node: Node = .{ .identity = .{ .table = "a", .key = "key" }, .properties = &.{.{ .name = "x", .value = original }} };
+    const changed: Node = .{ .identity = node.identity, .properties = &.{.{ .name = "x", .value = .{ .integer = 2 } }} };
+    const old = try context.clone(.{ .node = &node });
+    const new = try context.clone(.{ .node = &changed });
+    try std.testing.expect(old.node != new.node);
+    try std.testing.expect(old.property("x") == .list);
+    try std.testing.expectEqual(@as(i64, 2), new.property("x").integer);
+    var nested = original;
+    for (0..64) |_| {
+        const item = try a.create(Value);
+        item.* = nested;
+        nested = .{ .list = @as(*[1]Value, @ptrCast(item)) };
+    }
+    try std.testing.expectError(error.CypherValueDepthExceeded, context.clone(nested));
+}
+
+test "equality ownership strips entity payloads recursively and keeps full identities" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const node: Node = .{ .identity = .{ .table = "a", .key = "key" }, .labels = &.{"L"}, .properties = &.{.{ .name = "x", .value = .{ .string = "payload" } }} };
+    const edge: Relationship = .{ .identity = node.identity, .index = "index", .type = "E", .source = node.identity, .target = node.identity, .properties = node.properties };
+    const original: Value = .{ .map = &.{.{ .name = "nested", .value = .{ .list = &.{ .{ .node = &node }, .{ .relationship = &edge }, .{ .path = .{ .nodes = &.{&node}, .relationships = &.{&edge} } } } } }} };
+    const key = try cloneEquality(original, a);
+    try std.testing.expect(Value.eql(original, key));
+    const cells = key.map[0].value.list;
+    try std.testing.expectEqual(@as(usize, 0), cells[0].node.properties.len);
+    try std.testing.expectEqual(@as(usize, 0), cells[1].relationship.properties.len);
+    try std.testing.expectEqual(@as(usize, 0), cells[2].path.nodes[0].properties.len);
+    const other: Node = .{ .identity = .{ .table = "b", .key = "key" } };
+    try std.testing.expect(!Value.eql(cells[0], .{ .node = &other }));
+    var other_edge = edge;
+    other_edge.index = "other";
+    try std.testing.expect(!Value.eql(cells[1], .{ .relationship = &other_edge }));
+}
+
+fn membershipBytesScenario(allocator: std.mem.Allocator) !void {
+    // Arena remapping depends on adjacent allocations. Inject failures against
+    // a deterministic allocation schedule, as the runtime campaigns do.
+    var vtable = allocator.vtable.*;
+    vtable.resize = std.mem.Allocator.noResize;
+    vtable.remap = std.mem.Allocator.noRemap;
+    const backing: std.mem.Allocator = .{ .ptr = allocator.ptr, .vtable = &vtable };
+    var metadata = std.heap.ArenaAllocator.init(backing);
+    defer metadata.deinit();
+    const a = metadata.allocator();
+    var pool: ?*BytePool = null;
+    defer if (pool) |bytes| bytes.deinit();
+    const payload: [4092]u8 = @splat('x');
+    var first: Value = .null;
+    for (0..32) |i| {
+        const copy = try cloneMembership(.{ .list = &.{.{ .string = &payload }} }, a, backing, &pool, false);
+        if (i == 0) first = copy;
+        try std.testing.expectEqualStrings(&payload, copy.list[0].string);
+    }
+    const tail = pool.?.remaining;
+    const oversized: [70000]u8 = @splat('y');
+    const large = try cloneMembership(.{ .string = &oversized }, a, backing, &pool, true);
+    try std.testing.expectEqualStrings(&oversized, large.string);
+    try std.testing.expectEqual(tail.ptr, pool.?.remaining.ptr);
+    try std.testing.expectEqual(tail.len, pool.?.remaining.len);
+    try std.testing.expectEqualStrings(&payload, first.list[0].string);
+    var retained: usize = 0;
+    for (pool.?.blocks.items) |block_| retained += block_.len;
+    try std.testing.expect(retained <= 32 * payload.len + oversized.len + 65536);
+}
+test "membership byte slabs bound retention and release every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, membershipBytesScenario, .{});
+}

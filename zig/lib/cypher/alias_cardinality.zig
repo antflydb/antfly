@@ -22,8 +22,8 @@ const Index = @import("reduction.zig").Index;
 const A = std.mem.Allocator;
 pub const Rewrites = std.AutoHashMapUnmanaged(*const ast.Expr, ast.Expr);
 const Names = std.StringHashMapUnmanaged(usize);
-const Candidate = struct { expression: *const ast.Expr, valid: bool = true, uses: std.ArrayList(*const ast.Expr) = .empty };
-const Cohort = struct { members: std.ArrayList(usize) = .empty, full: bool = false };
+const Candidate = struct { expression: *const ast.Expr, valid: bool = true, prefix: ?usize = null, uses: std.ArrayList(*const ast.Expr) = .empty };
+const Cohort = struct { members: std.ArrayList(usize) = .empty, full: bool = false, prefix: ?usize = null };
 const Flow = struct {
     a: A,
     source: []const u8,
@@ -59,6 +59,18 @@ const Flow = struct {
                     return self.scan(value, projection.names, locals, index);
                 };
             };
+            if (@import("reduction.zig").prefixConsumer(value)) |prefix| {
+                if (prefix.input.value == .variable) {
+                    if (lookup(names, prefix.input.value.variable, locals)) |id| {
+                        self.candidates.items[id].prefix = @max(self.candidates.items[id].prefix orelse 0, prefix.limit);
+                        return;
+                    }
+                } else if (index != null and prefix.input.value == .call and std.ascii.eqlIgnoreCase(prefix.input.value.call.name, "collect")) {
+                    const slot = try self.cohort(index.?, prefix.input);
+                    self.cohorts.items[slot].prefix = @max(self.cohorts.items[slot].prefix orelse 0, prefix.limit);
+                    return self.scan(prefix.input.value.call.args, names, locals, index);
+                }
+            }
             switch (value.value) {
                 .variable => |name| self.full(names, name, locals),
                 .exists, .pattern_comprehension => self.barrier(names),
@@ -175,15 +187,19 @@ const Flow = struct {
         for (self.cohorts.items) |cohort_| {
             var allowed = !cohort_.full;
             var used = false;
+            var prefix = cohort_.prefix;
             for (cohort_.members.items) |id| {
+                if (self.candidates.items[id].prefix) |limit| prefix = @max(prefix orelse 0, limit);
                 allowed = allowed and self.candidates.items[id].valid;
                 used = used or self.candidates.items[id].uses.items.len != 0;
             }
-            if (!allowed or !used) continue;
+            // Mixing cardinality and prefix demands needs both count and
+            // payload state; keep the complete list until that demand exists.
+            if (!allowed or (used and prefix != null) or (!used and prefix == null)) continue;
             for (cohort_.members.items) |id| {
                 const original = self.candidates.items[id].expression;
                 var count = original.*;
-                count.value.call.name = "count";
+                if (prefix) |limit| count.value.call.collect_limit = limit else count.value.call.name = "count";
                 try rewrites.put(self.a, original, count);
                 for (self.candidates.items[id].uses.items) |use| {
                     var scalar = use.*;

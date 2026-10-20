@@ -3483,3 +3483,76 @@ test "alias demand and borrowed pagination release every failed allocation" {
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
 }
+
+test "bounded collection consumers preserve prefixes sharing escapes and lazy evaluation" {
+    try check("UNWIND [null,3,3,1,2] AS x RETURN head(collect(x)),collect(x)[0..2],collect(x)[2]", "[[3,[3,3],1]]");
+    try check("UNWIND [null,3,3,1,2] AS x RETURN head(collect(DISTINCT x)),collect(DISTINCT x)[0..2],collect(DISTINCT x)[2]", "[[3,[3,1],2]]");
+    try check("UNWIND [] AS x RETURN head(collect(x)),collect(x)[0..2],collect(x)[2]", "[[null,[],null]]");
+    try check("UNWIND [null,null] AS x RETURN head(collect(DISTINCT x)),collect(x)[0..0]", "[[null,[]]]");
+    try check("UNWIND [3,1,2] AS x RETURN head(collect(x)),collect(x),collect(x)[-1],collect(x)[1..]", "[[3,[3,1,2],2,[1,2]]]");
+    try check("UNWIND [3,1,2] AS x RETURN collect(x)[1..2],collect(x)[2..1],collect(x)[8]", "[[[1],[],null]]");
+    try check("UNWIND [1,2] AS x RETURN CASE WHEN true THEN head(collect(x)) ELSE head(collect(1/0)) END", "[[1]]");
+    try check("UNWIND [1,2] AS x CALL { WITH x UNWIND [x,x+1] AS y RETURN head(collect(y)) AS h } RETURN collect(h)", "[[[1,2]]]");
+    try check("UNWIND [1,2] AS x WITH collect(x) AS xs RETURN head(xs),xs[0..1],xs[1]", "[[1,[1],2]]");
+    try check("UNWIND [1,2] AS x WITH collect(x) AS xs WITH xs AS ys RETURN head(ys)", "[[1]]");
+    try check("UNWIND [1,2] AS x WITH collect(x) AS xs,collect(x) AS ys RETURN head(xs),ys[0..2]", "[[1,[1,2]]]");
+    try check("UNWIND [1,2] AS x WITH collect(x) AS xs RETURN head(xs),size(xs),xs", "[[1,2,[1,2]]]");
+    try check("UNWIND [1,2] AS x WITH collect(x) AS xs RETURN head(xs),[xs IN [[7,8]]|xs[1]]", "[[1,[8]]]");
+    try check("UNWIND [1,2] AS x WITH collect(x) AS xs WITH [7,8] AS xs RETURN xs[1]", "[[8]]");
+    try check("MATCH(n:Document) RETURN n.rank%2 AS k,head(collect(n.title)) AS h ORDER BY k", "[[0,\"Beta\"],[1,\"Alpha\"]]");
+    try check("MATCH(n:Document) RETURN count(DISTINCT n),head(collect(DISTINCT n)).title", "[[3,\"Alpha\"]]");
+    try check("MATCH(n:Document) RETURN head(collect(DISTINCT n)).title,count(DISTINCT n)", "[[\"Alpha\",3]]");
+    try check("MATCH(n:Document) RETURN count(DISTINCT [n]),head(collect(DISTINCT [n]))[0].title", "[[3,\"Alpha\"]]");
+    for ([_][]const u8{
+        "UNWIND [0,1] AS x RETURN head(collect(1/(1-x)))",
+        "UNWIND [0,1] AS x RETURN collect(DISTINCT 1/(1-x))[0..0]",
+        "UNWIND [0,1] AS x WITH collect(1/(1-x)) AS xs RETURN head(xs)",
+        "UNWIND [0,1] AS x RETURN CASE WHEN true THEN head(collect(1/(1-x))) ELSE 0 END",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}
+
+test "bounded collect equality memberships and shared sort ownership release allocation failures" {
+    const Campaign = struct {
+        fn run(backing: std.mem.Allocator) !void {
+            var vtable = backing.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const a: std.mem.Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, "MATCH(n:Document) RETURN n.rank%2 AS k,count(DISTINCT n),head(collect(DISTINCT n)).title AS h ORDER BY h LIMIT 1", .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
+}
+
+test "lazy bounded collect preserves intermediate value depth limits" {
+    for ([_]usize{ 63, 64 }) |depth| {
+        const text = try std.fmt.allocPrint(std.testing.allocator, "MATCH(n:Document) RETURN CASE WHEN true THEN head(collect(reduce(xs=0,x IN range(1,{d})|[xs]))) ELSE null END", .{depth});
+        defer std.testing.allocator.free(text);
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        // COLLECT itself contributes one level before HEAD consumes it.
+        if (depth == 64) {
+            try std.testing.expectError(error.CypherValueDepthExceeded, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+        } else {
+            var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{});
+            defer result.deinit();
+            var value = result.rows[0][0];
+            for (0..depth) |_| value = value.list[0];
+            try std.testing.expectEqual(@as(i64, 0), value.integer);
+        }
+    }
+}

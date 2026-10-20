@@ -42,6 +42,7 @@ fn hashValue(hasher: *std.hash.Wyhash, value: anytype) void {
         hashValue(hasher, value.args);
         hashValue(hasher, value.distinct);
         hashValue(hasher, value.star);
+        hashValue(hasher, value.collect_limit);
         return;
     }
     switch (@typeInfo(T)) {
@@ -138,6 +139,60 @@ fn cardinality(expression: *const ast.Expr) ?*const ast.Expr {
     if (!std.ascii.eqlIgnoreCase(aggregate.name, "collect") or aggregate.star or aggregate.args.len != 1) return null;
     return input;
 }
+/// A proved bounded prefix is independent of input cardinality. Unknown,
+/// negative and parameterized indices retain the complete collection.
+pub const Prefix = struct { input: *const ast.Expr, limit: usize };
+fn nonnegative(expression: *const ast.Expr) ?usize {
+    if (expression.value != .literal or expression.value.literal != .integer) return null;
+    return std.math.cast(usize, expression.value.literal.integer);
+}
+pub fn prefixConsumer(expression: *const ast.Expr) ?Prefix {
+    return switch (expression.value) {
+        .call => |call| if (std.ascii.eqlIgnoreCase(call.name, "head") and !call.star and !call.distinct and call.args.len == 1) .{ .input = call.args[0], .limit = 1 } else null,
+        .index => |index| .{ .input = index.base, .limit = std.math.add(usize, nonnegative(index.index) orelse return null, 1) catch return null },
+        .slice => |slice| blk: {
+            if (slice.start) |start| _ = nonnegative(start) orelse return null;
+            break :blk .{ .input = slice.base, .limit = nonnegative(slice.end orelse return null) orelse return null };
+        },
+        else => null,
+    };
+}
+const Prefixes = struct {
+    a: A,
+    index: Index = .{},
+    limits: std.ArrayList(?usize) = .empty,
+    fn record(self: *@This(), expression: *const ast.Expr, limit: ?usize) !void {
+        const slot = try self.index.intern(self.a, expression, self.limits.items.len);
+        if (slot == self.limits.items.len) return self.limits.append(self.a, limit);
+        self.limits.items[slot] = if (self.limits.items[slot] != null and limit != null) @max(self.limits.items[slot].?, limit.?) else null;
+    }
+    fn gather(self: *@This(), value: anytype) anyerror!void {
+        const T = @TypeOf(value);
+        if (T == *const ast.Expr) {
+            if (prefixConsumer(value)) |prefix| if (prefix.input.value == .call and std.ascii.eqlIgnoreCase(prefix.input.value.call.name, "collect")) {
+                try self.record(prefix.input, prefix.limit);
+                return;
+            };
+            if (value.value == .call and std.ascii.eqlIgnoreCase(value.value.call.name, "collect")) return self.record(value, null);
+            switch (value.value) {
+                .exists, .pattern_comprehension => return,
+                inline else => |payload| try self.gather(payload),
+            }
+            return;
+        }
+        switch (@typeInfo(T)) {
+            .pointer => |p| if (p.size == .slice and p.child != u8) {
+                for (value) |child| try self.gather(child);
+            },
+            .@"struct" => |info| inline for (info.field_names) |name| try self.gather(@field(value, name)),
+            .@"union" => switch (value) {
+                inline else => |payload| try self.gather(payload),
+            },
+            .optional => if (value) |child| try self.gather(child),
+            else => {},
+        }
+    }
+};
 const Cardinality = struct {
     a: A,
     source: []const u8,
@@ -171,7 +226,7 @@ const Cardinality = struct {
             else => {},
         }
     }
-    fn lower(self: *@This(), value: anytype, full: ?*const Index) anyerror!@TypeOf(value) {
+    fn lower(self: *@This(), value: anytype, full: ?*const Index, prefixes: ?*const Prefixes) anyerror!@TypeOf(value) {
         const T = @TypeOf(value);
         if (T == *const ast.Expr) {
             var expression = if (self.rewrites) |rewrites| rewrites.get(value) orelse value.* else value.*;
@@ -181,8 +236,13 @@ const Cardinality = struct {
                     expression.value.call.name = "count";
                 }
             }
+            if (expression.value == .call and std.ascii.eqlIgnoreCase(expression.value.call.name, "collect")) {
+                if (prefixes) |plan| if (plan.index.find(value)) |slot| if (plan.limits.items[slot]) |limit| {
+                    expression.value.call.collect_limit = if (expression.value.call.collect_limit) |existing| @min(existing, limit) else limit;
+                };
+            }
             const nested = expression.value == .exists or expression.value == .pattern_comprehension;
-            expression.value = try self.lower(expression.value, if (nested) null else full);
+            expression.value = try self.lower(expression.value, if (nested) null else full, if (nested) null else prefixes);
             if (std.meta.eql(expression, value.*)) return value;
             const result = try self.a.create(ast.Expr);
             result.* = expression;
@@ -193,7 +253,7 @@ const Cardinality = struct {
                 if (p.size == .slice and p.child != u8) {
                     var result: ?[]p.child = null;
                     for (value, 0..) |child, i| {
-                        const next = try self.lower(child, full);
+                        const next = try self.lower(child, full, prefixes);
                         if (result == null and !std.meta.eql(child, next)) result = try self.a.dupe(p.child, value);
                         if (result) |items| items[i] = next;
                     }
@@ -203,12 +263,15 @@ const Cardinality = struct {
             },
             .@"struct" => |info| {
                 var collections: Index = .{};
+                var bounded: Prefixes = .{ .a = self.a };
                 const scope = if (T == ast.Projection) scope: {
                     try self.fullCollections(value, &collections);
                     break :scope &collections;
                 } else full;
+                if (T == ast.Projection) try bounded.gather(value);
+                const demands = if (T == ast.Projection) &bounded else prefixes;
                 var result = value;
-                inline for (info.field_names) |name| @field(result, name) = try self.lower(@field(value, name), scope);
+                inline for (info.field_names) |name| @field(result, name) = try self.lower(@field(value, name), scope, demands);
                 // Replacing SIZE(alias) with a scalar binding must preserve the
                 // public implicit column name rather than exposing that alias.
                 if (T == ast.Item) if (result.alias == null and value.expression.value != .variable and result.expression.value == .variable) {
@@ -217,21 +280,21 @@ const Cardinality = struct {
                 return result;
             },
             .@"union" => return switch (value) {
-                inline else => |payload, tag| @unionInit(T, @tagName(tag), try self.lower(payload, full)),
+                inline else => |payload, tag| @unionInit(T, @tagName(tag), try self.lower(payload, full, prefixes)),
             },
-            .optional => return if (value) |child| try self.lower(child, full) else null,
+            .optional => return if (value) |child| try self.lower(child, full, prefixes) else null,
             else => return value,
         }
     }
 };
 pub fn lowerCardinality(a: A, query: ast.Query) !ast.Query {
     var lower: Cardinality = .{ .a = a, .source = query.source };
-    const direct = try lower.lower(query, null);
+    const direct = try lower.lower(query, null, null);
     var rewrites: @import("alias_cardinality.zig").Rewrites = .empty;
     try @import("alias_cardinality.zig").plan(a, query.source, direct, &rewrites);
     if (rewrites.count() == 0) return direct;
     lower.rewrites = &rewrites;
-    return lower.lower(direct, null);
+    return lower.lower(direct, null, null);
 }
 
 /// Compile pointer lookups once, instead of structurally comparing every key
@@ -310,4 +373,40 @@ test "cardinality planning retains source names shared full consumers and unchan
     try std.testing.expectEqual(compiled.query.clauses[0].operation.unwind.expression, lowered.clauses[0].operation.unwind.expression);
     // Lowering never mutates the compiled public schema or cached AST.
     try std.testing.expectEqualStrings("size", original[0].expression.value.call.name);
+}
+
+test "prefix planning combines consumers preserves full escapes and leaves public AST untouched" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const compiler = @import("compiler.zig");
+    var diagnostic: compiler.Diagnostic = .{};
+    var compiled = try compiler.compile(a, "UNWIND [1] AS x RETURN head(collect(x)),collect(x)[0..3],collect(x)[1]", .{}, &diagnostic);
+    defer compiled.deinit();
+    const lowered = try lowerCardinality(a, compiled.query);
+    var calls: Calls = .{};
+    for (lowered.clauses[1].operation.project.value.items) |item| {
+        const input = prefixConsumer(item.expression).?.input;
+        try std.testing.expectEqual(@as(?usize, 3), input.value.call.collect_limit);
+        try calls.append(a, input);
+    }
+    try std.testing.expectEqual(@as(usize, 1), calls.items.len);
+    try std.testing.expect(compiled.query.clauses[1].operation.project.value.items[0].expression.value.call.args[0].value.call.collect_limit == null);
+    for ([_][]const u8{
+        "UNWIND [1] AS x RETURN head(collect(x)),collect(x)",
+        "UNWIND [1] AS x RETURN head(collect(x)),collect(x)[-1]",
+        "UNWIND [1] AS x WITH collect(x) AS xs RETURN head(xs),size(xs)",
+        "UNWIND [1] AS x WITH collect(x) AS xs RETURN head(xs),xs",
+    }) |text| {
+        var other = try compiler.compile(a, text, .{}, &diagnostic);
+        defer other.deinit();
+        const planned = try lowerCardinality(a, other.query);
+        const first = planned.clauses[1].operation.project.value.items[0].expression;
+        const collection = if (first.value == .call and std.ascii.eqlIgnoreCase(first.value.call.name, "head")) first.value.call.args[0] else first;
+        try std.testing.expect(collection.value.call.collect_limit == null);
+    }
+    var aliased = try compiler.compile(a, "UNWIND [1] AS x WITH collect(x) AS xs WITH xs AS ys RETURN ys[0..3]", .{}, &diagnostic);
+    defer aliased.deinit();
+    const planned = try lowerCardinality(a, aliased.query);
+    try std.testing.expectEqual(@as(?usize, 3), planned.clauses[1].operation.project.value.items[0].expression.value.call.collect_limit);
 }

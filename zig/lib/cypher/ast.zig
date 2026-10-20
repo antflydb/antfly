@@ -49,7 +49,14 @@ pub const Unary = enum { positive, negative, not, is_null, is_not_null };
 pub const Binary = enum { add, subtract, multiply, divide, modulo, power, eq, neq, lt, lte, gt, gte, @"and", @"or", xor, in, starts_with, ends_with, contains, regex };
 pub const Entry = struct { name: []const u8, value: *const Expr };
 pub const MapSelector = union(enum) { property: []const u8, variable: []const u8, entry: Entry, all };
-pub const Function = struct { name: []const u8, args: []const *const Expr, distinct: bool = false, star: bool = false };
+pub const Function = struct {
+    name: []const u8,
+    args: []const *const Expr,
+    distinct: bool = false,
+    star: bool = false,
+    /// Physical retention demand; the parser never sets this field.
+    collect_limit: ?usize = null,
+};
 pub const Procedure = struct { name: []const u8, args: []const *const Expr, yields: []const Yield, predicate: ?*const Expr = null };
 pub const Branch = struct { condition: *const Expr, value: *const Expr };
 pub const Node = struct { span: Span, alias: ?[]const u8, labels: []const []const u8, properties: []const Entry };
