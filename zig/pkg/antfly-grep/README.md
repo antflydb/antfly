@@ -3923,16 +3923,17 @@ Profile counters and source hashes accompany each observation; scanner-only
 ratios above remain separate from complete-query latency.
 
 
-Logical verification now reuses the document store's existing versioned `DPD1`
-root-field range authority. Large originals may read only the roots referenced
-by predicates, bound to the current document revision and authenticated primary
-snapshot. Missing/old authority falls back to full bytes; selected hash corruption
-fails. Nested arrays and string semantics are preserved. Evaluation budgets still
-charge original bytes, and projected sources never populate the complete-source
-cache. The supplementary `stored_field_sources` profile counter exposes usage.
-Small originals keep the existing source reader; ordinal rows keep their existing
-schema-versioned decoding. Unrelated data inside a selected root still needs
-validation.
+Logical verification uses the document store's revision-bound authority, upgraded
+to `DPD2` object paths with legacy `DPD1` fallback. This handles the default nested
+`grep.content` schema without decoding unrelated `grep.regions`. Parent/kind flags
+fit the existing per-entry space; metadata remains capped at 32 KiB, 512 nodes and
+one sixteenth of original size. Construction has a fixed linear work allowance.
+Arrays and objects exceeding a limit stay opaque and are fetched as complete
+subtrees. Selected hashes are checked, original-byte budgets remain authoritative,
+and projected JSON never populates the complete-document cache. Missing/stale
+or legacy authority wakes bounded maintenance only on writable owners. Read-only
+retained cuts preserve their immutable fallback. Source matching and the public
+document contract remain unchanged.
 
 The source tuner now attributes scalar fallbacks correctly, excludes truncated
 batches from full-arm samples, and measures batch preparation/allocation as well

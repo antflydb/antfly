@@ -1201,6 +1201,7 @@ def test_logical_scalable_work_profile(stateful_api):
         # source. Projection should decline without a persistent read penalty.
         ("selected_dominant", 1024, "needle alpha beta " + "x" * 16384, {}),
         ("unselected_arrays", 1024, "needle alpha beta", {"unused": ["\n" * 16] * 512}),
+        ("nested_source", 1024, "needle alpha beta", {"unused": ["\n" * 16] * 512}),
     ]:
         table = f"logical_scalable_{name}_{time.time_ns()}"
         stateful_api.create_table(table)
@@ -1221,7 +1222,14 @@ def test_logical_scalable_work_profile(stateful_api):
         idle_cpu_ms_per_second = statistics.median(
             sample["cpu_ms"] * 1000 / sample["elapsed_ms"] for sample in idle_samples
         )
-        documents = {f"{i:06}": {"title": title, **extra} for i in range(count)}
+        field = "grep.content" if name == "nested_source" else "title"
+        missing_field = "grep.other" if name == "nested_source" else "other"
+        value = (
+            {"grep": {"content": title, "regions": extra["unused"]}}
+            if name == "nested_source"
+            else {"title": title, **extra}
+        )
+        documents = {f"{i:06}": value for i in range(count)}
         corpus = json.dumps(documents, sort_keys=True, separators=(",", ":")).encode()
         for offset in range(0, count, 128):
             keys = list(documents)[offset : offset + 128]
@@ -1233,11 +1241,11 @@ def test_logical_scalable_work_profile(stateful_api):
                 "bool": {
                     "should": [
                         *[
-                            {"contains": text, "field": "title"}
+                            {"contains": text, "field": field}
                             for text in ("needle", "alpha", "beta")
                         ],
-                        {"matches": "z[e]bra", "field": "title"},
-                        {"equals": "missing", "field": "other"},
+                        {"matches": "z[e]bra", "field": field},
+                        {"equals": "missing", "field": missing_field},
                     ]
                 }
             },
@@ -1782,3 +1790,60 @@ def test_logical_source_concurrency_profile(stateful_api):
         )
         + "\n"
     )
+
+
+def test_native_grep_nested_authority_keeps_retained_revisions(stateful_api, tmp_path):
+    api = stateful_api
+    table = f"grep_nested_authority_{time.time_ns()}"
+    api.create_table(table)
+    docs = {}
+    for i in range(96):
+        row = document(f"{i:03}.py", f"needle {i}\n")
+        row["grep"]["regions"] = [{"start_line": 1, "end_line": 1}] * 1024
+        docs[f"{i:03}"] = row
+    api.batch_write(table, inserts=docs, sync_level="full_index")
+    url = api.url + f"/tables/{table}/query"
+    payload = {
+        "query": {"contains": "needle", "field": "grep.content"},
+        "limit": 1,
+        "fields": [],
+        "profile": True,
+        "order_by": [{"field": "_id", "desc": False}],
+        "value_search_execution": {
+            "allow_scan": True,
+            "max_documents": 96,
+            "max_bytes": 8 * 1024 * 1024,
+        },
+    }
+    first = requests.post(url, json=payload, timeout=60)
+    assert first.status_code == 200, first.text
+    original = first.json()["responses"][0]
+    assert original["hits"]["total"]["value"] == 96, original
+    profile = original["profile"]["value_search"]
+    if os.environ.get("ANTFLY_BENCH_VALUE_SOURCE_FULL_READ") != "1":
+        assert profile["stored_field_sources"] > 0, profile
+    result = run_grep(tmp_path, api.url, table, "--json", "needle", page_size=128)
+    assert result.returncode == 0, result.stderr.decode()
+    events = [json.loads(line) for line in result.stdout.splitlines()]
+    assert [event["path"] for event in events if event["type"] == "match"] == [
+        f"{i:03}.py" for i in range(96)
+    ]
+    assert events[-1]["stats"]["complete"] is True
+    changed = document("000.py", "UPDATED\n")
+    changed["grep"]["regions"] = [{"start_line": 1, "end_line": 1}] * 1024
+    api.batch_write(table, inserts={"000": changed}, sync_level="full_index")
+    # A fresh predicate forces source reads through the retained cut rather
+    # than reusing the previous predicate's membership facts.
+    old = {
+        **payload,
+        "query": {"contains": "UPDATED", "field": "grep.content"},
+        "remote_snapshot": original["remote_snapshot"],
+    }
+    previous = requests.post(url, json=old, timeout=60)
+    assert previous.status_code == 200, previous.text
+    assert previous.json()["responses"][0]["hits"]["total"]["value"] == 0, previous.text
+    fresh = dict(old)
+    fresh.pop("remote_snapshot")
+    current = requests.post(url, json=fresh, timeout=60)
+    assert current.status_code == 200, current.text
+    assert current.json()["responses"][0]["hits"]["total"]["value"] == 1, current.text

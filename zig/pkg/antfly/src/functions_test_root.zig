@@ -20,6 +20,8 @@ test {
     // Value-only filters must reach their helpers without compiling DB query
     // fixtures merely to discover their private test dependencies.
     _ = @import("antfly_local_sources").storage_db_query_search_exec;
+    _ = @import("antfly_local_sources").sql_document_row;
+    _ = @import("antfly_local_sources").storage_document_mutation_revision;
     _ = @import("antfly_local_sources").functions_decisions;
     _ = @import("antfly_local_sources").functions_expressions;
     _ = @import("antfly_local_sources").functions_runtime;

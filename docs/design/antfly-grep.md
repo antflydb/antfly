@@ -93,8 +93,8 @@ properties; avoid a new grep-specific server protocol.
 
 Logical indexed predicates use the shared source reader described in
 [Logical field queries](logical-field-queries.md#remaining-storage-work-and-performance-qualification).
-Large document originals can reuse the existing authenticated `DPD1` root-field
-authority and range reads; ordinary small documents and missing/legacy authority
+Large document originals can reuse the authenticated `DPD2` object-path
+authority (with `DPD1` fallback) and range reads; ordinary small documents and missing/legacy authority
 retain full-source reads. This changes the physical work, not query semantics or
 original-byte evaluation budgets. The source epoch is pinned for the query,
 selected hashes are checked, arrays remain intact, and projected JSON cannot be

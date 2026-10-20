@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Original-value logical reads over revision-bound document range authorities.
+//! Original-value logical reads over revision-bound object-path authorities.
 //! The authenticated scope pins bodies, directories and revision proofs together.
 //! Missing/old authorities fall back to full bytes; invalid selected bytes fail.
 const std = @import("std");
@@ -53,8 +53,8 @@ fn many(scope: anytype, keys: []const []const u8, output: []?[]const u8) !void {
     for (output, 0..) |*value, i| value.* = fetched[slots[i]];
 }
 
-/// Root names are unique and decoded; nested predicate paths select their root
-/// subtree unchanged, preserving array elements and all source string semantics.
+/// Logical dot paths descend only through proven object members. Arrays and
+/// bounded opaque objects retain their entire subtree and element boundaries.
 /// Output is caller-owned. Temporary directories/range reads use the scope owner.
 pub fn load(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids: []const []const u8, roots: []const []const u8, authenticated: bool) ![]Row {
     if (physical.len > 64 or physical.len != ids.len or roots.len > 64) return error.InvalidBatch;
@@ -85,6 +85,7 @@ pub fn load(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids:
     if (count != 0) try many(scope, keys[0..count], raw[0..count]);
     const Prepared = struct {
         index: usize,
+        directory: projection.Directory,
         fields: []projection.Field,
         ranges: []ranges_mod.Range,
         values: [][]const u8,
@@ -98,7 +99,8 @@ pub fn load(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids:
             if (std.mem.eql(u8, physical[prior.index], physical[i])) break prior;
         } else null;
         if (duplicate) |prior| {
-            prepared[prepared_count] = .{ .index = i, .fields = prior.fields, .ranges = prior.ranges, .values = prior.values };
+            repair[i] = repair[prior.index];
+            prepared[prepared_count] = .{ .index = i, .directory = prior.directory, .fields = prior.fields, .ranges = prior.ranges, .values = prior.values };
             prepared_count += 1;
             continue;
         }
@@ -111,9 +113,25 @@ pub fn load(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids:
             repair[i] = !try projection.isCurrent(scratch, encoded_directory, proof);
             continue;
         };
+        if (directory.version == 1) repair[i] = true;
+        var chosen: [projection.maximum_fields]bool = @splat(false);
+        for (roots) |path| if (directory.resolve(path)) |field| {
+            chosen[field.index] = true;
+        };
+        // Parent selections subsume descendants. Never fetch/hash overlapping
+        // values twice when predicates request both an object and its members.
+        for (directory.fields) |field| if (chosen[field.index]) {
+            var parent = field.parent;
+            while (parent != projection.no_parent) : (parent = directory.fields[parent].parent) {
+                if (chosen[parent]) {
+                    chosen[field.index] = false;
+                    break;
+                }
+            }
+        };
         var selected: std.ArrayList(projection.Field) = .empty;
         var bytes: u64 = 0;
-        for (roots) |name| if (directory.find(name)) |field| {
+        for (directory.fields) |field| if (chosen[field.index]) {
             try selected.append(scratch, field);
             bytes +|= field.length;
         };
@@ -122,7 +140,7 @@ pub fn load(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids:
         const ranges = try scratch.alloc(ranges_mod.Range, selected.items.len);
         const values = try scratch.alloc([]const u8, selected.items.len);
         for (ranges, selected.items) |*range, field| range.* = .{ .offset = field.offset, .length = std.math.cast(usize, field.length) orelse return error.InvalidDocumentContentAuthority };
-        prepared[prepared_count] = .{ .index = i, .fields = selected.items, .ranges = ranges, .values = values };
+        prepared[prepared_count] = .{ .index = i, .directory = directory, .fields = selected.items, .ranges = ranges, .values = values };
         prepared_count += 1;
         if (ranges.len != 0) {
             requests[request_count] = .{ .key = physical[i], .ranges = ranges, .output = values };
@@ -141,18 +159,24 @@ pub fn load(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids:
         } else item.values;
         var out: std.Io.Writer.Allocating = .init(a);
         defer out.deinit();
-        try out.writer.writeByte('{');
-        for (item.fields, values, 0..) |field, value, j| {
+        for (item.fields, values) |field, value| {
             var digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
             if (!std.mem.eql(u8, &digest, &field.digest)) return error.InvalidDocumentContentAuthority;
-            if (j != 0) try out.writer.writeByte(',');
-            try std.json.Stringify.value(field.name, .{}, &out.writer);
-            try out.writer.writeByte(':');
-            try out.writer.writeAll(value);
         }
-        try out.writer.writeByte('}');
-        result[item.index] = .{ .bytes = try out.toOwnedSlice(), .original_bytes = proofs[item.index].?.bytes, .projected = true };
+        var writer = SelectedWriter{ .directory = item.directory, .values = values };
+        for (item.fields, 0..) |field, slot| {
+            writer.slots[field.index] = @intCast(slot);
+            var index = field.index;
+            while (true) {
+                writer.needed[index] = true;
+                const parent = item.directory.fields[index].parent;
+                if (parent == projection.no_parent) break;
+                index = parent;
+            }
+        }
+        try writer.object(&out.writer, 0, item.directory.root_count);
+        result[item.index] = .{ .bytes = try out.toOwnedSlice(), .original_bytes = proofs[item.index].?.bytes, .projected = true, .repair_authority = repair[item.index] };
     }
     count = 0;
     for (result, 0..) |row, i| if (!row.projected) {
@@ -167,6 +191,31 @@ pub fn load(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids:
     return result;
 }
 
+const SelectedWriter = struct {
+    directory: projection.Directory,
+    values: []const []const u8,
+    slots: [projection.maximum_fields]u8 = @splat(255),
+    needed: [projection.maximum_fields]bool = @splat(false),
+    fn object(self: *const @This(), writer: *std.Io.Writer, first: usize, count: usize) anyerror!void {
+        try writer.writeByte('{');
+        var written = false;
+        for (self.directory.fields[first..][0..count]) |field| {
+            if (!self.needed[field.index]) continue;
+            if (written) try writer.writeByte(',');
+            written = true;
+            try std.json.Stringify.value(field.name, .{}, writer);
+            try writer.writeByte(':');
+            if (self.slots[field.index] != 255) {
+                try writer.writeAll(self.values[self.slots[field.index]]);
+            } else {
+                if (field.kind != .object) return error.InvalidDocumentContentAuthority;
+                try self.object(writer, field.first_child, field.child_count);
+            }
+        }
+        try writer.writeByte('}');
+    }
+};
+
 test "logical value stored ranges bind revisions preserve arrays and reject corruption" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -179,7 +228,7 @@ test "logical value stored ranges bind revisions preserve arrays and reject corr
     const directory_key = projection.keyForRevision(rev_key);
     const ignored = try temp.alloc(u8, 32 * 1024);
     @memset(ignored, 'x');
-    const body = try std.fmt.allocPrint(temp, "{{\"ignored\":\"{s}\",\"nested\":[{{\"name\":\"hello\"}},{{\"name\":[null,\"world\"]}}]}}", .{ignored});
+    const body = try std.fmt.allocPrint(temp, "{{\"grep\":{{\"content\":\"needle\",\"ignored\":\"{s}\"}},\"nested\":[{{\"name\":\"hello\"}},{{\"name\":[null,\"world\"]}}],\"small\":{{\"one\":\"a\",\"two\":\"b\"}},\"small.one\":\"DECOY\"}}", .{ignored});
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
     const directory = (try projection.build(temp, body, internal.primary_kind, digest)).?;
@@ -234,6 +283,39 @@ test "logical value stored ranges bind revisions preserve arrays and reject corr
     // Missing selected fields are proven absent without a primary read.
     const missing = try load(temp, temp, &mock, &.{physical}, &.{"doc"}, &.{"absent"}, true);
     try std.testing.expectEqualStrings("{}", missing[0].bytes.?);
+    const old_range_bytes = mock.range_bytes;
+    const nested = try load(temp, temp, &mock, &.{physical}, &.{"doc"}, &.{"grep.content"}, true);
+    try std.testing.expect(nested[0].projected);
+    try std.testing.expectEqualStrings("{\"grep\":{\"content\":\"needle\"}}", nested[0].bytes.?);
+    try std.testing.expectEqual(@as(usize, "\"needle\"".len), mock.range_bytes - old_range_bytes);
+    const pair = try load(temp, temp, &mock, &.{physical}, &.{"doc"}, &.{ "small.one", "small.two" }, true);
+    try std.testing.expectEqualStrings("{\"small\":{\"one\":\"a\",\"two\":\"b\"}}", pair[0].bytes.?);
+    const parent_bytes = mock.range_bytes;
+    const parent = try load(temp, temp, &mock, &.{physical}, &.{"doc"}, &.{ "small.one", "small" }, true);
+    try std.testing.expectEqualStrings(pair[0].bytes.?, parent[0].bytes.?);
+    try std.testing.expectEqual(@as(usize, "{\"one\":\"a\",\"two\":\"b\"}".len), mock.range_bytes - parent_bytes);
+    const array_path = try load(temp, temp, &mock, &.{physical}, &.{"doc"}, &.{"nested.name"}, true);
+    try std.testing.expectEqualStrings(rows[0].bytes.?, array_path[0].bytes.?);
+
+    // A historical DPD1 directory remains readable. Its coarse root forces
+    // safe full reads here and requests bounded cache migration, never a guess.
+    const opened = (try projection.Directory.open(temp, directory, .{ .bytes = @as(u64, body.len), .kind = internal.primary_kind, .digest = digest })).?;
+    const grep_root = opened.find("grep").?;
+    const legacy_directory = try temp.alloc(u8, 47 + 50 + "grep".len);
+    @memcpy(legacy_directory[0..47], directory[0..47]);
+    @memcpy(legacy_directory[0..4], "DPD1");
+    std.mem.writeInt(u16, legacy_directory[45..47], 1, .little);
+    std.mem.writeInt(u16, legacy_directory[47..49], 4, .little);
+    @memcpy(legacy_directory[49..53], "grep");
+    std.mem.writeInt(u64, legacy_directory[53..61], grep_root.offset, .little);
+    std.mem.writeInt(u64, legacy_directory[61..69], grep_root.length, .little);
+    @memcpy(legacy_directory[69..101], &grep_root.digest);
+    mock.directory = legacy_directory;
+    const historical = try load(temp, temp, &mock, &.{physical}, &.{"doc"}, &.{"grep.content"}, true);
+    try std.testing.expect(!historical[0].projected and historical[0].repair_authority);
+    try std.testing.expectEqualStrings(body, historical[0].bytes.?);
+    mock.directory = directory;
+
     mock.corrupt = true;
     try std.testing.expectError(error.InvalidDocumentContentAuthority, load(temp, temp, &mock, &.{physical}, &.{"doc"}, wanted, true));
     mock.corrupt = false;

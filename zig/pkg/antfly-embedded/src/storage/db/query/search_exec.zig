@@ -18716,7 +18716,7 @@ const ValueExecution = struct {
     }
     fn projectedSources(self: *@This(), a: Allocator, ids: []const []const u8) !?[]LogicalSourceRow {
         var fields: [64][]const u8 = undefined;
-        const selected = self.roots(&fields);
+        const selected = self.paths(&fields);
         if (selected.len == 0) {
             self.projected_unavailable = true;
             return null;
@@ -18736,15 +18736,15 @@ const ValueExecution = struct {
         const reader = self.projected_reader.?;
         return try reader.load(reader.ctx, a, ids, selected);
     }
-    // Immutable query roots, decoded from predicate paths; never synthesized
-    // physical field names. Empty/root-wide predicates require original bytes.
-    fn roots(self: *@This(), output: *[64][]const u8) []const []const u8 {
+    // Immutable logical predicate paths, never synthesized physical names.
+    // Empty/root-wide predicates require complete original bytes.
+    fn paths(self: *@This(), output: *[64][]const u8) []const []const u8 {
         if (self.producers.items.len > output.len) return &.{};
         var n: usize = 0;
         for (self.producers.items) |producer| {
             const field = producer.matcher.spec.field;
             if (field.len == 0) return &.{};
-            const root = field[0 .. std.mem.indexOfScalar(u8, field, '.') orelse field.len];
+            const root = field;
             const duplicate = for (output[0..n]) |prior| {
                 if (std.mem.eql(u8, prior, root)) break true;
             } else false;
