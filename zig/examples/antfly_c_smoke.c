@@ -148,7 +148,10 @@ static int run_signal_lifetime_smoke(void) {
     struct sigaction ignored = {0}, original, active;
     ignored.sa_handler = SIG_IGN;
     sigemptyset(&ignored.sa_mask);
-    if (sigaction(SIGIO, &ignored, &original) != 0) return 1;
+    if (sigaction(SIGIO, &ignored, &original) != 0) {
+        rmdir(directory);
+        return 1;
+    }
     antfly_db *first = NULL, *second = NULL;
     int failed = expect_ok(antfly_lite_create(first_path, &first), "signal first open");
     if (!failed) failed = expect_ok(antfly_lite_create(second_path, &second), "signal second open");
@@ -164,7 +167,11 @@ static int run_signal_lifetime_smoke(void) {
     sigaction(SIGIO, &original, NULL);
     remove(first_path);
     remove(second_path);
-    rmdir(directory);
+    snprintf(first_path, sizeof(first_path), "%s/first.aflite.lock", directory);
+    snprintf(second_path, sizeof(second_path), "%s/second.aflite.lock", directory);
+    remove(first_path);
+    remove(second_path);
+    if (rmdir(directory) != 0) failed = 1;
     if (failed) fprintf(stderr, "foreign executor signal lifetime was not retained/restored\n");
     return failed;
 #else

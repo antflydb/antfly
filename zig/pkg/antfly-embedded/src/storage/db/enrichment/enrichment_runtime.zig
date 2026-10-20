@@ -34294,7 +34294,7 @@ fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !v
     });
     defer db.close();
     try db.setSchemaJson(alloc, "{}");
-    try db.addEnrichment(.{ .name = "copy", .kind = .asset, .field = "body", .content_type = if (graph) "application/json" else "text/plain", .producer_json = if (generated) "{\"type\":\"generator\",\"config\":{}}" else "" });
+    try db.addEnrichment(.{ .name = "copy", .kind = .asset, .field = "body", .content_type = if (graph) "application/json" else "text/plain", .producer_json = if (generated) "{\"type\":\"generator\",\"config\":{\"provider\":\"ollama\",\"model\":\"fixture\"}}" else "" });
     try db.addEnrichment(.{ .name = "downstream", .kind = .asset, .source_artifact_name = "copy", .content_type = "text/plain" });
     if (graph) try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"sources\":[{\"artifact\":\"copy\"}]}" });
     const asset_body = if (graph) "{\"type\":\"mentions\",\"target\":\"other\"}" else "hello";
@@ -34540,7 +34540,7 @@ test "asset preparation is lazy and byte bounded across retryable provider batch
         .artifact_name = "generated",
         .doc_key = "blocked",
         .source_field = "body",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"ollama\",\"model\":\"fixture\"}}",
         .execution_json = "{\"batch_items\":8,\"batch_bytes\":1}",
         .sequence = 7,
     };
@@ -34711,7 +34711,7 @@ test "asset producer neighbor context samples local graph adjacency into the inp
         .artifact_name = "conceptualize_v1",
         .doc_key = doc_key,
         .source_field = "name",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"ollama\",\"model\":\"fixture\"}}",
         .neighbor_context_json = "{\"graph_index\":\"taxonomy\",\"direction\":\"out\",\"limit\":8}",
         .sequence = 3,
     };
@@ -34794,7 +34794,7 @@ test "asset producer neighbor context samples local graph adjacency into the inp
         .name = "conceptualize_v1",
         .kind = .asset,
         .field = "name",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"ollama\",\"model\":\"fixture\"}}",
         .neighbor_context = .{ .graph_index = "taxonomy" },
     });
     try db.batch(.{ .graph_writes = &.{
