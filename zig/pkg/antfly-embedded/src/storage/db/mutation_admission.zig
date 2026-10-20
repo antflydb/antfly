@@ -121,6 +121,22 @@ pub fn acquireReplicationMutationShared(owner: anytype, controls: ?lock.ApplyRwL
     return acquireReplicationMutationSharedScoped(owner, controls, receiverMutationRoot(owner));
 }
 
+/// A completion attempt retaining mutation ownership cannot lend CPU to an
+/// apply holder. Return to the durable retry owner rather than wait in a cycle.
+pub fn lockApplyForCompletion(owner: anytype, controls: ?lock.ApplyRwLock.Acquisition) !void {
+    const original = controls orelse return lockApply(owner, null);
+    if (original.execution_wait != null) return lockApply(owner, controls);
+    try original.lifetime.check();
+    try owner.enforcePortableRuntimeGate();
+    if (!ownerField(owner, "core").*.apply_mutex.tryLockExclusiveForAdmission()) {
+        try original.lifetime.check();
+        return error.CommitCompletionPending;
+    }
+    errdefer ownerField(owner, "core").*.unlockApply();
+    try original.lifetime.check();
+    try owner.enforcePortableRuntimeGate();
+}
+
 /// BEGIN has not acquired a local policy/apply lease at this point. Preserve
 /// the caller's explicit wait policy while acquiring replication admission;
 /// enterRaw must recheck policy after this returns. Callers with other holders

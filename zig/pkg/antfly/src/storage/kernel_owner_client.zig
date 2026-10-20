@@ -535,6 +535,15 @@ pub const Owner = struct {
         try statusToError(status);
     }
 
+    pub fn transactionResolveWithAdmission(self: *Owner, table: []const u8, txn_id: [16]u8, status: abi.TxnStatus, commit_version: u64, sync_level: abi.SyncLevel, port: *const @import("antfly_local_sources").common_read_admission.Port) !void {
+        try port.checkpoint();
+        var trace: @import("antfly_local_sources").common_read_admission.RejectionTrace = .{};
+        const original = trace.bind(port.*).?;
+        const result = abi.antfly_storage_owner_transaction_resolve_with_admission(self.handle, &.{ .table_name = .fromSlice(table), .txn_id = .{ .bytes = txn_id }, .status = @backingInt(status), .commit_version = commit_version, .sync_level = @backingInt(sync_level), .port = &original });
+        if (trace.failure) |cause| return cause;
+        try statusToError(result);
+    }
+
     pub fn replicatedBatchJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_replicated_batch_json(

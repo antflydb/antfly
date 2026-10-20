@@ -84,6 +84,7 @@ const MutationDependencies = struct {
     pub const test_before_graph_replay_apply = &DBModule.test_before_graph_replay_apply;
     pub const test_fail_restore_projection_apply = &DBModule.test_fail_restore_projection_apply;
     pub const test_portable_runtime_batch_prelock_hook = &DBModule.test_portable_runtime_batch_prelock_hook;
+    pub const test_committed_visibility_retirement_hook = &DBModule.test_committed_visibility_retirement_hook;
 };
 const local_mutation = @import("local_mutation.zig").ImplementationFor(MutationDependencies);
 const document_collectors = @import("document_collectors.zig");
@@ -935,6 +936,11 @@ const PortableRuntimeBatchPrelockTestHook = struct {
     release: std.atomic.Value(bool) = .init(false),
 };
 var test_portable_runtime_batch_prelock_hook: ?*PortableRuntimeBatchPrelockTestHook = null;
+const CommittedVisibilityRetirementTestHook = struct {
+    ptr: *anyopaque,
+    observe_fn: *const fn (*anyopaque, [16]u8, bool, bool) void,
+};
+var test_committed_visibility_retirement_hook: ?*CommittedVisibilityRetirementTestHook = null;
 var legacy_dense_test_policy_token: u8 = 0;
 
 fn denyDenseNativeAuthorityForLegacyTest(_: *const anyopaque) bool {
@@ -25224,6 +25230,11 @@ pub const DB = struct {
         } else {
             try self.resolveTransactionIntentsInternalWithAcknowledgementPolicy(txn_id, status, commit_version, sync_level, cancellation, null, participant, null, true);
         }
+    }
+
+    pub fn resolveTransactionIntentsAndAcknowledgeParticipantWithAdmissionControls(self: *DB, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, commit_version: u64, sync_level: types.SyncLevel, cancellation: types.CancellationToken, participant: []const u8, controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !void {
+        try controls.lifetime.check();
+        try self.resolveTransactionIntentsInternalWithAcknowledgementPolicy(txn_id, status, commit_version, sync_level, cancellation, null, participant, controls, true);
     }
 
     pub fn resolveReplicatedTransactionAtOrderedReceipt(
@@ -143920,4 +143931,107 @@ test "lite generation cleanup and capacity accounting survive reopen (#1210)" {
     try std.testing.expectError(error.FileNotFound, storage.fileSize(corrupt_file));
     try std.testing.expectEqual(@as(u64, 40), try storage.fileSize(active_file));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, base, .{}));
+}
+
+test "required replicated begin ordinary completion bounds late indexed apply contention and retries the same decision" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("completion-late-apply");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_completion", .kind = .full_text, .config_json = "{}" });
+    const id: [16]u8 = @splat(0xb1);
+    _ = try db.beginTransactionScoped(id, 1, 2, &.{"local"}, false, true, null);
+    try db.writeTransaction(id, .{ .writes = &.{.{ .key = "doc", .value = "{\"title\":\"alpha\"}" }} });
+    const Worker = struct {
+        db: *DB,
+        id: [16]u8,
+        deadline: u64,
+        err: ?anyerror = null,
+        allow_visibility_wait: bool = false,
+        parked: bool = false,
+        loans: usize = 0,
+        resumes: usize = 0,
+        retired: std.atomic.Value(bool) = .init(false),
+        fn check(raw: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (monotonicTimeNs() >= self.deadline) return error.DeadlineExceeded;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.allow_visibility_wait) return error.UnexpectedCpuLoan;
+            try std.testing.expect(!self.parked);
+            // Observe this invocation's actual leases, not global lock
+            // availability: independent index workers may own those locks.
+            try std.testing.expect(self.retired.load(.acquire));
+            self.parked = true;
+            self.loans += 1;
+        }
+        fn observe(raw: *anyopaque, observed_txn_id: [16]u8, apply_held: bool, snapshot_active: bool) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (std.mem.eql(u8, &self.id, &observed_txn_id)) self.retired.store(!apply_held and !snapshot_active, .release);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.parked);
+            self.parked = false;
+            self.resumes += 1;
+        }
+        fn run(self: *@This()) void {
+            self.db.resolveTransactionIntentsAndAcknowledgeParticipantWithAdmissionControls(self.id, .committed, 3, .full_index, .{ .ptr = self, .check_fn = check }, "local", .{ .lifetime = .{ .context = self, .check_fn = check }, .execution_wait = .{ .ptr = self, .begin = begin, .end = end } }) catch |err| {
+                self.err = err;
+            };
+        }
+    };
+    var hook: PortableRuntimeBatchPrelockTestHook = .{};
+    test_portable_runtime_batch_prelock_hook = &hook;
+    defer test_portable_runtime_batch_prelock_hook = null;
+    var worker: Worker = .{ .db = &db, .id = id, .deadline = monotonicTimeNs() + 5 * std.time.ns_per_s };
+    var retirement_hook: CommittedVisibilityRetirementTestHook = .{ .ptr = &worker, .observe_fn = Worker.observe };
+    test_committed_visibility_retirement_hook = &retirement_hook;
+    defer test_committed_visibility_retirement_hook = null;
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var joined = false;
+    defer if (!joined) {
+        hook.release.store(true, .release);
+        thread.join();
+    };
+    while (!hook.entered.load(.acquire) and monotonicTimeNs() < worker.deadline) @import("antfly_platform").time.yieldNow();
+    try std.testing.expect(hook.entered.load(.acquire));
+    // The decision lookup already succeeded. Contention appears only after
+    // native preparation has reached the real batch snapshot/apply boundary.
+    db.core.lockApplyExclusive();
+    hook.release.store(true, .release);
+    thread.join();
+    joined = true;
+    db.core.unlockApplyExclusive();
+    // The original deadline bounds a broken wait too, making this regression
+    // fail deterministically instead of hanging the test process.
+    try std.testing.expectEqual(@as(?anyerror, error.Backpressured), worker.err);
+    try std.testing.expectEqual(@as(usize, 0), worker.loans);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(id));
+    try std.testing.expect((try db.get(a, "doc")) == null);
+    var manager = try db.core.initTxnManager();
+    defer manager.deinit();
+    const rejected_acks = try manager.getResolvedParticipants(a, id);
+    defer transactions_mod.freeParticipantList(a, rejected_acks);
+    try std.testing.expectEqual(@as(usize, 0), rejected_acks.len);
+    test_portable_runtime_batch_prelock_hook = null;
+    worker.deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
+    worker.err = null;
+    worker.allow_visibility_wait = true;
+    worker.run();
+    try std.testing.expectEqual(@as(?anyerror, null), worker.err);
+    try std.testing.expect(worker.loans > 0);
+    try std.testing.expectEqual(worker.loans, worker.resumes);
+    try std.testing.expect(!worker.parked);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(id));
+    const accepted_acks = try manager.getResolvedParticipants(a, id);
+    defer transactions_mod.freeParticipantList(a, accepted_acks);
+    try std.testing.expectEqual(@as(usize, 1), accepted_acks.len);
+    var result = try db.search(a, .{ .index_name = "ft_completion", .query = .{ .match = .{ .field = "title", .text = "alpha" } } });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc", result.hits[0].id);
 }

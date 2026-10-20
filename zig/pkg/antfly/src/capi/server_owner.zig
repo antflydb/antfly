@@ -4140,6 +4140,44 @@ pub fn storageOwnerTransactionBeginWithAdmission(owner: ?*anyopaque, request: *c
     return .ok;
 }
 
+/// Completion borrows its existing owner; it neither mints a new deadline nor
+/// turns a visibility rejection into permission to change a durable decision.
+pub fn storageOwnerTransactionResolveWithAdmission(owner: ?*anyopaque, request: *const kernel_owner_abi.TransactionResolveRequest) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const read = @import("antfly_local_sources").common_read_admission;
+    const raw = request.port orelse return .invalid_argument;
+    if (@intFromPtr(raw) % @alignOf(read.Port) != 0) return .invalid_argument;
+    const control: *const read.Port = @ptrCast(@alignCast(raw));
+    control.checkpoint() catch |err| return storageOwnerStatusFromError(err);
+    if (request._reserved != 0 or request.status < @backingInt(kernel_owner_abi.TxnStatus.committed) or request.status > @backingInt(kernel_owner_abi.TxnStatus.aborted) or request.sync_level > @backingInt(kernel_owner_abi.SyncLevel.full_index)) return .invalid_argument;
+    if ((request.table_name.len != 0 and request.table_name.ptr == null) or std.math.cast(usize, request.table_name.len) == null) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    const table = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    // The source only supplies ordinary public owners here. Private completion
+    // must first carry a native, apply-fenced authenticated Plan contract.
+    if (handle.db.local_execution.restore_staging_required.load(.acquire) or handle.db.local_execution.initial_child_hidden.load(.acquire)) return storageOwnerStatusFromError(error.UnsupportedOperation);
+    const resources = @import("antfly_local_sources").storage_resource_manager;
+    const bytes = @import("../storage/transaction_participant_admission.zig").workingSetBytes(0, table.len) catch return .invalid_argument;
+    var credit = if (handle.db.core.index_manager.resource_manager) |manager| manager.reserveConstructionWithAdmission(.relational_preparation_working_set, bytes, control.*) catch |err| return storageOwnerStatusFromError(err) else @as(?resources.ConstructionCredit, null);
+    defer if (credit) |*funded| funded.retire();
+    control.checkpoint() catch |err| return storageOwnerStatusFromError(err);
+    const workspace = handle.alloc.alloc(u8, bytes) catch |err| return storageOwnerStatusFromError(err);
+    defer handle.alloc.free(workspace);
+    var fixed = std.heap.FixedBufferAllocator.init(workspace);
+    const local = @import("antfly_local_sources").api_local_transaction_contract.participantIdForGroup(fixed.allocator(), table, handle.storage_owner_group_id) catch |err| return storageOwnerStatusFromError(err);
+    const Check = struct {
+        fn lifetime(ptr: *const anyopaque) !void {
+            const original: *const read.Port = @ptrCast(@alignCast(ptr));
+            try original.checkLifetime();
+        }
+    };
+    const wait = control.executionWaitAfterLifetime() catch |err| return storageOwnerStatusFromError(err);
+    const status: db_mod.types.TxnStatus = if (request.status == @backingInt(kernel_owner_abi.TxnStatus.committed)) .committed else .aborted;
+    const sync_level: db_mod.types.SyncLevel = @fromBackingInt(@intCast(request.sync_level));
+    handle.db.resolveTransactionIntentsAndAcknowledgeParticipantWithAdmissionControls(request.txn_id.bytes, status, request.commit_version, sync_level, .{ .ptr = control, .check_fn = Check.lifetime }, local, .{ .lifetime = .{ .context = control, .check_fn = Check.lifetime }, .execution_wait = wait }) catch |err| return storageOwnerStatusFromError(if (err == error.Backpressured) error.CommitCompletionPending else err);
+    return .ok;
+}
+
 pub fn storageOwnerReplicatedBatchJson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.JsonOperationRequest,

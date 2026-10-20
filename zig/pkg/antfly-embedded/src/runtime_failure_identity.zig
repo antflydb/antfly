@@ -34,6 +34,7 @@ const mappings = [_]Mapping{
     .{ .status = .invalid_table_file, .err = error.InvalidTableFile },
     .{ .status = .table_block_checksum_mismatch, .err = error.TableBlockChecksumMismatch },
     .{ .status = .backpressured, .err = error.Backpressured },
+    .{ .status = .commit_completion_pending, .err = error.CommitCompletionPending },
     .{ .status = .transaction_closed, .err = error.TransactionClosed },
     .{ .status = .scheduler_closed, .err = error.SchedulerClosed },
     .{ .status = .scheduler_full, .err = error.SchedulerFull },
@@ -1098,6 +1099,7 @@ test "committed visibility outcomes survive the storage owner boundary" {
         error.EnrichmentWorkerFailed,
         error.CommitVisibilityNotSatisfied,
         error.CommitPropagationIncomplete,
+        error.CommitCompletionPending,
     }) |err| {
         const failure = failureFromError(err, .storage_owner, abi.abi_version, 1);
         try std.testing.expect(failure.status != .internal);

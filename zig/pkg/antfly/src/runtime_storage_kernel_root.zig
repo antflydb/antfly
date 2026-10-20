@@ -171,6 +171,7 @@ comptime {
     exportInternal(&storage_kernel_exports.storageOwnerBatchJson, "antfly_storage_owner_batch_json");
     exportInternal(&storage_kernel_exports.storageOwnerBatchJsonWithAdmission, "antfly_storage_owner_batch_json_with_admission");
     exportInternal(&storage_kernel_exports.storageOwnerTransactionBeginWithAdmission, "antfly_storage_owner_transaction_begin_with_admission");
+    exportInternal(&storage_kernel_exports.storageOwnerTransactionResolveWithAdmission, "antfly_storage_owner_transaction_resolve_with_admission");
     exportInternal(&storage_kernel_exports.storageOwnerReplicatedBatchJson, "antfly_storage_owner_replicated_batch_json");
     exportInternal(&storage_kernel_exports.storageOwnerReplicatedBatchAtRaftEntryJson, "antfly_storage_owner_replicated_batch_at_raft_entry_json");
     exportInternal(&storage_kernel_exports.storageOwnerNativeInitialChildControlJson, "antfly_storage_owner_native_initial_child_control_json");

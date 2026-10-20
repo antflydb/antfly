@@ -3338,6 +3338,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (visibility_controls) |*original| {
                 if (opts.committed_visibility_wait) |boundary| original.execution_wait = boundary;
             }
+            if (builtin.is_test and @hasDecl(D, "test_committed_visibility_retirement_hook")) {
+                if (opts.transaction_resolution) |resolution| if (D.test_committed_visibility_retirement_hook.*) |hook|
+                    hook.observe_fn(hook.ptr, resolution.txn_id, apply_mutex_held, snapshot_mutation.active);
+            }
             const visibility_boundary = mutation_admission.committedVisibilityBoundary(visibility_controls, .{
                 .snapshot = opts.snapshot_mutation,
                 .row_policy = opts.row_policy_lease,
@@ -4329,7 +4333,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer if (replication_mutation) |*lease| lease.release();
             if (!bypass_replication_write_gate) try self.enforceReplicationWriteGate();
             if (status != .committed) {
-                try admission.lockApply(self, retained);
+                try admission.lockApplyForCompletion(self, retained);
                 defer S.ownerField(self, "core").*.unlockApply();
                 var marker_value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
                 const marker_writes: []const docstore_mod.KVPair = if (ordered_receipt) |identity| blk: {
@@ -4361,7 +4365,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try admission.checkLifetime(retained);
                 const schema_namespace = S.ownerField(self, "core").*.schemaNamespaceGeneration();
                 var accepted: ?transactions_mod.PreparedEffects = blk: {
-                    try admission.lockApply(self, retained);
+                    try admission.lockApplyForCompletion(self, retained);
                     defer S.ownerField(self, "core").*.unlockApply();
                     var manager = try S.ownerField(self, "core").*.initTxnManager();
                     defer manager.deinit();
@@ -4386,7 +4390,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     intent_keys[intents.writes.len + i] = key;
                 }
                 if (accepted == null and intents.writes.len == 0 and intents.deletes.len == 0) {
-                    try admission.lockApply(self, retained);
+                    try admission.lockApplyForCompletion(self, retained);
                     if (schema_namespace != S.ownerField(self, "core").*.schemaNamespaceGeneration()) {
                         S.ownerField(self, "core").*.unlockApply();
                         return error.PreparedGenerationChanged;
@@ -4445,6 +4449,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }, null, .{
                     .visibility_cancellation = visibility_cancellation,
                     .admission_controls = retained,
+                    .avoid_admission_capacity_cycle = controls != null,
+                    .committed_visibility_wait = if (controls) |original| original.execution_wait else null,
                     .enclosing_mutation_retirement = &replication_mutation,
                     .mutation_root = admission.receiverMutationRoot(self),
                     .bypass_replication_write_gate = bypass_replication_write_gate,

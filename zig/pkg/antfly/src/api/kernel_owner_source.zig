@@ -1214,6 +1214,8 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .txn_begin_group_local_with_pre_decision_context = txnBeginGroupLocalWithPreDecisionContext,
                 .txn_prepare_group_local = txnPrepareGroupLocal,
                 .txn_resolve_group_local = txnResolveGroupLocal,
+                .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
+                .txn_resolve_group_local_with_execution = txnResolveGroupLocalWithExecution,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .txn_status_group_local_with_request = txnStatusGroupLocalWithRequest,
                 .txn_preparation_status_group_local = txnPreparationStatusGroupLocal,
@@ -6231,6 +6233,21 @@ pub const ProvisionedKernelOwnerSource = struct {
         return {};
     }
 
+    const NativeTransactionControls = struct {
+        require_checked_reentry: bool = true,
+        context: request_operation.RequestContext,
+        route: ?metadata_api.CatalogRouteFence,
+        execution_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed,
+        fn check(value: @This()) !void {
+            try @import("../storage/hot_standby/owner_preflight_admission.zig").checkOriginal(value.context, value.execution_runnable);
+            if (value.route) |fence| try @import("../storage/hot_standby/owner_preflight_admission.zig").checkOriginal(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation }, null);
+            if (value.execution_runnable) |borrow| {
+                const status = borrow.checkpoint(borrow.context);
+                if (!status.isOk()) return @import("antfly_runtime_abi").error_abi.errorFromStatus(status);
+            }
+        }
+    };
+
     fn txnBeginGroupLocalWithPreDecisionContext(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -6252,20 +6269,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         var receiver = if (context.deadline_io) |borrow| try borrow.receive() else null;
         const io = if (receiver) |*received| received.io() else if (self.context_runtime) |runtime| runtime.io() orelse return error.BackendRuntimeIoUnavailable else return error.BackendRuntimeIoUnavailable;
-        const Controls = struct {
-            require_checked_reentry: bool = true,
-            context: request_operation.RequestContext,
-            route: ?metadata_api.CatalogRouteFence,
-            execution_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed,
-            fn check(value: @This()) !void {
-                try @import("../storage/hot_standby/owner_preflight_admission.zig").checkOriginal(value.context, value.execution_runnable);
-                if (value.route) |fence| try @import("../storage/hot_standby/owner_preflight_admission.zig").checkOriginal(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation }, null);
-                if (value.execution_runnable) |borrow| {
-                    const status = borrow.checkpoint(borrow.context);
-                    if (!status.isOk()) return @import("antfly_runtime_abi").error_abi.errorFromStatus(status);
-                }
-            }
-        };
+        const Controls = NativeTransactionControls;
         const Budget = @import("antfly_local_sources").common_read_execution_budget.Budget(Controls, Controls.check);
         const admission = @import("antfly_local_sources").common_read_admission;
         var budget: Budget = .{ .controls = .{ .context = active, .route = context.route_fence, .execution_runnable = context.execution_runnable }, .io = io };
@@ -6355,6 +6359,46 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .commit_version = commit_version,
             } },
         });
+        return {};
+    }
+
+    fn txnResolveGroupLocalWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_types.TxnId, status: db_types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_types.SyncLevel, cancellation: db_types.CancellationToken) !?void {
+        return txnResolveGroupLocalWithExecution(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, .{ .cancellation = cancellation });
+    }
+
+    fn txnResolveGroupLocalWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_types.TxnId, status: db_types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_types.SyncLevel, context: @import("antfly_local_sources").api_distributed_txn_contract.PreDecisionContext) !?void {
+        const original = @import("../storage/hot_standby/owner_preflight_admission.zig");
+        const active: request_operation.RequestContext = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .cancellation = context.cancellation };
+        try original.checkOriginal(active, context.execution_runnable);
+        if (context.route_fence) |fence| try original.checkOriginal(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation }, null);
+        if (context.restore_staging_scope != null or context.restore_staging_plan_id != null) return error.UnsupportedOperation;
+        if (!context.requiresAwareCallback()) return txnResolveGroupLocal(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level);
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var receiver = if (context.deadline_io) |borrow| try borrow.receive() else null;
+        const io = if (receiver) |*received| received.io() else if (self.context_runtime) |runtime| runtime.io() orelse return error.BackendRuntimeIoUnavailable else return error.BackendRuntimeIoUnavailable;
+        const Controls = NativeTransactionControls;
+        const Budget = @import("antfly_local_sources").common_read_execution_budget.Budget(Controls, Controls.check);
+        const admission = @import("antfly_local_sources").common_read_admission;
+        var budget: Budget = .{ .controls = .{ .context = active, .route = context.route_fence, .execution_runnable = context.execution_runnable }, .io = io };
+        var adapter: admission.Adapter(*Budget) = .{ .budget = &budget };
+        const payload = adapter.payload();
+        const control = admission.Port.init(&payload);
+        if (context.route_fence) |fence| {
+            if (fence.topology_epoch != topology_epoch) return error.TopologyChanged;
+            try self.validateRoutedReadControlled(alloc, fence, group_id, table_name, control);
+        }
+        var lease = try self.acquireWithControls(group_id, table_name, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation, .execution_runnable = context.execution_runnable, .retain_cpu = true });
+        defer lease.deinit();
+        if (lease.entry.restore_bootstrap_json.len != 0) return error.UnsupportedOperation;
+        if (context.route_fence) |fence| {
+            const identity = fence.route.identity_namespace;
+            if (identity.table_id != lease.entry.identity.table_id or identity.shard_id != lease.entry.identity.shard_id or identity.range_id != lease.entry.identity.range_id) return error.TopologyChanged;
+        }
+        try lease.owner().transactionResolveWithAdmission(table_name, txn_id, switch (status) {
+            .pending => return error.InvalidBatchRequest,
+            .committed => .committed,
+            .aborted => .aborted,
+        }, commit_version, @fromBackingInt(@intCast(@backingInt(sync_level))), &control);
         return {};
     }
 
@@ -9021,4 +9065,20 @@ test "controlled native BEGIN source rejects original execution before owner or 
 test "controlled native BEGIN source carries real typed operation through production ownership" {
     var source: ProvisionedKernelOwnerSource = undefined;
     _ = source.writeSource().txnBeginGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "docs", @splat(1), 2, 3, false, &.{}, .{ .deadline_ns = 10 }) catch {};
+}
+
+test "controlled native completion source rejects original admission before source access" {
+    const Reject = struct {
+        fn check(_: *const anyopaque) !void {
+            return error.MemoryLimitExceeded;
+        }
+    };
+    var marker: u8 = 0;
+    var source: ProvisionedKernelOwnerSource = undefined;
+    try std.testing.expectError(error.MemoryLimitExceeded, ProvisionedKernelOwnerSource.txnResolveGroupLocalWithExecution(&source, std.testing.allocator, 7, "docs", @splat(1), .aborted, 2, 3, .write, .{ .cancellation = .{ .ptr = &marker, .check_fn = Reject.check }, .restore_staging_scope = @splat(1) }));
+}
+
+test "controlled native completion source analyzes real owner acquisition" {
+    var source: ProvisionedKernelOwnerSource = undefined;
+    _ = source.writeSource().txnResolveGroupLocalWithExecution(std.testing.allocator, 7, "docs", @splat(1), .aborted, 2, 3, .write, .{ .deadline_ns = 10 }) catch {};
 }
