@@ -836,3 +836,43 @@ leases, atomic replay grants, derived-log quota and executable recovery bundles
 remain required before normal PREPARE driver activation. The full scheduling
 objective remains incomplete. Full Linux qualification is waived; public source
 packaging and the full storage archive were not requalified by this run.
+
+
+### Atomic accepted-frame and HA replay reservation seal
+
+The trusted `TxnManager.sealPreparedEffectsAndReplayPlan` path validates the
+stored intent/catalog contract and route binding, derives the replay key plan
+from the supplied canonical request and decoded accepted effects, then publishes
+the immutable frame, HA replay grant/claims and extra receipt in one backend
+batch. A refused grant leaves no newly sealed frame or receipt; inputs remain
+mutable within their separate intent-admission envelope. An identical retry
+preserves debt, while changing the plan cannot replace an accepted reservation.
+
+Backend batch callbacks now carry the borrowed scalar/key reservation and
+confirmed-abort cancellation into the DocStore owner. Ordinary batch staging is
+separate from commit so the grant is attached before publication. All three
+transaction resolution writer branches release an existing prepared grant on
+an authoritative abort before deleting its frame, in the same batch. Failed
+allocation or original cancellation rolls the entire transition back. Raw
+backends lacking the reservation capability fail closed. Native ABI 53 and
+storage owner ABI 111 reject older callback layouts; reader version 11 and all
+durable codecs remain unchanged.
+
+This API trusts the caller to supply the complete canonical request, including
+auxiliary/group physical and replay effects under retained schema/catalog/route
+witnesses. It does not certify an arbitrary DerivedBatch or fund the derived-log
+quota and executable recovery RAM/CPU/I/O/dependency bundle. The normal committed
+resolution driver does not yet materialize/consume this HA grant. Normal
+PREPARE drivers and strong provider activation remain off; the full scheduler
+objective and migration/legacy eligibility requirements remain incomplete.
+
+`prepared-replay-atomic-seal-verified.json` binds source commit `5875031295`,
+5,286 native/schema input hashes and all 4,559 packaged public sources. The final
+native run passed 72 custom-runner cases plus two owner-boundary cases, 97/97
+build steps, with no skips, failures or leaks. Five new cases cover atomic
+frame/grant/receipt publication, retry conflicts, saturated-pool refusal,
+allocation/checkpoint rollback for both sealing and abort, and unsupported raw
+backends. The unchanged independent ReleaseSafe package consumer passed 25/25
+compile steps. Generated error-table and storage control-catalog checks also
+passed. This is module-consumer qualification, not a full provider/storage
+archive or cold-runtime qualification. Full Linux qualification remains waived.
