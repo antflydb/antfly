@@ -4,6 +4,49 @@ Baseline: `e4d707de5634a8d758c606b4432037e1a1682052`. Design:
 [WORKLOAD_SCHEDULING.md](WORKLOAD_SCHEDULING.md). Branch:
 `codex/workload-scheduling` (PR #849).
 
+## Storage controls repaired and current main merged (2026-10-20)
+
+Fixture repair `0f1653e4e120029ba8c3d9aa89c97ca677f5d931` and merge
+`b81563cddd6bd86941e40ebcdf2b1bf805113605` supersede the earlier 25-failure storage-controls gate.
+The same branch and PR now include origin/main
+`d227ec2811235d618b8e50d86ab4b1472b207cc4`. No additional worktree, branch or PR was created.
+
+All 51 text-statistics control cases pass, including the cases that previously
+crashed. Seven native I/O test adapters now forward lifetime-only checks while
+CPU is loaned. Accounting fixtures explicitly include retained identity tables
+in the physical parent envelope; payload, cache/control allocation, cancellation,
+retirement and final destruction checks remain enforced. Legacy reclaimer fault
+preparation uses the charged identity allocator instead of directly growing its
+unaccounted map. These are qualification-fixture repairs, not relaxed production
+admission or accounting rules. All 119 resource-accounting cases also pass.
+
+The main merge retains grouped-source publication and resolver curation alongside
+original execution authority and retirement. Grouped publication cuts and borrowed
+execution waits share one implementation. Single decision jobs stay inline,
+borrowed parent execution is preserved, SDK streaming keeps local admission, and
+control consumers retain the selected DB source boundary. Required preparation
+remains disabled until its independent migration and producer work is complete.
+
+Merged compatibility contracts are native ABI 44, owner ABI 104, engine descriptor
+and accessor symbols 29, API kernel ABI 54, runtime-failure ABI 64, required
+preparation reader floor 10, data-Raft protocol 28 and metadata protocol 36.
+Released main grouped/resolver protocol numbers remain unchanged; unpublished
+preparation and remote initialization use distinct later gates.
+
+`native-storage-controls-main-merge-verified.json` binds the final source hashes,
+13 passing native targets (126/126 build steps and 69/69 standard tests, plus
+custom-runner cases), both production startup profiles and owner/mutation
+analysis, 109 Python SDK tests, 143 TypeScript SDK tests and type checking.
+An immutable merged-commit package contains 4541 verified public sources
+and passes all 25 ReleaseSafe consumer steps. Generated errors and the storage
+control catalog match. Actual native cold-open completion and the full linked
+storage-owner archive remain unqualified. Full Linux qualification remains waived.
+
+The full goal remains incomplete. Next are required mutation providers and their
+funded original producers, authenticated hidden-owner preparation and fresh route
+authority; migration/activation, large frames, completion resource bundles and the
+broader scheduler/fault scope also remain open.
+
 ## Independently prepared online status owners (2026-10-20)
 
 Source `090dc709dce3b77143bc5444f9013c7e1fd13625` schedules current online owner

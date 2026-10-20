@@ -15,10 +15,11 @@ Original source baseline: `e4d707de5634a8d758c606b4432037e1a1682052` on
 branch, `codex/workload-scheduling`, in `.worktrees/workload-scheduling`, and
 [PR #849](https://github.com/antflydb/antfly/pull/849). Subsequent main merges and
 implementation evidence are recorded in the implementation ledger.
-The current merge includes `origin/main` at `fc9bea9f20194754644605d796c00beeb1f325d0`.
+The current merge includes `origin/main` at `d227ec2811235d618b8e50d86ab4b1472b207cc4`
+(merge commit `b81563cddd6bd86941e40ebcdf2b1bf805113605`).
 
-Native ABI 43, storage-owner ABI 103, engine descriptor 28, file floor 7 and
-Raft protocol 25 fence persistent binding, original cohort handoff and typed
+Native ABI 44, storage-owner ABI 104, engine descriptor 29, required preparation
+file floor 10 and data-Raft protocol 28 fence persistent binding, original cohort handoff and typed
 recovery status. New stable SQL/HTTP sessions retain their original routed
 cohort before BEGIN. Required status compares actual saved mode and binding and
 represents successful absence explicitly; read errors cannot authorize a fresh
@@ -30,10 +31,12 @@ original expiry, adaptive admitted workspace and fresh metadata/quorum
 confirmation. Pending owners cannot serve status; original failures remain
 errors. Committed apply work preempts initial online certification, and checked
 I/O suspension leaves foreground CPU available. The focused build and
-public-package consumer checks pass. The broader storage controls suite still
-has 25 failures, including four crashes, versus 27 in the one-file baseline; no
-new failing case appears. Repairing those correctness failures takes priority
-before activation. Required mutation providers and original producers,
+public-package consumer checks pass. The storage-controls repairs now pass all
+51 cases with no crashes, plus 119 physical resource-accounting cases. The merged
+source passes 13 focused native targets, 109 Python SDK tests, 143 TypeScript SDK
+tests and type checking, and 25 immutable-package ReleaseSafe consumer steps.
+See the latest implementation ledger section and its verified receipt.
+Required mutation providers and original producers,
 hidden-owner preparation, fresh route authority, transport,
 migration/activation, completion resource bundles and broader fault
 qualification remain open. Full linked storage-owner runtime remains unqualified
