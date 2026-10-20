@@ -1361,6 +1361,11 @@ pub const IndexManager = struct {
     /// Exact persisted envelope requirement, independent of temporary reader
     /// reservations and parent/child feature-epoch aggregation.
     resolver_catalog_format_version: std.atomic.Value(u32) = .init(1),
+    /// Witness of the catalog snapshot validated by load or durable publication.
+    /// Unvalidated/ambiguous DocStore commits invalidate it without JSON work at
+    /// required BEGIN. A missing primary owner cannot attest DB eligibility.
+    resolver_catalog_attested_revision: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
+    resolver_catalog_attested_import: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
     alloc: Allocator,
     base_path: []u8,
     byte_range: docstore_mod.ByteRange,
@@ -22523,6 +22528,8 @@ pub const IndexManager = struct {
     /// The caller holds catalog_mutex from before opening txn through commit
     /// and publication of the returned reader/envelope stamp.
     pub fn alignRowDerivedArtifactCatalogNoLock(self: *IndexManager, txn: anytype, expected: @import("../artifact_inventory.zig").Catalogs, configs: []const types.IndexConfig) !CatalogReaderStamp {
+        const revision = self.catalogRevision();
+        const import_revision = self.catalogImportRevision();
         const inventory = @import("../artifact_inventory.zig");
         try inventory.requirePreparedCatalogUnchanged(txn, index_catalog_key, expected.indexes);
         try inventory.requirePreparedCatalogUnchanged(txn, enrichment_catalog_key, expected.enrichments);
@@ -22534,6 +22541,8 @@ pub const IndexManager = struct {
             return .{
                 .reader = try resolver_catalog.readMinimumReaderVersion(txn, resolver_catalog.supported_reader_version),
                 .format = if (expected.resolvers.len == 0) 1 else try resolver_catalog.catalogReaderVersion(self.alloc, expected.resolvers),
+                .revision = revision,
+                .import_revision = import_revision,
             };
         }
         if (self.count() != configs.len or self.text_indexes.items.len + self.dense_indexes.items.len + self.sparse_indexes.items.len != configs.len or self.resolvers.items.len != 0 or self.failed_index_loads.count() != 0) return error.ArtifactCatalogDrift;
@@ -22618,7 +22627,7 @@ pub const IndexManager = struct {
             };
         }
         try @import("../artifact_inventory.zig").refresh(txn);
-        return .{ .reader = reader_version, .format = desired_format };
+        return .{ .reader = reader_version, .format = desired_format, .revision = docstore_mod.DocStore.CatalogRevision.afterCommit(revision), .import_revision = import_revision };
     }
 
     pub fn matchesArtifactInventory(self: *IndexManager, expected: @import("../artifact_inventory.zig").Catalogs) !bool {
@@ -23172,18 +23181,44 @@ pub const IndexManager = struct {
         self.storeGeneratedEnrichmentTargetCache(try self.computeGeneratedEnrichmentTargetCache());
     }
 
-    const CatalogReaderStamp = struct { reader: u32, format: u32 };
+    const CatalogReaderStamp = struct { reader: u32, format: u32, revision: ?u64 = null, import_revision: ?u64 = null };
+
+    fn catalogRevision(self: *const IndexManager) ?u64 {
+        const store = self.primary_store orelse return null;
+        return store.resolver_catalog_revision.read();
+    }
+
+    fn catalogImportRevision(self: *const IndexManager) ?u64 {
+        const store = self.primary_store orelse return null;
+        return store.portableImportRevision() catch return null;
+    }
+
+    /// Caller holds apply/catalog ownership. This checks a publication witness,
+    /// not an inference from native ABI or an unaudited cached format integer.
+    pub fn hasPreparedCatalogAttestation(self: *const IndexManager, store: *const docstore_mod.DocStore) bool {
+        if (self.primary_store != store) return false;
+        if (store.portableImportPublicationInProgress()) return false;
+        const import_revision = store.portableImportRevision() catch return false;
+        if (self.resolver_catalog_attested_import.load(.acquire) != import_revision) return false;
+        const revision = self.resolver_catalog_attested_revision.load(.acquire);
+        if (self.resolver_catalog_format_version.load(.acquire) < resolver_catalog.prepared_transaction_reader_version) return false;
+        return store.resolver_catalog_revision.matches(revision);
+    }
 
     /// Publish only after durability, while retaining the catalog publication fence.
     pub fn publishCatalogReaderStamp(self: *IndexManager, stamp: CatalogReaderStamp) void {
         self.resolver_catalog_format_version.store(stamp.format, .release);
         self.minimum_reader_version.store(stamp.reader, .release);
+        self.resolver_catalog_attested_import.store(stamp.import_revision orelse std.math.maxInt(u64), .release);
+        self.resolver_catalog_attested_revision.store(stamp.revision orelse std.math.maxInt(u64), .release);
     }
 
     /// Older writers do not retain shadow replay or honor reserved names. Fence
     /// them while any reservation exists, preserving the feature epoch in a
     /// separate baseline. Marker publication/removal and fencing share a txn.
     fn stampCatalogReaderVersion(self: *IndexManager, txn: anytype, catalog: []const u8) !CatalogReaderStamp {
+        const revision = self.catalogRevision();
+        const import_revision = self.catalogImportRevision();
         const current = try resolver_catalog.readMinimumReaderVersion(txn, resolver_catalog.supported_reader_version);
         const baseline_raw = txn.get(replacement_reader_base_key) catch |err| switch (err) {
             error.NotFound => null,
@@ -23233,7 +23268,7 @@ pub const IndexManager = struct {
         if (pending) {
             try txn.put(replacement_reader_base_key, try resolver_catalog.readerVersionBytes(authoritative));
         } else if (baseline_raw != null) try txn.delete(replacement_reader_base_key);
-        return .{ .reader = version, .format = if (fenced_catalog != null) version else catalog_version };
+        return .{ .reader = version, .format = if (fenced_catalog != null) version else catalog_version, .revision = docstore_mod.DocStore.CatalogRevision.afterCommit(revision), .import_revision = import_revision };
     }
 
     /// Permanent requirements exclude a temporary reservation fence. Parent
@@ -23261,6 +23296,8 @@ pub const IndexManager = struct {
     }
 
     fn aggregateReaderVersionNoLock(self: *IndexManager, store: anytype, required: u32) !void {
+        const revision = self.catalogRevision();
+        const import_revision = self.catalogImportRevision();
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
@@ -23292,13 +23329,16 @@ pub const IndexManager = struct {
         }
         try txn.commit();
         if (version >= resolver_catalog.graph_expiration_namespace_reader_version) {
-            self.resolver_catalog_format_version.store(version, .release);
+            self.publishCatalogReaderStamp(.{ .reader = version, .format = version, .revision = docstore_mod.DocStore.CatalogRevision.afterCommit(revision), .import_revision = import_revision });
             self.invalidateWritePlanSnapshot();
         }
         self.minimum_reader_version.store(version, .release);
     }
 
     fn loadResolverCatalog(self: *IndexManager, store: anytype) !void {
+        self.resolver_catalog_attested_revision.store(std.math.maxInt(u64), .release);
+        const revision = self.catalogRevision();
+        const import_revision = self.catalogImportRevision();
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginRead();
@@ -23336,6 +23376,8 @@ pub const IndexManager = struct {
             const definitions = if (cfg.retired) &self.retired_resolvers else &self.resolvers;
             try definitions.append(self.alloc, try resolver_catalog.ResolverConfig.clone(self.alloc, cfg));
         }
+        self.resolver_catalog_attested_import.store(import_revision orelse std.math.maxInt(u64), .release);
+        self.resolver_catalog_attested_revision.store(revision orelse std.math.maxInt(u64), .release);
     }
 
     fn resolverDefinitionsAlloc(self: *const IndexManager, alloc: Allocator) ![]resolver_catalog.ResolverConfig {

@@ -124610,6 +124610,217 @@ test "db prepared transaction effects required protocol preserves every admissio
     }
 }
 
+test "db prepared transaction effects required catalog witness rejects active overlapping and exhausted revisions" {
+    const Revision = docstore_mod.DocStore.CatalogRevision;
+    var revision: Revision = .{};
+    const original = revision.read().?;
+    revision.beginWrite();
+    try std.testing.expect(revision.read() == null);
+    try std.testing.expect(!revision.matches(original));
+    revision.beginWrite();
+    revision.endWrite();
+    try std.testing.expect(revision.read() == null);
+    revision.endWrite();
+    try std.testing.expect(!revision.matches(original));
+    try std.testing.expect(!revision.matches(Revision.afterCommit(original).?));
+    const current = revision.read().?;
+    revision.beginWrite();
+    revision.endWrite();
+    try std.testing.expect(revision.matches(Revision.afterCommit(current).?));
+    revision.epoch.store(std.math.maxInt(u64) - 2, .release);
+    try std.testing.expect(Revision.afterCommit(revision.read()) == null);
+    revision.beginWrite();
+    revision.endWrite();
+    try std.testing.expect(revision.read() == null);
+    revision.beginWrite();
+    revision.endWrite();
+    try std.testing.expect(revision.read() == null);
+}
+
+test "db prepared transaction effects required catalog attestation avoids allocator work and survives aborted writes" {
+    const a = std.testing.allocator;
+    const key = @import("artifact_inventory.zig").resolver_key;
+    var directory = try TestDirectory.init("prepared-catalog-attestation");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.enablePreparedTransactionProtocol();
+    const revision = db.core.store.resolver_catalog_revision.read().?;
+    // Ordinary document/metadata traffic must not invalidate the catalog, even
+    // though it invalidates retained query generations.
+    try db.core.store.put("ordinary metadata", "value");
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        defer txn.abort();
+        try txn.put(key, "not committed JSON");
+    }
+    {
+        var batch = try db.core.store.beginWriteBatch();
+        defer batch.abort();
+        try batch.delete(key);
+    }
+    try std.testing.expect(db.core.store.resolver_catalog_revision.matches(revision));
+    var unavailable = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    const saved = db.core.alloc;
+    db.core.alloc = unavailable.allocator();
+    defer db.core.alloc = saved;
+    // The old check parsed the full catalog with this allocator on each call.
+    for (0..8) |_| try db.core.requirePreparedTransactionProtocol(null);
+    try std.testing.expectEqual(@as(usize, 0), unavailable.allocated_bytes);
+}
+
+test "db prepared transaction effects required catalog raw transaction batch append and delete invalidate admission" {
+    const a = std.testing.allocator;
+    const key = @import("artifact_inventory.zig").resolver_key;
+    const Mode = enum { transaction_put, batch_put, batch_append, transaction_delete, batch_delete };
+    inline for (std.meta.tags(Mode)) |mode| {
+        var directory = try TestDirectory.init("prepared-catalog-raw");
+        defer directory.cleanup();
+        {
+            var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+            defer db.close();
+            try db.enablePreparedTransactionProtocol();
+            const revision = db.core.store.resolver_catalog_revision.read().?;
+            switch (mode) {
+                .transaction_put, .transaction_delete => {
+                    var txn = try db.core.store.beginWriteTxn();
+                    errdefer txn.abort();
+                    if (mode == .transaction_put) try txn.put(key, "{\"version\":5,\"resolvers\":[]}") else try txn.delete(key);
+                    try txn.commit();
+                },
+                .batch_put, .batch_append, .batch_delete => {
+                    var batch = try db.core.store.beginWriteBatch();
+                    errdefer batch.abort();
+                    switch (mode) {
+                        .batch_put => try batch.put(key, "{\"version\":5,\"resolvers\":[]}"),
+                        .batch_append => try batch.asTxn().appendPut(key, "{\"version\":5,\"resolvers\":[]}"),
+                        .batch_delete => try batch.delete(key),
+                        else => unreachable,
+                    }
+                    try batch.commit();
+                },
+            }
+            try std.testing.expect(!db.core.store.resolver_catalog_revision.matches(revision));
+            try std.testing.expectError(error.InvalidPreparedTransactionProtocol, db.core.requirePreparedTransactionProtocol(null));
+            const id: types.TxnId = @splat(0xe1);
+            try std.testing.expectError(error.InvalidPreparedTransactionProtocol, db.core.beginTransactionRequiringPreparedEffects(id, 1, 1, &.{}, true, true, .{ .mode = .synchronous }, .{}, null));
+            var manager = try db.core.initTxnManager();
+            defer manager.deinit();
+            try std.testing.expectError(error.TxnNotFound, manager.getTransactionStatus(id));
+        }
+        // Reload validates actual durable bytes; absence cannot borrow the
+        // previous process's format attestation, while valid envelopes recover.
+        var reopened = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+        defer reopened.close();
+        if (mode == .transaction_delete or mode == .batch_delete)
+            try std.testing.expectError(error.InvalidPreparedTransactionProtocol, reopened.core.requirePreparedTransactionProtocol(null))
+        else
+            try reopened.core.requirePreparedTransactionProtocol(null);
+    }
+}
+
+test "db prepared transaction effects required catalog ambiguous commit invalidates old attestation" {
+    const erased = backend_erased_mod;
+    const Fault = struct {
+        inner: erased.Batch,
+        publish: bool,
+        committed: bool = false,
+        revision: *const docstore_mod.DocStore.CatalogRevision,
+        fn cast(ptr: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(ptr));
+        }
+        fn commit(_: Allocator, ptr: *anyopaque) !void {
+            const self = cast(ptr);
+            try std.testing.expect(self.revision.read() == null);
+            if (self.publish) {
+                try self.inner.commit();
+                self.committed = true;
+            }
+            return error.TestCommitReplyLost;
+        }
+        fn abort(_: Allocator, ptr: *anyopaque) void {
+            const self = cast(ptr);
+            if (!self.committed) self.inner.abort();
+        }
+        fn get(ptr: *anyopaque, key: []const u8) ![]const u8 {
+            return cast(ptr).inner.get(key);
+        }
+        fn put(ptr: *anyopaque, key: []const u8, value: []const u8) !void {
+            return cast(ptr).inner.put(key, value);
+        }
+        fn delete(ptr: *anyopaque, key: []const u8) !void {
+            return cast(ptr).inner.delete(key);
+        }
+        fn cursor(_: Allocator, ptr: *anyopaque) !erased.Cursor {
+            return cast(ptr).inner.openCursor();
+        }
+        const vtable: erased.Batch.VTable = .{ .commit = commit, .abort = abort, .get = get, .put = put, .delete = delete, .open_cursor = cursor };
+    };
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |publish| {
+        var directory = try TestDirectory.init("prepared-catalog-ambiguous");
+        defer directory.cleanup();
+        var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try db.enablePreparedTransactionProtocol();
+        var batch = try db.core.store.beginWriteBatch();
+        defer batch.abort();
+        var fault: Fault = .{ .inner = batch.runtime.?, .publish = publish, .revision = &db.core.store.resolver_catalog_revision };
+        batch.runtime = .{ .allocator = a, .ptr = &fault, .vtable = &Fault.vtable };
+        try batch.put(@import("artifact_inventory.zig").resolver_key, "{\"version\":5,\"resolvers\":[]}");
+        try std.testing.expectError(error.TestCommitReplyLost, batch.commit());
+        try std.testing.expectEqual(publish, fault.committed);
+        try std.testing.expect(db.core.store.resolver_catalog_revision.read() != null);
+        try std.testing.expectError(error.InvalidPreparedTransactionProtocol, db.core.requirePreparedTransactionProtocol(null));
+    }
+}
+
+test "db prepared transaction effects required catalog attestation rejects generation adoption and reloads authority" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("prepared-catalog-import-witness");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.enablePreparedTransactionProtocol();
+    try db.core.store.beginPortableImportPublication(std.testing.io);
+    db.core.store.finishPortableImportPublication();
+    try std.testing.expectError(error.InvalidPreparedTransactionProtocol, db.core.requirePreparedTransactionProtocol(null));
+    try db.core.loadIndexCatalogOnly();
+    try db.core.requirePreparedTransactionProtocol(null);
+}
+
+test "db prepared transaction effects required catalog partial reload cannot publish a format attestation" {
+    const a = std.testing.allocator;
+    const key = @import("artifact_inventory.zig").resolver_key;
+    var directory = try TestDirectory.init("prepared-catalog-incomplete-load");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.enablePreparedTransactionProtocol();
+    // The header is supported, but the resolver definition cannot be loaded.
+    // Publishing the cached version before deserialization is insufficient.
+    try db.core.store.put(key, "{\"version\":5,\"resolvers\":[{}]}");
+    try std.testing.expectError(error.MissingField, db.core.loadIndexCatalogOnly());
+    try std.testing.expectError(error.InvalidPreparedTransactionProtocol, db.core.requirePreparedTransactionProtocol(null));
+    try db.core.store.put(key, "{\"version\":5,\"resolvers\":[]}");
+    try db.core.loadIndexCatalogOnly();
+    try db.core.requirePreparedTransactionProtocol(null);
+}
+
+test "db prepared transaction effects required catalog eligibility rejects oversized reader sidecars" {
+    const a = std.testing.allocator;
+    const catalog = @import("catalog/resolver_catalog.zig");
+    for ([_][]const u8{ catalog.minimum_reader_key, catalog.replacement_reader_base_key }) |key| {
+        var directory = try TestDirectory.init("prepared-catalog-floor-size");
+        defer directory.cleanup();
+        var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try db.enablePreparedTransactionProtocol();
+        try db.core.store.put(key, "0000000000000000000000000000000000000000000000005");
+        try std.testing.expectError(error.InvalidPreparedTransactionProtocol, db.core.requirePreparedTransactionProtocol(null));
+    }
+}
+
 test "db prepared transaction effects required begin gates legacy commit" {
     const a = std.testing.allocator;
     var directory = try TestDirectory.init("required-prepare-db");

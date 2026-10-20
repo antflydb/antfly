@@ -453,6 +453,47 @@ fn updateGraphEndpointCleanupAdmission(txn: anytype, alloc: Allocator, key: []co
 }
 
 pub const DocStore = struct {
+    /// A process-local witness for a validated resolver catalog. Unlike the
+    /// query revision this changes only for catalog commits, including ambiguous
+    /// outcomes. Active writers and a second revision advance close the window
+    /// between backend publication and returning from commit. Saturation poisons
+    /// attestations permanently rather than allowing an ABA wrap.
+    pub const CatalogRevision = struct {
+        epoch: std.atomic.Value(u64) = .init(0),
+        writers: std.atomic.Value(usize) = .init(0),
+
+        fn advance(self: *@This()) void {
+            var previous = self.epoch.load(.acquire);
+            while (previous != std.math.maxInt(u64)) {
+                previous = self.epoch.cmpxchgWeak(previous, previous + 1, .acq_rel, .acquire) orelse return;
+            }
+        }
+        pub fn beginWrite(self: *@This()) void {
+            _ = self.writers.fetchAdd(1, .acq_rel);
+            self.advance();
+        }
+        pub fn endWrite(self: *@This()) void {
+            self.advance();
+            const previous = self.writers.fetchSub(1, .acq_rel);
+            std.debug.assert(previous != 0);
+        }
+        pub fn read(self: *const @This()) ?u64 {
+            if (self.writers.load(.acquire) != 0) return null;
+            const epoch = self.epoch.load(.acquire);
+            if (epoch == std.math.maxInt(u64) or self.writers.load(.acquire) != 0 or self.epoch.load(.acquire) != epoch) return null;
+            return epoch;
+        }
+        pub fn matches(self: *const @This(), epoch: u64) bool {
+            return (self.read() orelse return false) == epoch;
+        }
+        pub fn afterCommit(epoch: ?u64) ?u64 {
+            const before = epoch orelse return null;
+            if (before >= std.math.maxInt(u64) - 2) return null;
+            return before + 2;
+        }
+    };
+
+    resolver_catalog_revision: CatalogRevision = .{},
     payload_store: ?artifact_payload.Store = null,
     payload_capture_inline: bool = false,
     payload_migration_allowance: ?u64 = null,
@@ -523,6 +564,7 @@ pub const DocStore = struct {
         publication_backlog: @import("publication_backlog.zig").Capture = .{},
         document_revisions: @import("document_mutation_revision.zig").Capture = .{},
         artifact_inventory: artifact_replay_inventory.Capture = .{},
+        resolver_catalog_mutated: bool = false,
         mutation_capture: ?*@import("txn_mutation_capture.zig").Capture = null,
         payload_session: ?*artifact_payload.Session = null,
         alloc: Allocator,
@@ -627,6 +669,9 @@ pub const DocStore = struct {
             if (payload_session) |session| try session.stageReferenceEpoch(self);
             try self.publication_backlog.stage(self);
             if (payload_session) |session| try session.prepareCommit();
+            const catalog_owner = if (self.resolver_catalog_mutated) self.columnar_owner else null;
+            if (catalog_owner) |owner| owner.resolver_catalog_revision.beginWrite();
+            defer if (catalog_owner) |owner| owner.resolver_catalog_revision.endWrite();
             if (payload_session) |session| session.primary_commit_attempted = true;
             if (self.write) |*write| {
                 try write.commit();
@@ -847,6 +892,7 @@ pub const DocStore = struct {
             try self.invalidateColumns(key);
 
             const stored = if (self.payload_session) |session| try session.put(key, value) else value;
+            if (std.mem.eql(u8, key, "\x00\x00__metadata__:resolvers")) self.resolver_catalog_mutated = true;
             try self.write.?.put(key, if (self.payload_session) |session| session.primaryValue(value, stored) else stored);
             if (self.payload_session) |session| try session.recordOwnership(&self.write.?, key, stored);
         }
@@ -882,6 +928,7 @@ pub const DocStore = struct {
             try self.markColumnarDirty(key, null);
             try self.invalidateColumns(key);
 
+            if (std.mem.eql(u8, key, "\x00\x00__metadata__:resolvers")) self.resolver_catalog_mutated = true;
             self.write.?.delete(key) catch |err| {
                 if (err != error.NotFound or !@import("publication_backlog.zig").isObligation(key)) return err;
             };
@@ -987,6 +1034,7 @@ pub const DocStore = struct {
         publication_backlog: @import("publication_backlog.zig").Capture = .{},
         document_revisions: @import("document_mutation_revision.zig").Capture = .{},
         artifact_inventory: artifact_replay_inventory.Capture = .{},
+        resolver_catalog_mutated: bool = false,
         columnar_owner: ?*DocStore = null,
         payload_session: ?*artifact_payload.Session = null,
         alloc: Allocator,
@@ -1010,6 +1058,7 @@ pub const DocStore = struct {
             publication_gate: ?*std.atomic.Mutex,
             document_revisions: *@import("document_mutation_revision.zig").Capture,
             artifact_inventory: *artifact_replay_inventory.Capture,
+            resolver_catalog_mutated: *bool,
             retained_cache: ?*std.atomic.Value(u8) = null,
             payload_session: ?*artifact_payload.Session = null,
             alloc: Allocator,
@@ -1086,6 +1135,7 @@ pub const DocStore = struct {
                 try self.invalidateColumns(key);
 
                 const stored = if (self.payload_session) |session| try session.put(key, value) else value;
+                if (std.mem.eql(u8, key, "\x00\x00__metadata__:resolvers")) self.resolver_catalog_mutated.* = true;
                 try self.runtime.?.put(key, if (self.payload_session) |session| session.primaryValue(value, stored) else stored);
                 if (self.payload_session) |session| try session.recordOwnership(self.runtime.?, key, stored);
             }
@@ -1145,6 +1195,7 @@ pub const DocStore = struct {
                 try self.invalidateColumns(key);
 
                 const stored = if (self.payload_session) |session| try session.put(key, value) else value;
+                if (std.mem.eql(u8, key, "\x00\x00__metadata__:resolvers")) self.resolver_catalog_mutated.* = true;
                 try self.runtime.?.appendPut(key, if (self.payload_session) |session| session.primaryValue(value, stored) else stored);
                 if (self.payload_session) |session| try session.recordOwnership(self.runtime.?, key, stored);
             }
@@ -1179,6 +1230,7 @@ pub const DocStore = struct {
                 try self.markColumnarDirty(key, null);
                 try self.invalidateColumns(key);
 
+                if (std.mem.eql(u8, key, "\x00\x00__metadata__:resolvers")) self.resolver_catalog_mutated.* = true;
                 self.runtime.?.delete(key) catch |err| {
                     if (err != error.NotFound or !@import("publication_backlog.zig").isObligation(key)) return err;
                 };
@@ -1279,6 +1331,9 @@ pub const DocStore = struct {
             if (payload_session) |session| try session.stageReferenceEpoch(self);
             try self.publication_backlog.stage(self.asTxn());
             if (payload_session) |session| try session.prepareCommit();
+            const catalog_owner = if (self.resolver_catalog_mutated) self.columnar_owner else null;
+            if (catalog_owner) |owner| owner.resolver_catalog_revision.beginWrite();
+            defer if (catalog_owner) |owner| owner.resolver_catalog_revision.endWrite();
             if (payload_session) |session| session.primary_commit_attempted = true;
             if (self.runtime) |*runtime| {
                 try runtime.commit();
@@ -1306,6 +1361,7 @@ pub const DocStore = struct {
                 .publication_gate = if (self.columnar_owner) |owner| owner.runtime_store.publication_gate orelse &owner.publication_backlog_mutex else null,
                 .document_revisions = &self.document_revisions,
                 .artifact_inventory = &self.artifact_inventory,
+                .resolver_catalog_mutated = &self.resolver_catalog_mutated,
                 .retained_cache = if (self.columnar_owner) |owner| &owner.retained_effects_cache else null,
                 .payload_session = self.payload_session,
                 .alloc = self.alloc,

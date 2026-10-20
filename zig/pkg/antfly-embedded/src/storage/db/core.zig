@@ -2381,18 +2381,28 @@ pub const DBCore = struct {
         const control = trace.bind(original);
         var read = if (control) |owner| try self.store.beginReadTxnWithAdmission(.retain, owner) else try self.store.beginReadTxn();
         defer read.abort();
-        const minimum = catalog.readMinimumReaderVersion(&read, catalog.supported_reader_version) catch |err| return trace.failure orelse err;
+        const Floors = struct {
+            txn: *docstore_mod.DocStore.Txn,
+            pub fn get(self_: *@This(), key: []const u8) ![]const u8 {
+                const raw = try self_.txn.get(key);
+                // Writer-owned decimal u32 sidecars need at most ten bytes.
+                // Reject oversized metadata before parseInt can scan padding.
+                if (raw.len > 10) return error.InvalidPreparedTransactionProtocol;
+                return raw;
+            }
+        };
+        var floors: Floors = .{ .txn = &read };
+        const minimum = catalog.readMinimumReaderVersion(&floors, catalog.supported_reader_version) catch |err| return trace.failure orelse err;
         if (trace.failure) |cause| return cause;
         if (minimum < catalog.prepared_transaction_reader_version) return error.PreparedTransactionProtocolDisabled;
-        const baseline = catalog.readAuthoritativeReaderVersion(&read, catalog.supported_reader_version) catch |err| return trace.failure orelse err;
+        const baseline = catalog.readAuthoritativeReaderVersion(&floors, catalog.supported_reader_version) catch |err| return trace.failure orelse err;
         if (trace.failure) |cause| return cause;
         if (baseline < catalog.prepared_transaction_reader_version) return error.InvalidPreparedTransactionProtocol;
-        const raw = read.get(@import("artifact_inventory.zig").resolver_key) catch |err| {
-            if (trace.failure) |cause| return cause;
-            if (err == error.NotFound) return error.InvalidPreparedTransactionProtocol;
-            return err;
-        };
-        if (try catalog.catalogReaderVersion(self.alloc, raw) < catalog.prepared_transaction_reader_version) return error.InvalidPreparedTransactionProtocol;
+        // The catalog was fully validated on load or at durable publication.
+        // Its DocStore witness changes on every catalog commit attempt, so a
+        // raw or ambiguous mutation fails closed without fetching/parsing an
+        // unbounded resolver document on the required-BEGIN path.
+        if (!self.index_manager.hasPreparedCatalogAttestation(self.store)) return error.InvalidPreparedTransactionProtocol;
         if (control) |owner| try owner.checkpoint();
         if (trace.failure) |cause| return cause;
     }

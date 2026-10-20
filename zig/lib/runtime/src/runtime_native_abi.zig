@@ -67,7 +67,9 @@ const builtin = @import("builtin");
 // Reject older native owners that publish through that durable lease.
 // Merged inference callback dispatch and CUDA allocation ownership require
 // the combined native contract, beyond either pre-merge owner layout.
-pub const abi_version: u32 = 34;
+// DocStore transactions and catalog publishers carry revision witnesses.
+// Reject earlier layouts before reading mutation flags or publication stamps.
+pub const abi_version: u32 = 35;
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 
 pub const TypeContract = extern struct {
