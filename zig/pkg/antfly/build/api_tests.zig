@@ -1387,6 +1387,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-http-deadline-composition-test", "Verify forwarded budgets tighten original HTTP lifetimes without changing clock authority")
         .dependOn(&addFilteredTestRunArtifact(b, http_deadline_composition_tests).step);
 
+    const http_ingress_authorization_tests = b.addTest(.{
+        .name = "http-ingress-authorization-tests",
+        .root_module = options.api_http_runtime_test_mod,
+        .filters = &.{ "online merge ingress bounds owner work using the transport clock", "httpx schema patch merges at the authority and accepts version zero ETag", "httpx antfly routes require auth and enforce admin middleware" },
+        .max_rss = 4 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-http-ingress-authorization-test", "Verify internal merge deadlines and public schema method authorization")
+        .dependOn(&addFilteredTestRunArtifact(b, http_ingress_authorization_tests).step);
+
     const sql_http_ingress_check = b.addTest(.{
         .name = "sql-http-ingress-check",
         .root_module = options.api_http_runtime_test_mod,
