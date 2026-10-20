@@ -19,6 +19,58 @@ The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
 session semantics, correctness, durability and control progress under overload.
 
+## Original authority through provider control boundaries (2026-10-20)
+
+Source `aec0358112df715a12fac03bd0184a82df57a60d` preserves fallible request authority through
+inference checks and the production asset runtime's composed cancellation. Each
+invocation remembers its first rejection atomically, so a boolean transport poll
+cannot consume a one-shot error and let later work resume. Composition advertises
+a fallible check only when an underlying authority supplies one; atomic-only
+transport cancellation retains its compatibility behavior. No request control is
+installed on the shared lifecycle runtime.
+
+Dense/sparse wrappers recheck authority after input sanitization and before
+provider dispatch. Contextual parts/raster callbacks can run without an unused
+legacy callback. Asset calls with a finite deadline, borrowed execution or
+fallible authority reject unscoped generation and memory planning. Value-scoped
+asset calls also enforce the rule for scalar, batched, reported and raster work,
+capability queries and batch planning. Controlled scalar fallback remains valid;
+an uncontrolled batch callback cannot hide it. Late rejection frees owned output
+before acceptance, including partial batches. Quota translation applies only to
+actual OutOfMemory, preserving a different original failure after an allocation
+denial. Asset request-context helpers retain the inference cancellation/timeout aliases.
+
+Native ABI 47 fences the changed private control layouts. API ABI 55,
+storage-owner ABI 109, runnable ABI 16, runtime-failure ABI 66, engine descriptor
+29 and reader floor 10 remain unchanged; there is no durable format change.
+
+`provider-original-controls-v7` passes 88/88 build steps: 36 provider-control
+cases, 21 PDF/funding cases and a 42-case inference test binary containing two
+native HTTP deadline contracts, a discovery sentinel and companions. The focused cases verify
+original rejection during sanitization without dispatch, contextual-only raster
+support, strict callback/planning selection, controlled fallback, late output
+retirement, first-error retention after a transport poll and quota-error identity.
+The immutable-context fixture now uses a valid deadline; a separate expired call
+must fail before provider work. Both startup profiles and the source controller
+have semantic analysis only; full linked archive/cold-source runtime remain
+unqualified.
+
+Final qualification source `a5f1fdeb2d6ad8321c852c3a66dce8b9f74724ed` also includes the pinned
+generated error-name table and two passing name round-trip cases. The table adds
+three test names; shared numeric status identities remain unchanged.
+
+`provider-original-controls-verified.json` binds 5260 unchanged native inputs,
+4544 matching immutable public sources, generated-name/source-boundary checks
+and all 25 passing ReleaseSafe consumer steps.
+
+Original generated-effect preparation still needs its per-request provider
+context and independently funded CPU/child handoff. These boundary repairs do
+not wire that scope or authorize copying a parent's runnable to parallel children.
+Durable completion reservations before voting prepared, required-mode providers,
+hidden-owner authority and the remaining scheduler/fault/default-policy work
+remain open. The full design remains incomplete; full Linux qualification is
+waived.
+
 ## Caller-funded precommit producer planning (2026-10-20)
 
 Source `7ca0f1d0b40aa424d5de9ca8ebfe8881772706cb` connects generated-document preparation to
