@@ -5201,6 +5201,7 @@ def test_single_probe_membership_does_not_retain_source_or_index(graph_db):
             },
         )
         assert response["rows"][0][0]["value"] is expected
+        assert response["stats"]["memory_bytes"] < 128 << 10
     response = graph_db.cypher_json(
         "g",
         {
@@ -5229,3 +5230,69 @@ def test_concatenation_consumers_propagate_cardinality_windows(graph_db):
             assert response["rows"][0][0]["type"] == "null"
         else:
             assert response["rows"][0][0]["value"] == expected
+
+
+def test_range_membership_uses_arithmetic_with_exact_numeric_equality(graph_db):
+    response = graph_db.cypher_json(
+        "g",
+        {
+            "query": "RETURN 1000000000 IN range(1,1000000000),1.0 IN range(1,1000000000),1.5 IN range(1,1000000000),null IN range(1,0),-4 IN range(5,-5,-3)",
+            "limits": {"memory_bytes": 1 << 20, "intermediate_states": 1000},
+        },
+    )
+    assert [cell["value"] for cell in response["rows"][0]] == [True, True, False, False, True]
+
+
+def test_membership_cache_admission_keeps_wide_repeated_sources_streaming(graph_db):
+    word = "A" * 4096
+    response = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND [1,2,3] AS n RETURN ($word+toString(n)) IN [y IN range(1,2000)|$word+toString(y)]",
+            "parameters": {"word": word},
+            "limits": {"memory_bytes": 1 << 20},
+        },
+    )
+    assert [row[0]["value"] for row in response["rows"]] == [True, True, True]
+    # Narrow sources still acquire a reusable index within the same budget.
+    response = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND range(1,500) AS n RETURN count(CASE WHEN toString(n) IN [x IN range(1,1000)|toString(x)] THEN 1 END)",
+            "limits": {"memory_bytes": 4 << 20, "intermediate_states": 100000},
+        },
+    )
+    assert response["rows"][0][0]["value"] == "500"
+
+
+def test_concatenation_streams_into_membership_and_unwind(graph_db):
+    word = "A" * 4096
+    response = graph_db.cypher_json(
+        "g",
+        {
+            "query": "RETURN ($word+'1') IN ([y IN range(1,2000)|$word+toString(y)]+[])",
+            "parameters": {"word": word},
+            "limits": {"memory_bytes": 1 << 20},
+        },
+    )
+    assert response["rows"][0][0]["value"] is True
+    response = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND (range(1,500000000)+range(1,500000000)) AS x RETURN count(*)",
+            "limits": {"memory_bytes": 1 << 20, "intermediate_states": 1000},
+        },
+    )
+    assert response["rows"][0][0]["value"] == "1000000000"
+
+
+def test_unwind_forwarding_retains_sibling_bindings_without_materializing(graph_db):
+    for projection in ("range(1,1000000000) AS xs,2 AS seed", "2 AS seed,range(1,1000000000) AS xs"):
+        response = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"WITH {projection} UNWIND xs AS x RETURN seed,count(x)",
+                "limits": {"memory_bytes": 1 << 20, "intermediate_states": 1000},
+            },
+        )
+        assert [cell["value"] for cell in response["rows"][0]] == ["2", "1000000000"]

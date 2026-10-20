@@ -4188,6 +4188,8 @@ test "producer summaries and scalar seeds release every failed allocation" {
         "WITH range(1,1000000000) AS xs WITH xs AS ys UNWIND ys AS x RETURN count(*),count(1)",
         "WITH [x IN range(1,3)|toString(x)]+[4] AS xs RETURN head(xs),last(xs),size(xs)",
         "UNWIND [1,2,3] AS n RETURN n IN [x IN [1,null]|x]",
+        "UNWIND [1,2] AS n RETURN n IN ([x IN [1,2,3]|x]+[4])",
+        "WITH range(1,3) AS xs,toString(4) AS seed UNWIND xs AS x RETURN collect(x),min(seed)",
         "MATCH(a:Document {id:'a'}) UNWIND [1,2,3] AS n RETURN 'Beta' IN [(a)-[:CITES]->(b)|b.title]",
         "MATCH(a:Document {id:'a'}) RETURN [(a)-[:CITES]->(b)|[(b)-[:CITES]->(d)|d.title]]",
     }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{@as([]const u8, text)});
@@ -4328,4 +4330,57 @@ test "streaming membership preserves NULL eager errors and repeated invariant pr
         var fixture: Fixture = .{};
         try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
     }
+}
+
+test "range membership uses exact arithmetic and preserves empty NULL and numeric equality" {
+    try check("RETURN 1 IN range(1,3),1.0 IN range(1,3),1.5 IN range(1,3),null IN range(1,0),null IN range(1,3),'1' IN range(1,3)", "[[true,true,false,false,null,false]]");
+    try check("RETURN -4 IN range(5,-5,-3),-5 IN range(5,-5,-3),1 IN range(null,3),9223372036854775808.0 IN range(9223372036854775806,9223372036854775807)", "[[true,false,null,false]]");
+    for ([_][]const u8{
+        "RETURN 1000000000 IN range(1,1000000000)",
+        "RETURN -9223372036854775808 IN range(-9223372036854775808,9223372036854775807)",
+        "UNWIND (range(1,500000000)+range(1,500000000)) AS x RETURN count(*)=1000000000",
+        "WITH range(1,1000000000) AS xs,1 AS seed UNWIND xs AS x RETURN count(*)=1000000000",
+        "WITH 2 AS n WITH range(1,1000000000) AS xs,n AS seed UNWIND xs AS x RETURN seed,count(x)=1000000000",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = 1 << 20, .intermediate_states = 1000 });
+        defer result.deinit();
+        try std.testing.expect(result.rows[0][result.rows[0].len - 1].boolean);
+    }
+}
+
+test "concatenated producers stream ordered cells after complete eager validation" {
+    try check("UNWIND ([x IN [1,2]|x]+[x IN [3,4]|x]) AS x RETURN collect(x)", "[[[1,2,3,4]]]");
+    try check("UNWIND (0+[x IN [1,2]|x]+3) AS x RETURN collect(x)", "[[[0,1,2,3]]]");
+    try check("UNWIND ([1]+null) AS x RETURN count(*)", "[[0]]");
+    try check("RETURN 1 IN ([x IN [1,2]|x]+[]),null IN ([]+[]),9 IN ([null]+[1])", "[[true,false,null]]");
+    try check("WITH 3 AS n WITH range(1,n) AS xs,n+1 AS n UNWIND xs AS x RETURN collect(x),min(n)", "[[[1,2,3],4]]");
+    try check("WITH 3 AS n WITH n+1 AS n,range(1,n) AS xs UNWIND xs AS x RETURN collect(x),min(n)", "[[[1,2,3],4]]");
+    try check("WITH range(1,2) AS xs,4 AS seed UNWIND xs AS x RETURN xs,x,seed", "[[[1,2],1,4],[[1,2],2,4]]");
+    try check("WITH range(1,2) AS xs,4 AS seed WITH xs AS ys UNWIND ys AS x RETURN collect(x)", "[[[1,2]]]");
+    for ([_][]const u8{
+        "RETURN 1 IN ([x IN [1,0]|1/x]+[])",
+        "UNWIND ([1]+[x IN [1,0]|1/x]) AS x RETURN x LIMIT 1",
+        "UNWIND (null+[x IN [1,0]|1/x]) AS x RETURN count(*)",
+        "WITH [x IN [1,0]|1/x] AS xs,1%0 AS seed UNWIND xs AS x RETURN count(*)",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}
+
+test "bounded membership admission retains narrow reusable indexes" {
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "UNWIND range(1,500) AS n RETURN count(CASE WHEN toString(n) IN [x IN range(1,1000)|toString(x)] THEN 1 END)", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = 4 << 20, .intermediate_states = 100000 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 500), result.rows[0][0].integer);
 }

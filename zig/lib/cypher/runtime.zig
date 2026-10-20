@@ -1123,10 +1123,13 @@ const Engine = struct {
         scalars: std.AutoHashMapUnmanaged(u64, v.Value) = .empty,
         strings: ?@import("string_work.zig").Runtime = null,
         lists: std.AutoHashMapUnmanaged(u64, @import("invariant_membership.zig").Membership) = .empty,
-        streamed_lists: std.AutoHashMapUnmanaged(u64, void) = .empty,
+        producer_lists: std.AutoHashMapUnmanaged(u64, *@import("invariant_membership.zig").Producer) = .empty,
+        membership_budget: ?*Budget = null,
         owned_lists: std.AutoHashMapUnmanaged(Identity, @import("invariant_membership.zig").Membership) = .empty,
         fn deinit(self: *@This()) void {
             if (self.bytes) |pool| pool.deinit();
+            var producers = self.producer_lists.valueIterator();
+            while (producers.next()) |producer| producer.*.deinit();
         }
     };
 
@@ -2345,9 +2348,18 @@ const Engine = struct {
         };
     }
     fn identityAxis(p: ast.Projection, alias: []const u8) bool {
-        if (p.wildcard or p.distinct or p.predicate != null or p.order.len != 0 or p.skip != null or p.limit != null or p.items.len != 1) return false;
-        const item = p.items[0];
-        return item.expression.value == .variable and std.mem.eql(u8, item.expression.value.variable, alias) and std.mem.eql(u8, item.alias orelse alias, alias);
+        if (p.wildcard or p.distinct or p.predicate != null or p.order.len != 0 or p.skip != null or p.limit != null) return false;
+        var preserved = false;
+        for (p.items) |item| {
+            if (item.expression.value != .variable) return false;
+            const name = item.expression.value.variable;
+            const target = item.alias orelse name;
+            if (std.mem.eql(u8, name, alias)) {
+                if (!std.mem.eql(u8, target, alias)) return false;
+                preserved = true;
+            } else if (std.mem.eql(u8, target, alias)) return false;
+        }
+        return preserved;
     }
     fn axisExpressions(value: anytype, alias: []const u8, slots: *const std.AutoHashMapUnmanaged(*const ast.Expr, usize), counts: []const bool) bool {
         if (@TypeOf(value) == *const ast.Expr) {
@@ -4173,18 +4185,29 @@ const Engine = struct {
     }
     /// Forward a single producer binding into its sole UNWIND consumer. This
     /// is closure conversion, not substitution into every use: the source is
-    /// evaluated once in its original input scope, then that scope is dropped.
-    /// Extra expressions, filters, multiple input rows and escaping aliases keep
-    /// their ordinary projection barrier and eager error ordering.
-    fn forwardUnwind(self: *Engine, clauses: []const ast.Clause) !?[]const ast.Clause {
+    /// evaluated in its original input scope, then that scope is dropped.
+    /// Sibling bindings evaluate once in their original source order. Filters,
+    /// multiple input rows and escaping aliases retain their projection barrier.
+    const ForwardedUnwind = struct { clauses: []const ast.Clause, row: Row };
+    fn forwardUnwind(self: *Engine, clauses: []const ast.Clause, input: Row) !?ForwardedUnwind {
         if (clauses.len < 2 or clauses[0].operation != .project) return null;
         const first = clauses[0].operation.project;
         const p = first.value;
-        if (first.final or p.wildcard or p.distinct or p.predicate != null or p.order.len != 0 or p.skip != null or p.limit != null or p.items.len != 1) return null;
-        const source = p.items[0].expression;
-        if (aggregates(source)) return null;
-        if (!isRange(source) and !projectedSource(source)) return null;
-        var name = p.items[0].alias orelse return null;
+        if (first.final or p.wildcard or p.distinct or p.predicate != null or p.order.len != 0 or p.skip != null or p.limit != null or p.items.len == 0) return null;
+        // A single deferred producer can share a WITH with ordinary bindings.
+        // Sibling expressions still evaluate exactly once in the old scope.
+        var producer_index: ?usize = null;
+        for (p.items, 0..) |item, i| {
+            if (aggregates(item.expression)) return null;
+            if (isRange(item.expression) or projectedSource(item.expression)) {
+                if (producer_index != null) return null;
+                producer_index = i;
+            }
+        }
+        const selected = producer_index orelse return null;
+        const source = p.items[selected].expression;
+        if (p.items.len > 1 and (!self.read_only or !reduction_plan.repeatable(source))) return null;
+        var name = p.items[selected].alias orelse return null;
         var index: usize = 1;
         while (index < clauses.len and clauses[index].operation == .project) : (index += 1) {
             const step = clauses[index].operation.project;
@@ -4206,11 +4229,36 @@ const Engine = struct {
         const binding = try self.a.create(ast.Expr);
         binding.* = .{ .span = clauses[index].span, .value = .{ .variable = unwind.alias } };
         output[1] = .{ .span = clauses[0].span, .operation = .{ .project = .{ .final = false, .value = .{ .items = &.{} } } } };
-        const items = try self.a.alloc(ast.Item, 1);
+        const keep_siblings = index == 1;
+        const items = try self.a.alloc(ast.Item, 1 + if (keep_siblings) p.items.len - 1 else @as(usize, 0));
         items[0] = .{ .expression = binding, .alias = unwind.alias };
+        var captured: std.ArrayList(v.Entry) = .empty;
+        try captured.appendSlice(self.a, input);
+        var next_item: usize = 1;
+        if (p.items.len > 1) for (p.items, 0..) |item, i| {
+            if (i == selected) {
+                // Complete the producer's eager source phase in its original
+                // position before evaluating the following sibling expression.
+                _ = try self.listSummary(.{ .name = "collect", .args = &.{source}, .collect_limit = 0, .collect_summary = true }, input, null);
+            } else {
+                const value = try self.eval(item.expression, input, null);
+                if (!keep_siblings) continue;
+                var suffix: usize = i;
+                var hidden: []const u8 = undefined;
+                while (true) : (suffix += 1) {
+                    hidden = try std.fmt.allocPrint(self.a, "_producer_capture_{d}", .{suffix});
+                    if (lookup(captured.items, hidden) == null) break;
+                }
+                try captured.append(self.a, .{ .name = hidden, .value = value });
+                const reference = try self.a.create(ast.Expr);
+                reference.* = .{ .span = item.expression.span, .value = .{ .variable = hidden } };
+                items[next_item] = .{ .expression = reference, .alias = item.alias orelse try self.expressionName(item.expression) };
+                next_item += 1;
+            }
+        };
         output[1].operation.project.value.items = items;
         @memcpy(output[2..], clauses[index + 1 ..]);
-        return output;
+        return .{ .clauses = output, .row = try captured.toOwnedSlice(self.a) };
     }
     fn runWeighted(self: *Engine, clauses: []const ast.Clause, initial: WeightedRows, preserve_rows: bool) anyerror![]const Row {
         return (try self.runWeightedRows(clauses, initial, preserve_rows, false)).rows;
@@ -4496,8 +4544,9 @@ const Engine = struct {
         while (clause_index < clauses.len) : (clause_index += 1) {
             var clause = clauses[clause_index];
             try self.checkpoint();
-            if (clause.operation == .project and bags.rows.len == 1 and bags.weights[0].isOne()) if (try self.forwardUnwind(clauses[clause_index..])) |forwarded| {
-                clauses = forwarded;
+            if (clause.operation == .project and bags.rows.len == 1 and bags.weights[0].isOne()) if (try self.forwardUnwind(clauses[clause_index..], bags.rows[0])) |forwarded| {
+                bags.rows = try self.a.dupe(Row, &.{forwarded.row});
+                clauses = forwarded.clauses;
                 clause_index = 0;
                 clause = clauses[0];
             };
@@ -4764,8 +4813,9 @@ const Engine = struct {
         while (clause_index < clauses.len) : (clause_index += 1) {
             var clause = clauses[clause_index];
             try self.checkpoint();
-            if (!explain and clause.operation == .project and rows.len == 1) if (try self.forwardUnwind(clauses[clause_index..])) |forwarded| {
-                clauses = forwarded;
+            if (!explain and clause.operation == .project and rows.len == 1) if (try self.forwardUnwind(clauses[clause_index..], rows[0])) |forwarded| {
+                rows = try self.a.dupe(Row, &.{forwarded.row});
+                clauses = forwarded.clauses;
                 clause_index = 0;
                 clause = clauses[0];
             };
@@ -8623,15 +8673,34 @@ const Engine = struct {
         return owner;
     }
     fn evalMembership(self: *Engine, left: v.Value, right: *const ast.Expr, row: Row, group: ?[]const Row) !v.Value {
+        if (isRange(right)) {
+            const range = (try self.rangeInput(right, row, group)) orelse return .null;
+            return range.contains(left);
+        }
         const invariant = self.read_only and right.execution_invariant != null;
         if (projectedSource(right)) {
-            // A first probe observes one Boolean, not an escaping list/index.
-            // Repeated invariant probes promote once to the existing reusable
-            // index; correlated producers remain independent streaming inputs.
+            var candidate: ?*@import("invariant_membership.zig").Producer = null;
             const stream = if (invariant) blk: {
                 const owner = try self.invariantState();
-                const slot = try owner.streamed_lists.getOrPut(owner.work.a, right.execution_invariant.?);
-                break :blk !slot.found_existing;
+                var existing = owner.producer_lists.get(right.execution_invariant.?);
+                if (existing == null) {
+                    if (owner.membership_budget == null) {
+                        const budget = try owner.work.a.create(Budget);
+                        budget.* = .{ .backing = self.scratch_allocator, .limit = @min(1 << 20, self.limits.memory_bytes / 8) };
+                        owner.membership_budget = budget;
+                    }
+                    const cache = try owner.work.a.create(@import("invariant_membership.zig").Producer);
+                    cache.* = .{ .budget = owner.membership_budget.? };
+                    try owner.producer_lists.put(owner.work.a, right.execution_invariant.?, cache);
+                    existing = cache;
+                }
+                const cache = existing.?;
+                if (cache.ready) return cache.membership.contains(&self.values, left);
+                // The first Boolean probe pays no retained-source cost. A
+                // repeated probe may build an index within the soft budget.
+                if (cache.seen and !cache.disabled) candidate = cache;
+                cache.seen = true;
+                break :blk true;
             } else if (self.read_only and right.value == .pattern_comprehension) blk: {
                 // Repeated correlated patterns retain their existing bounded
                 // source memo. Probe markers have a separate namespace and
@@ -8646,9 +8715,11 @@ const Engine = struct {
                 break :blk true;
             } else true;
             if (stream) {
-                var membership: MembershipReceiver = .{ .left = left };
+                var membership: MembershipReceiver = .{ .left = left, .candidate = candidate };
                 var receiver: ListReceiver = .{ .ptr = &membership, .emit = MembershipReceiver.add, .destination = self.a, .observer = .{ .name = "collect", .args = &.{} } };
-                if (!try self.produceList(right, row, group, &receiver)) return .null;
+                const present = try self.produceList(right, row, group, &receiver);
+                if (candidate) |cache| cache.finish(present);
+                if (!present) return .null;
                 try receiver.check();
                 return if (membership.found) .{ .boolean = true } else if (membership.unknown) .null else .{ .boolean = false };
             }
@@ -8748,8 +8819,10 @@ const Engine = struct {
         left: v.Value,
         found: bool = false,
         unknown: bool = false,
+        candidate: ?*@import("invariant_membership.zig").Producer = null,
         fn add(ptr: *anyopaque, engine: *Engine, value: v.Value, _: Count, _: ?*const value_work.Work) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.candidate) |cache| try cache.add(value, engine, chargeWork);
             if (self.found) return;
             if (try engine.values.equal(self.left, value)) |same| self.found = same else self.unknown = true;
         }
@@ -8899,6 +8972,17 @@ const Engine = struct {
         return true;
     }
     fn produceList(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row, receiver: *ListReceiver) anyerror!bool {
+        if (self.read_only and reduction_plan.repeatable(expression)) if (reduction_plan.concatenatedList(expression)) |b| {
+            // Addition evaluates both complete operands before exposing a list.
+            // Validate into bounded summaries first, including NULL absorption
+            // and scalar embedding checks. Repeatable sources can then replay
+            // into the consumer without retaining their intermediate payloads.
+            const summary = try self.concatSummary(.{ .name = "collect", .args = &.{expression}, .collect_limit = 0, .collect_summary = true }, b.left, b.right, row, group);
+            if (summary.list[0] == .null) return false;
+            try self.produceAddedOperand(b.left, row, group, receiver);
+            try self.produceAddedOperand(b.right, row, group, receiver);
+            return true;
+        };
         if (expression.value == .comprehension) {
             var invariants: LoopScope = .{};
             defer invariants.deinit();
@@ -8922,6 +9006,15 @@ const Engine = struct {
         }
         if (expression.value == .pattern_comprehension and try self.producePattern(expression, row, receiver)) return true;
         var source = (try self.listSource(expression, row, group)) orelse return false;
+        if (source.values == .range and receiver.observer.collect_limit == 0 and receiver.observer.collect_filters.len == 0 and !receiver.observer.distinct) {
+            const length = source.values.range.length;
+            if (length != 0) {
+                const weight = if (std.math.cast(u64, length)) |n| Count.init(n) else try Count.init(std.math.maxInt(u64)).add(self.a, Count.one);
+                try self.state();
+                try receiver.accept(self, source.values.range.at(0), weight, null);
+            }
+            return true;
+        }
         // Only this caller-owned allocation epoch can be borrowed by escaping
         // values. The snapshot is immutable while receivers enter inner scopes;
         // it is never retained after the source returns or used as a value key.
@@ -8932,6 +9025,28 @@ const Engine = struct {
             try receiver.accept(self, value, Count.one, borrowed);
         }
         return true;
+    }
+    fn produceAddedOperand(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row, receiver: *ListReceiver) anyerror!void {
+        // The enclosing summary already validated this entire addition tree.
+        // Replay nested additions directly, rather than validating every
+        // prefix again (which would make a long concatenation quadratic).
+        if (reduction_plan.concatenatedList(expression)) |b| {
+            try self.produceAddedOperand(b.left, row, group, receiver);
+            try self.produceAddedOperand(b.right, row, group, receiver);
+            return;
+        }
+        if (isRange(expression) or projectedSource(expression)) {
+            _ = try self.produceList(expression, row, group, receiver);
+            return;
+        }
+        const value = try self.eval(expression, row, group);
+        if (value == .null) return;
+        if (value == .list) {
+            for (value.list) |item| {
+                try self.state();
+                try receiver.accept(self, item, Count.one, null);
+            }
+        } else try receiver.accept(self, value, Count.one, null);
     }
     const ListWriter = struct {
         demand: ListDemand,
@@ -8992,7 +9107,7 @@ const Engine = struct {
         }
     };
     fn projectedSource(expression: *const ast.Expr) bool {
-        return expression.value == .comprehension or expression.value == .pattern_comprehension or reduction_plan.reversedList(expression) != null;
+        return expression.value == .comprehension or expression.value == .pattern_comprehension or reduction_plan.reversedList(expression) != null or (reduction_plan.concatenatedList(expression) != null and reduction_plan.repeatable(expression));
     }
     fn rangeSummary(self: *Engine, call_value: ast.Function, row: Row, group: ?[]const Row) !v.Value {
         const sequence = try self.rangeInput(call_value.args[0], row, group);

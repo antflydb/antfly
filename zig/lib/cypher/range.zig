@@ -33,6 +33,23 @@ pub const Range = struct {
         std.debug.assert(ordinal < self.length);
         return .{ .integer = @intCast(@as(i128, self.start) + @as(i128, @intCast(ordinal)) * self.step) };
     }
+    /// Equality against integer cells is exact, including integral DOUBLE
+    /// needles near i64 boundaries. Empty lists precede NULL propagation.
+    pub fn contains(self: Range, needle: v.Value) v.Value {
+        if (self.length == 0) return .{ .boolean = false };
+        const integer: i64 = switch (needle) {
+            .null => return .null,
+            .integer => |n| n,
+            .number => |n| blk: {
+                if (!std.math.isFinite(n) or n < -9223372036854775808.0 or n >= 9223372036854775808.0 or @trunc(n) != n) return .{ .boolean = false };
+                break :blk @intFromFloat(n);
+            },
+            else => return .{ .boolean = false },
+        };
+        const distance = @as(i128, integer) - self.start;
+        const ordinal = @divTrunc(distance, self.step);
+        return .{ .boolean = @rem(distance, self.step) == 0 and ordinal >= 0 and ordinal < self.length };
+    }
     pub fn index(self: Range, position: i64) v.Value {
         const ordinal: i128 = if (position < 0) @as(i128, @intCast(self.length)) + position else position;
         return if (ordinal < 0 or ordinal >= self.length) .null else self.at(@intCast(ordinal));

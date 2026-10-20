@@ -71,3 +71,58 @@ pub const Membership = struct {
         return if (unknown) .null else .{ .boolean = false };
     }
 };
+
+/// Optional producer cache. Admission uses a statement-wide soft budget; an
+/// oversized source releases its partial keys and remains a streaming source.
+/// No borrowed producer payload survives an element arena.
+pub const Producer = struct {
+    budget: *@import("budget.zig"),
+    arena: ?std.heap.ArenaAllocator = null,
+    items: std.ArrayList(v.Value) = .empty,
+    membership: Membership = .{ .value = .null },
+    disabled: bool = false,
+    seen: bool = false,
+    ready: bool = false,
+    pub fn deinit(self: *@This()) void {
+        const a = self.budget.allocator();
+        self.membership.index.deinit(a);
+        self.membership.uncertain.deinit(a);
+        self.items.deinit(a);
+        if (self.arena) |*arena| arena.deinit();
+        self.arena = null;
+        self.items = .empty;
+        self.membership = .{ .value = .null };
+    }
+    pub fn add(self: *@This(), input: v.Value, ptr: *anyopaque, charge: *const fn (*anyopaque, usize) anyerror!void) !void {
+        if (self.disabled) return;
+        self.capture(input, ptr, charge) catch |err| {
+            if (err != error.OutOfMemory or !self.budget.exhausted) return err;
+            self.deinit();
+            self.disabled = true;
+        };
+    }
+    fn capture(self: *@This(), input: v.Value, ptr: *anyopaque, charge: *const fn (*anyopaque, usize) anyerror!void) !void {
+        if (self.arena == null) self.arena = .init(self.budget.allocator());
+        const a = self.arena.?.allocator();
+        var scratch = std.heap.ArenaAllocator.init(self.budget.backing);
+        defer scratch.deinit();
+        var context: v.CloneContext = .{ .a = a, .scratch = scratch.allocator(), .identity_only = true };
+        const value = try context.clone(input);
+        // Per-cell metadata must not accumulate with geometric arena growth.
+        // Retain payloads in the arena, reclaim resized index/vector storage,
+        // and discard hashing scratch after each cell.
+        var work: w.Work = .{ .a = scratch.allocator(), .ptr = ptr, .charge = charge };
+        const info = try work.info(value);
+        const mutable = self.budget.allocator();
+        const index = self.items.items.len;
+        try self.items.append(mutable, value);
+        if (value == .null) self.membership.has_null = true else if (info.unknown) {
+            try self.membership.uncertain.append(mutable, value);
+        } else try self.membership.index.insert(mutable, info.hash, index);
+    }
+    pub fn finish(self: *@This(), present: bool) void {
+        if (self.disabled) return;
+        self.membership.value = if (present) .{ .list = self.items.items } else .null;
+        self.ready = true;
+    }
+};
