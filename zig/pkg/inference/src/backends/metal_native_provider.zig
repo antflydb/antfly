@@ -106,6 +106,9 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     embeddinggemma2_linear_cache_bytes: usize = 0,
     embeddinggemma2_vision_linear_cache_bytes: usize = 0,
     embeddinggemma2_audio_linear_cache_bytes: usize = 0,
+    embedding_vision_coefficients: ?*@import("../ops/metal_embedding_bindings.zig").VisionCoefficients = null,
+    embedding_vision_workspace_builds: u64 = 0,
+    embedding_vision_coefficient_builds: u64 = 0,
     embedding_vision_workspaces: [2]?*@import("../ops/metal_embedding_bindings.zig").VisionWorkspace = @splat(null),
     /// One model-owned RGB preparer; coefficients replace by geometry and are
     /// admitted independently of request workspace. The provider lease serializes it.
@@ -241,6 +244,16 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
             std.heap.c_allocator.destroy(workspace);
             entry.* = null;
         };
+        if (self.embedding_vision_coefficients) |coefficients| {
+            bytes += coefficients.owner.host_bytes + coefficients.owner.backend_bytes;
+            coefficients.owner.deinit();
+            if (self.embeddinggemma2_cache_admission) |cache| {
+                cache.noteRelease(.host, coefficients.owner.host_bytes);
+                cache.noteRelease(.backend, coefficients.owner.backend_bytes);
+            }
+            std.heap.c_allocator.destroy(coefficients);
+            self.embedding_vision_coefficients = null;
+        }
         if (self.embedding_image_preparer) |*preparer| {
             preparer.deinit(); // Fence before releasing persistent admission.
             self.embedding_image_preparer = null;
