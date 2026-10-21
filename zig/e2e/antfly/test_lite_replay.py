@@ -154,7 +154,7 @@ def test_bulk_dense_replay_and_reopen(batch_size, storage_engine):
             )
 
         def assert_complete(count):
-            last_progress = (0, 0)
+            last_progress = (0,) * 8
             last_progress_at = time.monotonic()
 
             def diagnostic(value):
@@ -171,9 +171,18 @@ def test_bulk_dense_replay_and_reopen(batch_size, storage_engine):
                 worker = state.get("enrichment_runtime", {})
                 if worker.get("worker_failed"):
                     raise AssertionError(diagnostic(value))
+                # Source-receipt migration can keep replay advancing after
+                # every vector is present. Follow that durable work as well
+                # as embedding throughput while awaiting final publication.
                 progress = (
-                    state.get("total_indexed", 0),
-                    worker.get("embed_items_completed", 0),
+                    state.get("total_indexed", 0) or 0,
+                    worker.get("embed_items_completed", 0) or 0,
+                    worker.get("applied_sequence", 0) or 0,
+                    worker.get("processed_requests", 0) or 0,
+                    worker.get("skip_by_hash_count", 0) or 0,
+                    state.get("replay_applied_sequence", 0) or 0,
+                    state.get("replay_target_sequence", 0) or 0,
+                    state.get("catch_up_applied_sequence", 0) or 0,
                 )
                 now = time.monotonic()
                 if any(
@@ -187,7 +196,8 @@ def test_bulk_dense_replay_and_reopen(batch_size, storage_engine):
                 )
                 if now - last_progress_at >= 60:
                     raise AssertionError(
-                        "No vector progress for 60 seconds.\n" + diagnostic(value)
+                        "No derived replay progress for 60 seconds.\n"
+                        + diagnostic(value)
                     )
                 return bool(
                     ready_index_status(value, until="complete")
