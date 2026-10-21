@@ -6607,3 +6607,19 @@ actor-bound retirement remain next; in-range mandatory control dependencies
 still require refinement. Stronger remote-read defaults and normal required
 PREPARE integration remain disabled. The whole design remains incomplete;
 full Linux qualification remains waived.
+
+### Owned read-guard mutation scopes (2026-10-21)
+
+Existing DocStore read-guard metadata requires an exact transaction ID and
+admission/resolution phase. Original membership/count capture prevents a raw
+batch from deleting another guard or forging the final zero-count fast path.
+Commit checks the matching pending or completed terminal owner record; ordinary
+writers still honor remaining readers. The erased Batch callback and capability
+are fenced by native ABI 59/storage owner ABI 117. No durable format or reader
+epoch changed. Focused native recovery, mutation, allocation and ABI checks pass:
+397 fresh executions, 88/88 steps, no skips/failures/leaks.
+See [the implementation ledger](WORKLOAD_POOLING_IMPLEMENTATION.md) for limits.
+This closes the existing guard retirement escape before semantic predicate
+registration; it does not install compiled range predicates or broaden metadata
+exclusion. Raw-backend/import/peer eligibility and the stronger default guarantees
+remain open. The full design is incomplete; full Linux qualification stays waived.

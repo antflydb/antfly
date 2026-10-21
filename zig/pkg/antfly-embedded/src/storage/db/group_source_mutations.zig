@@ -874,8 +874,12 @@ const WriterGuardTest = struct {
         const a = std.testing.allocator;
         const framed = try key(a, logical);
         errdefer a.free(framed);
+        var manager = try @import("../transactions.zig").TxnManager.init(a, store);
+        defer manager.deinit();
+        try manager.initTransaction(@splat(7), 1);
         var writer = try store.beginWriteTxn();
         errdefer writer.abort();
+        try writer.setReadGuardScope(.{ .txn_id = @splat(7), .phase = .admission });
         try writer.put(framed, "");
         var count: [8]u8 = undefined;
         std.mem.writeInt(u64, &count, 1, .little);
@@ -919,7 +923,7 @@ test "prepared transaction effects writer read guards fence native transaction b
     };
 }
 
-test "prepared transaction effects writer read guards preserve exact framing control progress and atomic own retirement" {
+test "prepared transaction effects writer read guards preserve exact framing control progress and reject raw retirement" {
     const a = std.testing.allocator;
     const H = WriterGuardTest;
     var fixture: ReadCaptureTest = .{};
@@ -937,26 +941,31 @@ test "prepared transaction effects writer read guards preserve exact framing con
     try fixture.store.put("\x00\x00__txn_participant_ack__:other", "done");
     for ([_]bool{ false, true }) |batch| {
         if (batch) {
-            const restored = try H.install(&fixture.store, "doc\x00");
-            a.free(restored);
             var writer = try fixture.store.beginWriteBatch();
-            errdefer writer.abort();
+            defer writer.abort();
             try writer.put(physical, "batch");
-            try writer.delete(guard);
-            try writer.delete(H.guards.count_key);
-            try writer.commit();
+            try std.testing.expectError(error.InvalidTxnRecord, writer.delete(guard));
+            try std.testing.expectError(error.InvalidTxnRecord, writer.commit());
         } else {
             var writer = try fixture.store.beginWriteTxn();
-            errdefer writer.abort();
+            defer writer.abort();
             try writer.put(physical, "transaction");
-            try writer.delete(guard);
-            try writer.delete(H.guards.count_key);
-            try writer.commit();
+            try std.testing.expectError(error.InvalidTxnRecord, writer.delete(guard));
+            try std.testing.expectError(error.InvalidTxnRecord, writer.commit());
         }
     }
     const actual = try fixture.store.get(a, physical);
     defer a.free(actual);
-    try std.testing.expectEqualStrings("batch", actual);
+    try std.testing.expectEqualStrings("before", actual);
+    // Physical fixture cleanup deliberately bypasses DocStore. Ordinary native
+    // writers are checked above; imported/raw backend ownership is still separate.
+    {
+        var raw = try fixture.store.runtime_store.beginWrite();
+        errdefer raw.abort();
+        try raw.delete(guard);
+        try raw.delete(H.guards.count_key);
+        try raw.commit();
+    }
     {
         var writer = try fixture.store.beginWriteTxn();
         defer writer.abort();
@@ -985,7 +994,12 @@ test "prepared transaction effects writer read guards cover recursive range coun
         if (mode == 0) try fixture.store.put(ranges.activation_key, ranges.activation_value);
         const guard = try H.install(&fixture.store, if (mode == 0) &counter else if (mode == 1) head else "doc");
         defer a.free(guard);
-        if (mode == 2) try fixture.store.put(guard, "invalid");
+        if (mode == 2) {
+            var raw = try fixture.store.runtime_store.beginWrite();
+            errdefer raw.abort();
+            try raw.put(guard, "invalid");
+            try raw.commit();
+        }
         var writer = try fixture.store.beginWriteTxn();
         defer writer.abort();
         try writer.put(if (mode == 1) head else physical, "after");
@@ -1961,4 +1975,176 @@ test "prepared transaction effects semantic scan footprints cover every result-c
     try std.testing.expect(try footprint.conflictsMutation("p/a", true, true, null));
     try std.testing.expect(!try footprint.conflictsMutation("p/c", true, true, null));
     try std.testing.expect(try footprint.conflictsMutation("p/b", false, true, null));
+}
+
+test "prepared transaction effects guard metadata requires exact actor membership accounting and resolved ownership" {
+    const a = std.testing.allocator;
+    const H = WriterGuardTest;
+    var fixture: ReadCaptureTest = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const physical = try H.keys.documentKeyAlloc(a, "doc");
+    defer a.free(physical);
+    try fixture.store.put(physical, "before");
+    const guard = try H.install(&fixture.store, "doc");
+    defer a.free(guard);
+    for ([_]bool{ false, true }) |batch_mode| for (0..8) |mode| {
+        var transaction: ?DocStore.Txn = if (!batch_mode) try fixture.store.beginWriteTxn() else null;
+        defer if (transaction) |*writer| writer.abort();
+        var batch: ?DocStore.Batch = if (batch_mode) try fixture.store.beginWriteBatch() else null;
+        defer if (batch) |*writer| writer.abort();
+        // One helper exercises both concrete writer surfaces identically.
+        const Exercise = struct {
+            fn run(writer: anytype, mode_: usize, guarded: []const u8, row: []const u8) !void {
+                const scope: H.guards.Scope = .{ .txn_id = @splat(if (mode_ == 1) @as(u8, 8) else 7), .phase = if (mode_ == 3 or mode_ == 5 or mode_ == 7) .admission else .resolution };
+                if (mode_ != 0) try writer.setReadGuardScope(scope);
+                if (mode_ == 0 or mode_ == 1) {
+                    try std.testing.expectError(error.InvalidTxnRecord, writer.delete(guarded));
+                } else if (mode_ == 2 or mode_ == 3) {
+                    // Own scope cannot retire while pending, or retire using
+                    // admission authority. Check both mutation orders.
+                    try writer.delete(guarded);
+                    try writer.delete(H.guards.count_key);
+                    try writer.put(row, "escape");
+                } else if (mode_ == 4) {
+                    try writer.delete(H.guards.count_key);
+                } else if (mode_ == 5) {
+                    try writer.put(guarded, "nonempty guard value");
+                } else if (mode_ == 6) {
+                    const wrong: [8]u8 = .{ 7, 0, 0, 0, 0, 0, 0, 0 };
+                    try writer.put(H.guards.count_key, &wrong);
+                } else {
+                    try std.testing.expectError(error.InvalidTxnRecord, writer.setReadGuardScope(.{ .txn_id = @splat(7), .phase = .resolution }));
+                }
+                try std.testing.expectError(error.InvalidTxnRecord, writer.commit());
+                try std.testing.expectError(error.InvalidTxnRecord, writer.commit());
+            }
+        };
+        if (transaction) |*writer| try Exercise.run(writer, mode, guard, physical) else if (batch) |*writer| try Exercise.run(writer, mode, guard, physical);
+        const before = try fixture.store.get(a, physical);
+        defer a.free(before);
+        try std.testing.expectEqualStrings("before", before);
+        const intact = try fixture.store.get(a, guard);
+        defer a.free(intact);
+        try std.testing.expectEqual(@as(usize, 0), intact.len);
+        // Failed metadata authority never freezes independent ACK progress.
+        try fixture.store.put("\x00\x00__txn_participant_ack__:owner-test", "done");
+    };
+}
+
+test "prepared transaction effects guard admission rejects missing owners and conflicting data in the admission batch" {
+    const a = std.testing.allocator;
+    const H = WriterGuardTest;
+    var fixture: ReadCaptureTest = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const physical = try H.keys.documentKeyAlloc(a, "doc");
+    defer a.free(physical);
+    try fixture.store.put(physical, "before");
+    const guard = try H.key(a, "doc");
+    defer a.free(guard);
+    const one: [8]u8 = .{ 1, 0, 0, 0, 0, 0, 0, 0 };
+    {
+        var writer = try fixture.store.beginWriteBatch();
+        defer writer.abort();
+        try writer.setReadGuardScope(.{ .txn_id = @splat(7), .phase = .admission });
+        try writer.put(guard, "");
+        try writer.put(H.guards.count_key, &one);
+        try std.testing.expectError(error.InvalidTxnRecord, writer.commit());
+    }
+    var manager = try @import("../transactions.zig").TxnManager.init(a, &fixture.store);
+    defer manager.deinit();
+    try manager.initTransaction(@splat(7), 1);
+    for ([_]bool{ false, true }) |before_metadata| {
+        var writer = try fixture.store.beginWriteBatch();
+        defer writer.abort();
+        try writer.setReadGuardScope(.{ .txn_id = @splat(7), .phase = .admission });
+        if (before_metadata) try writer.put(physical, "unguarded prefix");
+        try writer.put(guard, "");
+        if (before_metadata) {
+            try std.testing.expectError(error.InvalidTxnRecord, writer.put(H.guards.count_key, &one));
+            try std.testing.expectError(error.InvalidTxnRecord, writer.commit());
+        } else {
+            try writer.put(H.guards.count_key, &one);
+            try writer.put(physical, "guarded suffix");
+            try std.testing.expectError(error.IntentConflict, writer.commit());
+        }
+    }
+    try std.testing.expectError(error.NotFound, fixture.store.get(a, guard));
+    try std.testing.expectError(error.NotFound, fixture.store.get(a, H.guards.count_key));
+}
+
+test "prepared transaction effects guard metadata capture unwinds allocations and preserves first authority failure" {
+    const a = std.testing.allocator;
+    const H = WriterGuardTest;
+    const transactions = @import("../transactions.zig");
+    var fixture: ReadCaptureTest = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    var manager = try transactions.TxnManager.init(a, &fixture.store);
+    defer manager.deinit();
+    try manager.initTransaction(@splat(7), 1);
+    const record_key = transactions.records_prefix.* ++ @as([16]u8, @splat(7));
+    const record = try fixture.store.get(a, &record_key);
+    defer a.free(record);
+    const guard = try H.key(a, "doc\x00");
+    defer a.free(guard);
+    const View = struct {
+        record_key: []const u8,
+        record: []const u8,
+        guard: []const u8,
+        present: bool = false,
+        calls: usize = 0,
+        fail_at: usize = 0,
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            self.calls += 1;
+            if (self.calls == self.fail_at) return error.TestInjectedFailure;
+            if (std.mem.eql(u8, key, H.guards.count_key)) return if (self.present) &.{ 1, 0, 0, 0, 0, 0, 0, 0 } else error.NotFound;
+            if (std.mem.eql(u8, key, self.guard)) return if (self.present) "" else error.NotFound;
+            if (std.mem.eql(u8, key, self.record_key)) return self.record;
+            return error.NotFound;
+        }
+        const Cursor = struct {
+            pub fn close(_: *@This()) void {}
+            pub fn seekAtOrAfter(_: *@This(), _: []const u8) !?@import("../backend_erased.zig").Entry {
+                return null;
+            }
+        };
+        pub fn openPhysicalCursorAdapter(_: *@This()) !Cursor {
+            return .{};
+        }
+        fn run(failing: A, guard_: []const u8, key_: []const u8, record_: []const u8, fail_at: usize) !usize {
+            var capture: H.guards.Capture = .{};
+            defer capture.deinit(failing);
+            try capture.setScope(.{ .txn_id = @splat(7), .phase = .admission });
+            var view: @This() = .{ .guard = guard_, .record_key = key_, .record = record_, .fail_at = fail_at };
+            var debt: @import("../publication_backlog.zig").Capture = .{};
+            defer debt.release();
+            var gate: std.atomic.Mutex = .unlocked;
+            const Step = struct {
+                fn check(capture_: *H.guards.Capture, cause: anyerror) !void {
+                    try std.testing.expectError(cause, capture_.check());
+                }
+            };
+            capture.touch(failing, &view, &debt, &gate, guard_) catch |cause| {
+                try Step.check(&capture, cause);
+                return cause;
+            };
+            try capture.touch(failing, &view, &debt, &gate, guard_);
+            try capture.touch(failing, &view, &debt, &gate, H.guards.count_key);
+            view.present = true;
+            capture.validate(failing, &view) catch |cause| {
+                try Step.check(&capture, cause);
+                return cause;
+            };
+            try std.testing.expectEqual(@as(usize, 1), capture.guard_changes.count());
+            return view.calls;
+        }
+        fn allocations(failing: A, guard_: []const u8, key_: []const u8, record_: []const u8) !void {
+            _ = try run(failing, guard_, key_, record_, 0);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, View.allocations, .{ guard, &record_key, record });
+    const calls = try View.run(a, guard, &record_key, record, 0);
+    for (1..calls + 1) |fail_at| try std.testing.expectError(error.TestInjectedFailure, View.run(a, guard, &record_key, record, fail_at));
 }

@@ -90,7 +90,8 @@ const builtin = @import("builtin");
 // Reject older capability layouts before trusting those semantics.
 // Semantic range observations own bounds and membership predicates.
 // Fence prior native owners before interpreting the expanded read set.
-pub const abi_version: u32 = 58;
+// Read-guard metadata carries an exact actor through native batch dispatch.
+pub const abi_version: u32 = 59;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

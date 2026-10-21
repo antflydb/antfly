@@ -1087,8 +1087,14 @@ pub const Batch = struct {
         contains_many_sorted: ?*const fn (*anyopaque, []const []const u8, []bool) anyerror!void = null,
         reserve_prepared_replay: ?*const fn (*anyopaque, PreparedReplayReservation, ?read_admission.Port) anyerror!void = null,
         cancel_prepared_replay: ?*const fn (*anyopaque, [16]u8) anyerror!void = null,
+        set_read_guard_scope: ?*const fn (*anyopaque, @import("transaction_read_guards.zig").Scope) anyerror!void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+
+    pub fn setReadGuardScope(self: *Batch, scope: @import("transaction_read_guards.zig").Scope) !void {
+        const set = self.vtable.set_read_guard_scope orelse return error.Unsupported;
+        try BoundaryAbi.call("set_read_guard_scope", self.boundary_dispatch, set, .{ self.ptr, scope });
+    }
 
     pub fn cancelPreparedReplay(self: *Batch, id: [16]u8) !void {
         const cancel = self.vtable.cancel_prepared_replay orelse return error.Unsupported;
@@ -2575,6 +2581,10 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             return error.Unsupported;
         }
 
+        pub fn setReadGuardScope(ptr: *anyopaque, scope: @import("transaction_read_guards.zig").Scope) anyerror!void {
+            try unbox(ptr).handle.setReadGuardScope(scope);
+        }
+
         pub fn cancelPreparedReplay(ptr: *anyopaque, id: [16]u8) anyerror!void {
             try unbox(ptr).handle.cancelPreparedReplayCredit(id);
         }
@@ -2605,6 +2615,7 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             .set_commit_participant = if (@hasDecl(Handle, "setCommitParticipant")) vt.setCommitParticipant else null,
             .contains_many_sorted = if (@hasDecl(Handle, "containsManySorted")) vt.containsManySorted else null,
             .reserve_prepared_replay = if (@hasDecl(Handle, "reservePreparedReplayCredit")) vt.reservePreparedReplay else null,
+            .set_read_guard_scope = if (@hasDecl(Handle, "setReadGuardScope")) vt.setReadGuardScope else null,
             .cancel_prepared_replay = if (@hasDecl(Handle, "cancelPreparedReplayCredit")) vt.cancelPreparedReplay else null,
         },
     };

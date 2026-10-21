@@ -1169,7 +1169,7 @@ pub const TxnManager = struct {
 
         try writes.appendSlice(self.alloc, extra_batch.writes);
 
-        try self.applyBatchWithParticipantAndAdmission(writes.items, extra_batch.deletes, null, .{ .previous = if (previous_admission) |old| old.reservation() else 0, .next = admission.reservation() }, null, control);
+        try self.applyResolutionResourceBatch(writes.items, extra_batch.deletes, null, .{ .previous = if (previous_admission) |old| old.reservation() else 0, .next = admission.reservation() }, null, control, null, .{ .txn_id = txn_id, .phase = .admission });
 
         self.traceWriteIntentSuccess(txn_id, intents, predicates);
     }
@@ -1310,7 +1310,7 @@ pub const TxnManager = struct {
             }
             if (status == .aborted and try self.hasPreparationRequirement(txn_id)) try completion_deletes.append(self.alloc, &requirement_key);
             if (completion_writes.items.len != 0 or completion_deletes.items.len != 0) {
-                try self.applyResolutionResourceBatch(completion_writes.items, completion_deletes.items, null, null, null, control, if (status == .aborted) .{ .id = txn_id, .status = status } else null);
+                try self.applyResolutionResourceBatch(completion_writes.items, completion_deletes.items, null, null, null, control, if (status == .aborted) .{ .id = txn_id, .status = status } else null, null);
             }
             return .{
                 .applied = false,
@@ -1375,7 +1375,7 @@ pub const TxnManager = struct {
             try completion_deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
             try completion_deletes.appendSlice(self.alloc, indexed_deletes.items);
             const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-            try self.applyResolutionResourceBatch(completion_writes.items, completion_deletes.items, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, null, control, if (status == .aborted) .{ .id = txn_id, .status = status } else null);
+            try self.applyResolutionResourceBatch(completion_writes.items, completion_deletes.items, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, null, control, if (status == .aborted) .{ .id = txn_id, .status = status } else null, null);
             return .{
                 .applied = false,
                 .replay_sequence = record.replay_sequence,
@@ -1516,7 +1516,7 @@ pub const TxnManager = struct {
         try deletes.appendSlice(self.alloc, indexed_deletes.items);
 
         const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-        try self.applyResolutionResourceBatch(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null, control, .{ .id = txn_id, .status = status, .prepared = consumed != null });
+        try self.applyResolutionResourceBatch(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null, control, .{ .id = txn_id, .status = status, .prepared = consumed != null }, null);
 
         if (self.trace_writer) |tw| {
             tw.traceEvent(&.{
@@ -3618,10 +3618,10 @@ pub const TxnManager = struct {
     }
 
     fn applyBatchWithParticipantAndAdmission(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant, control: ?read_control.Port) !void {
-        return self.applyResolutionResourceBatch(writes, deletes, replay, reservation, participant, control, null);
+        return self.applyResolutionResourceBatch(writes, deletes, replay, reservation, participant, control, null, null);
     }
 
-    fn applyResolutionResourceBatch(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant, control: ?read_control.Port, transition: ?struct { id: TxnId, status: TxnStatus, prepared: bool = false }) !void {
+    fn applyResolutionResourceBatch(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant, control: ?read_control.Port, transition: ?struct { id: TxnId, status: TxnStatus, prepared: bool = false }, guard_scope: ?writer_read_guards.Scope) !void {
         if (control) |owner| try owner.checkpoint();
         const mutation_batch = @import("transaction_batch_admission.zig");
         // Prepared data is detached before acquiring the writer. Its byte owner
@@ -3643,6 +3643,10 @@ pub const TxnManager = struct {
             replay;
         var batch = if (control) |owner| try self.store.beginBatchWithAdmission(owner) else try self.store.beginBatch();
         errdefer batch.abort();
+        const scope: ?writer_read_guards.Scope = if (transition) |decision| .{ .txn_id = decision.id, .phase = .resolution } else guard_scope;
+        if (scope) |selected| {
+            if (self.store.capabilities().owned_read_guard_mutations) try batch.setReadGuardScope(selected);
+        }
         if (transition) |decision| {
             // The authoritative decision was checked before this writer opened.
             // Transition the grant before the frame deletion, in this same batch.
@@ -4019,6 +4023,17 @@ fn resolveDecisionConflictReason(current: TxnStatus, requested: TxnStatus) []con
             .aborted => unreachable,
         },
     };
+}
+
+/// The typed mutation scope is checked against the final atomic record. A
+/// pending owner cannot shed guards, and one actor cannot retire another's.
+pub fn validateReadGuardOwner(txn: anytype, scope: writer_read_guards.Scope) !void {
+    const key = makeRecordKey(scope.txn_id);
+    const record = try decodeRecord(txn.get(&key) catch |err| return if (err == error.NotFound) error.InvalidTxnRecord else err);
+    switch (scope.phase) {
+        .admission => if (record.status != .pending or (record.intents_resolved_known and record.intents_resolved)) return error.InvalidTxnRecord,
+        .resolution => if (record.status == .pending or !record.intents_resolved_known or !record.intents_resolved) return error.InvalidTxnRecord,
+    }
 }
 
 fn decodeRecord(raw: []const u8) !TxnRecord {
@@ -8730,4 +8745,29 @@ test "prepared transaction effects range observation seals require reader fiftee
     try f.floor(15);
     try f.manager.resolveIntents(F.id, .aborted, 2);
     try std.testing.expectError(error.NotFound, f.store.get(a, &makePreparedReadObservationsKey(F.id)));
+}
+
+test "prepared transaction effects owned guard capability refuses a missing native batch scope operation" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(a, &runtime);
+    defer manager.deinit();
+    const id: TxnId = @splat(211);
+    try manager.initTransaction(id, 1);
+    const Capabilities = struct {
+        fn get(_: *anyopaque) @import("backend_types.zig").Capabilities {
+            return .{ .owned_read_guard_mutations = true };
+        }
+    };
+    const original = manager.store.vtable;
+    var incapable = original.*;
+    incapable.capabilities = Capabilities.get;
+    manager.store.vtable = &incapable;
+    defer manager.store.vtable = original;
+    try std.testing.expectError(error.Unsupported, manager.writeIntents(id, &.{}, &.{.{ .key = "absent", .expected_version = 0 }}));
+    try std.testing.expectEqual(@as(u64, 0), try manager.readGuardCount());
+    try std.testing.expect(!(try manager.loadTransactionRecord(id)).prepared);
 }

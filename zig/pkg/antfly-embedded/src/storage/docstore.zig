@@ -955,6 +955,10 @@ pub const DocStore = struct {
         /// Derive costs/roots from canonical request preparation and the exact
         /// durable frame. The caller must hold its request/catalog intent witness.
         /// Complete recovery working resources remain a separate prerequisite.
+        pub fn setReadGuardScope(self: *Txn, scope: transaction_read_guards.Scope) !void {
+            try self.read_guards.setScope(scope);
+        }
+
         pub fn reservePreparedReplayPlan(self: *Txn, expected: @import("db/prepared_transaction_effects.zig").Contract, request: @import("db/derived/derived_types.zig").DerivedBatch, original: ?@import("../common/read_admission.zig").Port) !void {
             errdefer self.artifact_inventory.poisoned = true;
             if (original) |port| try port.checkpoint();
@@ -1300,6 +1304,10 @@ pub const DocStore = struct {
             /// Derive costs/roots from canonical request preparation and the exact
             /// durable frame. The caller must hold its request/catalog intent witness.
             /// Complete recovery working resources remain a separate prerequisite.
+            pub fn setReadGuardScope(self: @This(), scope: transaction_read_guards.Scope) !void {
+                try self.read_guards.setScope(scope);
+            }
+
             pub fn reservePreparedReplayPlan(self: @This(), expected: @import("db/prepared_transaction_effects.zig").Contract, request: @import("db/derived/derived_types.zig").DerivedBatch, original: ?@import("../common/read_admission.zig").Port) !void {
                 errdefer self.artifact_inventory.poisoned = true;
                 if (original) |port| try port.checkpoint();
@@ -1442,6 +1450,10 @@ pub const DocStore = struct {
             if (columnar_owner) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
         }
 
+        pub fn setReadGuardScope(self: *Batch, scope: transaction_read_guards.Scope) !void {
+            try self.read_guards.setScope(scope);
+        }
+
         pub fn reservePreparedReplayPlan(self: *Batch, expected: @import("db/prepared_transaction_effects.zig").Contract, request: @import("db/derived/derived_types.zig").DerivedBatch, original: ?@import("../common/read_admission.zig").Port) !void {
             try self.asTxn().reservePreparedReplayPlan(expected, request, original);
         }
@@ -1550,6 +1562,7 @@ pub const DocStore = struct {
     fn backendCapabilities(self: *DocStore) backend_types.Capabilities {
         var capabilities = self.runtime_store.capabilities();
         capabilities.accounted_prepared_observations = true;
+        capabilities.owned_read_guard_mutations = true;
         return capabilities;
     }
 

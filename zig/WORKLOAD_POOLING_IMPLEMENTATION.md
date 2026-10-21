@@ -22113,3 +22113,68 @@ Final `semantic-scans-v5` evidence: all four native commands exited 0;
 22 catalog, 4 counters, 7 grouped reads, 14 cleanup and 51 ABI companions),
 with no skips, failures or leaks. All 5,491 source-input hashes were verified.
 The pinned generated-error check and whitespace checks passed.
+
+### Owned read-guard metadata mutations (2026-10-21)
+
+Before admitting compiled semantic predicates, the existing guard path needed
+its retirement escape closed: a raw native batch could delete a guard and its
+count, then pass a check against only the final view. DocStore guard-key/count
+mutations now require a fixed transaction ID and admission/resolution phase.
+Admission/resolution carry that value through the erased Batch callback as well
+as concrete transactions, batches and append paths. Native ABI 59/storage owner
+ABI 117 fence the callback, capability and expanded capture layout.
+
+Capture acquires the shared publication gate before reading the original count
+and each touched guard's original membership. It owns copied metadata keys,
+not borrowed backend values or caller authority pointers. Scope changes and
+other owners' framed guard keys are rejected and poison the writer. Final
+validation requires admission to leave guards present, resolution to remove
+existing guards, and the final count to equal the original count plus the exact
+membership delta. Empty values and exact key framing are mandatory. Count
+changes refresh the reader-presence fast path, so a guard installed before a
+later data mutation cannot be skipped. The absent-reader path still makes one
+count lookup; metadata bookkeeping is allocated only when metadata is touched.
+
+The same atomic writer view must contain a pending, unresolved owner record for
+admission, or a terminal record with known completed intent resolution for
+retirement. A pending owner cannot drop its guard even when a final count of
+zero would otherwise bypass conflict lookup. Other readers' guards remain in
+the final conflict view. TxnManager supplies admission scope at the final intent
+batch and resolution scope at the final decision/resource batch. A backend
+claiming `owned_read_guard_mutations` must provide the native scope operation;
+missing callbacks fail before staging mutations. Raw backends keep that capability
+false. This does not change the durable guard format or database reader epoch.
+
+Focused negative cases cover raw deletion, wrong-owner deletion, pending-owner
+retirement, retiring with admission scope, count-only deletion, forged counts,
+nonempty guard values, changing phase, missing owner records and data mutations
+on either side of guard installation. Concrete transactions and batches retain
+the first rejection across repeated commit attempts. The capture allocation
+matrix releases every key/map allocation; injected backend failures remain the
+first cause at capture and validation. Existing exact-framing, recursive counter,
+append, cross-view admission serialization, actual shared-reader restart,
+sole-reader upgrade, committed/aborted retirement and terminal retry cases remain
+in the selected regression scope. Independent untracked participant-ACK writes
+remain possible while a rejected guard writer retains its gate; this is not a
+whole-node publisher/control-progress qualification.
+
+This closes native DocStore metadata bypasses for the existing narrow guard
+surface. It does NOT register the newly compiled semantic point/range footprints,
+expand the metadata predicate whitelist or authenticate arbitrary raw writes to
+transaction records as distributed decisions. Raw backend/import/restore/migration
+and peer/downgrade eligibility still need the stronger protocol before activation.
+Next register/recover safe semantic predicates atomically and enforce their
+value/membership conflicts across writer paths using this owner retirement
+boundary. In-range mandatory counters/control dependencies still need refinement
+or commit-owned deltas. Complete live authority capture, pure preparation,
+executable recovery resources, derived-log quota, lifetime ownership and normal
+required PREPARE/default integration remain open. The full design is incomplete;
+stronger remote-read defaults remain off. Full Linux qualification remains waived.
+
+Final `read-guard-owner-v2`: all four native commands exited 0; 88/88 build
+steps passed; 397 fresh executions (98 prepared effects, 113 transaction/memory,
+88 DocStore, 47 DB and 51 ABI companions), no skips/failures/leaks. All 5,491
+source-input hashes remained unchanged. Generated-error and whitespace checks
+passed. V1 passed 47 DB, 88 DocStore and 112 transaction/memory tests; its
+prepared-root compile exposed a generic fake-view optional inference issue,
+corrected before the final run.

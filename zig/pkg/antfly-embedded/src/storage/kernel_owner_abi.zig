@@ -30,7 +30,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Reject older capability layouts before trusting those semantics.
 // Semantic range observations own bounds and membership predicates.
 // Fence prior native owners before interpreting the expanded read set.
-pub const abi_version: u32 = 116;
+// Read-guard metadata carries an exact actor through native batch dispatch.
+pub const abi_version: u32 = 117;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
