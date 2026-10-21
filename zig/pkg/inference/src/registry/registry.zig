@@ -16,6 +16,7 @@
 // Model registry: discovers local models and downloads from HuggingFace Hub.
 
 const std = @import("std");
+const lightonocr3 = @import("../readers/lightonocr3.zig");
 const ascii_compat = @import("../util/ascii_compat.zig");
 const Io = std.Io;
 const Dir = Io.Dir;
@@ -84,6 +85,8 @@ pub const bge_m3_pinned_ref = "BAAI/bge-m3:safetensors@" ++ bge_m3_pinned_revisi
 pub const embeddinggemma2_pinned_ref = "google/embeddinggemma-2:safetensors@914f7f89142e33e77833254d9c9b90c3cef7303b";
 
 pub const friendly_aliases = [_]FriendlyAlias{
+    .{ .alias = "lightonocr3-0.8b", .ref = lightonocr3.pinned_ref },
+    .{ .alias = "lightonocr3-4b", .ref = lightonocr3.pinned_ref_4b },
     .{ .alias = "bge-m3", .ref = "BAAI/bge-m3" },
     .{ .alias = "gemma4-e2b", .ref = "google/gemma-4-E2B-it-qat-q4_0-gguf:gguf" },
     .{ .alias = "gemma-4-e2b", .ref = "google/gemma-4-E2B-it-qat-q4_0-gguf:gguf" },
@@ -623,6 +626,12 @@ pub const ModelRegistry = struct {
                 projector_selection,
                 progress_sink,
             );
+        }
+        // Only the canonical safetensors source receives this trained OCR
+        // profile. Never infer executable prompt behavior from a path name.
+        const variant_revision = try download.parseVariantRevision(ref.variant);
+        if (lightonocr3.isHubSource(ref.owner, ref.name, variant_revision.variant)) {
+            try download.writeManagedArtifactAndUpdatePlan(self.allocator, io, transaction.staging, "model_manifest.json", lightonocr3.manifest_json);
         }
         try self.writePulledModelManifest(io, transaction.staging, tasks_csv, capabilities_csv);
         try download.completeManagedDownload(self.allocator, io, transaction.staging);
@@ -2768,4 +2777,21 @@ test "pull progress reports carry the model they belong to" {
     // A caller without a callback gets none.
     var bare = ModelRegistry.ProgressLabeler{ .inner = .{}, .model = "owner/model" };
     try std.testing.expect(bare.sink().callback == null);
+}
+
+test "LightOnOCR3 pulled manifest preserves OCR identity when tasks are overridden" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = @embedFile("../models/testdata/lightonocr3/config.json") });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = lightonocr3.manifest_json });
+    const model_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(model_dir);
+    const json = try synthesizePulledModelManifestJson(allocator, model_dir, "generate,read", null);
+    defer allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "lightonocr3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"generator\"") != null);
+    try std.testing.expectEqualStrings(lightonocr3.pinned_ref, resolveFriendlyRef("LightOnOCR3-0.8B").?);
+    try std.testing.expectEqualStrings(lightonocr3.pinned_ref_4b, resolveFriendlyRef("LightOnOCR3-4B").?);
 }

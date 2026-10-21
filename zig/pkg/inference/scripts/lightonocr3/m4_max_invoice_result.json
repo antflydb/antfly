@@ -1,0 +1,220 @@
+{
+  "date": "2026-10-21",
+  "machine": "Apple M4 Max, 36 GiB unified memory",
+  "model": "lightonai/LightOnOCR-3-0.8B",
+  "revision": "36d8636925327c671bd8e479c517a004f7566bd9",
+  "image": "src/models/testdata/lightonocr3/invoice.png",
+  "image_sha256": "23050ef19787ebc8f5386ffd5a6c322e6001855a108c4c65639cce465262754e",
+  "request": {
+    "image_size": [
+      1200,
+      360
+    ],
+    "resized_size": [
+      1216,
+      352
+    ],
+    "merged_image_tokens": 418,
+    "max_new_tokens": 128,
+    "prompt": "image-only, thinking disabled",
+    "sampling": "greedy"
+  },
+  "native": {
+    "build": "ReleaseFast, Zig 0.17.0",
+    "requested_backend": "metal",
+    "actual_backend": "native",
+    "cold_request_including_load_seconds": 53.96,
+    "warm_runs": [
+      {
+        "run": 0,
+        "seconds": 26.372,
+        "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+      },
+      {
+        "run": 1,
+        "seconds": 37.024,
+        "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+      },
+      {
+        "run": 2,
+        "seconds": 21.45,
+        "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+      }
+    ],
+    "median_warm_seconds": 26.372,
+    "node_process_termination_available": false
+  },
+  "pytorch": {
+    "metadata": {
+      "torch": "2.14.1",
+      "transformers": "5.5.4",
+      "platform": "macOS-27.0.1-arm64-arm-64bit",
+      "device": "mps",
+      "dtype": "bfloat16",
+      "image_size": [
+        1200,
+        360
+      ],
+      "model_dir": "/private/tmp/antfly-lightonocr3-model",
+      "max_new_tokens": 128,
+      "load_seconds": 4.557321124942973,
+      "prompt": "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "input_tokens": 432,
+      "image_grid_thw": [
+        [
+          1,
+          22,
+          76
+        ]
+      ]
+    },
+    "runs": [
+      {
+        "run": 0,
+        "warm": false,
+        "seconds": 3.3312373750377446,
+        "tokens": 22,
+        "token_ids": [
+          16614,
+          20979,
+          2136,
+          77796,
+          271,
+          33526,
+          220,
+          16,
+          17,
+          18,
+          19,
+          20,
+          271,
+          7354,
+          18954,
+          220,
+          19,
+          17,
+          13,
+          15,
+          15,
+          248046
+        ],
+        "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+        "mps_allocated_bytes": 1717005824,
+        "max_rss_bytes": 688013312
+      },
+      {
+        "run": 1,
+        "warm": true,
+        "seconds": 2.931948250043206,
+        "tokens": 22,
+        "token_ids": [
+          16614,
+          20979,
+          2136,
+          77796,
+          271,
+          33526,
+          220,
+          16,
+          17,
+          18,
+          19,
+          20,
+          271,
+          7354,
+          18954,
+          220,
+          19,
+          17,
+          13,
+          15,
+          15,
+          248046
+        ],
+        "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+        "mps_allocated_bytes": 1717005824,
+        "max_rss_bytes": 688013312
+      },
+      {
+        "run": 2,
+        "warm": true,
+        "seconds": 2.627622124971822,
+        "tokens": 22,
+        "token_ids": [
+          16614,
+          20979,
+          2136,
+          77796,
+          271,
+          33526,
+          220,
+          16,
+          17,
+          18,
+          19,
+          20,
+          271,
+          7354,
+          18954,
+          220,
+          19,
+          17,
+          13,
+          15,
+          15,
+          248046
+        ],
+        "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+        "mps_allocated_bytes": 1717005824,
+        "max_rss_bytes": 688013312
+      },
+      {
+        "run": 3,
+        "warm": true,
+        "seconds": 2.7355874170316383,
+        "tokens": 22,
+        "token_ids": [
+          16614,
+          20979,
+          2136,
+          77796,
+          271,
+          33526,
+          220,
+          16,
+          17,
+          18,
+          19,
+          20,
+          271,
+          7354,
+          18954,
+          220,
+          19,
+          17,
+          13,
+          15,
+          15,
+          248046
+        ],
+        "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+        "mps_allocated_bytes": 1717005824,
+        "max_rss_bytes": 688013312
+      }
+    ]
+  },
+  "native_over_pytorch_warm_median_ratio": 9.640342632009919,
+  "output_text_matches": true,
+  "limitations": [
+    "Historical CPU baseline: the benchmark used embedded-node defaults, which disallowed process-required GPU backends before model loading. This was a benchmark configuration issue, rather than proof that this model cannot execute on Metal.",
+    "Shared machine, three warm runs per process; approximate comparison only.",
+    "Native selected CPU fallback; PyTorch used MPS with BF16 and SDPA, without optional CUDA fused recurrent-attention kernels.",
+    "Same checkpoint, with native F32 conversion visible in the CPU profile; compute precision is not matched.",
+    "Image decoding/preprocessing and generation included; HTTP excluded; cold native request includes loading, PyTorch loading timed separately.",
+    "Single small invoice; no dense-page accuracy, grounding, token/logit parity, or CUDA qualification."
+  ],
+  "profile_observations": [
+    "Warm-request sample spent about 80% of main-thread samples in vision CPU SDPA.",
+    "CPU BF16-to-F32 weight conversion was also sampled."
+  ]
+}

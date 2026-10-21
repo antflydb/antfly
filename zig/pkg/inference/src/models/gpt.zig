@@ -323,6 +323,19 @@ pub const Config = struct {
         return true;
     }
 
+    /// Qwen3.5 shares Qwen3-VL's vision tower, without DeepStack taps,
+    /// and applies M-RoPE to only a prefix of each language attention head.
+    pub fn hasQwen35VisionArchitectureContract(self: Config) bool {
+        if (!self.isQwen35() or !self.supportsNativeQwen2VlVision() or self.usesMoe()) return false;
+        if (self.vision_temporal_patch_size != 2 or self.vision_num_position_embeddings == 0 or
+            self.vision_out_hidden_size != self.hidden_size or self.vision_deepstack_visual_indexes_len != 0 or
+            self.vision_deepstack_visual_indexes_truncated or !self.mrope_interleaved) return false;
+        const rotary_dim = self.layerRopeActiveDim(@max(self.qwen35_full_attention_interval, 1) - 1);
+        return rotary_dim > 0 and rotary_dim <= self.headDim() and
+            rotary_dim == 2 * (self.mrope_section[0] + self.mrope_section[1] + self.mrope_section[2]) and
+            self.boi_token_index >= 0 and self.eoi_token_index >= 0;
+    }
+
     pub fn tokenEmbeddingScale(self: Config) f32 {
         if (self.disable_token_embedding_scale) return 1.0;
         return switch (self.family) {
@@ -3637,4 +3650,38 @@ test "parse colqwen2 merged config lacks native vision detail" {
     try std.testing.expectEqual(@as(u32, 1536), config.vision_embed_dim);
     try std.testing.expectEqual(@as(u32, 14), config.vision_patch_size);
     try std.testing.expect(!config.supportsNativeQwen2VlVision());
+}
+
+test "LightOnOCR3 official 0.8B config has partial M-RoPE and no DeepStack" {
+    const config = try parseConfig(std.testing.allocator, @embedFile("testdata/lightonocr3/config.json"));
+    try std.testing.expectEqual(ModelFamily.qwen3_5, config.family);
+    try std.testing.expect(config.hasQwen35VisionArchitectureContract());
+    try std.testing.expectEqual(@as(u32, 1024), config.hidden_size);
+    try std.testing.expectEqual(@as(u32, 24), config.num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 256), config.headDim());
+    try std.testing.expectEqual(@as(usize, 64), config.layerRopeActiveDim(3));
+    try std.testing.expect(config.isEosToken(248046));
+    try std.testing.expectEqual(@as(u32, 16), config.qwen35_linear_num_value_heads);
+    try std.testing.expect(config.layerUsesQwen35LinearAttention(0));
+    try std.testing.expect(!config.layerUsesQwen35LinearAttention(3));
+    try std.testing.expectEqual(@as(u32, 12), config.vision_num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 768), config.vision_hidden_size);
+    try std.testing.expectEqual(@as(u8, 0), config.vision_deepstack_visual_indexes_len);
+    var invalid = config;
+    invalid.mrope_section = .{ 24, 20, 20 };
+    try std.testing.expect(!invalid.hasQwen35VisionArchitectureContract());
+}
+
+test "LightOnOCR3 official 4B config uses grouped recurrent heads and larger vision tower" {
+    const config = try parseConfig(std.testing.allocator, @embedFile("testdata/lightonocr3/config-4b.json"));
+    try std.testing.expect(config.hasQwen35VisionArchitectureContract());
+    try std.testing.expectEqual(@as(u32, 2560), config.hidden_size);
+    try std.testing.expectEqual(@as(u32, 9216), config.intermediate_size);
+    try std.testing.expectEqual(@as(u32, 32), config.num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 16), config.qwen35_linear_num_key_heads);
+    try std.testing.expectEqual(@as(u32, 32), config.qwen35_linear_num_value_heads);
+    try std.testing.expectEqual(@as(usize, 64), config.layerRopeActiveDim(3));
+    try std.testing.expectEqual(@as(u32, 24), config.vision_num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 1024), config.vision_hidden_size);
+    try std.testing.expect(config.isEosToken(248046));
 }

@@ -166,17 +166,33 @@ pub const NativeGenerationMediaAdmission = struct {
 /// One source of truth for multimodal scheduler and process-wide admission.
 /// Qwen3-VL probes encoded image headers and applies the exact smart-resize
 /// geometry used by its projector; no image is decoded or projected here.
+fn qwenVisionLimits(allocator: std.mem.Allocator, model_dir: []const u8, config: gpt_mod.Config) !qwen3vl_projector.Limits {
+    if (config.family != .qwen3_5) return .{};
+    const prep = try qwen2vl_mm.loadPreprocessorConfig(allocator, model_dir);
+    if (prep.patch_size != config.vision_patch_size or prep.merge_size != config.vision_spatial_merge_size or
+        prep.temporal_patch_size != config.vision_temporal_patch_size or
+        !prep.do_resize or !prep.do_normalize or !prep.do_rescale or !prep.do_convert_rgb or
+        !std.math.approxEqAbs(f32, prep.rescale_factor, 1.0 / 255.0, 1e-9) or
+        !std.mem.eql(f32, &prep.image_mean, &.{ 0.5, 0.5, 0.5 }) or
+        !std.mem.eql(f32, &prep.image_std, &.{ 0.5, 0.5, 0.5 })) return error.UnsupportedQwen2VlPreprocessorConfig;
+    // Preserve the shared projector safety cap for high-resolution pages.
+    const max_tokens = @min(try qwen2vl_mm.maxImageTokenCount(prep), 4096);
+    const factor = @as(usize, prep.patch_size) * prep.merge_size;
+    const min_tokens = @max(@as(usize, 4), @as(usize, prep.min_pixels) / (factor * factor));
+    return .{ .min_merged_tokens = min_tokens, .max_merged_tokens = max_tokens, .hard_max_merged_tokens = max_tokens };
+}
+
 pub fn nativeGenerationMediaAdmission(
     allocator: std.mem.Allocator,
     model_dir: []const u8,
     messages: []const Message,
     config: gpt_mod.Config,
 ) !NativeGenerationMediaAdmission {
-    if (config.family == .qwen3_vl) {
+    if (config.family == .qwen3_vl or config.hasQwen35VisionArchitectureContract()) {
         const images = try collectImagesInPromptOrder(allocator, messages);
         defer allocator.free(images);
         if (images.len == 0) return .{};
-        const projector = try qwen3vl_projector.estimateAdmission(images, config, .{});
+        const projector = try qwen3vl_projector.estimateAdmission(images, config, try qwenVisionLimits(allocator, model_dir, config));
         return .{
             // The text encode already contains an image placeholder. Retaining
             // one additional token per image preserves the existing
@@ -3859,19 +3875,20 @@ pub const NativeGenerationPipeline = struct {
                 if (has_audio) return error.NativeAudioGenerationNotImplemented;
                 if (!self.gpt_config.isMultimodal()) return error.InvalidModelForGeneration;
                 const model_dir = self.model_dir orelse return error.MissingModelDirForMultimodal;
-                if (self.gpt_config.family == .qwen3_vl) {
+                if (self.gpt_config.family == .qwen3_vl or self.gpt_config.hasQwen35VisionArchitectureContract()) {
                     if (!decode_state.isPaged()) return error.InvalidModelForGeneration;
                     if (images.len == 0 or images.len > 8) return error.ImageLimitExceeded;
                     const per_image_budget = expanded_prompt_token_limit / images.len;
-                    if (per_image_budget < 64) return error.InputTokenLimitExceeded;
-                    const per_image_limit = @min(@as(usize, 576), per_image_budget);
+                    var vision_limits = try qwenVisionLimits(allocator, model_dir, self.gpt_config);
+                    if (per_image_budget < vision_limits.min_merged_tokens) return error.InputTokenLimitExceeded;
+                    vision_limits.max_merged_tokens = @min(vision_limits.max_merged_tokens, per_image_budget);
                     var projected = if (config.qwen3vl_parity_json_path != null)
                         try qwen3vl_projector.encodeProjectedImagesResidentForQualification(
                             &self.cb,
                             allocator,
                             self.gpt_config,
                             images,
-                            .{ .max_images = 8, .max_merged_tokens = per_image_limit },
+                            vision_limits,
                         )
                     else
                         try qwen3vl_projector.encodeProjectedImagesResident(
@@ -3879,7 +3896,7 @@ pub const NativeGenerationPipeline = struct {
                             allocator,
                             self.gpt_config,
                             images,
-                            .{ .max_images = 8, .max_merged_tokens = per_image_limit },
+                            vision_limits,
                         );
                     defer projected.deinit();
                     var qwen_encoded = try encodeQwenPromptWithImagePlaceholders(
@@ -5893,6 +5910,8 @@ pub const NativeGenerationPipeline = struct {
         decode_state: *NativeDecodeState,
     ) !?[]f32 {
         if (prepared.plan.tokenCount() != seq_len or !decode_state.isPaged()) return error.InvalidPreparedPrompt;
+        try decode_state.ensureQwen35LinearCache(self.gpt_config);
+        decode_state.resetQwen35LinearCache();
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         var direct_prefill_turn_acquired = false;
         defer if (direct_prefill_turn_acquired) self.scheduler.?.finishTurn(self.scheduler_lease.?, .prefill);

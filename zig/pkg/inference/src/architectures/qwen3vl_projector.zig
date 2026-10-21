@@ -129,7 +129,7 @@ fn estimateAdmissionForImageDimensions(
 ) !AdmissionEstimate {
     try limits.validate();
     if (dimensions.len == 0 or dimensions.len > limits.max_images) return error.ImageLimitExceeded;
-    if (config.family != .qwen3_vl or config.vision_patch_size == 0 or
+    if ((config.family != .qwen3_vl and config.family != .qwen3_5) or config.vision_patch_size == 0 or
         config.vision_spatial_merge_size == 0 or config.vision_hidden_size == 0 or
         config.vision_intermediate_size == 0 or config.hidden_size == 0 or
         config.vision_num_attention_heads == 0)
@@ -275,6 +275,7 @@ pub const PreparedPrompt = struct {
 };
 
 const Config = struct {
+    is_qwen35: bool = false,
     text_hidden: usize,
     vision_hidden: usize,
     intermediate: usize,
@@ -804,7 +805,7 @@ pub fn prepareExpandedPromptEmbeddings(
     projected: ProjectedImages,
     max_input_tokens: usize,
 ) !PreparedPrompt {
-    if (config.family != .qwen3_vl or config.image_token_index < 0 or
+    if ((config.family != .qwen3_vl and config.family != .qwen3_5) or config.image_token_index < 0 or
         projected.tokens_per_image.len == 0 or projected.tokens_per_image.len != projected.grids.len or
         projected.hidden_size != config.hidden_size)
     {
@@ -1096,6 +1097,12 @@ fn encodeSingleImage(
     // later failures (including cancellation and backend allocation errors)
     // release the live tensor exactly once.
     defer cb.free(hidden);
+    if (cfg.is_qwen35 and cb.kind() == .metal) {
+        if (try cb.ensureDeviceResident(hidden)) |resident| {
+            cb.free(hidden);
+            hidden = resident;
+        }
+    }
     const patch_embed_ns = profileLap(profile, &stage_started_at);
 
     failed_stage = "rope_positions";
@@ -1130,11 +1137,24 @@ fn encodeSingleImage(
         });
         failed_stage = "vision_block";
         failed_layer = layer;
+        // One frame per vision block batches GPU operations while keeping
+        // retained scratch bounded to the admitted single-block envelope.
+        var owns_frame = cfg.is_qwen35 and cb.kind() == .metal and
+            !platform.env.getenvBool("TERMITE_METAL_DISABLE_QWEN35_VISION_FRAME") and
+            !cb.decoderRuntimeHasActiveFrame() and try cb.decoderRuntimeBeginFrame();
+        defer if (owns_frame) cb.decoderRuntimeCancelFrame() catch {};
         const block_started_at = if (profile) monotonicNowNs() else 0;
         const next = (encoderBlock(cb, allocator, weights, cfg, hidden, positions, geometry.patchCount(), layer) catch |zig017_err| {
             zig017_return_error = zig017_err;
             return zig017_err;
         });
+        if (owns_frame) {
+            cb.decoderRuntimeSubmitAndWaitFrame() catch |err| {
+                cb.free(next);
+                return err;
+            };
+            owns_frame = false;
+        }
         if (profile) blocks_ns +|= monotonicNowNs() -| block_started_at;
         cb.free(hidden);
         hidden = next;
@@ -1850,9 +1870,8 @@ fn parseConfig(file: *const gguf_format.File) !Config {
 }
 
 fn configFromResidentModel(config: gpt_config.Config) !Config {
-    if (config.family != .qwen3_vl or !config.hasQwen3VlArchitectureContract() or
-        config.vision_temporal_patch_size != 2 or config.vision_num_position_embeddings == 0 or
-        config.vision_deepstack_visual_indexes_len == 0)
+    if ((!config.hasQwen3VlArchitectureContract() and !config.hasQwen35VisionArchitectureContract()) or
+        config.vision_temporal_patch_size != 2 or config.vision_num_position_embeddings == 0)
     {
         return error.InvalidMultimodalConfig;
     }
@@ -1861,6 +1880,7 @@ fn configFromResidentModel(config: gpt_config.Config) !Config {
         return error.InvalidPositionEmbeddingShape;
     const patch_size: usize = @intCast(config.vision_patch_size);
     var cfg = Config{
+        .is_qwen35 = config.family == .qwen3_5,
         .text_hidden = @intCast(config.hidden_size),
         .vision_hidden = @intCast(config.vision_hidden_size),
         .intermediate = @intCast(config.vision_intermediate_size),
@@ -2187,4 +2207,17 @@ test "Qwen3-VL prompt preparation keeps M-RoPE mask and DeepStack aligned" {
     const values = try cb.toFloat32(prepared.input_embeddings.?, allocator);
     defer allocator.free(values);
     try std.testing.expectEqualSlices(f32, &.{ 2, 3, 100, 101, 200, 201, 4, 5 }, values);
+}
+
+test "LightOnOCR3 resident vision uses learned positions without DeepStack" {
+    const model = try gpt_config.parseConfig(std.testing.allocator, @embedFile("../models/testdata/lightonocr3/config.json"));
+    const cfg = try configFromResidentModel(model);
+    try std.testing.expectEqual(@as(usize, 768), cfg.vision_hidden);
+    try std.testing.expectEqual(@as(usize, 1024), cfg.text_hidden);
+    try std.testing.expectEqual(@as(usize, 12), cfg.block_count);
+    try std.testing.expectEqual(@as(usize, 0), cfg.deepstack_len);
+    try std.testing.expectEqual(@as(usize, 768), cfg.image_size);
+    const name = try residentWeightNameAlloc(std.testing.allocator, cfg, "v.position_embd.weight");
+    defer std.testing.allocator.free(name);
+    try std.testing.expectEqualStrings("model.visual.pos_embed.weight", name);
 }

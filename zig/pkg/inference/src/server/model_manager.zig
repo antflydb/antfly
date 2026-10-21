@@ -19,6 +19,7 @@
 // and backend session, and returns a pipeline ready for inference.
 
 const std = @import("std");
+const lightonocr3_reader = @import("../readers/lightonocr3.zig");
 const execution_control_mod = @import("../execution_control.zig");
 const InferenceExecutionControl = execution_control_mod.InferenceExecutionControl;
 const HardCancellationWatchdog = @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog;
@@ -7440,7 +7441,11 @@ pub const ModelManager = struct {
         var chat_template_failed = false;
         const needs_chat_template = man.model_type != .embedder and
             !man.isQwen3TextReranker() and !man.isQwen3VlReranker();
-        var chat_tmpl: ?*ChatTemplate = if (if (needs_chat_template) man.chat_template else null) |ct_source| blk2: {
+        const chat_template_source: ?[]const u8 = if (man.isLightOnOcr3())
+            lightonocr3_reader.chat_template
+        else
+            man.chat_template;
+        var chat_tmpl: ?*ChatTemplate = if (if (needs_chat_template) chat_template_source else null) |ct_source| blk2: {
             const ct = self.allocator.create(ChatTemplate) catch {
                 chat_template_failed = true;
                 break :blk2 null;

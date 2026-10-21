@@ -83,6 +83,7 @@ const silero_vad_mod = @import("../pipelines/silero_vad.zig");
 const speaker_embedding_mod = @import("../pipelines/speaker_embedding.zig");
 const transcription_sessions = @import("transcription_sessions.zig");
 const readers_mod = @import("../readers/reader.zig");
+const lightonocr3_reader_mod = @import("../readers/lightonocr3.zig");
 const qwen3vl_reader_mod = @import("../readers/qwen3vl.zig");
 const rebel_mod = @import("../pipelines/rebel.zig");
 const resolver_mod = @import("../pipelines/resolver.zig");
@@ -3234,7 +3235,7 @@ fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) Mod
         const capabilities = if (maybe_manifest) |*man| man.capabilities else &.{};
         const gliner_model_type = if (maybe_manifest) |*man| man.gliner_model_type else "";
         const zero_shot_classification = if (maybe_manifest) |*man| manifestSupportsZeroShotClassification(man) else false;
-        const qwen3vl_reader = if (maybe_manifest) |*man| isQwen3VlReadModel(man) else false;
+        const qwen3vl_reader = if (maybe_manifest) |*man| isGenerativeReadModel(man) else false;
 
         for (task_names) |task| {
             if (std.mem.eql(u8, task, "chunkers")) continue;
@@ -3305,7 +3306,7 @@ fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Alloc
         defer man.deinit();
         if (!model_manager_mod.isManifestPotentiallyLoadableInCurrentBuild(man)) continue;
 
-        const qwen3vl_reader = isQwen3VlReadModel(&man);
+        const qwen3vl_reader = isGenerativeReadModel(&man);
 
         for (task_names) |task| {
             if (std.mem.eql(u8, task, "chunkers")) continue;
@@ -7293,7 +7294,6 @@ pub const Node = struct {
         control: InferenceExecutionControl,
     ) ![]Qwen3VlReadResult {
         try control.update(.loading_model, 0, 1);
-        const prompt = qwen3vl_reader_mod.resolvePrompt(requested_prompt);
         const max_tokens: i32 = @intCast(requested_max_tokens orelse default_read_admission_max_tokens);
         // Keep one handle alive across the serial batch so another request
         // cannot evict the resident decoder/projector between page images.
@@ -7301,9 +7301,10 @@ pub const Node = struct {
         // handle for each item and therefore reuses this same loaded model.
         var resident_model_handle = try self.model_manager.acquireFromDirWithControl(model_path, control);
         defer resident_model_handle.release();
-        if (!isQwen3VlReadModel(&resident_model_handle.get().manifest))
+        if (!isGenerativeReadModel(&resident_model_handle.get().manifest))
             return error.InvalidModelForReading;
 
+        const prompt = try resolveGenerativeReadPrompt(&resident_model_handle.get().manifest, requested_prompt);
         const out = try allocator.alloc(Qwen3VlReadResult, image_datas.len);
         var filled: usize = 0;
         errdefer {
@@ -7417,11 +7418,11 @@ pub const Node = struct {
         defer self.allocator.free(model_path);
         var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
         defer admission_manifest.deinit();
-        const is_qwen3vl = isQwen3VlReadModel(&admission_manifest);
+        const is_qwen3vl = isGenerativeReadModel(&admission_manifest);
 
         if (is_qwen3vl) {
             const generation_units = estimateGenerateAdmissionUnitsFromShape(
-                qwen3vl_reader_mod.resolvePrompt(request.prompt).len,
+                (try resolveGenerativeReadPrompt(&admission_manifest, request.prompt)).len,
                 1,
                 @intCast(max_tokens orelse default_read_admission_max_tokens),
             );
@@ -7619,8 +7620,8 @@ pub const Node = struct {
         {
             var manifest = try manifest_mod.loadListingFromDir(allocator, model_path);
             defer manifest.deinit();
-            if (isQwen3VlReadModel(&manifest)) {
-                const prompt = qwen3vl_reader_mod.resolvePrompt(request.prompt);
+            if (isGenerativeReadModel(&manifest)) {
+                const prompt = try resolveGenerativeReadPrompt(&manifest, request.prompt);
                 const output_tokens = max_tokens orelse default_read_admission_max_tokens;
                 const contract = try resolvedInferenceExecutorContract(self, "read", &manifest);
                 const image_datas = try allocator.alloc([]const u8, request.images.len);
@@ -17308,10 +17309,11 @@ pub const Node = struct {
         var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer admission_manifest.deinit();
-        const is_qwen3vl = isQwen3VlReadModel(&admission_manifest);
+        const is_qwen3vl = isGenerativeReadModel(&admission_manifest);
 
         if (is_qwen3vl) {
-            const prompt = qwen3vl_reader_mod.resolvePrompt(body.prompt);
+            const prompt = resolveGenerativeReadPrompt(&admission_manifest, body.prompt) catch
+                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "LightOnOCR-3 prompt must be empty or grounding" });
             const generation_units = estimateGenerateAdmissionUnitsFromShape(
                 prompt.len,
                 1,
@@ -17324,7 +17326,7 @@ pub const Node = struct {
         const executor_contract = resolvedInferenceExecutorContract(self, "read", &admission_manifest) catch |err|
             return inferenceExecutorContractFailureResponse(ctx, err);
         const read_prompt_bytes = if (is_qwen3vl)
-            qwen3vl_reader_mod.resolvePrompt(body.prompt).len
+            (try resolveGenerativeReadPrompt(&admission_manifest, body.prompt)).len
         else if (body.prompt) |prompt|
             prompt.len
         else
@@ -20136,7 +20138,7 @@ pub const Node = struct {
                 continue;
             }
             const model_kind = @tagName(manifest.model_type);
-            const qwen3vl_reader = isQwen3VlReadModel(&manifest);
+            const qwen3vl_reader = isGenerativeReadModel(&manifest);
             const reader_candidate = manifestMatchesModelListingTask("readers", model_kind, &manifest);
             const compatibility_summary = self.compatibilitySummaryForDir(a, entry.path) catch CompatibilitySummary{
                 .level = .unknown,
@@ -22943,7 +22945,7 @@ fn manifestMatchesModelListingTask(
     model_kind: []const u8,
     manifest: *const manifest_mod.ModelManifest,
 ) bool {
-    if (std.mem.eql(u8, task, "readers") and isQwen3VlReadModel(manifest)) return true;
+    if (std.mem.eql(u8, task, "readers") and isGenerativeReadModel(manifest)) return true;
     if (std.mem.eql(u8, task, "extractors") and (manifest.laya_declared or manifest.embedding_style == .embedding_gemma2)) return false;
     if (std.mem.eql(u8, task, "deciders") and manifest.embedding_style != .embedding_gemma2 and
         !manifest.laya_declared and
@@ -27757,12 +27759,12 @@ test "Qwen3-VL read routing admits only generation bundles" {
         .inference_bundle_family = try allocator.dupe(u8, manifest_mod.qwen3_vl_gguf_bundle_family),
     };
     defer generation_manifest.deinit();
-    try std.testing.expect(isQwen3VlReadModel(&generation_manifest));
+    try std.testing.expect(isGenerativeReadModel(&generation_manifest));
     try std.testing.expect(manifestMatchesModelListingTask("generators", "generator", &generation_manifest));
     try std.testing.expect(manifestMatchesModelListingTask("readers", "generator", &generation_manifest));
 
     generation_manifest.model_type = .reranker;
-    try std.testing.expect(!isQwen3VlReadModel(&generation_manifest));
+    try std.testing.expect(!isGenerativeReadModel(&generation_manifest));
     try std.testing.expect(!manifestMatchesModelListingTask("readers", "reranker", &generation_manifest));
 
     var generic_generator = manifest_mod.ModelManifest{
@@ -27770,7 +27772,7 @@ test "Qwen3-VL read routing admits only generation bundles" {
         .model_type = .generator,
     };
     defer generic_generator.deinit();
-    try std.testing.expect(!isQwen3VlReadModel(&generic_generator));
+    try std.testing.expect(!isGenerativeReadModel(&generic_generator));
     try std.testing.expect(!manifestMatchesModelListingTask("readers", "generator", &generic_generator));
 }
 
@@ -27928,7 +27930,7 @@ test "Qwen3-VL direct read rejects insufficient generation capacity before fetch
     defer allocator.free(model_path);
     var manifest = try manifest_mod.loadFromDir(allocator, model_path);
     defer manifest.deinit();
-    try std.testing.expect(isQwen3VlReadModel(&manifest));
+    try std.testing.expect(isGenerativeReadModel(&manifest));
     var node = try Node.init(allocator, .{
         .models_dir = models_root,
         .max_concurrent_requests = 4,
@@ -34983,10 +34985,14 @@ fn normalizeReadPrompt(prompt: ?[]const u8) ?[]const u8 {
     return if (std.mem.trim(u8, value, " \t\r\n").len == 0) null else value;
 }
 
-fn isQwen3VlReadModel(manifest: *const manifest_mod.ModelManifest) bool {
-    return manifest.model_type == .generator and
-        manifest.isQwen3VlGgufBundle() and
-        !manifest.isQwen3VlReranker();
+fn isGenerativeReadModel(manifest: *const manifest_mod.ModelManifest) bool {
+    return manifest.isLightOnOcr3() or (manifest.model_type == .generator and
+        manifest.isQwen3VlGgufBundle() and !manifest.isQwen3VlReranker());
+}
+
+fn resolveGenerativeReadPrompt(manifest: *const manifest_mod.ModelManifest, prompt: ?[]const u8) ![]const u8 {
+    if (manifest.isLightOnOcr3()) return lightonocr3_reader_mod.resolvePrompt(prompt);
+    return qwen3vl_reader_mod.resolvePrompt(prompt);
 }
 
 fn optionalBytesEql(a: ?[]const u8, b: ?[]const u8) bool {
@@ -36004,4 +36010,133 @@ test "embeddinggemma2 linked reduced dimensions match HTTP and preserve ownershi
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "LightOnOCR3 read routing preserves image-only and grounding prompts" {
+    const allocator = std.testing.allocator;
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .generator,
+        .config_model_arch = try allocator.dupe(u8, "qwen3_5"),
+    };
+    defer manifest.deinit();
+    manifest.capabilities = try allocator.alloc([]const u8, 1);
+    manifest.capabilities[0] = try allocator.dupe(u8, "lightonocr3");
+    manifest.tasks = try allocator.alloc([]const u8, 1);
+    manifest.tasks[0] = try allocator.dupe(u8, "read");
+    try std.testing.expect(isGenerativeReadModel(&manifest));
+    try std.testing.expect(manifestMatchesModelListingTask("readers", "generator", &manifest));
+    try std.testing.expectEqualStrings("", try resolveGenerativeReadPrompt(&manifest, null));
+    try std.testing.expectEqualStrings("grounding", try resolveGenerativeReadPrompt(&manifest, "grounding"));
+    try std.testing.expectError(error.InvalidLightOnOcrPrompt, resolveGenerativeReadPrompt(&manifest, "<OCR>"));
+}
+
+test "LightOnOCR3 HTTP read rejects untrained prompts before loading weights" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDirPath(io, "models/generators/owner/lighton");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/generators/owner/lighton/config.json", .data = @embedFile("../models/testdata/lightonocr3/config.json") });
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/generators/owner/lighton/model_manifest.json", .data = lightonocr3_reader_mod.manifest_json });
+    const models_root = try tmp.dir.realPathFileAlloc(io, "models", allocator);
+    defer allocator.free(models_root);
+    var node = try Node.init(allocator, .{ .models_dir = models_root, .max_concurrent_requests = 64 });
+    defer node.deinit();
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/read");
+    defer request.deinit();
+    try request.setJson("{\"model\":\"owner/lighton\",\"prompt\":\"<OCR>\",\"images\":[{\"url\":\"https://example.invalid/page.png\"}]}");
+    var ctx = httpx.Context.init(allocator, io, &request);
+    defer ctx.deinit();
+    var response = try node.readImages(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "empty or grounding") != null);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+}
+
+test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
+    const model_dir = if (std.c.getenv("ANTFLY_TEST_LIGHTONOCR3_MODEL_DIR")) |value| std.mem.span(value) else return error.SkipZigTest;
+    // The opt-in full checkpoint has hundreds of thousands of tokenizer
+    // allocations; allocator stack tracing would dominate this smoke test.
+    const allocator = std.heap.smp_allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(models_root);
+    // This opt-in test runs in its own disposable process, matching the
+    // supervised server's cancellation contract for GPU backends.
+    // Optional operator-owned process envelope for a shared benchmark machine.
+    // Live availability and the fixed emergency reserve still apply.
+    const memory_limit_gib = platform.env.getenvUsize("ANTFLY_TEST_LIGHTONOCR3_MEMORY_LIMIT_GIB");
+    const memory_limit_bytes = try std.math.mul(usize, memory_limit_gib orelse 0, 1024 * 1024 * 1024);
+    const shared_limit_gib = platform.env.getenvUsize("ANTFLY_TEST_LIGHTONOCR3_SHARED_LIMIT_GIB") orelse memory_limit_gib orelse 0;
+    const shared_limit_bytes = try std.math.mul(usize, shared_limit_gib, 1024 * 1024 * 1024);
+    var node = try Node.init(allocator, .{
+        .models_dir = models_root,
+        .max_concurrent_requests = 64,
+        .process_termination_available = true,
+        .process_memory_limit_bytes = memory_limit_bytes,
+        // A benchmark operator may use the full envelope rather than the
+        // automatic shared-pool fraction. The independent live-memory check
+        // still enforces process usage, physical availability, and its reserve.
+        .generation_budget_overrides = if (shared_limit_bytes != 0) .{
+            .host_limit_bytes = shared_limit_bytes,
+            .combined_limit_bytes = shared_limit_bytes,
+        } else .{},
+        .process_memory_limit_provenance = if (memory_limit_gib != null) .explicit else .automatic,
+    });
+    defer node.deinit();
+    try node.attachIo(std.testing.io);
+    const external_image = if (std.c.getenv("ANTFLY_TEST_LIGHTONOCR3_IMAGE_PATH")) |path|
+        try std.Io.Dir.cwd().readFileAlloc(std.testing.io, std.mem.span(path), allocator, .limited(64 * 1024 * 1024))
+    else
+        null;
+    defer if (external_image) |bytes| allocator.free(bytes);
+    const fixture = external_image orelse @embedFile("../models/testdata/lightonocr3/invoice.png");
+    const request = readers_api.EncodedRequest{
+        .images = &.{.{ .bytes = fixture, .mime_type = "image/png", .item_id = "invoice", .page_number = 1 }},
+        .max_tokens = @intCast(platform.env.getenvUsize("ANTFLY_TEST_LIGHTONOCR3_MAX_TOKENS") orelse 128),
+    };
+    const benchmark = std.c.getenv("ANTFLY_BENCH_LIGHTONOCR3") != null;
+    const cold_start = embedTimingNowNs();
+    var result = try node.readEncodedImagesReportedDirect(allocator, model_dir, request);
+    defer result.deinit(allocator);
+    if (benchmark) {
+        if (node.model_manager.acquireLoadedModel(model_dir)) |handle| {
+            var loaded = handle;
+            defer loaded.release();
+            std.debug.print("\nLIGHTONOCR3 backend={s}\n", .{@tagName(loaded.get().session.backend())});
+        }
+        std.debug.print("\nLIGHTONOCR3 cold_request_ms={d} text={s}\n", .{ (embedTimingNowNs() - cold_start) / std.time.ns_per_ms, result.items[0].text });
+        for (0..(platform.env.getenvUsize("ANTFLY_TEST_LIGHTONOCR3_WARM_RUNS") orelse 3)) |run| {
+            const started = embedTimingNowNs();
+            var warm = try node.readEncodedImagesReportedDirect(allocator, model_dir, request);
+            defer warm.deinit(allocator);
+            std.debug.print("LIGHTONOCR3 warm_run={d} ms={d} text={s}\n", .{ run, (embedTimingNowNs() - started) / std.time.ns_per_ms, warm.items[0].text });
+            try std.testing.expectEqualStrings(result.items[0].text, warm.items[0].text);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), result.items.len);
+    try std.testing.expectEqual(@as(usize, 1), result.execution.serial_items);
+    try std.testing.expect(result.items[0].text.len > 0);
+    if (external_image == null) {
+        for ([_][]const u8{ "Antfly", "12345", "42.00" }) |expected|
+            try std.testing.expect(std.mem.indexOf(u8, result.items[0].text, expected) != null);
+    }
+}
+
+test "LightOnOCR3 page template preserves exact image-only and grounding framing" {
+    const allocator = std.testing.allocator;
+    var template = try generation.ChatTemplate.init(allocator, lightonocr3_reader_mod.chat_template, "", "<|im_end|>", "", "<|endoftext|>");
+    defer template.deinit();
+    for ([_][]const u8{ "", "grounding" }) |prompt| {
+        const parts = [_]generation.Message.ContentPart{ .{ .image = 0 }, .{ .text = prompt } };
+        const messages = [_]generation.Message{.{ .role = "user", .content = prompt, .image_bytes = &.{"image"}, .content_parts = &parts }};
+        const actual = try template.applyWithOptions(allocator, &messages, .{ .enable_thinking = false });
+        defer allocator.free(actual);
+        const expected = try std.fmt.allocPrint(allocator, "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{s}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", .{prompt});
+        defer allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, actual);
+    }
 }

@@ -10312,7 +10312,7 @@ pub fn decoderRuntimeTryApplyBf16GateUp(self: anytype, request: anytype) !?Metal
         getenvFlagEnabled("TERMITE_METAL_DISABLE_BF16_MM") or
         getenvFlagEnabled("TERMITE_METAL_DISABLE_BF16_TILED")) return null;
     if (request.activation != .silu or !request.input.isDevice() or request.input.ndim() != 2) return null;
-    if (request.input.dim(0) < 32 or request.input.dim(1) <= 0 or
+    if ((request.input.dim(0) != 1 and request.input.dim(0) < 32) or request.input.dim(1) <= 0 or
         @as(usize, @intCast(request.input.dim(1))) != request.in_dim) return null;
     const runtime = self.raw_decode_runtime orelse return null;
     const rows: usize = @intCast(request.input.dim(0));
@@ -18332,6 +18332,8 @@ fn probeMetalDeviceAvailable() bool {
 pub extern fn termite_metal_provider_create() ?*RawMetalProvider;
 pub extern fn termite_metal_provider_destroy(provider: ?*RawMetalProvider) void;
 pub extern fn termite_metal_decode_runtime_create() ?*RawMetalDecodeRuntime;
+pub extern fn termite_metal_decode_runtime_set_qwen35_ocr_vector_loads(runtime: ?*RawMetalDecodeRuntime, enabled: c_int) void;
+pub extern fn termite_metal_decode_runtime_set_lightonocr3_4b_projections(runtime: ?*RawMetalDecodeRuntime, enabled: c_int) void;
 pub extern fn termite_metal_decode_runtime_set_embeddinggemma2_rms_norm(runtime: ?*RawMetalDecodeRuntime, enabled: c_int) void;
 pub extern fn termite_metal_decode_runtime_embeddinggemma2_rms_norm_threads(runtime: ?*RawMetalDecodeRuntime, rows: usize, hidden_size: usize) u32;
 pub extern fn termite_metal_decode_runtime_destroy(runtime: ?*RawMetalDecodeRuntime) void;
@@ -19549,6 +19551,8 @@ pub extern fn termite_metal_decode_runtime_sdpa_segments_f32_device(
 ) c_int;
 pub extern fn termite_metal_decode_runtime_masked_mean_rows(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, mask: [*c]const i64, rows: usize, width: usize, dimensions: usize, active: usize, output: ?*anyopaque, output_offset: usize) c_int;
 pub extern fn termite_metal_decode_runtime_sdpa_grouped_f32_device(runtime: ?*RawMetalDecodeRuntime, q: ?*anyopaque, q_offset: usize, k: ?*anyopaque, k_offset: usize, v: ?*anyopaque, v_offset: usize, ranges: [*c]const u32, query_positions: [*c]const i32, key_positions: [*c]const i32, queries: usize, keys: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, score_scale: f32, window: u32, scores: ?*anyopaque, query_tile: usize, output: ?*anyopaque, output_offset: usize, check_ctx: ?*anyopaque, check_fn: *const fn (?*anyopaque) callconv(.c) c_int) c_int;
+pub extern fn termite_metal_decode_runtime_qwen35_core_available(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_qwen35_core_device(runtime: ?*RawMetalDecodeRuntime, handles: [*]const ?*anyopaque, offsets: [*]const usize, seq: usize, key_heads: usize, value_heads: usize, dim: usize, kernel: usize, initialized: c_int) c_int;
 pub extern fn termite_metal_decode_runtime_apply_mrope_device(
     runtime: ?*RawMetalDecodeRuntime,
     input_handle: ?*anyopaque,

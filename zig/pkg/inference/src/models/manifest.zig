@@ -517,6 +517,13 @@ pub const ModelManifest = struct {
         return false;
     }
 
+    /// Explicit reader profile, independent of the install directory's name.
+    pub fn isLightOnOcr3(self: *const ModelManifest) bool {
+        return self.model_type == .generator and
+            std.mem.eql(u8, self.config_model_arch, "qwen3_5") and
+            self.hasCapability("lightonocr3") and self.hasTask("read");
+    }
+
     pub fn hasTask(self: *const ModelManifest, task: []const u8) bool {
         if (!self.hasSupportedGlinerRuntime()) return false;
         for (self.tasks) |candidate| {
@@ -7837,4 +7844,17 @@ test "span wrapper manifest rejects unknown and malformed nested encoder contrac
         \\{"model_type":"modernbert","attention_bias":false,"mlp_bias":false,"norm_bias":false,"tie_word_embeddings":true,"hidden_size":-1,"intermediate_size":3840,"num_hidden_layers":28,"num_attention_heads":28,"vocab_size":50378,"max_position_embeddings":7999,"global_attn_every_n_layers":3,"local_attention":128,"pad_token_id":50283}
     });
     try std.testing.expectError(error.InvalidGlinerSpanEncoderConfig, loadFromDir(allocator, model_path));
+}
+
+test "LightOnOCR3 reader identity requires explicit metadata and the Qwen3.5 architecture" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+    try parseConfigJson(&manifest, allocator, @embedFile("testdata/lightonocr3/config.json"));
+    try std.testing.expect(!manifest.isLightOnOcr3());
+    try parseModelManifestJson(&manifest, allocator, @import("../readers/lightonocr3.zig").manifest_json);
+    try std.testing.expect(manifest.isLightOnOcr3());
+    try std.testing.expect(manifest.hasInput("image"));
+    manifest.model_type = .reranker;
+    try std.testing.expect(!manifest.isLightOnOcr3());
 }

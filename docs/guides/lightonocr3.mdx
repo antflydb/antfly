@@ -1,0 +1,318 @@
+---
+title: LightOnOCR-3 document OCR
+description: Run LightOnOCR-3-0.8B and 4B document parsers through Antfly's native inference runtime
+---
+
+LightOnOCR-3-0.8B and 4B are Apache-2.0 document parsers based on Qwen3.5. Each
+transcribes page images into Markdown, including HTML tables and LaTeX formulas.
+Antfly uses the integrated safetensors checkpoint with the native Qwen vision
+and hybrid-attention decoder paths.
+
+## Install
+
+```bash
+antfly inference pull lightonai/LightOnOCR-3-0.8B:safetensors@36d8636925327c671bd8e479c517a004f7566bd9
+```
+
+The pull installs the upstream configuration, tokenizer, chat template, image
+processor, and weights, plus a `model_manifest.json` declaring generation and
+reading. Runtime lookup also accepts `lightonocr3-0.8b`. The checkpoint contains
+852,985,920 BF16 parameters, approximately 1.7 GB of weights; working memory is
+additional. This integration does not add a Qwen3.5 GGUF weight mapping.
+
+The larger model uses the same image-only prompt and `/read` API:
+
+```bash
+antfly inference pull lightonai/LightOnOCR-3-4B:safetensors@b71010f095dc3735de7ee6b9969bff8f8f50b39a
+```
+
+Use `lightonocr3-4b` as the model name. Its 4,539,265,536 BF16 parameters
+occupy approximately 9.1 GB of weights. It has 32 decoder layers with hidden
+size 2560, 16 recurrent key heads and 32 value heads, plus a 24-layer vision
+encoder with hidden size 1024. The 0.8B model has 24 decoder layers with hidden
+size 1024 and a 12-layer vision encoder with hidden size 768. Both retain
+128-channel recurrent heads, four-tap convolution, and partial M-RoPE.
+
+The 4B Metal path also defers paged-attention completion within the active
+decoder frame, avoiding a GPU wait at every full-attention layer. The rollback
+is `TERMITE_METAL_DISABLE_ACTIVE_PAGED_SLOT_ATTENTION_DEFERRED=1`.
+
+On M4 Max, the 4B projection path uses SIMD reductions for single-token
+projections, including the small recurrent gates, and fuses FFN gate/up
+projection with SiLU. Its wide decode and attention-head RMS normalizations
+also use parallel F32 reductions instead of scanning each row in one lane.
+Eligible multi-token projections use Metal 4 TensorOps
+on macOS 26.1 or newer. Unsupported shapes, alignment, or shader availability
+retain the existing implementation. The master rollback is
+`TERMITE_METAL_DISABLE_LIGHTONOCR3_PROJECTIONS=1`.
+Normalization alone can be rolled back with
+`TERMITE_METAL_DISABLE_LIGHTONOCR3_PARALLEL_NORM=1`.
+
+F32 activations, accumulation, and recurrent state remain the default.
+`TERMITE_METAL_LIGHTONOCR3_BF16_ACTIVATIONS=1` experiments with BF16 inputs
+only for eligible multi-token TensorOps projections. It preserves F32 outputs
+and recurrent state; it does not convert the whole runtime to BF16.
+
+The 4B model automatically sizes its GPU cache and admission envelope from the
+weight artifact to cover both mapped source weights and prepared device
+weights. Explicit operator memory limits still take precedence. Working memory
+is additional to checkpoint size; the local comparison uses 36 GiB of unified
+memory.
+
+## Read a page
+
+Send a rendered PDF page or other document image to the inference service:
+
+```bash
+curl http://localhost:8080/ai/v1/read \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "lightonocr3-0.8b",
+    "images": [{"url": "data:image/png;base64,..."}],
+    "max_tokens": 1024
+  }'
+```
+
+Omit `prompt` or pass an empty string for transcription. This model is trained
+with an image-only prompt; a generic instruction such as `Transcribe this page`
+is rejected by `/read`. The alternative `"prompt": "grounding"` returns the
+model's native labeled bounding-box markers, descriptions, and chart tables in
+the result's `text`. These markers use coordinates normalized to 0–1000; they
+are not converted into pixel-coordinate `regions`.
+
+Pages execute serially through the generation runtime, and batch responses
+report serial execution. `/read` currently accepts at most 1024 output tokens
+per page and rejects truncated output. Use `/generate` with a larger budget
+for dense pages; its content should contain the image and either no text or
+the exact `grounding` keyword, with thinking disabled.
+
+## Resolution and validation
+
+The runtime reads pixel limits and patch geometry from the installed image
+processor, bounded by a runtime cap of 4096 merged vision tokens per image,
+and uses the same geometry for admission and execution. Resize page
+images before submitting them when optimizing latency; the upstream speed
+evaluation includes a 1540-pixel-long-side setting. Higher-resolution results
+must be measured separately.
+
+The shared Qwen vision path supplies learned image-position embeddings and
+two-axis vision rotary positions. Qwen3.5's full-attention layers use three-axis
+M-RoPE on the first 64 channels of each 256-channel head, preserving the tail;
+its remaining layers use recurrent linear attention. LightOn has no DeepStack
+vision taps. On Metal, the qualified 128-channel, four-tap DeltaNet path keeps
+causal convolution, normalized Q/K, gates, recurrent matrices, and gated RMSNorm
+on-device. Prefill distributes each value column across a 32-lane SIMD group;
+single-token decoding uses a separate kernel. Buffers belong to the request,
+and reset invalidates their history before reuse. The numerical test covers
+short prefixes, grouped heads, continued decoding, reset, and zero core
+readbacks against the CPU reference.
+
+Metal batches decoder commands across layers and vision commands within each
+block. The M4 Max also enables vectorized BF16 weight loads for the qualified
+0.8B and 4B text/vision projection shapes; activations and accumulation remain F32.
+Other shapes retain the existing dispatch. The CPU fallback uses vectorized
+recurrence and activations. Measure release-build latency on deployment
+hardware before setting an SLO; this does not qualify CUDA or vLLM throughput.
+
+Run the focused tests from `zig/` with the repository's Zig 0.17 toolchain:
+
+```bash
+zig build inference-test -Dtest-filter=LightOnOCR3
+```
+
+An opt-in smoke test uses a local installed checkpoint and an invoice image:
+
+```bash
+ANTFLY_TEST_LIGHTONOCR3_MODEL_DIR=/absolute/path/to/model \
+  zig build inference-test -Dtest-filter=LightOnOCR3
+```
+
+For a shared-machine 4B benchmark, the opt-in test also accepts
+`ANTFLY_TEST_LIGHTONOCR3_MEMORY_LIMIT_GIB=13` and
+`ANTFLY_TEST_LIGHTONOCR3_SHARED_LIMIT_GIB=24`. These set independent process
+and shared-pool limits using normal operator memory policy;
+live availability, process usage, and the emergency reserve remain enforced.
+The shared limit defaults to the process limit when omitted. These test-only
+options do not change production defaults.
+
+The 0.8B configuration fixture in `src/models/testdata/lightonocr3/` comes from the
+pinned [upstream checkpoint](https://huggingface.co/lightonai/LightOnOCR-3-0.8B/tree/36d8636925327c671bd8e479c517a004f7566bd9),
+licensed Apache-2.0. The 4B fixtures come from its
+[pinned checkpoint](https://huggingface.co/lightonai/LightOnOCR-3-4B/tree/b71010f095dc3735de7ee6b9969bff8f8f50b39a).
+The invoice fixture is copied from Antfly's existing native
+Apple OCR tests. Published quality and speed numbers are documented in
+[LightOn's evaluation](https://huggingface.co/blog/lightonai/lightonocr-3);
+they are not Antfly runtime measurements.
+
+## Rough local comparison with PyTorch
+
+The invoice smoke test can also print a cold request (including loading) and
+three warm requests with resident model weights. Use an optimized build and
+request the Metal backend on macOS:
+
+```bash
+cd zig
+ANTFLY_TEST_LIGHTONOCR3_MODEL_DIR=/absolute/path/to/model \
+ANTFLY_BENCH_LIGHTONOCR3=1 ANTFLY_INFERENCE_PREFERRED_BACKEND=metal \
+ANTFLY_INFERENCE_REQUIRED_BACKEND=metal \
+  zig build inference-test -Doptimize=ReleaseFast \
+  '-Dtest-filter=LightOnOCR3 real checkpoint'
+```
+
+From the repository root, run the Transformers reference with the same installed
+checkpoint and bundled invoice image:
+
+```bash
+uv run zig/pkg/inference/scripts/lightonocr3/benchmark_transformers_mps.py \
+  --model-dir /absolute/path/to/model --output /tmp/lightonocr3-pytorch.json
+```
+
+Add `--profile-phases` for an additional instrumented request reporting vision,
+language prefill, decode, and output-head timings. Instrumentation is excluded
+from the ordinary warm samples. MPS event intervals include device queue idle
+time; nested forward scopes must not be added together.
+
+The four bundled synthetic pages also exercise receipts, letters, and shipping
+labels. Compare a ReleaseFast inference test executable against Transformers:
+
+```bash
+uv run zig/pkg/inference/scripts/lightonocr3/benchmark_corpus.py \
+  --native-test /absolute/path/to/inference-test-executable \
+  --model-dir /absolute/path/to/4b-model \
+  --modes baseline f32 bf16 --warm-runs 3 \
+  --timeout-seconds 180 \
+  --output-dir /tmp/lightonocr3-corpus
+```
+
+This runs each runtime sequentially and saves raw logs, latency, transcription,
+required-string coverage, and whitespace-normalized character error rates.
+Repeat with `--pytorch-first` to reverse runtime order. Markdown formatting
+affects the raw character error rate; a separate content-only metric strips
+HTML tags, Markdown headings, and bold markers. These pages are smoke
+tests, not a representative OCR accuracy benchmark. `baseline` disables the
+new 4B kernels; `bf16` rounds eligible multi-token projection inputs
+while preserving F32 recurrent state and accumulation.
+Each subprocess defaults to a 600-second timeout. The process envelope is
+configurable with `--process-limit-gib`; larger pages may need more room than
+the invoice. Live physical-memory admission remains active.
+
+The reference uses BF16 weights, MPS, SDPA, greedy decoding, caching, the upstream
+image-only chat template with thinking disabled, and a 128-token output limit.
+It reports loading separately, one cold generation and three warm generations,
+including image preprocessing. Both use the original 1200×360 image, which
+resizes to 1216×352 and yields 418 merged image tokens. The native comparison
+uses the direct encoded-image `/read` implementation without HTTP overhead.
+These runs measure a small transcription example, rather than dense-page
+throughput or corpus accuracy. MPS does not exercise CUDA's optional fused
+recurrent-attention kernels.
+
+On an Apple M4 Max with 36 GiB unified memory (2026-10-21), two adjacent
+native/PyTorch rounds produced the following six warm requests per runtime:
+
+| Runtime | Warm range | Median |
+| --- | --- | --- |
+| Antfly ReleaseFast, Metal | 0.859–0.868 s | 0.865 s |
+| PyTorch 2.14.1 / Transformers 5.5.4, BF16 MPS | 0.888–1.077 s | 1.033 s |
+
+Native median latency was approximately **16% lower** (1.20× speedup).
+Every run returned identical invoice text. Each request recomputed the image
+and generation. These are shared-machine results on one small invoice;
+dense-page throughput, grounding performance, corpus accuracy, and CUDA remain
+unqualified. The reference uses BF16, while native activations and accumulation
+remain F32. This verifies text agreement on the fixture, rather than full
+PyTorch token/logit parity.
+
+The initial Metal implementation took 10.58–11.08 seconds warm. The earlier
+26-second CPU baseline came from a benchmark setup mistake: its embedded-node
+defaults disallowed process-required GPU backends before model loading. The
+checkpoint test now attaches the supervised-node I/O and cancellation runtime;
+the command above requires Metal so it cannot silently fall back.
+
+The original 0.8B qualification passed 17 focused tests, including GPU/CPU
+agreement for prefill, continued decoding,
+grouped heads, reset, and zero core readbacks. A separate independent native
+Metal check measured maximum output error below 5×10⁻⁷ and state error below
+4×10⁻⁹ against its CPU calculation.
+
+Raw paired measurements, generation phase timings, configuration and reference
+token IDs are in `scripts/lightonocr3/m4_max_invoice_optimized_result.json`
+under the inference package. The historical CPU baseline remains in
+`scripts/lightonocr3/m4_max_invoice_result.json`.
+
+### Initial 4B local comparison
+
+The same invoice and greedy 128-token budget were also measured with the
+pinned 4B BF16 checkpoint on the same M4 Max. Two adjacent native/PyTorch
+rounds provided six warm requests per runtime:
+
+| Runtime | Warm range | Median |
+| --- | --- | --- |
+| Antfly ReleaseFast, Metal | 2.593–2.638 s | 2.622 s |
+| PyTorch 2.14.1 / Transformers 5.5.4, BF16 MPS | 1.930–2.040 s | 1.976 s |
+
+Native median latency was **32.7% higher**
+(PyTorch/native median ratio: 0.75×).
+All runs returned the same invoice text as PyTorch. The 4B model uses the same
+GPU recurrence and command batching, plus vectorized loads for its larger
+projections, deferred attention completion, and artifact-sized memory budgets.
+The focused suite passed all 19 tests, including both model configurations, grouped-head GPU/CPU agreement,
+and preservation of explicit memory limits. The 0.8B real checkpoint was also
+rerun to verify the shared path.
+
+The native benchmark used an explicit 24 GiB process envelope; weights remained
+BF16, with F32 native activations and accumulation. Earlier PyTorch warm medians
+varied from 2.13 to 4.91 seconds as other builds ran; the JSON retains those
+setup measurements separately from the paired samples.
+
+These figures cover one small invoice on a shared machine. They do not establish
+corpus accuracy, dense-page performance, or CUDA throughput. Cold loading is
+reported separately in `scripts/lightonocr3/m4_max_invoice_4b_result.json`,
+along with every paired timing, phase timings, and the PyTorch token IDs.
+
+### Optimized 4B Metal comparison
+
+The optimized path adds parallel reductions for the small recurrent-gate
+projections and wide RMS normalizations, fused single-token FFN gate/up, and
+TensorOps prefill projections. Activations, accumulation, and recurrent state
+remain F32 with the same pinned BF16 weights.
+
+On the same shared M4 Max, two subsequent invoice rounds reversed runtime
+order and collected six warm requests per runtime:
+
+| Runtime | Warm range | Median |
+| --- | --- | --- |
+| Antfly ReleaseFast, Metal | 1.826–2.658 s | 2.207 s |
+| PyTorch 2.14.1 / Transformers 5.5.4, BF16 MPS | 3.195–4.292 s | 4.021 s |
+
+Native median latency was **45.1% lower** (1.82× speedup), and both runtime
+orders favored native. All invoice text matched. Machine load changed
+substantially across the qualification session; these are rough local
+measurements, including image processing and generation, with loading reported
+separately. They qualify this shared-machine comparison, not an isolated
+hardware SLO.
+
+Raw samples, controls, precision checks, and phase profiles are in
+`scripts/lightonocr3/m4_max_invoice_4b_optimized_result.json` under the inference
+package. The original 4B baseline remains in
+`scripts/lightonocr3/m4_max_invoice_4b_result.json`.
+
+All 19 focused tests passed, as did the real 0.8B Metal regression. Standalone
+F32 projection/fusion checks measured maximum absolute differences below
+2.4×10⁻⁶, and parallel norm checks stayed below 9×10⁻⁷ against the scalar
+implementation, with independent double-precision reference checks. A separate
+instrumented request measured sampled decoder GPU frames at 27.5 ms median,
+compared with 51.8 ms before parallel normalization.
+
+The projection-only qualification matched PyTorch text on all four synthetic
+pages in both F32 and experimental BF16-input modes. The final parallel-norm
+defaults were additionally checked on the invoice and the 202-token receipt;
+both matched PyTorch and preserved every required field. The final receipt
+round measured 11.65 seconds native versus 39.11 seconds PyTorch warm median.
+Final letter/shipping refreshes were limited by a delayed cold request and
+live-memory admission as machine load changed. Those incomplete attempts and
+the complete earlier four-page round are retained in
+`scripts/lightonocr3/m4_max_4b_corpus_result.json`.
+
+BF16 projection inputs did not show a consistent latency benefit in these
+runs, so F32 remains the default. These smoke checks qualify transcription
+agreement on the fixtures, rather than a corpus-wide OCR accuracy score.

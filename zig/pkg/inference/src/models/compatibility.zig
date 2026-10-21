@@ -224,6 +224,11 @@ fn assessWithRuntimeFacts(
         );
     }
 
+    // The LightOn profile selects the integrated resident vision tower and
+    // hybrid decoder. Keep generic Qwen3.5 and unsupported GGUF routes gated.
+    if (man.isLightOnOcr3() and man.safetensors_path != null and !man.usesGgufWeights())
+        return makeCompatible(architecture, "LightOnOCR-3 integrated safetensors OCR runtime");
+
     if (man.model_type == .generator)
         return assessGenerator(architecture, expert_count, qualified_gemma4_a4b);
 
@@ -853,4 +858,25 @@ test "known unsafe local site models stay blocked even with unknown opt in" {
     const rebel_result = assess(&rebel, "bart");
     try std.testing.expectEqual(Level.incompatible, rebel_result.level);
     try std.testing.expect(!rebel_result.allowed(true));
+}
+
+test "LightOnOCR3 compatibility enables only the explicit safetensors reader profile" {
+    const allocator = std.testing.allocator;
+    var man = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .generator,
+        .config_model_arch = try allocator.dupe(u8, "qwen3_5"),
+        .safetensors_path = try allocator.dupe(u8, "model.safetensors"),
+    };
+    defer man.deinit();
+    try std.testing.expectEqual(Level.incompatible, assess(&man, "qwen3_5").level);
+    man.tasks = try allocator.alloc([]const u8, 1);
+    man.tasks[0] = try allocator.dupe(u8, "read");
+    man.capabilities = try allocator.alloc([]const u8, 1);
+    man.capabilities[0] = try allocator.dupe(u8, "lightonocr3");
+    try std.testing.expectEqual(Level.compatible, assess(&man, "qwen3_5").level);
+    allocator.free(man.safetensors_path.?);
+    man.safetensors_path = null;
+    man.gguf_path = try allocator.dupe(u8, "unsupported.gguf");
+    try std.testing.expectEqual(Level.incompatible, assess(&man, "qwen3_5").level);
 }

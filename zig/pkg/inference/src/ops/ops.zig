@@ -4520,6 +4520,44 @@ pub const ComputeBackend = struct {
         return op(self.ptr, input, token_count, head_dim, theta, freq_scale, positions, sections);
     }
 
+    /// Qwen3.5 query/gate projection is interleaved per head, rather than
+    /// two contiguous halves of the entire multi-head projection.
+    pub fn splitPerHeadGate(self: *const ComputeBackend, input: CT, tokens: usize, heads: usize, head_dim: usize) !struct { query: CT, gate: CT } {
+        const rows = try std.math.mul(usize, tokens, heads);
+        const width = try std.math.mul(usize, heads, head_dim);
+        const per_head = (try self.reshape2d(input, rows, try std.math.mul(usize, head_dim, 2))) orelse return error.UnsupportedOperation;
+        defer self.free(per_head);
+        const queries = try self.sliceLastDim(per_head, 0, head_dim);
+        defer self.free(queries);
+        const gates = try self.sliceLastDim(per_head, head_dim, head_dim * 2);
+        defer self.free(gates);
+        const query = (try self.reshape2d(queries, tokens, width)) orelse return error.UnsupportedOperation;
+        errdefer self.free(query);
+        const gate = (try self.reshape2d(gates, tokens, width)) orelse return error.UnsupportedOperation;
+        return .{ .query = query, .gate = gate };
+    }
+
+    /// Rotate a prefix of each head using the existing device M-RoPE kernel.
+    /// Slicing per-head views preserves the unrotated tail without changing
+    /// the kernel ABI or downloading decoder tensors to the host.
+    pub fn partialMrope(self: *const ComputeBackend, input: CT, token_count: usize, heads: usize, head_dim: usize, theta: f32, freq_scale: f32, positions: []const u32, sections: [3]u32) !?CT {
+        const rotary_dim = 2 * (@as(usize, sections[0]) + sections[1] + sections[2]);
+        if (rotary_dim == 0 or rotary_dim > head_dim) return error.InvalidRoPEInput;
+        if (rotary_dim == head_dim) return self.mrope(input, token_count, head_dim, theta, freq_scale, positions, sections);
+        const rows = try std.math.mul(usize, token_count, heads);
+        const per_head = (try self.reshape2d(input, rows, head_dim)) orelse return error.UnsupportedOperation;
+        defer self.free(per_head);
+        const prefix = try self.sliceLastDim(per_head, 0, rotary_dim);
+        defer self.free(prefix);
+        const tail = try self.sliceLastDim(per_head, rotary_dim, head_dim);
+        defer self.free(tail);
+        const rotated = (try self.mrope(prefix, token_count, rotary_dim, theta, freq_scale, positions, sections)) orelse return null;
+        defer self.free(rotated);
+        const joined = try self.concat(rotated, tail, rows, rotary_dim, head_dim - rotary_dim);
+        defer self.free(joined);
+        return (try self.reshape2d(joined, token_count, try std.math.mul(usize, heads, head_dim))) orelse error.UnsupportedOperation;
+    }
+
     pub fn visionRope(self: *const ComputeBackend, input: CT, token_count: usize, head_dim: usize, theta: f32, positions: []const u32) !?CT {
         const op = self.vtable.visionRope orelse return null;
         return op(self.ptr, input, token_count, head_dim, theta, positions);

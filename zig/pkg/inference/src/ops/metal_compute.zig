@@ -50,6 +50,31 @@ const CT = ops.CT;
 const MetalTensor = metal_tensor_mod.MetalTensor;
 const QuantizedStorage = weight_source_mod.QuantizedStorage;
 
+/// Request-owned Qwen3.5 recurrent buffers and immutable F32 side weights.
+/// Reset invalidates logical history; the next GPU invocation clears it.
+pub const Qwen35LinearState = if (build_options.enable_metal) struct {
+    conv: [2]?MetalTensor = @splat(null),
+    recurrent: ?MetalTensor = null,
+    weights: [4]?MetalTensor = @splat(null),
+    key_heads: usize = 0,
+    value_heads: usize = 0,
+    initialized: bool = false,
+
+    pub fn reset(self: *@This()) void {
+        self.initialized = false;
+    }
+
+    pub fn deinit(self: *@This()) void {
+        for (&self.conv) |*tensor| if (tensor.*) |*value| value.deinit();
+        if (self.recurrent) |*value| value.deinit();
+        for (&self.weights) |*tensor| if (tensor.*) |*value| value.deinit();
+        self.* = .{};
+    }
+} else struct {
+    pub fn reset(_: *@This()) void {}
+    pub fn deinit(_: *@This()) void {}
+};
+
 const A4bMappedMoeRoute = enum {
     /// Explicit high-memory route: all mapped MoE weights are resident.
     resident,
@@ -1144,6 +1169,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     active_prefill_frame_contract_storage: ActivePrefillFrameContractStorage = .{},
     active_prefill_frame_tail_contract: ?ops.PlannedLayerContract = null,
     active_deberta_encoder_frame_plan_key: ?ActiveDebertaEncoderFramePlanKey = null,
+    qwen35_ocr_deferred_attention: bool = false,
+    lightonocr3_4b_projections: bool = false,
     pending_prefill_kv_device_seeds: std.ArrayListUnmanaged(PendingKvDeviceSeed) = .empty,
     timing_stats: ops.NativeQuantTimingStats = .{},
     boundary_scope: ops.gliner_boundary_device.ScopeAccounting = .{},
@@ -1551,6 +1578,68 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!prepared.complete()) return false;
         self.a4b_prepared_moe_layers[request.layer_index] = prepared;
         return true;
+    }
+
+    /// The qualified 128-channel DeltaNet core has no host readbacks. Each
+    /// invocation owns scratch; only history and small weights survive it.
+    pub fn qwen35LinearCore(cb: *const ops.ComputeBackend, state: *Qwen35LinearState, request: anytype) !?CT {
+        if (cb.kind() != .metal or request.dim != 128 or request.value_dim != 128 or request.conv_kernel != 4 or request.eps != 1e-6) return null;
+        if (request.seq_len == 0 or request.key_heads == 0 or request.value_heads == 0 or request.value_heads % request.key_heads != 0) return error.InvalidTensorShape;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const raw = self.provider_impl.raw_decode_runtime orelse return error.RuntimeUnavailable;
+        if (metal_runtime_mod.termite_metal_decode_runtime_qwen35_core_available(raw) == 0) return null;
+        const runtime: *anyopaque = @ptrCast(raw);
+        const channels = (request.key_heads * 2 + request.value_heads) * request.dim;
+        const value_width = request.value_heads * request.dim;
+        if (state.key_heads != 0 and (state.key_heads != request.key_heads or state.value_heads != request.value_heads)) return error.InvalidTensorShape;
+        state.key_heads = request.key_heads;
+        state.value_heads = request.value_heads;
+        for (&state.conv) |*tensor| {
+            if (tensor.* == null) tensor.* = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, channels * request.conv_kernel * 4, .private, &.{ @intCast(channels), @intCast(request.conv_kernel) });
+        }
+        if (state.recurrent == null) state.recurrent = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, request.value_heads * request.dim * request.dim * 4, .private, &.{ @intCast(request.value_heads), @intCast(request.dim), @intCast(request.dim) });
+        const weight_inputs = [_]CT{ request.conv_weight, request.a_log, request.dt_bias, request.norm_weight };
+        for (weight_inputs, &state.weights) |input, *tensor| {
+            if (tensor.* == null) {
+                const host = try cb.toFloat32(input, self.allocator);
+                defer self.allocator.free(host);
+                var device = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, host.len * 4, .private, &.{@intCast(host.len)});
+                errdefer device.deinit();
+                try device.uploadBytes(std.mem.sliceAsBytes(host));
+                tensor.* = device;
+            }
+        }
+        var mixed = try self.ownedDeviceMetalTensorFromCt(request.mixed);
+        defer mixed.deinit();
+        var z = try self.ownedDeviceMetalTensorFromCt(request.z);
+        defer z.deinit();
+        var beta = try self.ownedDeviceMetalTensorFromCt(request.beta);
+        defer beta.deinit();
+        var a = try self.ownedDeviceMetalTensorFromCt(request.a);
+        defer a.deinit();
+        var conv = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, request.seq_len * channels * 4, .private, &.{ @intCast(request.seq_len), @intCast(channels) });
+        defer conv.deinit();
+        var gates = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, request.seq_len * request.value_heads * 2 * 4, .private, &.{ @intCast(request.seq_len), @intCast(request.value_heads * 2) });
+        defer gates.deinit();
+        var core = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, request.seq_len * value_width * 4, .private, &.{ @intCast(request.seq_len), @intCast(value_width) });
+        defer core.deinit();
+        var output = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, request.seq_len * value_width * 4, .private, &.{ @intCast(request.seq_len), @intCast(value_width) });
+        errdefer output.deinit();
+        state.conv[1].?.invalidateHostMirror();
+        state.recurrent.?.invalidateHostMirror();
+        const tensors = [_]*const MetalTensor{ &mixed, &state.weights[0].?, &beta, &a, &state.weights[1].?, &state.weights[2].?, &state.conv[0].?, &state.conv[1].?, &state.recurrent.?, &conv, &gates, &core, &z, &state.weights[3].?, &output };
+        var handles: [15]?*anyopaque = undefined;
+        var offsets: [15]usize = undefined;
+        for (tensors, &handles, &offsets) |tensor, *handle, *offset| {
+            if (!tensor.isDevice() or tensor.dtype != .f32) return error.UnsupportedTensorType;
+            handle.* = tensor.deviceHandle();
+            offset.* = tensor.deviceByteOffset();
+        }
+        const rc = metal_runtime_mod.termite_metal_decode_runtime_qwen35_core_device(raw, &handles, &offsets, request.seq_len, request.key_heads, request.value_heads, request.dim, request.conv_kernel, @intFromBool(state.initialized));
+        if (rc != 0) return error.Qwen35MetalCoreFailed;
+        std.mem.swap(?MetalTensor, &state.conv[0], &state.conv[1]);
+        state.initialized = true;
+        return try self.ctFromOwnedMetalTensor(output);
     }
 
     pub fn debugHasRuntimeQuantizedStorage(cb: *const ops.ComputeBackend, tensor: CT) bool {
@@ -18647,7 +18736,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                                 .kv_position_offset = attention.kv_position_offset,
                                 .sliding_window = attention.sliding_window,
                             };
-                            if (activePagedSlotAttentionDeferredEnabled(self.data.a4b_inference != null)) {
+                            if (activePagedSlotAttentionDeferredEnabled(self.data.a4b_inference != null or self.qwen35_ocr_deferred_attention)) {
                                 if (try metal_runtime.decoderRuntimeApplyPagedKvAttentionSlotOnActiveFrame(
                                     self.provider_impl,
                                     slot_request,
@@ -22994,12 +23083,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn gatedFfnNoBiasOp(ctx: *anyopaque, request: *const ops.GatedFfnNoBiasRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (self.data.a4b_inference == null or
+        const lighton = self.lightonocr3_4b_projections and request.rows == 1 and
+            request.hidden_size == 2560 and request.intermediate_size == 9216 and request.activation == .silu;
+        if (!lighton and (self.data.a4b_inference == null or
             request.rows != 1 or
             !a4bHighMemoryFeatureEnabled(
                 "TERMITE_METAL_ENABLE_A4B_SHARED_FFN_FUSION",
                 "TERMITE_METAL_DISABLE_A4B_SHARED_FFN_FUSION",
-            ))
+            )))
         {
             return null;
         }
@@ -23031,6 +23122,24 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var input = try self.ownedMetalTensorFromCt(request.input);
         defer input.deinit();
         if (!input.isDevice()) return null;
+        if (lighton) {
+            var gated = (try metal_runtime.decoderRuntimeTryApplyBf16GateUp(self.provider_impl, .{
+                .gate_slot = gate_slot,
+                .up_slot = up_slot,
+                .input = input,
+                .in_dim = request.hidden_size,
+                .out_dim = request.intermediate_size,
+                .activation = request.activation,
+            })) orelse return null;
+            defer gated.deinit();
+            const output = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                .slot = down_slot,
+                .input = gated,
+                .in_dim = request.intermediate_size,
+                .out_dim = request.hidden_size,
+            })) orelse return null;
+            return self.ctFromOwnedMetalTensor(output);
+        }
         const output = (try metal_runtime.tryDeviceQuantizedGatedFfn(
             self.provider_impl,
             .{
@@ -40970,5 +41079,43 @@ test "metal GLiNER centered residual norm preserves sum and low variance" {
         const actual_sum = try cb.toFloat32(fused.sum, a);
         defer a.free(actual_sum);
         for (actual_sum, values, residual) |got, left, right| try std.testing.expectEqual(left + right, got);
+    }
+}
+
+test "LightOnOCR3 Metal partial M-RoPE preserves unrotated head channels" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var ws = testMetalWeightStoreInit(allocator);
+    defer ws.lazy_weights.deinit(allocator);
+    var compute = try MetalCompute.init(allocator, &ws, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const tokens = 2;
+    const heads = 2;
+    const dim = 256;
+    const rotary_dim = 64;
+    const positions = [_]u32{ 1, 4, 2, 5, 3, 6 };
+    var input: [tokens * heads * dim]f32 = undefined;
+    for (&input, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.1);
+    const host = try cb.fromFloat32Shape(&input, &.{ tokens, heads * dim });
+    defer cb.free(host);
+    const device = try compute.ownedDeviceMetalTensorFromCt(host);
+    const tensor = try compute.ctFromOwnedMetalTensor(device);
+    defer cb.free(tensor);
+    const output = (try cb.partialMrope(tensor, tokens, heads, dim, 10000000, 1, &positions, .{ 11, 11, 10 })) orelse return error.UnexpectedNull;
+    defer cb.free(output);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&cb, output));
+    const values = try cb.toFloat32(output, allocator);
+    defer allocator.free(values);
+    for (0..tokens) |token| {
+        for (0..heads) |head| {
+            const offset = (token * heads + head) * dim;
+            var expected: [rotary_dim]f32 = undefined;
+            const axes = [_]u32{ positions[token], positions[tokens + token], positions[2 * tokens + token] };
+            try native_compute_mod.mropeCore(&expected, input[offset..][0..rotary_dim], 1, rotary_dim, 10000000, 1, &axes, .{ 11, 11, 10 });
+            for (values[offset..][0..rotary_dim], expected) |actual, want| try std.testing.expectApproxEqAbs(want, actual, 2e-5);
+            try std.testing.expectEqualSlices(f32, input[offset + rotary_dim ..][0 .. dim - rotary_dim], values[offset + rotary_dim ..][0 .. dim - rotary_dim]);
+        }
     }
 }
