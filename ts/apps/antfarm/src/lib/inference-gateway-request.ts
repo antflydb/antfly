@@ -15,6 +15,14 @@ export function inferenceGatewayRequest(
   const model = selectedModel.trim();
   if (operation !== "generate/batch") {
     if (!model) throw new Error("Select a model or enter its canonical ID");
+    const generated =
+      (operation === "decisions" && request.decision_method === "generated") ||
+      (operation === "extract" && request.method === "generated");
+    if (generated) {
+      if ("model" in request) throw new Error("Generated tasks select generator.model");
+      if (!object(request.generator)) throw new Error("Generated tasks require a generator object");
+      return { ...request, generator: { ...request.generator, model } };
+    }
     return { ...request, model };
   }
   if ("model" in request) throw new Error("Batch models belong in each request body");

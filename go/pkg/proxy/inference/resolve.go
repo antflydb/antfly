@@ -277,7 +277,7 @@ func (l *ResolutionLease) NextAttempt(ctx context.Context) (*ResolutionLease, er
 	}
 
 	excluded := l.attempts.excludeAndSnapshot(l.Resolution.Endpoint)
-	allowed, err := l.proxy.capabilityLeaseEndpoints(l.capabilityToken, l.capabilityRevision, l.model, l.operation, l.capabilityAuthorizationDigest)
+	allowed, err := l.proxy.capabilityLeaseEndpointsForPlacement(l.capabilityToken, l.capabilityRevision, l.model, l.operation, l.endpointOperation, l.capabilityAuthorizationDigest)
 	if err != nil {
 		return nil, err
 	}
@@ -428,6 +428,7 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, routing Rou
 		headerValue(routing.Headers, capabilityRevisionHeader),
 		routeReq.Model,
 		routeReq.Operation,
+		routing.placementOperation(routeReq.Operation),
 		sha256.Sum256([]byte(p.upstreamAuthorizationForHeaders(routing.Headers))),
 	)
 	if err != nil {

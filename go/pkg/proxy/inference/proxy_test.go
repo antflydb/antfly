@@ -6279,6 +6279,11 @@ func TestGeneratedTasksRespectLogicalRejectRoute(t *testing.T) {
 			if generated.Code != 403 || calls != 0 {
 				t.Fatalf("task reject bypassed: generated status=%d upstream calls=%d body=%s", generated.Code, calls, generated.Body)
 			}
+			catalog := httptest.NewRecorder()
+			p.handleModels(catalog, httptest.NewRequest("GET", "/ai/v1/models?model=native&task=generate&operation="+operation, nil))
+			if catalog.Code == 200 || catalog.Header().Get(capabilityTokenHeader) != "" || calls != 0 {
+				t.Fatalf("task reject bypassed by discovery: status=%d calls=%d body=%s", catalog.Code, calls, catalog.Body)
+			}
 		})
 	}
 }
@@ -6299,16 +6304,25 @@ func TestGeneratedTasksKeepRouteAdmissionAndGeneratorPlacementAcrossRetries(t *t
 			}
 			calls := 0
 			p.registry.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-				calls++
 				if !strings.HasPrefix(r.URL.Host, "selected-") {
 					t.Fatalf("logical route bypassed: %s", r.URL)
 				}
+				if r.Method == http.MethodGet {
+					return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"generators":{"native":{}}}`)), Request: r}, nil
+				}
+				calls++
 				status := 200
 				if calls == 1 {
 					status = 503
 				}
 				return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{}`)), Request: r}, nil
 			})}
+			catalog := httptest.NewRecorder()
+			p.handleModels(catalog, httptest.NewRequest("GET", "/ai/v1/models?model=native&task=generate&operation="+operation, nil))
+			token, revision := catalog.Header().Get(capabilityTokenHeader), catalog.Header().Get(capabilityRevisionHeader)
+			if catalog.Code != 200 || token == "" || revision == "" {
+				t.Fatalf("discovery status=%d body=%s", catalog.Code, catalog.Body)
+			}
 			field, path := "decision_method", "/ai/v1/decisions"
 			if operation == "extract" {
 				field, path = "method", "/ai/v1/extract"
@@ -6316,6 +6330,8 @@ func TestGeneratedTasksKeepRouteAdmissionAndGeneratorPlacementAcrossRetries(t *t
 			send := func() *httptest.ResponseRecorder {
 				r := httptest.NewRequest("POST", path, strings.NewReader(`{"`+field+`":"generated","generator":{"provider":"antfly","model":"native"}}`))
 				r.Header.Set("Content-Type", "application/json")
+				r.Header.Set(capabilityTokenHeader, token)
+				r.Header.Set(capabilityRevisionHeader, revision)
 				w := httptest.NewRecorder()
 				p.proxyRequest(w, r, operation)
 				return w
@@ -6327,6 +6343,47 @@ func TestGeneratedTasksKeepRouteAdmissionAndGeneratorPlacementAcrossRetries(t *t
 			second := send()
 			if second.Code != 429 || calls != 2 {
 				t.Fatalf("logical rate limit bypassed: status=%d calls=%d body=%s", second.Code, calls, second.Body)
+			}
+		})
+	}
+}
+
+func TestGeneratedTaskLeaseScopeIsolation(t *testing.T) {
+	for _, operation := range []OperationType{"decide", "extract"} {
+		t.Run(string(operation), func(t *testing.T) {
+			p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, Logger: zap.NewNop()})
+			p.RegisterEndpoint("http://runtime", "primary", WorkloadTypeGeneral)
+			endpoints := map[string]leasedEndpoint{"http://runtime": {incarnation: p.registry.endpoints["http://runtime"].incarnation, operations: map[OperationType]bool{operation: true}}}
+			token, err := p.issueCapabilityLease("native", "generate", operation, p.Router().RouteManager().Generation(), "revision", "", endpoints)
+			if err != nil {
+				t.Fatal(err)
+			}
+			allowed, err := p.capabilityLeaseEndpointsForPlacement(token, "revision", "native", operation, "generate", sha256.Sum256(nil))
+			if err != nil || len(allowed) != 1 {
+				t.Fatalf("generated lease: allowed=%v err=%v", allowed, err)
+			}
+			for _, scope := range [][2]OperationType{{operation, operation}, {"generate", "generate"}, {"decide", "extract"}, {"extract", "generate"}, {"decide", "generate"}} {
+				if scope[0] == operation && scope[1] == "generate" {
+					continue
+				}
+				if _, err := p.capabilityLeaseEndpointsForPlacement(token, "revision", "native", scope[0], scope[1], sha256.Sum256(nil)); err == nil {
+					t.Fatalf("generated lease authorized %v", scope)
+				}
+			}
+			typedToken, err := p.issueCapabilityLease("native", string(operation), operation, p.Router().RouteManager().Generation(), "revision", "", endpoints)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if typedToken == token {
+				t.Fatal("typed and generated snapshots shared identity")
+			}
+			if _, err := p.capabilityLeaseEndpointsForPlacement(typedToken, "revision", "native", operation, "generate", sha256.Sum256(nil)); err == nil {
+				t.Fatal("typed lease authorized generated work")
+			}
+			for _, bad := range []string{"embed", "read", "predict", "generate.batch"} {
+				if _, err := catalogTaskScopeForOperation(bad, string(operation)); err == nil {
+					t.Fatalf("accepted inventory %s for generated task", bad)
+				}
 			}
 		})
 	}

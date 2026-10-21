@@ -98,6 +98,12 @@ proxy places these requests using generator inventory and forwards the original
 task URL and envelope. Route matching, rejection, rate limits, and capability-lease
 authorization continue to use the logical `decide` or `extract` operation, including
 on retries; generator placement does not select generation route policy.
+For proxy scoped discovery of generated tasks, use
+`/ai/v1/models?model=<generator-id>&task=generate&operation=decide` (or
+`operation=extract`). This selects generator inventory from the logical task's
+route cohort. The resulting capability lease binds both identities; ordinary
+generation and typed decision/extraction leases cannot be substituted. Antfarm
+places the selected model in `generator.model` for these generated envelopes.
 
 For chunking, a top-level `model` takes precedence over `config.model`; omitting
 both selects `fixed`. The proxy and gateway use the same precedence.

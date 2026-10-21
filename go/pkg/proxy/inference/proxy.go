@@ -1937,6 +1937,8 @@ type leasedEndpoint struct {
 	operations  map[OperationType]bool
 }
 
+// A lease binds an inventory task and a logical policy operation independently.
+// Generated decide/extract use task=generate without gaining generation policy.
 type proxyCapabilityLease struct {
 	identity            [sha256.Size]byte
 	model               string
@@ -3308,7 +3310,11 @@ func (p *Proxy) validateCapabilityLease(token, revision, model string, operation
 }
 
 func (p *Proxy) capabilityLeaseEndpoints(token, revision, model string, operation OperationType, authorizationDigest [sha256.Size]byte) (map[string]endpointRef, error) {
-	lease, err := p.validatedCapabilityLease(token, revision, model, operation, authorizationDigest)
+	return p.capabilityLeaseEndpointsForPlacement(token, revision, model, operation, operation, authorizationDigest)
+}
+
+func (p *Proxy) capabilityLeaseEndpointsForPlacement(token, revision, model string, operation, endpointOperation OperationType, authorizationDigest [sha256.Size]byte) (map[string]endpointRef, error) {
+	lease, err := p.validatedCapabilityLease(token, revision, model, operation, endpointOperation, authorizationDigest)
 	return lease.endpoints, err
 }
 
@@ -3318,7 +3324,7 @@ type validatedCapabilityLease struct {
 	scoped          bool
 }
 
-func (p *Proxy) validatedCapabilityLease(token, revision, model string, operation OperationType, authorizationDigest [sha256.Size]byte) (validatedCapabilityLease, error) {
+func (p *Proxy) validatedCapabilityLease(token, revision, model string, operation, endpointOperation OperationType, authorizationDigest [sha256.Size]byte) (validatedCapabilityLease, error) {
 	if token == "" {
 		if revision != "" {
 			return validatedCapabilityLease{}, staleCapabilityResolutionError("inference capability lease is incomplete")
@@ -3333,7 +3339,7 @@ func (p *Proxy) validatedCapabilityLease(token, revision, model string, operatio
 		ok = false
 	}
 	p.capabilityLeaseMu.Unlock()
-	if !ok || lease.model != model || lease.task != semanticTaskForOperation(operation) || lease.operation != operation ||
+	if !ok || lease.model != model || lease.task != semanticTaskForOperation(endpointOperation) || lease.operation != operation ||
 		lease.descriptorRevision == "" || lease.descriptorRevision != revision ||
 		lease.authorizationDigest != authorizationDigest {
 		return validatedCapabilityLease{}, staleCapabilityResolutionError("inference capability lease is stale")
@@ -3446,8 +3452,11 @@ func catalogTaskScopeForOperation(rawTask, rawOperation string) (catalogTaskScop
 		return scope, err
 	}
 	requested := OperationType(strings.TrimSpace(rawOperation))
-	valid := false
-	for _, candidate := range semanticOperationsForTask(rawTask, scope.Operation) {
+	// Generated decisions/extractions use generator inventory under their own
+	// route policy. Keep both identities in the lease instead of broadening a
+	// generation lease to authorize ordinary task requests.
+	valid := scope.Category == "generators" && (requested == "decide" || requested == "extract")
+	for _, candidate := range semanticOperationsForTask(strings.TrimSpace(rawTask), scope.Operation) {
 		if candidate == requested {
 			valid = true
 			break

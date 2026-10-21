@@ -39,6 +39,38 @@ describe("gateway request model selection", () => {
       ).toThrow();
     }
   });
+  it.each([
+    ["decisions", "decision_method"],
+    ["extract", "method"],
+  ] as const)("selects generator.model for generated %s", (operation, field) => {
+    const request = {
+      [field]: "generated",
+      generator: { provider: "antfly", model: "old", max_tokens: 40 },
+      input: "hello",
+    };
+    expect(inferenceGatewayRequest(operation, JSON.stringify(request), " generators/new ")).toEqual(
+      {
+        ...request,
+        generator: { ...request.generator, model: "generators/new" },
+      }
+    );
+    for (const invalid of [
+      { ...request, model: "ambiguous" },
+      { [field]: "generated" },
+      { ...request, generator: [] },
+    ]) {
+      expect(() =>
+        inferenceGatewayRequest(operation, JSON.stringify(invalid), "generators/new")
+      ).toThrow();
+    }
+    expect(
+      inferenceGatewayRequest(
+        operation,
+        JSON.stringify({ [field]: "model", input: "hello" }),
+        "named/task"
+      )
+    ).toEqual({ [field]: "model", input: "hello", model: "named/task" });
+  });
   it("applies selection to ordinary operations", () => {
     expect(inferenceGatewayRequest("generate", '{"messages":[]}', "generators/default")).toEqual({
       messages: [],
