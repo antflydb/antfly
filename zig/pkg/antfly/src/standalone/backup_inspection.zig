@@ -59,7 +59,7 @@ fn inspectStandalone(alloc: std.mem.Allocator, backend: *backend_mod.Handle, sto
             if ((try seen.getOrPut(alloc, range.group_id)).found_existing) return error.UnsupportedLiteInspectionLayout;
             const namespace = try std.fmt.allocPrint(alloc, "group-{d}/table-db", .{range.group_id});
             defer alloc.free(namespace);
-            try stores.inspectNamespace(backend, namespace, &.{ table.indexes_json, table.replication_sources_json });
+            try stores.inspectNamespace(backend, namespace, .{ .indexes_json = table.indexes_json, .replication_sources_json = table.replication_sources_json });
         }
         if (count != 1) return error.UnsupportedLiteInspectionLayout;
     }
@@ -87,7 +87,7 @@ test "backup preflight standalone Lite visits every table and authoritative prod
             .replace = true,
             .auxiliary_json = "{}",
             .tables = &.{
-                .{ .table_id = 11, .name = "default" },
+                .{ .table_id = 11, .name = "default", .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"${secret:private-pg}\",\"postgres_table\":\"public.users\"}]" },
                 .{ .table_id = 12, .name = "later", .indexes_json = "{\"vec\":{\"name\":\"vec\",\"type\":\"embeddings\",\"external\":true,\"dimension\":2}}" },
             },
             .ranges = &.{
@@ -116,6 +116,8 @@ test "backup preflight standalone Lite visits every table and authoritative prod
     try std.testing.expectEqual(@as(i64, 2), report.object.get("inventory").?.object.get("shards").?.integer);
     try std.testing.expect(report.object.get("inventory").?.object.get("requirements").?.array.items.len > 0);
     try std.testing.expect(!std.mem.eql(u8, "compatible", report.object.get("compatibility").?.object.get("verdict").?.string));
+    try std.testing.expect(std.mem.indexOf(u8, json, "replication_source") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "private-pg") == null);
     // A generic embedded-only reader must never silently fall back to root.
     const generic = try staging.inspectInputJsonAlloc(a, path, destination, .{});
     defer a.free(generic);

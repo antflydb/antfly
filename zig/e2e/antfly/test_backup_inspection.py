@@ -85,3 +85,81 @@ def test_inspect_standalone_lite_tables_and_dependencies(tmp_path):
         failed = False
     finally:
         server.stop(test_failed=failed)
+
+
+def test_inspect_postgres_source_requires_exact_future_ingestion_evidence(tmp_path):
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StandaloneAntflyServer(binary, "127.0.0.1", 0, storage_engine="lite")
+    failed = True
+    try:
+        # No source connection is made: the secret is deliberately unavailable.
+        # Its declarative dependency must still be inventoried before reconcile.
+        response = requests.post(
+            server.api_url + "/tables/cdc",
+            json={
+                "replication_sources": [
+                    {
+                        "type": "postgres",
+                        "dsn": "${secret:review-private-pg}",
+                        "postgres_table": "public.users",
+                    }
+                ]
+            },
+            timeout=30,
+        )
+        assert response.ok, response.text
+        server.pause()
+        source = server.root / "db.aflite"
+        before = hashlib.sha256(source.read_bytes()).hexdigest()
+        capabilities = tmp_path / "capabilities.json"
+
+        def inspect(requirements):
+            capabilities.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "configuration_id": "test",
+                        "requirements": requirements,
+                    }
+                )
+            )
+            result = subprocess.run(
+                [
+                    binary,
+                    "backup",
+                    "inspect",
+                    "--input",
+                    str(source),
+                    "--destination-capabilities",
+                    str(capabilities),
+                ],
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=True,
+            )
+            assert "review-private-pg" not in result.stdout + result.stderr
+            report = json.loads(result.stdout)
+            assert report["completeness"]["scan_complete"], report
+            assert report["completeness"]["dependency_analysis_complete"], report
+            return report
+
+        report = inspect([])
+        assert report["compatibility"]["verdict"] == "unknown", report
+        requirements = report["inventory"]["requirements"]
+        assert (
+            len(requirements) == 1 and requirements[0]["kind"] == "replication_source"
+        ), report
+        capability = {
+            "requirement_sha256": requirements[0]["sha256"],
+            "supported": True,
+        }
+        report = inspect([capability])
+        assert report["compatibility"]["verdict"] == "blocked", report
+        capability["future_ingestion"] = True
+        report = inspect([capability])
+        assert report["compatibility"]["verdict"] == "compatible", report
+        assert hashlib.sha256(source.read_bytes()).hexdigest() == before
+        failed = False
+    finally:
+        server.stop(test_failed=failed)

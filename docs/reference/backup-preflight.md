@@ -139,6 +139,20 @@ the source connection/credential reference or object-storage scheme/bucket.
 Retrieval requirements separately bind archive/page semantics. Neither the CLI
 nor the library performs arbitrary-URL requests.
 
+PostgreSQL replication definitions produce `replication_source` requirements.
+Each digest binds the declarative source, including its DSN or secret/environment
+reference, source table, slot, publication, routes and transforms. Runtime status
+and action hints are excluded. The inspector does not resolve credentials or
+open a database connection, and literal transform values are not media sources.
+Unknown providers or malformed contracts produce incomplete reports.
+
+A replication capability requires both `supported: true` and
+`future_ingestion: true`. The caller must verify destination-managed credentials,
+source-table access, and the slot/publication and logical replication behavior
+needed for future ingestion. Empty capability files and generic connection
+evidence cannot satisfy a replication requirement. DSNs and credentials are
+hashed into the identity and are never emitted in the report.
+
 Embedding requirements bind the canonical complete source definition, including
 model configuration, input/preprocessing/template, dimensions and vector-space
 assertions. Credential changes may conservatively change that binding. A model

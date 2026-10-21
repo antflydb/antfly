@@ -28,7 +28,7 @@ pub const report_version = 1;
 pub const inspector_version = "antfly-backup-preflight/1";
 pub const Digest = [64]u8;
 pub const Verdict = enum { compatible, blocked, unknown };
-pub const Kind = enum { embedded, source_local, source_external, source_expiring, archive_retrieval, page_retrieval, connection, model, producer_model, dynamic_loader, source_unresolved };
+pub const Kind = enum { embedded, source_local, source_external, source_expiring, archive_retrieval, page_retrieval, connection, replication_source, model, producer_model, dynamic_loader, source_unresolved };
 pub const Options = struct {
     max_input_bytes: u64 = 64 * 1024 * 1024 * 1024,
     max_expanded_bytes: u64 = 128 * 1024 * 1024 * 1024,
@@ -207,14 +207,15 @@ pub fn evaluate(r: *const Requirement, destination: ?Destination) Evaluation {
     const d = destination orelse return e;
     if (d.version != 1 or d.configuration_id.len == 0) return e;
     for (d.requirements) |cap| if (std.mem.eql(u8, cap.requirement_sha256, &r.sha256)) {
-        const supported = cap.supported and (r.kind != .producer_model or (cap.future_ingestion and cap.model_revision_verified)) and (r.kind != .model or (cap.query_embedding and cap.future_ingestion and cap.model_revision_verified and cap.preprocessing_verified and cap.vector_space_verified and r.dimensions > 0 and cap.dimensions == r.dimensions));
+        const supported = cap.supported and (r.kind != .replication_source or cap.future_ingestion) and (r.kind != .producer_model or (cap.future_ingestion and cap.model_revision_verified)) and (r.kind != .model or (cap.query_embedding and cap.future_ingestion and cap.model_revision_verified and cap.preprocessing_verified and cap.vector_space_verified and r.dimensions > 0 and cap.dimensions == r.dimensions));
         e.verdict = if (supported) .compatible else .blocked;
         e.reason_code = if (supported) "capability_verified" else switch (r.kind) {
             .model, .producer_model => "model_incompatible",
             .connection => "connection_missing",
+            .replication_source => "replication_incompatible",
             else => "source_unresolved",
         };
-        e.remediation = if (supported) "Revalidate this capability at restore admission." else if (r.kind == .model) "Verify the same model revision, preprocessing, dimensions and vector space for both query embedding and future ingestion." else "Configure durable access and the required retrieval semantics at the destination.";
+        e.remediation = if (supported) "Revalidate this capability at restore admission." else if (r.kind == .model) "Verify the same model revision, preprocessing, dimensions and vector space for both query embedding and future ingestion." else if (r.kind == .replication_source) "Verify destination-managed PostgreSQL credentials, source table, slot/publication access and future logical replication ingestion for this exact source contract." else "Configure durable access and the required retrieval semantics at the destination.";
         return e;
     };
     return e;
@@ -305,7 +306,9 @@ pub const Inspector = struct {
                         const json = try staging.tableIndexesJsonFromPortableMetadata(self.allocator, e.value, null);
                         defer self.allocator.free(json);
                         try self.metadataJson(json);
-                    } else if (std.mem.endsWith(u8, e.key, ":enrichments") or std.mem.endsWith(u8, e.key, ":resolvers") or std.mem.endsWith(u8, e.key, ":replication_sources")) try self.metadataJson(e.value);
+                    } else if (std.mem.endsWith(u8, e.key, ":replication_sources")) {
+                        try self.replicationSourcesJson(e.value);
+                    } else if (std.mem.endsWith(u8, e.key, ":enrichments") or std.mem.endsWith(u8, e.key, ":resolvers")) try self.metadataJson(e.value);
                 }
             },
             .document_batch => {
@@ -375,6 +378,35 @@ pub const Inspector = struct {
         var parsed = try std.json.parseFromSlice(Value, self.allocator, bytes, .{});
         defer parsed.deinit();
         try self.config(parsed.value, 0, "");
+    }
+
+    /// Replication is executable catalog metadata with its own contract, not
+    /// an inference definition or a media locator. Never resolve secret/env
+    /// references, interpret DSNs as URLs, or visit inert transform values.
+    pub fn replicationSourcesJson(self: *@This(), bytes: []const u8) !void {
+        if (bytes.len > self.options.max_metadata_bytes) return error.PreflightLimitExceeded;
+        const Source = @import("antfly_metadata_openapi").ReplicationSource;
+        var parsed = try std.json.parseFromSlice([]Source, self.allocator, bytes, .{});
+        defer parsed.deinit();
+        if (parsed.value.len > self.options.max_definitions) return error.PreflightLimitExceeded;
+        for (parsed.value) |source| {
+            try self.options.cancellation.check();
+            if (!eq(source.type, "postgres") or std.mem.trim(u8, source.dsn, " \t\r\n").len == 0 or std.mem.trim(u8, source.postgres_table, " \t\r\n").len == 0)
+                return error.UnsupportedReplicationInspection;
+            // Bind the whole declarative source: a capability for another
+            // source table, route, slot or publication cannot satisfy this one.
+            // Runtime status and action hints are observations, not contracts.
+            var contract = source;
+            contract.status = null;
+            contract.action_hint = null;
+            const json = try std.json.Stringify.valueAlloc(self.allocator, contract, .{});
+            defer self.allocator.free(json);
+            var value = try std.json.parseFromSlice(Value, self.allocator, json, .{});
+            defer value.deinit();
+            const identity = try canonical.canonicalJsonValueAlloc(self.allocator, value.value);
+            defer self.allocator.free(identity);
+            try self.report.add(self.options, .replication_source, identity, "", "replication_sources", 0);
+        }
     }
 
     fn config(self: *@This(), value: Value, depth: usize, catalog_name: []const u8) anyerror!void {
@@ -756,6 +788,60 @@ fn count(report: Report, kind: Kind) u64 {
         n += r.count;
     };
     return n;
+}
+
+test "backup preflight replication binds credentials and CDC configuration without visiting inert transforms" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "${secret:private-pg}", "${REVIEW_PG_DSN}", "postgres://user:private-password@localhost/db", "host=localhost dbname=private-db password=private-password" }) |dsn| {
+        const source = try std.json.Stringify.valueAlloc(a, .{.{ .type = "postgres", .dsn = dsn, .postgres_table = "public.users", .on_update = .{.{ .op = "$set", .path = "url", .value = "file:///inert-transform" }} }}, .{});
+        defer a.free(source);
+        var report: Report = .{ .allocator = a, .scan_complete = true };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        try inspector.replicationSourcesJson(source);
+        try std.testing.expectEqual(@as(usize, 1), report.requirements.items.len);
+        const requirement = &report.requirements.items[0];
+        try std.testing.expectEqual(Kind.replication_source, requirement.kind);
+        try std.testing.expectEqual(Verdict.unknown, evaluate(requirement, .{ .version = 1, .configuration_id = "empty" }).verdict);
+        const digest = requirement.sha256;
+        var cap: Capability = .{ .requirement_sha256 = &digest, .supported = true };
+        try std.testing.expectEqual(Verdict.blocked, evaluate(requirement, .{ .version = 1, .configuration_id = "read-only", .requirements = &.{cap} }).verdict);
+        cap.future_ingestion = true;
+        try std.testing.expectEqual(Verdict.compatible, evaluate(requirement, .{ .version = 1, .configuration_id = "cdc-verified", .requirements = &.{cap} }).verdict);
+        const output = try report.jsonAlloc(null);
+        defer a.free(output);
+        for ([_][]const u8{ dsn, "private-password", "private-db", "inert-transform" }) |secret| try std.testing.expect(std.mem.indexOf(u8, output, secret) == null);
+        // Table/slot changes need new evidence even when the DSN is unchanged.
+        const other = try std.json.Stringify.valueAlloc(a, .{.{ .type = "postgres", .dsn = dsn, .postgres_table = "public.other", .slot_name = "different-slot" }}, .{});
+        defer a.free(other);
+        try inspector.replicationSourcesJson(other);
+        try std.testing.expectEqual(@as(usize, 2), report.requirements.items.len);
+        try std.testing.expectEqual(Verdict.unknown, evaluate(&report.requirements.items[1], .{ .version = 1, .configuration_id = "old-source-only", .requirements = &.{cap} }).verdict);
+    }
+}
+
+test "backup preflight replication rejects unknown providers malformed contracts and limits" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "[{\"type\":\"future-provider\",\"dsn\":\"opaque\",\"postgres_table\":\"users\"}]",
+        "[{\"type\":\"postgres\",\"dsn\":\"\",\"postgres_table\":\"users\"}]",
+        "[{\"type\":\"postgres\",\"postgres_table\":\"users\"}]",
+        "[{\"type\":\"postgres\",\"dsn\":\"opaque\",\"postgres_table\":\"users\",\"future_connection\":{\"dsn\":\"other\"}}]",
+        "{}",
+    }) |source| {
+        var report: Report = .{ .allocator = a };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        if (inspector.replicationSourcesJson(source)) |_| return error.TestUnexpectedResult else |_| {}
+        try std.testing.expectEqual(@as(usize, 0), report.requirements.items.len);
+    }
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{ .max_definitions = 0 } };
+    defer inspector.deinit();
+    try std.testing.expectError(error.PreflightLimitExceeded, inspector.replicationSourcesJson("[{\"type\":\"postgres\",\"dsn\":\"opaque\",\"postgres_table\":\"users\"}]"));
 }
 
 test "backup preflight IP literals retain public and local scope" {

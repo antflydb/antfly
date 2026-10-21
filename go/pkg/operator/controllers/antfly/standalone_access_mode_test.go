@@ -172,6 +172,62 @@ func TestStandaloneSuspendRetainsIdentityAndResumesOneOwner(t *testing.T) {
 	}
 }
 
+func TestStandaloneSuspendRequiresCurrentLiveControllerOwnership(t *testing.T) {
+	for _, ownership := range []string{"foreign-controller", "previous-cluster-uid", "unowned", "cache-hides-foreign-controller"} {
+		t.Run(ownership, func(t *testing.T) {
+			ctx := context.Background()
+			scheme := runtime.NewScheme()
+			for _, add := range []func(*runtime.Scheme) error{antflyv1.AddToScheme, appsv1.AddToScheme, corev1.AddToScheme} {
+				if err := add(scheme); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cluster := baseStandaloneControllerCluster()
+			cluster.UID = "current-cluster"
+			c := newHAControllerTestClient(t, scheme, cluster)
+			r := &AntflyClusterReconciler{Client: c, Scheme: scheme}
+			r.applyDefaults(cluster)
+			if err := r.reconcileStandaloneStatefulSet(ctx, &envFromCache{}, cluster); err != nil {
+				t.Fatal(err)
+			}
+			key := types.NamespacedName{Name: standaloneStatefulSetName(cluster), Namespace: cluster.Namespace}
+			original := &appsv1.StatefulSet{}
+			if err := c.Get(ctx, key, original); err != nil {
+				t.Fatal(err)
+			}
+			foreign := original.DeepCopy()
+			switch ownership {
+			case "unowned":
+				foreign.OwnerReferences = nil
+			case "previous-cluster-uid":
+				foreign.OwnerReferences[0].UID = "previous-cluster"
+			default:
+				foreign.OwnerReferences[0].UID = "another-cluster"
+				foreign.OwnerReferences[0].Name = "another-cluster"
+			}
+			if ownership == "cache-hides-foreign-controller" {
+				r.BoundaryReader = newHAControllerTestClient(t, scheme, foreign)
+			} else {
+				if err := c.Update(ctx, foreign); err != nil {
+					t.Fatal(err)
+				}
+				original = foreign.DeepCopy()
+			}
+			cluster.Spec.Standalone.Suspend = true
+			if err := r.reconcileStandaloneStatefulSet(ctx, &envFromCache{}, cluster); err == nil || !strings.Contains(err.Error(), "not controlled") {
+				t.Fatalf("expected an ownership rejection, got %v", err)
+			}
+			observed := &appsv1.StatefulSet{}
+			if err := c.Get(ctx, key, observed); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(original.Spec, observed.Spec) || !reflect.DeepEqual(original.OwnerReferences, observed.OwnerReferences) {
+				t.Fatal("rejected suspension changed the workload or its claim retention")
+			}
+		})
+	}
+}
+
 func TestStandaloneRetainedPVCAccessMode(t *testing.T) {
 	for _, existingSet := range []bool{false, true} {
 		for _, tc := range []struct {

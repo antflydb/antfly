@@ -507,11 +507,17 @@ func (r *AntflyClusterReconciler) reconcileLegacyStandaloneStatefulSetStartupGat
 func (r *AntflyClusterReconciler) reconcileSuspendedStandaloneStatefulSet(ctx context.Context, cluster *antflyv1.AntflyCluster) (bool, error) {
 	existing := &appsv1.StatefulSet{}
 	key := types.NamespacedName{Name: standaloneStatefulSetName(cluster), Namespace: cluster.Namespace}
-	if err := r.Get(ctx, key, existing); err != nil {
+	if err := r.haBoundaryReader().Get(ctx, key, existing); err != nil {
 		if errors.IsNotFound(err) {
 			return false, nil
 		}
 		return false, err
+	}
+	// This fast path bypasses CreateOrUpdate and must establish ownership
+	// itself before changing availability or claim retention. Use the live
+	// object's resource version so an ownership race conflicts on Update.
+	if !metav1.IsControlledBy(existing, cluster) {
+		return false, fmt.Errorf("cannot suspend StatefulSet %s: it is not controlled by AntflyCluster UID %s", existing.Name, cluster.UID)
 	}
 	retention := existing.Spec.PersistentVolumeClaimRetentionPolicy
 	retain := retention != nil && retention.WhenScaled == appsv1.RetainPersistentVolumeClaimRetentionPolicyType && retention.WhenDeleted == appsv1.RetainPersistentVolumeClaimRetentionPolicyType

@@ -116,6 +116,7 @@ pub fn inspectInputJsonAllocWithLiteInspector(allocator: Allocator, input_path: 
             error.WriterLocked => "source_busy",
             error.BackupBaseRequired => "base_required",
             error.UnsupportedLiteInspectionLayout, error.StandaloneLiteCatalogRequiresApi => "unsupported_lite_layout",
+            error.UnsupportedReplicationInspection => "unsupported_replication_source",
             else => "input_uninspectable",
         };
     };
@@ -181,7 +182,7 @@ fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight
                 var inspector: preflight.Inspector = .{ .allocator = allocator, .report = report, .options = options };
                 defer inspector.deinit();
                 try inspector.metadataJson(manifest.indexes_json);
-                try inspector.metadataJson(manifest.replication_sources_json);
+                try inspector.replicationSourcesJson(manifest.replication_sources_json);
                 for (manifest.shards) |shard| {
                     try options.cancellation.check();
                     const canonical_path = try backups_api.shardSnapshotRelPath(allocator, manifest.backup_id, shard.group_id);
@@ -191,13 +192,13 @@ fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight
                     defer allocator.free(path);
                     var store = try @import("../docstore.zig").DocStore.open(allocator, path, .{ .read_only = true });
                     defer store.close();
-                    try stores.inspect(&store, &.{manifest.indexes_json});
+                    try stores.inspect(&store, .{ .indexes_json = manifest.indexes_json });
                 }
             }
         }
         if (!native) {
             report.format = "portable";
-            try inspectPortable(allocator, io, source, options, report, null);
+            _ = try inspectPortableCatalogs(allocator, io, source, options, report, .{});
         }
     } else return error.InvalidMagic;
     if (!backups_api.localArtifactStatsEqual(initial, try source.stat(io))) return error.SourceFileChanged;
@@ -230,6 +231,11 @@ fn preflightFileDigest(io: std.Io, source: std.Io.File, size: u64, options: pref
 
 /// One budget for the entire source, including every table/shard. Each store
 /// gets its own selector/model scope so names cannot leak between tables.
+pub const InspectionCatalogs = struct {
+    indexes_json: []const u8 = "",
+    replication_sources_json: []const u8 = "",
+};
+
 pub const StoreInspection = struct {
     allocator: Allocator,
     io: std.Io,
@@ -247,13 +253,13 @@ pub const StoreInspection = struct {
         self.remaining_expanded_bytes -= bytes;
     }
 
-    pub fn inspectNamespace(self: *StoreInspection, backend: *lite_backend.Handle, namespace: []const u8, catalogs: []const []const u8) !void {
+    pub fn inspectNamespace(self: *StoreInspection, backend: *lite_backend.Handle, namespace: []const u8, catalogs: InspectionCatalogs) !void {
         var store = try @import("../docstore.zig").DocStore.openRuntime(self.allocator, try backend.runtimeStoreForNamespace(namespace));
         defer store.close();
         try self.inspect(&store, catalogs);
     }
 
-    pub fn inspect(self: *StoreInspection, store: *@import("../docstore.zig").DocStore, catalogs: []const []const u8) !void {
+    pub fn inspect(self: *StoreInspection, store: *@import("../docstore.zig").DocStore, catalogs: InspectionCatalogs) !void {
         try self.options.cancellation.check();
         const scratch = try temporaryPortablePath(self.allocator, self.io);
         defer self.allocator.free(scratch);
@@ -299,22 +305,19 @@ pub fn inspectEmbeddedLite(allocator: Allocator, io: std.Io, backend: *lite_back
         if (catalog.?.value.tables.len >= stores.options.max_definitions) return error.PreflightLimitExceeded;
         try embedded_catalog.validate(catalog.?.value);
     }
-    try stores.inspect(&root, &.{});
+    try stores.inspect(&root, .{});
     if (catalog) |value| for (value.value.tables) |table| {
         const namespace = try embedded_catalog.namespaceAlloc(allocator, table.id);
         defer allocator.free(namespace);
-        try stores.inspectNamespace(backend, namespace, &.{});
+        try stores.inspectNamespace(backend, namespace, .{});
     };
 }
 
-fn inspectPortable(allocator: Allocator, io: std.Io, file: std.Io.File, options: preflight.Options, report: *preflight.Report, catalog: ?[]const u8) !void {
-    _ = try inspectPortableCatalogs(allocator, io, file, options, report, if (catalog) |json| &.{json} else &.{});
-}
-
-fn inspectPortableCatalogs(allocator: Allocator, io: std.Io, file: std.Io.File, options: preflight.Options, report: *preflight.Report, catalogs: []const []const u8) !portable_backup.FileInspection {
+fn inspectPortableCatalogs(allocator: Allocator, io: std.Io, file: std.Io.File, options: preflight.Options, report: *preflight.Report, catalogs: InspectionCatalogs) !portable_backup.FileInspection {
     var inspector: preflight.Inspector = .{ .allocator = allocator, .report = report, .options = options };
     defer inspector.deinit();
-    for (catalogs) |json| if (json.len != 0) try inspector.metadataJson(json);
+    if (catalogs.indexes_json.len != 0) try inspector.metadataJson(catalogs.indexes_json);
+    if (catalogs.replication_sources_json.len != 0) try inspector.replicationSourcesJson(catalogs.replication_sources_json);
     return portable_backup.inspectPortableFileBlocks(allocator, io, file, .{ .metadata_first = true, .max_input_bytes = options.max_input_bytes, .max_logical_bytes = options.max_expanded_bytes, .cancellation = options.cancellation }, &inspector, preflight.Inspector.visit);
 }
 
@@ -2532,10 +2535,10 @@ test "backup preflight Lite enumerates named embedded tables with isolated selec
     var root_store = try @import("../docstore.zig").DocStore.openRuntime(a, backend.native_runtime_store.?);
     defer root_store.close();
     const before = stores.remaining_expanded_bytes;
-    try stores.inspect(&root_store, &.{});
+    try stores.inspect(&root_store, .{});
     const root_size = before - stores.remaining_expanded_bytes;
     const mid = stores.remaining_expanded_bytes;
-    try stores.inspectNamespace(&backend, "embedded/tables/2", &.{});
+    try stores.inspectNamespace(&backend, "embedded/tables/2", .{});
     const named_size = mid - stores.remaining_expanded_bytes;
     const limited = try inspectInputJsonAlloc(a, path, destination, .{ .max_expanded_bytes = @max(root_size, named_size) });
     defer a.free(limited);
@@ -2582,7 +2585,7 @@ test "backup preflight native multishard scans later shards and table producers"
         .description = "",
         .schema_json = "{}",
         .read_schema_json = "",
-        .replication_sources_json = "[]",
+        .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"${secret:native-pg}\",\"postgres_table\":\"public.users\"}]",
         .indexes_json = "{\"enrichments\":[{\"name\":\"pdf\",\"kind\":\"asset\",\"field\":\"media\",\"producer\":{\"type\":\"reader\"}}]}",
         .shards = &shards,
     };
@@ -2603,6 +2606,8 @@ test "backup preflight native multishard scans later shards and table producers"
     try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("inventory").?.object.get("documents").?.integer);
     try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("inventory").?.object.get("shards").?.integer);
     try std.testing.expect(std.mem.indexOf(u8, json, "source_local") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "replication_source") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "native-pg") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"document_id\":\"z\"") != null);
 }
 
