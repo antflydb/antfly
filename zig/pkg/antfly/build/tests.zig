@@ -6068,6 +6068,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("docstore-required-prepare-db-test", "Verify durable required preparation through DB intent, resolution and recovery paths")
         .dependOn(&addCuratedTestRunArtifact(b, required_prepare_db_tests, &.{ "db prepared transaction effects required", "ordered artifact inventory DB authored acceptance survives projection and reopen" }).step);
+    const group_read_capture_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"grouped sources production"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("docstore-group-read-capture-test", "Verify local grouped-source production semantics without full provider archive qualification")
+        .dependOn(&addCuratedTestRunArtifact(b, group_read_capture_tests, &.{"grouped sources production"}).step);
+
     const replay_encoding_filters = [_][]const u8{ "change journal", "db encodeThinReplayRecordPayload", "db transaction committed transform", "db graph fact materialized scopes match journal" };
     const replay_encoding_tests = b.addTest(.{
         .root_module = antfly_test_mod,

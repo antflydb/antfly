@@ -258,6 +258,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 prepared_row_allocator.captureIoDomain();
                 return @import("antfly_source_root").antfly_sources.storage_engine.call("batchPrepared", .{ self, req, profile, opts, generated_memo, prepared_row_allocator });
             }
+            var metadata_reads = @import("prepared_read_set.zig").Owned.init(prepared_row_allocator.allocator(), null);
+            defer metadata_reads.deinit();
+            return batchInternalPreparedOwnedInner(self, req, profile, opts, generated_memo, prepared_row_allocator, &metadata_reads) catch |err| return metadata_reads.failure orelse err;
+        }
+
+        noinline fn batchInternalPreparedOwnedInner(
+            self: *S.PreparedBatchOwner,
+            req: types.BatchRequest,
+            profile: ?*BatchProfile,
+            opts: BatchExecutionOptions,
+            generated_memo: *GeneratedEmbeddingMemo,
+            prepared_row_allocator: *PreparedRowAllocator,
+            metadata_reads: *@import("prepared_read_set.zig").Owned,
+        ) anyerror!void {
             @setEvalBranchQuota(100_000);
             var root_binding = try @import("mutation_admission.zig").bindReceiverMutationRoot(self, opts.mutation_root);
             defer root_binding.release();
@@ -2386,7 +2400,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // instead of reserving a sequence that would either be lost (and make
             // the in-memory generation move backwards after restart) or require a
             // synthetic replay item that every managed consumer must drain.
-            var group_overlay = group_mutations.Overlay{ .completion_root = S.ownerField(self, "root_incarnation").*, .source_revision = if (opts.ordered_apply_receipt) |receipt| receipt.index else null, .owner_incarnation = @import("group_source_owner_identity.zig").fromNamespace(S.ownerField(self, "core").*.identity_namespace, S.ownerField(self, "root_incarnation").*), .allocator = group_alloc, .reader = group_mutations.Reader.fromStore(S.ownerField(self, "core").*.store) };
+            const capture_group_reads = (if (opts.transaction_resolution) |resolution| resolution.accepted_effects != null else false) or
+                (S.ownerField(self, "root_incarnation").* != 0 and explicit_embedding_artifact_writes.items.len != 0);
+            metadata_reads.control = publication_control;
+            var group_overlay = group_mutations.Overlay{ .captured_reads = if (capture_group_reads) metadata_reads else null, .completion_root = S.ownerField(self, "root_incarnation").*, .source_revision = if (opts.ordered_apply_receipt) |receipt| receipt.index else null, .owner_incarnation = @import("group_source_owner_identity.zig").fromNamespace(S.ownerField(self, "core").*.identity_namespace, S.ownerField(self, "root_incarnation").*), .allocator = group_alloc, .reader = group_mutations.Reader.fromStore(S.ownerField(self, "core").*.store) };
             const review_plan = if (opts.resolver_review_command) |command| try @import("resolver_review.zig").plan(group_alloc, S.ownerField(self, "core").*, command.*, true) else null;
             if (review_plan) |review| if (review.source_key) |key| try appendUniqueOwnedKeyIndexed(S.ownerField(self, "alloc").*, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, key);
             var group_staged = @import("group_source_snapshot.zig").Staged{ .changed = &.{}, .deleted = &.{}, .sequence = 0 };
@@ -3152,6 +3169,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .generated_reads = generated_precompute_snapshot.entries,
                 .transform_reads = transform_snapshot.entries,
             }, publication_control);
+            if (prepared_physical) |*plan| {
+                try metadata_reads.finish();
+                plan.dependencies.?.metadata_reads = try metadata_reads.take();
+            }
             const commit_writes = if (prepared_physical) |plan| plan.bytes.writes else store_writes.items;
             const commit_deletes = if (prepared_physical) |plan| plan.bytes.deletes else delete_keys.items;
             const commit_replay: ?docstore_mod.DocStore.ReplayAppend = if (prepared_physical) |plan|

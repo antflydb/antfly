@@ -145446,3 +145446,51 @@ test "db prepared transaction effects required ordinary transform retries concur
     try std.testing.expectEqual(@as(i64, 101), parsed.value.object.get("count").?.integer);
     try std.testing.expectEqual(@as(u64, 99), try db.getTimestamp(a, "doc"));
 }
+
+test "db prepared transaction effects required native authored writes retain group metadata observations through publication and reopen" {
+    const a = std.testing.allocator;
+    const publication = @import("artifact_publication.zig");
+    const acceptance = @import("artifact_authored_acceptance.zig");
+    var directory = try TestDirectory.init("native-authored-group-read-set");
+    defer directory.cleanup();
+    const options: OpenOptions = .{
+        .start_optional_runtimes = false,
+        .start_index_workers = false,
+        .start_independent_maintenance = false,
+        .online_source_authority = .native,
+        .identity_namespace = .{ .table_id = 7, .shard_id = 11, .range_id = 14 },
+    };
+    var db = try DB.open(a, directory.path(), options);
+    defer db.close();
+    try db.addEnrichment(.{ .name = "turns", .kind = .group, .source = .{ .group_by = "thread", .order_by = "ordinal", .field = "text" } });
+    try db.addIndex(.{ .name = "vector", .kind = .dense_vector, .config_json = "{\"field\":\"v\",\"dims\":2}" });
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        var namespace: publication.Namespace = undefined;
+        doc_identity.encodeNamespace(&namespace, db.core.identity_namespace);
+        const catalog = try @import("artifact_inventory.zig").local(&txn);
+        try publication.stageAuthority(&txn, .{ .mode = .activate, .namespace = namespace, .authority_epoch = 1, .catalog_digest = catalog.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
+        try txn.commit();
+    }
+    try db.batch(.{ .writes = &.{.{ .key = "member", .value = "{\"v\":[1,2],\"thread\":\"t\",\"ordinal\":1,\"text\":\"first\"}" }}, .timestamp_ns = 17 });
+    try db.batch(.{ .writes = &.{.{ .key = "member", .value = "{\"v\":[3,4],\"thread\":\"t\",\"ordinal\":2,\"text\":\"second\"}" }}, .timestamp_ns = 18 });
+    const artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "member", "vector");
+    defer a.free(artifact);
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const accepted = (try acceptance.readCurrent(&read, db.root_incarnation, "member", artifact)) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u64, 18), accepted.source.timestamp);
+    }
+    db.close();
+    db = try DB.open(a, directory.path(), options);
+    const row = (try db.get(a, "member")).?;
+    defer a.free(row);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, row, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("second", parsed.value.object.get("text").?.string);
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expect((try acceptance.readCurrent(&read, db.root_incarnation, "member", artifact)) != null);
+}

@@ -6090,3 +6090,60 @@ The caller must keep the DB/gate/allocator alive. Strong defaults remain off.
 No ABI/RPC/durable format changes are introduced here. Public consumer/provider/
 storage archive and external HA qualification were not rerun; full Linux
 qualification remains waived.
+
+
+### Owned group point reads and cursor observations
+
+`prepared_read_set.Owned` captures unique point keys with value presence, length
+and SHA-256, plus independent cursor transcripts for seek-after, seek-before,
+next and previous operations. Seek arguments are owned; returned key/value bytes
+are reduced to length/digest observations before source buffers retire. Empty
+results and stopping rows are included, so validation detects inserted scan
+members, empty-tail phantoms and changed boundaries. Unrelated writes which do
+not change observed results remain valid.
+
+The group overlay records underlying reads while its own staged writes/deletes
+satisfy later overlay reads without becoming baseline observations. Capture
+failure poisons the owner, including allocation errors and original controls;
+caught failures cannot produce a partially sealed plan. All source cursors must
+retire before sealing, and sealing clears borrowed control/failure addresses.
+Poisoned sealed owners cannot transfer or validate. Copying/hashing polls in
+4 KiB chunks. Incoming keys, commands and trace metadata use the preparation
+allocator; source values are not retained.
+
+A wrapper owns capture and first-error restoration around the physical mutation
+implementation. Accepted prepared resolution and potential native authored-vector
+writes capture group-overlay reads, seal/move them into the physical plan's
+retained dependencies, and validate before local publication. Validation uses
+one fresh immutable primary read and one live replay cursor at a time under
+the caller's apply exclusion. The captured read owner retires after local commit
+before remote/visibility waits, with the rest of the physical plan.
+
+Three new unit cases cover point absence versus empty values, deduplication,
+input retirement, overlay preimages, forward/reverse/interleaved cursor replay,
+live-cursor transfer refusal, scan phantoms and stopping rows, changed values,
+unrelated-write acceptance, every capture allocation and original control
+rejection in capture/validation, and poisoned partial/sealed owner refusal.
+A new DB case exercises native authored-vector writes which update grouped
+metadata and survive reopen. Seven unchanged local production group cases also
+pass, including publication, producer debt, ordered resolution, graph closure,
+deleted descendants, scanner retirement and local effect-protocol compatibility.
+`owned-group-read-set-v5.json` records 93 executions and 79/79 build steps, zero
+skips, failures or leaks.
+
+The full group target also requested provider archives with declared 24/28 GiB
+bounds beyond the focused 20 GiB cap. That attempt ran no claimed tests.
+`docstore-group-read-capture-test` runs the unchanged production group cases
+through the local physical root; full archive and distributed protocol boundary
+qualification remain unrun, consistent with the user's full-qualification waiver.
+No ABI/RPC/reader/durable format change is introduced by this phase.
+
+This is optimistic observation validation, not a durable read/conflict lease or
+full predecision capture. Group baseline materializer callbacks and other direct
+core/backend readers outside the overlay still need coverage. Existing metadata
+predicate guards are whitelisted and range tracking covers row/index spans;
+they do not yet protect arbitrary captured group metadata across a global vote.
+Writer coverage, complete preparation/commit separation, owned live execution
+and DB lifetimes, recovery resources/derived-log quota, migration/peer eligibility,
+normal required PREPARE negotiation and broader scheduler/default/session scope
+remain incomplete. Strong provider defaults remain off; the full goal is active.
