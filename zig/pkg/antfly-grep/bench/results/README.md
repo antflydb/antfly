@@ -5,6 +5,8 @@ limitations, and reproduction commands here. Write raw trials, profiler samples,
 server logs, and exploratory runs under the repository's ignored `output/`
 directory. CI runs should publish those raw files as downloadable artifacts;
 summaries should record their archive checksum and durable location when available.
+The compatibility checker rejects tracked raw outputs and summaries larger than
+64 KiB; ignored local outputs do not affect that check.
 An unpublished local artifact must be identified as local, not as downloadable
 evidence. Benchmarks are measurements, not universal performance guarantees.
 

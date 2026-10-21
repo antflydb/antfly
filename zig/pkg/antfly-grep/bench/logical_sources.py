@@ -69,7 +69,7 @@ def main():
     args = parser.parse_args()
     if args.advise_file_cache and platform.system() != "Linux":
         parser.error("--advise-file-cache requires Linux")
-    if args.advise_file_cache and args.suite in ("scalable", "ingestion"):
+    if args.advise_file_cache and args.suite not in ("concurrency", "both"):
         parser.error("--advise-file-cache requires the concurrency or both suites")
     assert args.rounds >= 1
     root = Path(__file__).resolve().parents[4]

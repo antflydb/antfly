@@ -662,7 +662,13 @@ influence batching only; stale or colliding hints cannot establish membership.
 
 Large physical text fields may spill postings before the surrounding document
 finishes. Unique field contributions release their temporary term keys between
-representations. Fresh large dictionaries reserve capacity once, and terms with
+representations. Repeated physical fields (including multiple `_all`
+contributions) use reusable sorted indices, ordered by field name and original
+contribution position. Discovery costs O(fields log fields); each group retains
+its original token offsets and combined norm, releases its analysis scratch, and
+can spill before the next physical field. Splitting a repeated field into
+independent document postings would corrupt its positions and is forbidden.
+Fresh large dictionaries reserve capacity once, and terms with
 a single occurrence and at most one position stay inline in a tagged posting
 accumulator. Promotion allocates owned arrays only when another occurrence
 arrives; accessors derive slices after hash-table movement. General mergers keep
@@ -701,8 +707,9 @@ entry as a hit. Directory ownership moves to an intrusive retired list while the
 mutex is held; releasing blocks, reader ownership, and empty directory storage
 happens after unlocking. Outstanding leases remain charged to the same byte
 budget until their last release. Shutdown drains all remaining ownership.
-Optional cache admission examines at most 64 LRU nodes and limits eviction
-attempts to 64; pressure can refuse acceleration without changing query results.
+Optional cache admission examines at most 64 LRU nodes per preflight or
+eviction and limits eviction attempts to 64; pressure can refuse acceleration
+without changing query results.
 Regressions exercise an expiry burst with a live key and a pinned expired key,
 check heap work bounds, and instrument reclamation outside the mutex.
 

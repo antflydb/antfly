@@ -982,6 +982,11 @@ def test_logical_retained_boolean_counts_need_no_source_work(stateful_api, num_s
         ({"should": leaves[2:]}, 20),
         ({"should": [leaves[0], leaves[1], leaves[3]], "minimum_should_match": 2}, 20),
         ({"must": leaves[:1], "must_not": leaves[1:2]}, 0),
+        ({"should": leaves[3:], "minimum_should_match": 0}, 20),
+        (
+            {"filter": leaves[0], "should": leaves[3:], "minimum_should_match": 1},
+            0,
+        ),
         (
             {
                 "must": [leaves[0]],
@@ -1342,6 +1347,18 @@ def qualification_verification(result):
     return result["profile"][key]
 
 
+def logical_process_io(pid):
+    """Linux process counters include background I/O, not just the timed RPC."""
+    path = Path(f"/proc/{pid}/io")
+    if not path.is_file():
+        return None
+    counters = dict(line.split(":", 1) for line in path.read_text().splitlines())
+    return {
+        name: int(counters[name])
+        for name in ("rchar", "wchar", "syscr", "syscw", "read_bytes", "write_bytes")
+    }
+
+
 def test_logical_substring_ingestion_profile(stateful_api):
     """Opt-in production substring pipeline: full_index publication and cleanup."""
     import hashlib
@@ -1397,19 +1414,24 @@ def test_logical_substring_ingestion_profile(stateful_api):
         batches = []
         for offset in range(0, len(corpus), 2):
             before = read_process()
+            io_before = logical_process_io(stateful_api._server.proc.pid)
             started = time.perf_counter_ns()
             keys = list(corpus)[offset : offset + 2]
             stateful_api.batch_write(
                 table, inserts={k: corpus[k] for k in keys}, sync_level="full_index"
             )
+            request_elapsed_ns = time.perf_counter_ns() - started
             after = read_process()
+            io_after = logical_process_io(stateful_api._server.proc.pid)
             batches.append(
                 {
                     "documents": len(keys),
-                    "http_ms": (time.perf_counter_ns() - started) / 1e6,
+                    "http_ms": request_elapsed_ns / 1e6,
                     "cpu_ms": (after["cpu_ns"] - before["cpu_ns"]) / 1e6,
                     "process_before": before,
                     "process_after": after,
+                    "io_before": io_before,
+                    "io_after": io_after,
                 }
             )
         elapsed = time.perf_counter_ns() - start
@@ -1435,7 +1457,8 @@ def test_logical_substring_ingestion_profile(stateful_api):
                 "corpus_sha256": hashlib.sha256(
                     json.dumps(corpus, sort_keys=True, separators=(",", ":")).encode()
                 ).hexdigest(),
-                "http_ms": elapsed / 1e6,
+                "http_ms": sum(batch["http_ms"] for batch in batches),
+                "wall_ms": elapsed / 1e6,
                 "cpu_ms": (final["cpu_ns"] - initial["cpu_ns"]) / 1e6,
                 "process_initial": initial,
                 "process_final": final,
@@ -1447,8 +1470,8 @@ def test_logical_substring_ingestion_profile(stateful_api):
     Path(destination).write_text(
         json.dumps(
             {
-                "protocol": 1,
-                "scope": "Schema-enabled substring pipeline; full_index batch writes include publication and cleanup. Process CPU includes background work. RSS samples are endpoints, not peak-memory bounds.",
+                "protocol": 2,
+                "scope": "Schema-enabled substring pipeline; full_index batch writes include publication and cleanup. http_ms sums RPC durations; wall_ms includes inter-batch instrumentation. Process CPU and Linux I/O counters include background work; kernel I/O counters do not establish cold-device traffic. RSS samples are endpoints, not peak-memory bounds.",
                 "binary_sha256": binary_digest,
                 "records": records,
             },

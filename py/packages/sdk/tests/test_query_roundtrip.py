@@ -64,3 +64,20 @@ def test_strict_models_reject_unknown_properties():
 
     with pytest.raises(ValueError, match="Unexpected properties"):
         NumericRangeQuery.from_dict({"bool": {"filter": {"match_all": {}}}})
+
+
+@pytest.mark.parametrize("minimum", [0, 1, 2])
+@pytest.mark.parametrize("field", ["query", "filter_query", "exclusion_query"])
+def test_canonical_boolean_threshold_roundtrip(minimum, field):
+    body = {
+        field: {
+            "bool": {
+                "should": [
+                    {"contains": "needle", "field": "content"},
+                    {"contains": "alpha", "field": "content"},
+                ],
+                "minimum_should_match": minimum,
+            }
+        }
+    }
+    assert QueryRequest.from_dict(body).to_dict() == body
