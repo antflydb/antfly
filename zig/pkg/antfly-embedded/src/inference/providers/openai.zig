@@ -293,7 +293,7 @@ pub const Provider = struct {
             .cancellation = self.cancellation,
         });
         defer resp.deinit();
-        if (!resp.ok()) return if (resp.status.code == 429) error.RateLimit else error.GenerateRequestFailed;
+        if (!resp.ok()) return inference.remoteGenerationStatusError(resp.status.code);
         const body = resp.body orelse return error.EmptyResponse;
         var parsed = try std.json.parseFromSlice(Response, alloc, body, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();

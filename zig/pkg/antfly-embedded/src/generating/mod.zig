@@ -83,6 +83,95 @@ test "provider registry gateway embedded canonical generation preserves tools us
 }
 pub const parseConfigFromValue = lib.parseConfigFromValue;
 
+test "provider registry gateway typed vendor chains preserve HTTP failure policy without public gateway" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Case = struct {
+        status: u16,
+        condition: ?ChainCondition = .on_error,
+        fallback: bool = false,
+        expected_error: ?anyerror = error.GenerateRequestFailed,
+        body: []const u8 = "{}",
+    };
+    const cases = [_]Case{
+        .{ .status = 502, .fallback = true },
+        .{ .status = 503, .fallback = true },
+        .{ .status = 503, .condition = .always, .fallback = true },
+        .{ .status = 503, .condition = null, .expected_error = error.ServiceUnavailable },
+        .{ .status = 503, .condition = .on_rate_limit, .expected_error = error.ServiceUnavailable },
+        .{ .status = 503, .condition = .on_timeout, .expected_error = error.ServiceUnavailable },
+        .{ .status = 429, .fallback = true },
+        .{ .status = 429, .condition = .on_rate_limit, .fallback = true },
+        .{ .status = 504, .condition = .on_timeout, .fallback = true },
+        .{ .status = 504, .expected_error = error.Timeout },
+        .{ .status = 504, .condition = .always, .expected_error = error.Timeout },
+        .{ .status = 400 },
+        .{ .status = 401 },
+        .{ .status = 403 },
+        .{ .status = 500 },
+        // Successful HTTP responses with unusable output are never retried.
+        .{ .status = 200, .body = "{\"choices\":[],\"candidates\":[]}" },
+        .{ .status = 200, .body = "{", .expected_error = null },
+    };
+    for ([_]Provider{ .openai, .openrouter, .ollama, .gemini, .vertex }) |provider| {
+        for (cases) |case| {
+            errdefer std.debug.print("typed chain provider={s} status={d} condition={any}\n", .{ @tagName(provider), case.status, case.condition });
+            const path = switch (provider) {
+                .gemini => "/primary/models/primary:generateContent",
+                .vertex => "/primary/projects/fixture/locations/us-central1/publishers/google/models/primary:generateContent",
+                else => "/primary/chat/completions",
+            };
+            var server = try httpx.TestServer.start(a, io, &.{
+                .{ .method = .POST, .path = path, .respond = .{ .status = case.status, .body = case.body } },
+                .{ .method = .POST, .path = "/backup/chat/completions", .respond = .{ .body = "{\"choices\":[{\"message\":{\"content\":\"backup\"}}]}" } },
+            });
+            defer server.deinit();
+            const primary = try std.fmt.allocPrint(a, "{s}/primary", .{server.baseUrl()});
+            defer a.free(primary);
+            const backup = try std.fmt.allocPrint(a, "{s}/backup", .{server.baseUrl()});
+            defer a.free(backup);
+            const Serve = struct {
+                fn run(peer: *httpx.TestServer, failure: *?anyerror) std.Io.Cancelable!void {
+                    // Always accept a possible backup so an erroneous fallback
+                    // fails assertions instead of blocking on a missing peer.
+                    for (0..2) |_| peer.handleOne() catch |err| {
+                        failure.* = err;
+                        return;
+                    };
+                }
+            };
+            var failure: ?anyerror = null;
+            var group: std.Io.Group = .init;
+            try group.concurrent(io, Serve.run, .{ &server, &failure });
+            defer group.cancel(io);
+            var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+            defer client.deinit();
+            const chain = [_]ChainLink{
+                .{ .generator = .{ .provider = provider, .model = "primary", .url = primary, .api_key = "fixture", .project_id = if (provider == .vertex) "fixture" else null }, .condition = case.condition },
+                .{ .generator = .{ .provider = .openai, .model = "backup", .url = backup, .api_key = "fixture" } },
+            };
+            // Exercise the same internal entry point used by agents and RAG,
+            // with no public gateway configuration or HTTP handlers installed.
+            if (executeChain(a, &client, &chain, &.{.{ .role = .user, .content = .{ .text = "hello" } }})) |value| {
+                var result = value;
+                defer result.deinit();
+                try std.testing.expect(case.fallback);
+                try std.testing.expectEqualStrings("backup", result.content);
+                try group.await(io);
+                if (failure) |err| return err;
+                try std.testing.expectEqual(@as(usize, 1), server.route_hits[1]);
+            } else |err| {
+                try std.testing.expect(!case.fallback);
+                if (case.expected_error) |expected| try std.testing.expectEqual(expected, err);
+                // Join before reading counters written by the server task.
+                group.cancel(io);
+                try std.testing.expectEqual(@as(usize, 0), server.route_hits[1]);
+            }
+            try std.testing.expectEqual(@as(usize, 1), server.route_hits[0]);
+        }
+    }
+}
+
 test "Apple generation backend bypasses HTTP quotas and honors request deadlines" {
     const alloc = std.testing.allocator;
     var client = httpx.Client.initWithConfig(alloc, std.testing.io, .{});

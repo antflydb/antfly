@@ -315,10 +315,10 @@ pub const View = struct {
 /// Timeouts, disconnects and malformed responses can have incurred work and
 /// are deliberately excluded unless a chain explicitly selects on_timeout.
 pub fn transientStatus(status: u16) ?anyerror {
-    return switch (status) {
-        429 => error.InferenceUpstreamRateLimited,
-        502, 503 => error.InferenceUpstreamUnavailable,
-        504 => error.Timeout,
+    return switch (@import("antfly_generating").remoteGenerationStatusError(status)) {
+        error.RateLimit => error.InferenceUpstreamRateLimited,
+        error.ServiceUnavailable => error.InferenceUpstreamUnavailable,
+        error.Timeout => error.Timeout,
         else => null,
     };
 }

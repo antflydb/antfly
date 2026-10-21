@@ -173,7 +173,7 @@ pub const GeminiProvider = struct {
             .cancellation = self.cancellation,
         });
         defer resp.deinit();
-        if (!resp.ok()) return if (resp.status.code == 429) error.RateLimit else error.GenerateRequestFailed;
+        if (!resp.ok()) return inference.remoteGenerationStatusError(resp.status.code);
         return try parseGenerateResponseAlloc(alloc, resp.body orelse return error.EmptyResponse, messages.len);
     }
 
@@ -529,7 +529,7 @@ pub const Provider = struct {
             .cancellation = control.cancellation,
         });
         defer resp.deinit();
-        if (!resp.ok()) return if (resp.status.code == 429) error.RateLimit else error.GenerateRequestFailed;
+        if (!resp.ok()) return inference.remoteGenerationStatusError(resp.status.code);
         const body = resp.body orelse return error.EmptyResponse;
 
         return try parseGenerateResponseAlloc(alloc, body, messages.len);

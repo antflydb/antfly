@@ -868,6 +868,20 @@ fn sleepMs(ms: u32) void {
     }
 }
 
+/// Preserve remote vendor HTTP failures for both typed generation and gateway
+/// chains. Native Antfly responses use localGenerationStatusError instead:
+/// their response bodies distinguish capacity from permanent model failures.
+/// Call only for unsuccessful HTTP responses; successful response decoding
+/// failures must remain terminal.
+pub fn remoteGenerationStatusError(status: u16) anyerror {
+    return switch (status) {
+        429 => error.RateLimit,
+        502, 503 => error.ServiceUnavailable,
+        504 => error.Timeout,
+        else => error.GenerateRequestFailed,
+    };
+}
+
 pub fn fallbackAllowed(condition: ?ChainCondition, err: anyerror) bool {
     const policy = condition orelse return false;
     const rate_limited = isRateLimitError(err) or err == error.InferenceUpstreamRateLimited;

@@ -54,6 +54,7 @@ pub const GenerateMessagesRequest = struct {
 };
 
 pub const localGenerationStatusError = generating.localGenerationStatusError;
+pub const remoteGenerationStatusError = generating.remoteGenerationStatusError;
 
 test "local generation budgets preserve explicit limits and reject overflow" {
     try std.testing.expectEqual(@as(i32, 128), (try GenerationOptions.fromMaxTokens(128)).max_tokens);
