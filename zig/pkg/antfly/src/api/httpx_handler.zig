@@ -4320,7 +4320,7 @@ pub const AntflyApiHandler = struct {
             error.Timeout => 504,
             error.EmbeddingIdentityMismatch => 409,
             error.Canceled, error.Cancelled => return error.Canceled,
-            error.UnsupportedLocalRateLimit, error.InvalidSynthesisOptions, error.UnsupportedSynthesisOptions, error.InvalidSynthesizingConfig, error.UnknownField, error.MissingField, error.InvalidGeneratorConfig, error.InvalidDecisionSpecification, error.InvalidReaderConfig, error.DecisionLimitExceeded, error.ModelRequired, error.InvalidModelIdentity, error.ModelTaskMismatch, error.AmbiguousModelIdentity, error.InvalidInferenceRequest, error.UnsupportedInferenceFeature, error.SyntaxError, error.UnexpectedToken => 400,
+            error.UnsupportedLocalRateLimit, error.InvalidSynthesisOptions, error.UnsupportedSynthesisOptions, error.InvalidSynthesizingConfig, error.InvalidGeneratorConfig, error.InvalidDecisionSpecification, error.InvalidReaderConfig, error.DecisionLimitExceeded, error.ModelRequired, error.InvalidModelIdentity, error.ModelTaskMismatch, error.AmbiguousModelIdentity, error.InvalidInferenceRequest, error.UnsupportedInferenceFeature => 400,
             else => 502,
         };
         _ = ctx.status(status);
@@ -18737,6 +18737,8 @@ test "httpx inference gateway preserves framed media through raw and named nativ
 test "httpx inference gateway generated tasks route nested generator without adding a model" {
     const Target = struct {
         calls: usize = 0,
+        named: bool = false,
+        override: bool = false,
         fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
             check(context) catch |err| return inference_connection_abi.statusFromError(err);
             return .ok;
@@ -18752,6 +18754,14 @@ test "httpx inference gateway generated tasks route nested generator without add
             try std.testing.expectEqualStrings("backend", generator.get("model").?.string);
             try std.testing.expectEqualStrings("antfly", generator.get("provider").?.string);
             try std.testing.expectEqualStrings("verdict_only", parsed.value.object.get("probabilities").?.string);
+            const limit = generator.get("max_tokens");
+            if (self.override or self.named) {
+                try std.testing.expectEqual(@as(i64, if (self.override) 13 else 24), limit.?.integer);
+                const temperature = generator.get("temperature").?;
+                const number: f64 = if (temperature == .float) temperature.float else @floatFromInt(temperature.integer);
+                try std.testing.expectApproxEqAbs(@as(f64, if (self.override) 0 else 0.2), number, 0.00001);
+            } else try std.testing.expect(limit == null);
+            try std.testing.expect(!generator.contains("api_key") and !generator.contains("api_url") and !generator.contains("url"));
             const operation = context.operation.slice();
             try std.testing.expect(std.mem.eql(u8, operation, "decisions") or std.mem.eql(u8, operation, "extract"));
             context.out_response.* = .{ .status = 200, .body = .{ .ptr = (try a.dupe(u8, "{}")).ptr, .len = 2 } };
@@ -18759,7 +18769,7 @@ test "httpx inference gateway generated tasks route nested generator without add
     };
     const a = std.testing.allocator;
     var config = try common_config.Config.parseFromSlice(a,
-        \\{"public_inference":{"enabled":true},"generators":{"native":{"provider":"antfly","model":"backend"}}}
+        \\{"public_inference":{"enabled":true},"generators":{"native":{"provider":"antfly","model":"backend","max_tokens":24,"temperature":0.2}}}
     );
     defer config.deinit();
     var target: Target = .{};
@@ -18769,19 +18779,46 @@ test "httpx inference gateway generated tasks route nested generator without add
     var handler = AntflyApiHandler{ .api_server = &server };
     for ([_][]const u8{ "backend", "local/backend", "generators/native", "connections/local-inference/models/backend" }) |model| {
         for ([_]bool{ false, true }) |extract| {
-            const body = try std.fmt.allocPrint(a, "{{\"{s}\":\"generated\",\"generator\":{{\"provider\":\"antfly\",\"model\":\"{s}\"}},\"probabilities\":\"verdict_only\",{s}}}", .{ if (extract) "method" else "decision_method", model, if (extract) "\"inputs\":[{\"content\":\"source\"}],\"schema\":{\"entities\":[\"person\"]}" else "\"input\":\"source\",\"questions\":[{\"name\":\"present\",\"type\":\"predicate\",\"instructions\":\"Present?\"}]" });
-            defer a.free(body);
-            var request = try httpx.Request.init(a, .POST, if (extract) "http://localhost/ai/v1/extract" else "http://localhost/ai/v1/decisions");
-            defer request.deinit();
-            request.body = body;
-            var ctx = httpx.Context.init(a, std.testing.io, &request);
-            defer ctx.deinit();
-            var response = try handler.gatewayRequest(&ctx, if (extract) .extract else .decide);
-            defer response.deinit();
-            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            for ([_]bool{ false, true }) |override| {
+                target.named = std.mem.eql(u8, model, "generators/native");
+                target.override = override;
+                const body = try std.fmt.allocPrint(a, "{{\"{s}\":\"generated\",\"generator\":{{\"provider\":\"antfly\",\"model\":\"{s}\"}},\"probabilities\":\"verdict_only\",{s}}}", .{ if (extract) "method" else "decision_method", model, if (extract) "\"inputs\":[{\"content\":\"source\"}],\"schema\":{\"entities\":[\"person\"]}" else "\"input\":\"source\",\"questions\":[{\"name\":\"present\",\"type\":\"predicate\",\"instructions\":\"Present?\"}]" });
+                defer a.free(body);
+                var request = try httpx.Request.init(a, .POST, if (extract) "http://localhost/ai/v1/extract" else "http://localhost/ai/v1/decisions");
+                defer request.deinit();
+                const parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+                defer parsed.deinit();
+                if (override) {
+                    const generator = parsed.value.object.getPtr("generator").?;
+                    try generator.object.put(parsed.arena.allocator(), "max_tokens", .{ .integer = 13 });
+                    try generator.object.put(parsed.arena.allocator(), "temperature", .{ .float = 0 });
+                }
+                const encoded = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+                defer a.free(encoded);
+                request.body = encoded;
+                var ctx = httpx.Context.init(a, std.testing.io, &request);
+                defer ctx.deinit();
+                var response = try handler.gatewayRequest(&ctx, if (extract) .extract else .decide);
+                defer response.deinit();
+                try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            }
         }
     }
-    try std.testing.expectEqual(@as(usize, 8), target.calls);
+    // Native constrained generation owns its tools/schema. Unsupported alias
+    // defaults must fail before invocation rather than disappearing silently.
+    try config.registry.registerGeneratorConfig("unsupported", .{ .provider = .antfly, .model = "backend", .url = "", .tools_json = "[]" });
+    var rejected_request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/decisions");
+    defer rejected_request.deinit();
+    rejected_request.body =
+        \\{"decision_method":"generated","generator":{"provider":"antfly","model":"generators/unsupported"},"probabilities":"verdict_only","input":"source","questions":[{"name":"present","type":"predicate","instructions":"Present?"}]}
+    ;
+    var rejected_context = httpx.Context.init(a, std.testing.io, &rejected_request);
+    defer rejected_context.deinit();
+    var rejected = try handler.gatewayRequest(&rejected_context, .decide);
+    defer rejected.deinit();
+    try std.testing.expectEqual(@as(u16, 400), rejected.status.code);
+    try std.testing.expectEqual(@as(i64, 24), (try config.registry.getGeneratorConfig("native")).max_tokens);
+    try std.testing.expectEqual(@as(usize, 16), target.calls);
     try std.testing.expectEqual(@as(usize, 0), server.inferenceAdmissionStats().in_flight);
 }
 
@@ -18854,6 +18891,9 @@ test "httpx inference gateway remote generated and framed requests retain creden
             defer parsed.deinit();
             try std.testing.expect(!parsed.value.object.contains("model"));
             try std.testing.expectEqualStrings("backend", parsed.value.object.get("generator").?.object.get("model").?.string);
+            const generator = parsed.value.object.get("generator").?.object;
+            try std.testing.expectEqual(@as(i64, 24), generator.get("max_tokens").?.integer);
+            try std.testing.expect(!generator.contains("api_key") and !generator.contains("api_url") and !generator.contains("url"));
         }
         fn framedGenerator(req: httpx.testing_mod.RequestInfo) !void {
             try std.testing.expectEqualStrings("Bearer generator-key", req.header("authorization").?);
@@ -18881,7 +18921,7 @@ test "httpx inference gateway remote generated and framed requests retain creden
     defer config.deinit();
     config.inference.api_url = try a.dupe(u8, upstream.baseUrl());
     config.inference.api_key = try a.dupe(u8, "inference-key");
-    try config.registry.registerGeneratorConfig("native", .{ .provider = .antfly, .model = "backend", .url = "", .api_key = "generator-key" });
+    try config.registry.registerGeneratorConfig("native", .{ .provider = .antfly, .model = "backend", .url = "", .api_key = "generator-key", .max_tokens = 24 });
     try config.registry.inference_capabilities.put(a, try a.dupe(u8, "generators/native"), .{ .images = .supported });
     var source = AuthStatusSource{};
     var server = ApiHttpServer.init(a, .{ .node_config = &config, .imported_runtime_io = .{ .api = io_impl.io(), .api_network = io_impl.io() } }, source.iface(), null, null);
@@ -19120,8 +19160,17 @@ test "httpx inference gateway remote native embedding retains shared quota crede
     config.inference.api_key = try a.dupe(u8, "default-key");
     var limits = @import("antfly_local_sources").common_provider_limits.Registry.init(a);
     defer limits.deinit();
+    const Local = struct {
+        calls: usize = 0,
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(context.target_context));
+            self.calls += 1;
+            return inference_connection_abi.statusFromError(error.UnsupportedInferenceFeature);
+        }
+    };
+    var local: Local = .{};
     var source = AuthStatusSource{};
-    var server = ApiHttpServer.init(a, .{ .node_config = &config, .imported_runtime_io = .{ .api = io_impl.io(), .api_network = io_impl.io() } }, source.iface(), null, null);
+    var server = ApiHttpServer.init(a, .{ .node_config = &config, .imported_runtime_io = .{ .api = io_impl.io(), .api_network = io_impl.io() }, .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &local, .invoke = Local.invoke } }, source.iface(), null, null);
     defer server.deinit();
     server.embedding_provider_runtime.limits = &limits;
     var handler = AntflyApiHandler{ .api_server = &server };
@@ -19159,6 +19208,7 @@ test "httpx inference gateway remote native embedding retains shared quota crede
     try upstream.handleOne();
     try group.await(io_impl.io());
     if (failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 0), local.calls);
     try std.testing.expectEqual(@as(usize, 0), server.inferenceAdmissionStats().in_flight);
 }
 
@@ -19214,4 +19264,48 @@ test "httpx inference gateway hosted legacy embedding parts produce one result p
     for (0..2) |_| try upstream.handleOne();
     try group.await(io_impl.io());
     if (failure) |err| return err;
+}
+
+test "httpx inference gateway request errors remain client errors without reclassifying upstream decoding" {
+    const a = std.testing.allocator;
+    var config = try common_config.Config.parseFromSlice(a,
+        \\{"public_inference":{"enabled":true},"text_to_speech":{"voice":{"provider":"openai","model":"tts-1","api_key":"fixture"}},"transcribers":{"speech":{"provider":"openai","model":"whisper-1","api_key":"fixture"}},"embedders":{"dense":{"provider":"openai","model":"text-embedding-3-small","dimensions":2,"api_key":"fixture"}}}
+    );
+    defer config.deinit();
+    var source = AuthStatusSource{};
+    var server = ApiHttpServer.init(a, .{ .node_config = &config }, source.iface(), null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    const Task = @import("antfly_local_sources").common_provider_registry.gateway.Task;
+    const cases = .{
+        .{ Task.embed, "/ai/v1/embeddings", "{\"model\":" },
+        .{ Task.embed, "/ai/v1/embeddings", "" },
+        .{ Task.embed, "/ai/v1/embeddings", "{\"model\":\"x\",\"model\":\"y\"}" },
+        .{ Task.embed, "/ai/v1/embeddings", "{\"model\":\"embedders/dense\",\"input\":[{\"type\":\"media\",\"mime_type\":\"image/png\",\"data\":\"!\"}]}" },
+        .{ Task.synthesize, "/ai/v1/synthesize", "{\"model\":\"synthesizers/voice\",\"text\":\"hello\",\"format\":\"invalid\"}" },
+        .{ Task.transcribe, "/ai/v1/transcribe", "{\"model\":\"transcribers/speech\",\"audio\":\"AAAA\",\"diarization\":true}" },
+    };
+    inline for (cases) |case| {
+        var request = try httpx.Request.init(a, .POST, "http://localhost" ++ case[1]);
+        defer request.deinit();
+        request.body = case[2];
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.gatewayRequest(&ctx, case[0]);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "invalid_request_error") != null);
+    }
+    // The same low-level errors from a response decoder remain server-side
+    // failures; only request parsers normalize them to InvalidInferenceRequest.
+    for ([_]anyerror{ error.UnexpectedEndOfInput, error.InvalidEnumTag, error.SyntaxError, error.UnexpectedToken, error.UnknownField, error.MissingField, error.InvalidInferenceResponse }) |err| {
+        var request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/generate");
+        defer request.deinit();
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try AntflyApiHandler.gatewayFailure(&ctx, err);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 502), response.status.code);
+    }
+    try std.testing.expectEqual(@as(usize, 0), server.inferenceAdmissionStats().in_flight);
 }

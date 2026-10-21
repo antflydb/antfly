@@ -93,7 +93,11 @@ existing inline media formats within the request memory budget.
 Generated decision and extraction requests select their generator through
 `generator.model`, with no top-level `model`. Native generator IDs and configured
 Antfly generator aliases use the same generator resolution as generation requests;
-the native runtime retains responsibility for constrained-output admission. The
+the native runtime retains responsibility for constrained-output admission.
+Configured native sampling defaults (including `max_tokens`, `temperature`,
+`top_p`, and `top_k`) apply to generated tasks; explicit nested generator options
+win. Transport URLs, credentials and policy stay at the gateway. Alias options
+that cannot participate in native constrained generation fail explicitly. The
 proxy places these requests using generator inventory and forwards the original
 task URL and envelope. Route matching, rejection, rate limits, and capability-lease
 authorization continue to use the logical `decide` or `extract` operation, including
@@ -107,6 +111,10 @@ places the selected model in `generator.model` for these generated envelopes.
 
 For chunking, a top-level `model` takes precedence over `config.model`; omitting
 both selects `fixed`. The proxy and gateway use the same precedence.
+
+Invalid caller JSON, schema values, and unsupported adapter options return 400.
+Malformed upstream responses remain 502 errors; request error normalization does
+not change response-decoding failures.
 
 The supported OpenAI compatibility matrix is:
 
@@ -130,7 +138,10 @@ objects produce one vector per object. They retain runtime usage, backend, and
 returns 409 before inference. Matching pins are enforced at the runtime, and a
 successful response with a missing or different identity fails before publication.
 Native remote calls use the same embedding credential source and shared quota
-identity as typed embedding calls. Hosted adapters preserve legacy item count;
+identity as typed embedding calls. They also share endpoint precedence:
+explicit alias URL, `ANTFLY_INFERENCE_URL`, deployment `inference.api_url`, then
+the process-local runtime when available. A local runtime does not override a
+configured remote embedding default. Hosted adapters preserve legacy item count;
 ordered native groups and native identity pins require an Antfly executor.
 Embedding-space/artifact pins and decision method/calibration metadata retain
 meaning. There is no cross-model embedding or decision fallback.

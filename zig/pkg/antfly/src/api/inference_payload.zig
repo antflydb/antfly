@@ -38,7 +38,7 @@ pub const Payload = struct {
             metadata = framed.metadata;
             attachments = framed.attachments;
         }
-        return .{ .value = try std.json.parseFromSliceLeaky(std.json.Value, a, metadata, .{}), .attachments = attachments };
+        return .{ .value = std.json.parseFromSliceLeaky(std.json.Value, a, metadata, .{}) catch |err| return requestParseError(err), .attachments = attachments };
     }
 
     pub fn encode(self: Payload, a: std.mem.Allocator) ![]const u8 {
@@ -50,6 +50,12 @@ pub const Payload = struct {
         return if (self.attachments != null) envelope.content_type else "application/json";
     }
 };
+
+/// Only errors from caller-owned JSON/schema parsing enter this boundary.
+/// Upstream decoding must retain its separate response-error classification.
+pub fn requestParseError(err: anyerror) anyerror {
+    return if (err == error.OutOfMemory) err else error.InvalidInferenceRequest;
+}
 
 pub fn encodeMetadata(a: std.mem.Allocator, metadata: []const u8, attachments: ?[]const envelope.Attachment) ![]const u8 {
     return if (attachments) |items| try envelope.encodeAlloc(a, metadata, items) else metadata;

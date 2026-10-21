@@ -98,7 +98,7 @@ pub fn session(server: anytype, ctx: *httpx.Context, principal: []const u8, meth
         operation = try std.fmt.allocPrint(a, "transcription/sessions/{s}{s}", .{ pinned.backend_id, action });
     } else {
         body = (try ctx.body()) orelse "";
-        var request = try std.json.parseFromSliceLeaky(Json, a, body, .{});
+        var request = std.json.parseFromSliceLeaky(Json, a, body, .{}) catch |err| return payloads.requestParseError(err);
         if (request != .object) return error.InvalidInferenceRequest;
         if (request.object.get("ttl_seconds")) |ttl| if (ttl == .integer and ttl.integer >= 1 and ttl.integer <= 3600) {
             requested_ttl_ns = @as(u64, @intCast(ttl.integer)) * std.time.ns_per_s;
@@ -368,6 +368,7 @@ fn executeGenerated(server: anytype, ctx: *httpx.Context, task: gateway.Task, a:
     var backend: []const u8 = undefined;
     var endpoint: ?[]const u8 = null;
     var api_key: ?[]const u8 = null;
+    var generator = request.object.get("generator").?;
     switch (target) {
         .local => |local| {
             if (local.explicit and server.cfg.local_inference_connection_target == null) return error.ModelNotFound;
@@ -384,6 +385,7 @@ fn executeGenerated(server: anytype, ctx: *httpx.Context, task: gateway.Task, a:
             if (configured.chain) return error.UnsupportedInferenceFeature;
             const cfg = try named.providers.getGeneratorConfig(configured.name);
             if (cfg.provider != .antfly or cfg.rate_limit != null) return error.UnsupportedInferenceFeature;
+            generator = try tasks.generatedGenerator(a, cfg, generator);
             backend = cfg.model;
             if (cfg.url.len != 0) endpoint = cfg.url;
             api_key = cfg.api_key;
@@ -393,7 +395,6 @@ fn executeGenerated(server: anytype, ctx: *httpx.Context, task: gateway.Task, a:
             }
         },
     }
-    var generator = request.object.get("generator").?;
     try generator.object.put(a, "model", .{ .string = backend });
     var adapted = request;
     try adapted.object.put(a, "generator", generator);
@@ -513,7 +514,7 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
                 }
             }
             if (cfg.rate_limit != null) return error.UnsupportedLocalRateLimit;
-            _ = try std.json.parseFromValue(@import("inference_api").GenerateRequest, a, request, .{});
+            _ = std.json.parseFromValue(@import("inference_api").GenerateRequest, a, request, .{}) catch |err| return payloads.requestParseError(err);
             try named.capabilities(target).require(try tasks.chatRequirements(request));
             const body = try tasks.chatBody(a, try tasks.withGenerationOptions(cfg, try generationOptions(a, request)), request);
             if (cfg.url.len != 0) return forwardEndpoint(server, ctx, cfg.url, cfg.api_key, execution_options.operation orelse "generate", body, fallback, observation, execution_options);
@@ -718,12 +719,15 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
             const dictation = std.mem.eql(u8, execution_options.operation orelse "transcribe", "dictate");
             try only(request, &.{ "model", "audio", "language", "diarization", "url", "timestamps" });
             const audio_url = if (request.object.get("url")) |value| try string(value) else try std.fmt.allocPrint(a, "data:audio/wav;base64,{s}", .{try string(request.object.get("audio") orelse return error.InvalidInferenceRequest)});
-            const result = try executor.transcribe(a, name, .{
+            const result = executor.transcribe(a, name, .{
                 .url = audio_url,
                 .language = if (request.object.get("language")) |value| try string(value) else null,
                 .diarization = if (request.object.get("diarization")) |value| if (value == .bool) value.bool else return error.InvalidInferenceRequest else null,
                 .timestamps = if (request.object.get("timestamps")) |value| if (value == .bool) value.bool else return error.InvalidInferenceRequest else null,
-            });
+            }) catch |err| return switch (err) {
+                error.UnsupportedTranscriptionOptions => error.UnsupportedInferenceFeature,
+                else => err,
+            };
             var speakers: std.ArrayList([]const u8) = .empty;
             if (result.speakers) |values| for (values) |speaker| {
                 if (speaker.label orelse speaker.id) |label| try speakers.append(a, label);
@@ -741,7 +745,7 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
         .synthesize => {
             var adapted = request;
             _ = adapted.object.swapRemove("model");
-            const parsed = try std.json.parseFromValue(@import("antfly_synthesizing").Request, a, adapted, .{});
+            const parsed = std.json.parseFromValue(@import("antfly_synthesizing").Request, a, adapted, .{}) catch |err| return payloads.requestParseError(err);
             var result = try executor.synthesize(a, name, parsed.value);
             defer @import("antfly_synthesizing").deinitResult(a, &result);
             if (result.audio) |audio| {
@@ -814,7 +818,7 @@ fn executeNativeEmbedding(server: anytype, ctx: *httpx.Context, a: std.mem.Alloc
     var execution = options;
     execution.response_delivery = .buffered;
     var response: httpx.Response = undefined;
-    if (cfg.url.len == 0 and server.cfg.local_inference_connection_target != null) {
+    if (server.cfg.local_inference_connection_target != null and !sources.inference_managed_embedder.hasRemoteAntflyEndpoint(cfg, server.cfg.node_config.?.inference.api_url)) {
         if ((try sources.common_provider_limits.Policy.fromConfig(cfg.rate_limit)).enabled()) return error.UnsupportedLocalRateLimit;
         response = try forward(server, ctx, sources.common_config.local_inference_connection_id, options.operation orelse "embeddings", body, false, observation, execution);
     } else {
@@ -996,7 +1000,7 @@ fn generationOptions(a: std.mem.Allocator, request: Json) !tasks.GenerationOptio
 
 fn prepareGeneration(a: std.mem.Allocator, cfg: generating.GeneratorConfig, request: Json, operation: []const u8) !PreparedGeneration {
     if (cfg.provider == .antfly and std.mem.eql(u8, operation, "generate")) {
-        _ = try std.json.parseFromValue(@import("inference_api").GenerateRequest, a, request, .{});
+        _ = std.json.parseFromValue(@import("inference_api").GenerateRequest, a, request, .{}) catch |err| return payloads.requestParseError(err);
     } else try only(request, &.{ "model", "messages", "stream", "max_tokens", "max_completion_tokens", "temperature", "tools", "tool_choice", "response_format", "top_p", "frequency_penalty", "presence_penalty", "stream_options", "seed", "stop" });
     var requirements = try tasks.chatRequirements(request);
     if (cfg.tools_json != null) requirements.tools = true;

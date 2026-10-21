@@ -321,6 +321,23 @@ pub fn withGenerationOptions(original: generating.GeneratorConfig, overrides: Ge
     return cfg;
 }
 
+/// Apply only native generation options to a generated-task envelope. Alias
+/// transport, credentials and policy remain at the gateway; explicit request
+/// options override borrowed defaults without changing the registry.
+pub fn generatedGenerator(a: std.mem.Allocator, cfg: generating.GeneratorConfig, request: Json) !Json {
+    if (request != .object) return error.InvalidInferenceRequest;
+    if (cfg.provider != .antfly or cfg.tools_json != null or cfg.tool_choice_json != null or cfg.response_format_json != null or cfg.logprobs) return error.UnsupportedInferenceFeature;
+    var forwarded = request;
+    try forwarded.object.put(a, "model", .{ .string = cfg.model });
+    if (!forwarded.object.contains("max_tokens")) try forwarded.object.put(a, "max_tokens", .{ .integer = cfg.max_tokens });
+    inline for (.{ "temperature", "top_p", "top_k", "frequency_penalty", "presence_penalty" }) |field| {
+        if (!forwarded.object.contains(field)) if (@field(cfg, field)) |value| {
+            try forwarded.object.put(a, field, try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, value, .{}), .{}));
+        };
+    }
+    return forwarded;
+}
+
 /// Keep native dictation options intact while applying named transcription
 /// defaults with the same precedence as the typed executor.
 pub fn transcriptionBody(a: std.mem.Allocator, cfg: transcribing.Config, request: Json) ![]u8 {
@@ -502,8 +519,9 @@ pub fn embeddingParts(a: std.mem.Allocator, input: Json) ![]@import("antfly_temp
             const mime = value.object.get("mime_type") orelse return error.InvalidInferenceRequest;
             const encoded = value.object.get("data") orelse return error.InvalidInferenceRequest;
             if (mime != .string or encoded != .string) return error.InvalidInferenceRequest;
-            const bytes = try a.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(encoded.string));
-            try std.base64.standard.Decoder.decode(bytes, encoded.string);
+            const size = std.base64.standard.Decoder.calcSizeForSlice(encoded.string) catch return error.InvalidInferenceRequest;
+            const bytes = try a.alloc(u8, size);
+            std.base64.standard.Decoder.decode(bytes, encoded.string) catch return error.InvalidInferenceRequest;
             part.* = .{ .binary = .{ .mime_type = mime.string, .data = bytes } };
         } else return error.UnsupportedInferenceFeature;
     }

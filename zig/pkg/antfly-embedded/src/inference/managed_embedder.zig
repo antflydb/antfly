@@ -4616,16 +4616,19 @@ fn catalogSemanticExecutionBindingAlloc(
     };
 }
 
-fn shouldUseAntflyProvider(embedder: embeddings_types.Config, options: InitOptions) bool {
-    if (options.antfly_provider == null) return false;
-    if (embedder.url.len > 0) return false;
-    const env_url = resolveOptionalEnv(std.heap.page_allocator, "ANTFLY_INFERENCE_URL");
-    if (env_url) |value| {
+/// Native gateway and typed vector adapters share transport precedence. A
+/// process-local runtime is eligible only when no remote endpoint is selected.
+pub fn hasRemoteAntflyEndpoint(embedder: embeddings_types.Config, default_endpoint: ?[]const u8) bool {
+    if (embedder.url.len > 0) return true;
+    if (resolveOptionalEnv(std.heap.page_allocator, "ANTFLY_INFERENCE_URL")) |value| {
         std.heap.page_allocator.free(value);
-        return false;
+        return true;
     }
-    if (configuredDefaultAntflyInferenceURL(options) != null) return false;
-    return true;
+    return if (default_endpoint) |value| std.mem.trim(u8, value, " \t\r\n").len > 0 else false;
+}
+
+fn shouldUseAntflyProvider(embedder: embeddings_types.Config, options: InitOptions) bool {
+    return options.antfly_provider != null and !hasRemoteAntflyEndpoint(embedder, options.inference_api_url);
 }
 
 fn buildManagedEmbeddingEntry(
