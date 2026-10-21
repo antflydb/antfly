@@ -462,7 +462,7 @@ test "external lake logical row maps spill verify value equivalence and flatten 
     const Failure = struct {
         fn run(allocator: A, storage: *pages_api.PageStore, root: Root) !void {
             var resolver: Reader = .{ .root = root, .pages = storage };
-            const before = TestRows.coordinate(17, false, count);
+            const before = TestRows.coordinate(1, false, 4);
             const moved = (try resolver.fromIndex(allocator, TestRows.old_files[before.file], before.group, before.row)).?;
             const reverse = (try resolver.toIndex(allocator, TestRows.new_files[moved.coordinate.file], moved.coordinate.group, moved.coordinate.row)).?;
             try std.testing.expectEqual(before, reverse.coordinate);
@@ -475,7 +475,13 @@ test "external lake logical row maps spill verify value equivalence and flatten 
     // Failure injection performs repeated reads; give each invocation its own
     // bounded-operation budget rather than exhausting the fixture's lifetime.
     pages.streaming = true;
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Failure.run, .{ &pages, loaded });
+    // Exhaustive failure enumeration is quadratic in decoded leaf allocations.
+    // The large fixture above owns spill/multi-page coverage; a small map has
+    // the same cursor and hydration ownership boundaries for this sweep.
+    const fault_old = try TestRows.build(ma, &manager, &pages, 4, false, false, "fault-old");
+    var fault_next = try TestRows.build(ma, &manager, &pages, 4, true, false, "fault-new");
+    try std.testing.expect(try proveReuse(ma, &pages, fault_old, &fault_next));
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Failure.run, .{ &pages, fault_next });
     var canceled = std.atomic.Value(bool).init(true);
     pages.cancellation = Token.fromAtomic(&canceled);
     try std.testing.expectError(error.Canceled, reader.fromIndex(a, TestRows.old_files[0], 0, 0));
