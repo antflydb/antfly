@@ -63,6 +63,7 @@ test {
     _ = @import("api/lake_index_refinements_test.zig");
     _ = @import("api/lake_index_sql_rows.zig");
     _ = @import("api/lake_index_text_query.zig");
+    _ = @import("api/lake_index_pack_proof.zig");
     _ = @import("api/lake_index_text_best_first.zig");
     _ = @import("api/lake_index_text_compaction.zig");
     _ = @import("api/lake_index_text_statistics.zig");
