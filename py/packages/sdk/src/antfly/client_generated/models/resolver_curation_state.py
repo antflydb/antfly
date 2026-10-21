@@ -10,8 +10,8 @@ from ..models.resolver_curation_state_version import ResolverCurationStateVersio
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.graph_resolver_suppression_config import GraphResolverSuppressionConfig
     from ..models.resolver_distinct_pair import ResolverDistinctPair
+    from ..models.runtime_resolver_suppression import RuntimeResolverSuppression
 
 
 T = TypeVar("T", bound="ResolverCurationState")
@@ -22,17 +22,14 @@ class ResolverCurationState:
     """
     Attributes:
         version (ResolverCurationStateVersion | Unset):
-        suppress (GraphResolverSuppressionConfig | Unset): Suppress mentions before candidate search, embedding,
-            adjudication and promotion. Suppressed mentions remain explainable in resolution artifacts and contribute no
-            canonical graph edges. Changes use the normal resolver generation and bounded backfill lifecycle. Redirects to
-            suppressed keys are rejected. Runtime suppressions are additive and outlive index versions.
+        suppress (RuntimeResolverSuppression | Unset):
         distinct (list[ResolverDistinctPair] | Unset):
         removed_aliases (list[str] | Unset): Explicitly restored identities; declarative aliases and promotion
             tombstones cannot recreate the removed redirect.
     """
 
     version: ResolverCurationStateVersion | Unset = UNSET
-    suppress: GraphResolverSuppressionConfig | Unset = UNSET
+    suppress: RuntimeResolverSuppression | Unset = UNSET
     distinct: list[ResolverDistinctPair] | Unset = UNSET
     removed_aliases: list[str] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -73,8 +70,8 @@ class ResolverCurationState:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.graph_resolver_suppression_config import GraphResolverSuppressionConfig
         from ..models.resolver_distinct_pair import ResolverDistinctPair
+        from ..models.runtime_resolver_suppression import RuntimeResolverSuppression
 
         d = dict(src_dict)
         _version = d.pop("version", UNSET)
@@ -85,11 +82,11 @@ class ResolverCurationState:
             version = ResolverCurationStateVersion(_version)
 
         _suppress = d.pop("suppress", UNSET)
-        suppress: GraphResolverSuppressionConfig | Unset
+        suppress: RuntimeResolverSuppression | Unset
         if isinstance(_suppress, Unset):
             suppress = UNSET
         else:
-            suppress = GraphResolverSuppressionConfig.from_dict(_suppress)
+            suppress = RuntimeResolverSuppression.from_dict(_suppress)
 
         _distinct = d.pop("distinct", UNSET)
         distinct: list[ResolverDistinctPair] | Unset = UNSET

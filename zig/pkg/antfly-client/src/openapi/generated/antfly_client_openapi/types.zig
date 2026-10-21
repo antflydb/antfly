@@ -8045,6 +8045,8 @@ pub const CreatedProviderConfig = struct {
     provider: []const u8,
     /// Configured provider model when applicable.
     model: ?[]const u8 = null,
+    /// Pinned immutable embedding asset and recipe identity.
+    model_identity: ?[]const u8 = null,
     models: ?[]const []const u8 = null,
     project_id: ?[]const u8 = null,
     location: ?[]const u8 = null,
@@ -8069,6 +8071,7 @@ pub const CreatedProviderConfig = struct {
     pub const openApiFieldMetadata = .{
         .{ "provider", "provider", false },
         .{ "model", "model", true },
+        .{ "model_identity", "model_identity", true },
         .{ "models", "models", true },
         .{ "project_id", "project_id", true },
         .{ "location", "location", true },
@@ -8104,6 +8107,10 @@ pub const CreatedProviderConfig = struct {
         try jw.write(self.provider);
         if (self.model) |value| {
             try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.model_identity) |value| {
+            try jw.objectField("model_identity");
             try jw.write(value);
         }
         if (self.models) |value| {
@@ -8308,6 +8315,448 @@ pub const Credentials = struct {
         }
         try jw.endObject();
     }
+};
+
+/// Server-owned provenance. Clients supply actor and reason on writes. Zero time/revision denote legacy records whose creation is unknown.
+pub const CurationOrigin = struct {
+    origin: ?[]const u8 = null,
+    /// UTF-8 client attribution, limited to 256 bytes.
+    actor: ?[]const u8 = null,
+    /// UTF-8 explanation, limited to 4096 bytes.
+    reason: ?[]const u8 = null,
+    created_at_ms: ?u64 = null,
+    revision: ?u64 = null,
+    proposal_id: OpenApiOptionalNullable([]const u8) = .absent,
+    cascade_from: OpenApiOptionalNullable([]const u8) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "origin", "origin", true },
+        .{ "actor", "actor", true },
+        .{ "reason", "reason", true },
+        .{ "created_at_ms", "created_at_ms", true },
+        .{ "revision", "revision", true },
+        .{ "proposal_id", "proposal_id", false },
+        .{ "cascade_from", "cascade_from", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.origin) |value| {
+            try jw.objectField("origin");
+            try jw.write(value);
+        }
+        if (self.actor) |value| {
+            try jw.objectField("actor");
+            try jw.write(value);
+        }
+        if (self.reason) |value| {
+            try jw.objectField("reason");
+            try jw.write(value);
+        }
+        if (self.created_at_ms) |value| {
+            try jw.objectField("created_at_ms");
+            try jw.write(value);
+        }
+        if (self.revision) |value| {
+            try jw.objectField("revision");
+            try jw.write(value);
+        }
+        switch (self.proposal_id) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("proposal_id");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("proposal_id");
+                try jw.write(value);
+            },
+        }
+        switch (self.cascade_from) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("cascade_from");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("cascade_from");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const CurationProposal = struct {
+    id: []const u8,
+    action: []const u8,
+    key: []const u8,
+    into: OpenApiOptionalNullable([]const u8) = .absent,
+    options: ?CurationProposalOptions = null,
+    confidence: OpenApiOptionalNullable(f64) = .absent,
+    evidence: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
+    origin: CurationOrigin,
+    state: []const u8,
+    decided: OpenApiOptionalNullable(CurationOrigin) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "action", "action", false },
+        .{ "key", "key", false },
+        .{ "into", "into", false },
+        .{ "options", "options", true },
+        .{ "confidence", "confidence", false },
+        .{ "evidence", "evidence", false },
+        .{ "origin", "origin", false },
+        .{ "state", "state", false },
+        .{ "decided", "decided", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("action");
+        try jw.write(self.action);
+        try jw.objectField("key");
+        try jw.write(self.key);
+        switch (self.into) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("into");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("into");
+                try jw.write(value);
+            },
+        }
+        if (self.options) |value| {
+            try jw.objectField("options");
+            try jw.write(value);
+        }
+        switch (self.confidence) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("confidence");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("confidence");
+                try jw.write(value);
+            },
+        }
+        switch (self.evidence) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("evidence");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("evidence");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("origin");
+        try jw.write(self.origin);
+        try jw.objectField("state");
+        try jw.write(self.state);
+        switch (self.decided) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("decided");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("decided");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const CurationProposalDecisionRequest = struct {
+    options: ?std.json.Value = null,
+    /// On rejection of a merge, pin the proposed pair distinct in the same commit.
+    pin_distinct: ?bool = null,
+    actor: ?[]const u8 = null,
+    reason: ?[]const u8 = null,
+    expected_revision: ?u64 = null,
+    wait: ?ResolverWait = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "options", "options", true },
+        .{ "pin_distinct", "pin_distinct", true },
+        .{ "actor", "actor", true },
+        .{ "reason", "reason", true },
+        .{ "expected_revision", "expected_revision", true },
+        .{ "wait", "wait", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.options) |value| {
+            try jw.objectField("options");
+            try jw.write(value);
+        }
+        if (self.pin_distinct) |value| {
+            try jw.objectField("pin_distinct");
+            try jw.write(value);
+        }
+        if (self.actor) |value| {
+            try jw.objectField("actor");
+            try jw.write(value);
+        }
+        if (self.reason) |value| {
+            try jw.objectField("reason");
+            try jw.write(value);
+        }
+        if (self.expected_revision) |value| {
+            try jw.objectField("expected_revision");
+            try jw.write(value);
+        }
+        if (self.wait) |value| {
+            try jw.objectField("wait");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const CurationProposalDecisionResult = struct {
+    proposal: ?CurationProposal = null,
+    complete: ?bool = null,
+    changed: ?bool = null,
+    atomicity: ?[]const u8 = null,
+    applied: ?bool = null,
+    results: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "proposal", "proposal", true },
+        .{ "complete", "complete", true },
+        .{ "changed", "changed", true },
+        .{ "atomicity", "atomicity", true },
+        .{ "applied", "applied", true },
+        .{ "results", "results", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.proposal) |value| {
+            try jw.objectField("proposal");
+            try jw.write(value);
+        }
+        if (self.complete) |value| {
+            try jw.objectField("complete");
+            try jw.write(value);
+        }
+        if (self.changed) |value| {
+            try jw.objectField("changed");
+            try jw.write(value);
+        }
+        if (self.atomicity) |value| {
+            try jw.objectField("atomicity");
+            try jw.write(value);
+        }
+        if (self.applied) |value| {
+            try jw.objectField("applied");
+            try jw.write(value);
+        }
+        if (self.results) |value| {
+            try jw.objectField("results");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const CurationProposalOptions = struct {
+    replace: ?bool = null,
+    pin_distinct: ?bool = null,
+    absorbed: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "replace", "replace", true },
+        .{ "pin_distinct", "pin_distinct", true },
+        .{ "absorbed", "absorbed", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.replace) |value| {
+            try jw.objectField("replace");
+            try jw.write(value);
+        }
+        if (self.pin_distinct) |value| {
+            try jw.objectField("pin_distinct");
+            try jw.write(value);
+        }
+        if (self.absorbed) |value| {
+            try jw.objectField("absorbed");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const CurationProposalPage = struct {
+    proposals: []const CurationProposal,
+    next_cursor: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("proposals");
+        try jw.write(self.proposals);
+        switch (self.next_cursor) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("next_cursor");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("next_cursor");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const CurationProposalRequest = struct {
+    action: []const u8,
+    key: []const u8,
+    into: OpenApiOptionalNullable([]const u8) = .absent,
+    options: ?CurationProposalOptions = null,
+    confidence: OpenApiOptionalNullable(f64) = .absent,
+    /// At most 16 KiB, 4096 values and depth 32.
+    evidence: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
+    actor: ?[]const u8 = null,
+    reason: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "action", "action", false },
+        .{ "key", "key", false },
+        .{ "into", "into", false },
+        .{ "options", "options", true },
+        .{ "confidence", "confidence", false },
+        .{ "evidence", "evidence", false },
+        .{ "actor", "actor", true },
+        .{ "reason", "reason", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("action");
+        try jw.write(self.action);
+        try jw.objectField("key");
+        try jw.write(self.key);
+        switch (self.into) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("into");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("into");
+                try jw.write(value);
+            },
+        }
+        if (self.options) |value| {
+            try jw.objectField("options");
+            try jw.write(value);
+        }
+        switch (self.confidence) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("confidence");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("confidence");
+                try jw.write(value);
+            },
+        }
+        switch (self.evidence) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("evidence");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("evidence");
+                try jw.write(value);
+            },
+        }
+        if (self.actor) |value| {
+            try jw.objectField("actor");
+            try jw.write(value);
+        }
+        if (self.reason) |value| {
+            try jw.objectField("reason");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const CurationSuppressionEntry = struct {
+    key: []const u8,
+    origin: CurationOrigin,
 };
 
 pub const DataShapeDecl = struct {
@@ -12069,7 +12518,58 @@ pub const EntityCurationResult = struct {
     results: []const std.json.Value,
 };
 
+pub const EntityDistinctRequest = struct {
+    expected_revision: ?u64 = null,
+    into: []const u8,
+    actor: ?[]const u8 = null,
+    reason: ?[]const u8 = null,
+    wait: ?ResolverWait = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "expected_revision", "expected_revision", true },
+        .{ "into", "into", false },
+        .{ "actor", "actor", true },
+        .{ "reason", "reason", true },
+        .{ "wait", "wait", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.expected_revision) |value| {
+            try jw.objectField("expected_revision");
+            try jw.write(value);
+        }
+        try jw.objectField("into");
+        try jw.write(self.into);
+        if (self.actor) |value| {
+            try jw.objectField("actor");
+            try jw.write(value);
+        }
+        if (self.reason) |value| {
+            try jw.objectField("reason");
+            try jw.write(value);
+        }
+        if (self.wait) |value| {
+            try jw.objectField("wait");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const EntityMergeRequest = struct {
+    expected_revision: ?u64 = null,
+    actor: ?[]const u8 = null,
+    reason: ?[]const u8 = null,
     into: []const u8,
     replace: ?bool = null,
     pin_distinct: ?bool = null,
@@ -12077,6 +12577,9 @@ pub const EntityMergeRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "expected_revision", "expected_revision", true },
+        .{ "actor", "actor", true },
+        .{ "reason", "reason", true },
         .{ "into", "into", false },
         .{ "replace", "replace", true },
         .{ "pin_distinct", "pin_distinct", true },
@@ -12093,6 +12596,18 @@ pub const EntityMergeRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.expected_revision) |value| {
+            try jw.objectField("expected_revision");
+            try jw.write(value);
+        }
+        if (self.actor) |value| {
+            try jw.objectField("actor");
+            try jw.write(value);
+        }
+        if (self.reason) |value| {
+            try jw.objectField("reason");
+            try jw.write(value);
+        }
         try jw.objectField("into");
         try jw.write(self.into);
         if (self.replace) |value| {
@@ -12101,6 +12616,64 @@ pub const EntityMergeRequest = struct {
         }
         if (self.pin_distinct) |value| {
             try jw.objectField("pin_distinct");
+            try jw.write(value);
+        }
+        if (self.wait) |value| {
+            try jw.objectField("wait");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const EntitySuppressRequest = struct {
+    /// Reject absorbed keys, release all transitive redirect sources, or suppress them with cascade provenance. Unsuppress never restores redirects.
+    absorbed: ?[]const u8 = null,
+    /// With absorbed=release, pin each released source distinct from the target.
+    pin_distinct: ?bool = null,
+    actor: ?[]const u8 = null,
+    reason: ?[]const u8 = null,
+    expected_revision: ?u64 = null,
+    wait: ?ResolverWait = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "absorbed", "absorbed", true },
+        .{ "pin_distinct", "pin_distinct", true },
+        .{ "actor", "actor", true },
+        .{ "reason", "reason", true },
+        .{ "expected_revision", "expected_revision", true },
+        .{ "wait", "wait", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.absorbed) |value| {
+            try jw.objectField("absorbed");
+            try jw.write(value);
+        }
+        if (self.pin_distinct) |value| {
+            try jw.objectField("pin_distinct");
+            try jw.write(value);
+        }
+        if (self.actor) |value| {
+            try jw.objectField("actor");
+            try jw.write(value);
+        }
+        if (self.reason) |value| {
+            try jw.objectField("reason");
+            try jw.write(value);
+        }
+        if (self.expected_revision) |value| {
+            try jw.objectField("expected_revision");
             try jw.write(value);
         }
         if (self.wait) |value| {
@@ -39609,7 +40182,7 @@ pub const ResolverAdjudicationEvidence = struct {
 
 pub const ResolverCurationState = struct {
     version: ?i64 = null,
-    suppress: ?GraphResolverSuppressionConfig = null,
+    suppress: ?RuntimeResolverSuppression = null,
     distinct: ?[]const ResolverDistinctPair = null,
     /// Explicitly restored identities; declarative aliases and promotion tombstones cannot recreate the removed redirect.
     removed_aliases: ?[]const []const u8 = null,
@@ -39655,6 +40228,35 @@ pub const ResolverCurationState = struct {
 pub const ResolverDistinctPair = struct {
     from: []const u8,
     to: []const u8,
+    origin: ?CurationOrigin = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "from", "from", false },
+        .{ "to", "to", false },
+        .{ "origin", "origin", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("from");
+        try jw.write(self.from);
+        try jw.objectField("to");
+        try jw.write(self.to);
+        if (self.origin) |value| {
+            try jw.objectField("origin");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ResolverGroupProgress = struct {
@@ -39674,6 +40276,8 @@ pub const ResolverList = struct {
 };
 
 pub const ResolverMergeRequest = struct {
+    actor: ?[]const u8 = null,
+    reason: ?[]const u8 = null,
     from: []const u8,
     to: []const u8,
     replace: ?bool = null,
@@ -39685,6 +40289,8 @@ pub const ResolverMergeRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "actor", "actor", true },
+        .{ "reason", "reason", true },
         .{ "from", "from", false },
         .{ "to", "to", false },
         .{ "replace", "replace", true },
@@ -39703,6 +40309,14 @@ pub const ResolverMergeRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.actor) |value| {
+            try jw.objectField("actor");
+            try jw.write(value);
+        }
+        if (self.reason) |value| {
+            try jw.objectField("reason");
+            try jw.write(value);
+        }
         try jw.objectField("from");
         try jw.write(self.from);
         try jw.objectField("to");
@@ -39859,6 +40473,35 @@ pub const ResolverNamespaceRequest = struct {
 pub const ResolverRedirect = struct {
     key: []const u8,
     target: []const u8,
+    origin: ?CurationOrigin = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "key", "key", false },
+        .{ "target", "target", false },
+        .{ "origin", "origin", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("key");
+        try jw.write(self.key);
+        try jw.objectField("target");
+        try jw.write(self.target);
+        if (self.origin) |value| {
+            try jw.objectField("origin");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ResolverRedirectList = struct {
@@ -40202,6 +40845,8 @@ pub const ResolverReview = struct {
 };
 
 pub const ResolverReviewDecision = struct {
+    actor: ?[]const u8 = null,
+    reason: ?[]const u8 = null,
     decision: []const u8,
     key: ?[]const u8 = null,
     table: ?[]const u8 = null,
@@ -40209,6 +40854,8 @@ pub const ResolverReviewDecision = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "actor", "actor", true },
+        .{ "reason", "reason", true },
         .{ "decision", "decision", false },
         .{ "key", "key", true },
         .{ "table", "table", true },
@@ -40225,6 +40872,14 @@ pub const ResolverReviewDecision = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.actor) |value| {
+            try jw.objectField("actor");
+            try jw.write(value);
+        }
+        if (self.reason) |value| {
+            try jw.objectField("reason");
+            try jw.write(value);
+        }
         try jw.objectField("decision");
         try jw.write(self.decision);
         if (self.key) |value| {
@@ -40351,12 +41006,14 @@ pub const ResolverSummary = struct {
 
 pub const ResolverSuppressionList = struct {
     configured: GraphResolverSuppressionConfig,
-    runtime: GraphResolverSuppressionConfig,
+    runtime: RuntimeResolverSuppression,
     revision: u64,
 };
 
 /// Add keys or normalized texts. The add/remove form updates both sets in one revision. Runtime removals do not override declarative suppression.
 pub const ResolverSuppressionRequest = struct {
+    actor: ?[]const u8 = null,
+    reason: ?[]const u8 = null,
     keys: ?[]const []const u8 = null,
     texts: ?[]const []const u8 = null,
     add: ?ResolverSuppressionSelection = null,
@@ -40367,6 +41024,8 @@ pub const ResolverSuppressionRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "actor", "actor", true },
+        .{ "reason", "reason", true },
         .{ "keys", "keys", true },
         .{ "texts", "texts", true },
         .{ "add", "add", true },
@@ -40385,6 +41044,14 @@ pub const ResolverSuppressionRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.actor) |value| {
+            try jw.objectField("actor");
+            try jw.write(value);
+        }
+        if (self.reason) |value| {
+            try jw.objectField("reason");
+            try jw.write(value);
+        }
         if (self.keys) |value| {
             try jw.objectField("keys");
             try jw.write(value);
@@ -40446,6 +41113,8 @@ pub const ResolverSuppressionSelection = struct {
 };
 
 pub const ResolverUnmergeRequest = struct {
+    actor: ?[]const u8 = null,
+    reason: ?[]const u8 = null,
     pin_distinct: ?bool = null,
     /// Optional revision fence. Explicit zero fences the first edit; omission disables the fence.
     expected_revision: ?u64 = null,
@@ -40453,6 +41122,8 @@ pub const ResolverUnmergeRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "actor", "actor", true },
+        .{ "reason", "reason", true },
         .{ "pin_distinct", "pin_distinct", true },
         .{ "expected_revision", "expected_revision", true },
         .{ "wait", "wait", true },
@@ -40468,6 +41139,14 @@ pub const ResolverUnmergeRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.actor) |value| {
+            try jw.objectField("actor");
+            try jw.write(value);
+        }
+        if (self.reason) |value| {
+            try jw.objectField("reason");
+            try jw.write(value);
+        }
         if (self.pin_distinct) |value| {
             try jw.objectField("pin_distinct");
             try jw.write(value);
@@ -41615,6 +42294,56 @@ pub const RuntimeDecl = struct {
         }
         if (self.config_json) |value| {
             try jw.objectField("config_json");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const RuntimeResolverSuppression = struct {
+    keys: ?[]const []const u8 = null,
+    texts: ?[]const []const u8 = null,
+    min_text_chars: ?u32 = null,
+    entries: ?[]const CurationSuppressionEntry = null,
+    text_entries: ?[]const CurationSuppressionEntry = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "keys", "keys", true },
+        .{ "texts", "texts", true },
+        .{ "min_text_chars", "min_text_chars", true },
+        .{ "entries", "entries", true },
+        .{ "text_entries", "text_entries", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.keys) |value| {
+            try jw.objectField("keys");
+            try jw.write(value);
+        }
+        if (self.texts) |value| {
+            try jw.objectField("texts");
+            try jw.write(value);
+        }
+        if (self.min_text_chars) |value| {
+            try jw.objectField("min_text_chars");
+            try jw.write(value);
+        }
+        if (self.entries) |value| {
+            try jw.objectField("entries");
+            try jw.write(value);
+        }
+        if (self.text_entries) |value| {
+            try jw.objectField("text_entries");
             try jw.write(value);
         }
         try jw.endObject();

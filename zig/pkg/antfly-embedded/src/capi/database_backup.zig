@@ -25,7 +25,7 @@ const store_mod = @import("../storage/docstore.zig");
 const lite_restore = @import("../storage/lite/portable_restore.zig");
 const magic = "ANTFLYDBAFB\x00\x01";
 const max_tables = 4096;
-const catalog_key = "\x00antfly/embedded/tables/v1";
+const catalog_key = @import("../storage/lite/embedded_catalog.zig").key;
 
 fn imageKey(key: []const u8) bool {
     // Keep the engine's portable primary boundary. Source index checkpoints,

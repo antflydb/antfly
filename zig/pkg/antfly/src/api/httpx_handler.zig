@@ -20,6 +20,7 @@
 /// Each handler method extracts wire parameters from the httpx Context, calls
 /// a typed operation, and adapts its owned result to an httpx.Response.
 const std = @import("std");
+const index_metadata = @import("antfly_local_sources").api_index_metadata;
 const ant_json = @import("antfly-json");
 const sql_execution = @import("sql_execution.zig");
 const sql_compiler = @import("antfly_local_sources").sql_compiler;
@@ -522,7 +523,7 @@ fn graphResolverDestinationsAllowedInConfig(
             }
             var it = object.iterator();
             while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, "resolvers")) continue;
+                if (std.mem.eql(u8, entry.key_ptr.*, "resolvers") or index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;
                 if (!(try graphResolverDestinationsAllowedInConfig(identity, entry.value_ptr.*))) return false;
             }
         },
@@ -3883,11 +3884,13 @@ pub const AntflyApiHandler = struct {
         return identity;
     }
 
-    fn requestMethod(ctx: *httpx.Context) ?http_common.Method {
+    fn requestMethod(ctx: *httpx.Context) ?http_server_mod.AuthorizationMethod {
         return switch (ctx.request.method) {
             .GET => .GET,
+            .HEAD => .HEAD,
             .POST => .POST,
             .PUT => .PUT,
+            .PATCH => .PATCH,
             .DELETE => .DELETE,
             else => null,
         };
@@ -4062,7 +4065,10 @@ pub const AntflyApiHandler = struct {
         if (http_server_mod.requiresAdminPermission(path) and !http_server_mod.permissionsAllow(authenticated.permissions, .@"*", "*", .admin)) {
             return try jsonErrorResponse(ctx, 403, "forbidden");
         }
-        const method = requestMethod(ctx) orelse return null;
+        // Every method that reaches a public handler must have explicit RBAC
+        // semantics. Treating an unmapped method as "no permission required"
+        // turns newly routed methods into authorization bypasses.
+        const method = requestMethod(ctx) orelse return try jsonErrorResponse(ctx, 405, "method not allowed");
         const required_permission = http_server_mod.requiredPermissionForRequest(ctx.allocator, method, path) catch |err| switch (err) {
             error.InvalidArgument => return try textResponse(ctx, 400, "invalid path parameter"),
             else => return err,
@@ -9378,6 +9384,68 @@ pub const AntflyApiHandler = struct {
         _ = database_name;
         _ = namespace_name;
         return self.reviewResolverMention(ctx, table_name, resolver_name, review_id);
+    }
+
+    pub fn proposeCuration(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .proposal_create, table_name, "", "");
+    }
+
+    pub fn namespaceProposeCuration(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.proposeCuration(ctx, table_name);
+    }
+
+    pub fn listCurationProposals(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, _: metadata_server_openapi.server.ListCurationProposalsParams) !httpx.Response {
+        // The shared resolver adapter validates and forwards the raw query for
+        // both public routes, including proposal filters and pagination.
+        return self.resolverRequest(ctx, .proposals, table_name, "", "");
+    }
+
+    pub fn namespaceListCurationProposals(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, _: metadata_server_openapi.server.NamespaceListCurationProposalsParams) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.resolverRequest(ctx, .proposals, table_name, "", "");
+    }
+
+    pub fn getCurationProposal(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, proposal_id: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .proposal, table_name, "", proposal_id);
+    }
+
+    pub fn namespaceGetCurationProposal(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, proposal_id: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.getCurationProposal(ctx, table_name, proposal_id);
+    }
+
+    pub fn acceptCurationProposal(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, proposal_id: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .proposal_accept, table_name, "", proposal_id);
+    }
+
+    pub fn namespaceAcceptCurationProposal(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, proposal_id: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.acceptCurationProposal(ctx, table_name, proposal_id);
+    }
+
+    pub fn rejectCurationProposal(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, proposal_id: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .proposal_reject, table_name, "", proposal_id);
+    }
+
+    pub fn namespaceRejectCurationProposal(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, proposal_id: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.rejectCurationProposal(ctx, table_name, proposal_id);
+    }
+
+    pub fn pinEntitiesDistinct(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .entity_distinct, table_name, "", key);
+    }
+
+    pub fn namespacePinEntitiesDistinct(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.pinEntitiesDistinct(ctx, table_name, key);
     }
 
     pub fn listEntityResolverState(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response {
@@ -17450,10 +17518,27 @@ test "httpx schema rewrite authorizes incoming dependencies before source admiss
 
 test "httpx schema patch merges at the authority and accepts version zero ETag" {
     const alloc = std.testing.allocator;
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+    var read_permission = try usermgr.Permission.initOwned(alloc, .table, "docs", .read);
+    defer read_permission.deinit(alloc);
+    var reader = try auth.manager.createUser("schema_reader", "secret", &.{read_permission});
+    defer reader.deinit(alloc);
+    var admin_permission = try usermgr.Permission.initOwned(alloc, .table, "docs", .admin);
+    defer admin_permission.deinit(alloc);
+    var admin = try auth.manager.createUser("schema_admin", "secret", &.{admin_permission});
+    defer admin.deinit(alloc);
+    const reader_authorization = try encodeBasicAuthorization(alloc, "schema_reader", "secret");
+    defer alloc.free(reader_authorization);
+    const admin_authorization = try encodeBasicAuthorization(alloc, "schema_admin", "secret");
+    defer alloc.free(admin_authorization);
     var source = SchemaUpdateStatusSource{};
     defer source.deinit(alloc);
     var writes = SchemaReconcileWriteSource{};
-    var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.iface());
+    var api_server = ApiHttpServer.init(alloc, .{ .auth_enabled = true, .user_manager = &auth.manager }, source.iface(), null, writes.iface());
     defer api_server.deinit();
 
     var e2e_server: HttpxE2eServer = undefined;
@@ -17467,15 +17552,62 @@ test "httpx schema patch merges at the authority and accepts version zero ETag" 
     defer alloc.free(base_url);
     const schema_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/schema", .{base_url});
     defer alloc.free(schema_url);
-    const headers = [_][2][]const u8{
+    const reader_headers = [_][2][]const u8{
         .{ "content-type", "application/merge-patch+json" },
+        .{ "authorization", reader_authorization },
         .{ "if-match", "\"schema-0\"" },
     };
-    var resp = try requestWithRetry(&client, client_io.io(), .PATCH, schema_url, "{\"description\":\"patched\"}", &headers, 20);
+    var denied = try requestWithRetry(&client, client_io.io(), .PATCH, schema_url, "{\"description\":\"forbidden\"}", &reader_headers, 20);
+    defer denied.deinit();
+    try std.testing.expectEqual(@as(u16, 403), denied.status.code);
+    try std.testing.expect(source.schema_json == null);
+
+    const admin_headers = [_][2][]const u8{
+        .{ "content-type", "application/merge-patch+json" },
+        .{ "authorization", admin_authorization },
+        .{ "if-match", "\"schema-0\"" },
+    };
+    var resp = try requestWithRetry(&client, client_io.io(), .PATCH, schema_url, "{\"description\":\"patched\"}", &admin_headers, 20);
     defer resp.deinit();
     try std.testing.expectEqual(@as(u16, 200), resp.status.code);
     try std.testing.expectEqualStrings("\"schema-1\"", resp.headers.get("etag").?);
     try std.testing.expect(std.mem.indexOf(u8, source.schema_json.?, "\"description\":\"patched\"") != null);
+}
+
+test "httpx HEAD fallback enforces GET table permission" {
+    const alloc = std.testing.allocator;
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+    var permission = try usermgr.Permission.initOwned(alloc, .table, "docs", .read);
+    defer permission.deinit(alloc);
+    var reader = try auth.manager.createUser("head_reader", "secret", &.{permission});
+    defer reader.deinit(alloc);
+    const authorization = try encodeBasicAuthorization(alloc, "head_reader", "secret");
+    defer alloc.free(authorization);
+
+    var source = SchemaUpdateStatusSource{};
+    defer source.deinit(alloc);
+    var api_server = ApiHttpServer.init(alloc, .{ .auth_enabled = true, .user_manager = &auth.manager }, source.iface(), null, null);
+    defer api_server.deinit();
+    var e2e_server: HttpxE2eServer = undefined;
+    try e2e_server.init(alloc, &api_server);
+    defer e2e_server.deinit();
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base_url = try e2e_server.baseUrl(alloc);
+    defer alloc.free(base_url);
+    const headers = [_][2][]const u8{.{ "authorization", authorization }};
+
+    const denied_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/private", .{base_url});
+    defer alloc.free(denied_url);
+    var denied = try requestWithRetry(&client, client_io.io(), .HEAD, denied_url, null, &headers, 20);
+    defer denied.deinit();
+    try std.testing.expectEqual(@as(u16, 403), denied.status.code);
 }
 
 test "schema ETags are strong and preserve version zero" {
@@ -18369,4 +18501,16 @@ test "httpx inference gateway batch isolates malformed successful responses and 
     try std.testing.expectEqual(@as(usize, 2), target.calls);
     try std.testing.expect(!target.saw_stream);
     try std.testing.expectEqual(@as(usize, 0), api_server.inferenceAdmissionStats().in_flight);
+}
+
+test "resolver curation HTTP destination checks ignore opaque control metadata" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const payload = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"_curation_proposals":{"resolvers":"invalid evidence"},"_resolver_curation":{"resolvers":[{"table":"protected"}]},"_resolver_namespaces":{"resolvers":false}}
+    , .{});
+    try std.testing.expect(try graphResolverDestinationsAllowedInConfig(null, payload));
+    const actual = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"graph\":{\"resolvers\":false}}", .{});
+    try std.testing.expectError(error.InvalidCreateTableRequest, graphResolverDestinationsAllowedInConfig(null, actual));
 }

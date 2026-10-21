@@ -39,6 +39,7 @@ pub const Command = struct {
     hidden: bool = false,
 };
 
+const backup_subcommands = [_][]const u8{"inspect"};
 const table_subcommands = [_][]const u8{ "create", "drop", "list", "get" };
 const index_subcommands = [_][]const u8{ "create", "drop", "list", "get", "wait", "maintenance" };
 const standby_subcommands = [_][]const u8{ "status", "slot", "seed", "fence", "promote", "rejoin", "follow", "switchover", "stream", "commit", "artifact" };
@@ -89,7 +90,7 @@ pub const commands = [_]Command{
     .{ .name = "insert", .description = "Insert a document", .route = .cli },
     .{ .name = "delete", .description = "Delete a document", .route = .cli },
     .{ .name = "agents", .description = "Run AI agents", .route = .cli, .subcommands = &agents_subcommands },
-    .{ .name = "backup", .description = "Back up tables", .route = .cli },
+    .{ .name = "backup", .description = "Back up tables and inspect backup files", .route = .cli, .subcommands = &backup_subcommands },
     .{ .name = "restore", .description = "Restore tables", .route = .cli },
     .{ .name = "storage", .description = "Manage table storage", .route = .storage, .subcommands = &.{"migrate"} },
     .{ .name = "connections", .description = "Manage provider connections", .route = .cli, .subcommands = &connections_subcommands },

@@ -9,6 +9,7 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.entity_curation_result_results_item_absorbed_item import EntityCurationResultResultsItemAbsorbedItem
     from ..models.entity_curation_result_results_item_curation import EntityCurationResultResultsItemCuration
     from ..models.resolver_distinct_pair import ResolverDistinctPair
     from ..models.resolver_redirect import ResolverRedirect
@@ -27,6 +28,7 @@ class EntityCurationResultResultsItem:
         canonical_key (str | Unset):
         curation (EntityCurationResultResultsItemCuration | Unset):
         revision (int | Unset):
+        absorbed (list[EntityCurationResultResultsItemAbsorbedItem] | Unset):
         changed (bool | Unset):
         replay_sequence (int | Unset):
         applied (bool | Unset):
@@ -44,6 +46,7 @@ class EntityCurationResultResultsItem:
     canonical_key: str | Unset = UNSET
     curation: EntityCurationResultResultsItemCuration | Unset = UNSET
     revision: int | Unset = UNSET
+    absorbed: list[EntityCurationResultResultsItemAbsorbedItem] | Unset = UNSET
     changed: bool | Unset = UNSET
     replay_sequence: int | Unset = UNSET
     applied: bool | Unset = UNSET
@@ -69,6 +72,13 @@ class EntityCurationResultResultsItem:
             curation = self.curation.to_dict()
 
         revision = self.revision
+
+        absorbed: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.absorbed, Unset):
+            absorbed = []
+            for absorbed_item_data in self.absorbed:
+                absorbed_item = absorbed_item_data.to_dict()
+                absorbed.append(absorbed_item)
 
         changed = self.changed
 
@@ -114,6 +124,8 @@ class EntityCurationResultResultsItem:
             field_dict["curation"] = curation
         if revision is not UNSET:
             field_dict["revision"] = revision
+        if absorbed is not UNSET:
+            field_dict["absorbed"] = absorbed
         if changed is not UNSET:
             field_dict["changed"] = changed
         if replay_sequence is not UNSET:
@@ -137,6 +149,9 @@ class EntityCurationResultResultsItem:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.entity_curation_result_results_item_absorbed_item import (
+            EntityCurationResultResultsItemAbsorbedItem,
+        )
         from ..models.entity_curation_result_results_item_curation import EntityCurationResultResultsItemCuration
         from ..models.resolver_distinct_pair import ResolverDistinctPair
         from ..models.resolver_redirect import ResolverRedirect
@@ -158,6 +173,15 @@ class EntityCurationResultResultsItem:
             curation = EntityCurationResultResultsItemCuration.from_dict(_curation)
 
         revision = d.pop("revision", UNSET)
+
+        _absorbed = d.pop("absorbed", UNSET)
+        absorbed: list[EntityCurationResultResultsItemAbsorbedItem] | Unset = UNSET
+        if _absorbed is not UNSET:
+            absorbed = []
+            for absorbed_item_data in _absorbed:
+                absorbed_item = EntityCurationResultResultsItemAbsorbedItem.from_dict(absorbed_item_data)
+
+                absorbed.append(absorbed_item)
 
         changed = d.pop("changed", UNSET)
 
@@ -198,6 +222,7 @@ class EntityCurationResultResultsItem:
             canonical_key=canonical_key,
             curation=curation,
             revision=revision,
+            absorbed=absorbed,
             changed=changed,
             replay_sequence=replay_sequence,
             applied=applied,
