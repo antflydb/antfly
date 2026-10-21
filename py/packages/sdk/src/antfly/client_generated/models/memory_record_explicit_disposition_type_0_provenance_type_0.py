@@ -23,13 +23,13 @@ class MemoryRecordExplicitDispositionType0ProvenanceType0:
         principal (str):
         recorded_at (int):
         evidence (list[MemoryRecordExplicitDispositionType0ProvenanceType0EvidenceItem]):
-        forgotten (bool | Unset):
+        forgotten (bool | Unset):  Default: False.
     """
 
     principal: str
     recorded_at: int
     evidence: list[MemoryRecordExplicitDispositionType0ProvenanceType0EvidenceItem]
-    forgotten: bool | Unset = UNSET
+    forgotten: bool | Unset = False
 
     def to_dict(self) -> dict[str, Any]:
         principal = self.principal

@@ -22,37 +22,38 @@ T = TypeVar("T", bound="MemoryInspectionStateConfig")
 class MemoryInspectionStateConfig:
     """
     Attributes:
-        version (int | Unset):
-        generation (int | Unset):
-        embedding_generation (int | Unset):
-        processing (MemoryInspectionStateConfigProcessing | Unset):
+        version (int | Unset):  Default: 1.
+        generation (int | Unset):  Default: 1.
+        embedding_generation (int | Unset):  Default: 1.
+        processing (MemoryInspectionStateConfigProcessing | Unset):  Default:
+            MemoryInspectionStateConfigProcessing.EXTERNAL.
         ontology_version (str | Unset):
         policy_version (str | Unset):
         features (MemoryInspectionStateConfigFeatures | Unset):
         models (MemoryInspectionStateConfigModels | Unset):
         predicates (list[MemoryInspectionStateConfigPredicatesItem] | Unset):
         source_rules (list[MemoryInspectionStateConfigSourceRulesItem] | Unset):
-        max_input_bytes (int | Unset):
-        max_output_items (int | Unset):
-        max_attempts (int | Unset):
-        max_recall_tokens (int | Unset):
+        max_input_bytes (int | Unset):  Default: 262144.
+        max_output_items (int | Unset):  Default: 128.
+        max_attempts (int | Unset):  Default: 3.
+        max_recall_tokens (int | Unset):  Default: 8192.
         retention_ms (int | None | Unset):
     """
 
-    version: int | Unset = UNSET
-    generation: int | Unset = UNSET
-    embedding_generation: int | Unset = UNSET
-    processing: MemoryInspectionStateConfigProcessing | Unset = UNSET
+    version: int | Unset = 1
+    generation: int | Unset = 1
+    embedding_generation: int | Unset = 1
+    processing: MemoryInspectionStateConfigProcessing | Unset = MemoryInspectionStateConfigProcessing.EXTERNAL
     ontology_version: str | Unset = UNSET
     policy_version: str | Unset = UNSET
     features: MemoryInspectionStateConfigFeatures | Unset = UNSET
     models: MemoryInspectionStateConfigModels | Unset = UNSET
     predicates: list[MemoryInspectionStateConfigPredicatesItem] | Unset = UNSET
     source_rules: list[MemoryInspectionStateConfigSourceRulesItem] | Unset = UNSET
-    max_input_bytes: int | Unset = UNSET
-    max_output_items: int | Unset = UNSET
-    max_attempts: int | Unset = UNSET
-    max_recall_tokens: int | Unset = UNSET
+    max_input_bytes: int | Unset = 262144
+    max_output_items: int | Unset = 128
+    max_attempts: int | Unset = 3
+    max_recall_tokens: int | Unset = 8192
     retention_ms: int | None | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:

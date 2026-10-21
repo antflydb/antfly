@@ -17,13 +17,14 @@ class ProvenanceDecisionInitiator:
     """
     Attributes:
         id (str):
-        kind (ProvenanceDecisionInitiatorKind | Unset):
-        assurance (ProvenanceDecisionInitiatorAssurance | Unset):
+        kind (ProvenanceDecisionInitiatorKind | Unset):  Default: ProvenanceDecisionInitiatorKind.USER.
+        assurance (ProvenanceDecisionInitiatorAssurance | Unset):  Default:
+            ProvenanceDecisionInitiatorAssurance.DECLARED.
     """
 
     id: str
-    kind: ProvenanceDecisionInitiatorKind | Unset = UNSET
-    assurance: ProvenanceDecisionInitiatorAssurance | Unset = UNSET
+    kind: ProvenanceDecisionInitiatorKind | Unset = ProvenanceDecisionInitiatorKind.USER
+    assurance: ProvenanceDecisionInitiatorAssurance | Unset = ProvenanceDecisionInitiatorAssurance.DECLARED
 
     def to_dict(self) -> dict[str, Any]:
         id = self.id

@@ -28,9 +28,9 @@ class MemoryRecord:
         input_hash (str | Unset):
         asserted_valid_to (int | None | Unset):
         explicit_disposition (MemoryRecordExplicitDispositionType0 | None | Unset):
-        recorded_at (int | Unset):
-        lifecycle (MemoryRecordLifecycle | Unset):
-        stale (bool | Unset):
+        recorded_at (int | Unset):  Default: 0.
+        lifecycle (MemoryRecordLifecycle | Unset):  Default: MemoryRecordLifecycle.ACTIVE.
+        stale (bool | Unset):  Default: False.
         reason (None | str | Unset):
         conflicts_with (list[str] | Unset):
         recorded_to (int | None | Unset):
@@ -46,9 +46,9 @@ class MemoryRecord:
     input_hash: str | Unset = UNSET
     asserted_valid_to: int | None | Unset = UNSET
     explicit_disposition: MemoryRecordExplicitDispositionType0 | None | Unset = UNSET
-    recorded_at: int | Unset = UNSET
-    lifecycle: MemoryRecordLifecycle | Unset = UNSET
-    stale: bool | Unset = UNSET
+    recorded_at: int | Unset = 0
+    lifecycle: MemoryRecordLifecycle | Unset = MemoryRecordLifecycle.ACTIVE
+    stale: bool | Unset = False
     reason: None | str | Unset = UNSET
     conflicts_with: list[str] | Unset = UNSET
     recorded_to: int | None | Unset = UNSET

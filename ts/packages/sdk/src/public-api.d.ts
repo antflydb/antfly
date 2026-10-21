@@ -23250,6 +23250,10 @@ export interface components {
             error: string;
         };
         ProvenanceDecision: {
+            /**
+             * Format: uint32
+             * @default 1
+             */
             schema_version?: number;
             resource: {
                 database?: string;
@@ -23257,12 +23261,14 @@ export interface components {
                 table: string;
                 /** Format: uint64 */
                 table_id: number;
+                /** @default null */
                 storage_name?: string | null;
                 /** @enum {string} */
                 kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
                 id: string;
                 /** Format: uint64 */
                 revision: number;
+                /** @default null */
                 digest?: string | null;
             };
             operation: {
@@ -23271,12 +23277,14 @@ export interface components {
                 table: string;
                 /** Format: uint64 */
                 table_id: number;
+                /** @default null */
                 storage_name?: string | null;
                 /** @enum {string} */
                 kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
                 id: string;
                 /** Format: uint64 */
                 revision: number;
+                /** @default null */
                 digest?: string | null;
             };
             action: string;
@@ -23284,67 +23292,109 @@ export interface components {
             status: "proposed" | "approved" | "applied" | "rejected" | "cancelled";
             initiator: {
                 id: string;
-                /** @enum {string} */
+                /**
+                 * @default user
+                 * @enum {string}
+                 */
                 kind?: "user" | "agent" | "service";
-                /** @enum {string} */
+                /**
+                 * @default declared
+                 * @enum {string}
+                 */
                 assurance?: "authenticated" | "declared";
             };
             executor: {
                 id: string;
-                /** @enum {string} */
+                /**
+                 * @default user
+                 * @enum {string}
+                 */
                 kind?: "user" | "agent" | "service";
-                /** @enum {string} */
+                /**
+                 * @default declared
+                 * @enum {string}
+                 */
                 assurance?: "authenticated" | "declared";
             };
+            /** @default null */
             origin?: {
+                /** @default null */
                 agent?: {
                     id: string;
-                    /** @enum {string} */
+                    /**
+                     * @default user
+                     * @enum {string}
+                     */
                     kind?: "user" | "agent" | "service";
-                    /** @enum {string} */
+                    /**
+                     * @default declared
+                     * @enum {string}
+                     */
                     assurance?: "authenticated" | "declared";
                 } | null;
+                /** @default null */
                 approver?: {
                     id: string;
-                    /** @enum {string} */
+                    /**
+                     * @default user
+                     * @enum {string}
+                     */
                     kind?: "user" | "agent" | "service";
-                    /** @enum {string} */
+                    /**
+                     * @default declared
+                     * @enum {string}
+                     */
                     assurance?: "authenticated" | "declared";
                 } | null;
+                /** @default null */
                 trace?: {
                     database?: string;
                     namespace?: string;
                     table: string;
                     /** Format: uint64 */
                     table_id: number;
+                    /** @default null */
                     storage_name?: string | null;
                     /** @enum {string} */
                     kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
                     id: string;
                     /** Format: uint64 */
                     revision: number;
+                    /** @default null */
                     digest?: string | null;
                 } | null;
+                /** @default null */
                 span?: {
                     database?: string;
                     namespace?: string;
                     table: string;
                     /** Format: uint64 */
                     table_id: number;
+                    /** @default null */
                     storage_name?: string | null;
                     /** @enum {string} */
                     kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
                     id: string;
                     /** Format: uint64 */
                     revision: number;
+                    /** @default null */
                     digest?: string | null;
                 } | null;
+                /** @default null */
                 workflow?: string | null;
+                /** @default null */
                 workflow_version?: string | null;
             } | null;
+            /** Format: int64 */
             decided_at: number;
+            /** Format: int64 */
             applied_at: number | null;
+            /**
+             * Format: int64
+             * @default null
+             */
             effective_at?: number | null;
+            /** Format: int64 */
             recorded_at: number;
             configuration: {
                 database?: string;
@@ -23352,18 +23402,24 @@ export interface components {
                 table: string;
                 /** Format: uint64 */
                 table_id: number;
+                /** @default null */
                 storage_name?: string | null;
                 /** @enum {string} */
                 kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
                 id: string;
                 /** Format: uint64 */
                 revision: number;
+                /** @default null */
                 digest?: string | null;
             };
             ontology_version: string;
             policy_version: string;
         };
         ProvenanceEnvelope: {
+            /**
+             * Format: uint32
+             * @default 1
+             */
             schema_version?: number;
             links?: {
                 /** @enum {string} */
@@ -23374,17 +23430,23 @@ export interface components {
                     table: string;
                     /** Format: uint64 */
                     table_id: number;
+                    /** @default null */
                     storage_name?: string | null;
                     /** @enum {string} */
                     kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
                     id: string;
                     /** Format: uint64 */
                     revision: number;
+                    /** @default null */
                     digest?: string | null;
                 };
             }[];
         };
         MemoryExplanation: {
+            /**
+             * Format: uint32
+             * @default 1
+             */
             schema_version?: number;
             nodes: {
                 resource: {
@@ -23393,15 +23455,18 @@ export interface components {
                     table: string;
                     /** Format: uint64 */
                     table_id: number;
+                    /** @default null */
                     storage_name?: string | null;
                     /** @enum {string} */
                     kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
                     id: string;
                     /** Format: uint64 */
                     revision: number;
+                    /** @default null */
                     digest?: string | null;
                 };
                 record: unknown;
+                /** @default false */
                 payload_truncated?: boolean;
                 links: {
                     /** @enum {string} */
@@ -23412,12 +23477,14 @@ export interface components {
                         table: string;
                         /** Format: uint64 */
                         table_id: number;
+                        /** @default null */
                         storage_name?: string | null;
                         /** @enum {string} */
                         kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
                         id: string;
                         /** Format: uint64 */
                         revision: number;
+                        /** @default null */
                         digest?: string | null;
                     } | null;
                     /** @enum {string} */
@@ -23427,21 +23494,42 @@ export interface components {
             complete: boolean;
             truncated: boolean;
             missing_evidence: boolean;
+            /** @default false */
             incomplete_history?: boolean;
-            /** @enum {string} */
+            /**
+             * @default recorded
+             * @enum {string}
+             */
             justification?: "recorded";
         };
         TraceEvent: {
+            /**
+             * Format: uint32
+             * @default 1
+             */
             schema_version?: number;
             trace_id: string;
             span_id: string;
+            /** @default null */
             parent_span_id?: string | null;
             name: string;
+            /** Format: int64 */
             started_at: number;
+            /**
+             * Format: int64
+             * @default null
+             */
             ended_at?: number | null;
-            /** @enum {string} */
+            /**
+             * @default running
+             * @enum {string}
+             */
             status?: "running" | "succeeded" | "failed" | "cancelled";
             provenance?: {
+                /**
+                 * Format: uint32
+                 * @default 1
+                 */
                 schema_version?: number;
                 links?: {
                     /** @enum {string} */
@@ -23452,12 +23540,14 @@ export interface components {
                         table: string;
                         /** Format: uint64 */
                         table_id: number;
+                        /** @default null */
                         storage_name?: string | null;
                         /** @enum {string} */
                         kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
                         id: string;
                         /** Format: uint64 */
                         revision: number;
+                        /** @default null */
                         digest?: string | null;
                     };
                 }[];
@@ -23468,8 +23558,15 @@ export interface components {
             namespace?: string;
             table: string;
             id: string;
-            /** @enum {string} */
+            /**
+             * @default record
+             * @enum {string}
+             */
             kind?: "record" | "relationship" | "trace";
+            /**
+             * Format: uint64
+             * @default null
+             */
             expected_revision?: number | null;
         };
         ResourceReference: {
@@ -23478,141 +23575,265 @@ export interface components {
             table: string;
             /** Format: uint64 */
             table_id: number;
+            /** @default null */
             storage_name?: string | null;
             /** @enum {string} */
             kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
             id: string;
             /** Format: uint64 */
             revision: number;
+            /** @default null */
             digest?: string | null;
         };
         ProvenanceOrigin: {
+            /** @default null */
             agent?: {
                 id: string;
-                /** @enum {string} */
+                /**
+                 * @default user
+                 * @enum {string}
+                 */
                 kind?: "user" | "agent" | "service";
-                /** @enum {string} */
+                /**
+                 * @default declared
+                 * @enum {string}
+                 */
                 assurance?: "authenticated" | "declared";
             } | null;
+            /** @default null */
             approver?: {
                 id: string;
-                /** @enum {string} */
+                /**
+                 * @default user
+                 * @enum {string}
+                 */
                 kind?: "user" | "agent" | "service";
-                /** @enum {string} */
+                /**
+                 * @default declared
+                 * @enum {string}
+                 */
                 assurance?: "authenticated" | "declared";
             } | null;
+            /** @default null */
             trace?: {
                 database?: string;
                 namespace?: string;
                 table: string;
                 /** Format: uint64 */
                 table_id: number;
+                /** @default null */
                 storage_name?: string | null;
                 /** @enum {string} */
                 kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
                 id: string;
                 /** Format: uint64 */
                 revision: number;
+                /** @default null */
                 digest?: string | null;
             } | null;
+            /** @default null */
             span?: {
                 database?: string;
                 namespace?: string;
                 table: string;
                 /** Format: uint64 */
                 table_id: number;
+                /** @default null */
                 storage_name?: string | null;
                 /** @enum {string} */
                 kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
                 id: string;
                 /** Format: uint64 */
                 revision: number;
+                /** @default null */
                 digest?: string | null;
             } | null;
+            /** @default null */
             workflow?: string | null;
+            /** @default null */
             workflow_version?: string | null;
         };
         MemoryExplainRequest: {
+            /** @default null */
             resource?: {
                 database?: string;
                 namespace?: string;
                 table: string;
                 /** Format: uint64 */
                 table_id: number;
+                /** @default null */
                 storage_name?: string | null;
                 /** @enum {string} */
                 kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
                 id: string;
                 /** Format: uint64 */
                 revision: number;
+                /** @default null */
                 digest?: string | null;
             } | null;
+            /**
+             * Format: uint64
+             * @default null
+             */
             revision?: number | null;
+            /**
+             * Format: int64
+             * @default null
+             */
             valid_at?: number | null;
+            /**
+             * Format: int64
+             * @default null
+             */
             known_at?: number | null;
+            /**
+             * Format: uint32
+             * @default 65536
+             */
             max_bytes?: number;
+            /**
+             * Format: uint32
+             * @default 64
+             */
             max_nodes?: number;
+            /**
+             * Format: uint32
+             * @default 8
+             */
             max_depth?: number;
         };
         MemorySpaceConfig: {
+            /**
+             * Format: uint32
+             * @default 1
+             */
             version?: number;
+            /**
+             * Format: uint64
+             * @default 1
+             */
             generation?: number;
+            /**
+             * Format: uint64
+             * @default 1
+             */
             embedding_generation?: number;
-            /** @enum {string} */
+            /**
+             * @default external
+             * @enum {string}
+             */
             processing?: "external" | "managed" | "hybrid";
             ontology_version?: string;
             policy_version?: string;
             features?: {
+                /** @default false */
                 semantic_recall?: boolean;
+                /** @default false */
                 entity_extraction?: boolean;
+                /** @default false */
                 assertion_distillation?: boolean;
+                /** @default false */
                 summaries?: boolean;
-                /** @enum {string} */
+                /**
+                 * @default explicit
+                 * @enum {string}
+                 */
                 reconciliation?: "explicit" | "deterministic" | "model";
             };
             models?: {
+                /** @default null */
                 embedder?: {
                     provider: string;
                     model: string;
                     revision: string;
+                    /**
+                     * Format: uint32
+                     * @default null
+                     */
                     dimensions?: number | null;
                 } | null;
+                /** @default null */
                 extractor?: {
                     provider: string;
                     model: string;
                     revision: string;
+                    /**
+                     * Format: uint32
+                     * @default null
+                     */
                     dimensions?: number | null;
                 } | null;
+                /** @default null */
                 generator?: {
                     provider: string;
                     model: string;
                     revision: string;
+                    /**
+                     * Format: uint32
+                     * @default null
+                     */
                     dimensions?: number | null;
                 } | null;
+                /** @default null */
                 decider?: {
                     provider: string;
                     model: string;
                     revision: string;
+                    /**
+                     * Format: uint32
+                     * @default null
+                     */
                     dimensions?: number | null;
                 } | null;
             };
             predicates?: {
                 name: string;
-                /** @enum {string} */
+                /**
+                 * @default many
+                 * @enum {string}
+                 */
                 cardinality?: "one" | "many";
+                /** @default null */
                 subject_type?: string | null;
+                /** @default null */
                 object_type?: string | null;
             }[];
             source_rules?: {
                 source_id: string;
+                /** @default null */
                 principal?: string | null;
+                /** @default null */
                 producer?: string | null;
+                /**
+                 * Format: uint32
+                 * @default 0
+                 */
                 authority?: number;
             }[];
+            /**
+             * Format: uint32
+             * @default 262144
+             */
             max_input_bytes?: number;
+            /**
+             * Format: uint32
+             * @default 128
+             */
             max_output_items?: number;
+            /**
+             * Format: uint32
+             * @default 3
+             */
             max_attempts?: number;
+            /**
+             * Format: uint32
+             * @default 8192
+             */
             max_recall_tokens?: number;
+            /**
+             * Format: uint64
+             * @default null
+             */
             retention_ms?: number | null;
         };
         MemoryEvidence: {
@@ -23620,40 +23841,72 @@ export interface components {
             source_id?: string;
             source_version?: string;
             text?: string;
+            /** @default null */
             resource?: {
                 database?: string;
                 namespace?: string;
                 table: string;
                 /** Format: uint64 */
                 table_id: number;
+                /** @default null */
                 storage_name?: string | null;
                 /** @enum {string} */
                 kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
                 id: string;
                 /** Format: uint64 */
                 revision: number;
+                /** @default null */
                 digest?: string | null;
             } | null;
+            /** @default null */
             resource_selector?: {
                 database?: string;
                 namespace?: string;
                 table: string;
                 id: string;
-                /** @enum {string} */
+                /**
+                 * @default record
+                 * @enum {string}
+                 */
                 kind?: "record" | "relationship" | "trace";
+                /**
+                 * Format: uint64
+                 * @default null
+                 */
                 expected_revision?: number | null;
             } | null;
+            /** @default null */
             source_url?: string | null;
+            /** @default null */
             author?: string | null;
+            /**
+             * Format: int64
+             * @default null
+             */
             event_time?: number | null;
+            /** @default null */
             timezone?: string | null;
+            /** @default null */
             thread_id?: string | null;
+            /** @default null */
             turn_id?: string | null;
+            /**
+             * Format: int64
+             * @default null
+             */
             ordinal?: number | null;
             producer?: string;
+            /** @default false */
             managed?: boolean;
-            /** @enum {string} */
+            /**
+             * @default private
+             * @enum {string}
+             */
             visibility?: "private" | "team";
+            /**
+             * Format: int64
+             * @default null
+             */
             expires_at?: number | null;
         };
         MemoryAssertion: {
@@ -23662,23 +23915,48 @@ export interface components {
             predicate: string;
             value: string;
             statement: string;
-            /** @enum {string} */
+            /**
+             * @default semantic
+             * @enum {string}
+             */
             kind?: "semantic" | "episodic" | "procedural" | "decision" | "rationale" | "preference" | "lesson" | "constraint" | "open_question" | "alternative" | "summary";
             scope?: string;
+            /** @default null */
             task?: string | null;
+            /** @default null */
             environment?: string | null;
-            /** @enum {string} */
+            /**
+             * @default reported
+             * @enum {string}
+             */
             role?: "reported" | "observed" | "inferred" | "hypothesized";
-            /** @enum {string} */
+            /**
+             * @default actual
+             * @enum {string}
+             */
             modality?: "actual" | "planned" | "desired" | "conditional" | "hypothetical";
-            /** @enum {string} */
+            /**
+             * @default settled
+             * @enum {string}
+             */
             stability?: "provisional" | "settled";
+            /**
+             * Format: int64
+             * @default null
+             */
             valid_from?: number | null;
+            /**
+             * Format: int64
+             * @default null
+             */
             valid_to?: number | null;
             evidence: {
                 id: string;
+                /** @default null */
                 span?: {
+                    /** Format: uint32 */
                     start: number;
+                    /** Format: uint32 */
                     end: number;
                 } | null;
             }[];
@@ -23686,8 +23964,11 @@ export interface components {
             support_sets?: {
                 evidence: {
                     id: string;
+                    /** @default null */
                     span?: {
+                        /** Format: uint32 */
                         start: number;
+                        /** Format: uint32 */
                         end: number;
                     } | null;
                 }[];
@@ -23698,76 +23979,116 @@ export interface components {
             rejected_in_favor_of?: string[];
             preconditions?: string[];
             steps?: string[];
+            /** @default null */
             expected_outcome?: string | null;
             producer?: string;
-            /** @enum {string} */
+            /**
+             * @default private
+             * @enum {string}
+             */
             visibility?: "private" | "team";
+            /** @default null */
             embedding?: number[] | null;
+            /** @default null */
             embedding_model?: {
                 provider: string;
                 model: string;
                 revision: string;
+                /**
+                 * Format: uint32
+                 * @default null
+                 */
                 dimensions?: number | null;
             } | null;
+            /** @default null */
             reconciliation_reason?: string | null;
         };
         MemoryObservationRequest: {
+            /** @default null */
             origin?: {
+                /** @default null */
                 agent?: {
                     id: string;
-                    /** @enum {string} */
+                    /**
+                     * @default user
+                     * @enum {string}
+                     */
                     kind?: "user" | "agent" | "service";
-                    /** @enum {string} */
+                    /**
+                     * @default declared
+                     * @enum {string}
+                     */
                     assurance?: "authenticated" | "declared";
                 } | null;
+                /** @default null */
                 approver?: {
                     id: string;
-                    /** @enum {string} */
+                    /**
+                     * @default user
+                     * @enum {string}
+                     */
                     kind?: "user" | "agent" | "service";
-                    /** @enum {string} */
+                    /**
+                     * @default declared
+                     * @enum {string}
+                     */
                     assurance?: "authenticated" | "declared";
                 } | null;
+                /** @default null */
                 trace?: {
                     database?: string;
                     namespace?: string;
                     table: string;
                     /** Format: uint64 */
                     table_id: number;
+                    /** @default null */
                     storage_name?: string | null;
                     /** @enum {string} */
                     kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
                     id: string;
                     /** Format: uint64 */
                     revision: number;
+                    /** @default null */
                     digest?: string | null;
                 } | null;
+                /** @default null */
                 span?: {
                     database?: string;
                     namespace?: string;
                     table: string;
                     /** Format: uint64 */
                     table_id: number;
+                    /** @default null */
                     storage_name?: string | null;
                     /** @enum {string} */
                     kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
                     id: string;
                     /** Format: uint64 */
                     revision: number;
+                    /** @default null */
                     digest?: string | null;
                 } | null;
+                /** @default null */
                 workflow?: string | null;
+                /** @default null */
                 workflow_version?: string | null;
             } | null;
             context_evidence_ids?: string[];
             evidence: components["schemas"]["MemoryEvidence"][];
             assertions?: components["schemas"]["MemoryAssertion"][];
             entities?: {
-                /** @enum {string} */
+                /**
+                 * @default private
+                 * @enum {string}
+                 */
                 visibility?: "private" | "team";
                 evidence?: {
                     id: string;
+                    /** @default null */
                     span?: {
+                        /** Format: uint32 */
                         start: number;
+                        /** Format: uint32 */
                         end: number;
                     } | null;
                 }[];
@@ -23783,16 +24104,23 @@ export interface components {
         };
         MemoryCorrection: {
             id: string;
+            /** Format: uint64 */
             expected_revision: number;
             /** @enum {string} */
             lifecycle: "active" | "disputed" | "superseded" | "retracted";
-            /** @enum {string|null} */
+            /**
+             * @default null
+             * @enum {string|null}
+             */
             stability?: "provisional" | "settled" | null;
             reason: string;
             evidence?: {
                 id: string;
+                /** @default null */
                 span?: {
+                    /** Format: uint32 */
                     start: number;
+                    /** Format: uint32 */
                     end: number;
                 } | null;
             }[];
@@ -23801,6 +24129,7 @@ export interface components {
             evidence_ids?: string[];
             assertion_ids?: string[];
             source_ids?: string[];
+            /** @default false */
             all?: boolean;
         };
         MemoryOutcome: {
@@ -23812,30 +24141,70 @@ export interface components {
         };
         MemoryRecallRequest: {
             query?: string;
-            /** @enum {string|null} */
+            /**
+             * @default null
+             * @enum {string|null}
+             */
             relationship?: "depends_on" | "supersedes" | "motivates" | "rejected_in_favor_of" | null;
+            /** @default null */
             target_id?: string | null;
-            /** @enum {string|null} */
+            /**
+             * @default null
+             * @enum {string|null}
+             */
             missing_relationship?: "depends_on" | "supersedes" | "motivates" | "rejected_in_favor_of" | null;
+            /** @default null */
             subject?: string | null;
+            /** @default null */
             predicate?: string | null;
+            /** @default null */
             scope?: string | null;
+            /** @default null */
             environment?: string | null;
+            /** @default null */
             task?: string | null;
-            /** @enum {string|null} */
+            /**
+             * @default null
+             * @enum {string|null}
+             */
             kind?: "semantic" | "episodic" | "procedural" | "decision" | "rationale" | "preference" | "lesson" | "constraint" | "open_question" | "alternative" | "summary" | null;
+            /**
+             * Format: int64
+             * @default null
+             */
             valid_at?: number | null;
+            /**
+             * Format: int64
+             * @default null
+             */
             known_at?: number | null;
+            /** @default false */
             include_history?: boolean;
+            /** @default true */
             include_provisional?: boolean;
+            /**
+             * Format: uint32
+             * @default 20
+             */
             limit?: number;
+            /**
+             * Format: uint32
+             * @default 2048
+             */
             token_budget?: number;
+            /** @default null */
             cursor?: string | null;
+            /** @default null */
             embedding?: number[] | null;
+            /** @default null */
             embedding_model?: {
                 provider: string;
                 model: string;
                 revision: string;
+                /**
+                 * Format: uint32
+                 * @default null
+                 */
                 dimensions?: number | null;
             } | null;
         };
@@ -23844,15 +24213,20 @@ export interface components {
             action: string;
             request_hash: string;
             owner: string;
+            /** Format: uint64 */
             revision: number;
+            /** Format: uint64 */
             config_generation: number;
+            /** Format: int64 */
             created_at: number;
             /** @enum {string} */
             phase: "pending" | "running" | "succeeded" | "failed" | "cancelled";
             evidence_accepted: boolean;
             assertions_ready: boolean;
+            /** Format: uint32 */
             attempts: number;
             error_code: string | null;
+            /** Format: int64 */
             next_retry_at: number | null;
         };
         MemoryRecord: {
@@ -23862,23 +24236,48 @@ export interface components {
                 predicate: string;
                 value: string;
                 statement: string;
-                /** @enum {string} */
+                /**
+                 * @default semantic
+                 * @enum {string}
+                 */
                 kind?: "semantic" | "episodic" | "procedural" | "decision" | "rationale" | "preference" | "lesson" | "constraint" | "open_question" | "alternative" | "summary";
                 scope?: string;
+                /** @default null */
                 task?: string | null;
+                /** @default null */
                 environment?: string | null;
-                /** @enum {string} */
+                /**
+                 * @default reported
+                 * @enum {string}
+                 */
                 role?: "reported" | "observed" | "inferred" | "hypothesized";
-                /** @enum {string} */
+                /**
+                 * @default actual
+                 * @enum {string}
+                 */
                 modality?: "actual" | "planned" | "desired" | "conditional" | "hypothetical";
-                /** @enum {string} */
+                /**
+                 * @default settled
+                 * @enum {string}
+                 */
                 stability?: "provisional" | "settled";
+                /**
+                 * Format: int64
+                 * @default null
+                 */
                 valid_from?: number | null;
+                /**
+                 * Format: int64
+                 * @default null
+                 */
                 valid_to?: number | null;
                 evidence: {
                     id: string;
+                    /** @default null */
                     span?: {
+                        /** Format: uint32 */
                         start: number;
+                        /** Format: uint32 */
                         end: number;
                     } | null;
                 }[];
@@ -23886,8 +24285,11 @@ export interface components {
                 support_sets?: {
                     evidence: {
                         id: string;
+                        /** @default null */
                         span?: {
+                            /** Format: uint32 */
                             start: number;
+                            /** Format: uint32 */
                             end: number;
                         } | null;
                     }[];
@@ -23898,64 +24300,119 @@ export interface components {
                 rejected_in_favor_of?: string[];
                 preconditions?: string[];
                 steps?: string[];
+                /** @default null */
                 expected_outcome?: string | null;
                 producer?: string;
-                /** @enum {string} */
+                /**
+                 * @default private
+                 * @enum {string}
+                 */
                 visibility?: "private" | "team";
+                /** @default null */
                 embedding?: number[] | null;
+                /** @default null */
                 embedding_model?: {
                     provider: string;
                     model: string;
                     revision: string;
+                    /**
+                     * Format: uint32
+                     * @default null
+                     */
                     dimensions?: number | null;
                 } | null;
+                /** @default null */
                 reconciliation_reason?: string | null;
             };
             input_hash?: string;
+            /**
+             * Format: int64
+             * @default null
+             */
             asserted_valid_to?: number | null;
+            /** @default null */
             explicit_disposition?: {
+                /** @default null */
                 provenance?: {
                     principal: string;
+                    /** Format: int64 */
                     recorded_at: number;
                     evidence: {
                         id: string;
+                        /** @default null */
                         span?: {
+                            /** Format: uint32 */
                             start: number;
+                            /** Format: uint32 */
                             end: number;
                         } | null;
                     }[];
+                    /** @default false */
                     forgotten?: boolean;
                 } | null;
                 /** @enum {string} */
                 lifecycle: "active" | "disputed" | "superseded" | "retracted";
+                /** Format: int64 */
                 valid_to: number | null;
                 superseded_by: string | null;
+                /**
+                 * Format: int64
+                 * @default null
+                 */
                 superseded_valid_at?: number | null;
+                /** Format: int64 */
                 recorded_to: number | null;
                 conflicts_with: string[];
                 reason: string | null;
             } | null;
             owner: string;
+            /** Format: int64 */
             recorded_from: number;
+            /**
+             * Format: int64
+             * @default 0
+             */
             recorded_at?: number;
+            /** Format: uint64 */
             revision: number;
-            /** @enum {string} */
+            /**
+             * @default active
+             * @enum {string}
+             */
             lifecycle?: "active" | "disputed" | "superseded" | "retracted";
+            /** @default false */
             stale?: boolean;
+            /** @default null */
             reason?: string | null;
             conflicts_with?: string[];
+            /**
+             * Format: int64
+             * @default null
+             */
             recorded_to?: number | null;
+            /** @default null */
             superseded_by?: string | null;
+            /**
+             * Format: int64
+             * @default null
+             */
             superseded_valid_at?: number | null;
+            /** Format: uint64 */
             config_generation: number;
         };
         MemoryEntity: {
-            /** @enum {string} */
+            /**
+             * @default private
+             * @enum {string}
+             */
             visibility?: "private" | "team";
             evidence?: {
                 id: string;
+                /** @default null */
                 span?: {
+                    /** Format: uint32 */
                     start: number;
+                    /** Format: uint32 */
                     end: number;
                 } | null;
             }[];
@@ -23966,23 +24423,35 @@ export interface components {
             distinct_from?: string[];
         };
         MemoryEntityCorrection: {
-            /** @enum {string} */
+            /**
+             * @default reject
+             * @enum {string}
+             */
             absorbed?: "reject" | "release" | "suppress";
             reason?: string;
             /** @enum {string} */
             action: "merge" | "unmerge" | "suppress" | "unsuppress";
             from: string;
+            /** @default null */
             to?: string | null;
+            /** Format: uint64 */
             expected_revision: number;
+            /** @default false */
             replace?: boolean;
+            /** @default false */
             pin_distinct?: boolean;
         };
         MemoryEmbeddingBatch: {
+            /** Format: uint64 */
             generation: number;
             model: {
                 provider: string;
                 model: string;
                 revision: string;
+                /**
+                 * Format: uint32
+                 * @default null
+                 */
                 dimensions?: number | null;
             };
             items: {
@@ -23999,23 +24468,48 @@ export interface components {
                         predicate: string;
                         value: string;
                         statement: string;
-                        /** @enum {string} */
+                        /**
+                         * @default semantic
+                         * @enum {string}
+                         */
                         kind?: "semantic" | "episodic" | "procedural" | "decision" | "rationale" | "preference" | "lesson" | "constraint" | "open_question" | "alternative" | "summary";
                         scope?: string;
+                        /** @default null */
                         task?: string | null;
+                        /** @default null */
                         environment?: string | null;
-                        /** @enum {string} */
+                        /**
+                         * @default reported
+                         * @enum {string}
+                         */
                         role?: "reported" | "observed" | "inferred" | "hypothesized";
-                        /** @enum {string} */
+                        /**
+                         * @default actual
+                         * @enum {string}
+                         */
                         modality?: "actual" | "planned" | "desired" | "conditional" | "hypothetical";
-                        /** @enum {string} */
+                        /**
+                         * @default settled
+                         * @enum {string}
+                         */
                         stability?: "provisional" | "settled";
+                        /**
+                         * Format: int64
+                         * @default null
+                         */
                         valid_from?: number | null;
+                        /**
+                         * Format: int64
+                         * @default null
+                         */
                         valid_to?: number | null;
                         evidence: {
                             id: string;
+                            /** @default null */
                             span?: {
+                                /** Format: uint32 */
                                 start: number;
+                                /** Format: uint32 */
                                 end: number;
                             } | null;
                         }[];
@@ -24023,8 +24517,11 @@ export interface components {
                         support_sets?: {
                             evidence: {
                                 id: string;
+                                /** @default null */
                                 span?: {
+                                    /** Format: uint32 */
                                     start: number;
+                                    /** Format: uint32 */
                                     end: number;
                                 } | null;
                             }[];
@@ -24035,63 +24532,115 @@ export interface components {
                         rejected_in_favor_of?: string[];
                         preconditions?: string[];
                         steps?: string[];
+                        /** @default null */
                         expected_outcome?: string | null;
                         producer?: string;
-                        /** @enum {string} */
+                        /**
+                         * @default private
+                         * @enum {string}
+                         */
                         visibility?: "private" | "team";
+                        /** @default null */
                         embedding?: number[] | null;
+                        /** @default null */
                         embedding_model?: {
                             provider: string;
                             model: string;
                             revision: string;
+                            /**
+                             * Format: uint32
+                             * @default null
+                             */
                             dimensions?: number | null;
                         } | null;
+                        /** @default null */
                         reconciliation_reason?: string | null;
                     };
                     input_hash?: string;
+                    /**
+                     * Format: int64
+                     * @default null
+                     */
                     asserted_valid_to?: number | null;
+                    /** @default null */
                     explicit_disposition?: {
+                        /** @default null */
                         provenance?: {
                             principal: string;
+                            /** Format: int64 */
                             recorded_at: number;
                             evidence: {
                                 id: string;
+                                /** @default null */
                                 span?: {
+                                    /** Format: uint32 */
                                     start: number;
+                                    /** Format: uint32 */
                                     end: number;
                                 } | null;
                             }[];
+                            /** @default false */
                             forgotten?: boolean;
                         } | null;
                         /** @enum {string} */
                         lifecycle: "active" | "disputed" | "superseded" | "retracted";
+                        /** Format: int64 */
                         valid_to: number | null;
                         superseded_by: string | null;
+                        /**
+                         * Format: int64
+                         * @default null
+                         */
                         superseded_valid_at?: number | null;
+                        /** Format: int64 */
                         recorded_to: number | null;
                         conflicts_with: string[];
                         reason: string | null;
                     } | null;
                     owner: string;
+                    /** Format: int64 */
                     recorded_from: number;
+                    /**
+                     * Format: int64
+                     * @default 0
+                     */
                     recorded_at?: number;
+                    /** Format: uint64 */
                     revision: number;
-                    /** @enum {string} */
+                    /**
+                     * @default active
+                     * @enum {string}
+                     */
                     lifecycle?: "active" | "disputed" | "superseded" | "retracted";
+                    /** @default false */
                     stale?: boolean;
+                    /** @default null */
                     reason?: string | null;
                     conflicts_with?: string[];
+                    /**
+                     * Format: int64
+                     * @default null
+                     */
                     recorded_to?: number | null;
+                    /** @default null */
                     superseded_by?: string | null;
+                    /**
+                     * Format: int64
+                     * @default null
+                     */
                     superseded_valid_at?: number | null;
+                    /** Format: uint64 */
                     config_generation: number;
                 };
                 score: number;
                 historical: boolean;
                 citations: {
                     id: string;
+                    /** @default null */
                     span?: {
+                        /** Format: uint32 */
                         start: number;
+                        /** Format: uint32 */
                         end: number;
                     } | null;
                 }[];
@@ -24099,10 +24648,15 @@ export interface components {
             next_cursor: string | null;
             complete: boolean;
             truncated: boolean;
+            /** Format: uint64 */
             scanned: number;
+            /** Format: uint64 */
             omitted: number;
+            /** Format: uint64 */
             token_upper_bound: number;
+            /** Format: uint64 */
             revision: number;
+            /** Format: uint64 */
             config_generation: number;
             /** @enum {string} */
             retrieval: "lexical" | "lexical_vector";
@@ -24115,23 +24669,48 @@ export interface components {
                     predicate: string;
                     value: string;
                     statement: string;
-                    /** @enum {string} */
+                    /**
+                     * @default semantic
+                     * @enum {string}
+                     */
                     kind?: "semantic" | "episodic" | "procedural" | "decision" | "rationale" | "preference" | "lesson" | "constraint" | "open_question" | "alternative" | "summary";
                     scope?: string;
+                    /** @default null */
                     task?: string | null;
+                    /** @default null */
                     environment?: string | null;
-                    /** @enum {string} */
+                    /**
+                     * @default reported
+                     * @enum {string}
+                     */
                     role?: "reported" | "observed" | "inferred" | "hypothesized";
-                    /** @enum {string} */
+                    /**
+                     * @default actual
+                     * @enum {string}
+                     */
                     modality?: "actual" | "planned" | "desired" | "conditional" | "hypothetical";
-                    /** @enum {string} */
+                    /**
+                     * @default settled
+                     * @enum {string}
+                     */
                     stability?: "provisional" | "settled";
+                    /**
+                     * Format: int64
+                     * @default null
+                     */
                     valid_from?: number | null;
+                    /**
+                     * Format: int64
+                     * @default null
+                     */
                     valid_to?: number | null;
                     evidence: {
                         id: string;
+                        /** @default null */
                         span?: {
+                            /** Format: uint32 */
                             start: number;
+                            /** Format: uint32 */
                             end: number;
                         } | null;
                     }[];
@@ -24139,8 +24718,11 @@ export interface components {
                     support_sets?: {
                         evidence: {
                             id: string;
+                            /** @default null */
                             span?: {
+                                /** Format: uint32 */
                                 start: number;
+                                /** Format: uint32 */
                                 end: number;
                             } | null;
                         }[];
@@ -24151,70 +24733,126 @@ export interface components {
                     rejected_in_favor_of?: string[];
                     preconditions?: string[];
                     steps?: string[];
+                    /** @default null */
                     expected_outcome?: string | null;
                     producer?: string;
-                    /** @enum {string} */
+                    /**
+                     * @default private
+                     * @enum {string}
+                     */
                     visibility?: "private" | "team";
+                    /** @default null */
                     embedding?: number[] | null;
+                    /** @default null */
                     embedding_model?: {
                         provider: string;
                         model: string;
                         revision: string;
+                        /**
+                         * Format: uint32
+                         * @default null
+                         */
                         dimensions?: number | null;
                     } | null;
+                    /** @default null */
                     reconciliation_reason?: string | null;
                 };
                 input_hash?: string;
+                /**
+                 * Format: int64
+                 * @default null
+                 */
                 asserted_valid_to?: number | null;
+                /** @default null */
                 explicit_disposition?: {
+                    /** @default null */
                     provenance?: {
                         principal: string;
+                        /** Format: int64 */
                         recorded_at: number;
                         evidence: {
                             id: string;
+                            /** @default null */
                             span?: {
+                                /** Format: uint32 */
                                 start: number;
+                                /** Format: uint32 */
                                 end: number;
                             } | null;
                         }[];
+                        /** @default false */
                         forgotten?: boolean;
                     } | null;
                     /** @enum {string} */
                     lifecycle: "active" | "disputed" | "superseded" | "retracted";
+                    /** Format: int64 */
                     valid_to: number | null;
                     superseded_by: string | null;
+                    /**
+                     * Format: int64
+                     * @default null
+                     */
                     superseded_valid_at?: number | null;
+                    /** Format: int64 */
                     recorded_to: number | null;
                     conflicts_with: string[];
                     reason: string | null;
                 } | null;
                 owner: string;
+                /** Format: int64 */
                 recorded_from: number;
+                /**
+                 * Format: int64
+                 * @default 0
+                 */
                 recorded_at?: number;
+                /** Format: uint64 */
                 revision: number;
-                /** @enum {string} */
+                /**
+                 * @default active
+                 * @enum {string}
+                 */
                 lifecycle?: "active" | "disputed" | "superseded" | "retracted";
+                /** @default false */
                 stale?: boolean;
+                /** @default null */
                 reason?: string | null;
                 conflicts_with?: string[];
+                /**
+                 * Format: int64
+                 * @default null
+                 */
                 recorded_to?: number | null;
+                /** @default null */
                 superseded_by?: string | null;
+                /**
+                 * Format: int64
+                 * @default null
+                 */
                 superseded_valid_at?: number | null;
+                /** Format: uint64 */
                 config_generation: number;
             }[];
             next_cursor: string | null;
             complete: boolean;
+            /** Format: uint64 */
             revision: number;
         };
         MemoryEntityPage: {
             items: {
                 entity: {
-                    /** @enum {string} */
+                    /**
+                     * @default private
+                     * @enum {string}
+                     */
                     visibility?: "private" | "team";
                     evidence?: {
                         id: string;
+                        /** @default null */
                         span?: {
+                            /** Format: uint32 */
                             start: number;
+                            /** Format: uint32 */
                             end: number;
                         } | null;
                     }[];
@@ -24225,7 +24863,15 @@ export interface components {
                     distinct_from?: string[];
                 };
                 owner: string;
+                /**
+                 * Format: uint64
+                 * @default 0
+                 */
                 revision?: number;
+                /**
+                 * Format: int64
+                 * @default null
+                 */
                 recorded_at?: number | null;
             }[];
             next_cursor: string | null;
@@ -24233,134 +24879,286 @@ export interface components {
         };
         MemoryInspection: {
             state: {
+                /**
+                 * Format: uint64
+                 * @default 0
+                 */
                 table_id?: number;
                 database: string;
                 namespace: string;
                 space: string;
                 config: {
+                    /**
+                     * Format: uint32
+                     * @default 1
+                     */
                     version?: number;
+                    /**
+                     * Format: uint64
+                     * @default 1
+                     */
                     generation?: number;
+                    /**
+                     * Format: uint64
+                     * @default 1
+                     */
                     embedding_generation?: number;
-                    /** @enum {string} */
+                    /**
+                     * @default external
+                     * @enum {string}
+                     */
                     processing?: "external" | "managed" | "hybrid";
                     ontology_version?: string;
                     policy_version?: string;
                     features?: {
+                        /** @default false */
                         semantic_recall?: boolean;
+                        /** @default false */
                         entity_extraction?: boolean;
+                        /** @default false */
                         assertion_distillation?: boolean;
+                        /** @default false */
                         summaries?: boolean;
-                        /** @enum {string} */
+                        /**
+                         * @default explicit
+                         * @enum {string}
+                         */
                         reconciliation?: "explicit" | "deterministic" | "model";
                     };
                     models?: {
+                        /** @default null */
                         embedder?: {
                             provider: string;
                             model: string;
                             revision: string;
+                            /**
+                             * Format: uint32
+                             * @default null
+                             */
                             dimensions?: number | null;
                         } | null;
+                        /** @default null */
                         extractor?: {
                             provider: string;
                             model: string;
                             revision: string;
+                            /**
+                             * Format: uint32
+                             * @default null
+                             */
                             dimensions?: number | null;
                         } | null;
+                        /** @default null */
                         generator?: {
                             provider: string;
                             model: string;
                             revision: string;
+                            /**
+                             * Format: uint32
+                             * @default null
+                             */
                             dimensions?: number | null;
                         } | null;
+                        /** @default null */
                         decider?: {
                             provider: string;
                             model: string;
                             revision: string;
+                            /**
+                             * Format: uint32
+                             * @default null
+                             */
                             dimensions?: number | null;
                         } | null;
                     };
                     predicates?: {
                         name: string;
-                        /** @enum {string} */
+                        /**
+                         * @default many
+                         * @enum {string}
+                         */
                         cardinality?: "one" | "many";
+                        /** @default null */
                         subject_type?: string | null;
+                        /** @default null */
                         object_type?: string | null;
                     }[];
                     source_rules?: {
                         source_id: string;
+                        /** @default null */
                         principal?: string | null;
+                        /** @default null */
                         producer?: string | null;
+                        /**
+                         * Format: uint32
+                         * @default 0
+                         */
                         authority?: number;
                     }[];
+                    /**
+                     * Format: uint32
+                     * @default 262144
+                     */
                     max_input_bytes?: number;
+                    /**
+                     * Format: uint32
+                     * @default 128
+                     */
                     max_output_items?: number;
+                    /**
+                     * Format: uint32
+                     * @default 3
+                     */
                     max_attempts?: number;
+                    /**
+                     * Format: uint32
+                     * @default 8192
+                     */
                     max_recall_tokens?: number;
+                    /**
+                     * Format: uint64
+                     * @default null
+                     */
                     retention_ms?: number | null;
                 };
                 pending_config: {
+                    /**
+                     * Format: uint32
+                     * @default 1
+                     */
                     version?: number;
+                    /**
+                     * Format: uint64
+                     * @default 1
+                     */
                     generation?: number;
+                    /**
+                     * Format: uint64
+                     * @default 1
+                     */
                     embedding_generation?: number;
-                    /** @enum {string} */
+                    /**
+                     * @default external
+                     * @enum {string}
+                     */
                     processing?: "external" | "managed" | "hybrid";
                     ontology_version?: string;
                     policy_version?: string;
                     features?: {
+                        /** @default false */
                         semantic_recall?: boolean;
+                        /** @default false */
                         entity_extraction?: boolean;
+                        /** @default false */
                         assertion_distillation?: boolean;
+                        /** @default false */
                         summaries?: boolean;
-                        /** @enum {string} */
+                        /**
+                         * @default explicit
+                         * @enum {string}
+                         */
                         reconciliation?: "explicit" | "deterministic" | "model";
                     };
                     models?: {
+                        /** @default null */
                         embedder?: {
                             provider: string;
                             model: string;
                             revision: string;
+                            /**
+                             * Format: uint32
+                             * @default null
+                             */
                             dimensions?: number | null;
                         } | null;
+                        /** @default null */
                         extractor?: {
                             provider: string;
                             model: string;
                             revision: string;
+                            /**
+                             * Format: uint32
+                             * @default null
+                             */
                             dimensions?: number | null;
                         } | null;
+                        /** @default null */
                         generator?: {
                             provider: string;
                             model: string;
                             revision: string;
+                            /**
+                             * Format: uint32
+                             * @default null
+                             */
                             dimensions?: number | null;
                         } | null;
+                        /** @default null */
                         decider?: {
                             provider: string;
                             model: string;
                             revision: string;
+                            /**
+                             * Format: uint32
+                             * @default null
+                             */
                             dimensions?: number | null;
                         } | null;
                     };
                     predicates?: {
                         name: string;
-                        /** @enum {string} */
+                        /**
+                         * @default many
+                         * @enum {string}
+                         */
                         cardinality?: "one" | "many";
+                        /** @default null */
                         subject_type?: string | null;
+                        /** @default null */
                         object_type?: string | null;
                     }[];
                     source_rules?: {
                         source_id: string;
+                        /** @default null */
                         principal?: string | null;
+                        /** @default null */
                         producer?: string | null;
+                        /**
+                         * Format: uint32
+                         * @default 0
+                         */
                         authority?: number;
                     }[];
+                    /**
+                     * Format: uint32
+                     * @default 262144
+                     */
                     max_input_bytes?: number;
+                    /**
+                     * Format: uint32
+                     * @default 128
+                     */
                     max_output_items?: number;
+                    /**
+                     * Format: uint32
+                     * @default 3
+                     */
                     max_attempts?: number;
+                    /**
+                     * Format: uint32
+                     * @default 8192
+                     */
                     max_recall_tokens?: number;
+                    /**
+                     * Format: uint64
+                     * @default null
+                     */
                     retention_ms?: number | null;
                 } | null;
+                /** Format: uint64 */
                 revision: number;
                 owner: string;
+                /** Format: int64 */
                 created_at: number;
             };
             capabilities: {

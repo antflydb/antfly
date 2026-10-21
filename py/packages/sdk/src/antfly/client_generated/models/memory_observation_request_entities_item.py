@@ -23,7 +23,8 @@ class MemoryObservationRequestEntitiesItem:
     Attributes:
         id (str):
         name (str):
-        visibility (MemoryObservationRequestEntitiesItemVisibility | Unset):
+        visibility (MemoryObservationRequestEntitiesItemVisibility | Unset):  Default:
+            MemoryObservationRequestEntitiesItemVisibility.PRIVATE.
         evidence (list[MemoryObservationRequestEntitiesItemEvidenceItem] | Unset):
         type_ (str | Unset):
         aliases (list[str] | Unset):
@@ -32,7 +33,9 @@ class MemoryObservationRequestEntitiesItem:
 
     id: str
     name: str
-    visibility: MemoryObservationRequestEntitiesItemVisibility | Unset = UNSET
+    visibility: MemoryObservationRequestEntitiesItemVisibility | Unset = (
+        MemoryObservationRequestEntitiesItemVisibility.PRIVATE
+    )
     evidence: list[MemoryObservationRequestEntitiesItemEvidenceItem] | Unset = UNSET
     type_: str | Unset = UNSET
     aliases: list[str] | Unset = UNSET

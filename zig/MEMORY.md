@@ -1181,3 +1181,32 @@ zero retention duration, and zero-valued selectors remain distinct from absent
 or null fields. The OpenAPI generator derives this rule from native optional
 numeric types, including nested records, rather than maintaining a list of time
 field names. List and recall time filters share that contract.
+
+
+### Live embedded readers and complete operation progress
+
+Embedded ordinary-resource reads resolve their storage owner through the active
+handle guard. Inference may release the connection lease and resume on a new
+storage generation; no resource reader retains a pointer into the retired one.
+The C ABI regression releases that lease, commits a source edit through an independent
+native writer, resumes, and verifies that the existing reader sees the new generation.
+
+Managed observations and configuration builds distinguish the source-access
+prerequisite from producer failures. `MemorySourceAccessDenied` leaves the
+operation pending, queued, and at its committed cursor without spending an
+attempt. This applies to both primary and contextual observations. Source expiry,
+forgetting, deletion, and revision drift remain terminal cancellation causes.
+Restoring access resumes the same admitted operation.
+
+Every completed advance projects phase, readiness, attempts, error code and retry
+time from the target operation through one shared function. Cancellation clears
+readiness and retry time. The same status reaches the live operation, advance
+receipt, immutable operation snapshots and recorded decision; terminal replay
+cannot turn cancellation into successful publication.
+
+Native wire schemas publish primitive defaults, signedness, exact integer bounds
+and supported 32/64-bit numeric formats. Go bindings retain presence for nullable
+scalars, defaulted scalar body fields, and every optional query/header parameter.
+Consequently omitted options remain omitted, explicit false overrides true, epoch
+zero remains a timestamp, and the full native uint64 domain round-trips. Strict
+model schemas retain required fields and bounds without injecting wire defaults.

@@ -32,13 +32,29 @@ def convert(value):
         return value
     if "anyOf" in value and any(item.get("type") == "null" for item in value["anyOf"]):
         inner = next(item for item in value["anyOf"] if item.get("type") != "null")
-        result = {**convert(inner), "nullable": True}
-        if result.get("type") in ("integer", "number", "boolean"):
-            # Presence is semantic: zero is a valid epoch, revision selector,
-            # retention duration or score. Go value fields lose it on marshal.
-            result["x-go-type-skip-optional-pointer"] = False
-        return result
-    return {key: convert(child) for key, child in value.items()}
+        result = {
+            **convert(inner),
+            **{key: convert(child) for key, child in value.items() if key != "anyOf"},
+            "nullable": True,
+        }
+    else:
+        result = {key: convert(child) for key, child in value.items()}
+    scalar = result.get("type") in ("integer", "number", "boolean", "string")
+    if scalar and (result.get("nullable") or "default" in result):
+        # Omission, explicit zero/false, and native defaults are distinct.
+        result["x-go-type-skip-optional-pointer"] = False
+    if result.get("type") == "integer" and result.get("format") in {
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+    }:
+        result["x-go-type"] = result["format"]
+    return result
 
 
 def optional(schema, required=()):
@@ -156,7 +172,11 @@ def main():
             {
                 "name": name,
                 "in": "header",
-                "schema": {"type": "string", "default": value},
+                "schema": {
+                    "type": "string",
+                    "default": value,
+                    "x-go-type-skip-optional-pointer": False,
+                },
                 "description": "Catalog scope for this memory space.",
             }
             for name, value in (
@@ -202,7 +222,11 @@ def main():
                         "format": "int64",
                     }
             params.extend(
-                {"name": key, "in": "query", "schema": schema}
+                {
+                    "name": key,
+                    "in": "query",
+                    "schema": {**schema, "x-go-type-skip-optional-pointer": False},
+                }
                 for key, schema in fields.items()
             )
         if mutation:

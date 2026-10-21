@@ -19,7 +19,8 @@ class MemoryEvidenceResourceSelectorType0:
         id (str):
         database (str | Unset):
         namespace (str | Unset):
-        kind (MemoryEvidenceResourceSelectorType0Kind | Unset):
+        kind (MemoryEvidenceResourceSelectorType0Kind | Unset):  Default:
+            MemoryEvidenceResourceSelectorType0Kind.RECORD.
         expected_revision (int | None | Unset):
     """
 
@@ -27,7 +28,7 @@ class MemoryEvidenceResourceSelectorType0:
     id: str
     database: str | Unset = UNSET
     namespace: str | Unset = UNSET
-    kind: MemoryEvidenceResourceSelectorType0Kind | Unset = UNSET
+    kind: MemoryEvidenceResourceSelectorType0Kind | Unset = MemoryEvidenceResourceSelectorType0Kind.RECORD
     expected_revision: int | None | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:

@@ -31,13 +31,13 @@ class MemoryAssertion:
         value (str):
         statement (str):
         evidence (list[MemoryAssertionEvidenceItem]):
-        kind (MemoryAssertionKind | Unset):
+        kind (MemoryAssertionKind | Unset):  Default: MemoryAssertionKind.SEMANTIC.
         scope (str | Unset):
         task (None | str | Unset):
         environment (None | str | Unset):
-        role (MemoryAssertionRole | Unset):
-        modality (MemoryAssertionModality | Unset):
-        stability (MemoryAssertionStability | Unset):
+        role (MemoryAssertionRole | Unset):  Default: MemoryAssertionRole.REPORTED.
+        modality (MemoryAssertionModality | Unset):  Default: MemoryAssertionModality.ACTUAL.
+        stability (MemoryAssertionStability | Unset):  Default: MemoryAssertionStability.SETTLED.
         valid_from (int | None | Unset):
         valid_to (int | None | Unset):
         depends_on (list[str] | Unset):
@@ -49,7 +49,7 @@ class MemoryAssertion:
         steps (list[str] | Unset):
         expected_outcome (None | str | Unset):
         producer (str | Unset):
-        visibility (MemoryAssertionVisibility | Unset):
+        visibility (MemoryAssertionVisibility | Unset):  Default: MemoryAssertionVisibility.PRIVATE.
         embedding (list[float] | None | Unset):
         embedding_model (MemoryAssertionEmbeddingModelType0 | None | Unset):
         reconciliation_reason (None | str | Unset):
@@ -61,13 +61,13 @@ class MemoryAssertion:
     value: str
     statement: str
     evidence: list[MemoryAssertionEvidenceItem]
-    kind: MemoryAssertionKind | Unset = UNSET
+    kind: MemoryAssertionKind | Unset = MemoryAssertionKind.SEMANTIC
     scope: str | Unset = UNSET
     task: None | str | Unset = UNSET
     environment: None | str | Unset = UNSET
-    role: MemoryAssertionRole | Unset = UNSET
-    modality: MemoryAssertionModality | Unset = UNSET
-    stability: MemoryAssertionStability | Unset = UNSET
+    role: MemoryAssertionRole | Unset = MemoryAssertionRole.REPORTED
+    modality: MemoryAssertionModality | Unset = MemoryAssertionModality.ACTUAL
+    stability: MemoryAssertionStability | Unset = MemoryAssertionStability.SETTLED
     valid_from: int | None | Unset = UNSET
     valid_to: int | None | Unset = UNSET
     depends_on: list[str] | Unset = UNSET
@@ -79,7 +79,7 @@ class MemoryAssertion:
     steps: list[str] | Unset = UNSET
     expected_outcome: None | str | Unset = UNSET
     producer: str | Unset = UNSET
-    visibility: MemoryAssertionVisibility | Unset = UNSET
+    visibility: MemoryAssertionVisibility | Unset = MemoryAssertionVisibility.PRIVATE
     embedding: list[float] | None | Unset = UNSET
     embedding_model: MemoryAssertionEmbeddingModelType0 | None | Unset = UNSET
     reconciliation_reason: None | str | Unset = UNSET

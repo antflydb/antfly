@@ -18,11 +18,11 @@ T = TypeVar("T", bound="ProvenanceEnvelope")
 class ProvenanceEnvelope:
     """
     Attributes:
-        schema_version (int | Unset):
+        schema_version (int | Unset):  Default: 1.
         links (list[ProvenanceEnvelopeLinksItem] | Unset):
     """
 
-    schema_version: int | Unset = UNSET
+    schema_version: int | Unset = 1
     links: list[ProvenanceEnvelopeLinksItem] | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:

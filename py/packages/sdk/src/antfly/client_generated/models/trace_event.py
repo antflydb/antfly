@@ -23,10 +23,10 @@ class TraceEvent:
         span_id (str):
         name (str):
         started_at (int):
-        schema_version (int | Unset):
+        schema_version (int | Unset):  Default: 1.
         parent_span_id (None | str | Unset):
         ended_at (int | None | Unset):
-        status (TraceEventStatus | Unset):
+        status (TraceEventStatus | Unset):  Default: TraceEventStatus.RUNNING.
         provenance (TraceEventProvenance | Unset):
     """
 
@@ -34,10 +34,10 @@ class TraceEvent:
     span_id: str
     name: str
     started_at: int
-    schema_version: int | Unset = UNSET
+    schema_version: int | Unset = 1
     parent_span_id: None | str | Unset = UNSET
     ended_at: int | None | Unset = UNSET
-    status: TraceEventStatus | Unset = UNSET
+    status: TraceEventStatus | Unset = TraceEventStatus.RUNNING
     provenance: TraceEventProvenance | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:

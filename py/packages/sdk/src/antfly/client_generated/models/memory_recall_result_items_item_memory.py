@@ -30,9 +30,10 @@ class MemoryRecallResultItemsItemMemory:
         input_hash (str | Unset):
         asserted_valid_to (int | None | Unset):
         explicit_disposition (MemoryRecallResultItemsItemMemoryExplicitDispositionType0 | None | Unset):
-        recorded_at (int | Unset):
-        lifecycle (MemoryRecallResultItemsItemMemoryLifecycle | Unset):
-        stale (bool | Unset):
+        recorded_at (int | Unset):  Default: 0.
+        lifecycle (MemoryRecallResultItemsItemMemoryLifecycle | Unset):  Default:
+            MemoryRecallResultItemsItemMemoryLifecycle.ACTIVE.
+        stale (bool | Unset):  Default: False.
         reason (None | str | Unset):
         conflicts_with (list[str] | Unset):
         recorded_to (int | None | Unset):
@@ -48,9 +49,9 @@ class MemoryRecallResultItemsItemMemory:
     input_hash: str | Unset = UNSET
     asserted_valid_to: int | None | Unset = UNSET
     explicit_disposition: MemoryRecallResultItemsItemMemoryExplicitDispositionType0 | None | Unset = UNSET
-    recorded_at: int | Unset = UNSET
-    lifecycle: MemoryRecallResultItemsItemMemoryLifecycle | Unset = UNSET
-    stale: bool | Unset = UNSET
+    recorded_at: int | Unset = 0
+    lifecycle: MemoryRecallResultItemsItemMemoryLifecycle | Unset = MemoryRecallResultItemsItemMemoryLifecycle.ACTIVE
+    stale: bool | Unset = False
     reason: None | str | Unset = UNSET
     conflicts_with: list[str] | Unset = UNSET
     recorded_to: int | None | Unset = UNSET

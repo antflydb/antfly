@@ -37,13 +37,17 @@ class MemoryRecordPageItemsItemAssertion:
         value (str):
         statement (str):
         evidence (list[MemoryRecordPageItemsItemAssertionEvidenceItem]):
-        kind (MemoryRecordPageItemsItemAssertionKind | Unset):
+        kind (MemoryRecordPageItemsItemAssertionKind | Unset):  Default:
+            MemoryRecordPageItemsItemAssertionKind.SEMANTIC.
         scope (str | Unset):
         task (None | str | Unset):
         environment (None | str | Unset):
-        role (MemoryRecordPageItemsItemAssertionRole | Unset):
-        modality (MemoryRecordPageItemsItemAssertionModality | Unset):
-        stability (MemoryRecordPageItemsItemAssertionStability | Unset):
+        role (MemoryRecordPageItemsItemAssertionRole | Unset):  Default:
+            MemoryRecordPageItemsItemAssertionRole.REPORTED.
+        modality (MemoryRecordPageItemsItemAssertionModality | Unset):  Default:
+            MemoryRecordPageItemsItemAssertionModality.ACTUAL.
+        stability (MemoryRecordPageItemsItemAssertionStability | Unset):  Default:
+            MemoryRecordPageItemsItemAssertionStability.SETTLED.
         valid_from (int | None | Unset):
         valid_to (int | None | Unset):
         depends_on (list[str] | Unset):
@@ -55,7 +59,8 @@ class MemoryRecordPageItemsItemAssertion:
         steps (list[str] | Unset):
         expected_outcome (None | str | Unset):
         producer (str | Unset):
-        visibility (MemoryRecordPageItemsItemAssertionVisibility | Unset):
+        visibility (MemoryRecordPageItemsItemAssertionVisibility | Unset):  Default:
+            MemoryRecordPageItemsItemAssertionVisibility.PRIVATE.
         embedding (list[float] | None | Unset):
         embedding_model (MemoryRecordPageItemsItemAssertionEmbeddingModelType0 | None | Unset):
         reconciliation_reason (None | str | Unset):
@@ -67,13 +72,13 @@ class MemoryRecordPageItemsItemAssertion:
     value: str
     statement: str
     evidence: list[MemoryRecordPageItemsItemAssertionEvidenceItem]
-    kind: MemoryRecordPageItemsItemAssertionKind | Unset = UNSET
+    kind: MemoryRecordPageItemsItemAssertionKind | Unset = MemoryRecordPageItemsItemAssertionKind.SEMANTIC
     scope: str | Unset = UNSET
     task: None | str | Unset = UNSET
     environment: None | str | Unset = UNSET
-    role: MemoryRecordPageItemsItemAssertionRole | Unset = UNSET
-    modality: MemoryRecordPageItemsItemAssertionModality | Unset = UNSET
-    stability: MemoryRecordPageItemsItemAssertionStability | Unset = UNSET
+    role: MemoryRecordPageItemsItemAssertionRole | Unset = MemoryRecordPageItemsItemAssertionRole.REPORTED
+    modality: MemoryRecordPageItemsItemAssertionModality | Unset = MemoryRecordPageItemsItemAssertionModality.ACTUAL
+    stability: MemoryRecordPageItemsItemAssertionStability | Unset = MemoryRecordPageItemsItemAssertionStability.SETTLED
     valid_from: int | None | Unset = UNSET
     valid_to: int | None | Unset = UNSET
     depends_on: list[str] | Unset = UNSET
@@ -85,7 +90,9 @@ class MemoryRecordPageItemsItemAssertion:
     steps: list[str] | Unset = UNSET
     expected_outcome: None | str | Unset = UNSET
     producer: str | Unset = UNSET
-    visibility: MemoryRecordPageItemsItemAssertionVisibility | Unset = UNSET
+    visibility: MemoryRecordPageItemsItemAssertionVisibility | Unset = (
+        MemoryRecordPageItemsItemAssertionVisibility.PRIVATE
+    )
     embedding: list[float] | None | Unset = UNSET
     embedding_model: MemoryRecordPageItemsItemAssertionEmbeddingModelType0 | None | Unset = UNSET
     reconciliation_reason: None | str | Unset = UNSET

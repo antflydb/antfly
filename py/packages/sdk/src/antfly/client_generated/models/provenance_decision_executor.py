@@ -17,13 +17,13 @@ class ProvenanceDecisionExecutor:
     """
     Attributes:
         id (str):
-        kind (ProvenanceDecisionExecutorKind | Unset):
-        assurance (ProvenanceDecisionExecutorAssurance | Unset):
+        kind (ProvenanceDecisionExecutorKind | Unset):  Default: ProvenanceDecisionExecutorKind.USER.
+        assurance (ProvenanceDecisionExecutorAssurance | Unset):  Default: ProvenanceDecisionExecutorAssurance.DECLARED.
     """
 
     id: str
-    kind: ProvenanceDecisionExecutorKind | Unset = UNSET
-    assurance: ProvenanceDecisionExecutorAssurance | Unset = UNSET
+    kind: ProvenanceDecisionExecutorKind | Unset = ProvenanceDecisionExecutorKind.USER
+    assurance: ProvenanceDecisionExecutorAssurance | Unset = ProvenanceDecisionExecutorAssurance.DECLARED
 
     def to_dict(self) -> dict[str, Any]:
         id = self.id

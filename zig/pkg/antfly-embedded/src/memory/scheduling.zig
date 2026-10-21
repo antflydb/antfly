@@ -38,7 +38,7 @@ pub const Executor = struct {
 };
 fn blocked(err: anyerror) bool {
     return switch (err) {
-        error.Forbidden, error.Unauthorized, error.StoredDestinationAuthorizationRevoked, error.StoredDestinationAuthorizationInvalid, error.StoredDestinationCredentialUnsupported, error.MemoryRowPolicyUnsupported => true,
+        error.MemorySourceAccessDenied, error.Forbidden, error.Unauthorized, error.StoredDestinationAuthorizationRevoked, error.StoredDestinationAuthorizationInvalid, error.StoredDestinationCredentialUnsupported, error.MemoryRowPolicyUnsupported => true,
         else => false,
     };
 }

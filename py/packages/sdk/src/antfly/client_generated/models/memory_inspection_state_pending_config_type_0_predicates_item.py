@@ -18,13 +18,16 @@ class MemoryInspectionStatePendingConfigType0PredicatesItem:
     """
     Attributes:
         name (str):
-        cardinality (MemoryInspectionStatePendingConfigType0PredicatesItemCardinality | Unset):
+        cardinality (MemoryInspectionStatePendingConfigType0PredicatesItemCardinality | Unset):  Default:
+            MemoryInspectionStatePendingConfigType0PredicatesItemCardinality.MANY.
         subject_type (None | str | Unset):
         object_type (None | str | Unset):
     """
 
     name: str
-    cardinality: MemoryInspectionStatePendingConfigType0PredicatesItemCardinality | Unset = UNSET
+    cardinality: MemoryInspectionStatePendingConfigType0PredicatesItemCardinality | Unset = (
+        MemoryInspectionStatePendingConfigType0PredicatesItemCardinality.MANY
+    )
     subject_type: None | str | Unset = UNSET
     object_type: None | str | Unset = UNSET
 

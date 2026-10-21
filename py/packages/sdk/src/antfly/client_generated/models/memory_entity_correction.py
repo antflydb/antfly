@@ -19,21 +19,21 @@ class MemoryEntityCorrection:
         action (MemoryEntityCorrectionAction):
         from_ (str):
         expected_revision (int):
-        absorbed (MemoryEntityCorrectionAbsorbed | Unset):
+        absorbed (MemoryEntityCorrectionAbsorbed | Unset):  Default: MemoryEntityCorrectionAbsorbed.REJECT.
         reason (str | Unset):
         to (None | str | Unset):
-        replace (bool | Unset):
-        pin_distinct (bool | Unset):
+        replace (bool | Unset):  Default: False.
+        pin_distinct (bool | Unset):  Default: False.
     """
 
     action: MemoryEntityCorrectionAction
     from_: str
     expected_revision: int
-    absorbed: MemoryEntityCorrectionAbsorbed | Unset = UNSET
+    absorbed: MemoryEntityCorrectionAbsorbed | Unset = MemoryEntityCorrectionAbsorbed.REJECT
     reason: str | Unset = UNSET
     to: None | str | Unset = UNSET
-    replace: bool | Unset = UNSET
-    pin_distinct: bool | Unset = UNSET
+    replace: bool | Unset = False
+    pin_distinct: bool | Unset = False
 
     def to_dict(self) -> dict[str, Any]:
         action = self.action.value

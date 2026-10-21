@@ -21,13 +21,17 @@ class ProvenanceDecisionOriginType0ApproverType0:
     """
     Attributes:
         id (str):
-        kind (ProvenanceDecisionOriginType0ApproverType0Kind | Unset):
-        assurance (ProvenanceDecisionOriginType0ApproverType0Assurance | Unset):
+        kind (ProvenanceDecisionOriginType0ApproverType0Kind | Unset):  Default:
+            ProvenanceDecisionOriginType0ApproverType0Kind.USER.
+        assurance (ProvenanceDecisionOriginType0ApproverType0Assurance | Unset):  Default:
+            ProvenanceDecisionOriginType0ApproverType0Assurance.DECLARED.
     """
 
     id: str
-    kind: ProvenanceDecisionOriginType0ApproverType0Kind | Unset = UNSET
-    assurance: ProvenanceDecisionOriginType0ApproverType0Assurance | Unset = UNSET
+    kind: ProvenanceDecisionOriginType0ApproverType0Kind | Unset = ProvenanceDecisionOriginType0ApproverType0Kind.USER
+    assurance: ProvenanceDecisionOriginType0ApproverType0Assurance | Unset = (
+        ProvenanceDecisionOriginType0ApproverType0Assurance.DECLARED
+    )
 
     def to_dict(self) -> dict[str, Any]:
         id = self.id

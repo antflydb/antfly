@@ -17,13 +17,13 @@ class MemoryInspectionStatePendingConfigType0SourceRulesItem:
         source_id (str):
         principal (None | str | Unset):
         producer (None | str | Unset):
-        authority (int | Unset):
+        authority (int | Unset):  Default: 0.
     """
 
     source_id: str
     principal: None | str | Unset = UNSET
     producer: None | str | Unset = UNSET
-    authority: int | Unset = UNSET
+    authority: int | Unset = 0
 
     def to_dict(self) -> dict[str, Any]:
         source_id = self.source_id

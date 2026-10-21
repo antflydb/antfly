@@ -21,7 +21,8 @@ class MemoryEntityPageItemsItemEntity:
     Attributes:
         id (str):
         name (str):
-        visibility (MemoryEntityPageItemsItemEntityVisibility | Unset):
+        visibility (MemoryEntityPageItemsItemEntityVisibility | Unset):  Default:
+            MemoryEntityPageItemsItemEntityVisibility.PRIVATE.
         evidence (list[MemoryEntityPageItemsItemEntityEvidenceItem] | Unset):
         type_ (str | Unset):
         aliases (list[str] | Unset):
@@ -30,7 +31,7 @@ class MemoryEntityPageItemsItemEntity:
 
     id: str
     name: str
-    visibility: MemoryEntityPageItemsItemEntityVisibility | Unset = UNSET
+    visibility: MemoryEntityPageItemsItemEntityVisibility | Unset = MemoryEntityPageItemsItemEntityVisibility.PRIVATE
     evidence: list[MemoryEntityPageItemsItemEntityEvidenceItem] | Unset = UNSET
     type_: str | Unset = UNSET
     aliases: list[str] | Unset = UNSET

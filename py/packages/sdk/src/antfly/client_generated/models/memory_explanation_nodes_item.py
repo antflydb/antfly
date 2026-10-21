@@ -22,13 +22,13 @@ class MemoryExplanationNodesItem:
         resource (MemoryExplanationNodesItemResource):
         record (Any):
         links (list[MemoryExplanationNodesItemLinksItem]):
-        payload_truncated (bool | Unset):
+        payload_truncated (bool | Unset):  Default: False.
     """
 
     resource: MemoryExplanationNodesItemResource
     record: Any
     links: list[MemoryExplanationNodesItemLinksItem]
-    payload_truncated: bool | Unset = UNSET
+    payload_truncated: bool | Unset = False
 
     def to_dict(self) -> dict[str, Any]:
         resource = self.resource.to_dict()

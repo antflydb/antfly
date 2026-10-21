@@ -17,6 +17,8 @@ package oapi
 
 import (
 	"encoding/json"
+	"math"
+	"net/http"
 	"testing"
 )
 
@@ -25,7 +27,7 @@ func TestMemorySupersessionBoundaryPreservesUnknownAndEpoch(t *testing.T) {
 		name     string
 		raw      string
 		known    bool
-		boundary int
+		boundary int64
 	}{
 		{name: "missing", raw: `{}`},
 		{name: "unknown", raw: `{"superseded_valid_at":null,"explicit_disposition":{"superseded_valid_at":null}}`},
@@ -37,7 +39,7 @@ func TestMemorySupersessionBoundaryPreservesUnknownAndEpoch(t *testing.T) {
 			if err := json.Unmarshal([]byte(tc.raw), &record); err != nil {
 				t.Fatal(err)
 			}
-			for _, boundary := range []*int{record.SupersededValidAt, record.ExplicitDisposition.SupersededValidAt} {
+			for _, boundary := range []*int64{record.SupersededValidAt, record.ExplicitDisposition.SupersededValidAt} {
 				if (boundary != nil) != tc.known {
 					t.Fatalf("replacement time lost its known/unknown state: %v", boundary)
 				}
@@ -121,5 +123,94 @@ func TestMemoryListQueryPreservesEpochZero(t *testing.T) {
 		if !query.Has(name) || query.Get(name) != "0" {
 			t.Fatalf("epoch query %s lost: %s", name, request.URL)
 		}
+	}
+}
+
+func TestMemoryHTTPOptionalParametersPreserveAbsence(t *testing.T) {
+	database := "projects"
+	requests := []func() (*http.Request, error){
+		func() (*http.Request, error) {
+			return NewListMemoriesRequest("http://memory.test", "team", &ListMemoriesParams{XAntflyDatabase: &database})
+		},
+		func() (*http.Request, error) {
+			return NewGetMemoryHistoryRequest("http://memory.test", "team", "claim", &GetMemoryHistoryParams{XAntflyDatabase: &database})
+		},
+		func() (*http.Request, error) {
+			return NewListMemoryEntitiesRequest("http://memory.test", "team", &ListMemoryEntitiesParams{XAntflyDatabase: &database})
+		},
+	}
+	for _, build := range requests {
+		request, err := build()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if request.URL.RawQuery != "" {
+			t.Fatalf("absent parameters sent: %s", request.URL)
+		}
+		if got := request.Header.Get("X-Antfly-Database"); got != database {
+			t.Fatalf("scope lost: %q", got)
+		}
+		if got := request.Header.Values("X-Antfly-Namespace"); len(got) != 0 {
+			t.Fatalf("absent namespace sent: %v", got)
+		}
+	}
+}
+
+func TestMemoryProvisionalFilterPreservesOmittedFalseAndTrue(t *testing.T) {
+	for _, raw := range []string{`{}`, `{"include_provisional":false}`, `{"include_provisional":true}`} {
+		var request MemoryRecallRequest
+		if err := json.Unmarshal([]byte(raw), &request); err != nil {
+			t.Fatal(err)
+		}
+		encoded, err := json.Marshal(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(encoded) != raw {
+			t.Fatalf("filter changed: %s -> %s", raw, encoded)
+		}
+	}
+	exclude := false
+	request, err := NewListMemoriesRequest("http://memory.test", "team", &ListMemoriesParams{IncludeProvisional: &exclude})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q := request.URL.Query(); len(q) != 1 || q.Get("include_provisional") != "false" {
+		t.Fatalf("filter changed: %s", request.URL)
+	}
+}
+
+func TestMemoryNativeIntegerDomainsRoundTrip(t *testing.T) {
+	var config MemorySpaceConfig
+	if err := json.Unmarshal([]byte(`{"retention_ms":18446744073709551615}`), &config); err != nil {
+		t.Fatal(err)
+	}
+	if config.RetentionMs == nil || *config.RetentionMs != math.MaxUint64 {
+		t.Fatalf("uint64 lost: %v", config.RetentionMs)
+	}
+	var correction MemoryCorrection
+	if err := json.Unmarshal([]byte(`{"expected_revision":18446744073709551615}`), &correction); err != nil {
+		t.Fatal(err)
+	}
+	if correction.ExpectedRevision != math.MaxUint64 {
+		t.Fatalf("uint64 revision lost: %v", correction.ExpectedRevision)
+	}
+	var request MemoryRecallRequest
+	if err := json.Unmarshal([]byte(`{"known_at":-9223372036854775808,"valid_at":9223372036854775807}`), &request); err != nil {
+		t.Fatal(err)
+	}
+	if request.KnownAt == nil || *request.KnownAt != math.MinInt64 || request.ValidAt == nil || *request.ValidAt != math.MaxInt64 {
+		t.Fatal("signed timestamp bounds lost")
+	}
+	encoded, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded MemorySpaceConfig
+	if err = json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.RetentionMs == nil || *decoded.RetentionMs != math.MaxUint64 {
+		t.Fatalf("round trip lost retention: %s", encoded)
 	}
 }

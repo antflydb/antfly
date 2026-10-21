@@ -29,7 +29,17 @@ fn build(comptime T: type, a: std.mem.Allocator, comptime strict: bool) anyerror
             var properties: std.json.ObjectMap = .empty;
             var required: std.ArrayList(std.json.Value) = .empty;
             inline for (info.field_names, info.field_types, info.field_attrs) |name, Field, attrs| {
-                try properties.put(a, name, try build(Field, a, strict));
+                var property = try build(Field, a, strict);
+                // Wire defaults are part of the client contract. Strict model
+                // schemas still require every field and do not supply defaults.
+                if (!strict) if (attrs.defaultValue(Field)) |default| switch (@typeInfo(Field)) {
+                    .bool, .int, .float, .@"enum", .optional => {
+                        const json = try std.json.Stringify.valueAlloc(a, default, .{});
+                        try property.object.put(a, "default", try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{ .parse_numbers = false }));
+                    },
+                    else => {},
+                };
+                try properties.put(a, name, property);
                 if (strict or attrs.defaultValue(Field) == null) try required.append(a, .{ .string = name });
             }
             try object.put(a, "type", .{ .string = "object" });
@@ -54,7 +64,12 @@ fn build(comptime T: type, a: std.mem.Allocator, comptime strict: bool) anyerror
             try object.put(a, "type", .{ .string = if (info.child == u8) "string" else "array" });
             if (info.child != u8) try object.put(a, "items", try build(info.child, a, strict));
         },
-        .int => try object.put(a, "type", .{ .string = "integer" }),
+        .int => |info| {
+            try object.put(a, "type", .{ .string = "integer" });
+            try object.put(a, "minimum", .{ .number_string = try std.fmt.allocPrint(a, "{d}", .{std.math.minInt(T)}) });
+            try object.put(a, "maximum", .{ .number_string = try std.fmt.allocPrint(a, "{d}", .{std.math.maxInt(T)}) });
+            if (!strict) try object.put(a, "format", .{ .string = try std.fmt.allocPrint(a, "{s}int{d}", .{ if (info.signedness == .unsigned) "u" else "", if (info.bits <= 32) @as(u8, 32) else @as(u8, 64) }) });
+        },
         .float => try object.put(a, "type", .{ .string = "number" }),
         .bool => try object.put(a, "type", .{ .string = "boolean" }),
         else => @compileError("unsupported memory schema type: " ++ @typeName(T)),
@@ -66,4 +81,25 @@ test "memory schemas cover native generated contracts" {
     defer arena.deinit();
     const schema = try value(@import("types.zig").Generated, arena.allocator());
     try std.testing.expect(schema.object.contains("additionalProperties"));
+}
+
+test "memory wire schemas preserve scalar defaults and native integer domains" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Contract = struct { revision: u64 = std.math.maxInt(u64), known: ?i64 = null, include_provisional: bool = true, limit: u16 = 20 };
+    const props = (try wire(Contract, a)).object.get("properties").?.object;
+    const revision = props.get("revision").?.object;
+    try std.testing.expectEqualStrings("uint64", revision.get("format").?.string);
+    try std.testing.expectEqualStrings("18446744073709551615", revision.get("maximum").?.number_string);
+    try std.testing.expectEqualStrings("18446744073709551615", revision.get("default").?.number_string);
+    try std.testing.expect(props.get("include_provisional").?.object.get("default").?.bool);
+    const known = props.get("known").?.object;
+    try std.testing.expect(known.get("default").? == .null);
+    const integer = known.get("anyOf").?.array.items[0].object;
+    try std.testing.expectEqualStrings("int64", integer.get("format").?.string);
+    try std.testing.expectEqualStrings("-9223372036854775808", integer.get("minimum").?.number_string);
+    const strict = try value(Contract, a);
+    try std.testing.expectEqual(@as(usize, 4), strict.object.get("required").?.array.items.len);
+    try std.testing.expect(strict.object.get("properties").?.object.get("include_provisional").?.object.get("default") == null);
 }

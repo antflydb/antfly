@@ -564,7 +564,7 @@ const Run = struct {
         const durable = self.retained(record, 0);
         self.retention_maintenance = previous;
         if (!try durable) return false;
-        if (!try self.retained(record, 0)) return error.Forbidden;
+        if (!try self.retained(record, 0)) return error.MemorySourceAccessDenied;
         return true;
     }
     fn outcomeRetained(self: *Run, record: StoredOutcome) !bool {
@@ -1579,6 +1579,7 @@ const Run = struct {
         var pending = (try self.read(t.Operation, path)) orelse return error.MemoryNotFound;
         receipt.origin = pending.origin;
         receipt.config_generation = pending.config_generation;
+        defer projectProgress(pending, receipt);
         try self.service.context.requireGrant(operationGrant(pending));
         if (!eql(u8, pending.owner, self.service.context.principal) and !self.service.context.admin) return error.Forbidden;
         if (pending.phase == .succeeded or pending.phase == .cancelled) return;
@@ -1588,12 +1589,12 @@ const Run = struct {
         self.service.context.principal = pending.owner;
         defer self.service.context.principal = caller;
         if (eql(u8, pending.action, "configure")) {
-            self.reindex(path, &pending, receipt) catch |err| {
+            self.reindex(path, &pending) catch |err| {
                 // Source authorization is a publication prerequisite, not a
                 // producer failure. Keep the durable cursor and retry budget.
-                if (err == error.Forbidden or err == error.Unauthorized) return err;
+                if (err == error.MemorySourceAccessDenied) return err;
                 if (err != error.MemoryExternalVectorRequired) pending.attempts += 1;
-                try self.processingFailure(path, &pending, receipt, err);
+                try self.processingFailure(path, &pending, err);
                 if (pending.phase == .failed) {
                     self.state.pending_config = null;
                     try self.put("cleanup", .{ .cursor = @as(?[]const u8, null) });
@@ -1603,10 +1604,7 @@ const Run = struct {
             return;
         }
         if (pending.config_generation != self.state.config.generation) {
-            pending.phase = .cancelled;
-            pending.error_code = "MemoryConfigurationChanged";
-            try self.put(path, pending);
-            try self.remove(try key(self.a, "pending", pending.id));
+            try self.cancelOperation(path, &pending, "MemoryConfigurationChanged");
             return;
         }
         if (pending.attempts >= self.state.config.max_attempts) return error.MemoryRetryExhausted;
@@ -1614,33 +1612,27 @@ const Run = struct {
         var sources: std.ArrayList(t.StoredEvidence) = .empty;
         for (pending.inputs) |input| {
             const source = (try self.evidence(input)) orelse {
-                pending.phase = .cancelled;
-                pending.error_code = "MemoryForgotten";
-                try self.put(path, pending);
-                try self.remove(try key(self.a, "pending", pending.id));
+                try self.cancelOperation(path, &pending, "MemoryForgotten");
                 return;
             };
             try self.authorize(source.owner, source.evidence.visibility);
-            if (!try self.evidenceRetained(source) or !try self.resourceCurrent(source)) {
-                pending.phase = .cancelled;
-                pending.error_code = "MemoryForgotten";
-                try self.put(path, pending);
-                try self.remove(try key(self.a, "pending", pending.id));
+            if (!try self.processingSourceAvailable(source)) {
+                try self.cancelOperation(path, &pending, "MemoryForgotten");
                 return;
             }
             try sources.append(self.a, source);
         }
         for (pending.context_inputs) |input| {
-            var source = (try self.evidence(input)) orelse return self.processingFailure(path, &pending, receipt, error.MemoryForgotten);
+            var source = (try self.evidence(input)) orelse return self.processingFailure(path, &pending, error.MemoryForgotten);
             try self.authorize(source.owner, source.evidence.visibility);
-            if (!try self.evidenceRetained(source) or !try self.resourceCurrent(source)) return self.processingFailure(path, &pending, receipt, error.MemoryForgotten);
+            if (!try self.processingSourceAvailable(source)) return self.processingFailure(path, &pending, error.MemoryForgotten);
             source.context_only = true;
             try sources.append(self.a, source);
         }
         pending.attempts += 1;
         const generate = self.service.backend.generate orelse return error.MemoryCapabilityUnavailable;
-        const generated = generate(self.service.backend.ptr, self.a, self.state.config, sources.items) catch |err| return self.processingFailure(path, &pending, receipt, err);
-        self.publishGenerated(pending, generated, sources.items) catch |err| return self.processingFailure(path, &pending, receipt, err);
+        const generated = generate(self.service.backend.ptr, self.a, self.state.config, sources.items) catch |err| return self.processingFailure(path, &pending, err);
+        self.publishGenerated(pending, generated, sources.items) catch |err| return self.processingFailure(path, &pending, err);
         pending.phase = .succeeded;
         pending.assertions_ready = true;
         pending.error_code = null;
@@ -1648,17 +1640,46 @@ const Run = struct {
         try self.put(path, pending);
         try self.remove(try key(self.a, "pending", pending.id));
     }
-    fn processingFailure(self: *Run, path: []const u8, pending: *t.Operation, receipt: *t.Operation, err: anyerror) !void {
+    fn cancelOperation(self: *Run, path: []const u8, pending: *t.Operation, code: []const u8) !void {
+        pending.phase = .cancelled;
+        pending.assertions_ready = false;
+        pending.error_code = code;
+        pending.next_retry_at = null;
+        try self.put(path, pending.*);
+        try self.remove(try key(self.a, "pending", pending.id));
+    }
+    fn projectProgress(pending: t.Operation, receipt: *t.Operation) void {
+        receipt.phase = pending.phase;
+        receipt.evidence_accepted = pending.evidence_accepted;
+        receipt.assertions_ready = pending.phase == .succeeded and pending.assertions_ready;
+        receipt.attempts = pending.attempts;
+        receipt.error_code = pending.error_code;
+        receipt.next_retry_at = pending.next_retry_at;
+    }
+    fn processingSourceAvailable(self: *Run, source: t.StoredEvidence) !bool {
+        // Forgetting fences, expiry, deletion and version drift are terminal;
+        // an inaccessible current source remains a durable work obligation.
+        const previous = self.retention_maintenance;
+        self.retention_maintenance = true;
+        const durable = self.evidenceRetained(source);
+        self.retention_maintenance = previous;
+        if (!try durable) return false;
+        if (source.evidence.resource) |reference| {
+            const snapshot = try self.resourceSnapshot(reference);
+            if (snapshot.state == .denied) return error.MemorySourceAccessDenied;
+            return snapshot.state == .current;
+        }
+        return true;
+    }
+    fn processingFailure(self: *Run, path: []const u8, pending: *t.Operation, err: anyerror) !void {
         // A rejected model output publishes no partial assertions or entities.
         self.changes.clearRetainingCapacity();
         pending.phase = if (err == error.MemoryForgotten) .cancelled else if (pending.attempts >= self.state.config.max_attempts) .failed else .pending;
         pending.error_code = @errorName(err);
-        pending.next_retry_at = self.service.context.now_ms +| (@as(i64, 1000) * (@as(i64, 1) << @intCast(@min(pending.attempts, 10))));
+        pending.assertions_ready = false;
+        pending.next_retry_at = if (pending.phase == .pending) self.service.context.now_ms +| (@as(i64, 1000) * (@as(i64, 1) << @intCast(@min(pending.attempts, 10)))) else null;
         try self.put(path, pending.*);
         if (pending.phase == .failed or pending.phase == .cancelled) try self.remove(try key(self.a, "pending", pending.id));
-        receipt.phase = pending.phase;
-        receipt.assertions_ready = false;
-        receipt.error_code = pending.error_code;
     }
     fn publishGenerated(self: *Run, pending: t.Operation, generated: t.Generated, sources: []const t.StoredEvidence) !void {
         // Reconstruct ownership from immutable admitted evidence; never trust
@@ -1716,7 +1737,7 @@ const Run = struct {
             try self.putVector(config, record.assertion, item.embedding);
         }
     }
-    fn reindex(self: *Run, path: []const u8, pending: *t.Operation, receipt: *t.Operation) !void {
+    fn reindex(self: *Run, path: []const u8, pending: *t.Operation) !void {
         try self.requireAdmin();
         const config = self.state.pending_config orelse return error.MemoryConfigurationChanged;
         if (config.generation != pending.config_generation) return error.MemoryConfigurationChanged;
@@ -1745,8 +1766,6 @@ const Run = struct {
         pending.attempts = 0;
         pending.error_code = null;
         pending.next_retry_at = null;
-        receipt.phase = pending.phase;
-        receipt.assertions_ready = pending.assertions_ready;
         try self.put(path, pending.*);
     }
     fn retireAssertion(self: *Run, id: []const u8) !void {

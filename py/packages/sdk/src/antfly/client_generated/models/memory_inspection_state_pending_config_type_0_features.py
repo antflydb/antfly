@@ -17,18 +17,21 @@ T = TypeVar("T", bound="MemoryInspectionStatePendingConfigType0Features")
 class MemoryInspectionStatePendingConfigType0Features:
     """
     Attributes:
-        semantic_recall (bool | Unset):
-        entity_extraction (bool | Unset):
-        assertion_distillation (bool | Unset):
-        summaries (bool | Unset):
-        reconciliation (MemoryInspectionStatePendingConfigType0FeaturesReconciliation | Unset):
+        semantic_recall (bool | Unset):  Default: False.
+        entity_extraction (bool | Unset):  Default: False.
+        assertion_distillation (bool | Unset):  Default: False.
+        summaries (bool | Unset):  Default: False.
+        reconciliation (MemoryInspectionStatePendingConfigType0FeaturesReconciliation | Unset):  Default:
+            MemoryInspectionStatePendingConfigType0FeaturesReconciliation.EXPLICIT.
     """
 
-    semantic_recall: bool | Unset = UNSET
-    entity_extraction: bool | Unset = UNSET
-    assertion_distillation: bool | Unset = UNSET
-    summaries: bool | Unset = UNSET
-    reconciliation: MemoryInspectionStatePendingConfigType0FeaturesReconciliation | Unset = UNSET
+    semantic_recall: bool | Unset = False
+    entity_extraction: bool | Unset = False
+    assertion_distillation: bool | Unset = False
+    summaries: bool | Unset = False
+    reconciliation: MemoryInspectionStatePendingConfigType0FeaturesReconciliation | Unset = (
+        MemoryInspectionStatePendingConfigType0FeaturesReconciliation.EXPLICIT
+    )
 
     def to_dict(self) -> dict[str, Any]:
         semantic_recall = self.semantic_recall

@@ -16,13 +16,14 @@ class MemorySpaceConfigPredicatesItem:
     """
     Attributes:
         name (str):
-        cardinality (MemorySpaceConfigPredicatesItemCardinality | Unset):
+        cardinality (MemorySpaceConfigPredicatesItemCardinality | Unset):  Default:
+            MemorySpaceConfigPredicatesItemCardinality.MANY.
         subject_type (None | str | Unset):
         object_type (None | str | Unset):
     """
 
     name: str
-    cardinality: MemorySpaceConfigPredicatesItemCardinality | Unset = UNSET
+    cardinality: MemorySpaceConfigPredicatesItemCardinality | Unset = MemorySpaceConfigPredicatesItemCardinality.MANY
     subject_type: None | str | Unset = UNSET
     object_type: None | str | Unset = UNSET
 

@@ -17,13 +17,13 @@ class MemoryForgetRequest:
         evidence_ids (list[str] | Unset):
         assertion_ids (list[str] | Unset):
         source_ids (list[str] | Unset):
-        all_ (bool | Unset):
+        all_ (bool | Unset):  Default: False.
     """
 
     evidence_ids: list[str] | Unset = UNSET
     assertion_ids: list[str] | Unset = UNSET
     source_ids: list[str] | Unset = UNSET
-    all_: bool | Unset = UNSET
+    all_: bool | Unset = False
 
     def to_dict(self) -> dict[str, Any]:
         evidence_ids: list[str] | Unset = UNSET

@@ -33,10 +33,10 @@ class MemoryRecallRequest:
         kind (MemoryRecallRequestKind | Unset):
         valid_at (int | None | Unset):
         known_at (int | None | Unset):
-        include_history (bool | Unset):
-        include_provisional (bool | Unset):
-        limit (int | Unset):
-        token_budget (int | Unset):
+        include_history (bool | Unset):  Default: False.
+        include_provisional (bool | Unset):  Default: True.
+        limit (int | Unset):  Default: 20.
+        token_budget (int | Unset):  Default: 2048.
         cursor (None | str | Unset):
         embedding (list[float] | None | Unset):
         embedding_model (MemoryRecallRequestEmbeddingModelType0 | None | Unset):
@@ -54,10 +54,10 @@ class MemoryRecallRequest:
     kind: MemoryRecallRequestKind | Unset = UNSET
     valid_at: int | None | Unset = UNSET
     known_at: int | None | Unset = UNSET
-    include_history: bool | Unset = UNSET
-    include_provisional: bool | Unset = UNSET
-    limit: int | Unset = UNSET
-    token_budget: int | Unset = UNSET
+    include_history: bool | Unset = False
+    include_provisional: bool | Unset = True
+    limit: int | Unset = 20
+    token_budget: int | Unset = 2048
     cursor: None | str | Unset = UNSET
     embedding: list[float] | None | Unset = UNSET
     embedding_model: MemoryRecallRequestEmbeddingModelType0 | None | Unset = UNSET

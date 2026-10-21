@@ -32,37 +32,40 @@ T = TypeVar("T", bound="MemoryInspectionStatePendingConfigType0")
 class MemoryInspectionStatePendingConfigType0:
     """
     Attributes:
-        version (int | Unset):
-        generation (int | Unset):
-        embedding_generation (int | Unset):
-        processing (MemoryInspectionStatePendingConfigType0Processing | Unset):
+        version (int | Unset):  Default: 1.
+        generation (int | Unset):  Default: 1.
+        embedding_generation (int | Unset):  Default: 1.
+        processing (MemoryInspectionStatePendingConfigType0Processing | Unset):  Default:
+            MemoryInspectionStatePendingConfigType0Processing.EXTERNAL.
         ontology_version (str | Unset):
         policy_version (str | Unset):
         features (MemoryInspectionStatePendingConfigType0Features | Unset):
         models (MemoryInspectionStatePendingConfigType0Models | Unset):
         predicates (list[MemoryInspectionStatePendingConfigType0PredicatesItem] | Unset):
         source_rules (list[MemoryInspectionStatePendingConfigType0SourceRulesItem] | Unset):
-        max_input_bytes (int | Unset):
-        max_output_items (int | Unset):
-        max_attempts (int | Unset):
-        max_recall_tokens (int | Unset):
+        max_input_bytes (int | Unset):  Default: 262144.
+        max_output_items (int | Unset):  Default: 128.
+        max_attempts (int | Unset):  Default: 3.
+        max_recall_tokens (int | Unset):  Default: 8192.
         retention_ms (int | None | Unset):
     """
 
-    version: int | Unset = UNSET
-    generation: int | Unset = UNSET
-    embedding_generation: int | Unset = UNSET
-    processing: MemoryInspectionStatePendingConfigType0Processing | Unset = UNSET
+    version: int | Unset = 1
+    generation: int | Unset = 1
+    embedding_generation: int | Unset = 1
+    processing: MemoryInspectionStatePendingConfigType0Processing | Unset = (
+        MemoryInspectionStatePendingConfigType0Processing.EXTERNAL
+    )
     ontology_version: str | Unset = UNSET
     policy_version: str | Unset = UNSET
     features: MemoryInspectionStatePendingConfigType0Features | Unset = UNSET
     models: MemoryInspectionStatePendingConfigType0Models | Unset = UNSET
     predicates: list[MemoryInspectionStatePendingConfigType0PredicatesItem] | Unset = UNSET
     source_rules: list[MemoryInspectionStatePendingConfigType0SourceRulesItem] | Unset = UNSET
-    max_input_bytes: int | Unset = UNSET
-    max_output_items: int | Unset = UNSET
-    max_attempts: int | Unset = UNSET
-    max_recall_tokens: int | Unset = UNSET
+    max_input_bytes: int | Unset = 262144
+    max_output_items: int | Unset = 128
+    max_attempts: int | Unset = 3
+    max_recall_tokens: int | Unset = 8192
     retention_ms: int | None | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:

@@ -32670,7 +32670,7 @@ pub const MemoryConfigureRequest = struct {
 
 pub const MemoryCorrection = struct {
     id: []const u8,
-    expected_revision: i64,
+    expected_revision: u64,
     lifecycle: []const u8,
     stability: OpenApiOptionalNullable([]const u8) = .absent,
     reason: []const u8,
@@ -32754,7 +32754,7 @@ pub const MemoryCreateSpaceRequest = struct {
 };
 
 pub const MemoryEmbeddingBatch = struct {
-    generation: i64,
+    generation: u64,
     model: std.json.Value,
     items: []const std.json.Value,
 };
@@ -32823,7 +32823,7 @@ pub const MemoryEntityCorrection = struct {
     action: []const u8,
     from: []const u8,
     to: OpenApiOptionalNullable([]const u8) = .absent,
-    expected_revision: i64,
+    expected_revision: u64,
     replace: ?bool = null,
     pin_distinct: ?bool = null,
 
@@ -33116,12 +33116,12 @@ pub const MemoryEvidence = struct {
 
 pub const MemoryExplainRequest = struct {
     resource: OpenApiOptionalNullable(std.json.Value) = .absent,
-    revision: OpenApiOptionalNullable(i64) = .absent,
+    revision: OpenApiOptionalNullable(u64) = .absent,
     valid_at: OpenApiOptionalNullable(i64) = .absent,
     known_at: OpenApiOptionalNullable(i64) = .absent,
-    max_bytes: ?i64 = null,
-    max_nodes: ?i64 = null,
-    max_depth: ?i64 = null,
+    max_bytes: ?u32 = null,
+    max_nodes: ?u32 = null,
+    max_depth: ?u32 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -33205,7 +33205,7 @@ pub const MemoryExplainRequest = struct {
 };
 
 pub const MemoryExplanation = struct {
-    schema_version: ?i64 = null,
+    schema_version: ?u32 = null,
     nodes: []const std.json.Value,
     complete: bool,
     truncated: bool,
@@ -33367,13 +33367,13 @@ pub const MemoryOperation = struct {
     action: []const u8,
     request_hash: []const u8,
     owner: []const u8,
-    revision: i64,
-    config_generation: i64,
+    revision: u64,
+    config_generation: u64,
     created_at: i64,
     phase: []const u8,
     evidence_accepted: bool,
     assertions_ready: bool,
-    attempts: i64,
+    attempts: u32,
     error_code: ?[]const u8,
     next_retry_at: ?i64,
 
@@ -33491,8 +33491,8 @@ pub const MemoryRecallRequest = struct {
     known_at: OpenApiOptionalNullable(i64) = .absent,
     include_history: ?bool = null,
     include_provisional: ?bool = null,
-    limit: ?i64 = null,
-    token_budget: ?i64 = null,
+    limit: ?u32 = null,
+    token_budget: ?u32 = null,
     cursor: OpenApiOptionalNullable([]const u8) = .absent,
     embedding: OpenApiOptionalNullable([]const f64) = .absent,
     embedding_model: OpenApiOptionalNullable(std.json.Value) = .absent,
@@ -33713,11 +33713,11 @@ pub const MemoryRecallResult = struct {
     next_cursor: ?[]const u8,
     complete: bool,
     truncated: bool,
-    scanned: i64,
-    omitted: i64,
-    token_upper_bound: i64,
-    revision: i64,
-    config_generation: i64,
+    scanned: u64,
+    omitted: u64,
+    token_upper_bound: u64,
+    revision: u64,
+    config_generation: u64,
     retrieval: []const u8,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -33776,7 +33776,7 @@ pub const MemoryRecord = struct {
     owner: []const u8,
     recorded_from: i64,
     recorded_at: ?i64 = null,
-    revision: i64,
+    revision: u64,
     lifecycle: ?[]const u8 = null,
     stale: ?bool = null,
     reason: OpenApiOptionalNullable([]const u8) = .absent,
@@ -33784,7 +33784,7 @@ pub const MemoryRecord = struct {
     recorded_to: OpenApiOptionalNullable(i64) = .absent,
     superseded_by: OpenApiOptionalNullable([]const u8) = .absent,
     superseded_valid_at: OpenApiOptionalNullable(i64) = .absent,
-    config_generation: i64,
+    config_generation: u64,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -33920,7 +33920,7 @@ pub const MemoryRecordPage = struct {
     items: []const std.json.Value,
     next_cursor: ?[]const u8,
     complete: bool,
-    revision: i64,
+    revision: u64,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -33956,9 +33956,9 @@ pub const MemoryRecordPage = struct {
 pub const MemoryResult = std.json.ArrayHashMap(std.json.Value);
 
 pub const MemorySpaceConfig = struct {
-    version: ?i64 = null,
-    generation: ?i64 = null,
-    embedding_generation: ?i64 = null,
+    version: ?u32 = null,
+    generation: ?u64 = null,
+    embedding_generation: ?u64 = null,
     processing: ?[]const u8 = null,
     ontology_version: ?[]const u8 = null,
     policy_version: ?[]const u8 = null,
@@ -33966,11 +33966,11 @@ pub const MemorySpaceConfig = struct {
     models: ?std.json.Value = null,
     predicates: ?[]const std.json.Value = null,
     source_rules: ?[]const std.json.Value = null,
-    max_input_bytes: ?i64 = null,
-    max_output_items: ?i64 = null,
-    max_attempts: ?i64 = null,
-    max_recall_tokens: ?i64 = null,
-    retention_ms: OpenApiOptionalNullable(i64) = .absent,
+    max_input_bytes: ?u32 = null,
+    max_output_items: ?u32 = null,
+    max_attempts: ?u32 = null,
+    max_recall_tokens: ?u32 = null,
+    retention_ms: OpenApiOptionalNullable(u64) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -35853,7 +35853,7 @@ pub const PriorArtifactContext = struct {
 };
 
 pub const ProvenanceDecision = struct {
-    schema_version: ?i64 = null,
+    schema_version: ?u32 = null,
     resource: std.json.Value,
     operation: std.json.Value,
     action: []const u8,
@@ -35953,7 +35953,7 @@ pub const ProvenanceDecision = struct {
 };
 
 pub const ProvenanceEnvelope = struct {
-    schema_version: ?i64 = null,
+    schema_version: ?u32 = null,
     links: ?[]const std.json.Value = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -43263,7 +43263,7 @@ pub const ResourceSelector = struct {
     table: []const u8,
     id: []const u8,
     kind: ?[]const u8 = null,
-    expected_revision: OpenApiOptionalNullable(i64) = .absent,
+    expected_revision: OpenApiOptionalNullable(u64) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -48903,7 +48903,7 @@ pub const TopologyChangedError = struct {
 };
 
 pub const TraceEvent = struct {
-    schema_version: ?i64 = null,
+    schema_version: ?u32 = null,
     trace_id: []const u8,
     span_id: []const u8,
     parent_span_id: OpenApiOptionalNullable([]const u8) = .absent,

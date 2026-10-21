@@ -47,13 +47,17 @@ class MemoryRecallResultItemsItemMemoryAssertion:
         value (str):
         statement (str):
         evidence (list[MemoryRecallResultItemsItemMemoryAssertionEvidenceItem]):
-        kind (MemoryRecallResultItemsItemMemoryAssertionKind | Unset):
+        kind (MemoryRecallResultItemsItemMemoryAssertionKind | Unset):  Default:
+            MemoryRecallResultItemsItemMemoryAssertionKind.SEMANTIC.
         scope (str | Unset):
         task (None | str | Unset):
         environment (None | str | Unset):
-        role (MemoryRecallResultItemsItemMemoryAssertionRole | Unset):
-        modality (MemoryRecallResultItemsItemMemoryAssertionModality | Unset):
-        stability (MemoryRecallResultItemsItemMemoryAssertionStability | Unset):
+        role (MemoryRecallResultItemsItemMemoryAssertionRole | Unset):  Default:
+            MemoryRecallResultItemsItemMemoryAssertionRole.REPORTED.
+        modality (MemoryRecallResultItemsItemMemoryAssertionModality | Unset):  Default:
+            MemoryRecallResultItemsItemMemoryAssertionModality.ACTUAL.
+        stability (MemoryRecallResultItemsItemMemoryAssertionStability | Unset):  Default:
+            MemoryRecallResultItemsItemMemoryAssertionStability.SETTLED.
         valid_from (int | None | Unset):
         valid_to (int | None | Unset):
         depends_on (list[str] | Unset):
@@ -65,7 +69,8 @@ class MemoryRecallResultItemsItemMemoryAssertion:
         steps (list[str] | Unset):
         expected_outcome (None | str | Unset):
         producer (str | Unset):
-        visibility (MemoryRecallResultItemsItemMemoryAssertionVisibility | Unset):
+        visibility (MemoryRecallResultItemsItemMemoryAssertionVisibility | Unset):  Default:
+            MemoryRecallResultItemsItemMemoryAssertionVisibility.PRIVATE.
         embedding (list[float] | None | Unset):
         embedding_model (MemoryRecallResultItemsItemMemoryAssertionEmbeddingModelType0 | None | Unset):
         reconciliation_reason (None | str | Unset):
@@ -77,13 +82,21 @@ class MemoryRecallResultItemsItemMemoryAssertion:
     value: str
     statement: str
     evidence: list[MemoryRecallResultItemsItemMemoryAssertionEvidenceItem]
-    kind: MemoryRecallResultItemsItemMemoryAssertionKind | Unset = UNSET
+    kind: MemoryRecallResultItemsItemMemoryAssertionKind | Unset = (
+        MemoryRecallResultItemsItemMemoryAssertionKind.SEMANTIC
+    )
     scope: str | Unset = UNSET
     task: None | str | Unset = UNSET
     environment: None | str | Unset = UNSET
-    role: MemoryRecallResultItemsItemMemoryAssertionRole | Unset = UNSET
-    modality: MemoryRecallResultItemsItemMemoryAssertionModality | Unset = UNSET
-    stability: MemoryRecallResultItemsItemMemoryAssertionStability | Unset = UNSET
+    role: MemoryRecallResultItemsItemMemoryAssertionRole | Unset = (
+        MemoryRecallResultItemsItemMemoryAssertionRole.REPORTED
+    )
+    modality: MemoryRecallResultItemsItemMemoryAssertionModality | Unset = (
+        MemoryRecallResultItemsItemMemoryAssertionModality.ACTUAL
+    )
+    stability: MemoryRecallResultItemsItemMemoryAssertionStability | Unset = (
+        MemoryRecallResultItemsItemMemoryAssertionStability.SETTLED
+    )
     valid_from: int | None | Unset = UNSET
     valid_to: int | None | Unset = UNSET
     depends_on: list[str] | Unset = UNSET
@@ -95,7 +108,9 @@ class MemoryRecallResultItemsItemMemoryAssertion:
     steps: list[str] | Unset = UNSET
     expected_outcome: None | str | Unset = UNSET
     producer: str | Unset = UNSET
-    visibility: MemoryRecallResultItemsItemMemoryAssertionVisibility | Unset = UNSET
+    visibility: MemoryRecallResultItemsItemMemoryAssertionVisibility | Unset = (
+        MemoryRecallResultItemsItemMemoryAssertionVisibility.PRIVATE
+    )
     embedding: list[float] | None | Unset = UNSET
     embedding_model: MemoryRecallResultItemsItemMemoryAssertionEmbeddingModelType0 | None | Unset = UNSET
     reconciliation_reason: None | str | Unset = UNSET

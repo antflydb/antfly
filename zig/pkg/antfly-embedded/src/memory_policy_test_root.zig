@@ -16,4 +16,5 @@
 //! Versioned memory contracts. No server, model runtime, or extension imports.
 test {
     _ = @import("memory/service_test.zig");
+    _ = @import("memory/schema.zig");
 }

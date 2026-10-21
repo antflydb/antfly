@@ -18,13 +18,16 @@ class MemoryInspectionStateConfigPredicatesItem:
     """
     Attributes:
         name (str):
-        cardinality (MemoryInspectionStateConfigPredicatesItemCardinality | Unset):
+        cardinality (MemoryInspectionStateConfigPredicatesItemCardinality | Unset):  Default:
+            MemoryInspectionStateConfigPredicatesItemCardinality.MANY.
         subject_type (None | str | Unset):
         object_type (None | str | Unset):
     """
 
     name: str
-    cardinality: MemoryInspectionStateConfigPredicatesItemCardinality | Unset = UNSET
+    cardinality: MemoryInspectionStateConfigPredicatesItemCardinality | Unset = (
+        MemoryInspectionStateConfigPredicatesItemCardinality.MANY
+    )
     subject_type: None | str | Unset = UNSET
     object_type: None | str | Unset = UNSET
 

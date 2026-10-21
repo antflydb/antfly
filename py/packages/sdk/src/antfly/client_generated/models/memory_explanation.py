@@ -23,18 +23,18 @@ class MemoryExplanation:
         complete (bool):
         truncated (bool):
         missing_evidence (bool):
-        schema_version (int | Unset):
-        incomplete_history (bool | Unset):
-        justification (MemoryExplanationJustification | Unset):
+        schema_version (int | Unset):  Default: 1.
+        incomplete_history (bool | Unset):  Default: False.
+        justification (MemoryExplanationJustification | Unset):  Default: MemoryExplanationJustification.RECORDED.
     """
 
     nodes: list[MemoryExplanationNodesItem]
     complete: bool
     truncated: bool
     missing_evidence: bool
-    schema_version: int | Unset = UNSET
-    incomplete_history: bool | Unset = UNSET
-    justification: MemoryExplanationJustification | Unset = UNSET
+    schema_version: int | Unset = 1
+    incomplete_history: bool | Unset = False
+    justification: MemoryExplanationJustification | Unset = MemoryExplanationJustification.RECORDED
 
     def to_dict(self) -> dict[str, Any]:
         nodes = []

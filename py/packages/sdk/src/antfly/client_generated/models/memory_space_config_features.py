@@ -15,18 +15,19 @@ T = TypeVar("T", bound="MemorySpaceConfigFeatures")
 class MemorySpaceConfigFeatures:
     """
     Attributes:
-        semantic_recall (bool | Unset):
-        entity_extraction (bool | Unset):
-        assertion_distillation (bool | Unset):
-        summaries (bool | Unset):
-        reconciliation (MemorySpaceConfigFeaturesReconciliation | Unset):
+        semantic_recall (bool | Unset):  Default: False.
+        entity_extraction (bool | Unset):  Default: False.
+        assertion_distillation (bool | Unset):  Default: False.
+        summaries (bool | Unset):  Default: False.
+        reconciliation (MemorySpaceConfigFeaturesReconciliation | Unset):  Default:
+            MemorySpaceConfigFeaturesReconciliation.EXPLICIT.
     """
 
-    semantic_recall: bool | Unset = UNSET
-    entity_extraction: bool | Unset = UNSET
-    assertion_distillation: bool | Unset = UNSET
-    summaries: bool | Unset = UNSET
-    reconciliation: MemorySpaceConfigFeaturesReconciliation | Unset = UNSET
+    semantic_recall: bool | Unset = False
+    entity_extraction: bool | Unset = False
+    assertion_distillation: bool | Unset = False
+    summaries: bool | Unset = False
+    reconciliation: MemorySpaceConfigFeaturesReconciliation | Unset = MemorySpaceConfigFeaturesReconciliation.EXPLICIT
 
     def to_dict(self) -> dict[str, Any]:
         semantic_recall = self.semantic_recall

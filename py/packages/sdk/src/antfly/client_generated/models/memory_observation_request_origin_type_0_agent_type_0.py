@@ -21,13 +21,19 @@ class MemoryObservationRequestOriginType0AgentType0:
     """
     Attributes:
         id (str):
-        kind (MemoryObservationRequestOriginType0AgentType0Kind | Unset):
-        assurance (MemoryObservationRequestOriginType0AgentType0Assurance | Unset):
+        kind (MemoryObservationRequestOriginType0AgentType0Kind | Unset):  Default:
+            MemoryObservationRequestOriginType0AgentType0Kind.USER.
+        assurance (MemoryObservationRequestOriginType0AgentType0Assurance | Unset):  Default:
+            MemoryObservationRequestOriginType0AgentType0Assurance.DECLARED.
     """
 
     id: str
-    kind: MemoryObservationRequestOriginType0AgentType0Kind | Unset = UNSET
-    assurance: MemoryObservationRequestOriginType0AgentType0Assurance | Unset = UNSET
+    kind: MemoryObservationRequestOriginType0AgentType0Kind | Unset = (
+        MemoryObservationRequestOriginType0AgentType0Kind.USER
+    )
+    assurance: MemoryObservationRequestOriginType0AgentType0Assurance | Unset = (
+        MemoryObservationRequestOriginType0AgentType0Assurance.DECLARED
+    )
 
     def to_dict(self) -> dict[str, Any]:
         id = self.id

@@ -34,8 +34,8 @@ class MemoryEvidence:
         turn_id (None | str | Unset):
         ordinal (int | None | Unset):
         producer (str | Unset):
-        managed (bool | Unset):
-        visibility (MemoryEvidenceVisibility | Unset):
+        managed (bool | Unset):  Default: False.
+        visibility (MemoryEvidenceVisibility | Unset):  Default: MemoryEvidenceVisibility.PRIVATE.
         expires_at (int | None | Unset):
     """
 
@@ -53,8 +53,8 @@ class MemoryEvidence:
     turn_id: None | str | Unset = UNSET
     ordinal: int | None | Unset = UNSET
     producer: str | Unset = UNSET
-    managed: bool | Unset = UNSET
-    visibility: MemoryEvidenceVisibility | Unset = UNSET
+    managed: bool | Unset = False
+    visibility: MemoryEvidenceVisibility | Unset = MemoryEvidenceVisibility.PRIVATE
     expires_at: int | None | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:

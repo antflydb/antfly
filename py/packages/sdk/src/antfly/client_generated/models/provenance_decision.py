@@ -36,7 +36,7 @@ class ProvenanceDecision:
         configuration (ProvenanceDecisionConfiguration):
         ontology_version (str):
         policy_version (str):
-        schema_version (int | Unset):
+        schema_version (int | Unset):  Default: 1.
         origin (None | ProvenanceDecisionOriginType0 | Unset):
         effective_at (int | None | Unset):
     """
@@ -53,7 +53,7 @@ class ProvenanceDecision:
     configuration: ProvenanceDecisionConfiguration
     ontology_version: str
     policy_version: str
-    schema_version: int | Unset = UNSET
+    schema_version: int | Unset = 1
     origin: None | ProvenanceDecisionOriginType0 | Unset = UNSET
     effective_at: int | None | Unset = UNSET
 

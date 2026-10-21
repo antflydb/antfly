@@ -375,7 +375,7 @@ fn classifyError(err: anyerror) ErrorCode {
         error.VersionConflict, error.MemoryRevisionConflict, error.MemoryIdempotencyConflict, error.MemoryEvidenceConflict, error.MemoryAssertionConflict, error.MemoryOutcomeConflict, error.MemoryEntityConflict, error.MemoryProducerConflict, error.MemoryCursorStale, error.MemoryConfigurationChanged, error.MemoryResourceChanged => .version_conflict,
         error.MemorySpaceExists => .version_conflict,
         error.MemorySpaceNotFound, error.MemoryNotFound => .not_found,
-        error.MemoryVisibilityConflict, error.Forbidden, error.Unauthorized => .invalid_argument,
+        error.MemorySourceAccessDenied, error.MemoryVisibilityConflict, error.Forbidden, error.Unauthorized => .invalid_argument,
         error.MemoryCapabilityUnavailable, error.MemoryModelRequired, error.MemoryModelRevisionMismatch, error.MemoryModelRevisionUnavailable, error.MemoryExternalVectorRequired, error.MemoryExecutionIdentityRequired => .unsupported,
         error.MemoryConfigurationTransition, error.MemoryRetryNotReady => .busy,
         error.MemoryRetryExhausted => .stalled,

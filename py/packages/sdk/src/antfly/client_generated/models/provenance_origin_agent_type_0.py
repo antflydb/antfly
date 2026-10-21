@@ -17,13 +17,13 @@ class ProvenanceOriginAgentType0:
     """
     Attributes:
         id (str):
-        kind (ProvenanceOriginAgentType0Kind | Unset):
-        assurance (ProvenanceOriginAgentType0Assurance | Unset):
+        kind (ProvenanceOriginAgentType0Kind | Unset):  Default: ProvenanceOriginAgentType0Kind.USER.
+        assurance (ProvenanceOriginAgentType0Assurance | Unset):  Default: ProvenanceOriginAgentType0Assurance.DECLARED.
     """
 
     id: str
-    kind: ProvenanceOriginAgentType0Kind | Unset = UNSET
-    assurance: ProvenanceOriginAgentType0Assurance | Unset = UNSET
+    kind: ProvenanceOriginAgentType0Kind | Unset = ProvenanceOriginAgentType0Kind.USER
+    assurance: ProvenanceOriginAgentType0Assurance | Unset = ProvenanceOriginAgentType0Assurance.DECLARED
 
     def to_dict(self) -> dict[str, Any]:
         id = self.id

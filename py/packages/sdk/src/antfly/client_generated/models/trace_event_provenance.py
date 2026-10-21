@@ -18,11 +18,11 @@ T = TypeVar("T", bound="TraceEventProvenance")
 class TraceEventProvenance:
     """
     Attributes:
-        schema_version (int | Unset):
+        schema_version (int | Unset):  Default: 1.
         links (list[TraceEventProvenanceLinksItem] | Unset):
     """
 
-    schema_version: int | Unset = UNSET
+    schema_version: int | Unset = 1
     links: list[TraceEventProvenanceLinksItem] | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:

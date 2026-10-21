@@ -27,7 +27,7 @@ class MemoryInspectionState:
         revision (int):
         owner (str):
         created_at (int):
-        table_id (int | Unset):
+        table_id (int | Unset):  Default: 0.
     """
 
     database: str
@@ -38,7 +38,7 @@ class MemoryInspectionState:
     revision: int
     owner: str
     created_at: int
-    table_id: int | Unset = UNSET
+    table_id: int | Unset = 0
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.memory_inspection_state_pending_config_type_0 import MemoryInspectionStatePendingConfigType0

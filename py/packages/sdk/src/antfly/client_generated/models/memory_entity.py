@@ -21,7 +21,7 @@ class MemoryEntity:
     Attributes:
         id (str):
         name (str):
-        visibility (MemoryEntityVisibility | Unset):
+        visibility (MemoryEntityVisibility | Unset):  Default: MemoryEntityVisibility.PRIVATE.
         evidence (list[MemoryEntityEvidenceItem] | Unset):
         type_ (str | Unset):
         aliases (list[str] | Unset):
@@ -30,7 +30,7 @@ class MemoryEntity:
 
     id: str
     name: str
-    visibility: MemoryEntityVisibility | Unset = UNSET
+    visibility: MemoryEntityVisibility | Unset = MemoryEntityVisibility.PRIVATE
     evidence: list[MemoryEntityEvidenceItem] | Unset = UNSET
     type_: str | Unset = UNSET
     aliases: list[str] | Unset = UNSET

@@ -22,18 +22,18 @@ class MemoryExplainRequest:
         revision (int | None | Unset):
         valid_at (int | None | Unset):
         known_at (int | None | Unset):
-        max_bytes (int | Unset):
-        max_nodes (int | Unset):
-        max_depth (int | Unset):
+        max_bytes (int | Unset):  Default: 65536.
+        max_nodes (int | Unset):  Default: 64.
+        max_depth (int | Unset):  Default: 8.
     """
 
     resource: MemoryExplainRequestResourceType0 | None | Unset = UNSET
     revision: int | None | Unset = UNSET
     valid_at: int | None | Unset = UNSET
     known_at: int | None | Unset = UNSET
-    max_bytes: int | Unset = UNSET
-    max_nodes: int | Unset = UNSET
-    max_depth: int | Unset = UNSET
+    max_bytes: int | Unset = 65536
+    max_nodes: int | Unset = 64
+    max_depth: int | Unset = 8
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.memory_explain_request_resource_type_0 import MemoryExplainRequestResourceType0

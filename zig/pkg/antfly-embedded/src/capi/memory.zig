@@ -27,11 +27,14 @@ pub const Request = struct {
 };
 
 const ResourceReader = struct {
-    owner: *h.Handle,
+    // The guard is rebound when inference resumes; a captured Handle can be
+    // retired and freed by another connection while the lease is released.
+    guard: *@import("db.zig").HandleGuard,
     fn read(ptr: *anyopaque, a: std.mem.Allocator, reference: memory.types.provenance.Resource) !memory.types.provenance.Snapshot {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, reference.database, "default") or !std.mem.eql(u8, reference.namespace, "public")) return .{ .state = .denied };
-        const db = @import("tables.zig").get(self.owner, reference.table) catch |err| switch (err) {
+        const current = self.guard.handle;
+        const db = @import("tables.zig").get(current.parent_handle orelse current, reference.table) catch |err| switch (err) {
             error.UndefinedTable, error.TableNotFound => return .{ .state = .missing },
             else => return err,
         };
@@ -67,7 +70,7 @@ pub fn execute(guard: *@import("db.zig").HandleGuard, handle_ptr: ?*anyopaque, a
     if (request.action == .create) try tables.create(handle.parent_handle orelse handle, table, "{}", true);
     const database = try tables.get(handle.parent_handle orelse handle, table);
     const context: memory.Context = .{ .table_id = database.core.identity_namespace.table_id, .space = space, .principal = request.principal, .admin = true, .now_ms = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms) };
-    var resources: ResourceReader = .{ .owner = handle.parent_handle orelse handle };
+    var resources: ResourceReader = .{ .guard = guard };
     var adapter: engine.Native(h.db_mod.DB) = .{ .db = database, .context = context, .resource_ptr = &resources, .resource_fn = ResourceReader.read };
     // Provider lifetime is independent of the storage generation. Retain it
     // across every model call and writer-lease release in this operation.
@@ -83,6 +86,7 @@ pub fn execute(guard: *@import("db.zig").HandleGuard, handle_ptr: ?*anyopaque, a
         handle_ptr: ?*anyopaque,
         adapter: *engine.Native(h.db_mod.DB),
         table: []const u8,
+        table_id: u64,
         access: @import("db.zig").HandleAccess,
         legacy_suspended: bool = false,
         fn before(ptr: *anyopaque) !void {
@@ -103,10 +107,62 @@ pub fn execute(guard: *@import("db.zig").HandleGuard, handle_ptr: ?*anyopaque, a
             if (!self.guard.resumeAccess(self.handle_ptr, self.access)) return error.MemoryRevisionConflict;
             if (self.guard.entry_error != null) return error.MemoryRevisionConflict;
             const current = self.guard.handle;
-            self.adapter.db = try @import("tables.zig").get(current.parent_handle orelse current, self.table);
+            const db = try @import("tables.zig").get(current.parent_handle orelse current, self.table);
+            if (db.core.identity_namespace.table_id != self.table_id) return error.MemorySpaceBindingChanged;
+            self.adapter.db = db;
         }
     };
-    var hooks: Hooks = .{ .guard = guard, .handle_ptr = handle_ptr, .adapter = &adapter, .table = table, .access = guard.access };
+    var hooks: Hooks = .{ .guard = guard, .handle_ptr = handle_ptr, .adapter = &adapter, .table = table, .table_id = context.table_id, .access = guard.access };
     var bridge: @import("../memory/models.zig").Bridge = .{ .base = adapter.backend(), .producer = runtime.producer(), .alloc = a, .inference_ptr = &hooks, .before_inference = Hooks.before, .after_inference = Hooks.after, .embedding_options = .{ .antfly_provider = handle.liteAntflyProvider(), .io = h.handleLockIo(), .source_table = table } };
     return (memory.Service{ .backend = bridge.backend(), .context = context }).execute(alloc, request.action, request.id, try @import("antfly-json").stringifyValueAlloc(a, request.body), request.idempotency_key);
+}
+
+test "capi native memory resource reader follows a resumed storage generation" {
+    const api = @import("db.zig");
+    const a = std.testing.allocator;
+    var directory = try @import("../common/test_directory.zig").TestDirectory.init("memory-resume-generation");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    var id: ?*anyopaque = null;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_lite_create(path, &id));
+    defer api.antfly_db_close(id);
+    {
+        const setup = api.enterHandle(id, .exclusive) orelse return error.TestUnexpectedResult;
+        defer setup.leave();
+        const root = setup.handle.parent_handle orelse setup.handle;
+        try @import("tables.zig").create(root, "business", "{}", true);
+        const db = try @import("tables.zig").get(root, "business");
+        try db.batch(.{ .writes = &.{.{ .key = "approval", .value = "{\"message\":\"BEFORE\"}" }}, .sync_level = .write });
+    }
+    var guard = api.enterHandle(id, .read) orelse return error.TestUnexpectedResult;
+    defer guard.leave();
+    const prior_address = @intFromPtr(guard.handle);
+    var reader: ResourceReader = .{ .guard = &guard };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const reference: memory.types.provenance.Resource = .{ .table = "business", .table_id = 0, .kind = .record, .id = "approval", .revision = 0 };
+    const before = try ResourceReader.read(&reader, alloc, reference);
+    try std.testing.expect(std.mem.indexOf(u8, before.json, "BEFORE") != null);
+    // Exercise the inference lease boundary with an independent native writer,
+    // as another process would. Shared in-process connections can mutate the
+    // same cached runtime without forcing a generation replacement.
+    guard.suspendQuery();
+    {
+        var lease = try @import("../storage/lite/native.zig").lockWriterPathWithIo(a, h.handleLockIo(), path);
+        defer lease.close();
+        const writer = try api.openLiteHandleAllocWithSharedInference(a, path, .{ .no_sync = true, .profile = .hosted, .externally_locked = true }, false, h.handleLockIo(), null, null);
+        defer h.closeHandle(writer);
+        const db = try @import("tables.zig").get(writer, "business");
+        try db.batch(.{ .writes = &.{.{ .key = "approval", .value = "{\"message\":\"AFTER\"}" }}, .sync_level = .write });
+    }
+    try std.testing.expect(guard.resumeQuery(id));
+    try std.testing.expect(guard.entry_error == null);
+    try std.testing.expect(@intFromPtr(guard.handle) != prior_address);
+    const after = try ResourceReader.read(&reader, alloc, reference);
+    try std.testing.expectEqual(memory.types.provenance.ResourceState.current, after.state);
+    try std.testing.expect(std.mem.indexOf(u8, after.json, "AFTER") != null);
+    try std.testing.expect(after.revision != before.revision);
 }

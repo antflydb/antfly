@@ -15173,12 +15173,14 @@ paths:
           schema:
             type: string
             default: default
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: X-Antfly-Namespace
           in: header
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: Idempotency-Key
           in: header
@@ -15270,12 +15272,14 @@ paths:
           schema:
             type: string
             default: default
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: X-Antfly-Namespace
           in: header
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
       responses:
         '200':
@@ -15353,12 +15357,14 @@ paths:
           schema:
             type: string
             default: default
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: X-Antfly-Namespace
           in: header
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: Idempotency-Key
           in: header
@@ -15450,12 +15456,14 @@ paths:
           schema:
             type: string
             default: default
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: X-Antfly-Namespace
           in: header
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: Idempotency-Key
           in: header
@@ -15547,12 +15555,14 @@ paths:
           schema:
             type: string
             default: default
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: X-Antfly-Namespace
           in: header
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: Idempotency-Key
           in: header
@@ -15644,12 +15654,14 @@ paths:
           schema:
             type: string
             default: default
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: X-Antfly-Namespace
           in: header
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: Idempotency-Key
           in: header
@@ -15741,12 +15753,14 @@ paths:
           schema:
             type: string
             default: default
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: X-Antfly-Namespace
           in: header
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: Idempotency-Key
           in: header
@@ -15838,12 +15852,14 @@ paths:
           schema:
             type: string
             default: default
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: X-Antfly-Namespace
           in: header
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: Idempotency-Key
           in: header
@@ -15935,12 +15951,14 @@ paths:
           schema:
             type: string
             default: default
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: X-Antfly-Namespace
           in: header
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: Idempotency-Key
           in: header
@@ -16032,12 +16050,14 @@ paths:
           schema:
             type: string
             default: default
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: X-Antfly-Namespace
           in: header
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
       responses:
         '200':
@@ -16127,12 +16147,14 @@ paths:
           schema:
             type: string
             default: default
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: X-Antfly-Namespace
           in: header
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
       responses:
         '200':
@@ -16217,12 +16239,14 @@ paths:
           schema:
             type: string
             default: default
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: X-Antfly-Namespace
           in: header
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
       responses:
         '200':
@@ -16307,81 +16331,104 @@ paths:
           schema:
             type: string
             default: default
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: X-Antfly-Namespace
           in: header
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: cursor
           in: query
           schema:
             type: string
+            x-go-type-skip-optional-pointer: false
         - name: limit
           in: query
           schema:
             type: integer
             minimum: 1
             maximum: 256
+            x-go-type-skip-optional-pointer: false
         - name: subject
           in: query
           schema:
             type: string
+            x-go-type-skip-optional-pointer: false
         - name: predicate
           in: query
           schema:
             type: string
+            x-go-type-skip-optional-pointer: false
         - name: scope
           in: query
           schema:
             type: string
+            x-go-type-skip-optional-pointer: false
         - name: task
           in: query
           schema:
             type: string
+            x-go-type-skip-optional-pointer: false
         - name: environment
           in: query
           schema:
             type: string
+            x-go-type-skip-optional-pointer: false
         - name: kind
           in: query
           schema:
             type: string
+            x-go-type-skip-optional-pointer: false
         - name: relationship
           in: query
           schema:
             type: string
+            x-go-type-skip-optional-pointer: false
         - name: target_id
           in: query
           schema:
             type: string
+            x-go-type-skip-optional-pointer: false
         - name: missing_relationship
           in: query
           schema:
             type: string
+            x-go-type-skip-optional-pointer: false
         - name: include_history
           in: query
           schema:
             type: boolean
+            x-go-type-skip-optional-pointer: false
         - name: include_provisional
           in: query
           schema:
             type: boolean
+            x-go-type-skip-optional-pointer: false
         - name: valid_at
           in: query
           schema:
             type: integer
+            minimum: -9223372036854775808
+            maximum: 9223372036854775807
+            format: int64
+            x-go-type: int64
+            default: null
             nullable: true
             x-go-type-skip-optional-pointer: false
-            format: int64
         - name: known_at
           in: query
           schema:
             type: integer
+            minimum: -9223372036854775808
+            maximum: 9223372036854775807
+            format: int64
+            x-go-type: int64
+            default: null
             nullable: true
             x-go-type-skip-optional-pointer: false
-            format: int64
       responses:
         '200':
           description: Accepted durable operation or requested memory result.
@@ -16464,12 +16511,14 @@ paths:
           schema:
             type: string
             default: default
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: X-Antfly-Namespace
           in: header
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
       responses:
         '200':
@@ -16553,23 +16602,27 @@ paths:
           schema:
             type: string
             default: default
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: X-Antfly-Namespace
           in: header
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: cursor
           in: query
           schema:
             type: string
+            x-go-type-skip-optional-pointer: false
         - name: limit
           in: query
           schema:
             type: integer
             minimum: 1
             maximum: 256
+            x-go-type-skip-optional-pointer: false
       responses:
         '200':
           description: Accepted durable operation or requested memory result.
@@ -16652,12 +16705,14 @@ paths:
           schema:
             type: string
             default: default
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: X-Antfly-Namespace
           in: header
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
       responses:
         '200':
@@ -16740,12 +16795,14 @@ paths:
           schema:
             type: string
             default: default
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: X-Antfly-Namespace
           in: header
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: Idempotency-Key
           in: header
@@ -16831,12 +16888,14 @@ paths:
           schema:
             type: string
             default: default
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: X-Antfly-Namespace
           in: header
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: Idempotency-Key
           in: header
@@ -16927,12 +16986,14 @@ paths:
           schema:
             type: string
             default: default
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: X-Antfly-Namespace
           in: header
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
       responses:
         '200':
@@ -17016,12 +17077,14 @@ paths:
           schema:
             type: string
             default: default
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: X-Antfly-Namespace
           in: header
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
       responses:
         '200':
@@ -17100,12 +17163,14 @@ paths:
           schema:
             type: string
             default: default
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: X-Antfly-Namespace
           in: header
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: Idempotency-Key
           in: header
@@ -17202,12 +17267,14 @@ paths:
           schema:
             type: string
             default: default
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: X-Antfly-Namespace
           in: header
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
       responses:
         '200':
@@ -17286,23 +17353,27 @@ paths:
           schema:
             type: string
             default: default
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: X-Antfly-Namespace
           in: header
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: cursor
           in: query
           schema:
             type: string
+            x-go-type-skip-optional-pointer: false
         - name: limit
           in: query
           schema:
             type: integer
             minimum: 1
             maximum: 256
+            x-go-type-skip-optional-pointer: false
       responses:
         '200':
           description: Accepted durable operation or requested memory result.
@@ -48050,6 +48121,12 @@ components:
       properties:
         schema_version:
           type: integer
+          minimum: 0
+          maximum: 4294967295
+          format: uint32
+          default: 1
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
         resource:
           type: object
           properties:
@@ -48067,7 +48144,9 @@ components:
               x-go-type: uint64
             storage_name:
               type: string
+              default: null
               nullable: true
+              x-go-type-skip-optional-pointer: false
             kind:
               type: string
               enum:
@@ -48092,7 +48171,9 @@ components:
               x-go-type: uint64
             digest:
               type: string
+              default: null
               nullable: true
+              x-go-type-skip-optional-pointer: false
           required:
             - table
             - table_id
@@ -48117,7 +48198,9 @@ components:
               x-go-type: uint64
             storage_name:
               type: string
+              default: null
               nullable: true
+              x-go-type-skip-optional-pointer: false
             kind:
               type: string
               enum:
@@ -48142,7 +48225,9 @@ components:
               x-go-type: uint64
             digest:
               type: string
+              default: null
               nullable: true
+              x-go-type-skip-optional-pointer: false
           required:
             - table
             - table_id
@@ -48171,11 +48256,15 @@ components:
                 - user
                 - agent
                 - service
+              default: user
+              x-go-type-skip-optional-pointer: false
             assurance:
               type: string
               enum:
                 - authenticated
                 - declared
+              default: declared
+              x-go-type-skip-optional-pointer: false
           required:
             - id
           additionalProperties: false
@@ -48190,11 +48279,15 @@ components:
                 - user
                 - agent
                 - service
+              default: user
+              x-go-type-skip-optional-pointer: false
             assurance:
               type: string
               enum:
                 - authenticated
                 - declared
+              default: declared
+              x-go-type-skip-optional-pointer: false
           required:
             - id
           additionalProperties: false
@@ -48212,14 +48305,19 @@ components:
                     - user
                     - agent
                     - service
+                  default: user
+                  x-go-type-skip-optional-pointer: false
                 assurance:
                   type: string
                   enum:
                     - authenticated
                     - declared
+                  default: declared
+                  x-go-type-skip-optional-pointer: false
               required:
                 - id
               additionalProperties: false
+              default: null
               nullable: true
             approver:
               type: object
@@ -48232,14 +48330,19 @@ components:
                     - user
                     - agent
                     - service
+                  default: user
+                  x-go-type-skip-optional-pointer: false
                 assurance:
                   type: string
                   enum:
                     - authenticated
                     - declared
+                  default: declared
+                  x-go-type-skip-optional-pointer: false
               required:
                 - id
               additionalProperties: false
+              default: null
               nullable: true
             trace:
               type: object
@@ -48258,7 +48361,9 @@ components:
                   x-go-type: uint64
                 storage_name:
                   type: string
+                  default: null
                   nullable: true
+                  x-go-type-skip-optional-pointer: false
                 kind:
                   type: string
                   enum:
@@ -48283,7 +48388,9 @@ components:
                   x-go-type: uint64
                 digest:
                   type: string
+                  default: null
                   nullable: true
+                  x-go-type-skip-optional-pointer: false
               required:
                 - table
                 - table_id
@@ -48291,6 +48398,7 @@ components:
                 - id
                 - revision
               additionalProperties: false
+              default: null
               nullable: true
             span:
               type: object
@@ -48309,7 +48417,9 @@ components:
                   x-go-type: uint64
                 storage_name:
                   type: string
+                  default: null
                   nullable: true
+                  x-go-type-skip-optional-pointer: false
                 kind:
                   type: string
                   enum:
@@ -48334,7 +48444,9 @@ components:
                   x-go-type: uint64
                 digest:
                   type: string
+                  default: null
                   nullable: true
+                  x-go-type-skip-optional-pointer: false
               required:
                 - table
                 - table_id
@@ -48342,27 +48454,50 @@ components:
                 - id
                 - revision
               additionalProperties: false
+              default: null
               nullable: true
             workflow:
               type: string
+              default: null
               nullable: true
+              x-go-type-skip-optional-pointer: false
             workflow_version:
               type: string
+              default: null
               nullable: true
+              x-go-type-skip-optional-pointer: false
           additionalProperties: false
+          default: null
           nullable: true
         decided_at:
           type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
         applied_at:
           type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
           nullable: true
           x-go-type-skip-optional-pointer: false
         effective_at:
           type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+          default: null
           nullable: true
           x-go-type-skip-optional-pointer: false
         recorded_at:
           type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
         configuration:
           type: object
           properties:
@@ -48380,7 +48515,9 @@ components:
               x-go-type: uint64
             storage_name:
               type: string
+              default: null
               nullable: true
+              x-go-type-skip-optional-pointer: false
             kind:
               type: string
               enum:
@@ -48405,7 +48542,9 @@ components:
               x-go-type: uint64
             digest:
               type: string
+              default: null
               nullable: true
+              x-go-type-skip-optional-pointer: false
           required:
             - table
             - table_id
@@ -48436,6 +48575,12 @@ components:
       properties:
         schema_version:
           type: integer
+          minimum: 0
+          maximum: 4294967295
+          format: uint32
+          default: 1
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
         links:
           type: array
           items:
@@ -48475,7 +48620,9 @@ components:
                     x-go-type: uint64
                   storage_name:
                     type: string
+                    default: null
                     nullable: true
+                    x-go-type-skip-optional-pointer: false
                   kind:
                     type: string
                     enum:
@@ -48500,7 +48647,9 @@ components:
                     x-go-type: uint64
                   digest:
                     type: string
+                    default: null
                     nullable: true
+                    x-go-type-skip-optional-pointer: false
                 required:
                   - table
                   - table_id
@@ -48518,6 +48667,12 @@ components:
       properties:
         schema_version:
           type: integer
+          minimum: 0
+          maximum: 4294967295
+          format: uint32
+          default: 1
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
         nodes:
           type: array
           items:
@@ -48540,7 +48695,9 @@ components:
                     x-go-type: uint64
                   storage_name:
                     type: string
+                    default: null
                     nullable: true
+                    x-go-type-skip-optional-pointer: false
                   kind:
                     type: string
                     enum:
@@ -48565,7 +48722,9 @@ components:
                     x-go-type: uint64
                   digest:
                     type: string
+                    default: null
                     nullable: true
+                    x-go-type-skip-optional-pointer: false
                 required:
                   - table
                   - table_id
@@ -48576,6 +48735,8 @@ components:
               record: {}
               payload_truncated:
                 type: boolean
+                default: false
+                x-go-type-skip-optional-pointer: false
               links:
                 type: array
                 items:
@@ -48615,7 +48776,9 @@ components:
                           x-go-type: uint64
                         storage_name:
                           type: string
+                          default: null
                           nullable: true
+                          x-go-type-skip-optional-pointer: false
                         kind:
                           type: string
                           enum:
@@ -48640,7 +48803,9 @@ components:
                           x-go-type: uint64
                         digest:
                           type: string
+                          default: null
                           nullable: true
+                          x-go-type-skip-optional-pointer: false
                       required:
                         - table
                         - table_id
@@ -48674,10 +48839,14 @@ components:
           type: boolean
         incomplete_history:
           type: boolean
+          default: false
+          x-go-type-skip-optional-pointer: false
         justification:
           type: string
           enum:
             - recorded
+          default: recorded
+          x-go-type-skip-optional-pointer: false
       required:
         - nodes
         - complete
@@ -48689,19 +48858,36 @@ components:
       properties:
         schema_version:
           type: integer
+          minimum: 0
+          maximum: 4294967295
+          format: uint32
+          default: 1
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
         trace_id:
           type: string
         span_id:
           type: string
         parent_span_id:
           type: string
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
         name:
           type: string
         started_at:
           type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
         ended_at:
           type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+          default: null
           nullable: true
           x-go-type-skip-optional-pointer: false
         status:
@@ -48711,11 +48897,19 @@ components:
             - succeeded
             - failed
             - cancelled
+          default: running
+          x-go-type-skip-optional-pointer: false
         provenance:
           type: object
           properties:
             schema_version:
               type: integer
+              minimum: 0
+              maximum: 4294967295
+              format: uint32
+              default: 1
+              x-go-type-skip-optional-pointer: false
+              x-go-type: uint32
             links:
               type: array
               items:
@@ -48755,7 +48949,9 @@ components:
                         x-go-type: uint64
                       storage_name:
                         type: string
+                        default: null
                         nullable: true
+                        x-go-type-skip-optional-pointer: false
                       kind:
                         type: string
                         enum:
@@ -48780,7 +48976,9 @@ components:
                         x-go-type: uint64
                       digest:
                         type: string
+                        default: null
                         nullable: true
+                        x-go-type-skip-optional-pointer: false
                     required:
                       - table
                       - table_id
@@ -48816,8 +49014,15 @@ components:
             - record
             - relationship
             - trace
+          default: record
+          x-go-type-skip-optional-pointer: false
         expected_revision:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+          default: null
           nullable: true
           x-go-type-skip-optional-pointer: false
       required:
@@ -48841,7 +49046,9 @@ components:
           x-go-type: uint64
         storage_name:
           type: string
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
         kind:
           type: string
           enum:
@@ -48866,7 +49073,9 @@ components:
           x-go-type: uint64
         digest:
           type: string
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
       required:
         - table
         - table_id
@@ -48888,14 +49097,19 @@ components:
                 - user
                 - agent
                 - service
+              default: user
+              x-go-type-skip-optional-pointer: false
             assurance:
               type: string
               enum:
                 - authenticated
                 - declared
+              default: declared
+              x-go-type-skip-optional-pointer: false
           required:
             - id
           additionalProperties: false
+          default: null
           nullable: true
         approver:
           type: object
@@ -48908,14 +49122,19 @@ components:
                 - user
                 - agent
                 - service
+              default: user
+              x-go-type-skip-optional-pointer: false
             assurance:
               type: string
               enum:
                 - authenticated
                 - declared
+              default: declared
+              x-go-type-skip-optional-pointer: false
           required:
             - id
           additionalProperties: false
+          default: null
           nullable: true
         trace:
           type: object
@@ -48934,7 +49153,9 @@ components:
               x-go-type: uint64
             storage_name:
               type: string
+              default: null
               nullable: true
+              x-go-type-skip-optional-pointer: false
             kind:
               type: string
               enum:
@@ -48959,7 +49180,9 @@ components:
               x-go-type: uint64
             digest:
               type: string
+              default: null
               nullable: true
+              x-go-type-skip-optional-pointer: false
           required:
             - table
             - table_id
@@ -48967,6 +49190,7 @@ components:
             - id
             - revision
           additionalProperties: false
+          default: null
           nullable: true
         span:
           type: object
@@ -48985,7 +49209,9 @@ components:
               x-go-type: uint64
             storage_name:
               type: string
+              default: null
               nullable: true
+              x-go-type-skip-optional-pointer: false
             kind:
               type: string
               enum:
@@ -49010,7 +49236,9 @@ components:
               x-go-type: uint64
             digest:
               type: string
+              default: null
               nullable: true
+              x-go-type-skip-optional-pointer: false
           required:
             - table
             - table_id
@@ -49018,13 +49246,18 @@ components:
             - id
             - revision
           additionalProperties: false
+          default: null
           nullable: true
         workflow:
           type: string
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
         workflow_version:
           type: string
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
       additionalProperties: false
     MemoryExplainRequest:
       type: object
@@ -49046,7 +49279,9 @@ components:
               x-go-type: uint64
             storage_name:
               type: string
+              default: null
               nullable: true
+              x-go-type-skip-optional-pointer: false
             kind:
               type: string
               enum:
@@ -49071,7 +49306,9 @@ components:
               x-go-type: uint64
             digest:
               type: string
+              default: null
               nullable: true
+              x-go-type-skip-optional-pointer: false
           required:
             - table
             - table_id
@@ -49079,41 +49316,95 @@ components:
             - id
             - revision
           additionalProperties: false
+          default: null
           nullable: true
         revision:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+          default: null
           nullable: true
           x-go-type-skip-optional-pointer: false
         valid_at:
           type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+          default: null
           nullable: true
           x-go-type-skip-optional-pointer: false
         known_at:
           type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+          default: null
           nullable: true
           x-go-type-skip-optional-pointer: false
         max_bytes:
           type: integer
+          minimum: 0
+          maximum: 4294967295
+          format: uint32
+          default: 65536
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
         max_nodes:
           type: integer
+          minimum: 0
+          maximum: 65535
+          format: uint32
+          default: 64
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
         max_depth:
           type: integer
+          minimum: 0
+          maximum: 255
+          format: uint32
+          default: 8
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
       additionalProperties: false
     MemorySpaceConfig:
       type: object
       properties:
         version:
           type: integer
+          minimum: 0
+          maximum: 4294967295
+          format: uint32
+          default: 1
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
         generation:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          default: 1
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint64
         embedding_generation:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          default: 1
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint64
         processing:
           type: string
           enum:
             - external
             - managed
             - hybrid
+          default: external
+          x-go-type-skip-optional-pointer: false
         ontology_version:
           type: string
         policy_version:
@@ -49123,18 +49414,28 @@ components:
           properties:
             semantic_recall:
               type: boolean
+              default: false
+              x-go-type-skip-optional-pointer: false
             entity_extraction:
               type: boolean
+              default: false
+              x-go-type-skip-optional-pointer: false
             assertion_distillation:
               type: boolean
+              default: false
+              x-go-type-skip-optional-pointer: false
             summaries:
               type: boolean
+              default: false
+              x-go-type-skip-optional-pointer: false
             reconciliation:
               type: string
               enum:
                 - explicit
                 - deterministic
                 - model
+              default: explicit
+              x-go-type-skip-optional-pointer: false
           additionalProperties: false
         models:
           type: object
@@ -49150,6 +49451,11 @@ components:
                   type: string
                 dimensions:
                   type: integer
+                  minimum: 0
+                  maximum: 4294967295
+                  format: uint32
+                  x-go-type: uint32
+                  default: null
                   nullable: true
                   x-go-type-skip-optional-pointer: false
               required:
@@ -49157,6 +49463,7 @@ components:
                 - model
                 - revision
               additionalProperties: false
+              default: null
               nullable: true
             extractor:
               type: object
@@ -49169,6 +49476,11 @@ components:
                   type: string
                 dimensions:
                   type: integer
+                  minimum: 0
+                  maximum: 4294967295
+                  format: uint32
+                  x-go-type: uint32
+                  default: null
                   nullable: true
                   x-go-type-skip-optional-pointer: false
               required:
@@ -49176,6 +49488,7 @@ components:
                 - model
                 - revision
               additionalProperties: false
+              default: null
               nullable: true
             generator:
               type: object
@@ -49188,6 +49501,11 @@ components:
                   type: string
                 dimensions:
                   type: integer
+                  minimum: 0
+                  maximum: 4294967295
+                  format: uint32
+                  x-go-type: uint32
+                  default: null
                   nullable: true
                   x-go-type-skip-optional-pointer: false
               required:
@@ -49195,6 +49513,7 @@ components:
                 - model
                 - revision
               additionalProperties: false
+              default: null
               nullable: true
             decider:
               type: object
@@ -49207,6 +49526,11 @@ components:
                   type: string
                 dimensions:
                   type: integer
+                  minimum: 0
+                  maximum: 4294967295
+                  format: uint32
+                  x-go-type: uint32
+                  default: null
                   nullable: true
                   x-go-type-skip-optional-pointer: false
               required:
@@ -49214,6 +49538,7 @@ components:
                 - model
                 - revision
               additionalProperties: false
+              default: null
               nullable: true
           additionalProperties: false
         predicates:
@@ -49228,12 +49553,18 @@ components:
                 enum:
                   - one
                   - many
+                default: many
+                x-go-type-skip-optional-pointer: false
               subject_type:
                 type: string
+                default: null
                 nullable: true
+                x-go-type-skip-optional-pointer: false
               object_type:
                 type: string
+                default: null
                 nullable: true
+                x-go-type-skip-optional-pointer: false
             required:
               - name
             additionalProperties: false
@@ -49246,25 +49577,64 @@ components:
                 type: string
               principal:
                 type: string
+                default: null
                 nullable: true
+                x-go-type-skip-optional-pointer: false
               producer:
                 type: string
+                default: null
                 nullable: true
+                x-go-type-skip-optional-pointer: false
               authority:
                 type: integer
+                minimum: 0
+                maximum: 65535
+                format: uint32
+                default: 0
+                x-go-type-skip-optional-pointer: false
+                x-go-type: uint32
             required:
               - source_id
             additionalProperties: false
         max_input_bytes:
           type: integer
+          minimum: 0
+          maximum: 4294967295
+          format: uint32
+          default: 262144
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
         max_output_items:
           type: integer
+          minimum: 0
+          maximum: 65535
+          format: uint32
+          default: 128
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
         max_attempts:
           type: integer
+          minimum: 0
+          maximum: 255
+          format: uint32
+          default: 3
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
         max_recall_tokens:
           type: integer
+          minimum: 0
+          maximum: 4294967295
+          format: uint32
+          default: 8192
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
         retention_ms:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+          default: null
           nullable: true
           x-go-type-skip-optional-pointer: false
       additionalProperties: false
@@ -49296,7 +49666,9 @@ components:
               x-go-type: uint64
             storage_name:
               type: string
+              default: null
               nullable: true
+              x-go-type-skip-optional-pointer: false
             kind:
               type: string
               enum:
@@ -49321,7 +49693,9 @@ components:
               x-go-type: uint64
             digest:
               type: string
+              default: null
               nullable: true
+              x-go-type-skip-optional-pointer: false
           required:
             - table
             - table_id
@@ -49329,6 +49703,7 @@ components:
             - id
             - revision
           additionalProperties: false
+          default: null
           nullable: true
         resource_selector:
           type: object
@@ -49347,49 +49722,86 @@ components:
                 - record
                 - relationship
                 - trace
+              default: record
+              x-go-type-skip-optional-pointer: false
             expected_revision:
               type: integer
+              minimum: 0
+              maximum: 18446744073709551615
+              format: uint64
+              x-go-type: uint64
+              default: null
               nullable: true
               x-go-type-skip-optional-pointer: false
           required:
             - table
             - id
           additionalProperties: false
+          default: null
           nullable: true
         source_url:
           type: string
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
         author:
           type: string
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
         event_time:
           type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+          default: null
           nullable: true
           x-go-type-skip-optional-pointer: false
         timezone:
           type: string
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
         thread_id:
           type: string
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
         turn_id:
           type: string
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
         ordinal:
           type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+          default: null
           nullable: true
           x-go-type-skip-optional-pointer: false
         producer:
           type: string
         managed:
           type: boolean
+          default: false
+          x-go-type-skip-optional-pointer: false
         visibility:
           type: string
           enum:
             - private
             - team
+          default: private
+          x-go-type-skip-optional-pointer: false
         expires_at:
           type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+          default: null
           nullable: true
           x-go-type-skip-optional-pointer: false
       required:
@@ -49422,14 +49834,20 @@ components:
             - open_question
             - alternative
             - summary
+          default: semantic
+          x-go-type-skip-optional-pointer: false
         scope:
           type: string
         task:
           type: string
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
         environment:
           type: string
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
         role:
           type: string
           enum:
@@ -49437,6 +49855,8 @@ components:
             - observed
             - inferred
             - hypothesized
+          default: reported
+          x-go-type-skip-optional-pointer: false
         modality:
           type: string
           enum:
@@ -49445,17 +49865,31 @@ components:
             - desired
             - conditional
             - hypothetical
+          default: actual
+          x-go-type-skip-optional-pointer: false
         stability:
           type: string
           enum:
             - provisional
             - settled
+          default: settled
+          x-go-type-skip-optional-pointer: false
         valid_from:
           type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+          default: null
           nullable: true
           x-go-type-skip-optional-pointer: false
         valid_to:
           type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+          default: null
           nullable: true
           x-go-type-skip-optional-pointer: false
         evidence:
@@ -49470,12 +49904,21 @@ components:
                 properties:
                   start:
                     type: integer
+                    minimum: 0
+                    maximum: 4294967295
+                    format: uint32
+                    x-go-type: uint32
                   end:
                     type: integer
+                    minimum: 0
+                    maximum: 4294967295
+                    format: uint32
+                    x-go-type: uint32
                 required:
                   - start
                   - end
                 additionalProperties: false
+                default: null
                 nullable: true
             required:
               - id
@@ -49501,12 +49944,21 @@ components:
                       properties:
                         start:
                           type: integer
+                          minimum: 0
+                          maximum: 4294967295
+                          format: uint32
+                          x-go-type: uint32
                         end:
                           type: integer
+                          minimum: 0
+                          maximum: 4294967295
+                          format: uint32
+                          x-go-type: uint32
                       required:
                         - start
                         - end
                       additionalProperties: false
+                      default: null
                       nullable: true
                   required:
                     - id
@@ -49540,7 +49992,9 @@ components:
             type: string
         expected_outcome:
           type: string
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
         producer:
           type: string
         visibility:
@@ -49548,10 +50002,13 @@ components:
           enum:
             - private
             - team
+          default: private
+          x-go-type-skip-optional-pointer: false
         embedding:
           type: array
           items:
             type: number
+          default: null
           nullable: true
         embedding_model:
           type: object
@@ -49564,6 +50021,11 @@ components:
               type: string
             dimensions:
               type: integer
+              minimum: 0
+              maximum: 4294967295
+              format: uint32
+              x-go-type: uint32
+              default: null
               nullable: true
               x-go-type-skip-optional-pointer: false
           required:
@@ -49571,10 +50033,13 @@ components:
             - model
             - revision
           additionalProperties: false
+          default: null
           nullable: true
         reconciliation_reason:
           type: string
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
       required:
         - id
         - subject
@@ -49600,14 +50065,19 @@ components:
                     - user
                     - agent
                     - service
+                  default: user
+                  x-go-type-skip-optional-pointer: false
                 assurance:
                   type: string
                   enum:
                     - authenticated
                     - declared
+                  default: declared
+                  x-go-type-skip-optional-pointer: false
               required:
                 - id
               additionalProperties: false
+              default: null
               nullable: true
             approver:
               type: object
@@ -49620,14 +50090,19 @@ components:
                     - user
                     - agent
                     - service
+                  default: user
+                  x-go-type-skip-optional-pointer: false
                 assurance:
                   type: string
                   enum:
                     - authenticated
                     - declared
+                  default: declared
+                  x-go-type-skip-optional-pointer: false
               required:
                 - id
               additionalProperties: false
+              default: null
               nullable: true
             trace:
               type: object
@@ -49646,7 +50121,9 @@ components:
                   x-go-type: uint64
                 storage_name:
                   type: string
+                  default: null
                   nullable: true
+                  x-go-type-skip-optional-pointer: false
                 kind:
                   type: string
                   enum:
@@ -49671,7 +50148,9 @@ components:
                   x-go-type: uint64
                 digest:
                   type: string
+                  default: null
                   nullable: true
+                  x-go-type-skip-optional-pointer: false
               required:
                 - table
                 - table_id
@@ -49679,6 +50158,7 @@ components:
                 - id
                 - revision
               additionalProperties: false
+              default: null
               nullable: true
             span:
               type: object
@@ -49697,7 +50177,9 @@ components:
                   x-go-type: uint64
                 storage_name:
                   type: string
+                  default: null
                   nullable: true
+                  x-go-type-skip-optional-pointer: false
                 kind:
                   type: string
                   enum:
@@ -49722,7 +50204,9 @@ components:
                   x-go-type: uint64
                 digest:
                   type: string
+                  default: null
                   nullable: true
+                  x-go-type-skip-optional-pointer: false
               required:
                 - table
                 - table_id
@@ -49730,14 +50214,20 @@ components:
                 - id
                 - revision
               additionalProperties: false
+              default: null
               nullable: true
             workflow:
               type: string
+              default: null
               nullable: true
+              x-go-type-skip-optional-pointer: false
             workflow_version:
               type: string
+              default: null
               nullable: true
+              x-go-type-skip-optional-pointer: false
           additionalProperties: false
+          default: null
           nullable: true
         context_evidence_ids:
           type: array
@@ -49761,6 +50251,8 @@ components:
                 enum:
                   - private
                   - team
+                default: private
+                x-go-type-skip-optional-pointer: false
               evidence:
                 type: array
                 items:
@@ -49773,12 +50265,21 @@ components:
                       properties:
                         start:
                           type: integer
+                          minimum: 0
+                          maximum: 4294967295
+                          format: uint32
+                          x-go-type: uint32
                         end:
                           type: integer
+                          minimum: 0
+                          maximum: 4294967295
+                          format: uint32
+                          x-go-type: uint32
                       required:
                         - start
                         - end
                       additionalProperties: false
+                      default: null
                       nullable: true
                   required:
                     - id
@@ -49821,6 +50322,10 @@ components:
           type: string
         expected_revision:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
         lifecycle:
           type: string
           enum:
@@ -49833,7 +50338,9 @@ components:
           enum:
             - provisional
             - settled
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
         reason:
           type: string
         evidence:
@@ -49848,12 +50355,21 @@ components:
                 properties:
                   start:
                     type: integer
+                    minimum: 0
+                    maximum: 4294967295
+                    format: uint32
+                    x-go-type: uint32
                   end:
                     type: integer
+                    minimum: 0
+                    maximum: 4294967295
+                    format: uint32
+                    x-go-type: uint32
                 required:
                   - start
                   - end
                 additionalProperties: false
+                default: null
                 nullable: true
             required:
               - id
@@ -49881,6 +50397,8 @@ components:
             type: string
         all:
           type: boolean
+          default: false
+          x-go-type-skip-optional-pointer: false
       additionalProperties: false
     MemoryOutcome:
       type: object
@@ -49915,10 +50433,14 @@ components:
             - supersedes
             - motivates
             - rejected_in_favor_of
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
         target_id:
           type: string
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
         missing_relationship:
           type: string
           enum:
@@ -49926,22 +50448,34 @@ components:
             - supersedes
             - motivates
             - rejected_in_favor_of
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
         subject:
           type: string
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
         predicate:
           type: string
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
         scope:
           type: string
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
         environment:
           type: string
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
         task:
           type: string
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
         kind:
           type: string
           enum:
@@ -49956,30 +50490,61 @@ components:
             - open_question
             - alternative
             - summary
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
         valid_at:
           type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+          default: null
           nullable: true
           x-go-type-skip-optional-pointer: false
         known_at:
           type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+          default: null
           nullable: true
           x-go-type-skip-optional-pointer: false
         include_history:
           type: boolean
+          default: false
+          x-go-type-skip-optional-pointer: false
         include_provisional:
           type: boolean
+          default: true
+          x-go-type-skip-optional-pointer: false
         limit:
           type: integer
+          minimum: 0
+          maximum: 65535
+          format: uint32
+          default: 20
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
         token_budget:
           type: integer
+          minimum: 0
+          maximum: 4294967295
+          format: uint32
+          default: 2048
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
         cursor:
           type: string
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
         embedding:
           type: array
           items:
             type: number
+          default: null
           nullable: true
         embedding_model:
           type: object
@@ -49992,6 +50557,11 @@ components:
               type: string
             dimensions:
               type: integer
+              minimum: 0
+              maximum: 4294967295
+              format: uint32
+              x-go-type: uint32
+              default: null
               nullable: true
               x-go-type-skip-optional-pointer: false
           required:
@@ -49999,6 +50569,7 @@ components:
             - model
             - revision
           additionalProperties: false
+          default: null
           nullable: true
       additionalProperties: false
     MemoryOperation:
@@ -50014,10 +50585,22 @@ components:
           type: string
         revision:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
         config_generation:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
         created_at:
           type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
         phase:
           type: string
           enum:
@@ -50032,11 +50615,20 @@ components:
           type: boolean
         attempts:
           type: integer
+          minimum: 0
+          maximum: 255
+          format: uint32
+          x-go-type: uint32
         error_code:
           type: string
           nullable: true
+          x-go-type-skip-optional-pointer: false
         next_retry_at:
           type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
           nullable: true
           x-go-type-skip-optional-pointer: false
       required:
@@ -50084,14 +50676,20 @@ components:
                 - open_question
                 - alternative
                 - summary
+              default: semantic
+              x-go-type-skip-optional-pointer: false
             scope:
               type: string
             task:
               type: string
+              default: null
               nullable: true
+              x-go-type-skip-optional-pointer: false
             environment:
               type: string
+              default: null
               nullable: true
+              x-go-type-skip-optional-pointer: false
             role:
               type: string
               enum:
@@ -50099,6 +50697,8 @@ components:
                 - observed
                 - inferred
                 - hypothesized
+              default: reported
+              x-go-type-skip-optional-pointer: false
             modality:
               type: string
               enum:
@@ -50107,17 +50707,31 @@ components:
                 - desired
                 - conditional
                 - hypothetical
+              default: actual
+              x-go-type-skip-optional-pointer: false
             stability:
               type: string
               enum:
                 - provisional
                 - settled
+              default: settled
+              x-go-type-skip-optional-pointer: false
             valid_from:
               type: integer
+              minimum: -9223372036854775808
+              maximum: 9223372036854775807
+              format: int64
+              x-go-type: int64
+              default: null
               nullable: true
               x-go-type-skip-optional-pointer: false
             valid_to:
               type: integer
+              minimum: -9223372036854775808
+              maximum: 9223372036854775807
+              format: int64
+              x-go-type: int64
+              default: null
               nullable: true
               x-go-type-skip-optional-pointer: false
             evidence:
@@ -50132,12 +50746,21 @@ components:
                     properties:
                       start:
                         type: integer
+                        minimum: 0
+                        maximum: 4294967295
+                        format: uint32
+                        x-go-type: uint32
                       end:
                         type: integer
+                        minimum: 0
+                        maximum: 4294967295
+                        format: uint32
+                        x-go-type: uint32
                     required:
                       - start
                       - end
                     additionalProperties: false
+                    default: null
                     nullable: true
                 required:
                   - id
@@ -50163,12 +50786,21 @@ components:
                           properties:
                             start:
                               type: integer
+                              minimum: 0
+                              maximum: 4294967295
+                              format: uint32
+                              x-go-type: uint32
                             end:
                               type: integer
+                              minimum: 0
+                              maximum: 4294967295
+                              format: uint32
+                              x-go-type: uint32
                           required:
                             - start
                             - end
                           additionalProperties: false
+                          default: null
                           nullable: true
                       required:
                         - id
@@ -50202,7 +50834,9 @@ components:
                 type: string
             expected_outcome:
               type: string
+              default: null
               nullable: true
+              x-go-type-skip-optional-pointer: false
             producer:
               type: string
             visibility:
@@ -50210,10 +50844,13 @@ components:
               enum:
                 - private
                 - team
+              default: private
+              x-go-type-skip-optional-pointer: false
             embedding:
               type: array
               items:
                 type: number
+              default: null
               nullable: true
             embedding_model:
               type: object
@@ -50226,6 +50863,11 @@ components:
                   type: string
                 dimensions:
                   type: integer
+                  minimum: 0
+                  maximum: 4294967295
+                  format: uint32
+                  x-go-type: uint32
+                  default: null
                   nullable: true
                   x-go-type-skip-optional-pointer: false
               required:
@@ -50233,10 +50875,13 @@ components:
                 - model
                 - revision
               additionalProperties: false
+              default: null
               nullable: true
             reconciliation_reason:
               type: string
+              default: null
               nullable: true
+              x-go-type-skip-optional-pointer: false
           required:
             - id
             - subject
@@ -50249,6 +50894,11 @@ components:
           type: string
         asserted_valid_to:
           type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+          default: null
           nullable: true
           x-go-type-skip-optional-pointer: false
         explicit_disposition:
@@ -50261,6 +50911,10 @@ components:
                   type: string
                 recorded_at:
                   type: integer
+                  minimum: -9223372036854775808
+                  maximum: 9223372036854775807
+                  format: int64
+                  x-go-type: int64
                 evidence:
                   type: array
                   items:
@@ -50273,23 +50927,35 @@ components:
                         properties:
                           start:
                             type: integer
+                            minimum: 0
+                            maximum: 4294967295
+                            format: uint32
+                            x-go-type: uint32
                           end:
                             type: integer
+                            minimum: 0
+                            maximum: 4294967295
+                            format: uint32
+                            x-go-type: uint32
                         required:
                           - start
                           - end
                         additionalProperties: false
+                        default: null
                         nullable: true
                     required:
                       - id
                     additionalProperties: false
                 forgotten:
                   type: boolean
+                  default: false
+                  x-go-type-skip-optional-pointer: false
               required:
                 - principal
                 - recorded_at
                 - evidence
               additionalProperties: false
+              default: null
               nullable: true
             lifecycle:
               type: string
@@ -50300,17 +50966,31 @@ components:
                 - retracted
             valid_to:
               type: integer
+              minimum: -9223372036854775808
+              maximum: 9223372036854775807
+              format: int64
+              x-go-type: int64
               nullable: true
               x-go-type-skip-optional-pointer: false
             superseded_by:
               type: string
               nullable: true
+              x-go-type-skip-optional-pointer: false
             superseded_valid_at:
               type: integer
+              minimum: -9223372036854775808
+              maximum: 9223372036854775807
+              format: int64
+              x-go-type: int64
+              default: null
               nullable: true
               x-go-type-skip-optional-pointer: false
             recorded_to:
               type: integer
+              minimum: -9223372036854775808
+              maximum: 9223372036854775807
+              format: int64
+              x-go-type: int64
               nullable: true
               x-go-type-skip-optional-pointer: false
             conflicts_with:
@@ -50320,6 +51000,7 @@ components:
             reason:
               type: string
               nullable: true
+              x-go-type-skip-optional-pointer: false
           required:
             - lifecycle
             - valid_to
@@ -50328,15 +51009,30 @@ components:
             - conflicts_with
             - reason
           additionalProperties: false
+          default: null
           nullable: true
         owner:
           type: string
         recorded_from:
           type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
         recorded_at:
           type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: int64
         revision:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
         lifecycle:
           type: string
           enum:
@@ -50344,28 +51040,50 @@ components:
             - disputed
             - superseded
             - retracted
+          default: active
+          x-go-type-skip-optional-pointer: false
         stale:
           type: boolean
+          default: false
+          x-go-type-skip-optional-pointer: false
         reason:
           type: string
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
         conflicts_with:
           type: array
           items:
             type: string
         recorded_to:
           type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+          default: null
           nullable: true
           x-go-type-skip-optional-pointer: false
         superseded_by:
           type: string
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
         superseded_valid_at:
           type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+          default: null
           nullable: true
           x-go-type-skip-optional-pointer: false
         config_generation:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
       required:
         - assertion
         - owner
@@ -50381,6 +51099,8 @@ components:
           enum:
             - private
             - team
+          default: private
+          x-go-type-skip-optional-pointer: false
         evidence:
           type: array
           items:
@@ -50393,12 +51113,21 @@ components:
                 properties:
                   start:
                     type: integer
+                    minimum: 0
+                    maximum: 4294967295
+                    format: uint32
+                    x-go-type: uint32
                   end:
                     type: integer
+                    minimum: 0
+                    maximum: 4294967295
+                    format: uint32
+                    x-go-type: uint32
                 required:
                   - start
                   - end
                 additionalProperties: false
+                default: null
                 nullable: true
             required:
               - id
@@ -50430,6 +51159,8 @@ components:
             - reject
             - release
             - suppress
+          default: reject
+          x-go-type-skip-optional-pointer: false
         reason:
           type: string
         action:
@@ -50443,13 +51174,23 @@ components:
           type: string
         to:
           type: string
+          default: null
           nullable: true
+          x-go-type-skip-optional-pointer: false
         expected_revision:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
         replace:
           type: boolean
+          default: false
+          x-go-type-skip-optional-pointer: false
         pin_distinct:
           type: boolean
+          default: false
+          x-go-type-skip-optional-pointer: false
       required:
         - action
         - from
@@ -50460,6 +51201,10 @@ components:
       properties:
         generation:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
         model:
           type: object
           properties:
@@ -50471,6 +51216,11 @@ components:
               type: string
             dimensions:
               type: integer
+              minimum: 0
+              maximum: 4294967295
+              format: uint32
+              x-go-type: uint32
+              default: null
               nullable: true
               x-go-type-skip-optional-pointer: false
           required:
@@ -50536,14 +51286,20 @@ components:
                           - open_question
                           - alternative
                           - summary
+                        default: semantic
+                        x-go-type-skip-optional-pointer: false
                       scope:
                         type: string
                       task:
                         type: string
+                        default: null
                         nullable: true
+                        x-go-type-skip-optional-pointer: false
                       environment:
                         type: string
+                        default: null
                         nullable: true
+                        x-go-type-skip-optional-pointer: false
                       role:
                         type: string
                         enum:
@@ -50551,6 +51307,8 @@ components:
                           - observed
                           - inferred
                           - hypothesized
+                        default: reported
+                        x-go-type-skip-optional-pointer: false
                       modality:
                         type: string
                         enum:
@@ -50559,17 +51317,31 @@ components:
                           - desired
                           - conditional
                           - hypothetical
+                        default: actual
+                        x-go-type-skip-optional-pointer: false
                       stability:
                         type: string
                         enum:
                           - provisional
                           - settled
+                        default: settled
+                        x-go-type-skip-optional-pointer: false
                       valid_from:
                         type: integer
+                        minimum: -9223372036854775808
+                        maximum: 9223372036854775807
+                        format: int64
+                        x-go-type: int64
+                        default: null
                         nullable: true
                         x-go-type-skip-optional-pointer: false
                       valid_to:
                         type: integer
+                        minimum: -9223372036854775808
+                        maximum: 9223372036854775807
+                        format: int64
+                        x-go-type: int64
+                        default: null
                         nullable: true
                         x-go-type-skip-optional-pointer: false
                       evidence:
@@ -50584,12 +51356,21 @@ components:
                               properties:
                                 start:
                                   type: integer
+                                  minimum: 0
+                                  maximum: 4294967295
+                                  format: uint32
+                                  x-go-type: uint32
                                 end:
                                   type: integer
+                                  minimum: 0
+                                  maximum: 4294967295
+                                  format: uint32
+                                  x-go-type: uint32
                               required:
                                 - start
                                 - end
                               additionalProperties: false
+                              default: null
                               nullable: true
                           required:
                             - id
@@ -50615,12 +51396,21 @@ components:
                                     properties:
                                       start:
                                         type: integer
+                                        minimum: 0
+                                        maximum: 4294967295
+                                        format: uint32
+                                        x-go-type: uint32
                                       end:
                                         type: integer
+                                        minimum: 0
+                                        maximum: 4294967295
+                                        format: uint32
+                                        x-go-type: uint32
                                     required:
                                       - start
                                       - end
                                     additionalProperties: false
+                                    default: null
                                     nullable: true
                                 required:
                                   - id
@@ -50654,7 +51444,9 @@ components:
                           type: string
                       expected_outcome:
                         type: string
+                        default: null
                         nullable: true
+                        x-go-type-skip-optional-pointer: false
                       producer:
                         type: string
                       visibility:
@@ -50662,10 +51454,13 @@ components:
                         enum:
                           - private
                           - team
+                        default: private
+                        x-go-type-skip-optional-pointer: false
                       embedding:
                         type: array
                         items:
                           type: number
+                        default: null
                         nullable: true
                       embedding_model:
                         type: object
@@ -50678,6 +51473,11 @@ components:
                             type: string
                           dimensions:
                             type: integer
+                            minimum: 0
+                            maximum: 4294967295
+                            format: uint32
+                            x-go-type: uint32
+                            default: null
                             nullable: true
                             x-go-type-skip-optional-pointer: false
                         required:
@@ -50685,10 +51485,13 @@ components:
                           - model
                           - revision
                         additionalProperties: false
+                        default: null
                         nullable: true
                       reconciliation_reason:
                         type: string
+                        default: null
                         nullable: true
+                        x-go-type-skip-optional-pointer: false
                     required:
                       - id
                       - subject
@@ -50701,6 +51504,11 @@ components:
                     type: string
                   asserted_valid_to:
                     type: integer
+                    minimum: -9223372036854775808
+                    maximum: 9223372036854775807
+                    format: int64
+                    x-go-type: int64
+                    default: null
                     nullable: true
                     x-go-type-skip-optional-pointer: false
                   explicit_disposition:
@@ -50713,6 +51521,10 @@ components:
                             type: string
                           recorded_at:
                             type: integer
+                            minimum: -9223372036854775808
+                            maximum: 9223372036854775807
+                            format: int64
+                            x-go-type: int64
                           evidence:
                             type: array
                             items:
@@ -50725,23 +51537,35 @@ components:
                                   properties:
                                     start:
                                       type: integer
+                                      minimum: 0
+                                      maximum: 4294967295
+                                      format: uint32
+                                      x-go-type: uint32
                                     end:
                                       type: integer
+                                      minimum: 0
+                                      maximum: 4294967295
+                                      format: uint32
+                                      x-go-type: uint32
                                   required:
                                     - start
                                     - end
                                   additionalProperties: false
+                                  default: null
                                   nullable: true
                               required:
                                 - id
                               additionalProperties: false
                           forgotten:
                             type: boolean
+                            default: false
+                            x-go-type-skip-optional-pointer: false
                         required:
                           - principal
                           - recorded_at
                           - evidence
                         additionalProperties: false
+                        default: null
                         nullable: true
                       lifecycle:
                         type: string
@@ -50752,17 +51576,31 @@ components:
                           - retracted
                       valid_to:
                         type: integer
+                        minimum: -9223372036854775808
+                        maximum: 9223372036854775807
+                        format: int64
+                        x-go-type: int64
                         nullable: true
                         x-go-type-skip-optional-pointer: false
                       superseded_by:
                         type: string
                         nullable: true
+                        x-go-type-skip-optional-pointer: false
                       superseded_valid_at:
                         type: integer
+                        minimum: -9223372036854775808
+                        maximum: 9223372036854775807
+                        format: int64
+                        x-go-type: int64
+                        default: null
                         nullable: true
                         x-go-type-skip-optional-pointer: false
                       recorded_to:
                         type: integer
+                        minimum: -9223372036854775808
+                        maximum: 9223372036854775807
+                        format: int64
+                        x-go-type: int64
                         nullable: true
                         x-go-type-skip-optional-pointer: false
                       conflicts_with:
@@ -50772,6 +51610,7 @@ components:
                       reason:
                         type: string
                         nullable: true
+                        x-go-type-skip-optional-pointer: false
                     required:
                       - lifecycle
                       - valid_to
@@ -50780,15 +51619,30 @@ components:
                       - conflicts_with
                       - reason
                     additionalProperties: false
+                    default: null
                     nullable: true
                   owner:
                     type: string
                   recorded_from:
                     type: integer
+                    minimum: -9223372036854775808
+                    maximum: 9223372036854775807
+                    format: int64
+                    x-go-type: int64
                   recorded_at:
                     type: integer
+                    minimum: -9223372036854775808
+                    maximum: 9223372036854775807
+                    format: int64
+                    default: 0
+                    x-go-type-skip-optional-pointer: false
+                    x-go-type: int64
                   revision:
                     type: integer
+                    minimum: 0
+                    maximum: 18446744073709551615
+                    format: uint64
+                    x-go-type: uint64
                   lifecycle:
                     type: string
                     enum:
@@ -50796,28 +51650,50 @@ components:
                       - disputed
                       - superseded
                       - retracted
+                    default: active
+                    x-go-type-skip-optional-pointer: false
                   stale:
                     type: boolean
+                    default: false
+                    x-go-type-skip-optional-pointer: false
                   reason:
                     type: string
+                    default: null
                     nullable: true
+                    x-go-type-skip-optional-pointer: false
                   conflicts_with:
                     type: array
                     items:
                       type: string
                   recorded_to:
                     type: integer
+                    minimum: -9223372036854775808
+                    maximum: 9223372036854775807
+                    format: int64
+                    x-go-type: int64
+                    default: null
                     nullable: true
                     x-go-type-skip-optional-pointer: false
                   superseded_by:
                     type: string
+                    default: null
                     nullable: true
+                    x-go-type-skip-optional-pointer: false
                   superseded_valid_at:
                     type: integer
+                    minimum: -9223372036854775808
+                    maximum: 9223372036854775807
+                    format: int64
+                    x-go-type: int64
+                    default: null
                     nullable: true
                     x-go-type-skip-optional-pointer: false
                   config_generation:
                     type: integer
+                    minimum: 0
+                    maximum: 18446744073709551615
+                    format: uint64
+                    x-go-type: uint64
                 required:
                   - assertion
                   - owner
@@ -50841,12 +51717,21 @@ components:
                       properties:
                         start:
                           type: integer
+                          minimum: 0
+                          maximum: 4294967295
+                          format: uint32
+                          x-go-type: uint32
                         end:
                           type: integer
+                          minimum: 0
+                          maximum: 4294967295
+                          format: uint32
+                          x-go-type: uint32
                       required:
                         - start
                         - end
                       additionalProperties: false
+                      default: null
                       nullable: true
                   required:
                     - id
@@ -50860,20 +51745,41 @@ components:
         next_cursor:
           type: string
           nullable: true
+          x-go-type-skip-optional-pointer: false
         complete:
           type: boolean
         truncated:
           type: boolean
         scanned:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
         omitted:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
         token_upper_bound:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
         revision:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
         config_generation:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
         retrieval:
           type: string
           enum:
@@ -50926,14 +51832,20 @@ components:
                       - open_question
                       - alternative
                       - summary
+                    default: semantic
+                    x-go-type-skip-optional-pointer: false
                   scope:
                     type: string
                   task:
                     type: string
+                    default: null
                     nullable: true
+                    x-go-type-skip-optional-pointer: false
                   environment:
                     type: string
+                    default: null
                     nullable: true
+                    x-go-type-skip-optional-pointer: false
                   role:
                     type: string
                     enum:
@@ -50941,6 +51853,8 @@ components:
                       - observed
                       - inferred
                       - hypothesized
+                    default: reported
+                    x-go-type-skip-optional-pointer: false
                   modality:
                     type: string
                     enum:
@@ -50949,17 +51863,31 @@ components:
                       - desired
                       - conditional
                       - hypothetical
+                    default: actual
+                    x-go-type-skip-optional-pointer: false
                   stability:
                     type: string
                     enum:
                       - provisional
                       - settled
+                    default: settled
+                    x-go-type-skip-optional-pointer: false
                   valid_from:
                     type: integer
+                    minimum: -9223372036854775808
+                    maximum: 9223372036854775807
+                    format: int64
+                    x-go-type: int64
+                    default: null
                     nullable: true
                     x-go-type-skip-optional-pointer: false
                   valid_to:
                     type: integer
+                    minimum: -9223372036854775808
+                    maximum: 9223372036854775807
+                    format: int64
+                    x-go-type: int64
+                    default: null
                     nullable: true
                     x-go-type-skip-optional-pointer: false
                   evidence:
@@ -50974,12 +51902,21 @@ components:
                           properties:
                             start:
                               type: integer
+                              minimum: 0
+                              maximum: 4294967295
+                              format: uint32
+                              x-go-type: uint32
                             end:
                               type: integer
+                              minimum: 0
+                              maximum: 4294967295
+                              format: uint32
+                              x-go-type: uint32
                           required:
                             - start
                             - end
                           additionalProperties: false
+                          default: null
                           nullable: true
                       required:
                         - id
@@ -51005,12 +51942,21 @@ components:
                                 properties:
                                   start:
                                     type: integer
+                                    minimum: 0
+                                    maximum: 4294967295
+                                    format: uint32
+                                    x-go-type: uint32
                                   end:
                                     type: integer
+                                    minimum: 0
+                                    maximum: 4294967295
+                                    format: uint32
+                                    x-go-type: uint32
                                 required:
                                   - start
                                   - end
                                 additionalProperties: false
+                                default: null
                                 nullable: true
                             required:
                               - id
@@ -51044,7 +51990,9 @@ components:
                       type: string
                   expected_outcome:
                     type: string
+                    default: null
                     nullable: true
+                    x-go-type-skip-optional-pointer: false
                   producer:
                     type: string
                   visibility:
@@ -51052,10 +52000,13 @@ components:
                     enum:
                       - private
                       - team
+                    default: private
+                    x-go-type-skip-optional-pointer: false
                   embedding:
                     type: array
                     items:
                       type: number
+                    default: null
                     nullable: true
                   embedding_model:
                     type: object
@@ -51068,6 +52019,11 @@ components:
                         type: string
                       dimensions:
                         type: integer
+                        minimum: 0
+                        maximum: 4294967295
+                        format: uint32
+                        x-go-type: uint32
+                        default: null
                         nullable: true
                         x-go-type-skip-optional-pointer: false
                     required:
@@ -51075,10 +52031,13 @@ components:
                       - model
                       - revision
                     additionalProperties: false
+                    default: null
                     nullable: true
                   reconciliation_reason:
                     type: string
+                    default: null
                     nullable: true
+                    x-go-type-skip-optional-pointer: false
                 required:
                   - id
                   - subject
@@ -51091,6 +52050,11 @@ components:
                 type: string
               asserted_valid_to:
                 type: integer
+                minimum: -9223372036854775808
+                maximum: 9223372036854775807
+                format: int64
+                x-go-type: int64
+                default: null
                 nullable: true
                 x-go-type-skip-optional-pointer: false
               explicit_disposition:
@@ -51103,6 +52067,10 @@ components:
                         type: string
                       recorded_at:
                         type: integer
+                        minimum: -9223372036854775808
+                        maximum: 9223372036854775807
+                        format: int64
+                        x-go-type: int64
                       evidence:
                         type: array
                         items:
@@ -51115,23 +52083,35 @@ components:
                               properties:
                                 start:
                                   type: integer
+                                  minimum: 0
+                                  maximum: 4294967295
+                                  format: uint32
+                                  x-go-type: uint32
                                 end:
                                   type: integer
+                                  minimum: 0
+                                  maximum: 4294967295
+                                  format: uint32
+                                  x-go-type: uint32
                               required:
                                 - start
                                 - end
                               additionalProperties: false
+                              default: null
                               nullable: true
                           required:
                             - id
                           additionalProperties: false
                       forgotten:
                         type: boolean
+                        default: false
+                        x-go-type-skip-optional-pointer: false
                     required:
                       - principal
                       - recorded_at
                       - evidence
                     additionalProperties: false
+                    default: null
                     nullable: true
                   lifecycle:
                     type: string
@@ -51142,17 +52122,31 @@ components:
                       - retracted
                   valid_to:
                     type: integer
+                    minimum: -9223372036854775808
+                    maximum: 9223372036854775807
+                    format: int64
+                    x-go-type: int64
                     nullable: true
                     x-go-type-skip-optional-pointer: false
                   superseded_by:
                     type: string
                     nullable: true
+                    x-go-type-skip-optional-pointer: false
                   superseded_valid_at:
                     type: integer
+                    minimum: -9223372036854775808
+                    maximum: 9223372036854775807
+                    format: int64
+                    x-go-type: int64
+                    default: null
                     nullable: true
                     x-go-type-skip-optional-pointer: false
                   recorded_to:
                     type: integer
+                    minimum: -9223372036854775808
+                    maximum: 9223372036854775807
+                    format: int64
+                    x-go-type: int64
                     nullable: true
                     x-go-type-skip-optional-pointer: false
                   conflicts_with:
@@ -51162,6 +52156,7 @@ components:
                   reason:
                     type: string
                     nullable: true
+                    x-go-type-skip-optional-pointer: false
                 required:
                   - lifecycle
                   - valid_to
@@ -51170,15 +52165,30 @@ components:
                   - conflicts_with
                   - reason
                 additionalProperties: false
+                default: null
                 nullable: true
               owner:
                 type: string
               recorded_from:
                 type: integer
+                minimum: -9223372036854775808
+                maximum: 9223372036854775807
+                format: int64
+                x-go-type: int64
               recorded_at:
                 type: integer
+                minimum: -9223372036854775808
+                maximum: 9223372036854775807
+                format: int64
+                default: 0
+                x-go-type-skip-optional-pointer: false
+                x-go-type: int64
               revision:
                 type: integer
+                minimum: 0
+                maximum: 18446744073709551615
+                format: uint64
+                x-go-type: uint64
               lifecycle:
                 type: string
                 enum:
@@ -51186,28 +52196,50 @@ components:
                   - disputed
                   - superseded
                   - retracted
+                default: active
+                x-go-type-skip-optional-pointer: false
               stale:
                 type: boolean
+                default: false
+                x-go-type-skip-optional-pointer: false
               reason:
                 type: string
+                default: null
                 nullable: true
+                x-go-type-skip-optional-pointer: false
               conflicts_with:
                 type: array
                 items:
                   type: string
               recorded_to:
                 type: integer
+                minimum: -9223372036854775808
+                maximum: 9223372036854775807
+                format: int64
+                x-go-type: int64
+                default: null
                 nullable: true
                 x-go-type-skip-optional-pointer: false
               superseded_by:
                 type: string
+                default: null
                 nullable: true
+                x-go-type-skip-optional-pointer: false
               superseded_valid_at:
                 type: integer
+                minimum: -9223372036854775808
+                maximum: 9223372036854775807
+                format: int64
+                x-go-type: int64
+                default: null
                 nullable: true
                 x-go-type-skip-optional-pointer: false
               config_generation:
                 type: integer
+                minimum: 0
+                maximum: 18446744073709551615
+                format: uint64
+                x-go-type: uint64
             required:
               - assertion
               - owner
@@ -51218,10 +52250,15 @@ components:
         next_cursor:
           type: string
           nullable: true
+          x-go-type-skip-optional-pointer: false
         complete:
           type: boolean
         revision:
           type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
       required:
         - items
         - next_cursor
@@ -51244,6 +52281,8 @@ components:
                     enum:
                       - private
                       - team
+                    default: private
+                    x-go-type-skip-optional-pointer: false
                   evidence:
                     type: array
                     items:
@@ -51256,12 +52295,21 @@ components:
                           properties:
                             start:
                               type: integer
+                              minimum: 0
+                              maximum: 4294967295
+                              format: uint32
+                              x-go-type: uint32
                             end:
                               type: integer
+                              minimum: 0
+                              maximum: 4294967295
+                              format: uint32
+                              x-go-type: uint32
                           required:
                             - start
                             - end
                           additionalProperties: false
+                          default: null
                           nullable: true
                       required:
                         - id
@@ -51288,8 +52336,19 @@ components:
                 type: string
               revision:
                 type: integer
+                minimum: 0
+                maximum: 18446744073709551615
+                format: uint64
+                default: 0
+                x-go-type-skip-optional-pointer: false
+                x-go-type: uint64
               recorded_at:
                 type: integer
+                minimum: -9223372036854775808
+                maximum: 9223372036854775807
+                format: int64
+                x-go-type: int64
+                default: null
                 nullable: true
                 x-go-type-skip-optional-pointer: false
             required:
@@ -51299,6 +52358,7 @@ components:
         next_cursor:
           type: string
           nullable: true
+          x-go-type-skip-optional-pointer: false
         complete:
           type: boolean
       required:
@@ -51314,6 +52374,12 @@ components:
           properties:
             table_id:
               type: integer
+              minimum: 0
+              maximum: 18446744073709551615
+              format: uint64
+              default: 0
+              x-go-type-skip-optional-pointer: false
+              x-go-type: uint64
             database:
               type: string
             namespace:
@@ -51325,16 +52391,36 @@ components:
               properties:
                 version:
                   type: integer
+                  minimum: 0
+                  maximum: 4294967295
+                  format: uint32
+                  default: 1
+                  x-go-type-skip-optional-pointer: false
+                  x-go-type: uint32
                 generation:
                   type: integer
+                  minimum: 0
+                  maximum: 18446744073709551615
+                  format: uint64
+                  default: 1
+                  x-go-type-skip-optional-pointer: false
+                  x-go-type: uint64
                 embedding_generation:
                   type: integer
+                  minimum: 0
+                  maximum: 18446744073709551615
+                  format: uint64
+                  default: 1
+                  x-go-type-skip-optional-pointer: false
+                  x-go-type: uint64
                 processing:
                   type: string
                   enum:
                     - external
                     - managed
                     - hybrid
+                  default: external
+                  x-go-type-skip-optional-pointer: false
                 ontology_version:
                   type: string
                 policy_version:
@@ -51344,18 +52430,28 @@ components:
                   properties:
                     semantic_recall:
                       type: boolean
+                      default: false
+                      x-go-type-skip-optional-pointer: false
                     entity_extraction:
                       type: boolean
+                      default: false
+                      x-go-type-skip-optional-pointer: false
                     assertion_distillation:
                       type: boolean
+                      default: false
+                      x-go-type-skip-optional-pointer: false
                     summaries:
                       type: boolean
+                      default: false
+                      x-go-type-skip-optional-pointer: false
                     reconciliation:
                       type: string
                       enum:
                         - explicit
                         - deterministic
                         - model
+                      default: explicit
+                      x-go-type-skip-optional-pointer: false
                   additionalProperties: false
                 models:
                   type: object
@@ -51371,6 +52467,11 @@ components:
                           type: string
                         dimensions:
                           type: integer
+                          minimum: 0
+                          maximum: 4294967295
+                          format: uint32
+                          x-go-type: uint32
+                          default: null
                           nullable: true
                           x-go-type-skip-optional-pointer: false
                       required:
@@ -51378,6 +52479,7 @@ components:
                         - model
                         - revision
                       additionalProperties: false
+                      default: null
                       nullable: true
                     extractor:
                       type: object
@@ -51390,6 +52492,11 @@ components:
                           type: string
                         dimensions:
                           type: integer
+                          minimum: 0
+                          maximum: 4294967295
+                          format: uint32
+                          x-go-type: uint32
+                          default: null
                           nullable: true
                           x-go-type-skip-optional-pointer: false
                       required:
@@ -51397,6 +52504,7 @@ components:
                         - model
                         - revision
                       additionalProperties: false
+                      default: null
                       nullable: true
                     generator:
                       type: object
@@ -51409,6 +52517,11 @@ components:
                           type: string
                         dimensions:
                           type: integer
+                          minimum: 0
+                          maximum: 4294967295
+                          format: uint32
+                          x-go-type: uint32
+                          default: null
                           nullable: true
                           x-go-type-skip-optional-pointer: false
                       required:
@@ -51416,6 +52529,7 @@ components:
                         - model
                         - revision
                       additionalProperties: false
+                      default: null
                       nullable: true
                     decider:
                       type: object
@@ -51428,6 +52542,11 @@ components:
                           type: string
                         dimensions:
                           type: integer
+                          minimum: 0
+                          maximum: 4294967295
+                          format: uint32
+                          x-go-type: uint32
+                          default: null
                           nullable: true
                           x-go-type-skip-optional-pointer: false
                       required:
@@ -51435,6 +52554,7 @@ components:
                         - model
                         - revision
                       additionalProperties: false
+                      default: null
                       nullable: true
                   additionalProperties: false
                 predicates:
@@ -51449,12 +52569,18 @@ components:
                         enum:
                           - one
                           - many
+                        default: many
+                        x-go-type-skip-optional-pointer: false
                       subject_type:
                         type: string
+                        default: null
                         nullable: true
+                        x-go-type-skip-optional-pointer: false
                       object_type:
                         type: string
+                        default: null
                         nullable: true
+                        x-go-type-skip-optional-pointer: false
                     required:
                       - name
                     additionalProperties: false
@@ -51467,25 +52593,64 @@ components:
                         type: string
                       principal:
                         type: string
+                        default: null
                         nullable: true
+                        x-go-type-skip-optional-pointer: false
                       producer:
                         type: string
+                        default: null
                         nullable: true
+                        x-go-type-skip-optional-pointer: false
                       authority:
                         type: integer
+                        minimum: 0
+                        maximum: 65535
+                        format: uint32
+                        default: 0
+                        x-go-type-skip-optional-pointer: false
+                        x-go-type: uint32
                     required:
                       - source_id
                     additionalProperties: false
                 max_input_bytes:
                   type: integer
+                  minimum: 0
+                  maximum: 4294967295
+                  format: uint32
+                  default: 262144
+                  x-go-type-skip-optional-pointer: false
+                  x-go-type: uint32
                 max_output_items:
                   type: integer
+                  minimum: 0
+                  maximum: 65535
+                  format: uint32
+                  default: 128
+                  x-go-type-skip-optional-pointer: false
+                  x-go-type: uint32
                 max_attempts:
                   type: integer
+                  minimum: 0
+                  maximum: 255
+                  format: uint32
+                  default: 3
+                  x-go-type-skip-optional-pointer: false
+                  x-go-type: uint32
                 max_recall_tokens:
                   type: integer
+                  minimum: 0
+                  maximum: 4294967295
+                  format: uint32
+                  default: 8192
+                  x-go-type-skip-optional-pointer: false
+                  x-go-type: uint32
                 retention_ms:
                   type: integer
+                  minimum: 0
+                  maximum: 18446744073709551615
+                  format: uint64
+                  x-go-type: uint64
+                  default: null
                   nullable: true
                   x-go-type-skip-optional-pointer: false
               additionalProperties: false
@@ -51494,16 +52659,36 @@ components:
               properties:
                 version:
                   type: integer
+                  minimum: 0
+                  maximum: 4294967295
+                  format: uint32
+                  default: 1
+                  x-go-type-skip-optional-pointer: false
+                  x-go-type: uint32
                 generation:
                   type: integer
+                  minimum: 0
+                  maximum: 18446744073709551615
+                  format: uint64
+                  default: 1
+                  x-go-type-skip-optional-pointer: false
+                  x-go-type: uint64
                 embedding_generation:
                   type: integer
+                  minimum: 0
+                  maximum: 18446744073709551615
+                  format: uint64
+                  default: 1
+                  x-go-type-skip-optional-pointer: false
+                  x-go-type: uint64
                 processing:
                   type: string
                   enum:
                     - external
                     - managed
                     - hybrid
+                  default: external
+                  x-go-type-skip-optional-pointer: false
                 ontology_version:
                   type: string
                 policy_version:
@@ -51513,18 +52698,28 @@ components:
                   properties:
                     semantic_recall:
                       type: boolean
+                      default: false
+                      x-go-type-skip-optional-pointer: false
                     entity_extraction:
                       type: boolean
+                      default: false
+                      x-go-type-skip-optional-pointer: false
                     assertion_distillation:
                       type: boolean
+                      default: false
+                      x-go-type-skip-optional-pointer: false
                     summaries:
                       type: boolean
+                      default: false
+                      x-go-type-skip-optional-pointer: false
                     reconciliation:
                       type: string
                       enum:
                         - explicit
                         - deterministic
                         - model
+                      default: explicit
+                      x-go-type-skip-optional-pointer: false
                   additionalProperties: false
                 models:
                   type: object
@@ -51540,6 +52735,11 @@ components:
                           type: string
                         dimensions:
                           type: integer
+                          minimum: 0
+                          maximum: 4294967295
+                          format: uint32
+                          x-go-type: uint32
+                          default: null
                           nullable: true
                           x-go-type-skip-optional-pointer: false
                       required:
@@ -51547,6 +52747,7 @@ components:
                         - model
                         - revision
                       additionalProperties: false
+                      default: null
                       nullable: true
                     extractor:
                       type: object
@@ -51559,6 +52760,11 @@ components:
                           type: string
                         dimensions:
                           type: integer
+                          minimum: 0
+                          maximum: 4294967295
+                          format: uint32
+                          x-go-type: uint32
+                          default: null
                           nullable: true
                           x-go-type-skip-optional-pointer: false
                       required:
@@ -51566,6 +52772,7 @@ components:
                         - model
                         - revision
                       additionalProperties: false
+                      default: null
                       nullable: true
                     generator:
                       type: object
@@ -51578,6 +52785,11 @@ components:
                           type: string
                         dimensions:
                           type: integer
+                          minimum: 0
+                          maximum: 4294967295
+                          format: uint32
+                          x-go-type: uint32
+                          default: null
                           nullable: true
                           x-go-type-skip-optional-pointer: false
                       required:
@@ -51585,6 +52797,7 @@ components:
                         - model
                         - revision
                       additionalProperties: false
+                      default: null
                       nullable: true
                     decider:
                       type: object
@@ -51597,6 +52810,11 @@ components:
                           type: string
                         dimensions:
                           type: integer
+                          minimum: 0
+                          maximum: 4294967295
+                          format: uint32
+                          x-go-type: uint32
+                          default: null
                           nullable: true
                           x-go-type-skip-optional-pointer: false
                       required:
@@ -51604,6 +52822,7 @@ components:
                         - model
                         - revision
                       additionalProperties: false
+                      default: null
                       nullable: true
                   additionalProperties: false
                 predicates:
@@ -51618,12 +52837,18 @@ components:
                         enum:
                           - one
                           - many
+                        default: many
+                        x-go-type-skip-optional-pointer: false
                       subject_type:
                         type: string
+                        default: null
                         nullable: true
+                        x-go-type-skip-optional-pointer: false
                       object_type:
                         type: string
+                        default: null
                         nullable: true
+                        x-go-type-skip-optional-pointer: false
                     required:
                       - name
                     additionalProperties: false
@@ -51636,35 +52861,82 @@ components:
                         type: string
                       principal:
                         type: string
+                        default: null
                         nullable: true
+                        x-go-type-skip-optional-pointer: false
                       producer:
                         type: string
+                        default: null
                         nullable: true
+                        x-go-type-skip-optional-pointer: false
                       authority:
                         type: integer
+                        minimum: 0
+                        maximum: 65535
+                        format: uint32
+                        default: 0
+                        x-go-type-skip-optional-pointer: false
+                        x-go-type: uint32
                     required:
                       - source_id
                     additionalProperties: false
                 max_input_bytes:
                   type: integer
+                  minimum: 0
+                  maximum: 4294967295
+                  format: uint32
+                  default: 262144
+                  x-go-type-skip-optional-pointer: false
+                  x-go-type: uint32
                 max_output_items:
                   type: integer
+                  minimum: 0
+                  maximum: 65535
+                  format: uint32
+                  default: 128
+                  x-go-type-skip-optional-pointer: false
+                  x-go-type: uint32
                 max_attempts:
                   type: integer
+                  minimum: 0
+                  maximum: 255
+                  format: uint32
+                  default: 3
+                  x-go-type-skip-optional-pointer: false
+                  x-go-type: uint32
                 max_recall_tokens:
                   type: integer
+                  minimum: 0
+                  maximum: 4294967295
+                  format: uint32
+                  default: 8192
+                  x-go-type-skip-optional-pointer: false
+                  x-go-type: uint32
                 retention_ms:
                   type: integer
+                  minimum: 0
+                  maximum: 18446744073709551615
+                  format: uint64
+                  x-go-type: uint64
+                  default: null
                   nullable: true
                   x-go-type-skip-optional-pointer: false
               additionalProperties: false
               nullable: true
             revision:
               type: integer
+              minimum: 0
+              maximum: 18446744073709551615
+              format: uint64
+              x-go-type: uint64
             owner:
               type: string
             created_at:
               type: integer
+              minimum: -9223372036854775808
+              maximum: 9223372036854775807
+              format: int64
+              x-go-type: int64
           required:
             - database
             - namespace

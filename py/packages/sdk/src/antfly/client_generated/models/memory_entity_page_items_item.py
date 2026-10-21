@@ -20,13 +20,13 @@ class MemoryEntityPageItemsItem:
     Attributes:
         entity (MemoryEntityPageItemsItemEntity):
         owner (str):
-        revision (int | Unset):
+        revision (int | Unset):  Default: 0.
         recorded_at (int | None | Unset):
     """
 
     entity: MemoryEntityPageItemsItemEntity
     owner: str
-    revision: int | Unset = UNSET
+    revision: int | Unset = 0
     recorded_at: int | None | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:

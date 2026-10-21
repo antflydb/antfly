@@ -19,7 +19,7 @@ class ResourceSelector:
         id (str):
         database (str | Unset):
         namespace (str | Unset):
-        kind (ResourceSelectorKind | Unset):
+        kind (ResourceSelectorKind | Unset):  Default: ResourceSelectorKind.RECORD.
         expected_revision (int | None | Unset):
     """
 
@@ -27,7 +27,7 @@ class ResourceSelector:
     id: str
     database: str | Unset = UNSET
     namespace: str | Unset = UNSET
-    kind: ResourceSelectorKind | Unset = UNSET
+    kind: ResourceSelectorKind | Unset = ResourceSelectorKind.RECORD
     expected_revision: int | None | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
