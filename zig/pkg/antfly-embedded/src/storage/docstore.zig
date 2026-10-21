@@ -995,6 +995,14 @@ pub const DocStore = struct {
             try credit.reserve(self, self.alloc, &self.artifact_inventory, expected.txn_id, fingerprint, plan.base, plan.roots, original);
         }
 
+        /// The owner supplies the final captured batch under its apply/catalog
+        /// witness. Input and frame authority are rechecked in this writer.
+        pub fn reservePreparedReplayAssembly(self: *Txn, expected: @import("db/prepared_transaction_effects.zig").Contract, fingerprint: [32]u8, assembly: *const @import("transaction_batch_admission.zig").OwnedBatch, original: ?@import("../common/read_admission.zig").Port) !void {
+            errdefer self.artifact_inventory.poisoned = true;
+            try self.publication_backlog.acquireMutationGate(if (self.columnar_owner) |owner| owner.runtime_store.publication_gate orelse &owner.publication_backlog_mutex else null);
+            try @import("prepared_replay_credit.zig").reserveAssembly(self, self.alloc, &self.artifact_inventory, expected, fingerprint, assembly, original);
+        }
+
         pub fn reservePreparedReplayCredit(self: *Txn, id: [16]u8, frame: [32]u8, base: @import("replay_record_shape.zig").Record, roots: []const []const u8, original: ?@import("../common/read_admission.zig").Port) !void {
             errdefer self.artifact_inventory.poisoned = true;
             try self.publication_backlog.acquireMutationGate(if (self.columnar_owner) |owner| owner.runtime_store.publication_gate orelse &owner.publication_backlog_mutex else null);
@@ -1362,6 +1370,14 @@ pub const DocStore = struct {
                 try credit.reserve(self, self.alloc, self.artifact_inventory, expected.txn_id, fingerprint, plan.base, plan.roots, original);
             }
 
+            /// The owner supplies the final captured batch under its apply/catalog
+            /// witness. Input and frame authority are rechecked in this writer.
+            pub fn reservePreparedReplayAssembly(self: @This(), expected: @import("db/prepared_transaction_effects.zig").Contract, fingerprint: [32]u8, assembly: *const @import("transaction_batch_admission.zig").OwnedBatch, original: ?@import("../common/read_admission.zig").Port) !void {
+                errdefer self.artifact_inventory.poisoned = true;
+                try self.publication_backlog.acquireMutationGate(self.publication_gate);
+                try @import("prepared_replay_credit.zig").reserveAssembly(self, self.alloc, self.artifact_inventory, expected, fingerprint, assembly, original);
+            }
+
             pub fn reservePreparedReplayCredit(self: @This(), id: [16]u8, frame: [32]u8, base: @import("replay_record_shape.zig").Record, roots: []const []const u8, original: ?@import("../common/read_admission.zig").Port) !void {
                 errdefer self.artifact_inventory.poisoned = true;
                 try self.publication_backlog.acquireMutationGate(self.publication_gate);
@@ -1510,6 +1526,9 @@ pub const DocStore = struct {
 
         pub fn reservePreparedReplayPlan(self: *Batch, expected: @import("db/prepared_transaction_effects.zig").Contract, request: @import("db/derived/derived_types.zig").DerivedBatch, original: ?@import("../common/read_admission.zig").Port) !void {
             try self.asTxn().reservePreparedReplayPlan(expected, request, original);
+        }
+        pub fn reservePreparedReplayAssembly(self: *Batch, expected: @import("db/prepared_transaction_effects.zig").Contract, fingerprint: [32]u8, assembly: *const @import("transaction_batch_admission.zig").OwnedBatch, original: ?@import("../common/read_admission.zig").Port) !void {
+            try self.asTxn().reservePreparedReplayAssembly(expected, fingerprint, assembly, original);
         }
         pub fn reservePreparedReplayCredit(self: *Batch, id: [16]u8, frame: [32]u8, base: @import("replay_record_shape.zig").Record, roots: []const []const u8, original: ?@import("../common/read_admission.zig").Port) !void {
             try self.asTxn().reservePreparedReplayCredit(id, frame, base, roots, original);
@@ -8774,4 +8793,145 @@ test "docstore prepared replay plan refuses disabled protocol before reading fra
     defer batch.abort();
     try std.testing.expectError(error.PreparedTransactionProtocolDisabled, batch.reservePreparedReplayPlan(contract, .{}, null));
     try std.testing.expectError(error.InvalidArtifactReplayInventory, batch.commit());
+}
+
+test "docstore prepared replay credit assembly claims auxiliary roots while retaining omitted primary floors on all native writers" {
+    const F = PreparedReplayCreditFixture;
+    const a = std.testing.allocator;
+    for (0..3) |path| {
+        var fixture: F = .{};
+        try fixture.init();
+        defer fixture.deinit();
+        const expected = try fixture.preparedInputs();
+        const frame = try fixture.store.get(a, &@import("transactions.zig").makePreparedEffectsKey(F.input_id));
+        defer a.free(frame);
+        const fingerprint = (try F.effects.inspect(frame, null)).fingerprint;
+        const auxiliary = try internal_keys.documentKeyAlloc(a, "group-result");
+        defer a.free(auxiliary);
+        const payload = try @import("db/derived/change_journal.zig").encodeRecord(a, .{ .sequence = 1, .changed_doc_keys = &.{"group-result"} });
+        defer a.free(payload);
+        var assembly = try @import("transaction_batch_admission.zig").OwnedBatch.capture(a, &.{.{ .key = auxiliary, .value = "unpublished" }}, &.{}, .{ .sequence = 1, .payload = payload }, null);
+        defer assembly.deinit();
+        if (path == 0) {
+            var txn = try fixture.store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.reservePreparedReplayAssembly(expected, fingerprint, &assembly, null);
+            try txn.commit();
+        } else {
+            var batch = try fixture.store.beginWriteBatch();
+            errdefer batch.abort();
+            if (path == 1) try batch.reservePreparedReplayAssembly(expected, fingerprint, &assembly, null) else try batch.asTxn().reservePreparedReplayAssembly(expected, fingerprint, &assembly, null);
+            try batch.commit();
+        }
+        const saved = try fixture.grant(F.input_id);
+        try std.testing.expectEqual(@as(u64, 3), saved.root_count);
+        try std.testing.expect(try saved.budget() >= payload.len);
+        try std.testing.expect(saved.base.overwritten_doc_keys.count > 0);
+        try std.testing.expect(saved.base.deleted_doc_keys.count > 0);
+        try std.testing.expectError(error.NotFound, fixture.store.get(a, auxiliary));
+        {
+            var read = try fixture.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqual(F.input_id, (try F.credit.owner(&read, try F.credit.documentHash(auxiliary))).?);
+        }
+        // Identical retry does not add debt or duplicate root ownership.
+        const debt = try fixture.debt();
+        {
+            var txn = try fixture.store.beginWriteBatch();
+            errdefer txn.abort();
+            try txn.reservePreparedReplayAssembly(expected, fingerprint, &assembly, null);
+            try txn.commit();
+        }
+        try std.testing.expectEqualDeep(debt, try fixture.debt());
+        try fixture.saturate();
+        try fixture.store.put(&(F.credit.replay_prefix.* ++ F.input_id), payload);
+        try std.testing.expectEqual(F.credit.Phase.materialized, (try fixture.grant(F.input_id)).phase);
+    }
+}
+
+test "docstore prepared replay credit assembly rejects mismatched frames malformed replay and stale inputs without publishing credit" {
+    const F = PreparedReplayCreditFixture;
+    const a = std.testing.allocator;
+    for (0..5) |damage| {
+        var fixture: F = .{};
+        try fixture.init();
+        defer fixture.deinit();
+        const expected = try fixture.preparedInputs();
+        const raw = try fixture.store.get(a, &@import("transactions.zig").makePreparedEffectsKey(F.input_id));
+        defer a.free(raw);
+        var fingerprint = (try F.effects.inspect(raw, null)).fingerprint;
+        if (damage == 0) fingerprint[0] ^= 1;
+        const payload = try @import("db/derived/change_journal.zig").encodeRecord(a, .{});
+        defer a.free(payload);
+        var assembly = try @import("transaction_batch_admission.zig").OwnedBatch.capture(a, &.{}, &.{}, if (damage == 1) null else .{ .sequence = 1, .payload = if (damage == 2) "malformed" else payload }, null);
+        defer assembly.deinit();
+        const debt = try fixture.debt();
+        var batch = try fixture.store.beginWriteBatch();
+        var active = true;
+        defer if (active) batch.abort();
+        if (damage == 3) {
+            try batch.put("\x00\x00__txn_intents__:" ++ F.input_id ++ ":orphan", "\x00{}");
+            try batch.put("\x00\x00__txn_intent_locks__:orphan", &F.input_id);
+        }
+        if (damage == 4) try batch.delete("\x00\x00__txn_intent_locks__:" ++ F.input_row);
+        const result = batch.reservePreparedReplayAssembly(expected, fingerprint, &assembly, null);
+        try std.testing.expectError(if (damage == 1) error.InvalidPreparedEffects else if (damage == 2) error.InvalidBinaryRecord else error.PreparedEffectsMismatch, result);
+        // Ignoring reservation failure cannot commit earlier staged mutations.
+        try std.testing.expectError(error.InvalidArtifactReplayInventory, batch.commit());
+        batch.abort();
+        active = false;
+        try std.testing.expectEqualDeep(debt, try fixture.debt());
+        try std.testing.expectError(error.NotFound, fixture.store.get(a, &F.credit.grantKey(F.input_id)));
+    }
+}
+
+test "docstore prepared replay credit assembly unwinds output allocations and preserves every original checkpoint rejection" {
+    const F = PreparedReplayCreditFixture;
+    const a = std.testing.allocator;
+    var fixture: F = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const expected = try fixture.preparedInputs();
+    const frame = try fixture.store.get(a, &@import("transactions.zig").makePreparedEffectsKey(F.input_id));
+    defer a.free(frame);
+    const fingerprint = (try F.effects.inspect(frame, null)).fingerprint;
+    const auxiliary = try internal_keys.documentKeyAlloc(a, "auxiliary");
+    defer a.free(auxiliary);
+    const payload = try @import("db/derived/change_journal.zig").encodeRecord(a, .{ .sequence = 1, .changed_doc_keys = &.{"auxiliary"} });
+    defer a.free(payload);
+    var assembly = try @import("transaction_batch_admission.zig").OwnedBatch.capture(a, &.{.{ .key = auxiliary, .value = "opaque" }}, &.{}, .{ .sequence = 1, .payload = payload }, null);
+    defer assembly.deinit();
+    const Checks = struct {
+        calls: usize = 0,
+        stop: usize = std.math.maxInt(usize),
+        cause: anyerror = error.DeadlineExceeded,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == self.stop) return self.cause;
+        }
+        fn run(alloc: Allocator, store: *DocStore, contract: F.effects.Contract, hash: [32]u8, owned: *const @import("transaction_batch_admission.zig").OwnedBatch, checks: ?*@This()) !void {
+            var batch = try store.beginWriteBatch();
+            defer batch.abort();
+            const adapter = batch.asTxn();
+            // Inject reservation scratch and its retained authority together.
+            // The writer's own staged-state allocations keep their allocator.
+            var capture: artifact_replay_inventory.Capture = .{};
+            defer capture.deinit(alloc);
+            try adapter.publication_backlog.acquireMutationGate(adapter.publication_gate);
+            const controls = @import("../common/read_admission.zig");
+            var source: controls.Payload = .{ .ptr = checks orelse undefined, .vtable = &.{ .checkpoint = check } };
+            try F.credit.reserveAssembly(adapter, alloc, &capture, contract, hash, owned, if (checks != null) .init(&source) else null);
+        }
+    };
+    const before = try fixture.debt();
+    try std.testing.checkAllAllocationFailures(a, Checks.run, .{ &fixture.store, expected, fingerprint, &assembly, @as(?*Checks, null) });
+    var baseline: Checks = .{};
+    try Checks.run(a, &fixture.store, expected, fingerprint, &assembly, &baseline);
+    for ([_]anyerror{ error.NotFound, error.OutOfMemory, error.DeadlineExceeded }) |cause| for (1..baseline.calls + 1) |stop| {
+        var checks: Checks = .{ .stop = stop, .cause = cause };
+        try std.testing.expectError(cause, Checks.run(a, &fixture.store, expected, fingerprint, &assembly, &checks));
+    };
+    try std.testing.expectEqualDeep(before, try fixture.debt());
+    try std.testing.expectError(error.NotFound, fixture.store.get(a, &F.credit.grantKey(F.input_id)));
 }

@@ -147880,3 +147880,50 @@ test "db prepared transaction effects required assembly boundary preserves failu
     defer db.core.unlockApply();
     try owned.validateDependencies(db.core, null);
 }
+
+test "db prepared transaction effects required assembly funds complete grouped generated replay before normal resolution" {
+    const a = std.testing.allocator;
+    const F = PreparedAssemblyFixture;
+    const credit = @import("../prepared_replay_credit.zig");
+    for ([_]bool{ false, true }) |relational| {
+        var directory = try TestDirectory.init("prepared-assembly-funded");
+        defer directory.cleanup();
+        var db = try DB.open(a, directory.path(), F.options);
+        defer db.close();
+        try F.seed(&db, relational, true);
+        // Replay retention is independently opted in; the ordinary prepared
+        // effects fixture deliberately enables only its earlier reader floor.
+        const floors = @import("catalog/reader_versions.zig");
+        const floor = try @import("catalog/resolver_catalog.zig").readerVersionBytes(floors.replay_credit_reader_version);
+        try db.core.store.put(floors.minimum_reader_key, floor);
+        try db.core.store.put(floors.replacement_reader_base_key, floor);
+        var plan = try db.prepareTransactionAssembly(a, F.id, 19, null);
+        defer plan.deinit();
+        {
+            db.core.lockApply();
+            defer db.core.unlockApply();
+            try plan.validateDependencies(db.core, null);
+            var batch = try db.core.store.beginWriteBatch();
+            errdefer batch.abort();
+            const contract = plan.preparation.?;
+            try batch.reservePreparedReplayAssembly(contract.contract, contract.fingerprint, &plan.bytes, null);
+            try batch.commit();
+        }
+        try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(F.id));
+        {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            const grant = (try credit.load(&read, F.id)).?;
+            try std.testing.expect(grant.root_count > 2);
+            try std.testing.expect(try grant.budget() >= plan.bytes.replay.?.payload.len);
+            var shape = try @import("../prepared_replay_plan.zig").deriveFromMutations(a, plan.bytes.writes, plan.bytes.deletes, plan.bytes.replay.?.payload, null);
+            defer shape.deinit();
+            try credit.validateMutationPlan(&read, F.id, shape, null);
+        }
+        try db.resolveTransactionIntentsWithSyncLevel(F.id, .committed, 19, .propose);
+        try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(F.id));
+        const actual = try db.core.store.get(a, plan.bytes.writes[0].key);
+        defer a.free(actual);
+        try std.testing.expectEqualSlices(u8, plan.bytes.writes[0].value, actual);
+    }
+}

@@ -260,6 +260,32 @@ pub fn reserve(txn: anytype, a: std.mem.Allocator, capture: *inventory.Capture, 
     }
     if (original) |port| try port.checkpoint();
 }
+/// Reserve against the complete assembled batch while independently deriving
+/// a floor from this writer's stored intents and exact accepted frame. The
+/// enclosing caller holds apply/catalog witnesses; this does not authorize a
+/// vote, install read guards or reserve executable recovery working resources.
+pub fn reserveAssembly(txn: anytype, a: std.mem.Allocator, capture: *inventory.Capture, expected: @import("db/prepared_transaction_effects.zig").Contract, fingerprint: Hash, assembly: *const @import("transaction_batch_admission.zig").OwnedBatch, original: ?control.Port) !void {
+    errdefer capture.poisoned = true;
+    var trace: control.RejectionTrace = .{};
+    reserveAssemblyInner(txn, a, capture, expected, fingerprint, assembly, trace.bind(original)) catch |cause| return trace.failure orelse cause;
+    if (trace.failure) |cause| return cause;
+}
+fn reserveAssemblyInner(txn: anytype, a: std.mem.Allocator, capture: *inventory.Capture, expected: @import("db/prepared_transaction_effects.zig").Contract, fingerprint: Hash, assembly: *const @import("transaction_batch_admission.zig").OwnedBatch, original: ?control.Port) !void {
+    if (original) |port| try port.checkpoint();
+    try requireFloors(txn);
+    const replay = assembly.replay orelse return error.InvalidPreparedEffects;
+    const raw = (try readOptional(txn, &(backlog.prepared_effects_prefix.* ++ expected.txn_id))) orelse return error.PreparedEffectsRequired;
+    var decoded = try @import("db/prepared_transaction_effects.zig").decode(a, raw, expected, original);
+    defer decoded.deinit();
+    if (!std.meta.eql(raw[raw.len - 32 ..][0..32].*, fingerprint)) return error.PreparedEffectsMismatch;
+    var floor = try @import("transactions.zig").derivePreparedReplayPlanFromTxn(a, txn, expected, .{}, decoded.plan.effects, original);
+    defer floor.deinit();
+    var plan = try @import("prepared_replay_plan.zig").coverAssembly(a, assembly.writes, assembly.deletes, replay.payload, floor, original);
+    defer plan.deinit();
+    try capture.retainPreparedInputs(a, expected, fingerprint);
+    try reserve(txn, a, capture, expected.txn_id, fingerprint, plan.base, plan.roots, original);
+}
+
 /// Final writer-view proof. No payload scan and no independent resource grant.
 pub fn validateGrant(txn: anytype, id: Id) !void {
     const grant = try load(txn, id);

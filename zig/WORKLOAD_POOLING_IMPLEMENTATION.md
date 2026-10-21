@@ -22424,3 +22424,46 @@ raw/import/restore/migration/peer eligibility and broader scheduler/session/tena
 whole-node/remote coverage remain open. Strong required providers stay disabled;
 the whole goal remains active. Full Linux qualification remains waived and Linux
 builds still require pinned Nix/glibc Zig. Cross-engine performance is unproven.
+
+### Assembly-derived replay reservation (2026-10-21)
+
+DocStore transactions, batches and batch adapters can reserve replay retention
+from the owning assembler's detached physical batch. The writer independently
+loads the exact accepted frame, checks its expected contract and fingerprint,
+and reconstructs the complete stored-intent floor with schema, birth/revision,
+digest and lock checks. The grant covers both views: it unions their distinct
+physical document roots and takes the maximum count and key bytes in each
+canonical replay lane. Auxiliary group/generated roots enter the reservation;
+logical no-ops cannot remove the original primary floor. Overlapping lanes and
+roots are not added twice.
+
+The writer retains the original input authority through its existing final-view
+validation. Reservation failure poisons the writer, including malformed replay,
+changed inputs and original-control rejection. Retrying an identical reservation
+is idempotent. This stages only credit and claims; detached document postimages
+are not published. The native owner must still validate the candidate's live
+dependencies under apply before opening this reservation writer.
+
+This is HA replay retention funding, not a PREPARE vote or executable recovery
+bundle. Replay sequence relocation and progress-safe counters, backend-generated
+commit metadata, durable read guards, live route/lifetime ownership, derived-log
+quota and executable recovery resources remain required. Strong required
+providers stay disabled and the full goal remains active. No durable encoding,
+ABI layout, reader floor or activation default changed. Full Linux qualification
+remains waived; Linux builds require pinned Nix/glibc Zig.
+
+Pinned Debug qualification passes six assembly/DB cases, 14 replay-credit cases,
+23 replay-plan cases and 51 runtime ABI/identity companions: 94 executions with
+zero skips, failures or leaks. The new cases exercise all three writer views,
+idempotent retries, full-backlog materialization, invalid frames/replay/inputs,
+ignored-failure poisoning, reservation scratch allocation failures, every original
+checkpoint for NotFound/OutOfMemory/deadline rejection, and normal document and
+relational/group/generated resolution. Existing native reopen cases also pass.
+The new assembly-specific reservation is not independently qualified across
+reopen or Lite/object engines. The 5,494 source/schema hashes are independently
+reverified against final source; see assembled-replay-credit-verified.json and
+assembled-replay-credit-v4.json/log in the cumulative receipts. Earlier stopped
+or failed runs preserve harness, compiler and fixture corrections and supply no
+final qualification. Pinned formatting, generated-error, control-catalog,
+whitespace and embedded source-boundary checks pass (964 production sources,
+no server coordination imports).

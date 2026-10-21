@@ -101,6 +101,10 @@ const Builder = struct {
         try self.checkpoint();
         const prefix = try inventory.docPrefix(physical);
         if (prefix.len >= physical.len) return error.InvalidPreparedEffects;
+        try self.includeRoot(prefix);
+    }
+    fn includeRoot(self: *Builder, prefix: []const u8) !void {
+        try self.checkpoint();
         if (self.seen.contains(prefix)) return;
         if (self.roots.items.len == max_roots) return error.Backpressured;
         const owned = try self.allocator.dupe(u8, prefix);
@@ -257,6 +261,29 @@ pub fn deriveFromMutations(a: A, writes: anytype, deletes: []const []const u8, r
     try builder.checkpoint();
     const roots = try builder.roots.toOwnedSlice(a);
     return .{ .allocator = a, .base = builder.base, .roots = roots };
+}
+
+/// Cover both the owning assembler's complete batch and the authoritative
+/// stored-input/accepted-effect floor. Logical no-ops may shrink the assembled
+/// replay; they cannot drop the original transaction's protected roots.
+/// Maxima are per lane, so overlap is not charged twice.
+pub fn coverAssembly(a: A, writes: anytype, deletes: []const []const u8, replay: []const u8, floor: Plan, original: ?control.Port) !Plan {
+    var assembled = try deriveFromMutations(a, writes, deletes, replay, original);
+    defer assembled.deinit();
+    var builder: Builder = .{ .allocator = a, .original = original };
+    defer builder.deinit();
+    inline for (comptime std.meta.fieldNames(shape.Record)) |lane| {
+        const left = @field(assembled.base, lane);
+        const right = @field(floor.base, lane);
+        _ = try left.encodedBytes();
+        _ = try right.encodedBytes();
+        @field(builder.base, lane) = .{ .count = @max(left.count, right.count), .key_bytes = @max(left.key_bytes, right.key_bytes) };
+    }
+    _ = try builder.base.encodedBytes();
+    for (assembled.roots) |root| try builder.includeRoot(root);
+    for (floor.roots) |root| try builder.includeRoot(root);
+    try builder.checkpoint();
+    return .{ .allocator = a, .base = builder.base, .roots = try builder.roots.toOwnedSlice(a) };
 }
 
 const Fixture = struct {
@@ -536,6 +563,58 @@ test "prepared replay plan assembled mutations unwind allocations and every orig
     try Checks.run(std.testing.allocator, &baseline);
     for (1..baseline.calls + 1) |fail_at| {
         var checks: Checks = .{ .fail_at = fail_at };
+        try std.testing.expectError(error.DeadlineExceeded, Checks.run(std.testing.allocator, &checks));
+    }
+}
+
+test "prepared replay plan assembly cover preserves primary floors and unions auxiliary roots without duplicate lane charges" {
+    const a = std.testing.allocator;
+    const row = try keys.documentKeyAlloc(a, "row");
+    defer a.free(row);
+    const auxiliary = try keys.documentKeyAlloc(a, "group-result");
+    defer a.free(auxiliary);
+    var floor = try deriveWithPrimaryKeys(a, .{ .writes = &.{"row"}, .deletes = &.{"gone"} }, .{}, .{}, null);
+    defer floor.deinit();
+    const payload = try @import("db/derived/change_journal.zig").encodeRecord(a, .{ .sequence = 17, .changed_doc_keys = &.{ "row", "group-result" } });
+    defer a.free(payload);
+    const writes = [_]@import("docstore.zig").KVPair{ .{ .key = row, .value = "{}" }, .{ .key = auxiliary, .value = "{}" } };
+    var covered = try coverAssembly(a, &writes, &.{}, payload, floor, null);
+    defer covered.deinit();
+    try std.testing.expectEqual(@as(usize, 3), covered.roots.len);
+    try std.testing.expectEqual(@as(u64, 2), covered.base.changed_doc_keys.count);
+    try std.testing.expectEqual(floor.base.deleted_doc_keys, covered.base.deleted_doc_keys);
+    try std.testing.expectEqual(floor.base.overwritten_doc_keys, covered.base.overwritten_doc_keys);
+    try std.testing.expect(try covered.base.encodedBytes() >= payload.len);
+}
+
+test "prepared replay plan assembly cover unwinds every allocation and original checkpoint" {
+    const Checks = struct {
+        calls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == self.fail_at) return error.DeadlineExceeded;
+        }
+        fn run(a: A, checks: ?*@This()) !void {
+            const backing = std.testing.allocator;
+            const row = try keys.documentKeyAlloc(backing, "auxiliary");
+            defer backing.free(row);
+            var floor = try deriveWithPrimaryKeys(backing, .{ .writes = &.{"input"} }, .{}, .{}, null);
+            defer floor.deinit();
+            const replay = try @import("db/derived/change_journal.zig").encodeRecord(backing, .{ .changed_doc_keys = &.{"auxiliary"} });
+            defer backing.free(replay);
+            const writes = [_]@import("docstore.zig").KVPair{.{ .key = row, .value = "opaque" }};
+            var source: control.Payload = .{ .ptr = checks orelse undefined, .vtable = &.{ .checkpoint = check } };
+            var result = try coverAssembly(a, &writes, &.{}, replay, floor, if (checks != null) .init(&source) else null);
+            defer result.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Checks.run, .{@as(?*Checks, null)});
+    var baseline: Checks = .{};
+    try Checks.run(std.testing.allocator, &baseline);
+    for (1..baseline.calls + 1) |stop| {
+        var checks: Checks = .{ .fail_at = stop };
         try std.testing.expectError(error.DeadlineExceeded, Checks.run(std.testing.allocator, &checks));
     }
 }
