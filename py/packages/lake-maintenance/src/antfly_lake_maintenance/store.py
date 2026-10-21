@@ -240,6 +240,22 @@ class Store:
             if error.response["ResponseMetadata"]["HTTPStatusCode"] != 404:
                 raise
 
+    def delete_current(self, uri, version):
+        """CAS deletion of mutable authority, preserving a concurrent renewal."""
+        scheme, bucket, key = self._parts(uri)
+        if scheme != "s3":
+            return self.delete(uri, version)
+        from botocore.exceptions import ClientError
+
+        try:
+            self.s3.delete_object(Bucket=bucket, Key=key, IfMatch=version)
+        except ClientError as error:
+            status = error.response["ResponseMetadata"]["HTTPStatusCode"]
+            if status in (409, 412):
+                raise Conflict("delete object changed") from error
+            if status != 404:
+                raise
+
     def inventory(self, prefix, *, all_versions=False):
         scheme, bucket, key = self._parts(prefix)
         if not prefix.endswith("/"):

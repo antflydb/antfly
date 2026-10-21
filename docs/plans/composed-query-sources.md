@@ -144,7 +144,7 @@ Reads authorize the saved name and every leaf. Definitions permit literal union
 or overlay leaves only, preventing recursion. Drop/recreate changes the source ID
 and invalidates previous cursors; definitions do not freeze table contents.
 
-HTTP SQL SELECT requests accept `lake_visibility: "accepted"`; the default remains
+HTTP SQL SELECT requests accept `read_requirements: {visibility: "accepted"}`; the default remains
 `"committed"`. Idle statements and prepared execution outside a transaction take
 one statement cut. Inside an HTTP SQL session transaction, the first accepted
 read persists its visibility mode and binds each writable lake table once.
@@ -272,7 +272,11 @@ reused after restart and during archive promotion. Leases fence stale completion
 Graceful cancellation conditionally releases unfinished claims with a separate
 one-second cleanup budget, including ambiguous successful claim writes recovered
 by random ownership token; hard crashes use the 120-second lease expiry. `{"action":"enrichment_status"}` on
-`/tables/{table}/lake/maintenance` reports completed/failed recent coverage. Jobs
+`/tables/{table}/lake/maintenance` reports composed table coverage under the actual
+WAL position, archive generation, incarnation, and recipe. Its version-2 status
+includes required/ready partition counts and the minimum covered artifact-retention
+horizon; reusable partition claims keep their separate version-1 job identity.
+Older completions cannot replace newer archive/WAL coverage. Jobs
 and segment artifacts retain for 24 hours; bounded background conditional cleanup
 collects expired state. Index work still obeys the bounded WAL, memory and request
 budgets; large jobs make vendor progress through durable memoized inputs. A live
@@ -525,6 +529,11 @@ promise gap-free vendor CDC. Credentials remain named connections/secret referen
 
 ## Hacker News rollout and qualification
 
+The follow-up [deployment qualification plan](hackernews-deployment-qualification.md)
+sets reproducible archive benchmarks, budget reservations and release gates for
+source freshness and the public service. A single-table archive verdict does not
+establish current/history deployment readiness.
+
 The example supports independent historical/current workers and HTTP qualification
 of a two-table union or overlay, including a saved logical source. Its accepted-WAL
 suffix is a bounded publication backlog, not a rolling year-long current tier. A
@@ -589,3 +598,26 @@ horizon before conditionally publishing the manifest. Foreign authorities, parti
 views and extensions beyond the chunk horizon fail closed. Mutable host storage
 falls back to a coherent native capture. A new chunk-retention extension protocol
 would be needed to pin an immutable view beyond its existing protection horizon.
+
+Archive and accepted-WAL vector partitions share bounded parallel admission.
+Every lane owns mutable source-version maps, range-reader flights, index runtime
+pins and predicate cursors, while borrowing pinned immutable publication data.
+Merge order remains archive then recent-run order. All lanes join or cancel
+before their parent reader authority ends; saturation and oversized work retain
+serial execution. Native text admission uses streaming predicate pack proofs and
+range-local pattern proofs; fixed-frequency BM25 envelopes can also prove
+logical-order tie pruning using the scorer's actual f32 arithmetic.
+
+### Native SQL join batch delivery
+
+Join delivery stages bounded probe/build row references and retains their typed
+column owners until the next pull. Native primitive column views, frozen JSON,
+and encoded JSON pass through projection and replay without building a complete
+Datum row matrix. Output reordering follows the logical join plan even when the
+optimizer flips build/probe roles. Residual predicates evaluate over candidate
+batches before matched-state updates and outer-row emission. Null-extended rows
+never evaluate the ON expression; unsupported or lazy expressions retain scalar
+prefix/error semantics. Inseparable spilled partitions expose borrowed block
+references with the same pull boundary, rather than materializing every candidate
+row in the skew loop. Public result materialization and response-size admission
+remain at the delivery boundary.

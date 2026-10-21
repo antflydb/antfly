@@ -57,23 +57,72 @@ pub fn resident(comptime T: type, cached: artifacts.CachedRead, ref: local.serve
     return true;
 }
 
+/// Lookup never performs I/O; speculative readers pin only resident metadata.
+pub fn lookup(comptime T: type, cached: artifacts.CachedRead, ref: local.serverless_manifest_artifact_ref.ArtifactRef) !?Owned(T) {
+    try cached.context.ensureActive();
+    const lease = cached.cache.decoded.lookup(try cacheKey(T, cached, ref)) orelse return null;
+    errdefer lease.release();
+    try cached.context.ensureActive();
+    return .{ .lease = lease, .value = @ptrCast(@alignCast(lease.item.payload.extension)) };
+}
+
 pub fn acquire(comptime T: type, cached: artifacts.CachedRead, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, cancellation: @import("antfly_cancellation").CancellationToken, comptime load: anytype) !Owned(T) {
+    const Adapter = struct {
+        fn decode(a: std.mem.Allocator, source: stores.ArtifactStore, reference: local.serverless_manifest_artifact_ref.ArtifactRef, token: @import("antfly_cancellation").CancellationToken, cache: artifacts.CachedRead, _: void) !T {
+            return load(a, source, reference, token, cache);
+        }
+    };
+    return acquireInterpreted(T, cached, store, ref, cancellation, "", {}, Adapter.decode);
+}
+
+/// Interpretation is authenticated by the caller on every use. Include it in
+/// the immutable cache key so a physical block cannot reuse incompatible state.
+pub fn acquireInterpreted(comptime T: type, cached: artifacts.CachedRead, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, cancellation: @import("antfly_cancellation").CancellationToken, interpretation: []const u8, arguments: anytype, comptime load: anytype) !Owned(T) {
+    return acquireInterpretedBounded(T, cached, store, ref, cancellation, interpretation, arguments, load, 64 * 1024 * 1024, null);
+}
+
+/// Optional interpretations remember only their own deterministic size decline.
+/// Shared loading pressure and backing allocator failures remain retryable.
+pub fn acquireInterpretedBounded(comptime T: type, cached: artifacts.CachedRead, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, cancellation: @import("antfly_cancellation").CancellationToken, interpretation: []const u8, arguments: anytype, comptime load: anytype, limit: usize, fallback: ?T) !Owned(T) {
     try cached.context.ensureActive();
     try cancellation.check();
-    const key = try cacheKey(T, cached, ref);
+    var key = try cacheKey(T, cached, ref);
+    if (interpretation.len != 0) {
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update(&key);
+        hash.update(interpretation);
+        hash.final(&key);
+    }
+    if (fallback != null) {
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update(&key);
+        var encoded_limit: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded_limit, limit, .little);
+        hash.update(&encoded_limit);
+        hash.final(&key);
+    }
     var loader = struct {
         store: stores.ArtifactStore,
         ref: local.serverless_manifest_artifact_ref.ArtifactRef,
         cancellation: @import("antfly_cancellation").CancellationToken,
         cached: artifacts.CachedRead,
+        arguments: @TypeOf(arguments),
+        fallback: ?T,
         fn decode(raw: *anyopaque, item: *local.serverless_query_lake_decoded_cache.Item) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const a = item.arena.allocator();
+            const decoded = load(a, self.store, self.ref, self.cancellation, self.cached, self.arguments) catch |err| declined: {
+                if (err != error.OutOfMemory or !item.budget.exhausted or item.budget.admission_exhausted) return err;
+                const result = self.fallback orelse return err;
+                _ = item.arena.reset(.free_all);
+                item.budget.exhausted = false;
+                break :declined result;
+            };
             const value = try a.create(T);
-            value.* = try load(a, self.store, self.ref, self.cancellation, self.cached);
+            value.* = decoded;
             item.payload = .{ .extension = value };
         }
-    }{ .store = store, .ref = ref, .cancellation = cancellation, .cached = cached };
+    }{ .store = store, .ref = ref, .cancellation = cancellation, .cached = cached, .arguments = arguments, .fallback = fallback };
     // Both API cancellation and the serving deadline remain active while
     // waiting for another decoder or global decode memory admission.
     const Check = struct {
@@ -88,7 +137,7 @@ pub fn acquire(comptime T: type, cached: artifacts.CachedRead, store: stores.Art
     var check: Check = .{ .token = cancellation, .parent = cached.context };
     var context = cached.context;
     context.checkpoint = .{ .ptr = &check, .check = Check.check };
-    const lease = try cached.cache.decoded.acquire(key, 64 * 1024 * 1024, context, .{ .ptr = &loader, .load = @TypeOf(loader).decode });
+    const lease = try cached.cache.decoded.acquire(key, limit, context, .{ .ptr = &loader, .load = @TypeOf(loader).decode });
     return .{ .lease = lease, .value = @ptrCast(@alignCast(lease.item.payload.extension)) };
 }
 
@@ -146,6 +195,17 @@ pub fn acquireColumnBlock(cached: artifacts.CachedRead, store: stores.ArtifactSt
     return acquire(local.sql_spill.ColumnarBlock, cached, store, .{ .kind = .ordered_row_index, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, Loader.load);
 }
 
+/// A verified pack already owns the immutable block bytes. Cache admission
+/// still binds the exact content identity and copies into the cache lease.
+pub fn acquireColumnBlockBytes(cached: artifacts.CachedRead, store: stores.ArtifactStore, ref: artifacts.ChunkRef, cancellation: @import("antfly_cancellation").CancellationToken, bytes: []const u8) !Owned(local.sql_spill.ColumnarBlock) {
+    const Loader = struct {
+        fn load(a: std.mem.Allocator, _: stores.ArtifactStore, _: local.serverless_manifest_artifact_ref.ArtifactRef, _: @import("antfly_cancellation").CancellationToken, _: ?artifacts.CachedRead, data: []const u8) !local.sql_spill.ColumnarBlock {
+            return local.sql_spill.decodeColumnarBlockInArena(a, try a.dupe(u8, data), artifacts.max_block_bytes);
+        }
+    };
+    return acquireInterpreted(local.sql_spill.ColumnarBlock, cached, store, .{ .kind = .ordered_row_index, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, "", bytes, Loader.load);
+}
+
 test "external lake decoded covering blocks share exact dictionaries and fence current readers" {
     const a = std.testing.allocator;
     var directory = try local.common_test_directory.TestDirectory.init("cover-decoded-cache");
@@ -184,4 +244,49 @@ test "external lake decoded covering blocks share exact dictionaries and fence c
     const isolated = try acquireColumnBlock(cached, store, ref, .none);
     defer isolated.release();
     try std.testing.expect(isolated.value != first.value);
+}
+
+test "external lake decoded metadata remembers local interpretation size declines" {
+    const a = std.testing.allocator;
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    const Value = struct { expanded: bool = false };
+    const Loader = struct {
+        var calls: usize = 0;
+        fn load(alloc: std.mem.Allocator, _: stores.ArtifactStore, _: local.serverless_manifest_artifact_ref.ArtifactRef, _: @import("antfly_cancellation").CancellationToken, _: ?artifacts.CachedRead, _: void) !Value {
+            calls += 1;
+            _ = try alloc.alloc(u8, 128 * 1024);
+            return .{ .expanded = true };
+        }
+    };
+    Loader.calls = 0;
+    const scope = try stores.UploadScope.forPublication(@splat(5), 1, std.testing.io);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("size-decline", &digest, .{});
+    const checksum = std.fmt.bytesToHex(&digest, .lower);
+    const id = try scope.artifactId(&checksum);
+    const ref: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .algebraic_segment, .artifact_id = &id, .checksum = &checksum, .byte_len = 8 };
+    const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(1), .context = .{} };
+    for (0..2) |_| {
+        const owned = try acquireInterpretedBounded(Value, cached, undefined, ref, .none, "selected-column", {}, Loader.load, 4096, .{});
+        defer owned.release();
+        try std.testing.expect(!owned.value.expanded);
+        try std.testing.expect(owned.lease.item.budget.live < 4096);
+    }
+    try std.testing.expectEqual(@as(usize, 1), Loader.calls);
+    // A changed interpretation policy does not inherit a smaller policy's hint.
+    const admitted = try acquireInterpretedBounded(Value, cached, undefined, ref, .none, "selected-column", {}, Loader.load, 256 * 1024, .{});
+    defer admitted.release();
+    try std.testing.expect(admitted.value.expanded);
+    try std.testing.expectEqual(@as(usize, 2), Loader.calls);
+    const Transient = struct {
+        var calls: usize = 0;
+        fn load(_: std.mem.Allocator, _: stores.ArtifactStore, _: local.serverless_manifest_artifact_ref.ArtifactRef, _: @import("antfly_cancellation").CancellationToken, _: ?artifacts.CachedRead, _: void) !Value {
+            calls += 1;
+            return error.OutOfMemory;
+        }
+    };
+    Transient.calls = 0;
+    for (0..2) |_| try std.testing.expectError(error.OutOfMemory, acquireInterpretedBounded(Value, cached, undefined, ref, .none, "transient-failure", {}, Transient.load, 4096, .{}));
+    try std.testing.expectEqual(@as(usize, 2), Transient.calls);
 }

@@ -43,6 +43,16 @@ class ZigValidationScopeTests(unittest.TestCase):
         self.assertIn("vopr-test", workflow)
         self.assertIn("vopr-build", workflow)
 
+    def test_e2e_archives_include_native_grep(self):
+        workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
+        packages = re.findall(
+            r'run: tar -C zig -czf .*antfly-e2e-(?:base|full)\.tar\.gz" (.*)', workflow
+        )
+        self.assertEqual(len(packages), 2)
+        for members in packages:
+            self.assertIn("zig-out/bin/antfly-grep", members.split())
+            self.assertIn("zig-out/bin/antfly", members.split())
+
     def test_full_validation_job_admission_and_build_reuse(self):
         workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
         blocks = dict(
@@ -101,6 +111,8 @@ class ZigValidationScopeTests(unittest.TestCase):
         ]
         base_jobs = [
             "zig-base-tests",
+            "zig-base-wasm",
+            "zig-base-lite-models",
             "zig-base",
             "e2e-base-plan",
             "e2e-base-tests",
@@ -119,6 +131,16 @@ class ZigValidationScopeTests(unittest.TestCase):
         for job in base_jobs:
             self.assertTrue(selected(job))
             self.assertFalse(selected(job, full=True))
+            self.assertFalse(selected(job, **{"needs.admission.result": "failure"}))
+            self.assertFalse(selected(job, **{"github.run_attempt": 2}))
+        self.assertFalse(
+            selected(
+                "zig-base-lite-models", **{"needs.changes.outputs.zig_tests": "false"}
+            )
+        )
+        self.assertTrue(
+            selected("zig-base-wasm", **{"needs.changes.outputs.zig_tests": "false"})
+        )
         self.assertTrue(selected("e2e-base-build", full=True))
         self.assertTrue(selected("e2e-base-low-fd"))
         self.assertTrue(selected("e2e-base-low-fd", full=True))
@@ -139,16 +161,21 @@ class ZigValidationScopeTests(unittest.TestCase):
         # Evaluate the actual aggregate shell, including independent low-FD
         # coverage. Full validation must not hide a failed specialized lane.
         aggregate = blocks["e2e-full"]
-        self.assertIn("e2e-base-low-fd]", aggregate)
+        self.assertIn(
+            "e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance]",
+            aggregate,
+        )
         self.assertIn("LOW_FD_RESULT: ${{ needs.e2e-base-low-fd.result }}", aggregate)
         command = textwrap.dedent(aggregate.split("run: |\n", 1)[1])
-        for build, tests, low_fd, required, success in (
-            ("success", "success", "success", "true", True),
-            ("success", "success", "failure", "true", False),
-            ("success", "success", "skipped", "true", False),
-            ("success", "success", "skipped", "false", True),
-            ("failure", "success", "success", "true", False),
-            ("success", "failure", "success", "true", False),
+        for build, tests, low_fd, required, native, success in (
+            ("success", "success", "success", "true", "success", True),
+            ("success", "success", "failure", "true", "success", False),
+            ("success", "success", "skipped", "true", "success", False),
+            ("success", "success", "skipped", "false", "success", True),
+            ("failure", "success", "success", "true", "success", False),
+            ("success", "failure", "success", "true", "success", False),
+            ("success", "success", "skipped", "false", "failure", False),
+            ("success", "success", "success", "true", "skipped", False),
         ):
             with self.subTest(
                 build=build, tests=tests, low_fd=low_fd, required=required
@@ -161,10 +188,160 @@ class ZigValidationScopeTests(unittest.TestCase):
                         "TEST_RESULT": tests,
                         "LOW_FD_RESULT": low_fd,
                         "REQUIRE_LOW_FD": required,
+                        "NATIVE_SDK_RESULT": native,
+                        "PGWIRE_DRIVER_RESULT": "success",
                     },
+                    check=False,
                     capture_output=True,
                 )
                 self.assertEqual(result.returncode == 0, success, result.stderr)
+
+        self.assertTrue(selected("embedded-sdk-native"))
+        self.assertTrue(selected("embedded-sdk-native", full=True))
+        self.assertTrue(selected("embedded-sdk-native", pr="", event="push"))
+        self.assertFalse(
+            selected(
+                "embedded-sdk-native",
+                **{
+                    "needs.e2e-base-build.result": "failure",
+                    "needs.e2e-full-build.result": "skipped",
+                },
+            )
+        )
+        self.assertTrue(selected("pgwire-driver-conformance"))
+        self.assertTrue(selected("pgwire-driver-conformance", full=True))
+        self.assertTrue(selected("pgwire-driver-conformance", pr="", event="push"))
+        self.assertFalse(
+            selected(
+                "pgwire-driver-conformance",
+                **{
+                    "needs.e2e-base-build.result": "failure",
+                    "needs.e2e-full-build.result": "skipped",
+                },
+            )
+        )
+
+        # Execute both actual aggregate checks: a skipped/failed driver job
+        # cannot be hidden by otherwise successful E2E and native SDK results.
+        for job in ("e2e-base", "e2e-full"):
+            command = textwrap.dedent(blocks[job].split("run: |\n", 1)[1])
+            if job == "e2e-base":
+                command = command.split("\n- uses:", 1)[0]
+            for driver in ("success", "failure", "skipped"):
+                with self.subTest(job=job, driver=driver):
+                    result = subprocess.run(
+                        ["bash", "-c", command],
+                        env={
+                            **os.environ,
+                            "BUILD_RESULT": "success",
+                            "TEST_RESULT": "success",
+                            "PLAN_RESULT": "success",
+                            "LOW_FD_RESULT": "success",
+                            "REQUIRE_LOW_FD": "true",
+                            "NATIVE_SDK_RESULT": "success",
+                            "PGWIRE_DRIVER_RESULT": driver,
+                        },
+                        check=False,
+                        capture_output=True,
+                    )
+                    self.assertEqual(
+                        result.returncode == 0, driver == "success", result.stderr
+                    )
+
+    def test_base_native_wasm_and_model_qualification_have_independent_owners(self):
+        workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
+        blocks = dict(
+            re.findall(r"\n  ([\w-]+):\n(.*?)(?=\n  [\w-]+:\n|\Z)", workflow, re.DOTALL)
+        )
+        native, wasm, models = (
+            blocks[name]
+            for name in ("zig-base-tests", "zig-base-wasm", "zig-base-lite-models")
+        )
+        for block in (native, wasm, models):
+            self.assertIn("needs: [admission, changes]", block)
+            self.assertIn("runs-on: arc-antfly-heavy", block)
+            self.assertIn('ANTFLY_ZIG_MAX_RSS: "23622320128"', block)
+        self.assertIn("Run hermetic Antfly unit tests", native)
+        self.assertIn("Set up Node for generated source checks", native)
+        for name in (
+            "Build and test Apache WASM artifacts",
+            "Exercise real Lite extraction through public graph APIs",
+        ):
+            self.assertNotIn(name, native)
+        for command in (
+            "node pkg/antfly-embedded/wasm_client_test.mjs",
+            "build wasm-test inference-wasm",
+            "zig build inference-wasm -Dwebgpu=true",
+            "zig build inference-wasm -Dwasm-memory-model=wasm64",
+            "zig build wasm -Dwasm=true -j1",
+            "zig build wasm -Dwasm=true -Dwasm-memory-model=wasm64",
+            "node web/test-wasm-abi.mjs wasm32",
+            "node web/test-wasm-abi.mjs wasm64",
+        ):
+            self.assertIn(command, wasm)
+        libraries, evaluation = models.split(
+            "      - name: Exercise real Lite extraction through public graph APIs", 1
+        )
+        self.assertIn("build capi \\", libraries)
+        self.assertIn("python3 scripts/ci/prepare_lite_previous_reader.py", libraries)
+        self.assertIn("timeout-minutes: 25", evaluation)
+        self.assertIn("build capi-test", evaluation)
+        self.assertIn('--cache-dir "$ZIG_LOCAL_CACHE_DIR"', evaluation)
+        self.assertNotIn("--cache-dir ../../.zig-cache", models)
+        self.assertNotIn("--cache-dir ../../.zig-cache", blocks["zig-full-tests"])
+        self.assertIn("tests/test_graph_edge_readiness.py", evaluation)
+        self.assertIn("scripts/ci/run_lite_extraction_eval.py", evaluation)
+        self.assertIn("scripts/ci/run_lite_embedding_test.py", evaluation)
+        for block in (wasm, models):
+            self.assertIn("if: always() && steps.cache.outcome == 'success'", block)
+            self.assertIn('--release-phase "$ZIG_LOCAL_CACHE_DIR"', block)
+
+    def test_base_aggregate_requires_each_selected_qualification(self):
+        workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
+        aggregate = workflow.split("\n  zig-base:\n", 1)[1].split("\n  zig-full:\n", 1)[
+            0
+        ]
+        self.assertIn("zig-base-wasm, zig-base-lite-models", aggregate)
+        command = textwrap.dedent(aggregate.split("run: |\n", 1)[1])
+        healthy = {
+            "CHANGES_RESULT": "success",
+            "X86_64_RESULT": "success",
+            "ARM64_CODEC_RESULT": "success",
+            "GREP_RESULT": "success",
+            "WASM_RESULT": "success",
+            "LITE_MODEL_RESULT": "success",
+            "REQUIRE_LITE_MODELS": "true",
+        }
+        cases = [({}, True)]
+        for key in (
+            "CHANGES_RESULT",
+            "X86_64_RESULT",
+            "ARM64_CODEC_RESULT",
+            "GREP_RESULT",
+            "WASM_RESULT",
+            "LITE_MODEL_RESULT",
+        ):
+            for status in ("failure", "skipped", "cancelled"):
+                cases.append(({key: status}, False))
+        for status in ("success", "skipped", "failure", "cancelled"):
+            cases.append(
+                (
+                    {
+                        "REQUIRE_LITE_MODELS": "false",
+                        "LITE_MODEL_RESULT": status,
+                    },
+                    status in ("success", "skipped"),
+                )
+            )
+        for overrides, expected in cases:
+            with self.subTest(overrides=overrides):
+                result = subprocess.run(
+                    ["bash", "-c", command],
+                    env={**os.environ, **healthy, **overrides},
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode == 0, expected, result.stderr)
 
     def test_codegen_and_laya_inputs_select_zig_validation(self):
         workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
@@ -203,6 +380,71 @@ class ZigValidationScopeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             subprocess.run(["git", "init", "-q", temporary], check=True)
+            for name in inputs | unrelated:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            selected = subprocess.check_output(
+                ["git", "ls-files", "-z", "--", *pathspecs], cwd=root
+            )
+        self.assertEqual(
+            {path.decode() for path in selected.split(b"\0") if path}, inputs
+        )
+
+    def test_ingestion_e2e_uses_checkout_sdk_and_matching_native_artifact(self):
+        workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
+        full = workflow.split("\n  e2e-full-tests:\n", 1)[1].split(
+            "\n  e2e-full:\n", 1
+        )[0]
+        self.assertIn("name: Download ingestion native library", full)
+        self.assertIn("if: matrix.suite == 'antfly'", full)
+        self.assertIn(
+            "libantfly-e2e-${{ inputs.full_validation && 'base' || 'full' }}-${{ github.run_id }}",
+            full,
+        )
+        self.assertIn(
+            "ANTFLY_LIBRARY=${GITHUB_WORKSPACE}/zig/zig-out/lib/libantfly.so", full
+        )
+        manifest = (ROOT / "zig/e2e/antfly/pyproject.toml").read_text()
+        self.assertIn(
+            '"antfly-embedded"', manifest.split("iceberg =", 1)[1].split("\n", 1)[0]
+        )
+        self.assertIn(
+            'antfly-embedded = { path = "../../../py/packages/embedded", editable = true }',
+            manifest,
+        )
+        lock = (ROOT / "zig/e2e/antfly/uv.lock").read_text()
+        self.assertIn('source = { editable = "../../../py/packages/embedded" }', lock)
+
+    def test_embedded_sdk_and_driver_inputs_select_the_capi_producer(self):
+        workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
+        command = workflow.split('if ! "$helper"')[2].split("\n          then", 1)[0]
+        pathspecs = shlex.split(command.split(" -- ", 1)[1].replace("\\\n", " "))
+        inputs = {
+            "go/pkg/embedded/sql_driver.go",
+            "rs/crates/embedded/src/sqlx.rs",
+            "rs/crates/embedded-sys/build.rs",
+            "rs/Cargo.lock",
+            "py/packages/embedded/tests/test_sql.py",
+            "ts/packages/embedded/src/kysely.ts",
+            "ts/packages/embedded-linux-x64/package.json",
+            "ts/pnpm-lock.yaml",
+            "zig/pkg/antfly-embedded/include/antfly.h",
+            "zig/pkg/antfly-embedded/src/capi/sql.zig",
+            "scripts/ci/test-embedded-sdk-native.sh",
+            "scripts/ci/test_embedded_sdk_native.py",
+            "scripts/pgwire_drivers/rust/src/main.rs",
+            "scripts/test_pgwire_drivers.py",
+        }
+        unrelated = {
+            "go/pkg/sdk/client.go",
+            "py/packages/sdk/src/client.py",
+            "docs/guide.md",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-q", tmp], check=True)
             for name in inputs | unrelated:
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)

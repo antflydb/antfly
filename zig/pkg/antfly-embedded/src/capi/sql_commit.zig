@@ -25,6 +25,7 @@ const key = "\x00antfly/embedded/sql-commit/v1";
 const Record = struct { id: h.db_mod.types.TxnId, timestamp: u64, tables: []const []const u8 };
 
 fn store(handle: *h.Handle, record: ?Record) !void {
+    handle.sql_commit_recovery_needed = true;
     const bytes = if (record) |value| try std.json.Stringify.valueAlloc(handle.alloc, value, .{}) else null;
     defer if (bytes) |value| handle.alloc.free(value);
     var write = try handle.db.core.store.beginWriteTxn();
@@ -35,10 +36,15 @@ fn store(handle: *h.Handle, record: ?Record) !void {
 
 pub fn recover(handle: *h.Handle) !void {
     if (handle.sql_decision_uncertain) return error.SqlMutationOutcomeUnknown;
+    if (!handle.sql_commit_recovery_needed) return;
+    if (h.builtin.is_test) handle.sql_commit_recovery_scans +%= 1;
     var read = try handle.db.core.store.beginReadTxn();
     defer read.abort();
     const bytes = read.get(key) catch |err| switch (err) {
-        error.NotFound => return,
+        error.NotFound => {
+            handle.sql_commit_recovery_needed = false;
+            return;
+        },
         else => return err,
     };
     const parsed = try std.json.parseFromSlice(Record, handle.alloc, bytes, .{});
@@ -63,6 +69,7 @@ pub fn recover(handle: *h.Handle) !void {
         if (committed and participant_status == .aborted) return error.SqlMutationOutcomeUnknown;
     }
     try store(handle, null);
+    handle.sql_commit_recovery_needed = false;
     // Participant receipts are private implementation details. Keep the
     // coordinator decision for native retention/reconciliation of a 40003
     // receipt after reopening, while acknowledging its finished participants.
@@ -100,10 +107,13 @@ pub fn commit(handle: *h.Handle, requests: []const contract.TableCommitRequest, 
             .schema_version = request.schema_version,
             .relational_schema_version = request.relational_schema_version,
             .relational_integrity_generation_set = request.relational_integrity_generation_set,
+            .relational_repair = request.relational_repair,
             .writes = request.writes,
             .deletes = request.deletes,
             .predicates = request.predicates,
             .integrity_commands = request.integrity_commands,
+            .relational_activation = request.relational_activation,
+            .relational_retirement = request.relational_retirement,
         });
     }
     out_id.* = id;

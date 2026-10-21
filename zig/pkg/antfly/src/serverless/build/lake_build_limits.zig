@@ -49,6 +49,11 @@ pub const WorkingSetAllocator = struct {
     live_bytes: usize = 0,
     max_live_bytes: usize,
     limit_exceeded: bool = false,
+    mutex: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *WorkingSetAllocator) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
 
     pub fn init(backing: std.mem.Allocator, limits: Limits) !WorkingSetAllocator {
         try limits.validate();
@@ -59,6 +64,19 @@ pub const WorkingSetAllocator = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
+    pub fn headroom(a: std.mem.Allocator) ?usize {
+        if (a.vtable == &vtable) {
+            const self: *WorkingSetAllocator = @ptrCast(@alignCast(a.ptr));
+            self.lock();
+            const available = self.max_live_bytes -| self.live_bytes;
+            const backing = self.backing;
+            self.mutex.unlock();
+            return @min(available, headroom(backing) orelse return null);
+        }
+        if (@import("antfly_local_sources").sql_parallel_scheduler.LockedAllocator.parentAllocator(a)) |parent| return headroom(parent);
+        if (comptime @import("builtin").is_test) if (a.vtable == std.testing.allocator.vtable) return std.math.maxInt(usize);
+        return @import("antfly_local_sources").sql_memory_budget.optionalHeadroom(a);
+    }
     fn permitsGrowth(self: *WorkingSetAllocator, additional_bytes: usize) bool {
         if (additional_bytes <= self.max_live_bytes -| self.live_bytes) return true;
         self.limit_exceeded = true;
@@ -67,6 +85,8 @@ pub const WorkingSetAllocator = struct {
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *WorkingSetAllocator = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
         if (!self.permitsGrowth(len)) return null;
         const memory = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
         self.live_bytes += len;
@@ -75,6 +95,8 @@ pub const WorkingSetAllocator = struct {
 
     fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
         const self: *WorkingSetAllocator = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
         const growth = new_len -| memory.len;
         if (growth > 0 and !self.permitsGrowth(growth)) return false;
         if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
@@ -84,6 +106,8 @@ pub const WorkingSetAllocator = struct {
 
     fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
         const self: *WorkingSetAllocator = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
         const growth = new_len -| memory.len;
         if (growth > 0 and !self.permitsGrowth(growth)) return null;
         const remapped = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
@@ -93,6 +117,8 @@ pub const WorkingSetAllocator = struct {
 
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *WorkingSetAllocator = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
         self.backing.rawFree(memory, alignment, ret_addr);
         self.live_bytes -|= memory.len;
     }
@@ -146,6 +172,7 @@ pub fn estimateBatchBytes(batch: rowsource.ColumnBatch) usize {
     total = addOrMax(total, batch.snapshot.snapshot_id.len);
     total = addOrMax(total, std.math.mul(usize, batch.row_refs.len, @sizeOf(rowsource.RowRef)) catch return std.math.maxInt(usize));
     total = addOrMax(total, std.math.mul(usize, batch.columns.len, @sizeOf(rowsource.ColumnVector)) catch return std.math.maxInt(usize));
+    if (batch.external_span) |span| total = addOrMax(total, span.first.file_id.len);
     for (batch.row_refs) |row_ref| {
         const ref_bytes = switch (row_ref) {
             .relational_key => |key| key.len,
@@ -155,8 +182,10 @@ pub fn estimateBatchBytes(batch: rowsource.ColumnBatch) usize {
         total = addOrMax(total, ref_bytes);
     }
     for (batch.columns) |column| {
-        total = addOrMax(total, addOrMax(column.name.len, column.nulls.bytes.len));
+        total = addOrMax(total, addOrMax(column.name.len, if (column.nulls.bits != null) column.rowCount() else column.nulls.bytes.len));
         const value_bytes = switch (column.values) {
+            .decimal128 => |values| std.math.mul(usize, values.values.len, @sizeOf(i128)) catch std.math.maxInt(usize),
+            .encoded => std.math.maxInt(usize),
             inline .dictionary_i64, .dictionary_f64 => |values| addOrMax(std.math.mul(usize, values.indices.len, @sizeOf(u32)) catch std.math.maxInt(usize), std.math.mul(usize, values.values.len, 8) catch std.math.maxInt(usize)),
             .dictionary_bytes => |values| blk: {
                 var bytes = std.math.mul(usize, values.indices.len, @sizeOf(u32)) catch break :blk std.math.maxInt(usize);
@@ -213,4 +242,28 @@ test "lake build working-set allocator rejects growth before allocation" {
     try std.testing.expectError(error.OutOfMemory, bounded_alloc.alloc(u8, 1));
     try std.testing.expect(bounded.limit_exceeded);
     try std.testing.expectEqual(@as(usize, 8), bounded.live_bytes);
+}
+
+test "lake build working-set allocator shares exact accounting across upload workers" {
+    var bounded = try WorkingSetAllocator.init(std.testing.allocator, .{ .max_working_set_bytes = 8192 });
+    const Worker = struct {
+        fn run(allocator: std.mem.Allocator) void {
+            for (0..1000) |_| {
+                const bytes = allocator.alloc(u8, 1024) catch @panic("concurrent accounting exceeded admitted working set");
+                @memset(bytes, 1);
+                allocator.free(bytes);
+            }
+        }
+    };
+    var threads: [8]std.Thread = undefined;
+    var started: usize = 0;
+    defer for (threads[0..started]) |thread| thread.join();
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{bounded.allocator()});
+        started += 1;
+    }
+    for (threads) |thread| thread.join();
+    started = 0;
+    try std.testing.expectEqual(@as(usize, 0), bounded.live_bytes);
+    try std.testing.expect(!bounded.limit_exceeded);
 }

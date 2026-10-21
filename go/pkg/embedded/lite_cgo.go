@@ -103,6 +103,8 @@ const (
 // --inference-kv-budget-mb/--inference-scratch-budget-mb/
 // --process-memory-budget-mb flags.
 type OpenOptions struct {
+	// ModelsDir selects models used by database enrichments. Empty uses default.
+	ModelsDir string
 	// Storage selects a .aflite file (the default) or a directory. Directory
 	// storage is created by opening a missing path; CreateWithOptions only
 	// creates .aflite files.
@@ -194,6 +196,13 @@ func ValidateABI() error {
 	return nil
 }
 
+// LastErrorDetail returns the native validation error for the current OS thread.
+// Call immediately after failure while runtime.LockOSThread is held across
+// both the operation and this accessor.
+func LastErrorDetail() string {
+	return C.GoString(C.antfly_last_error_detail())
+}
+
 func cABIErrorCodeName(code ErrorCode) string {
 	return C.GoString(C.antfly_error_code_name(C.antfly_error_code(code)))
 }
@@ -238,6 +247,8 @@ func OpenStatusOnly(path string) (*DB, error) {
 // maintenance mode. In this profile callers drive pending work explicitly with
 // RunUntilIdle.
 func OpenHosted(path string) (*DB, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	if err := ValidateABI(); err != nil {
 		return nil, err
 	}
@@ -255,6 +266,8 @@ func OpenHosted(path string) (*DB, error) {
 // CreateHosted creates a new Antfly Lite database in hosted/manual maintenance
 // mode. In this profile callers drive pending work explicitly with RunUntilIdle.
 func CreateHosted(path string) (*DB, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	if err := ValidateABI(); err != nil {
 		return nil, err
 	}
@@ -280,6 +293,8 @@ func CreateWithOptions(path string, opts OpenOptions) (*DB, error) {
 }
 
 func openWithOptions(path string, opts OpenOptions, create bool) (*DB, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	if err := ValidateABI(); err != nil {
 		return nil, err
 	}
@@ -307,6 +322,11 @@ func openWithOptions(path string, opts OpenOptions, create bool) (*DB, error) {
 	}
 	if opts.LocalRuntimeConfigured {
 		cOpts.flags |= C.ANTFLY_OPEN_FLAG_LOCAL_RUNTIME_CONFIGURED
+	}
+	if opts.ModelsDir != "" {
+		directory := C.CBytes([]byte(opts.ModelsDir))
+		defer C.free(directory)
+		cOpts.models_dir = C.antfly_slice{ptr: (*C.uint8_t)(directory), len: C.size_t(len(opts.ModelsDir))}
 	}
 	cOpts.inference_host_budget_mb = C.uint32_t(opts.HostBudgetMB)
 	cOpts.inference_backend_budget_mb = C.uint32_t(opts.BackendBudgetMB)
@@ -420,6 +440,14 @@ func (db *DB) Backup() ([]byte, error) {
 	})
 }
 
+// BackupJSON exports a portable archive with an explicit optional table scope.
+// Default is always included. Full backups never silently omit unavailable tables.
+func (db *DB) BackupJSON(options []byte) ([]byte, error) {
+	return db.withInputOutput(options, func(handle unsafe.Pointer, input C.antfly_slice, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_db_backup_json((*C.antfly_db)(handle), input, out)
+	})
+}
+
 // ImportBackup imports a portable Antfly backup archive into this empty
 // database. OutcomeUnknown means the live handle adopted the imported
 // generation, but crash durability could not be confirmed; inspect the handle
@@ -440,6 +468,8 @@ type RestoreOptions struct {
 }
 
 func restoreCOptions(storage Storage) (C.antfly_open_options, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	var cOpts C.antfly_open_options
 	if err := check(C.antfly_open_options_init(&cOpts)); err != nil {
 		return cOpts, err
@@ -453,6 +483,8 @@ func restoreCOptions(storage Storage) (C.antfly_open_options, error) {
 }
 
 func restoreBackupBytes(path string, backup []byte, opts RestoreOptions) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	cOpts, err := restoreCOptions(opts.Storage)
 	if err != nil {
 		return err
@@ -471,6 +503,8 @@ func restoreBackupBytes(path string, backup []byte, opts RestoreOptions) error {
 }
 
 func restoreBackupFile(path, backupPath string, opts RestoreOptions) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	cOpts, err := restoreCOptions(opts.Storage)
 	if err != nil {
 		return err
@@ -498,6 +532,8 @@ func (db *DB) CheckJSON() ([]byte, error) {
 // CheckFileJSON runs Lite integrity checks for path without opening a database
 // handle and returns the JSON result.
 func CheckFileJSON(path string) ([]byte, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	if err := ValidateABI(); err != nil {
 		return nil, err
 	}
@@ -528,6 +564,8 @@ func (db *DB) CompactJSON() ([]byte, error) {
 
 // CopyStableSnapshotJSON copies a stable Lite snapshot to destPath.
 func (db *DB) CopyStableSnapshotJSON(destPath string, replace bool) ([]byte, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	if !strings.HasSuffix(destPath, ".aflite") {
 		return nil, InvalidArgument
 	}
@@ -550,6 +588,8 @@ func (db *DB) CopyStableSnapshotJSON(destPath string, replace bool) ([]byte, err
 // CopyStableSnapshotFileJSON opens srcPath read-only, copies a stable Lite
 // snapshot to destPath, and returns the JSON result.
 func CopyStableSnapshotFileJSON(srcPath, destPath string, replace bool) ([]byte, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	if err := ValidateABI(); err != nil {
 		return nil, err
 	}
@@ -567,6 +607,8 @@ func CopyStableSnapshotFileJSON(srcPath, destPath string, replace bool) ([]byte,
 
 // Batch applies write intents at timestampNS.
 func (db *DB) Batch(writes []WriteIntent, timestampNS uint64) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := db.acquire()
 	if err != nil {
 		return err
@@ -627,6 +669,8 @@ func (db *DB) SetSchemaJSON(schema []byte) error {
 
 // RunUntilIdle drains pending enrichment and index work.
 func (db *DB) RunUntilIdle() error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := db.acquire()
 	if err != nil {
 		return err
@@ -658,7 +702,143 @@ func (db *DB) IndexesJSON() ([]byte, error) {
 	})
 }
 
-// AddIndexJSON adds an index from its JSON configuration.
+// RenderResolverKeyJSON renders the durable resolver template and follows key aliases, without writes or ANN search.
+func (db *DB) RenderResolverKeyJSON(resolver string, mention []byte) ([]byte, error) {
+	name, cleanup := makeCStringSlice([]byte(resolver))
+	defer cleanup()
+	input, cleanupInput := makeCStringSlice(mention)
+	defer cleanupInput()
+	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_db_render_resolver_key_json((*C.antfly_db)(handle), name, input, out)
+	})
+}
+
+// ResolveQueryJSON extracts text or resolves supplied extraction mentions, including ANN, without writes.
+func (db *DB) ResolveQueryJSON(resolver string, mention []byte) ([]byte, error) {
+	name, cleanup := makeCStringSlice([]byte(resolver))
+	defer cleanup()
+	input, cleanupInput := makeCStringSlice(mention)
+	defer cleanupInput()
+	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_db_resolve_query_json((*C.antfly_db)(handle), name, input, out)
+	})
+}
+
+// MergeResolverKeysJSON persists {"key","target"}; RunUntilIdle re-keys existing resolution edges.
+func (db *DB) MergeResolverKeysJSON(resolver string, request []byte) error {
+	name, cleanup := makeCStringSlice([]byte(resolver))
+	defer cleanup()
+	return db.withInput(request, func(handle unsafe.Pointer, input C.antfly_slice) C.antfly_error_code {
+		return C.antfly_db_merge_resolver_keys_json((*C.antfly_db)(handle), name, input)
+	})
+}
+
+// UnmergeResolverKeyJSON undoes a redirect and can pin its former target distinct.
+func (db *DB) UnmergeResolverKeyJSON(resolver string, request []byte) ([]byte, error) {
+	name, cleanup := makeCStringSlice([]byte(resolver))
+	defer cleanup()
+	input, cleanupInput := makeCStringSlice(request)
+	defer cleanupInput()
+	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_db_unmerge_resolver_key_json((*C.antfly_db)(handle), name, input, out)
+	})
+}
+
+// SuppressResolverKeysJSON atomically updates runtime key and text suppressions.
+func (db *DB) SuppressResolverKeysJSON(resolver string, request []byte) ([]byte, error) {
+	name, cleanup := makeCStringSlice([]byte(resolver))
+	defer cleanup()
+	input, cleanupInput := makeCStringSlice(request)
+	defer cleanupInput()
+	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_db_suppress_resolver_keys_json((*C.antfly_db)(handle), name, input, out)
+	})
+}
+
+// UnsuppressResolverKeyJSON removes runtime suppression while preserving declarative rules.
+func (db *DB) UnsuppressResolverKeyJSON(resolver string, request []byte) ([]byte, error) {
+	name, cleanup := makeCStringSlice([]byte(resolver))
+	defer cleanup()
+	input, cleanupInput := makeCStringSlice(request)
+	defer cleanupInput()
+	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_db_unsuppress_resolver_key_json((*C.antfly_db)(handle), name, input, out)
+	})
+}
+
+// ResolverCurationJSON inspects one resolver, or every identity for an empty name.
+func (db *DB) ResolverCurationJSON(resolver string) ([]byte, error) {
+	name, cleanup := makeCStringSlice([]byte(resolver))
+	defer cleanup()
+	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_db_resolver_curation_json((*C.antfly_db)(handle), name, out)
+	})
+}
+
+// ResolverReviewsJSON pages reviews or submits an artifact-bound decision.
+func (db *DB) ResolverReviewsJSON(request []byte) ([]byte, error) {
+	input, cleanup := makeCStringSlice(request)
+	defer cleanup()
+	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_db_resolver_reviews_json((*C.antfly_db)(handle), input, out)
+	})
+}
+
+// CurateEntityJSON applies an entity correction to every matching resolver namespace.
+func (db *DB) CurateEntityJSON(table, key string, request []byte) ([]byte, error) {
+	target, cleanup := makeCStringSlice([]byte(table))
+	defer cleanup()
+	entity, cleanupKey := makeCStringSlice([]byte(key))
+	defer cleanupKey()
+	input, cleanupInput := makeCStringSlice(request)
+	defer cleanupInput()
+	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_db_curate_entity_json((*C.antfly_db)(handle), target, entity, input, out)
+	})
+}
+
+// ResolverIdentitiesJSON lists active and retired identities, including durable merges.
+func (db *DB) ResolverIdentitiesJSON() ([]byte, error) {
+	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_db_list_resolver_identities_json((*C.antfly_db)(handle), out)
+	})
+}
+
+// DropResolverIdentity deletes retired identity metadata; artifacts and canonical rows remain.
+// Retry on Busy. Delete source documents for artifact cleanup; explicitly delete unused canonical rows.
+func (db *DB) DropResolverIdentity(name string) (bool, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	handle, release, err := db.acquire()
+	if err != nil {
+		return false, err
+	}
+	defer release()
+	defer runtime.KeepAlive(db)
+	input, cleanup := makeCStringSlice([]byte(name))
+	defer cleanup()
+	var deleted C.bool
+	if err := check(C.antfly_db_drop_resolver_identity((*C.antfly_db)(handle), input, &deleted)); err != nil {
+		return false, err
+	}
+	return bool(deleted), nil
+}
+
+// SetResolverNamespaceJSON atomically resets or migrates resolver identities; drain afterward.
+// Retry the identical request on Busy.
+func (db *DB) SetResolverNamespaceJSON(resolver string, request []byte) error {
+	name, cleanup := makeCStringSlice([]byte(resolver))
+	defer cleanup()
+	return db.withInput(request, func(handle unsafe.Pointer, input C.antfly_slice) C.antfly_error_code {
+		return C.antfly_db_set_resolver_namespace_json((*C.antfly_db)(handle), name, input)
+	})
+}
+
+// AddIndexJSON adds or replaces an index. Retry the identical request on Busy.
+// A graph replaces command registers a resumable background shadow; the old
+// index serves until activation. It also works when the old index is absent.
+// Optional wait:{timeout_ms:N} waits for activation. Deadline Busy leaves the
+// accepted shadow running; PendingWorkStatsJSON reports progress and last error.
 func (db *DB) AddIndexJSON(config []byte) error {
 	return db.withInput(config, func(handle unsafe.Pointer, input C.antfly_slice) C.antfly_error_code {
 		return C.antfly_db_add_index_json((*C.antfly_db)(handle), input)
@@ -666,7 +846,10 @@ func (db *DB) AddIndexJSON(config []byte) error {
 }
 
 // DeleteIndex deletes an index by name and reports whether it existed.
+// DeleteIndex retires an index; retry on Busy. Returns whether the index existed.
 func (db *DB) DeleteIndex(name string) (bool, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := db.acquire()
 	if err != nil {
 		return false, err
@@ -678,6 +861,26 @@ func (db *DB) DeleteIndex(name string) (bool, error) {
 
 	var deleted C.bool
 	if err := check(C.antfly_db_delete_index((*C.antfly_db)(handle), input, &deleted)); err != nil {
+		return false, err
+	}
+	return bool(deleted), nil
+}
+
+// CancelReplacement cancels a running or failed shadow by its new name.
+func (db *DB) CancelReplacement(name string) (bool, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	handle, release, err := db.acquire()
+	if err != nil {
+		return false, err
+	}
+	defer release()
+	defer runtime.KeepAlive(db)
+	input, cleanup := makeCStringSlice([]byte(name))
+	defer cleanup()
+
+	var deleted C.bool
+	if err := check(C.antfly_db_cancel_replacement((*C.antfly_db)(handle), input, &deleted)); err != nil {
 		return false, err
 	}
 	return bool(deleted), nil
@@ -700,6 +903,8 @@ func (db *DB) AddEnrichmentJSON(config []byte) error {
 // DeleteEnrichment deletes an enrichment by kind and name and reports whether
 // it existed.
 func (db *DB) DeleteEnrichment(kind, name string) (bool, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := db.acquire()
 	if err != nil {
 		return false, err
@@ -736,6 +941,8 @@ func (db *DB) StatsJSON() ([]byte, error) {
 // The request contains statement, parameters and an optional result limit.
 // The returned body includes SQLSTATE diagnostics on failure.
 func (db *DB) SQLJSON(request []byte) ([]byte, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := db.acquire()
 	if err != nil {
 		return nil, err
@@ -800,6 +1007,8 @@ func (db *DB) LookupArtifactJSON(artifactIDBase64 string) ([]byte, error) {
 
 // DecodeArtifactIDJSON decodes a base64 artifact ID without opening a database.
 func DecodeArtifactIDJSON(artifactIDBase64 string) ([]byte, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	input, cleanup := makeCStringSlice([]byte(artifactIDBase64))
 	defer cleanup()
 
@@ -874,6 +1083,8 @@ func (db *DB) MatchPatternJSON(request []byte) ([]byte, error) {
 }
 
 func (db *DB) readBuffer(fn func(unsafe.Pointer, *C.antfly_buffer) C.antfly_error_code) ([]byte, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := db.acquire()
 	if err != nil {
 		return nil, err
@@ -888,6 +1099,8 @@ func (db *DB) readBuffer(fn func(unsafe.Pointer, *C.antfly_buffer) C.antfly_erro
 }
 
 func (db *DB) withInput(input []byte, fn func(unsafe.Pointer, C.antfly_slice) C.antfly_error_code) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := db.acquire()
 	if err != nil {
 		return err
@@ -900,6 +1113,8 @@ func (db *DB) withInput(input []byte, fn func(unsafe.Pointer, C.antfly_slice) C.
 }
 
 func (db *DB) withInputOutput(input []byte, fn func(unsafe.Pointer, C.antfly_slice, *C.antfly_buffer) C.antfly_error_code) ([]byte, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := db.acquire()
 	if err != nil {
 		return nil, err
@@ -921,6 +1136,8 @@ func (db *DB) withStringInputOutput(input string, fn func(unsafe.Pointer, C.antf
 }
 
 func (db *DB) graphLookup(indexName, key, edgeType string, direction uint8, fn func(unsafe.Pointer, C.antfly_slice, C.antfly_slice, C.antfly_slice, C.uint8_t, *C.antfly_buffer) C.antfly_error_code) ([]byte, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := db.acquire()
 	if err != nil {
 		return nil, err
@@ -999,6 +1216,11 @@ func takeBuffer(buffer C.antfly_buffer) []byte {
 func check(code C.antfly_error_code) error {
 	if code == C.ANTFLY_OK {
 		return nil
+	}
+	if C.antfly_last_error_code() == code {
+		if detail := C.GoString(C.antfly_last_error_detail()); detail != "" {
+			return &NativeError{Code: ErrorCode(code), Detail: detail}
+		}
 	}
 	return ErrorCode(code)
 }

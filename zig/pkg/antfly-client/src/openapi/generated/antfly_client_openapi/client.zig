@@ -223,11 +223,27 @@ pub const CreateNamespaceTableResponse = union(enum) {
     }
 };
 
+pub const NamespaceListCurationProposalsParams = struct {
+    state: ?[]const u8 = null,
+    action: ?[]const u8 = null,
+    cursor: ?[]const u8 = null,
+    limit: ?[]const u8 = null,
+};
+
 pub const LookupNamespaceTableDocumentParams = struct {
     /// Comma-separated list of fields to include in the response.
     fields: ?[]const u8 = null,
     /// Read consistency; defaults to read_index.
     consistency: ?[]const u8 = null,
+};
+
+pub const NamespaceUnmergeResolverKeyParams = struct {
+    pin_distinct: ?[]const u8 = null,
+};
+
+pub const NamespaceListResolverReviewsParams = struct {
+    cursor: ?[]const u8 = null,
+    limit: ?[]const u8 = null,
 };
 
 /// Success payload selected by HTTP status, never by trial-decoding another status's schema.
@@ -346,6 +362,24 @@ pub const ListRestoreJobsParams = struct {
     scope: ?[]const u8 = null,
 };
 
+/// Success payload selected by HTTP status, never by trial-decoding another status's schema.
+pub const CreateQuerySourceResponse = union(enum) {
+    status_201: types.SavedQuerySource,
+    status_202: types.CatalogMutationVisibilityPending,
+    pub fn parseResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) !std.json.Parsed(@This()) {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const value: @This() = switch (status) {
+            201 => .{ .status_201 = try std.json.parseFromSliceLeaky(types.SavedQuerySource, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            202 => .{ .status_202 = try std.json.parseFromSliceLeaky(types.CatalogMutationVisibilityPending, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            else => return error.InvalidApiResponse,
+        };
+        return .{ .arena = arena, .value = value };
+    }
+};
+
 pub const ListTablesParams = struct {
     /// Filter tables by name prefix (e.g., "prod_")
     prefix: ?[]const u8 = null,
@@ -375,6 +409,13 @@ pub const CreateTableResponse = union(enum) {
     }
 };
 
+pub const ListCurationProposalsParams = struct {
+    state: ?[]const u8 = null,
+    action: ?[]const u8 = null,
+    cursor: ?[]const u8 = null,
+    limit: ?[]const u8 = null,
+};
+
 pub const LookupKeyParams = struct {
     /// Comma-separated list of fields to include in the response. If not specified, returns the full document. Supports: - Simple fields: "title,author" - Nested paths: "user.address.city" - Wildcards: "_chunks.*" - Exclusions: "-_chunks.*._embedding" - Special fields: "_embeddings,_summaries,_chunks"
     fields: ?[]const u8 = null,
@@ -394,6 +435,15 @@ pub const GetDocumentArtifactManifestParams = struct {
 
 pub const GetLakeCommitOutcomeParams = struct {
     request_hash: []const u8,
+};
+
+pub const UnmergeResolverKeyParams = struct {
+    pin_distinct: ?[]const u8 = null,
+};
+
+pub const ListResolverReviewsParams = struct {
+    cursor: ?[]const u8 = null,
+    limit: ?[]const u8 = null,
 };
 
 /// Success payload selected by HTTP status, never by trial-decoding another status's schema.
@@ -508,20 +558,21 @@ pub const Client = struct {
         return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
     }
 
-    /// Chunk text into smaller segments
+    /// Chunk content with optional model-aware embeddings
     /// POST /ai/v1/chunk
-    pub fn chunkText(self: *@This(), body: types.InferenceChunkRequest) !ApiResponse(types.InferenceChunkResponse) {
+    pub fn chunkText(self: *@This(), body: types.InferenceChunkRequest) !RawResponse {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/chunk", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.InferenceChunkResponse).fromResponse(self.allocator, &resp);
+        defer resp.deinit();
+        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
     }
 
     /// Answer named decision questions
     /// POST /ai/v1/decisions
-    pub fn decide(self: *@This(), body: types.InferenceDecideRequest) !ApiResponse(types.InferenceDecideResponse) {
+    pub fn decide(self: *@This(), body: types.DecisionRequest) !ApiResponse(types.InferenceDecideResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/decisions", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
@@ -574,7 +625,7 @@ pub const Client = struct {
 
     /// Extract entities, relations, classifications, and structures
     /// POST /ai/v1/extract
-    pub fn extract(self: *@This(), body: types.ExtractionRequest) !ApiResponse(types.ExtractionResponse) {
+    pub fn extract(self: *@This(), body: types.ExtractionInputRequest) !ApiResponse(types.ExtractionResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/extract", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
@@ -650,6 +701,17 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.InferenceRewriteResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Synthesize speech using a named text-to-speech configuration
+    /// POST /ai/v1/synthesize
+    pub fn synthesizeSpeech(self: *@This(), body: types.InferenceSynthesisRequest) !ApiResponse(std.json.Value) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/synthesize", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
     }
 
     /// Transcribe audio to text (speech-to-text)
@@ -1860,6 +1922,133 @@ pub const Client = struct {
         return ApiResponse(types.RelationalConstraintStatus).fromResponse(self.allocator, &resp);
     }
 
+    /// listCurationProposals
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals
+    pub fn namespaceListCurationProposals(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, params: NamespaceListCurationProposalsParams) !ApiResponse(types.CurationProposalPage) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/curation/proposals", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.state) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "state=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.action) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "action=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.cursor) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "cursor=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.limit) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "limit=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.CurationProposalPage).fromResponse(self.allocator, &resp);
+    }
+
+    /// proposeCuration
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals
+    pub fn namespaceProposeCuration(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.CurationProposalRequest) !ApiResponse(types.CurationProposal) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/curation/proposals", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.CurationProposal).fromResponse(self.allocator, &resp);
+    }
+
+    /// getCurationProposal
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}
+    pub fn namespaceGetCurationProposal(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, proposal_id: []const u8) !ApiResponse(types.CurationProposal) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_proposal_id = try httpx.PercentEncoding.encode(self.allocator, proposal_id);
+        defer self.allocator.free(encoded_proposal_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/curation/proposals/{s}", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_proposal_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.CurationProposal).fromResponse(self.allocator, &resp);
+    }
+
+    /// acceptCurationProposal
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:accept
+    pub fn namespaceAcceptCurationProposal(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, proposal_id: []const u8, body: types.CurationProposalDecisionRequest) !ApiResponse(types.CurationProposalDecisionResult) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_proposal_id = try httpx.PercentEncoding.encode(self.allocator, proposal_id);
+        defer self.allocator.free(encoded_proposal_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/curation/proposals/{s}:accept", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_proposal_id });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.CurationProposalDecisionResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// rejectCurationProposal
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:reject
+    pub fn namespaceRejectCurationProposal(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, proposal_id: []const u8, body: types.CurationProposalDecisionRequest) !ApiResponse(types.CurationProposalDecisionResult) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_proposal_id = try httpx.PercentEncoding.encode(self.allocator, proposal_id);
+        defer self.allocator.free(encoded_proposal_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/curation/proposals/{s}:reject", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_proposal_id });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.CurationProposalDecisionResult).fromResponse(self.allocator, &resp);
+    }
+
     /// Retrieve a document by key from an explicit namespace table
     /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/documents/{key}
     pub fn lookupNamespaceTableDocument(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, params: LookupNamespaceTableDocumentParams) !ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
@@ -1899,6 +2088,118 @@ pub const Client = struct {
         }
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
+    }
+
+    /// list entity resolver state
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}/redirects
+    pub fn namespaceListEntityResolverState(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !ApiResponse(types.EntityCurationResult) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/entities/{s}/redirects", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_key });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.EntityCurationResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// pinEntitiesDistinct
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:distinct
+    pub fn namespacePinEntitiesDistinct(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, body: types.EntityDistinctRequest) !ApiResponse(types.EntityCurationResult) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/entities/{s}:distinct", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_key });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.EntityCurationResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// merge entity
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:merge
+    pub fn namespaceMergeEntity(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, body: types.EntityMergeRequest) !ApiResponse(types.EntityCurationResult) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/entities/{s}:merge", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_key });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.EntityCurationResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// suppress entity
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:suppress
+    pub fn namespaceSuppressEntity(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, body: types.EntitySuppressRequest) !ApiResponse(types.EntityCurationResult) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/entities/{s}:suppress", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_key });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.EntityCurationResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// unmerge entity
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:unmerge
+    pub fn namespaceUnmergeEntity(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, body: types.ResolverUnmergeRequest) !ApiResponse(types.EntityCurationResult) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/entities/{s}:unmerge", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_key });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.EntityCurationResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// unsuppress entity
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:unsuppress
+    pub fn namespaceUnsuppressEntity(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, body: types.ResolverUnmergeRequest) !ApiResponse(types.EntityCurationResult) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/entities/{s}:unsuppress", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_key });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.EntityCurationResult).fromResponse(self.allocator, &resp);
     }
 
     /// List indexes for an explicit namespace table
@@ -2060,6 +2361,310 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+    }
+
+    /// list resolvers
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers
+    pub fn namespaceListResolvers(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !ApiResponse(types.ResolverList) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/resolvers", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverList).fromResponse(self.allocator, &resp);
+    }
+
+    /// get resolver
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}
+    pub fn namespaceGetResolver(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !ApiResponse(types.ResolverSummary) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_resolver_name = try httpx.PercentEncoding.encode(self.allocator, resolver_name);
+        defer self.allocator.free(encoded_resolver_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/resolvers/{s}", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_resolver_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverSummary).fromResponse(self.allocator, &resp);
+    }
+
+    /// drop resolver identity
+    /// DELETE /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}
+    pub fn namespaceDropResolverIdentity(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !ApiResponse(types.ResolverMutationResult) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_resolver_name = try httpx.PercentEncoding.encode(self.allocator, resolver_name);
+        defer self.allocator.free(encoded_resolver_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/resolvers/{s}", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_resolver_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverMutationResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// list resolver redirects
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/redirects
+    pub fn namespaceListResolverRedirects(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !ApiResponse(types.ResolverRedirectList) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_resolver_name = try httpx.PercentEncoding.encode(self.allocator, resolver_name);
+        defer self.allocator.free(encoded_resolver_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/resolvers/{s}/redirects", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_resolver_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverRedirectList).fromResponse(self.allocator, &resp);
+    }
+
+    /// merge resolver keys
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/redirects
+    pub fn namespaceMergeResolverKeys(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8, body: types.ResolverMergeRequest) !ApiResponse(types.ResolverMutationResult) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_resolver_name = try httpx.PercentEncoding.encode(self.allocator, resolver_name);
+        defer self.allocator.free(encoded_resolver_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/resolvers/{s}/redirects", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_resolver_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverMutationResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// unmerge resolver key
+    /// DELETE /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/redirects/{key}
+    pub fn namespaceUnmergeResolverKey(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8, key: []const u8, body: ?types.ResolverUnmergeRequest, params: NamespaceUnmergeResolverKeyParams) !ApiResponse(types.ResolverMutationResult) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_resolver_name = try httpx.PercentEncoding.encode(self.allocator, resolver_name);
+        defer self.allocator.free(encoded_resolver_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/resolvers/{s}/redirects/{s}", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_resolver_name, encoded_key });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.pin_distinct) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "pin_distinct=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        const json_body = if (body) |value| try httpx.json.Json.stringifyRequest(self.allocator, value) else null;
+        defer if (json_body) |value| self.allocator.free(value);
+        var resp = if (json_body) |value|
+            try self.http.delete(url, .{ .json = value, .headers = self.authHeaders() })
+        else
+            try self.http.delete(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverMutationResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// list resolver reviews
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/reviews
+    pub fn namespaceListResolverReviews(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8, params: NamespaceListResolverReviewsParams) !ApiResponse(types.ResolverReviewPage) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_resolver_name = try httpx.PercentEncoding.encode(self.allocator, resolver_name);
+        defer self.allocator.free(encoded_resolver_name);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/resolvers/{s}/reviews", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_resolver_name });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.cursor) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "cursor=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.limit) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "limit=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverReviewPage).fromResponse(self.allocator, &resp);
+    }
+
+    /// review resolver mention
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/reviews/{reviewId}
+    pub fn namespaceReviewResolverMention(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8, review_id: []const u8, body: types.ResolverReviewDecision) !ApiResponse(types.ResolverMutationResult) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_resolver_name = try httpx.PercentEncoding.encode(self.allocator, resolver_name);
+        defer self.allocator.free(encoded_resolver_name);
+        const encoded_review_id = try httpx.PercentEncoding.encode(self.allocator, review_id);
+        defer self.allocator.free(encoded_review_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/resolvers/{s}/reviews/{s}", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_resolver_name, encoded_review_id });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverMutationResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// list resolver suppressions
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/suppressions
+    pub fn namespaceListResolverSuppressions(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !ApiResponse(types.ResolverSuppressionList) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_resolver_name = try httpx.PercentEncoding.encode(self.allocator, resolver_name);
+        defer self.allocator.free(encoded_resolver_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/resolvers/{s}/suppressions", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_resolver_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverSuppressionList).fromResponse(self.allocator, &resp);
+    }
+
+    /// suppress resolver keys
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/suppressions
+    pub fn namespaceSuppressResolverKeys(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8, body: types.ResolverSuppressionRequest) !ApiResponse(types.ResolverMutationResult) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_resolver_name = try httpx.PercentEncoding.encode(self.allocator, resolver_name);
+        defer self.allocator.free(encoded_resolver_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/resolvers/{s}/suppressions", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_resolver_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverMutationResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// unsuppress resolver key
+    /// DELETE /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/suppressions/{key}
+    pub fn namespaceUnsuppressResolverKey(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8, key: []const u8, body: ?types.ResolverUnmergeRequest) !ApiResponse(types.ResolverMutationResult) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_resolver_name = try httpx.PercentEncoding.encode(self.allocator, resolver_name);
+        defer self.allocator.free(encoded_resolver_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/resolvers/{s}/suppressions/{s}", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_resolver_name, encoded_key });
+        defer self.allocator.free(url);
+        const json_body = if (body) |value| try httpx.json.Json.stringifyRequest(self.allocator, value) else null;
+        defer if (json_body) |value| self.allocator.free(value);
+        var resp = if (json_body) |value|
+            try self.http.delete(url, .{ .json = value, .headers = self.authHeaders() })
+        else
+            try self.http.delete(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverMutationResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// set resolver namespace
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}:namespace
+    pub fn namespaceSetResolverNamespace(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8, body: types.ResolverNamespaceRequest) !ApiResponse(types.ResolverMutationResult) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_resolver_name = try httpx.PercentEncoding.encode(self.allocator, resolver_name);
+        defer self.allocator.free(encoded_resolver_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/resolvers/{s}:namespace", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_resolver_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverMutationResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// render resolver key
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}:render
+    pub fn namespaceRenderResolverKey(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8, body: types.ResolverRenderRequest) !ApiResponse(types.ResolverRenderResponse) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_resolver_name = try httpx.PercentEncoding.encode(self.allocator, resolver_name);
+        defer self.allocator.free(encoded_resolver_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/resolvers/{s}:render", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_resolver_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverRenderResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// resolve resolver query
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}:resolve
+    pub fn namespaceResolveResolverQuery(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8, body: types.ResolverResolveRequest) !ApiResponse(types.ResolverResolveResponse) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_resolver_name = try httpx.PercentEncoding.encode(self.allocator, resolver_name);
+        defer self.allocator.free(encoded_resolver_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/resolvers/{s}:resolve", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_resolver_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverResolveResponse).fromResponse(self.allocator, &resp);
     }
 
     /// Restore an explicit namespace table from backup
@@ -2431,7 +3036,7 @@ pub const Client = struct {
 
     /// Create saved query source
     /// POST /db/v1/sources/{sourceName}
-    pub fn createQuerySource(self: *@This(), source_name: []const u8, body: std.json.Value) !ApiResponse(types.SavedQuerySource) {
+    pub fn createQuerySource(self: *@This(), source_name: []const u8, body: std.json.Value) !ApiResponse(CreateQuerySourceResponse) {
         const encoded_source_name = try httpx.PercentEncoding.encode(self.allocator, source_name);
         defer self.allocator.free(encoded_source_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/sources/{s}", .{ self.base_url, encoded_source_name });
@@ -2439,7 +3044,7 @@ pub const Client = struct {
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.SavedQuerySource).fromResponse(self.allocator, &resp);
+        return ApiResponse(CreateQuerySourceResponse).fromResponse(self.allocator, &resp);
     }
 
     /// Drop saved query source
@@ -2682,7 +3287,7 @@ pub const Client = struct {
         return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
     }
 
-    /// Reprocess a derived asset across a table range
+    /// Reprocess a derived artifact across a table range
     /// POST /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess
     pub fn reprocessDocumentArtifactRange(self: *@This(), table_name: []const u8, artifact_name: []const u8, body: ?types.DocumentArtifactTableReprocessRequest) !ApiResponse(types.DocumentArtifactTableReprocessResponse) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
@@ -2839,6 +3444,113 @@ pub const Client = struct {
         return ApiResponse(types.RelationalConstraintStatus).fromResponse(self.allocator, &resp);
     }
 
+    /// listCurationProposals
+    /// GET /db/v1/tables/{tableName}/curation/proposals
+    pub fn listCurationProposals(self: *@This(), table_name: []const u8, params: ListCurationProposalsParams) !ApiResponse(types.CurationProposalPage) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/curation/proposals", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.state) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "state=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.action) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "action=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.cursor) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "cursor=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.limit) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "limit=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.CurationProposalPage).fromResponse(self.allocator, &resp);
+    }
+
+    /// proposeCuration
+    /// POST /db/v1/tables/{tableName}/curation/proposals
+    pub fn proposeCuration(self: *@This(), table_name: []const u8, body: types.CurationProposalRequest) !ApiResponse(types.CurationProposal) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/curation/proposals", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.CurationProposal).fromResponse(self.allocator, &resp);
+    }
+
+    /// getCurationProposal
+    /// GET /db/v1/tables/{tableName}/curation/proposals/{proposalId}
+    pub fn getCurationProposal(self: *@This(), table_name: []const u8, proposal_id: []const u8) !ApiResponse(types.CurationProposal) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_proposal_id = try httpx.PercentEncoding.encode(self.allocator, proposal_id);
+        defer self.allocator.free(encoded_proposal_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/curation/proposals/{s}", .{ self.base_url, encoded_table_name, encoded_proposal_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.CurationProposal).fromResponse(self.allocator, &resp);
+    }
+
+    /// acceptCurationProposal
+    /// POST /db/v1/tables/{tableName}/curation/proposals/{proposalId}:accept
+    pub fn acceptCurationProposal(self: *@This(), table_name: []const u8, proposal_id: []const u8, body: types.CurationProposalDecisionRequest) !ApiResponse(types.CurationProposalDecisionResult) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_proposal_id = try httpx.PercentEncoding.encode(self.allocator, proposal_id);
+        defer self.allocator.free(encoded_proposal_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/curation/proposals/{s}:accept", .{ self.base_url, encoded_table_name, encoded_proposal_id });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.CurationProposalDecisionResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// rejectCurationProposal
+    /// POST /db/v1/tables/{tableName}/curation/proposals/{proposalId}:reject
+    pub fn rejectCurationProposal(self: *@This(), table_name: []const u8, proposal_id: []const u8, body: types.CurationProposalDecisionRequest) !ApiResponse(types.CurationProposalDecisionResult) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_proposal_id = try httpx.PercentEncoding.encode(self.allocator, proposal_id);
+        defer self.allocator.free(encoded_proposal_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/curation/proposals/{s}:reject", .{ self.base_url, encoded_table_name, encoded_proposal_id });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.CurationProposalDecisionResult).fromResponse(self.allocator, &resp);
+    }
+
     /// Adopt stored write destinations with the current credential
     /// POST /db/v1/tables/{tableName}/destination-authorization
     pub fn reauthorizeTableDestinations(self: *@This(), table_name: []const u8) !ApiResponse(std.json.Value) {
@@ -2964,7 +3676,7 @@ pub const Client = struct {
         return ApiResponse(types.DocumentArtifactManifest).fromResponse(self.allocator, &resp);
     }
 
-    /// Reprocess a derived asset
+    /// Reprocess a derived artifact
     /// POST /db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess
     pub fn reprocessDocumentArtifact(self: *@This(), table_name: []const u8, key: []const u8, artifact_name: []const u8) !ApiResponse(types.DocumentArtifactReprocessResponse) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
@@ -2977,6 +3689,94 @@ pub const Client = struct {
         defer self.allocator.free(url);
         var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.DocumentArtifactReprocessResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// list entity resolver state
+    /// GET /db/v1/tables/{tableName}/entities/{key}/redirects
+    pub fn listEntityResolverState(self: *@This(), table_name: []const u8, key: []const u8) !ApiResponse(types.EntityCurationResult) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/entities/{s}/redirects", .{ self.base_url, encoded_table_name, encoded_key });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.EntityCurationResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// pinEntitiesDistinct
+    /// POST /db/v1/tables/{tableName}/entities/{key}:distinct
+    pub fn pinEntitiesDistinct(self: *@This(), table_name: []const u8, key: []const u8, body: types.EntityDistinctRequest) !ApiResponse(types.EntityCurationResult) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/entities/{s}:distinct", .{ self.base_url, encoded_table_name, encoded_key });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.EntityCurationResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// merge entity
+    /// POST /db/v1/tables/{tableName}/entities/{key}:merge
+    pub fn mergeEntity(self: *@This(), table_name: []const u8, key: []const u8, body: types.EntityMergeRequest) !ApiResponse(types.EntityCurationResult) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/entities/{s}:merge", .{ self.base_url, encoded_table_name, encoded_key });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.EntityCurationResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// suppress entity
+    /// POST /db/v1/tables/{tableName}/entities/{key}:suppress
+    pub fn suppressEntity(self: *@This(), table_name: []const u8, key: []const u8, body: types.EntitySuppressRequest) !ApiResponse(types.EntityCurationResult) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/entities/{s}:suppress", .{ self.base_url, encoded_table_name, encoded_key });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.EntityCurationResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// unmerge entity
+    /// POST /db/v1/tables/{tableName}/entities/{key}:unmerge
+    pub fn unmergeEntity(self: *@This(), table_name: []const u8, key: []const u8, body: types.ResolverUnmergeRequest) !ApiResponse(types.EntityCurationResult) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/entities/{s}:unmerge", .{ self.base_url, encoded_table_name, encoded_key });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.EntityCurationResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// unsuppress entity
+    /// POST /db/v1/tables/{tableName}/entities/{key}:unsuppress
+    pub fn unsuppressEntity(self: *@This(), table_name: []const u8, key: []const u8, body: types.ResolverUnmergeRequest) !ApiResponse(types.EntityCurationResult) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/entities/{s}:unsuppress", .{ self.base_url, encoded_table_name, encoded_key });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.EntityCurationResult).fromResponse(self.allocator, &resp);
     }
 
     /// List all indexes for a table
@@ -3292,6 +4092,254 @@ pub const Client = struct {
         else
             try self.http.post(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.TableRepairRunResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// list resolvers
+    /// GET /db/v1/tables/{tableName}/resolvers
+    pub fn listResolvers(self: *@This(), table_name: []const u8) !ApiResponse(types.ResolverList) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/resolvers", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverList).fromResponse(self.allocator, &resp);
+    }
+
+    /// get resolver
+    /// GET /db/v1/tables/{tableName}/resolvers/{resolverName}
+    pub fn getResolver(self: *@This(), table_name: []const u8, resolver_name: []const u8) !ApiResponse(types.ResolverSummary) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_resolver_name = try httpx.PercentEncoding.encode(self.allocator, resolver_name);
+        defer self.allocator.free(encoded_resolver_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/resolvers/{s}", .{ self.base_url, encoded_table_name, encoded_resolver_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverSummary).fromResponse(self.allocator, &resp);
+    }
+
+    /// drop resolver identity
+    /// DELETE /db/v1/tables/{tableName}/resolvers/{resolverName}
+    pub fn dropResolverIdentity(self: *@This(), table_name: []const u8, resolver_name: []const u8) !ApiResponse(types.ResolverMutationResult) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_resolver_name = try httpx.PercentEncoding.encode(self.allocator, resolver_name);
+        defer self.allocator.free(encoded_resolver_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/resolvers/{s}", .{ self.base_url, encoded_table_name, encoded_resolver_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverMutationResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// list resolver redirects
+    /// GET /db/v1/tables/{tableName}/resolvers/{resolverName}/redirects
+    pub fn listResolverRedirects(self: *@This(), table_name: []const u8, resolver_name: []const u8) !ApiResponse(types.ResolverRedirectList) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_resolver_name = try httpx.PercentEncoding.encode(self.allocator, resolver_name);
+        defer self.allocator.free(encoded_resolver_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/resolvers/{s}/redirects", .{ self.base_url, encoded_table_name, encoded_resolver_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverRedirectList).fromResponse(self.allocator, &resp);
+    }
+
+    /// merge resolver keys
+    /// POST /db/v1/tables/{tableName}/resolvers/{resolverName}/redirects
+    pub fn mergeResolverKeys(self: *@This(), table_name: []const u8, resolver_name: []const u8, body: types.ResolverMergeRequest) !ApiResponse(types.ResolverMutationResult) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_resolver_name = try httpx.PercentEncoding.encode(self.allocator, resolver_name);
+        defer self.allocator.free(encoded_resolver_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/resolvers/{s}/redirects", .{ self.base_url, encoded_table_name, encoded_resolver_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverMutationResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// unmerge resolver key
+    /// DELETE /db/v1/tables/{tableName}/resolvers/{resolverName}/redirects/{key}
+    pub fn unmergeResolverKey(self: *@This(), table_name: []const u8, resolver_name: []const u8, key: []const u8, body: ?types.ResolverUnmergeRequest, params: UnmergeResolverKeyParams) !ApiResponse(types.ResolverMutationResult) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_resolver_name = try httpx.PercentEncoding.encode(self.allocator, resolver_name);
+        defer self.allocator.free(encoded_resolver_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/resolvers/{s}/redirects/{s}", .{ self.base_url, encoded_table_name, encoded_resolver_name, encoded_key });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.pin_distinct) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "pin_distinct=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        const json_body = if (body) |value| try httpx.json.Json.stringifyRequest(self.allocator, value) else null;
+        defer if (json_body) |value| self.allocator.free(value);
+        var resp = if (json_body) |value|
+            try self.http.delete(url, .{ .json = value, .headers = self.authHeaders() })
+        else
+            try self.http.delete(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverMutationResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// list resolver reviews
+    /// GET /db/v1/tables/{tableName}/resolvers/{resolverName}/reviews
+    pub fn listResolverReviews(self: *@This(), table_name: []const u8, resolver_name: []const u8, params: ListResolverReviewsParams) !ApiResponse(types.ResolverReviewPage) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_resolver_name = try httpx.PercentEncoding.encode(self.allocator, resolver_name);
+        defer self.allocator.free(encoded_resolver_name);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/resolvers/{s}/reviews", .{ self.base_url, encoded_table_name, encoded_resolver_name });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.cursor) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "cursor=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.limit) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "limit=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverReviewPage).fromResponse(self.allocator, &resp);
+    }
+
+    /// review resolver mention
+    /// POST /db/v1/tables/{tableName}/resolvers/{resolverName}/reviews/{reviewId}
+    pub fn reviewResolverMention(self: *@This(), table_name: []const u8, resolver_name: []const u8, review_id: []const u8, body: types.ResolverReviewDecision) !ApiResponse(types.ResolverMutationResult) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_resolver_name = try httpx.PercentEncoding.encode(self.allocator, resolver_name);
+        defer self.allocator.free(encoded_resolver_name);
+        const encoded_review_id = try httpx.PercentEncoding.encode(self.allocator, review_id);
+        defer self.allocator.free(encoded_review_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/resolvers/{s}/reviews/{s}", .{ self.base_url, encoded_table_name, encoded_resolver_name, encoded_review_id });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverMutationResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// list resolver suppressions
+    /// GET /db/v1/tables/{tableName}/resolvers/{resolverName}/suppressions
+    pub fn listResolverSuppressions(self: *@This(), table_name: []const u8, resolver_name: []const u8) !ApiResponse(types.ResolverSuppressionList) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_resolver_name = try httpx.PercentEncoding.encode(self.allocator, resolver_name);
+        defer self.allocator.free(encoded_resolver_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/resolvers/{s}/suppressions", .{ self.base_url, encoded_table_name, encoded_resolver_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverSuppressionList).fromResponse(self.allocator, &resp);
+    }
+
+    /// suppress resolver keys
+    /// POST /db/v1/tables/{tableName}/resolvers/{resolverName}/suppressions
+    pub fn suppressResolverKeys(self: *@This(), table_name: []const u8, resolver_name: []const u8, body: types.ResolverSuppressionRequest) !ApiResponse(types.ResolverMutationResult) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_resolver_name = try httpx.PercentEncoding.encode(self.allocator, resolver_name);
+        defer self.allocator.free(encoded_resolver_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/resolvers/{s}/suppressions", .{ self.base_url, encoded_table_name, encoded_resolver_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverMutationResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// unsuppress resolver key
+    /// DELETE /db/v1/tables/{tableName}/resolvers/{resolverName}/suppressions/{key}
+    pub fn unsuppressResolverKey(self: *@This(), table_name: []const u8, resolver_name: []const u8, key: []const u8, body: ?types.ResolverUnmergeRequest) !ApiResponse(types.ResolverMutationResult) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_resolver_name = try httpx.PercentEncoding.encode(self.allocator, resolver_name);
+        defer self.allocator.free(encoded_resolver_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/resolvers/{s}/suppressions/{s}", .{ self.base_url, encoded_table_name, encoded_resolver_name, encoded_key });
+        defer self.allocator.free(url);
+        const json_body = if (body) |value| try httpx.json.Json.stringifyRequest(self.allocator, value) else null;
+        defer if (json_body) |value| self.allocator.free(value);
+        var resp = if (json_body) |value|
+            try self.http.delete(url, .{ .json = value, .headers = self.authHeaders() })
+        else
+            try self.http.delete(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverMutationResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// set resolver namespace
+    /// POST /db/v1/tables/{tableName}/resolvers/{resolverName}:namespace
+    pub fn setResolverNamespace(self: *@This(), table_name: []const u8, resolver_name: []const u8, body: types.ResolverNamespaceRequest) !ApiResponse(types.ResolverMutationResult) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_resolver_name = try httpx.PercentEncoding.encode(self.allocator, resolver_name);
+        defer self.allocator.free(encoded_resolver_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/resolvers/{s}:namespace", .{ self.base_url, encoded_table_name, encoded_resolver_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverMutationResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// render resolver key
+    /// POST /db/v1/tables/{tableName}/resolvers/{resolverName}:render
+    pub fn renderResolverKey(self: *@This(), table_name: []const u8, resolver_name: []const u8, body: types.ResolverRenderRequest) !ApiResponse(types.ResolverRenderResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_resolver_name = try httpx.PercentEncoding.encode(self.allocator, resolver_name);
+        defer self.allocator.free(encoded_resolver_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/resolvers/{s}:render", .{ self.base_url, encoded_table_name, encoded_resolver_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverRenderResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// resolve resolver query
+    /// POST /db/v1/tables/{tableName}/resolvers/{resolverName}:resolve
+    pub fn resolveResolverQuery(self: *@This(), table_name: []const u8, resolver_name: []const u8, body: types.ResolverResolveRequest) !ApiResponse(types.ResolverResolveResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_resolver_name = try httpx.PercentEncoding.encode(self.allocator, resolver_name);
+        defer self.allocator.free(encoded_resolver_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/resolvers/{s}:resolve", .{ self.base_url, encoded_table_name, encoded_resolver_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.ResolverResolveResponse).fromResponse(self.allocator, &resp);
     }
 
     /// Restore a table from backup
@@ -3842,6 +4890,15 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.InferencePredictResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// List predictor feature schemas through the gateway
+    /// GET /ml/v1/predictors
+    pub fn listGatewayPredictors(self: *@This()) !ApiResponse(types.InferencePredictorsResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ml/v1/predictors", .{self.base_url});
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.InferencePredictorsResponse).fromResponse(self.allocator, &resp);
     }
 
     fn authHeaders(self: *const @This()) ?[]const [2][]const u8 {

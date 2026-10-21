@@ -211,6 +211,97 @@ def _provision_artifact_full_text(api, table_name: str, *, chunk_size: int) -> d
     return detail
 
 
+@pytest.mark.parametrize(
+    ("objects", "error_code"),
+    [
+        ((), "MissingRoot"),
+        ((b"<< /Type /Catalog >>",), "MissingPages"),
+        (
+            (
+                b"<< /Type /Catalog /Pages 2 0 R >>",
+                b"<< /Type /Pages /Kids [] /Count 0 >>",
+            ),
+            "EmptyPdfPageTree",
+        ),
+    ],
+)
+def test_malformed_pdf_reprocess_publishes_terminal_manifest(
+    stateful_api, objects, error_code
+):
+    table_name = f"malformed_pdf_{time.time_ns()}"
+    stateful_api.post(
+        f"/tables/{table_name}",
+        {
+            "num_shards": 1,
+            "indexes": {"document_units_graph": _document_units_index_config()},
+        },
+    )
+    # Valid xref offsets isolate structural errors beyond malformed headers.
+    pdf = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, contents in enumerate(objects, 1):
+        offsets.append(len(pdf))
+        pdf += f"{number} 0 obj\n".encode() + contents + b"\nendobj\n"
+    xref = len(pdf)
+    pdf += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode()
+    for offset in offsets:
+        pdf += f"{offset:010d} 00000 n \n".encode()
+    root = " /Root 1 0 R" if objects else ""
+    pdf += f"trailer\n<< /Size {len(objects) + 1}{root} >>\nstartxref\n{xref}\n%%EOF\n".encode()
+    stateful_api.batch_write(
+        table_name,
+        inserts={
+            "doc": {
+                "filename": "broken.pdf",
+                "mime_type": "application/pdf",
+                "version": "1",
+                "url": "data:application/pdf;base64,"
+                + base64.b64encode(pdf).decode("ascii"),
+            }
+        },
+        sync_level="write",
+    )
+    path = _document_artifact_path(table_name, "doc", DOCUMENT_UNITS_ARTIFACT)
+    response = stateful_api.post(f"{path}/reprocess", {})
+    assert response["reprocess"] == "triggered"
+    # Reprocessing acknowledges durable submission. A fresh artifact can still
+    # be absent while the worker publishes its terminal failure manifest.
+    manifest = wait_until(
+        lambda: stateful_api.get(f"{path}?detail=raw"),
+        timeout_s=60,
+        ready_when=lambda value: (
+            value is not None and value.get("merge_status") == "failed"
+        ),
+        retry_not_found=True,
+    )
+    assert manifest["merge_status"] == "failed"
+    assert manifest["unit_count"] == 0
+    failure = json.loads(manifest["manifest_json"])["last_error"]
+    assert failure["code"] == error_code
+    assert failure["stage"] == "pdf_structure"
+    response = stateful_api._request(
+        "POST",
+        f"/tables/{table_name}/query",
+        {
+            "fields": ["unit_id"],
+            "hierarchy": {
+                "children": {
+                    "level": "unit",
+                    "parent": {"level": "source", "id": "doc"},
+                }
+            },
+            "order_by": [{"field": "_hierarchy.position"}],
+            "limit": 1,
+        },
+    )
+    assert response.status_code == 409, response.text + (
+        "\n" + stateful_api._server.debug_logs() if stateful_api._server else ""
+    )
+    assert response.json()["error"] == "document_artifact_publication_failed"
+    assert response.json()["retryable"] is False
+    assert "Retry-After" not in response.headers
+
+
 def test_document_artifact_manifest_and_reprocess_job_e2e(stateful_api):
     table_name = f"document_artifacts_{time.time_ns()}"
     created = stateful_api.post(

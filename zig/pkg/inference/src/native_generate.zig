@@ -30,7 +30,6 @@ const generation = @import("pipelines/generation.zig");
 const graph_mod = @import("graph/root.zig");
 const kernel_jit = graph_mod.kernel_jit;
 const quant_matmul = @import("graph/quant_matmul.zig");
-const onnx_decoder_only_vlm = @import("pipelines/onnx_decoder_only_vlm.zig");
 const model_manager_mod = @import("server/model_manager.zig");
 const manifest_mod = @import("models/manifest.zig");
 const gpt_mod = @import("models/gpt.zig");
@@ -90,6 +89,7 @@ const Options = struct {
     prompt: []const u8,
     image_paths: [8][]const u8 = @splat(""),
     image_count: usize = 0,
+    video_path: ?[]const u8 = null,
     audio_paths: [8][]const u8 = @splat(""),
     audio_count: usize = 0,
     backend: BackendChoice = .auto,
@@ -291,14 +291,16 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         return;
     }
     const opts = try parseArgs(args);
+    try validateVideoOptions(opts);
     const jit_config = try validateKernelJitOptions(io, opts);
     try validateCacheCompactionOption(opts.cache_compaction_ratio);
     try native_backend_choice.validate(opts.backend);
-    if (opts.raw_decode_bench and (opts.image_count > 0 or opts.audio_count > 0)) return error.RawDecodeBenchRequiresTextOnly;
+    if (opts.raw_decode_bench and (opts.image_count > 0 or opts.audio_count > 0 or opts.video_path != null)) return error.RawDecodeBenchRequiresTextOnly;
     if (opts.raw_decode_bench and opts.draft_model != null and opts.speculation_policy != .off) return error.RawDecodeBenchSpeculationUnsupported;
     if (opts.raw_decode_bench and opts.stream) return error.RawDecodeBenchStreamingUnsupported;
     const require_server = requireWarmServer(opts);
     if (selectedServerUrl(opts, platform.env.getenv("ANTFLY_INFERENCE_SERVER_URL"))) |server_url| {
+        if (opts.video_path != null) return error.VideoRequiresLocalBackend;
         if (opts.raw_decode_bench) return error.RawDecodeBenchRequiresLocalBackend;
         var server_opts = opts;
         server_opts.server_url = server_url;
@@ -322,13 +324,14 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         }
         break :blk draft_model_dir;
     } else opts.draft_model;
-    if (effective_draft_model != null and opts.backend == .onnx) return error.SpeculativeDecodingRequiresNativeBackend;
     const started_at = std.Io.Timestamp.now(io, .awake);
 
     var preflight_manifest = try manifest_mod.loadFromDir(allocator, opts.model_dir);
     defer preflight_manifest.deinit();
     try preflightModelLoadBudget(allocator, &preflight_manifest, opts);
 
+    const loaded_video = if (opts.video_path) |path| try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(256 * 1024 * 1024)) else null;
+    defer if (loaded_video) |bytes| allocator.free(bytes);
     var loaded_images = std.ArrayListUnmanaged([]u8).empty;
     defer {
         for (loaded_images.items) |image_bytes| allocator.free(image_bytes);
@@ -383,6 +386,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             .role = "user",
             .content = opts.prompt,
             .image_bytes = message_image_slice,
+            .video_bytes = loaded_video,
             .audio_bytes = message_audio_slice,
             .content_parts = content_part_slice,
         },
@@ -409,7 +413,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     };
 
     const artifact_backend = switch (opts.backend) {
-        .onnx => "onnx",
         .xla => "xla",
         else => null,
     };
@@ -421,125 +424,23 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     else
         null;
     defer if (resolved_artifact_dir) |path| allocator.free(path);
-    const route_onnx_whole_model_graph = opts.backend == .onnx and opts.compiled_target == .whole_model;
 
     var session_manager = backends.SessionManager.initWithIo(allocator, io);
-    configureBackendPreference(&session_manager, if (route_onnx_whole_model_graph) .native else opts.backend);
+    configureBackendPreference(&session_manager, opts.backend);
     session_manager.a4b_inference_request = a4bInferenceRequest(opts);
     session_manager.kernel_jit = jit_config;
     session_manager.kernel_jit_load_context = .startup_preload;
 
     try native_backend_choice.validateRequiredCompiledBackend(
         &session_manager,
-        if (artifact_backend) |backend|
-            if (std.mem.eql(u8, backend, "onnx")) .onnx else .pjrt
-        else
-            null,
+        if (artifact_backend != null) .pjrt else null,
     );
-
-    const allow_direct_onnx = (opts.backend == .auto or opts.backend == .onnx) and
-        try session_manager.allowsDirectBackend(.onnx);
-    if (allow_direct_onnx and !jit_config.mode.compiles() and opts.kernel_jit_profile_out == null and effective_draft_model == null and build_options.enable_onnx and
-        !route_onnx_whole_model_graph and
-        !c_file.fileExistsInDir(allocator, opts.model_dir, "genai_config.json") and
-        onnx_decoder_only_vlm.isSupportedModelDir(allocator, opts.model_dir))
-    {
-        var pipeline = try onnx_decoder_only_vlm.Pipeline.load(allocator, opts.model_dir);
-        defer pipeline.deinit();
-        const loaded_model_at = std.Io.Timestamp.now(io, .awake);
-
-        const apply_chat_template = !opts.raw_prompt and !opts.no_chat_template and pipeline.chat_tmpl != null;
-        const rendered_prompt = if (opts.raw_prompt)
-            try allocator.dupe(u8, opts.prompt)
-        else if (apply_chat_template)
-            try pipeline.chat_tmpl.?.applyWithOptions(allocator, &messages, .{
-                .enable_thinking = opts.enable_thinking,
-            })
-        else
-            try generation.formatMessages(allocator, &messages);
-        defer allocator.free(rendered_prompt);
-        pipeline.prompt_override = rendered_prompt;
-
-        var prompt_encoded = try generation.encodePromptForGeneration(
-            pipeline.hf_tok.tokenizer(),
-            allocator,
-            rendered_prompt,
-            4096,
-            !opts.no_bos and pipeline.manifest.add_bos_token,
-            pipeline.manifest.bos_token,
-        );
-        defer prompt_encoded.deinit();
-        const encoded_prompt_at = std.Io.Timestamp.now(io, .awake);
-
-        if (opts.print_chat_template_status) {
-            print("chat_template={}\n", .{apply_chat_template});
-        }
-        if (opts.print_prompt) {
-            print("prompt:\n{s}\n", .{rendered_prompt});
-        }
-        if (opts.print_prompt_token_ids) {
-            print("prompt_token_ids:", .{});
-            for (prompt_encoded.ids[0..countPromptTokens(prompt_encoded.attention_mask)]) |id| {
-                print(" {d}", .{id});
-            }
-            print("\n", .{});
-        }
-
-        if (artifact_backend != null and effective_draft_model == null and !route_onnx_whole_model_graph and opts.max_tokens == 1 and opts.image_count == 0 and opts.audio_count == 0) {
-            if (try tryRunArtifactForPromptShape(
-                allocator,
-                io,
-                &opts,
-                resolved_artifact_dir.?,
-                artifact_backend.?,
-                countPromptTokens(prompt_encoded.attention_mask),
-                countPromptTokens(prompt_encoded.attention_mask),
-                "paged_prefill",
-            )) return;
-        }
-
-        var result = try generateWithOptionalStreaming(&pipeline, &messages, config, opts.stream);
-        defer result.deinit();
-        const finished_generate_at = std.Io.Timestamp.now(io, .awake);
-
-        if (!opts.stream) print("{s}\n", .{result.text});
-        if (opts.print_token_ids) {
-            if (result.token_ids) |ids| {
-                print("token_ids:", .{});
-                for (ids) |id| print(" {d}", .{id});
-                print("\n", .{});
-            } else {
-                print("token_ids=unavailable\n", .{});
-            }
-        }
-        if (opts.print_finish_reason or opts.print_token_count) {
-            if (opts.print_finish_reason and opts.print_token_count) {
-                print("finish_reason={s} tokens={d}\n", .{ result.finish_reason, result.tokens_used });
-            } else if (opts.print_finish_reason) {
-                print("finish_reason={s}\n", .{result.finish_reason});
-            } else {
-                print("tokens={d}\n", .{result.tokens_used});
-            }
-        }
-        if (opts.print_timing) {
-            print(
-                "timing_ms: load_model={d} prompt_prep={d} scheduler=0 backend_setup=0 decode_setup=0 generate={d} total={d}\n",
-                .{
-                    durationMillis(started_at, loaded_model_at),
-                    durationMillis(loaded_model_at, encoded_prompt_at),
-                    durationMillis(encoded_prompt_at, finished_generate_at),
-                    durationMillis(started_at, finished_generate_at),
-                },
-            );
-        }
-        return;
-    }
 
     var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
     defer model_manager.deinit();
 
     var draft_session_manager = backends.SessionManager.initWithIo(allocator, io);
-    configureBackendPreference(&draft_session_manager, if (route_onnx_whole_model_graph) .native else opts.backend);
+    configureBackendPreference(&draft_session_manager, opts.backend);
     const draft_jit_config = try draftKernelJitConfig(
         jit_config,
         opts.kernel_jit_draft_qualified_profile,
@@ -550,7 +451,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     var draft_model_manager = model_manager_mod.ModelManager.init(allocator, draft_session_manager);
     defer draft_model_manager.deinit();
 
-    if (artifact_backend != null and effective_draft_model == null and !route_onnx_whole_model_graph and opts.max_tokens == 1 and opts.image_count == 0 and opts.audio_count == 0) {
+    if (artifact_backend != null and effective_draft_model == null and opts.max_tokens == 1 and opts.video_path == null and opts.image_count == 0 and opts.audio_count == 0) {
         var artifact_arena = std.heap.ArenaAllocator.init(allocator);
         defer artifact_arena.deinit();
         const artifact_allocator = artifact_arena.allocator();
@@ -571,19 +472,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         }
     }
 
-    if (route_onnx_whole_model_graph) {
-        try runOnnxWholeModelGraphGenerate(
-            allocator,
-            io,
-            &opts,
-            messages[0..],
-            config,
-            resolved_artifact_dir.?,
-            started_at,
-        );
-        return;
-    }
-
     generation.gemma4_mtp_debug_override = opts.debug_mtp;
     try warmInitCudaBeforeLargeModelScan(opts.backend);
     debugGenerateSetup("load model begin dir={s}", .{opts.model_dir});
@@ -599,7 +487,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         gpt_config.disable_token_embedding_scale = true;
     }
     const tokenizer = model.getTokenizer();
-    if (effective_draft_model != null and (opts.image_count > 0 or opts.audio_count > 0)) {
+    if (effective_draft_model != null and (opts.image_count > 0 or opts.audio_count > 0 or opts.video_path != null)) {
         return error.MultimodalSpeculativeDecodingNotSupported;
     }
     var draft_gpt_config = preflight_draft_gpt_config;
@@ -665,7 +553,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         prompt_media_allowance,
     ) catch return error.PromptTooLong;
 
-    if (artifact_backend != null and effective_draft_model == null and !route_onnx_whole_model_graph and opts.max_tokens == 1 and opts.image_count == 0 and opts.audio_count == 0) {
+    if (artifact_backend != null and effective_draft_model == null and opts.max_tokens == 1 and opts.video_path == null and opts.image_count == 0 and opts.audio_count == 0) {
         if (try tryRunArtifactForPromptShape(
             allocator,
             io,
@@ -723,7 +611,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         explicit_partition_backend == .metal and
         compiled_attachment_target == .whole_model and
         effective_draft_model == null and
-        opts.image_count == 0 and
+        opts.video_path == null and opts.image_count == 0 and
         opts.audio_count == 0 and
         graph_mod.metal_executor.supportsSession(model.session))
     {
@@ -737,7 +625,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .metal => .metal,
         .cuda => .cuda,
         .pjrt => return error.UnexpectedPjrtBackend,
-        .onnx => return error.UnexpectedOnnxBackend,
         .wasm => return error.UnexpectedWasmBackend,
     };
     const idle_prefill_ceiling = generation.nativeGenerationPrefillChunkCeiling(
@@ -818,7 +705,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config) and
         config.draft_model == null and
         !config.speculation_requested and
-        opts.image_count == 0 and
+        opts.video_path == null and opts.image_count == 0 and
         opts.audio_count == 0;
     const kv_capacity_policy = generation.generationKvCapacityPolicyForRoute(
         if (compiled_whole_model_route or live_whole_model_route)
@@ -6393,7 +6280,7 @@ fn generationKvBackendKind(backend: backends.BackendType) ?runtime.kv.pool.Backe
         .native => .native,
         .metal => .metal,
         .cuda => .cuda,
-        .onnx, .pjrt, .wasm => null,
+        .pjrt, .wasm => null,
     };
 }
 
@@ -6603,7 +6490,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
     if (!liveWholeModelExecutorRequested(opts, gpt_config)) return false;
     if (generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config)) return false;
     if (config.draft_model != null or config.speculation_requested) return false;
-    if (opts.image_count > 0 or opts.audio_count > 0) return false;
+    if (opts.image_count > 0 or opts.audio_count > 0 or opts.video_path != null) return false;
 
     gpt_arch.resetDebugTimingStats();
 
@@ -7158,191 +7045,6 @@ fn tryRunLiveWholeModelExecutorGenerate(
     return true;
 }
 
-fn runOnnxWholeModelGraphGenerate(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    opts: *const Options,
-    messages: []const generation.Message,
-    config: generation.GenerationConfig,
-    artifact_dir: []const u8,
-    started_at: std.Io.Timestamp,
-) !void {
-    if (!build_options.enable_onnx) return error.BackendUnavailable;
-    if (opts.image_count > 0 or opts.audio_count > 0) return error.UnsupportedMultimodalWholeModelArtifact;
-
-    var session_manager = backends.SessionManager.initWithIo(allocator, io);
-    configureBackendPreference(&session_manager, .native);
-    var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
-    defer model_manager.deinit();
-
-    const model = try model_manager.loadFromDir(opts.model_dir);
-    const loaded_model_at = std.Io.Timestamp.now(io, .awake);
-    const gpt_config = session_factory.getGptConfig(model.session) orelse return error.InvalidModelForGeneration;
-    if (generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config)) {
-        return error.DeepSeekV4CompressedGraphModeNotSupported;
-    }
-    const tokenizer = model.getTokenizer();
-    const apply_chat_template = !opts.raw_prompt and !opts.no_chat_template and model.chat_tmpl != null;
-    const rendered_prompt = if (opts.raw_prompt)
-        try allocator.dupe(u8, opts.prompt)
-    else if (apply_chat_template)
-        try model.chat_tmpl.?.applyWithOptions(allocator, messages, .{
-            .enable_thinking = opts.enable_thinking,
-        })
-    else
-        try generation.formatMessages(allocator, messages);
-    defer allocator.free(rendered_prompt);
-    var prompt_encoded = try generation.encodePromptForGeneration(
-        tokenizer,
-        allocator,
-        rendered_prompt,
-        2048,
-        !opts.no_bos and model.manifest.add_bos_token,
-        model.manifest.bos_token,
-    );
-    const encoded_prompt_at = std.Io.Timestamp.now(io, .awake);
-    defer prompt_encoded.deinit();
-    const prompt_tokens = countPromptTokens(prompt_encoded.attention_mask);
-
-    if (opts.print_chat_template_status) {
-        print("chat_template={}\n", .{apply_chat_template});
-    }
-    if (opts.print_prompt) {
-        print("prompt:\n{s}\n", .{rendered_prompt});
-    }
-    if (opts.print_prompt_token_ids) {
-        print("prompt_token_ids:", .{});
-        for (prompt_encoded.ids[0..prompt_tokens]) |id| {
-            print(" {d}", .{id});
-        }
-        print("\n", .{});
-    }
-
-    var kv_manager = runtime.kv.manager.KvManager.init(allocator);
-    defer kv_manager.deinit();
-    const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
-        .native => .native,
-        .metal => .metal,
-        .cuda => .cuda,
-        .pjrt => return error.UnexpectedPjrtBackend,
-        .onnx => return error.UnexpectedOnnxBackend,
-        .wasm => return error.UnexpectedWasmBackend,
-    };
-    const kv_dtype = if (opts.cache_dtype) |name|
-        runtime.kv.pool.parseKvDType(name) orelse return error.InvalidCacheDtype
-    else
-        session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
-    const budget_backend_class: runtime.tier.memory.BackendClass = switch (backend_kind) {
-        .native => .cpu,
-        else => .gpu,
-    };
-    var budget_limits = runtime.tier.memory.defaultLimitsForBackend(budget_backend_class);
-    budget_limits = session_factory.widenBudgetLimitsForSession(model.session, budget_limits);
-    budget_limits = try applyBudgetOverrides(budget_limits, opts.*);
-    var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
-    print("budget: host={d}MiB backend={d}MiB combined={d}MiB\n", .{
-        budget_limits.host_limit_bytes / (1024 * 1024),
-        budget_limits.backend_limit_bytes / (1024 * 1024),
-        budget_limits.combined_limit_bytes / (1024 * 1024),
-    });
-    run_budget.reserveEstimate(try runtime.tier.memory.estimateGptGeneration(
-        backend_kind,
-        kv_dtype,
-        gpt_config,
-        prompt_tokens,
-        @intCast(@max(opts.max_tokens, 1)),
-        256,
-    )) catch |err| {
-        if (err == error.MemoryBudgetExceeded) {
-            printBudgetExceeded(model.session, &run_budget);
-        }
-        return err;
-    };
-    var cb = session_factory.getComputeBackendWithBudget(model.session, allocator, &run_budget) catch |err| {
-        if (err == error.MemoryBudgetExceeded) {
-            printBudgetExceeded(model.session, &run_budget);
-        }
-        return err;
-    };
-    const created_backend_at = std.Io.Timestamp.now(io, .awake);
-    defer cb.deinit();
-
-    const kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, kvSlidingTrimForced());
-    const pool_id = try kv_manager.addPool(kv_pool_config);
-    var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, kv_pool_config);
-    defer kv_storage.deinit();
-    try cb.provisionKvDeviceWriteHook(&kv_storage);
-    var decode_state = generation.NativeDecodeState.initPaged(allocator, &kv_manager, pool_id, model.shared_moe_cache);
-    decode_state.kv_storage = &kv_storage;
-    const created_decode_state_at = std.Io.Timestamp.now(io, .awake);
-    defer decode_state.deinit();
-
-    var graph_cache = graph_mod.cache.GraphCache.init(allocator);
-    defer graph_cache.deinit();
-    var pipeline = generation.NativeGenerationPipeline{
-        .allocator = allocator,
-        .io = io,
-        .cb = cb,
-        .gpt_config = gpt_config,
-        .tokenizer = tokenizer,
-        .add_bos_token = model.manifest.add_bos_token,
-        .bos_token = model.manifest.bos_token,
-        .chat_template = if (opts.no_chat_template) null else model.chat_tmpl,
-        .prompt_override = if (opts.raw_prompt) rendered_prompt else null,
-        .return_raw_token_ids = opts.print_token_ids,
-        .print_timing = opts.print_timing,
-        .model_dir = opts.model_dir,
-        .artifact_dir = artifact_dir,
-        .gguf_projector_path = model.manifest.gguf_projector_path,
-        .decode_state = &decode_state,
-        .scheduler = null,
-        .scheduler_lease = null,
-        .graph_cache = &graph_cache,
-        .compiled_partition_backend = .onnx,
-        .compiled_attachment_target = .whole_model,
-        .pjrt_client = null,
-    };
-
-    gpt_arch.resetDebugTimingStats();
-    var result = try generateWithOptionalStreaming(&pipeline, messages, config, opts.stream);
-    const finished_generate_at = std.Io.Timestamp.now(io, .awake);
-    defer result.deinit();
-
-    if (!opts.stream) print("{s}\n", .{result.text});
-    if (opts.print_token_ids) {
-        if (result.token_ids) |ids| {
-            print("token_ids:", .{});
-            for (ids) |id| print(" {d}", .{id});
-            print("\n", .{});
-        } else {
-            print("token_ids=unavailable\n", .{});
-        }
-    }
-    if (opts.print_finish_reason or opts.print_token_count) {
-        if (opts.print_finish_reason and opts.print_token_count) {
-            print("finish_reason={s} tokens={d}\n", .{ result.finish_reason, result.tokens_used });
-        } else if (opts.print_finish_reason) {
-            print("finish_reason={s}\n", .{result.finish_reason});
-        } else {
-            print("tokens={d}\n", .{result.tokens_used});
-        }
-    }
-    if (opts.print_timing) printSpeculativeStats(&result);
-    if (opts.print_timing) {
-        print(
-            "timing_ms: load_model={d} prompt_prep={d} scheduler=0 backend_setup={d} decode_setup={d} generate={d} total={d}\n",
-            .{
-                durationMillis(started_at, loaded_model_at),
-                durationMillis(loaded_model_at, encoded_prompt_at),
-                durationMillis(encoded_prompt_at, created_backend_at),
-                durationMillis(created_backend_at, created_decode_state_at),
-                durationMillis(created_decode_state_at, finished_generate_at),
-                durationMillis(started_at, finished_generate_at),
-            },
-        );
-    }
-}
-
 fn tryRunArtifactForPromptShape(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -7359,7 +7061,7 @@ fn tryRunArtifactForPromptShape(
     const artifact_allocator = artifact_arena.allocator();
     var found = (try compiled_artifact.findMatchingArtifactPath(allocator, io, artifact_dir, .{
         .backend = artifact_backend,
-        .kind = if (std.mem.eql(u8, artifact_backend, "onnx")) "onnx_graph" else null,
+        .kind = null,
         .model_dir = opts.model_dir,
         .seq_len = seq_len,
         .query_seq_len = query_seq_len,
@@ -7527,33 +7229,30 @@ fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, qu
 
     print("{s}\n", .{choice.message.content.valueOrNull() orelse ""});
     if (opts.print_finish_reason or opts.print_token_count) {
-        if (opts.print_finish_reason and opts.print_token_count) {
-            print("finish_reason={s} tokens={d}\n", .{ @tagName(choice.finish_reason), parsed.value.usage.completion_tokens });
-        } else if (opts.print_finish_reason) {
-            print("finish_reason={s}\n", .{@tagName(choice.finish_reason)});
-        } else {
-            print("tokens={d}\n", .{parsed.value.usage.completion_tokens});
+        if (opts.print_finish_reason) print("finish_reason={s}", .{@tagName(choice.finish_reason)});
+        if (opts.print_token_count) {
+            if (opts.print_finish_reason) print(" ", .{});
+            if (parsed.value.usage) |usage| print("tokens={d}", .{usage.completion_tokens}) else print("tokens=unknown", .{});
         }
+        print("\n", .{});
     }
     if (opts.print_timing) {
         const total_ms = durationMillis(started_at, finished_at);
-        const tokens_per_sec: f64 = if (total_ms > 0)
-            @as(f64, @floatFromInt(parsed.value.usage.completion_tokens)) * 1000.0 / @as(f64, @floatFromInt(total_ms))
-        else
-            0;
         if (parsed.value.speculation.valueOrNull()) |status| {
             const summary = try formatServerSpeculationStatus(allocator, status);
             defer allocator.free(summary);
             print("{s}\n", .{summary});
         }
-        print("timing_ms: server_request={d} total={d} tokens_per_sec={d:.2}\n", .{ total_ms, total_ms, tokens_per_sec });
+        if (parsed.value.usage) |usage| {
+            const tokens_per_sec: f64 = if (total_ms > 0) @as(f64, @floatFromInt(usage.completion_tokens)) * 1000.0 / @as(f64, @floatFromInt(total_ms)) else 0;
+            print("timing_ms: server_request={d} total={d} tokens_per_sec={d:.2}\n", .{ total_ms, total_ms, tokens_per_sec });
+        } else print("timing_ms: server_request={d} total={d} tokens_per_sec=unknown\n", .{ total_ms, total_ms });
     }
 }
 
 fn generateBackendOverrideForChoice(choice: BackendChoice) ?api.ModelBackend {
     return switch (choice) {
         .auto => null,
-        .onnx => .onnx,
         .native => .native,
         .metal => .metal,
         .cuda => .cuda,
@@ -7765,7 +7464,7 @@ fn stripDefaultModelsDir(home: []const u8, model_dir: []const u8) ?[]const u8 {
 }
 
 fn serverGenerateSupportsOptions(opts: Options) bool {
-    return opts.image_count == 0 and
+    return opts.video_path == null and opts.image_count == 0 and
         opts.audio_count == 0 and
         !opts.raw_prompt and
         !opts.no_bos and
@@ -7929,6 +7628,11 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
             opts.speculation_calibration = generation.parseSpeculationCalibration(args[i]) orelse return error.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--video")) {
+            i += 1;
+            if (i >= args.len) return error.MissingVideoPath;
+            if (opts.video_path != null) return error.VideoLimitExceeded;
+            opts.video_path = args[i];
         } else if (std.mem.eql(u8, arg, "--image")) {
             i += 1;
             if (i >= args.len) return error.MissingImagePath;
@@ -8464,7 +8168,7 @@ fn predictedWeightTier(
             if (build_options.enable_metal and !shouldPreferNativeAheadOfMetal(allocator, manifest)) return .backend;
             return .host;
         },
-        .onnx, .xla, .webgpu => return .host,
+        .xla, .webgpu => return .host,
     }
 }
 
@@ -8474,7 +8178,7 @@ fn predictedBackendType(choice: BackendChoice, tier: runtime.tier.memory.Residen
         .metal => .metal,
         .cuda => .cuda,
         .auto => .metal,
-        .onnx, .native, .xla, .webgpu => .native,
+        .native, .xla, .webgpu => .native,
     };
 }
 
@@ -8520,12 +8224,37 @@ fn metalEagerDenseMaxBytes() u64 {
     return mb * 1024 * 1024;
 }
 
+fn validateVideoOptions(opts: Options) !void {
+    if (opts.video_path == null) return;
+    if (opts.image_count > 0 or opts.audio_count > 0) return error.UnsupportedMixedVideoInput;
+    if (opts.raw_prompt or opts.draft_model != null) return error.UnsupportedVideoGenerationOption;
+}
+
+test "video CLI accepts one clip and rejects conflicting inputs" {
+    const opts = try parseArgs(&.{ "model", "describe", "--video", "clip.mp4", "--backend", "cuda" });
+    try std.testing.expectEqualStrings("clip.mp4", opts.video_path.?);
+    try validateVideoOptions(opts);
+    try std.testing.expect(!serverGenerateSupportsOptions(opts));
+    try std.testing.expectError(error.MissingVideoPath, parseArgs(&.{ "model", "describe", "--video" }));
+    try std.testing.expectError(error.VideoLimitExceeded, parseArgs(&.{ "model", "describe", "--video", "a.mp4", "--video", "b.mp4" }));
+    for ([_][]const u8{ "--image", "--audio" }) |flag| {
+        const mixed = try parseArgs(&.{ "model", "describe", "--video", "clip.mp4", flag, "media" });
+        try std.testing.expectError(error.UnsupportedMixedVideoInput, validateVideoOptions(mixed));
+    }
+    const raw = try parseArgs(&.{ "model", "describe", "--video", "clip.mp4", "--raw-prompt" });
+    try std.testing.expectError(error.UnsupportedVideoGenerationOption, validateVideoOptions(raw));
+    const draft = try parseArgs(&.{ "model", "describe", "--video", "clip.mp4", "--draft-model", "draft" });
+    try std.testing.expectError(error.UnsupportedVideoGenerationOption, validateVideoOptions(draft));
+}
+
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path]... [--audio path] [--backend auto|onnx|native|metal|cuda|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--a4b-residency-mode auto|streamed|resident] [--a4b-memory-budget-mb N] [--a4b-load-strategy auto|pipeline|legacy] [--a4b-load-workers N] [--a4b-load-staging-mb N] [--a4b-prepared-pack auto|off|required] [--a4b-drop-host-cache-after-load] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--enable-thinking|--disable-thinking] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--qwen3vl-parity-json path] [--qwen3vl-parity-patch-f32le path] [--qwen3vl-parity-logits-f32le path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
+        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path]... [--audio path] [--video h264.mp4] [--backend auto|native|metal|cuda|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--a4b-residency-mode auto|streamed|resident] [--a4b-memory-budget-mb N] [--a4b-load-strategy auto|pipeline|legacy] [--a4b-load-workers N] [--a4b-load-staging-mb N] [--a4b-prepared-pack auto|off|required] [--a4b-drop-host-cache-after-load] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--enable-thinking|--disable-thinking] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--qwen3vl-parity-json path] [--qwen3vl-parity-patch-f32le path] [--qwen3vl-parity-logits-f32le path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  With --server or ANTFLY_INFERENCE_SERVER_URL, sends the request to an already-running inference server.
         \\  --stream prints generated text incrementally as token deltas arrive.
+        \\  --video accepts one progressive 8-bit H.264 MP4 clip on local CUDA Gemma4 (up to 60s, sampled at 1 FPS).
+        \\  Video currently excludes audio, mixed image inputs, HDR, rotation, and non-square pixels.
         \\  --require-server or ANTFLY_INFERENCE_REQUIRE_WARM_SERVER=1 fails unless a server URL is configured.
         \\  draft-model enables native speculative decoding with a tokenizer-compatible drafter such as a Gemma 4 *-assistant model.
         \\  speculation-calibration defaults to none; Gemma4 MTP auto mode requires probe or positive to run the drafter.
@@ -8935,7 +8664,7 @@ test "Metal auto draft admission defaults off and stays Gemma4 MTP-only" {
 test "draft KV backend follows the loaded draft session" {
     try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, .native), generationKvBackendKind(.native));
     try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, .metal), generationKvBackendKind(.metal));
-    try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, null), generationKvBackendKind(.onnx));
+    try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, null), generationKvBackendKind(.pjrt));
     const mixed_draft: gpt_mod.Config = .{
         .family = .gemma,
         .hidden_size = 512,

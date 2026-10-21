@@ -24,8 +24,10 @@
 //! Zig contributors' MIT license above. The protocol change accepts an optional
 //! TLS 1.2 or TLS 1.3 initial-handshake CertificateRequest and sends an empty
 //! client Certificate message, as required when bearer authentication is used
-//! without a client certificate. Remove this copy after upstream Zig provides
-//! the same behavior and Antfly's minimum Zig revision includes it.
+//! without a client certificate. The writer also retains plaintext that does
+//! not fit in one ciphertext buffer during flush. Remove this copy after
+//! upstream Zig provides both behaviors and Antfly's minimum revision includes
+//! them.
 
 const builtin = @import("builtin");
 const native_endian = builtin.cpu.arch.endian();
@@ -1133,10 +1135,15 @@ fn drain(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize 
 fn flush(w: *Writer) Writer.Error!void {
     const c: *Client = @alignCast(@fieldParentPtr("writer", w));
     const output = c.output;
-    const ciphertext_buf = try output.writableSliceGreedy(min_buffer_len);
-    const prepared = prepareCiphertextRecord(c, ciphertext_buf, w.buffered(), .application_data);
-    output.advance(prepared.ciphertext_end);
-    w.end = 0;
+    while (w.end != 0) {
+        const ciphertext_buf = try output.writableSliceGreedy(min_buffer_len);
+        const prepared = prepareCiphertextRecord(c, ciphertext_buf, w.buffered(), .application_data);
+        // Record framing and authentication tags can leave a plaintext tail
+        // even when the output buffer meets the minimum TLS capacity.
+        assert(prepared.cleartext_len > 0);
+        output.advance(prepared.ciphertext_end);
+        _ = w.consume(prepared.cleartext_len);
+    }
 }
 
 /// Sends a `close_notify` alert, which is necessary for the server to

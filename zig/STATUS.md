@@ -82,7 +82,7 @@ request-path-repair rule remain live constraints.
 
 Known live gap: split-process heartbeat propagation is not yet proven in a
 real E2E run (an API-only process can still report synthetic status instead of
-the data owner's published runtime status); see TODO.md/FLAKES.md. Managed
+the data owner's published runtime status); see TODO.md. Managed
 embedding lifecycle, schema-migration full-text rebuild readiness, and CDC
 status-summary counters have also shown status-plane publisher gaps in E2E
 runs rather than proven runtime-status contract bugs.
@@ -449,6 +449,18 @@ A successor owner also supplies an admitted, config-matching durable checkpoint
 prefix. It may replace a previous payload only after that recovery proof covers
 the payload's applied prefix. Older local owners cannot replace their successor.
 Read-only/status-only observations cannot claim writable-owner succession.
+Lite and other backends without sidecar files persist the full projection
+checkpoint in primary metadata, atomically with the legacy scalar watermark.
+Generation, configuration, lifecycle, and optional count certificates therefore
+survive writer replacement. Legacy scalar-only records remain readable as replay
+progress but cannot prove recovery. Ordered newer sibling publications supersede
+continuity snapshots during index DDL, including when deletes reduce counts.
+Enriched checkpoints are trusted only when their sequence matches the scalar
+watermark in the same transaction. Legacy advances, rewinds, or clears discard
+that recovery proof. Explicit checkpoint replacement revokes existing evidence
+and overwrites malformed records atomically; ordinary replay rejects corruption.
+Max replay updates below the retained watermark cannot change its generation,
+configuration identity, or count certificate, including when identity is unknown.
 These local stamps are not persisted or sent through the runtime wire codec;
 distributed reporter fencing remains a separate authority.
 

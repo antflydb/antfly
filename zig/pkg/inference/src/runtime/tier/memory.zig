@@ -774,6 +774,11 @@ pub const AdmissionLease = struct {
     /// deliberately separate from policy accounting: the kernel/cgroup probe
     /// reflects physical pressure, while AdmissionAmounts tracks ownership.
     live_reserved_bytes: usize,
+    /// Residency deducted from this epoch after materialization. Return only
+    /// this owned credit when it shrinks/frees; later kernel epochs must not
+    /// receive credit for memory they may already have observed as free.
+    live_settled_bytes: usize = 0,
+    live_settled_epoch: u64 = 0,
 
     /// Reduce a peak reservation to the bytes that remain resident after a
     /// construction/import phase. This never acquires new capacity, so the
@@ -788,10 +793,13 @@ pub const AdmissionLease = struct {
             return error.InvalidAdmissionLeaseReduction;
         try controller.retainExternalLease(self.external_lease, retained);
         controller.releaseSingle(backend_class, released);
-        controller.settleLiveReservation(
-            self.live_reserved_bytes,
-            retained_live_bytes,
-        );
+        if (self.live_reserved_bytes != 0) {
+            self.live_settled_epoch = controller.settleLiveReservation(self.live_reserved_bytes, retained_live_bytes);
+            self.live_settled_bytes = retained_live_bytes;
+        } else if (retained_live_bytes < self.live_settled_bytes) {
+            controller.releaseSettledResidency(self.live_settled_epoch, self.live_settled_bytes - retained_live_bytes);
+            self.live_settled_bytes = retained_live_bytes;
+        }
         self.amounts = retained;
         self.amounts_by_backend[backendClassIndex(backend_class)] = retained;
         self.live_reserved_bytes = 0;
@@ -800,6 +808,7 @@ pub const AdmissionLease = struct {
     pub fn release(self: *AdmissionLease) void {
         const controller = self.controller orelse return;
         controller.releaseLiveReservation(self.live_reserved_bytes);
+        controller.releaseSettledResidency(self.live_settled_epoch, self.live_settled_bytes);
         controller.release(self.amounts_by_backend, self.amounts, self.external_lease);
         self.controller = null;
         self.amounts = .{};
@@ -807,6 +816,8 @@ pub const AdmissionLease = struct {
         self.retain_backend_class = null;
         self.external_lease = null;
         self.live_reserved_bytes = 0;
+        self.live_settled_bytes = 0;
+        self.live_settled_epoch = 0;
     }
 };
 
@@ -818,6 +829,7 @@ pub const AdmissionController = struct {
     live_mutex: std.atomic.Mutex = .unlocked,
     live_capacity_bytes: usize = 0,
     live_pending_bytes: usize = 0,
+    live_epoch: u64 = 0,
     /// Suppress a warning storm while repeated requests are denied by the
     /// same live-memory pressure condition. A successful new epoch clears it.
     live_denial_reported: bool = false,
@@ -1315,6 +1327,7 @@ pub const AdmissionController = struct {
             const memory_info = info orelse return 0;
             const available = memory_info.available_bytes orelse return 0;
             const reserve = liveHostAdmissionReserve(memory_info);
+            self.live_epoch = std.math.add(u64, self.live_epoch, 1) catch return error.ResourceTemporarilyUnavailable;
             self.live_capacity_bytes = available -| reserve;
         }
 
@@ -1341,8 +1354,8 @@ pub const AdmissionController = struct {
         self: *AdmissionController,
         reserved_bytes: usize,
         retained_bytes: usize,
-    ) void {
-        if (reserved_bytes == 0) return;
+    ) u64 {
+        if (reserved_bytes == 0) return 0;
         std.debug.assert(retained_bytes <= reserved_bytes);
         spinLockAdmission(&self.live_mutex);
         defer self.live_mutex.unlock();
@@ -1350,6 +1363,14 @@ pub const AdmissionController = struct {
         self.live_pending_bytes -= reserved_bytes;
         self.live_capacity_bytes -|= retained_bytes;
         if (self.live_pending_bytes == 0) self.live_capacity_bytes = 0;
+        return self.live_epoch;
+    }
+
+    fn releaseSettledResidency(self: *AdmissionController, epoch: u64, bytes: usize) void {
+        if (bytes == 0) return;
+        spinLockAdmission(&self.live_mutex);
+        defer self.live_mutex.unlock();
+        if (self.live_pending_bytes != 0 and self.live_epoch == epoch) self.live_capacity_bytes +|= bytes;
     }
 
     fn releaseLiveReservation(
@@ -1536,6 +1557,30 @@ fn checkLiveHostMemoryWithInfo(info: SystemMemoryInfo, incremental_bytes: usize)
 
 pub fn defaultLimitsForBackend(backend: BackendClass) Limits {
     return defaultLimitsForBackendWithProcessLimit(backend, 0);
+}
+
+/// Automatic workload scratch caps must accommodate the admitted model's
+/// execution envelope. Physical host/backend/combined limits remain unchanged;
+/// an explicit operator scratch cap remains authoritative.
+pub fn withAutomaticScratchFloor(limits: Limits, explicit_scratch_limit: usize, host_scratch: usize, backend_scratch: usize) !Limits {
+    var result = limits;
+    if (explicit_scratch_limit == 0) {
+        const required = std.math.add(usize, host_scratch, backend_scratch) catch return error.MemoryBudgetExceeded;
+        result.scratch_limit_bytes = @max(result.scratch_limit_bytes, required);
+    }
+    return result;
+}
+
+test "model scratch floors preserve explicit caps and physical memory envelopes" {
+    const limits: Limits = .{ .host_limit_bytes = 8192, .backend_limit_bytes = 8192, .combined_limit_bytes = 12288, .scratch_limit_bytes = 1024 };
+    const automatic = try withAutomaticScratchFloor(limits, 0, 512, 4096);
+    try std.testing.expectEqual(@as(usize, 4608), automatic.scratch_limit_bytes);
+    try std.testing.expectEqual(limits.host_limit_bytes, automatic.host_limit_bytes);
+    try std.testing.expectEqual(limits.backend_limit_bytes, automatic.backend_limit_bytes);
+    try std.testing.expectEqual(limits.combined_limit_bytes, automatic.combined_limit_bytes);
+    try std.testing.expectEqual(limits, try withAutomaticScratchFloor(limits, 1024, 512, 4096));
+    var budget = RunBudget.init(try withAutomaticScratchFloor(limits, 0, 16384, 0));
+    try std.testing.expectError(error.MemoryBudgetExceeded, budget.reserveEstimate(.{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .host, .scratch_bytes = 16384, .scratch_tier = .host }));
 }
 
 pub fn defaultLimitsForBackendWithProcessLimit(
@@ -3636,7 +3681,7 @@ test "settled live residency remains committed during pressure epoch" {
 
     _ = try controller.tryReserveLiveCapacityWithInfo(gib(3), info);
     _ = try controller.tryReserveLiveCapacityWithInfo(gib(1), info);
-    controller.settleLiveReservation(gib(3), gib(2));
+    _ = controller.settleLiveReservation(gib(3), gib(2));
 
     try std.testing.expectEqual(gib(1), controller.live_pending_bytes);
     try std.testing.expectEqual(gib(8), controller.live_capacity_bytes);
@@ -4315,4 +4360,44 @@ test "derive gpu limits keeps combined cap sane" {
     try std.testing.expect(limits.combined_limit_bytes >= gib(6));
     try std.testing.expect(limits.combined_limit_bytes <= gib(12));
     try std.testing.expect(limits.backend_limit_bytes <= limits.combined_limit_bytes);
+}
+
+test "embeddinggemma2 live retained admission returns freed residency within its pressure epoch" {
+    var controller = AdmissionController{};
+    defer controller.deinit();
+    const info = SystemMemoryInfo{ .total_bytes = gib(64), .available_bytes = gib(20) };
+    const pending = try controller.tryReserveLiveCapacityWithInfo(mib(1), info);
+    defer controller.releaseLiveReservation(pending);
+    const capacity = controller.live_capacity_bytes;
+    for (0..100) |_| {
+        var lease = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = mib(128) }, false);
+        defer lease.release();
+        lease.live_reserved_bytes = try controller.tryReserveLiveCapacityWithInfo(mib(128), info);
+        try lease.retain(.{ .host_scratch_bytes = mib(64) });
+        try std.testing.expectEqual(capacity - mib(64), controller.live_capacity_bytes);
+        try lease.retain(.{ .host_scratch_bytes = mib(32) });
+        try std.testing.expectEqual(capacity - mib(32), controller.live_capacity_bytes);
+        lease.release();
+        try std.testing.expectEqual(capacity, controller.live_capacity_bytes);
+        try std.testing.expectEqual(pending, controller.live_pending_bytes);
+    }
+}
+
+test "embeddinggemma2 live retained admission cannot credit a later kernel sample" {
+    var controller = AdmissionController{};
+    defer controller.deinit();
+    const info = SystemMemoryInfo{ .total_bytes = gib(64), .available_bytes = gib(20) };
+    const pending = try controller.tryReserveLiveCapacityWithInfo(mib(1), info);
+    var lease = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = mib(128) }, false);
+    defer lease.release();
+    lease.live_reserved_bytes = try controller.tryReserveLiveCapacityWithInfo(mib(128), info);
+    try lease.retain(.{ .host_scratch_bytes = mib(64) });
+    const old_epoch = controller.live_epoch;
+    controller.releaseLiveReservation(pending);
+    const next = try controller.tryReserveLiveCapacityWithInfo(mib(1), info);
+    defer controller.releaseLiveReservation(next);
+    try std.testing.expect(controller.live_epoch != old_epoch);
+    const capacity = controller.live_capacity_bytes;
+    lease.release();
+    try std.testing.expectEqual(capacity, controller.live_capacity_bytes);
 }

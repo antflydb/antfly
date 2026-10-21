@@ -33,6 +33,7 @@ remove this compatibility copy when upgrading to a release with a working backen
 pkg/
   antfly/            AntflyDB server, API, metadata, storage, search, raft
   antfly-client/     Zig client package
+  antfly-grep/       Native local regex and decision-based source search CLI
   antfly-embedded/   Embedded Antfly package and WASM smoke surface
   inference/         Inference runtime, OpenAPI server, tools, web UI
   inference-client/  Zig inference client package
@@ -78,9 +79,9 @@ currently live under `pkg/inference/`.
   macOS packaging workflow already uses a macOS 15 runner.
 - `uv` for Python e2e suites and repository helper scripts.
 - Optional native runtime dependencies for some inference features, such as
-  ONNX Runtime, FFmpeg, CUDA, or Metal. The build detects available local
-  support and exposes flags such as `-Dmetal=...`, `-Dcuda=...`, and
-  `-Donnx=...`.
+  FFmpeg, CUDA, or Metal. The build detects available local support and
+  exposes flags such as `-Dmetal=...` and `-Dcuda=...`. ONNX models run on
+  Antfly's own ONNX implementation and need no external runtime.
 
 The [0.17 release notes](https://ziglang.org/download/0.17.0/release-notes.html)
 also describe changes that can compile successfully while changing behavior:

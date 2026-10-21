@@ -327,10 +327,10 @@ const Allocator = std.mem.Allocator;
 
 pub const pdf_runtime_available = builtin.os.tag != .freestanding and builtin.os.tag != .wasi and !builtin.is_test and !build_options.bench_minimal_deps;
 
-pub fn effectiveRemoteContentMaxDownloadSize(remote_content: ?*const scraping.RemoteContentConfig) u64 {
+pub fn effectiveRemoteContentMaxDownloadSize(remote_content: ?*const scraping.RemoteContentConfig) !u64 {
     if (comptime builtin.os.tag != .freestanding and builtin.os.tag != .wasi and !build_options.bench_minimal_deps) {
         if (remote_content) |remote| {
-            var snapshot = remote.acquire();
+            var snapshot = try remote.acquire();
             defer snapshot.deinit();
             if (snapshot.config.security) |security| {
                 if (security.max_download_size_bytes) |value| return value;
@@ -343,7 +343,7 @@ pub fn effectiveRemoteContentMaxDownloadSize(remote_content: ?*const scraping.Re
 pub fn inlineDataUriSourceTooLarge(remote_content: ?*const scraping.RemoteContentConfig, source_text: []const u8) !bool {
     if (!scraping.data_uri.hasScheme(source_text)) return false;
     const decoded_len = scraping.dataUriDecodedSize(source_text) catch return false;
-    return @as(u64, @intCast(decoded_len)) > effectiveRemoteContentMaxDownloadSize(remote_content);
+    return @as(u64, @intCast(decoded_len)) > try effectiveRemoteContentMaxDownloadSize(remote_content);
 }
 
 pub fn validateInlineSourceSize(remote_content: ?*const scraping.RemoteContentConfig, source_text: []const u8) !void {
@@ -418,7 +418,8 @@ pub fn failureStageFromErrorName(error_name: []const u8, fallback: []const u8) [
         "InvalidPdfHeader",    "MissingPdfEof",       "MissingStartXref",   "MissingTrailer",
         "InvalidStartXref",    "InvalidXref",         "CyclicXref",         "UnsupportedXrefFormat",
         "ExpectedTrailerDict", "MalformedXrefStream", "MalformedXrefTable", "InvalidObjectStream",
-        "InvalidPageTree",
+        "InvalidPageTree",     "MissingRoot",         "MissingPages",       "EmptyPdfPageTree",
+        "InvalidPdf",
     };
     inline for (structure_errors) |name| if (std.mem.eql(u8, error_name, name)) return "pdf_structure";
     return fallback;

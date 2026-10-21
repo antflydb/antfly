@@ -98,6 +98,8 @@ pub const ExtractedWrite = struct {
     mentioned_graph_indexes: [][]u8,
     dense_embeddings: []DenseEmbeddingWrite,
     sparse_embeddings: []SparseEmbeddingWrite,
+    /// Explicit null directives; omission leaves caller-owned vectors intact.
+    deleted_embedding_indexes: [][]u8 = &.{},
     /// Transient logical source for immediate full-text application. The tree
     /// borrows `prepared_region` and is deliberately never cloned or serialized;
     /// durable replay reconstructs the typed root from the committed AROW.
@@ -178,96 +180,101 @@ pub const ExtractedWrite = struct {
             out.cleaned_value = if (self.cleaned_value_owned or self.logical_source != null) try alloc.dupe(u8, value) else @constCast(value);
             out.cleaned_value_owned = self.cleaned_value_owned or self.logical_source != null;
         }
-        out.graph_writes = try alloc.alloc(types.GraphEdgeWrite, self.graph_writes.len);
-        var graph_initialized: usize = 0;
-        errdefer out.graph_writes = out.graph_writes[0..graph_initialized];
-        for (self.graph_writes, 0..) |write, i| {
-            out.graph_writes[i] = blk: {
-                const index_name = try alloc.dupe(u8, write.index_name);
-                errdefer alloc.free(index_name);
-                const source = try alloc.dupe(u8, write.source);
-                errdefer alloc.free(source);
-                const target = try alloc.dupe(u8, write.target);
-                errdefer alloc.free(target);
-                const edge_type = try alloc.dupe(u8, write.edge_type);
-                errdefer alloc.free(edge_type);
-                const edge_id = try alloc.dupe(u8, write.edge_id);
-                errdefer alloc.free(edge_id);
-                const owner_document = try alloc.dupe(u8, write.owner_document);
-                errdefer alloc.free(owner_document);
-                const metadata_json = if (write.metadata_json.len > 0) try alloc.dupe(u8, write.metadata_json) else "";
-                errdefer if (metadata_json.len > 0) alloc.free(@constCast(metadata_json));
-                const owner = if (write.owner.len > 0) try alloc.dupe(u8, write.owner) else "";
-                break :blk .{
-                    .index_name = index_name,
-                    .source = source,
-                    .target = target,
-                    .edge_type = edge_type,
-                    .edge_id = edge_id,
-                    .owner_document = owner_document,
-                    .weight = write.weight,
-                    .created_at = write.created_at,
-                    .updated_at = write.updated_at,
-                    .metadata_json = metadata_json,
-                    .owner = owner,
+        out.graph_writes = blk: {
+            const items = try alloc.alloc(types.GraphEdgeWrite, self.graph_writes.len);
+            errdefer alloc.free(items);
+            var initialized: usize = 0;
+            errdefer for (items[0..initialized]) |*write| write.deinit(alloc);
+            for (self.graph_writes, 0..) |write, i| {
+                items[i] = try write.cloneAlloc(alloc);
+                initialized += 1;
+            }
+            break :blk items;
+        };
+        out.mentioned_graph_indexes = try cloneNames(alloc, self.mentioned_graph_indexes);
+        out.deleted_embedding_indexes = try cloneNames(alloc, self.deleted_embedding_indexes);
+        out.dense_embeddings = entries: {
+            const items = try alloc.alloc(DenseEmbeddingWrite, self.dense_embeddings.len);
+            errdefer alloc.free(items);
+            var initialized: usize = 0;
+            errdefer for (items[0..initialized]) |embedding| freeDenseEmbedding(alloc, embedding);
+            for (self.dense_embeddings, 0..) |embedding, i| {
+                items[i] = blk: {
+                    const index_name = try alloc.dupe(u8, embedding.index_name);
+                    errdefer alloc.free(index_name);
+                    const doc_key = try alloc.dupe(u8, embedding.doc_key);
+                    errdefer alloc.free(doc_key);
+                    const artifact_key = if (embedding.artifact_key) |key| try alloc.dupe(u8, key) else null;
+                    errdefer if (artifact_key) |key| alloc.free(key);
+                    const vector = try alloc.dupe(f32, embedding.vector);
+                    break :blk .{
+                        .index_name = index_name,
+                        .doc_key = doc_key,
+                        .parent_doc_key = embedding.parent_doc_key,
+                        .artifact_key = artifact_key,
+                        .vector = vector,
+                    };
                 };
-            };
-            graph_initialized += 1;
-        }
-        out.mentioned_graph_indexes = try alloc.alloc([]u8, self.mentioned_graph_indexes.len);
-        var mentioned_initialized: usize = 0;
-        errdefer out.mentioned_graph_indexes = out.mentioned_graph_indexes[0..mentioned_initialized];
-        for (self.mentioned_graph_indexes, 0..) |name, i| {
-            out.mentioned_graph_indexes[i] = try alloc.dupe(u8, name);
-            mentioned_initialized += 1;
-        }
-        out.dense_embeddings = try alloc.alloc(DenseEmbeddingWrite, self.dense_embeddings.len);
-        var dense_initialized: usize = 0;
-        errdefer out.dense_embeddings = out.dense_embeddings[0..dense_initialized];
-        for (self.dense_embeddings, 0..) |embedding, i| {
-            out.dense_embeddings[i] = blk: {
-                const index_name = try alloc.dupe(u8, embedding.index_name);
-                errdefer alloc.free(index_name);
-                const doc_key = try alloc.dupe(u8, embedding.doc_key);
-                errdefer alloc.free(doc_key);
-                const artifact_key = if (embedding.artifact_key) |key| try alloc.dupe(u8, key) else null;
-                errdefer if (artifact_key) |key| alloc.free(key);
-                const vector = try alloc.dupe(f32, embedding.vector);
-                break :blk .{
-                    .index_name = index_name,
-                    .doc_key = doc_key,
-                    .parent_doc_key = embedding.parent_doc_key,
-                    .artifact_key = artifact_key,
-                    .vector = vector,
+                initialized += 1;
+            }
+            break :entries items;
+        };
+        out.sparse_embeddings = entries: {
+            const items = try alloc.alloc(SparseEmbeddingWrite, self.sparse_embeddings.len);
+            errdefer alloc.free(items);
+            var initialized: usize = 0;
+            errdefer for (items[0..initialized]) |embedding| freeSparseEmbedding(alloc, embedding);
+            for (self.sparse_embeddings, 0..) |embedding, i| {
+                items[i] = blk: {
+                    const index_name = try alloc.dupe(u8, embedding.index_name);
+                    errdefer alloc.free(index_name);
+                    const doc_key = try alloc.dupe(u8, embedding.doc_key);
+                    errdefer alloc.free(doc_key);
+                    const artifact_key = if (embedding.artifact_key) |key| try alloc.dupe(u8, key) else null;
+                    errdefer if (artifact_key) |key| alloc.free(key);
+                    const indices = try alloc.dupe(u32, embedding.indices);
+                    errdefer alloc.free(indices);
+                    const values = try alloc.dupe(f32, embedding.values);
+                    break :blk .{
+                        .index_name = index_name,
+                        .doc_key = doc_key,
+                        .artifact_key = artifact_key,
+                        .indices = indices,
+                        .values = values,
+                    };
                 };
-            };
-            dense_initialized += 1;
-        }
-        out.sparse_embeddings = try alloc.alloc(SparseEmbeddingWrite, self.sparse_embeddings.len);
-        var sparse_initialized: usize = 0;
-        errdefer out.sparse_embeddings = out.sparse_embeddings[0..sparse_initialized];
-        for (self.sparse_embeddings, 0..) |embedding, i| {
-            out.sparse_embeddings[i] = blk: {
-                const index_name = try alloc.dupe(u8, embedding.index_name);
-                errdefer alloc.free(index_name);
-                const doc_key = try alloc.dupe(u8, embedding.doc_key);
-                errdefer alloc.free(doc_key);
-                const artifact_key = if (embedding.artifact_key) |key| try alloc.dupe(u8, key) else null;
-                errdefer if (artifact_key) |key| alloc.free(key);
-                const indices = try alloc.dupe(u32, embedding.indices);
-                errdefer alloc.free(indices);
-                const values = try alloc.dupe(f32, embedding.values);
-                break :blk .{
-                    .index_name = index_name,
-                    .doc_key = doc_key,
-                    .artifact_key = artifact_key,
-                    .indices = indices,
-                    .values = values,
-                };
-            };
-            sparse_initialized += 1;
-        }
+                initialized += 1;
+            }
+            break :entries items;
+        };
         return out;
+    }
+
+    fn cloneNames(alloc: Allocator, names: []const []u8) ![][]u8 {
+        const items = try alloc.alloc([]u8, names.len);
+        errdefer alloc.free(items);
+        var initialized: usize = 0;
+        errdefer for (items[0..initialized]) |name| alloc.free(name);
+        for (names, 0..) |name, i| {
+            items[i] = try alloc.dupe(u8, name);
+            initialized += 1;
+        }
+        return items;
+    }
+
+    fn freeDenseEmbedding(alloc: Allocator, embedding: DenseEmbeddingWrite) void {
+        alloc.free(embedding.index_name);
+        alloc.free(embedding.doc_key);
+        if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
+        alloc.free(embedding.vector);
+    }
+
+    fn freeSparseEmbedding(alloc: Allocator, embedding: SparseEmbeddingWrite) void {
+        alloc.free(embedding.index_name);
+        alloc.free(embedding.doc_key);
+        if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
+        alloc.free(embedding.indices);
+        alloc.free(embedding.values);
     }
 
     pub fn deinit(self: *ExtractedWrite, alloc: Allocator) void {
@@ -293,33 +300,15 @@ pub const ExtractedWrite = struct {
             source.field_json.deinit(source.alloc);
             source.alloc.destroy(source);
         }
-        for (self.graph_writes) |graph_write| {
-            alloc.free(@constCast(graph_write.index_name));
-            alloc.free(@constCast(graph_write.source));
-            alloc.free(@constCast(graph_write.target));
-            alloc.free(@constCast(graph_write.edge_type));
-            if (graph_write.edge_id.len > 0) alloc.free(@constCast(graph_write.edge_id));
-            if (graph_write.owner_document.len > 0) alloc.free(@constCast(graph_write.owner_document));
-            if (graph_write.metadata_json.len > 0) alloc.free(@constCast(graph_write.metadata_json));
-            if (graph_write.owner.len > 0) alloc.free(@constCast(graph_write.owner));
-        }
+        for (self.graph_writes) |*write| write.deinit(alloc);
         if (self.graph_writes.len > 0) alloc.free(self.graph_writes);
         for (self.mentioned_graph_indexes) |index_name| alloc.free(index_name);
         if (self.mentioned_graph_indexes.len > 0) alloc.free(self.mentioned_graph_indexes);
-        for (self.dense_embeddings) |embedding| {
-            alloc.free(embedding.index_name);
-            alloc.free(embedding.doc_key);
-            if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
-            if (embedding.vector.len > 0) alloc.free(embedding.vector);
-        }
+        for (self.deleted_embedding_indexes) |name| alloc.free(name);
+        if (self.deleted_embedding_indexes.len > 0) alloc.free(self.deleted_embedding_indexes);
+        for (self.dense_embeddings) |embedding| freeDenseEmbedding(alloc, embedding);
         if (self.dense_embeddings.len > 0) alloc.free(self.dense_embeddings);
-        for (self.sparse_embeddings) |embedding| {
-            alloc.free(embedding.index_name);
-            alloc.free(embedding.doc_key);
-            if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
-            if (embedding.indices.len > 0) alloc.free(embedding.indices);
-            if (embedding.values.len > 0) alloc.free(embedding.values);
-        }
+        for (self.sparse_embeddings) |embedding| freeSparseEmbedding(alloc, embedding);
         if (self.sparse_embeddings.len > 0) alloc.free(self.sparse_embeddings);
         self.* = undefined;
     }
@@ -358,6 +347,8 @@ pub const PreparedRelationalProjection = struct {
 /// parse supplies validation, special-field extraction, the semantic digest,
 /// and the physical base row.
 pub const PreparedRelationalWrite = struct {
+    /// Bounded grouped projections retained with the prepared row region.
+    group_changes: ?[]const @import("group_source_mutations.zig").Plan.Change = null,
     parsed: ?std.json.Parsed(std.json.Value),
     extracted: ExtractedWrite,
     packed_row: []u8,
@@ -908,6 +899,11 @@ pub const BuildTextSegmentResult = struct {
 pub const default_text_segment_target_bytes: usize = 32 * 1024 * 1024;
 
 pub const BuildTextSegmentsOptions = struct {
+    /// Encoded results belong to the caller's allocator. Transient builders
+    /// may have a shorter, reclaiming lifetime even when results use a region.
+    scratch_allocator: ?Allocator = null,
+    postings_run_io: ?std.Io = null,
+    postings_run_directory: []const u8 = ".",
     target_segment_bytes: usize = default_text_segment_target_bytes,
     target_build_memory_bytes: ?usize = null,
     doc_scratch_retained_bytes: ?usize = null,
@@ -991,6 +987,18 @@ pub const TextProjectionBatchBuilder = struct {
         doc: TextProjectionSourceDoc,
         selected_field: ?[]const u8,
     ) !void {
+        return self.appendSourceDocForIndex(doc, selected_field, false);
+    }
+
+    /// Empty primary rows still belong to a complete default index. Retain
+    /// their identities for match_all, filters and sorting without inventing
+    /// postings. The catalog supplies this proof per source document.
+    pub fn appendSourceDocForIndex(
+        self: *TextProjectionBatchBuilder,
+        doc: TextProjectionSourceDoc,
+        selected_field: ?[]const u8,
+        retain_empty: bool,
+    ) !void {
         const has_selected_field = selected_field != null;
         const extraction_root = doc.typed_source orelse doc.root;
         const extracted = if (selected_field) |field|
@@ -999,7 +1007,7 @@ pub const TextProjectionBatchBuilder = struct {
             ExtractedTextFields{ .fields = doc.schema_less_text_fields }
         else
             try extractTextFieldsFromValue(self.arena, extraction_root, self.text_analysis, self.schema, self.observed_field_analyzers);
-        if (extracted.fields.len == 0 and !extracted.recursive_typed_fields and extracted.infer_type_dynamic_paths.len == 0 and !extractedHasTypedFields(extracted)) return;
+        if (!retain_empty and extracted.fields.len == 0 and !extracted.recursive_typed_fields and extracted.infer_type_dynamic_paths.len == 0 and !extractedHasTypedFields(extracted)) return;
 
         try self.text_docs.append(self.arena, .{
             .id = doc.key,
@@ -1351,6 +1359,8 @@ fn buildTextOptionsFromSegmentOptions(options: BuildTextSegmentsOptions) introdu
     var build_options = introducer_mod.BuildTextOptions{
         .profile = options.profile,
         .resource_manager = options.resource_manager,
+        .postings_run_io = options.postings_run_io,
+        .postings_run_directory = options.postings_run_directory,
         .index_sort = options.index_sort,
         .store_document_source = options.store_document_source,
     };
@@ -1397,10 +1407,17 @@ pub fn buildTextSegmentsFromProjectionBatch(
             .docs = projection_batch.docs[start..end],
             .observed_field_analyzers = &.{},
         };
-        const segment = try introducer_mod.buildSegmentFromTextWithAnalysisOptions(alloc, chunk.docs, &analysis_mod.default_analyzer, text_analysis, build_options);
+        const segment = blk: {
+            var output = segment_mod.MemorySegmentSink.init(alloc);
+            defer output.deinit();
+            var sink = output.sink();
+            try introducer_mod.writeSegmentFromTextWithAnalysisOptions(options.scratch_allocator orelse alloc, chunk.docs, &analysis_mod.default_analyzer, text_analysis, build_options, &sink);
+            break :blk try output.finishOwned();
+        };
+        errdefer alloc.free(segment);
         if (segment.len > 0) {
             try segments.append(alloc, segment);
-        }
+        } else alloc.free(segment);
         start = end;
     }
 
@@ -2235,6 +2252,11 @@ fn extractWriteFromParsedPrepared(
         }
         graph_writes.deinit(alloc);
     }
+    var deleted_embedding_indexes = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (deleted_embedding_indexes.items) |name| alloc.free(name);
+        deleted_embedding_indexes.deinit(alloc);
+    }
     var dense_embeddings = std.ArrayListUnmanaged(DenseEmbeddingWrite).empty;
     errdefer {
         for (dense_embeddings.items) |embedding| {
@@ -2318,6 +2340,10 @@ fn extractWriteFromParsedPrepared(
             const index_name = emb_entry.key_ptr.*;
             const emb_value = emb_entry.value_ptr.*;
             switch (emb_value) {
+                .null => {
+                    try deleted_embedding_indexes.ensureUnusedCapacity(alloc, 1);
+                    deleted_embedding_indexes.appendAssumeCapacity(try alloc.dupe(u8, index_name));
+                },
                 .array, .string => {
                     const vector = try parseDenseEmbeddingValue(alloc, emb_value);
                     errdefer alloc.free(vector);
@@ -2375,6 +2401,7 @@ fn extractWriteFromParsedPrepared(
     errdefer result.deinit(alloc);
     result.graph_writes = try graph_writes.toOwnedSlice(alloc);
     result.mentioned_graph_indexes = try mentioned_indexes.toOwnedSlice(alloc);
+    result.deleted_embedding_indexes = try deleted_embedding_indexes.toOwnedSlice(alloc);
     result.dense_embeddings = try dense_embeddings.toOwnedSlice(alloc);
     result.sparse_embeddings = try sparse_embeddings.toOwnedSlice(alloc);
     return result;
@@ -4339,6 +4366,8 @@ fn buildRelationalRowValueFromParsedInternal(
                     .value_type = value_type,
                     .is_json = column.is_json,
                     .is_dense_vector = column.column_type == .dense_vector,
+                    .is_numeric = column.column_type == .numeric,
+                    .sql_array_element_type = if (column.column_type == .sql_array) column.sql_element_type else null,
                     .is_null = true,
                     .value = relationalZeroValue(value_type),
                 };
@@ -4351,7 +4380,22 @@ fn buildRelationalRowValueFromParsedInternal(
                 .none => return error.InvalidBatchRequest,
             };
 
-            const value = if (column.is_json) blk: {
+            const value = if (column.column_type == .sql_array) blk: {
+                const kind = column.sql_element_type orelse return error.InvalidBatchRequest;
+                var decoded = try @import("../../sql/array_wire.zig").decodeBorrowedWithModifier(output_alloc, kind, found, column.numeric_modifier, .{});
+                defer decoded.deinit();
+                const encoded = try @import("../../sql/array_storage.zig").encodeAlloc(output_alloc, decoded.value, .{});
+                errdefer output_alloc.free(encoded);
+                try owned_buffers.append(output_alloc, encoded);
+                break :blk typed_dv.TypedValue{ .bytes_val = encoded };
+            } else if (column.column_type == .numeric) blk: {
+                if (column.sql_element_type != .numeric) return error.InvalidBatchRequest;
+                var context: @import("../../sql/numeric_value.zig").Context = .{ .alloc = output_alloc };
+                const encoded = try @import("../../sql/numeric_storage.zig").encodeJsonWithModifier(&context, found, column.numeric_modifier);
+                errdefer output_alloc.free(encoded);
+                try owned_buffers.append(output_alloc, encoded);
+                break :blk typed_dv.TypedValue{ .bytes_val = encoded };
+            } else if (column.is_json) blk: {
                 const encoded = try document_content_hash.canonicalJsonValueAlloc(output_alloc, found);
                 errdefer output_alloc.free(encoded);
                 try owned_buffers.append(output_alloc, encoded);
@@ -4365,6 +4409,8 @@ fn buildRelationalRowValueFromParsedInternal(
                 .value_type = value_type,
                 .is_json = column.is_json,
                 .is_dense_vector = column.column_type == .dense_vector,
+                .is_numeric = column.column_type == .numeric,
+                .sql_array_element_type = if (column.column_type == .sql_array) column.sql_element_type else null,
                 .value = value,
             };
         }
@@ -4495,7 +4541,7 @@ fn relationalValueType(column_type: runtime_schema.RelationalColumnType) typed_d
         .number => .f64_val,
         .boolean => .bool_val,
         .geopoint => .geo_point,
-        .string, .blob, .geoshape, .json, .dense_vector => .bytes_val,
+        .string, .blob, .geoshape, .json, .dense_vector, .sql_array, .numeric => .bytes_val,
     };
 }
 
@@ -4519,6 +4565,9 @@ fn relationalTypedValueAlloc(
     owned: *std.ArrayListUnmanaged([]u8),
 ) !?typed_dv.TypedValue {
     return switch (column_type) {
+        // SQL arrays require the complete immutable column descriptor and are
+        // prepared by makeCell, never inferred from this coarse type alone.
+        .sql_array, .numeric => error.InvalidBatchRequest,
         .string, .blob, .geoshape => switch (value) {
             .string => |text| .{ .bytes_val = text },
             else => null,
@@ -6455,6 +6504,279 @@ test "relational UUID ingress shares canonical typed bytes and semantic hash" {
     try std.testing.expectEqualStrings("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", upper.parsedValue().object.get("id").?.string);
 }
 
+test "relational index system SQL array preparation roundtrips PostgreSQL fixtures and logical hashes" {
+    const alloc = std.testing.allocator;
+    const Faults = struct {
+        fn run(backing: Allocator, json: []const u8, schema: runtime_schema.TableSchema) !void {
+            var vtable = backing.vtable.*;
+            vtable.resize = Allocator.noResize;
+            vtable.remap = Allocator.noRemap;
+            const a: Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
+            var layout = try relational_row_codec.PhysicalLayout.init(a, schema);
+            defer layout.deinit();
+            var row = try PreparedRelationalWrite.init(a, "row", json, null, schema, &layout);
+            defer row.deinit(a);
+            try row.finalizeMetadata(0);
+            const cell = (try relational_row_codec.findCellByOrdinalWithLayout(row.packed_row, schema, &layout, 0)).?;
+            const rendered = try relational_row_codec.reconstructDocumentAlloc(a, &.{cell});
+            defer a.free(rendered);
+        }
+    };
+    const arrays = @import("../../sql/array_value.zig");
+    const wire = @import("../../sql/array_wire.zig");
+    const storage = @import("../../sql/array_storage.zig");
+    const Fixture = struct { entries: []const struct { element_type: arrays.ElementType, binary: []const u8 } };
+    const fixture = try std.json.parseFromSlice(Fixture, alloc, @embedFile("../../sql/fixtures/sql_array_binary_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    for (fixture.value.entries) |entry| {
+        const pg = try alloc.alloc(u8, entry.binary.len / 2);
+        defer alloc.free(pg);
+        _ = try std.fmt.hexToBytes(pg, entry.binary);
+        var original = try @import("../../sql/array_binary.zig").decode(alloc, entry.element_type, pg, .{});
+        defer original.deinit();
+        const envelope = try wire.encodeAlloc(alloc, original.value, .{});
+        defer alloc.free(envelope);
+        const json = try std.mem.concat(alloc, u8, &.{ "{\"a\":", envelope, "}" });
+        defer alloc.free(json);
+        const schema: runtime_schema.TableSchema = .{ .version = 9, .storage_mode = .relational, .relational_columns = &.{.{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = entry.element_type, .allows_null = true }} };
+        var layout = try relational_row_codec.PhysicalLayout.init(alloc, schema);
+        defer layout.deinit();
+        var prepared = try PreparedRelationalWrite.init(alloc, "row", json, null, schema, &layout);
+        defer prepared.deinit(alloc);
+        try prepared.finalizeMetadata(0);
+        try relational_row_codec.validateOrdinalWithLayout(prepared.packed_row, schema, &layout);
+        const cell = (try relational_row_codec.findCellByOrdinalWithLayout(prepared.packed_row, schema, &layout, 0)).?;
+        try std.testing.expectEqual(entry.element_type, cell.sql_array_element_type.?);
+        var decoded = try storage.decode(alloc, entry.element_type, cell.value.bytes_val, .{});
+        defer decoded.deinit();
+        var work: arrays.Budget = .{ .remaining = 1_000_000 };
+        try std.testing.expectEqual(std.math.Order.eq, try original.value.compare(decoded.value, &work));
+        const logical = try document_content_hash.hashRelationalParsedValue(alloc, prepared.parsedValue(), schema);
+        try std.testing.expectEqualSlices(u8, &logical, &prepared.semantic_hash);
+        const rendered = try relational_row_codec.reconstructDocumentAlloc(alloc, &.{cell});
+        defer alloc.free(rendered);
+        var restored = try PreparedRelationalWrite.init(alloc, "row", rendered, null, schema, &layout);
+        defer restored.deinit(alloc);
+        try restored.finalizeMetadata(0);
+        try std.testing.expectEqualSlices(u8, prepared.packed_row, restored.packed_row);
+        var region = std.heap.ArenaAllocator.init(alloc);
+        defer region.deinit();
+        const owned_json = try relational_row_codec.ownedJsonValueFromCellAlloc(region.allocator(), schema.relational_columns[0], cell);
+        var from_json = try wire.decode(alloc, entry.element_type, owned_json, .{});
+        defer from_json.deinit();
+        try std.testing.expectEqual(std.math.Order.eq, try original.value.compare(from_json.value, &work));
+        try std.testing.checkAllAllocationFailures(alloc, Faults.run, .{ json, schema });
+    }
+}
+
+test "relational index system SQL array hashes normalize equality without discarding physical zero signs" {
+    const alloc = std.testing.allocator;
+    const schema: runtime_schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = .float64 }} };
+    var layout = try relational_row_codec.PhysicalLayout.init(alloc, schema);
+    defer layout.deinit();
+    const prefix = "{\"a\":{\"dimensions\":[{\"length\":1,\"lower_bound\":1}],\"values\":[";
+    const suffix = "],\"sql_nulls\":[false]}}";
+    var negative = try PreparedRelationalWrite.init(alloc, "row", prefix ++ "-0.0" ++ suffix, null, schema, &layout);
+    defer negative.deinit(alloc);
+    var positive = try PreparedRelationalWrite.init(alloc, "row", prefix ++ "0.0" ++ suffix, null, schema, &layout);
+    defer positive.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, &negative.semantic_hash, &positive.semantic_hash);
+    try std.testing.expect(!std.mem.eql(u8, negative.packed_row, positive.packed_row));
+}
+
+test "relational index system NUMERIC array rows preserve scale while hashing logical identity across restore" {
+    const a = std.testing.allocator;
+    const schema: runtime_schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = .numeric }} };
+    var layout = try relational_row_codec.PhysicalLayout.init(a, schema);
+    defer layout.deinit();
+    const prefix = "{\"a\":{\"dimensions\":[{\"length\":1,\"lower_bound\":-7}],\"values\":[\"";
+    const suffix = "\"],\"sql_nulls\":[false]}}";
+    const cases = [_][2][]const u8{ .{ "1.20", "1.2" }, .{ "-0.00", "0" }, .{ "10000000000.00", "1e10" } };
+    for (cases) |pair| {
+        const left_json = try std.mem.concat(a, u8, &.{ prefix, pair[0], suffix });
+        defer a.free(left_json);
+        const right_json = try std.mem.concat(a, u8, &.{ prefix, pair[1], suffix });
+        defer a.free(right_json);
+        var left = try PreparedRelationalWrite.init(a, "row", left_json, null, schema, &layout);
+        defer left.deinit(a);
+        var right = try PreparedRelationalWrite.init(a, "row", right_json, null, schema, &layout);
+        defer right.deinit(a);
+        try left.finalizeMetadata(0);
+        try right.finalizeMetadata(0);
+        try std.testing.expectEqualSlices(u8, &left.semantic_hash, &right.semantic_hash);
+        try std.testing.expect(!std.mem.eql(u8, left.packed_row, right.packed_row));
+        try relational_row_codec.validateOrdinalWithLayout(left.packed_row, schema, &layout);
+        const parsed_hash = try document_content_hash.hashRelationalParsedValue(a, left.parsedValue(), schema);
+        try std.testing.expectEqualSlices(u8, &left.semantic_hash, &parsed_hash);
+        const cell = (try relational_row_codec.findCellByOrdinalWithLayout(left.packed_row, schema, &layout, 0)).?;
+        const rendered = try relational_row_codec.reconstructDocumentAlloc(a, &.{cell});
+        defer a.free(rendered);
+        var restored = try PreparedRelationalWrite.init(a, "row", rendered, null, schema, &layout);
+        defer restored.deinit(a);
+        try restored.finalizeMetadata(0);
+        try std.testing.expectEqualSlices(u8, left.packed_row, restored.packed_row);
+    }
+}
+
+test "relational index system NUMERIC scalar preparation matches PostgreSQL binary senders" {
+    const a = std.testing.allocator;
+    const fixture = try std.json.parseFromSlice(struct {
+        senders: []const struct { input: []const u8, binary: []const u8 },
+    }, a, @embedFile("../../sql/fixtures/sql_exact_numeric_binary_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    try std.testing.expectEqual(@as(usize, 65), fixture.value.senders.len);
+    const schema: runtime_schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric, .allows_null = true }} };
+    var layout = try relational_row_codec.PhysicalLayout.init(a, schema);
+    defer layout.deinit();
+    for (fixture.value.senders) |entry| {
+        const json = try std.json.Stringify.valueAlloc(a, .{ .n = entry.input }, .{});
+        defer a.free(json);
+        var prepared = try PreparedRelationalWrite.init(a, "row", json, null, schema, &layout);
+        defer prepared.deinit(a);
+        try prepared.finalizeMetadata(0);
+        try relational_row_codec.validateOrdinalWithLayout(prepared.packed_row, schema, &layout);
+        const cell = (try relational_row_codec.findCellByOrdinalWithLayout(prepared.packed_row, schema, &layout, 0)).?;
+        try std.testing.expect(cell.is_numeric and !cell.is_json);
+        const expected = try a.alloc(u8, entry.binary.len / 2);
+        defer a.free(expected);
+        _ = try std.fmt.hexToBytes(expected, entry.binary);
+        try std.testing.expectEqualSlices(u8, expected, cell.value.bytes_val);
+        const parsed_hash = try document_content_hash.hashRelationalParsedValue(a, prepared.parsedValue(), schema);
+        try std.testing.expectEqualSlices(u8, &prepared.semantic_hash, &parsed_hash);
+        const rendered = try relational_row_codec.reconstructDocumentAlloc(a, &.{cell});
+        defer a.free(rendered);
+        var restored = try PreparedRelationalWrite.init(a, "row", rendered, null, schema, &layout);
+        defer restored.deinit(a);
+        try restored.finalizeMetadata(0);
+        try std.testing.expectEqualSlices(u8, prepared.packed_row, restored.packed_row);
+    }
+}
+
+test "relational index system NUMERIC modifiers round before row hash and strict restore admission" {
+    const a = std.testing.allocator;
+    const table: runtime_schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_numeric_modifiers = true, .relational_columns = &.{.{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric, .numeric_modifier = .{ .precision = 4, .scale = 2 } }} };
+    var layout = try relational_row_codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    const Run = struct {
+        fn run(alloc: Allocator, schema: runtime_schema.TableSchema, physical: *const relational_row_codec.PhysicalLayout) !void {
+            var row = try PreparedRelationalWrite.init(alloc, "row", "{\"n\":12.345}", null, schema, physical);
+            defer row.deinit(alloc);
+            try row.finalizeMetadata(0);
+            try relational_row_codec.validateOrdinalWithLayout(row.packed_row, schema, physical);
+            const digest = try document_content_hash.hashRelationalParsedValue(alloc, row.parsedValue(), schema);
+            try std.testing.expectEqualSlices(u8, &row.semantic_hash, &digest);
+            const cell = (try relational_row_codec.findCellByOrdinalWithLayout(row.packed_row, schema, physical, 0)).?;
+            const numeric = @import("../../sql/numeric_storage.zig");
+            const value = try numeric.jsonValueAlloc(alloc, cell.value.bytes_val);
+            defer alloc.free(value.number_string);
+            try std.testing.expectEqualStrings("12.35", value.number_string);
+        }
+    };
+    try Run.run(a, table, &layout);
+    try std.testing.checkAllAllocationFailures(a, Run.run, .{ table, &layout });
+    try std.testing.expectError(error.InvalidSqlNumber, PreparedRelationalWrite.init(a, "row", "{\"n\":99.995}", null, table, &layout));
+}
+
+test "relational index system NUMERIC array modifiers round before hashing and strict restore" {
+    const a = std.testing.allocator;
+    const table: runtime_schema.TableSchema = .{
+        .version = 1,
+        .storage_mode = .relational,
+        .requires_public_schema = true,
+        .requires_numeric_modifiers = true,
+        .relational_columns = &.{.{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = .numeric, .numeric_modifier = .{ .precision = 4, .scale = 2 } }},
+    };
+    var layout = try relational_row_codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    const json =
+        \\{"a":{"dimensions":[{"length":3,"lower_bound":-7}],"values":["12.345",null,"0.001"],"sql_nulls":[false,true,false]}}
+    ;
+    const Run = struct {
+        fn run(alloc: Allocator, schema: runtime_schema.TableSchema, physical: *const relational_row_codec.PhysicalLayout, input: []const u8) !void {
+            var row = try PreparedRelationalWrite.init(alloc, "row", input, null, schema, physical);
+            defer row.deinit(alloc);
+            try row.finalizeMetadata(0);
+            try relational_row_codec.validateOrdinalWithLayout(row.packed_row, schema, physical);
+            const digest = try document_content_hash.hashRelationalParsedValue(alloc, row.parsedValue(), schema);
+            try std.testing.expectEqualSlices(u8, &row.semantic_hash, &digest);
+            const cell = (try relational_row_codec.findCellByOrdinalWithLayout(row.packed_row, schema, physical, 0)).?;
+            const view = try @import("../../common/sql_array_layout.zig").View.open(.numeric, cell.value.bytes_val, .{});
+            try std.testing.expectEqual(@as(usize, 3), view.count);
+            try std.testing.expect((try view.cell(1)).sql_null);
+            const value = try @import("../../sql/numeric_storage.zig").jsonValueAlloc(alloc, (try view.cell(0)).bytes);
+            defer alloc.free(value.number_string);
+            try std.testing.expectEqualStrings("12.35", value.number_string);
+            const rendered = try relational_row_codec.reconstructDocumentAlloc(alloc, &.{cell});
+            defer alloc.free(rendered);
+            var restored = try PreparedRelationalWrite.init(alloc, "row", rendered, null, schema, physical);
+            defer restored.deinit(alloc);
+            try restored.finalizeMetadata(0);
+            try std.testing.expectEqualSlices(u8, row.packed_row, restored.packed_row);
+        }
+    };
+    try Run.run(a, table, &layout, json);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Run.run, .{ table, &layout, json });
+    const overflow =
+        \\{"a":{"dimensions":[{"length":2,"lower_bound":-7}],"values":["12.345","99.995"],"sql_nulls":[false,false]}}
+    ;
+    try std.testing.expectError(error.InvalidSqlNumber, PreparedRelationalWrite.init(a, "row", overflow, null, table, &layout));
+}
+
+test "relational index system NUMERIC scalar rows hash logical identity and unwind preparation faults" {
+    const a = std.testing.allocator;
+    const schema: runtime_schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric, .allows_null = true }} };
+    var layout = try relational_row_codec.PhysicalLayout.init(a, schema);
+    defer layout.deinit();
+    const cases = [_][2][]const u8{
+        .{ "{\"n\":1.20}", "{\"n\":1.2}" },
+        .{ "{\"n\":-0.00}", "{\"n\":0}" },
+        .{ "{\"n\":10000000000.00}", "{\"n\":1e10}" },
+    };
+    for (cases) |pair| {
+        var left = try PreparedRelationalWrite.init(a, "row", pair[0], null, schema, &layout);
+        defer left.deinit(a);
+        var right = try PreparedRelationalWrite.init(a, "row", pair[1], null, schema, &layout);
+        defer right.deinit(a);
+        try std.testing.expectEqualSlices(u8, &left.semantic_hash, &right.semantic_hash);
+        try std.testing.expect(!std.mem.eql(u8, left.packed_row, right.packed_row));
+    }
+    const Run = struct {
+        fn run(alloc: Allocator, table: runtime_schema.TableSchema, physical: *const relational_row_codec.PhysicalLayout) !void {
+            for ([_][]const u8{ "{\"n\":123456789012345678901234567890.00001}", "{\"n\":\"NaN\"}", "{\"n\":null}", "{}" }) |json| {
+                var prepared = try PreparedRelationalWrite.init(alloc, "row", json, null, table, physical);
+                defer prepared.deinit(alloc);
+                try prepared.finalizeMetadata(0);
+                try relational_row_codec.validateOrdinalWithLayout(prepared.packed_row, table, physical);
+            }
+        }
+    };
+    try Run.run(a, schema, &layout);
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ schema, &layout });
+    var ctx: @import("../../sql/numeric_value.zig").Context = .{ .alloc = a };
+    try std.testing.expectError(error.InvalidBatchRequest, @import("../../sql/numeric_storage.zig").fromJson(&ctx, .{ .float = 1.25 }));
+}
+
+test "relational index system SQL float4 preparation hashes and indexes canonical logical values" {
+    const alloc = std.testing.allocator;
+    const parsed = try schema_api.parseValidatedTableSchema(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"f":{"type":"number","x-antfly-sql-type":"float32"}},"additionalProperties":false}}}}
+    );
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var validator = try schema_api.CompiledTableValidator.takeParsed(alloc, parsed);
+    defer validator.deinit(alloc);
+    var layout = try relational_row_codec.PhysicalLayout.init(alloc, schema);
+    defer layout.deinit();
+    var source = try PreparedRelationalWrite.init(alloc, "row", "{\"f\":0.1}", validator, schema, &layout);
+    defer source.deinit(alloc);
+    var canonical = try PreparedRelationalWrite.init(alloc, "row", "{\"f\":0.10000000149011612}", validator, schema, &layout);
+    defer canonical.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, &source.semantic_hash, &canonical.semantic_hash);
+    try std.testing.expectEqualSlices(u8, source.packed_row, canonical.packed_row);
+    try std.testing.expectEqual(@as(f64, @as(f32, 0.1)), source.parsedValue().object.get("f").?.float);
+}
+
 test "sparse relational preparation preserves canonical hash order with one physical sort" {
     const alloc = std.testing.allocator;
     const columns = [_]runtime_schema.RelationalColumn{
@@ -6596,4 +6918,40 @@ test "external lake mapped datetime projection sorts signed and wide instants" {
     try std.testing.expectEqual(@as(i128, -1), (try values.getDateTimeNs(0)).?);
     try std.testing.expectEqual(@as(i128, 0), (try values.getDateTimeNs(1)).?);
     try std.testing.expectEqual(@as(i128, 253402300799999999999), (try values.getDateTimeNs(2)).?);
+}
+
+test "default text projection retains empty primary identity without postings (#1095)" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const source = (try buildTextProjectionSourceBatchFromWrites(arena, &.{.{ .key = "empty", .value = "{}" }})).docs[0];
+    var builder = TextProjectionBatchBuilder.init(arena, .{}, null, null);
+    defer builder.deinit();
+    try builder.appendSourceDocForIndex(source, null, true);
+    try std.testing.expectEqual(@as(usize, 1), builder.text_docs.items.len);
+    try std.testing.expectEqualStrings("empty", builder.text_docs.items[0].id);
+    try std.testing.expectEqual(@as(usize, 0), builder.text_docs.items[0].text_fields.len);
+    // Partial and artifact projections retain their actual emitted population.
+    try builder.appendSourceDocForIndex(source, "body", false);
+    try builder.appendSourceDocForIndex(source, null, false);
+    try std.testing.expectEqual(@as(usize, 1), builder.text_docs.items.len);
+}
+
+test "document mapper explicit null embeddings own extraction and clone allocation failures" {
+    const Case = struct {
+        fn run(alloc: Allocator) !void {
+            var extracted = try extractWrite(alloc, "doc:a", "{\"title\":\"kept\",\"_embeddings\":{\"dense\":null,\"sparse\":null,\"dense_kept\":[1,0,0],\"sparse_kept\":{\"indices\":[7],\"values\":[1]}},\"_edges\":{\"g\":{\"links\":[{\"target\":\"doc:b\"}]}}}");
+            defer extracted.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 2), extracted.deleted_embedding_indexes.len);
+            try std.testing.expectEqual(@as(usize, 1), extracted.dense_embeddings.len);
+            try std.testing.expectEqual(@as(usize, 1), extracted.sparse_embeddings.len);
+            var cloned = try extracted.clone(alloc);
+            defer cloned.deinit(alloc);
+            try std.testing.expectEqualStrings("dense", cloned.deleted_embedding_indexes[0]);
+            try std.testing.expectEqualStrings("sparse", cloned.deleted_embedding_indexes[1]);
+            try std.testing.expect(std.mem.indexOf(u8, cloned.cleaned_value.?, "_embeddings") == null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

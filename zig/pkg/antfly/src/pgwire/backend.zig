@@ -18,8 +18,14 @@
 //! Parameters remain typed values, never interpolated into SQL text.
 const std = @import("std");
 
-pub const Type = enum { string, uuid, integer, number, boolean, datetime, json, unknown };
-pub const Column = struct { name: []const u8, type: Type };
+pub const Type = enum { string, uuid, integer, number, boolean, datetime, json, array, unknown };
+pub const Parameter = @import("antfly_local_sources").sql_scalar.Type;
+pub const Column = struct {
+    name: []const u8,
+    type: Type,
+    element_type: ?@import("antfly_local_sources").sql_array_value.ElementType = null,
+    numeric_modifier: ?@import("antfly_local_sources").sql_scalar.NumericModifier = null,
+};
 pub const TransactionStatus = enum(u8) { idle = 'I', in_transaction = 'T', failed = 'E' };
 
 pub const Identity = struct {
@@ -29,8 +35,15 @@ pub const Identity = struct {
 
 pub const Request = struct {
     statement: []const u8,
+    /// Reclaiming allocator sharing the connection cap. Result envelopes use
+    /// the describe/execute arena; backend-owned execution scratch/results can
+    /// release memory independently instead of nesting under that arena.
+    scratch_allocator: ?std.mem.Allocator = null,
     parameters: []const std.json.Value = &.{},
+    parameter_cells: ?[]const @import("antfly_local_sources").sql_scalar.Datum = null,
+    parameter_owner: ?@import("antfly_local_sources").sql_parameter_frame.PayloadLease = null,
     parameter_types: []const Type = &.{},
+    parameter_descriptors: []const Parameter = &.{},
     database: ?[]const u8 = null,
     namespace: ?[]const u8 = null,
     /// Ordered lookup candidates for unqualified SQL relations. The first
@@ -51,6 +64,10 @@ pub const Request = struct {
     setting_epoch: ?u64 = null,
     /// Connection-owned, identity-fenced setting values for this statement.
     lake_visibility: @import("session_commands.zig").LakeVisibility = .committed,
+    read_requirements: @import("session_commands.zig").ReadRequirements = .{},
+    /// Borrowed only during admission; streaming owners capture the deadline
+    /// before returning so later statements can reuse the connection budget.
+    read_receipt_budget: ?*@import("antfly_local_sources").sql_read_requirements.WaitBudget = null,
     setting_overlay: []const @import("antfly_local_sources").sql_setting_catalog.OverlayEntry = &.{},
 
     pub fn check(self: Request) !void {
@@ -88,6 +105,7 @@ pub const MutationOutcome = enum { committed, committed_pending, committed_repai
 pub const Description = struct {
     columns: []const Column = &.{},
     parameter_types: []const Type = &.{},
+    parameter_descriptors: []const Parameter = &.{},
     binding_guard: ?[]const u8 = null,
     setting_epoch: ?u64 = null,
 };
@@ -151,7 +169,18 @@ pub const Result = struct {
     }
 };
 
-pub const Cell = struct { value: std.json.Value, sql_null: bool };
+pub const Cell = struct {
+    /// Canonical JSONB bytes owned by the result lease. JSON null remains a
+    /// non-NULL value; ordinary scalars keep their existing representation.
+    json_bytes: ?[]const u8 = null,
+    /// Validated immutable tokens borrow the result lease; pgwire streams them
+    /// directly into DataRow frames without an intermediate JSON string.
+    frozen_json: ?@import("antfly_local_sources").sql_execution_batch.FrozenJson = null,
+    value: std.json.Value = .null,
+    sql_null: bool,
+    array: ?*const @import("antfly_local_sources").sql_array_value.Value = null,
+    numeric: ?*const @import("antfly_local_sources").sql_numeric_value.Value = null,
+};
 pub const Cells = struct {
     context: *anyopaque,
     begin: usize = 0,
@@ -165,6 +194,7 @@ pub const Backend = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        native_parameters: bool = false,
         // Called even when a deployment permits anonymous access. The backend
         // alone decides whether credentials authorize a principal; a startup
         // username/database never itself grants access.
@@ -177,6 +207,7 @@ pub const Backend = struct {
         /// Evaluate SQL EXECUTE arguments as scalar expressions without any
         /// catalog/table access. Values are owned by the supplied allocator.
         evaluate_parameters: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request, []const []const u8) anyerror![]const std.json.Value = null,
+        evaluate_parameter_cells: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request, []const []const u8) anyerror![]const @import("antfly_local_sources").sql_scalar.Datum = null,
         /// Mark an explicit transaction failed when a SQL cursor fetch or
         /// declaration fails after its statement snapshot was opened.
         fail_transaction: ?*const fn (*anyopaque, Identity, Request) anyerror!void = null,

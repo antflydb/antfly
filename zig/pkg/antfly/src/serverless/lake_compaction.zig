@@ -57,7 +57,7 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
     source_options.read_only = job.dry_run;
     var files = try configured.openBindingObjectStoreAlloc(a, binding, source_options);
     defer files.deinit();
-    const destination: catalog.row_commit.Files = .{ .client = files.client, .bucket = files.bucket, .prefix = files.prefix, .uri = binding.source_uri, .context = context };
+    const destination = try ingestion.destinationFiles(scratch, files, binding.source_uri, context);
     var progress: Progress = undefined;
     if (saved) |value| {
         if (job.dry_run) return error.LakeMaintenanceAlreadyStarted;
@@ -124,7 +124,8 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
                 const keep = try scratch.alloc(bool, batch.rowCount());
                 @memset(keep, true);
                 try stream.deleteMask(scratch, batch, keep);
-                for (keep, batch.row_refs, 0..) |visible, reference, row| {
+                for (keep, 0..) |visible, row| {
+                    const reference = batch.rowRef(row);
                     if (scanned == job.max_rows) break :scan;
                     var image: V = .{ .object = .empty };
                     var bytes: usize = 0;

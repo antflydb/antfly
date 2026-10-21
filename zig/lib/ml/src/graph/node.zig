@@ -191,6 +191,9 @@ pub const ScatterReduction = enum { serial_v1, pytorch_gather_v1, pytorch_embedd
 pub const GatherAttrs = struct {
     axis: u8 = 0,
     elements: bool = false,
+    /// ONNX GatherND indexes coordinate tuples rather than one axis.
+    nd: bool = false,
+    batch_dims: u8 = 0,
     backward_reduction: ScatterReduction = .serial_v1,
     /// Embedding lookup leaves the padding row readable in forward, but
     /// suppresses its weight gradient. Only the embedding profile consumes it.
@@ -637,6 +640,22 @@ pub const RopeAttrs = struct {
     consecutive_pairs: bool = false,
 };
 
+/// Split-half rotary embedding by explicit tables: `x` is `[rows, width]`
+/// with `width / head_dim` heads per row, and `cos`/`sin` are
+/// `[rows * heads, head_dim / 2]`, one row per (row, head). For pair i,
+/// lo = x[..i], hi = x[..i + head_dim/2]:
+///   forward: (lo*cos - hi*sin, lo*sin + hi*cos)
+///   inverse: (lo*cos + hi*sin, hi*cos - lo*sin), the transpose, which is
+///   the VJP of the forward (and vice versa).
+pub const RopeTableAttrs = struct {
+    head_dim: u32,
+    inverse: bool = false,
+};
+
+/// GeGLU over rows of [gate | value], each `width` wide:
+/// gelu_exact(gate) * value. The backward takes (x, dout) and returns dx.
+pub const GegluAttrs = struct { width: u32 };
+
 pub const Conv1dAttrs = struct {
     batch: u32,
     in_channels: u32,
@@ -846,6 +865,12 @@ pub const OpCode = union(enum) {
     fused_segment_training_attention_backward_v1: SegmentTrainingAttentionAttrs,
     fused_relative_position_bias: RelativePositionBiasAttrs,
     fused_rope: RopeAttrs,
+    fused_rope_table: RopeTableAttrs,
+    /// [rows, 3*width] (Q | K | V) -> planar [3*rows, width] with Q and K
+    /// rotated by tables as `fused_rope_table`; `inverse` maps back.
+    fused_qkv_rope_table: RopeTableAttrs,
+    fused_geglu: GegluAttrs,
+    fused_geglu_backward: GegluAttrs,
     fused_conv1d: Conv1dAttrs,
     fused_conv2d: Conv2dAttrs,
     fused_windowed_self_attention: WindowedAttentionAttrs,

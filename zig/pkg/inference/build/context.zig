@@ -20,6 +20,7 @@ pub const Context = struct {
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.lang.Optimize,
+    strip: bool = false,
     paths: runtime.Paths,
     backend: runtime.BackendOptions,
     graph: runtime.Graph,
@@ -48,6 +49,6 @@ pub const Context = struct {
         artifact.root_module.link_libc = true;
     }
     pub fn hasAccelerator(ctx: Context) bool {
-        return ctx.backend.enable_metal or ctx.backend.enable_cuda or ctx.backend.enable_onnx or ctx.backend.enable_pjrt;
+        return ctx.backend.enable_metal or ctx.backend.enable_cuda or ctx.backend.enable_pjrt;
     }
 };

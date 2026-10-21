@@ -25,7 +25,7 @@ pub const max_readers = 256;
 pub const lease_ms: u64 = 10 * 60 * 1000;
 pub const grace_ms: u64 = 30 * 1000;
 pub const Reader = struct { token: catalog.Token, generation: u64, expires_ms: u64 };
-pub const StoreBinding = struct { identity: catalog.Digest, locator: catalog.StoreLocator };
+pub const StoreBinding = struct { identity: catalog.Digest, locator: catalog.StoreLocator, vacuum: ?@import("../serverless/artifacts/cloud_generations.zig").VacuumCut = null };
 pub const Collection = struct {
     token: catalog.Token,
     store: catalog.Digest,
@@ -50,6 +50,7 @@ pub const State = struct {
     reader_upload_floor: ?u64 = null,
     current: ?u64 = null,
     pending: ?catalog.Attempt = null,
+    checkpoint: ?catalog.Publication = null,
     dropped: bool = false,
     publications: []const catalog.Publication = &.{},
     readers: []const Reader = &.{},
@@ -60,6 +61,13 @@ pub const State = struct {
         for (self.publications) |publication| if (publication.generation == generation) return publication;
         return null;
     }
+    /// Partial construction is a GC root, but cannot admit a query reader.
+    pub fn gcPublications(self: State, a: A) ![]const catalog.Publication {
+        const all = try a.alloc(catalog.Publication, self.publications.len + @as(usize, if (self.checkpoint != null) 1 else 0));
+        @memcpy(all[0..self.publications.len], self.publications);
+        if (self.checkpoint) |saved| all[self.publications.len] = saved;
+        return all;
+    }
     fn retired(self: State, generation: u64) bool {
         if (self.collection) |collection| for (collection.retired) |old| if (generation == old) return true;
         return false;
@@ -68,11 +76,19 @@ pub const State = struct {
         if (self.version != 1 or self.publications.len > max_publications or self.readers.len > max_readers or self.stores.len > 64) return error.InvalidLakeIndexLifecycle;
         for (self.stores, 0..) |store, index| {
             try store.locator.validate();
+            if (store.vacuum) |cut| {
+                try cut.validate();
+                if (cut.cutoff > self.generation +| 1) return error.InvalidLakeIndexLifecycle;
+            }
             if (std.mem.allEqual(u8, &store.identity, 0)) return error.InvalidLakeIndexLifecycle;
             for (self.stores[0..index]) |other| if (std.mem.eql(u8, &store.identity, &other.identity)) return error.InvalidLakeIndexLifecycle;
         }
         if (self.reader_upload_floor) |floor| if (floor == 0 or floor > self.generation) return error.InvalidLakeIndexLifecycle;
         if (self.namespace) |namespace| if (std.mem.allEqual(u8, &namespace, 0)) return error.InvalidLakeIndexLifecycle;
+        if (self.checkpoint) |saved| {
+            try saved.validate();
+            if (self.dropped or saved.generation > self.generation or !std.meta.eql(saved.namespace, self.namespace)) return error.InvalidLakeIndexLifecycle;
+        }
         var prior: u64 = 0;
         for (self.publications) |publication| {
             try publication.validate();
@@ -112,6 +128,8 @@ pub const State = struct {
         next.generation = catalog_state.generation;
         next.namespace = catalog_state.namespace;
         next.pending = catalog_state.pending;
+        next.checkpoint = catalog_state.checkpoint;
+        if (catalog_state.checkpoint) |saved| if (saved.store_locator) |locator| try next.retainStore(a, saved.signature.store, locator);
         if (next.reader_upload_floor == null) {
             if (catalog_state.pending) |pending| if (pending.reader_protocol >= 24) {
                 next.reader_upload_floor = pending.generation;
@@ -156,6 +174,7 @@ pub const State = struct {
     pub fn drop(self: State) !State {
         var next = try self.advance();
         next.dropped = true;
+        next.checkpoint = null;
         next.current = null;
         next.pending = null;
         try next.validate();
@@ -220,7 +239,8 @@ pub const State = struct {
             if (!protected) try retired_generations.append(a, publication.generation);
         }
         var next = try self.advance();
-        const cutoff = if (self.pending) |pending| pending.generation else self.generation +| 1;
+        var cutoff = if (self.pending) |pending| pending.generation else self.generation +| 1;
+        if (self.checkpoint) |saved| cutoff = @min(cutoff, saved.generation);
         next.collection = .{ .token = token, .store = store, .namespace = self.namespace, .expires_ms = std.math.add(u64, now, lease_ms) catch return error.InvalidLakeIndexLifecycle, .upload_cutoff = cutoff, .upload_floor = self.reader_upload_floor orelse cutoff, .retired = try retired_generations.toOwnedSlice(a) };
         try next.validate();
         return next;
@@ -245,6 +265,9 @@ pub const State = struct {
         return next;
     }
     pub fn finishCollection(self: State, a: A, token: catalog.Token, now: u64) !State {
+        return self.finishCollectionRetainingStore(a, token, now, false);
+    }
+    pub fn finishCollectionRetainingStore(self: State, a: A, token: catalog.Token, now: u64, retain_store: bool) !State {
         const collection = self.collection orelse return error.LakeIndexCollectionFenceChanged;
         if (now == 0 or now >= collection.expires_ms or !std.mem.eql(u8, &collection.token, &token)) return error.LakeIndexCollectionFenceChanged;
         var retained: std.ArrayList(catalog.Publication) = .empty;
@@ -264,7 +287,7 @@ pub const State = struct {
                 if (std.mem.eql(u8, &publication.signature.store, &store.identity)) break true;
             } else false;
             const has_pending = if (next.pending) |pending| std.mem.eql(u8, &pending.signature.store, &store.identity) else false;
-            if (!std.mem.eql(u8, &collection.store, &store.identity) or has_publication or has_pending) try stores.append(a, store);
+            if (retain_store or !std.mem.eql(u8, &collection.store, &store.identity) or has_publication or has_pending or (if (next.checkpoint) |saved| std.mem.eql(u8, &saved.signature.store, &store.identity) else false)) try stores.append(a, store);
         }
         next.stores = try stores.toOwnedSlice(a);
         try next.validate();
@@ -277,7 +300,7 @@ pub const Mutation = union(enum) {
     release: catalog.Token,
     begin_collection: struct { token: catalog.Token, store: catalog.Digest, now_ms: u64 },
     checkpoint_collection: struct { token: catalog.Token, previous: ?[]const u8 = null, progress: @import("antfly_local_sources").serverless_manifest_artifact_ref.ArtifactRef, now_ms: u64 },
-    finish_collection: struct { token: catalog.Token, now_ms: u64 },
+    finish_collection: struct { token: catalog.Token, now_ms: u64, retain_store: bool = false, vacuum: ?@import("../serverless/artifacts/cloud_generations.zig").VacuumCut = null },
     /// Receipt observation may see a later reader mutation. Unique tokens and
     /// monotonic deadlines prove this command's effect without replaying it.
     pub fn observed(self: Mutation, state: State) bool {
@@ -304,7 +327,24 @@ pub const Mutation = union(enum) {
             .release => |token| state.release(a, token),
             .begin_collection => |m| state.beginCollection(a, m.token, m.store, m.now_ms),
             .checkpoint_collection => |m| state.checkpointCollection(a, m.token, m.previous, m.progress, m.now_ms),
-            .finish_collection => |m| state.finishCollection(a, m.token, m.now_ms),
+            .finish_collection => |m| blk: {
+                var next = try state.finishCollectionRetainingStore(a, m.token, m.now_ms, m.retain_store);
+                if (m.vacuum) |cut| {
+                    const collection = state.collection orelse return error.InvalidLakeIndexLifecycle;
+                    try cut.validate();
+                    if (cut.floor != collection.upload_floor or cut.cutoff != collection.upload_cutoff) return error.InvalidLakeIndexLifecycle;
+                    const progress = collection.progress orelse return error.InvalidLakeIndexLifecycle;
+                    const scope = (try @import("../serverless/artifacts/store.zig").uploadScopeFromArtifactId(progress.artifact_id)) orelse return error.InvalidLakeIndexLifecycle;
+                    if (!std.mem.eql(u8, &scope.domain, &cut.domain)) return error.InvalidLakeIndexLifecycle;
+                    const bindings = try a.dupe(StoreBinding, next.stores);
+                    for (bindings) |*binding| if (std.mem.eql(u8, &binding.identity, &collection.store)) {
+                        binding.vacuum = cut;
+                    };
+                    next.stores = bindings;
+                    try next.validate();
+                }
+                break :blk next;
+            },
         };
     }
     /// Admission runs before any command is appended. A publication race is
@@ -427,7 +467,11 @@ test "external lake collection retains failed upload stores through DROP and rot
     state = try state.beginCollection(a, @splat(7), @splat(4), 3);
     try std.testing.expectEqual(@as(u64, 1), state.collection.?.upload_floor);
     try std.testing.expectEqual(@as(u64, 3), state.collection.?.upload_cutoff);
-    state = try state.finishCollection(a, @splat(7), 4);
+    state = try state.finishCollectionRetainingStore(a, @splat(7), 4, true);
+    try std.testing.expectEqual(@as(usize, 2), state.stores.len);
+    state = try parse(a, try encode(a, state));
+    state = try state.beginCollection(a, @splat(9), @splat(4), 4);
+    state = try state.finishCollection(a, @splat(9), 4);
     try std.testing.expectEqual(@as(usize, 1), state.stores.len);
     try std.testing.expectEqual(rotated_signature.store, state.stores[0].identity);
     state = try state.beginCollection(a, @splat(6), @splat(5), 5);
@@ -462,4 +506,33 @@ pub fn mutateOnService(svc: anytype, a: A, write: Write, request: @import("antfl
     svc.waitForTransitionApplied(receipt) catch return error.MetadataMutationOutcomeUnknown;
     const observed = try parse(a, try store.getLakeIndexLifecycle(a, svc.metadata_group_id, write.table_id));
     if (observed.revision <= write.expected_revision or !write.mutation.observed(observed)) return error.MetadataMutationOutcomeUnknown;
+}
+
+test "external lake resumable checkpoint is fenced and protected without becoming queryable" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const saved = testPublication(2);
+    var building = try (catalog.State{ .generation = 1, .published = testPublication(1) }).begin(saved.signature, saved.token, saved.published_at_ms - 1, 100);
+    building.pending.?.reader_protocol = saved.reader_protocol;
+    building.pending.?.store_locator = saved.store_locator;
+    const checkpointed = try building.saveCheckpoint(saved, saved.published_at_ms);
+    try std.testing.expectEqual(@as(u64, 1), checkpointed.published.?.generation);
+    try std.testing.expectError(error.LakeIndexPublicationFenceChanged, building.saveCheckpoint(saved, saved.published_at_ms + 100));
+    var forged = saved;
+    forged.token = @splat(9);
+    try std.testing.expectError(error.LakeIndexPublicationFenceChanged, building.saveCheckpoint(forged, saved.published_at_ms));
+    const failed = try checkpointed.fail(saved.token, "interrupted", 200);
+    building = try failed.begin(saved.signature, @splat(3), 200, 100);
+    try std.testing.expect(building.checkpoint != null);
+    var changed = saved.signature;
+    changed.source = @splat(8);
+    try std.testing.expect((try failed.begin(changed, @splat(3), 200, 100)).checkpoint == null);
+    var lifecycle = try (State{}).synchronize(ca, failed);
+    try std.testing.expectEqual(@as(usize, 2), (try lifecycle.gcPublications(ca)).len);
+    try std.testing.expectError(error.LakeIndexGenerationRetired, lifecycle.acquire(ca, @splat(4), 2, 200));
+    lifecycle = try lifecycle.beginCollection(ca, @splat(5), saved.signature.store, 200);
+    try std.testing.expectEqual(@as(u64, 2), lifecycle.collection.?.upload_cutoff);
+    try std.testing.expect((try lifecycle.drop()).checkpoint == null);
 }

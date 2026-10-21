@@ -22,6 +22,7 @@ Mirrors go/pkg/embedded's TestErrorCodeMetadataMatchesCABI.
 from __future__ import annotations
 
 import ctypes
+from pathlib import Path
 
 import pytest
 
@@ -32,7 +33,7 @@ pytestmark = pytest.mark.usefixtures("require_native")
 
 # 0-10 and 255 are the defined antfly_error_code values; 127 exercises the
 # "unknown code" fallback on both sides.
-CODES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 255, 127]
+CODES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 255, 127]
 
 
 def test_error_code_metadata_matches_c_abi() -> None:
@@ -62,3 +63,15 @@ def test_open_options_struct_size_matches_c_abi() -> None:
     got = lib.antfly_open_options_size()
     want = ctypes.sizeof(_ffi.AntflyOpenOptions)
     assert got == want, f"C ABI open options size {got}, compiled struct size {want}"
+
+
+def test_sql_cannot_reuse_same_code_index_diagnostic(tmp_path: Path) -> None:
+    with antfly_embedded.create_hosted(tmp_path / "db.aflite") as db:
+        db.create_table("entities", {})
+        with db.open_table("entities") as table:
+            with pytest.raises(errors.InvalidArgumentError, match="MissingIndexType") as index_error:
+                db.add_index({"name": "invalid"})
+            with pytest.raises(errors.InvalidArgumentError, match="root database handle") as sql_error:
+                table.sql_session()
+            assert "MissingIndexType" not in str(sql_error.value)
+            assert "MissingIndexType" in str(index_error.value)

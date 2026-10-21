@@ -67,7 +67,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "lsm backend physical split preserves L0 overwrite and tombstone order",
         "data runtime health metrics include replay debt and provisioned warmup counters",
         "data runtime kernel resource metrics",
-        "data runtime status refresh publishes synthetic missing status for absent local group db",
+        "data runtime status refresh uses control metadata to publish synthetic missing status",
         "data runtime local group status does not open roots owned by transitions",
         "data runtime local group status provider collects and caches group statuses",
         "data runtime storage ownership fingerprint excludes transient placement progress",
@@ -242,6 +242,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data runtime records and backs off HA standby replication round failures",
         "data runtime HA replication HTTP budget covers base64 apply envelope",
         "data runtime HA apply window remains bounded for control-plane liveness",
+        "data runtime publication proof yields without transport failure backoff",
         "data runtime disk usage scanner reads borrowed filesystem for sharding evidence",
         "data runtime HA apply window does not report caught up with pending or deferred WAL",
         "data server keeps upstream replication availability failures nonfatal",
@@ -266,7 +267,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = options.data_implementation_module,
         .filters = lib_data_runtime_tests.object.filters,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
-        .max_rss = lib_data_runtime_tests.object.step.max_rss,
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("data-runtime-implementation-tests", b.graph.host.result, target.result, options.data_implementation_module.optimize, lib_data_runtime_tests.object.step.max_rss),
     });
     const run_lib_data_runtime_tests = @import("linked_tests.zig").runPair(b, lib_data_runtime_tests, implementation_tests);
     const lib_data_runtime_test_step = b.step("antfly-data-runtime-test", "Run focused data runtime tests");

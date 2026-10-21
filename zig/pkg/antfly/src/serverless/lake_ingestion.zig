@@ -28,6 +28,13 @@ const Binding = local.serverless_external_source_catalog_binding.Binding;
 const Options = configured.BindingObjectStoreOpenOptions;
 const Context = catalog.types.Context;
 const Attempt = struct { id: []const u8, expected: []const u8, body: []const u8, timestamp_ms: i64 };
+fn attemptId(a: A, lsn: u64, table: catalog.types.Table) ![]u8 {
+    // Retirement advances managed HEAD without changing metadata_location.
+    // A definitively rejected intent must get a new identity at that authority.
+    const authority = try std.json.Stringify.valueAlloc(a, .{ table.metadata_location, table.version, table.record_key }, .{});
+    defer a.free(authority);
+    return std.fmt.allocPrint(a, "wal-{d}-{s}", .{ lsn, catalog.types.digestHex(authority) });
+}
 pub fn openQueue(a: A, binding: Binding, options: Options) !local.serverless_object_store_support.OpenedObjectStore {
     if (binding.write_policy != .iceberg_writer or binding.catalog == null) return error.ExternalLakeReadOnly;
     const config = options.node_config orelse return error.NativeArtifactStorageRequired;
@@ -47,6 +54,12 @@ pub fn prefix(a: A, base: []const u8, binding: Binding, options: Options) ![]u8 
     const identity = try std.json.Stringify.valueAlloc(a, .{ .source = binding.source_uri, .catalog = binding.catalog }, .{});
     defer a.free(identity);
     return std.fmt.allocPrint(a, "{s}{s}lake-ingestion/{d}/{d}/{s}", .{ base, if (base.len == 0) "" else "/", options.catalog_table_id, options.catalog_generation, catalog.types.digestHex(identity) });
+}
+/// Filesystem ingestion publishes object URIs through its bucket adapter.
+/// Maintenance must use the same URI namespace when reading those artifacts.
+pub fn destinationFiles(a: A, files: local.serverless_object_store_support.OpenedObjectStore, source_uri: []const u8, context: Context) !catalog.row_commit.Files {
+    const uri = if (files.fs_client != null) try std.fmt.allocPrint(a, "object://{s}/{s}", .{ files.bucket, files.prefix }) else source_uri;
+    return .{ .client = files.client, .bucket = files.bucket, .prefix = files.prefix, .uri = uri, .context = context };
 }
 pub fn coverage(a: A, table: catalog.types.Table) !u64 {
     var p = try std.json.parseFromSlice(V, a, table.metadata_json, .{});
@@ -143,9 +156,9 @@ pub fn drain(a: A, binding: Binding, options: Options, context: Context) !bool {
         var files = try configured.openBindingObjectStoreAlloc(a, binding, source_options);
         defer files.deinit();
         const timestamp: i64 = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
-        const files_uri = if (files.fs_client != null) try std.fmt.allocPrint(scratch, "object://{s}/{s}", .{ files.bucket, files.prefix }) else binding.source_uri;
-        const built = try catalog.row_commit.prepare(scratch, current.table, .{ .client = files.client, .bucket = files.bucket, .prefix = files.prefix, .uri = files_uri, .context = context }, parsed.value, record.lsn, timestamp);
-        attempt = .{ .id = try std.fmt.allocPrint(scratch, "wal-{d}-{s}", .{ record.lsn, catalog.types.digestHex(current.table.metadata_location) }), .expected = current.table.metadata_location, .body = built.body, .timestamp_ms = timestamp };
+        const destination = try destinationFiles(scratch, files, binding.source_uri, context);
+        const built = try catalog.row_commit.prepare(scratch, current.table, destination, parsed.value, record.lsn, timestamp);
+        attempt = .{ .id = try attemptId(scratch, record.lsn, current.table), .expected = current.table.metadata_location, .body = built.body, .timestamp_ms = timestamp };
         const bytes = try std.json.Stringify.valueAlloc(scratch, attempt, .{});
         var stored = client.putObject(opened.bucket, intent_key, bytes, .{ .if_none_match = true, .cancellation = catalog.types.contextCancellation(&context) }) catch |err| switch (err) {
             error.PreconditionFailed, error.ObjectAlreadyExists => return true,
@@ -185,7 +198,68 @@ pub fn watermark(a: A, binding: Binding, options: Options, context: Context) !u6
     return store.watermark(a);
 }
 
-pub const Pending = struct { lsn: u64, key_fields: []const []const u8, changes: []const Batch.Change };
+pub const KeyIdentity = enum { legacy_json, canonical };
+pub fn rowId(a: A, keys: []const []const u8, row: V, encoding: KeyIdentity) ![]u8 {
+    const encoded = if (encoding == .canonical)
+        try local.serverless_external_source_mod.lake_catalog.row_commit.stable_key.identity(a, keys, row, &.{})
+    else legacy: {
+        const values = try a.alloc(V, keys.len);
+        defer a.free(values);
+        for (keys, values) |key, *value| value.* = row.object.get(key) orelse return error.InvalidWal;
+        break :legacy try std.json.Stringify.valueAlloc(a, values, .{});
+    };
+    defer a.free(encoded);
+    return std.fmt.allocPrint(a, "wal1:{s}", .{local.serverless_external_source_mod.lake_catalog.types.digestHex(encoded)});
+}
+pub const Pending = struct {
+    key_identity: KeyIdentity = .legacy_json,
+    block_digests: []const [32]u8 = &.{},
+    cut_identity: ?[32]u8 = null,
+    base_lsn: u64 = 0,
+    lsn: u64,
+    key_fields: []const []const u8,
+    changes: []const Batch.Change = &.{},
+    change_blocks: []const []const Batch.Change = &.{},
+    pub fn count(self: @This()) usize {
+        var n = self.changes.len;
+        for (self.change_blocks) |block| n += block.len;
+        return n;
+    }
+    pub fn materialized(self: @This(), a: A) !Pending {
+        if (self.change_blocks.len == 0) return self;
+        var result = self;
+        const changes = try a.alloc(Batch.Change, self.count());
+        @memcpy(changes[0..self.changes.len], self.changes);
+        var n = self.changes.len;
+        for (self.change_blocks) |block| {
+            @memcpy(changes[n..][0..block.len], block);
+            n += block.len;
+        }
+        result.changes = changes;
+        result.change_blocks = &.{};
+        result.block_digests = &.{};
+        return result;
+    }
+    pub fn jsonStringify(self: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+        try stream.beginObject();
+        try stream.objectField("key_identity");
+        try stream.write(self.key_identity);
+        try stream.objectField("cut_identity");
+        try stream.write(self.cut_identity);
+        try stream.objectField("base_lsn");
+        try stream.write(self.base_lsn);
+        try stream.objectField("lsn");
+        try stream.write(self.lsn);
+        try stream.objectField("key_fields");
+        try stream.write(self.key_fields);
+        try stream.objectField("changes");
+        try stream.beginArray();
+        for (self.changes) |change| try stream.write(change);
+        for (self.change_blocks) |block| for (block) |change| try stream.write(change);
+        try stream.endArray();
+        try stream.endObject();
+    }
+};
 /// Caller arena owns the immutable WAL cut and its normalized final images.
 pub fn pending(a: A, binding: Binding, options: Options, context: Context, cut: u64) !Pending {
     var opened = try openQueue(a, binding, options);
@@ -193,15 +267,26 @@ pub fn pending(a: A, binding: Binding, options: Options, context: Context, cut: 
     const base = try prefix(a, opened.prefix, binding, options);
     const store: wal.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = context };
     const suffix = try store.range(a, cut);
+    return normalizePending(a, cut, suffix.lsn, suffix.records);
+}
+pub fn normalizePending(a: A, cut: u64, lsn: u64, records: []const wal.Record) !Pending {
+    return normalizePendingWithBase(a, cut, lsn, null, records);
+}
+/// Final images may borrow an immutable prior cut. Its owner must outlive this
+/// result; new records are parsed only once and replace earlier key images.
+pub fn normalizePendingWithBase(a: A, cut: u64, lsn: u64, base: ?Pending, records: []const wal.Record) !Pending {
     var changes: std.ArrayList(Batch.Change) = .empty;
     var latest: std.StringHashMapUnmanaged(usize) = .empty;
-    var keys: []const []const u8 = &.{};
-    for (suffix.records) |record| {
+    var keys: []const []const u8 = if (base) |previous| previous.key_fields else &.{};
+    if (base) |previous| for (previous.changes) |change| {
+        const identity = try local.serverless_external_source_mod.lake_catalog.row_commit.stable_key.identity(a, keys, change.row, &.{});
+        try latest.put(a, identity, changes.items.len);
+        try changes.append(a, change);
+    };
+    for (records) |record| {
         const batch = try std.json.parseFromSliceLeaky(Batch, a, record.payload, .{ .allocate = .alloc_always });
         if (keys.len == 0) keys = batch.key_fields else if (!keyFieldsEqual(keys, batch.key_fields)) return error.LakeSourceConflict;
         for (batch.changes) |change| {
-            var values: std.ArrayList(V) = .empty;
-            for (keys) |field| try values.append(a, change.row.object.get(field) orelse return error.InvalidWal);
             const identity = try local.serverless_external_source_mod.lake_catalog.row_commit.stable_key.identity(a, keys, change.row, &.{});
             const entry = try latest.getOrPut(a, identity);
             if (entry.found_existing) changes.items[entry.value_ptr.*] = change else {
@@ -211,5 +296,117 @@ pub fn pending(a: A, binding: Binding, options: Options, context: Context, cut: 
             }
         }
     }
-    return .{ .lsn = suffix.lsn, .key_fields = keys, .changes = changes.items };
+    return .{ .base_lsn = cut, .lsn = lsn, .key_fields = keys, .changes = changes.items };
+}
+
+test "external lake filesystem maintenance reads ingestion artifacts in the same namespace" {
+    const alloc = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("lake-artifact-namespace");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const uri = try std.fmt.allocPrint(a, "file://{s}", .{directory.path()});
+    var opened = try local.serverless_object_store_support.OpenedObjectStore.initFileUriWithOptions(alloc, uri, "archive", .{ .ensure_bucket = true });
+    defer opened.deinit();
+    const writer = try destinationFiles(a, opened, uri, .{});
+    const artifact = try catalog.row_commit.upload(a, writer, "metadata/manifest.avro", "manifest-content");
+    try std.testing.expect(std.mem.startsWith(u8, artifact, "object://archive/"));
+    const maintenance = try destinationFiles(a, opened, uri, .{});
+    try std.testing.expectEqualStrings("manifest-content", try catalog.row_commit.read(a, maintenance, artifact));
+}
+
+test "external lake filesystem retirement validates live roots and subsequent ingestion" {
+    const alloc = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("lake-filesystem-retirement");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const uri = try std.fmt.allocPrint(a, "file://{s}", .{directory.path()});
+    var opened = try local.serverless_object_store_support.OpenedObjectStore.initFileUriWithOptions(alloc, uri, "archive", .{ .ensure_bucket = true });
+    defer opened.deinit();
+    const files = try destinationFiles(a, opened, uri, .{});
+    var managed: catalog.managed.Managed = .{ .client = opened.client, .bucket = opened.bucket, .prefix = opened.prefix, .source_uri = uri };
+    _ = try managed.create(a, "create", "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]}}", 1);
+    const row = try std.json.parseFromSliceLeaky(V, a, "{\"id\":1}", .{});
+    const batch: Batch = .{ .batch_id = "first", .source = "test", .epoch = "1", .checkpoint = "1", .key_fields = &.{"id"}, .changes = &.{.{ .op = .upsert, .row = row }} };
+    const initial = try managed.load(a);
+    const first = try catalog.row_commit.prepare(a, initial, files, batch, 1, 2);
+    _ = try managed.commit(a, .{ .id = "first", .expected_metadata_location = initial.metadata_location, .body = first.body, .timestamp_ms = 2 });
+    const parent = try managed.load(a);
+    const orphan = try catalog.row_commit.upload(a, files, "data/orphan.parquet", "orphan");
+    const retired = try managed.retire(a, .{ .id = "retire", .expected_metadata_location = parent.metadata_location, .expected_version = parent.version.?, .objects = &.{orphan} });
+    try std.testing.expect(retired.retirement_root != null);
+    var reopened = managed;
+    const current = try reopened.load(a);
+    var next = batch;
+    next.batch_id = "second";
+    next.expected_checkpoint = "1";
+    next.checkpoint = "2";
+    const second = try catalog.row_commit.prepare(a, current, files, next, 2, 3);
+    _ = try reopened.commit(a, .{ .id = "second", .expected_metadata_location = current.metadata_location, .body = second.body, .timestamp_ms = 3 });
+    const latest = try reopened.load(a);
+    const root = try catalog.metadata.parse(a, latest.metadata_json);
+    const snapshots = (try catalog.metadata.get(root, "snapshots")).array.items;
+    const live_uri = try catalog.metadata.str(try catalog.metadata.get(snapshots[snapshots.len - 1], "manifest-list"));
+    try std.testing.expectError(error.LakeObjectStillReferenced, reopened.retire(a, .{ .id = "retire-live", .expected_metadata_location = latest.metadata_location, .expected_version = latest.version.?, .objects = &.{live_uri} }));
+}
+
+test "external lake filesystem WAL retries a rejected intent after metadata preserving retirement" {
+    const alloc = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("lake-wal-retirement-retry");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json = try std.json.Stringify.valueAlloc(a, .{ .deployment_mode = "standalone", .storage = .{ .engine = "local", .local = .{ .base_dir = directory.path() } } }, .{});
+    var config = try local.common_config.Config.parseFromSlice(alloc, json);
+    defer config.deinit();
+    const binding: Binding = .{ .table_id = "events", .format = .iceberg, .source_uri = try std.fmt.allocPrint(a, "file://{s}/warehouse", .{directory.path()}), .schema_fingerprint = "schema", .write_policy = .iceberg_writer, .catalog = .{ .type = .managed } };
+    const options: Options = .{ .node_config = &config, .catalog_table_id = 7 };
+    var opened = try configured.openBindingObjectStoreAlloc(alloc, binding, options);
+    defer opened.deinit();
+    var client = opened.client;
+    var managed: catalog.managed.Managed = .{ .client = client, .bucket = opened.bucket, .prefix = opened.prefix, .source_uri = binding.source_uri };
+    _ = try managed.create(a, "create", "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]}}", 1);
+    const parent = try managed.load(a);
+    const payload = "{\"batch_id\":\"first\",\"source\":\"test\",\"epoch\":\"1\",\"checkpoint\":\"1\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"upsert\",\"row\":{\"id\":1}}]}";
+    const lsn = try accept(a, binding, options, .{}, payload);
+    const batch = try std.json.parseFromSliceLeaky(Batch, a, payload, .{});
+    const files = try destinationFiles(a, opened, binding.source_uri, .{});
+    const prepared = try catalog.row_commit.prepare(a, parent, files, batch, lsn, 2);
+    const attempt: Attempt = .{ .id = try attemptId(a, lsn, parent), .expected = parent.metadata_location, .body = prepared.body, .timestamp_ms = 2 };
+    const commit: catalog.types.Commit = .{ .id = attempt.id, .expected_metadata_location = attempt.expected, .body = attempt.body, .timestamp_ms = attempt.timestamp_ms };
+    var queue = try openQueue(alloc, binding, options);
+    defer queue.deinit();
+    var queue_client = queue.client;
+    const active_key = try std.fmt.allocPrint(a, "{s}/active/{d}.json", .{ try prefix(a, queue.prefix, binding, options), lsn });
+    var active = try queue_client.putObject(queue.bucket, active_key, try std.json.Stringify.valueAlloc(a, attempt, .{}), .{});
+    active.deinit(queue_client.allocator);
+    // Seed the durable catalog intent at the crash point immediately before
+    // its HEAD CAS. Retirement then wins that CAS while preserving metadata.
+    const candidate = try catalog.metadata.applyAlloc(a, parent.metadata_json, parent.metadata_location, commit);
+    const relative = try std.fmt.allocPrint(a, "metadata/antfly-{s}.metadata.json", .{catalog.types.digestHex(candidate)});
+    const metadata_key = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ opened.prefix, if (opened.prefix.len == 0) "" else "/", relative });
+    var metadata_object = try client.putObject(opened.bucket, metadata_key, candidate, .{});
+    metadata_object.deinit(client.allocator);
+    const rejected: catalog.managed.Record = .{ .commit_id = attempt.id, .request_hash = &catalog.types.commitHash(commit), .metadata_location = try std.fmt.allocPrint(a, "{s}/{s}", .{ binding.source_uri, relative }), .metadata_key = metadata_key, .metadata_hash = &catalog.types.digestHex(candidate), .previous_record = parent.record_key, .previous_version = parent.version };
+    const intent_key = try std.fmt.allocPrint(a, "{s}{s}metadata/antfly-catalog/intents/{s}.json", .{ opened.prefix, if (opened.prefix.len == 0) "" else "/", catalog.types.digestHex(attempt.id) });
+    var intent = try client.putObject(opened.bucket, intent_key, try std.json.Stringify.valueAlloc(a, rejected, .{}), .{});
+    intent.deinit(client.allocator);
+    const orphan = try catalog.row_commit.upload(a, files, "data/orphan.parquet", "orphan");
+    _ = try managed.retire(a, .{ .id = "retire", .expected_metadata_location = parent.metadata_location, .expected_version = parent.version.?, .objects = &.{orphan} });
+    const retired = try managed.load(a);
+    try std.testing.expectEqualStrings(parent.metadata_location, retired.metadata_location);
+    try std.testing.expect(!std.mem.eql(u8, parent.version.?, retired.version.?));
+    try std.testing.expectError(error.LakeCommitConflict, managed.commit(a, commit));
+    // First pass resolves the saved rejection, second pass plans at the new
+    // catalog version, and a third pass proves publication is complete.
+    try std.testing.expect(try drain(a, binding, options, .{}));
+    try std.testing.expect(try drain(a, binding, options, .{}));
+    try std.testing.expect(!try drain(a, binding, options, .{}));
+    const published = try managed.load(a);
+    try std.testing.expectEqual(lsn, try coverage(a, published));
+    try std.testing.expectEqual(catalog.types.Outcome.not_committed, try managed.resolve(a, attempt.id, &catalog.types.commitHash(commit)));
 }

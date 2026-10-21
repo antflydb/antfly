@@ -43,7 +43,7 @@ pub const MaterializationLimits = struct {
     borrow_dictionary: bool = false,
     /// Legacy row scanners retain their approximate numeric contract. Native
     /// SQL and public typed lake rows explicitly select lossless decimal text.
-    decimal_representation: enum { approximate_number, exact_string } = .approximate_number,
+    decimal_representation: enum { approximate_number, exact_string, native_decimal } = .approximate_number,
     /// Internal page cursor: physical rows represented by the supplied page.
     page_row_count: ?usize = null,
     max_rows: usize = 1_000_000,
@@ -275,6 +275,12 @@ pub const PersistentObjectRangeCacheStats = struct {
     writes_coalesced: usize = 0,
     writes_dropped: usize = 0,
     dropped_bytes: usize = 0,
+    drops_policy: usize = 0,
+    drops_queue: usize = 0,
+    drops_memory: usize = 0,
+    drops_capacity: usize = 0,
+    drops_allocation: usize = 0,
+    drops_closing: usize = 0,
     queued_bytes: usize = 0,
     queued_entries: usize = 0,
 };
@@ -284,6 +290,8 @@ pub const PersistentObjectRangeCacheEnqueueResult = enum {
     coalesced,
     dropped,
 };
+
+const CacheDropReason = enum { policy, queue, memory, capacity, allocation, closing };
 
 pub const PersistentObjectRangeCacheResources = struct {
     /// Called without the disk-cache mutex when eviction is blocked by pins.
@@ -350,7 +358,9 @@ pub const PersistentObjectRangeCache = struct {
         errdefer if (state.owner_lock) |file| file.close(io);
         try state.initializeInventory();
         errdefer state.deinitInventory();
-        state.worker = try io.concurrent(persistentObjectRangeWorkerMain, .{state});
+        // Reads and startup inventory do not need a writer. Admit the
+        // optional worker lazily on the first queued write so executor
+        // pressure cannot discard an otherwise usable persisted cache.
         return .{ .state = state };
     }
 
@@ -674,6 +684,10 @@ const PersistentObjectRangeCacheState = struct {
                 }
                 continue;
             }
+            const protected = persistentCachedKeyProtected(io, self.alloc, dir, entry.name, self.policy.max_cache_key_bytes) catch |err| switch (err) {
+                error.Canceled => return err,
+                else => false,
+            };
             const owned = try self.alloc.create(PersistentObjectRangeCacheEntry);
             const filename = self.alloc.dupe(u8, entry.name) catch |err| {
                 self.alloc.destroy(owned);
@@ -683,7 +697,7 @@ const PersistentObjectRangeCacheState = struct {
                 .filename = filename,
                 .disk_bytes = disk_bytes,
                 .modified_ns = stat.mtime.toNanoseconds(),
-                .protected = persistentCachedKeyProtected(io, self.alloc, dir, filename, self.policy.max_cache_key_bytes) catch false,
+                .protected = protected,
             };
             discovered.push(self.alloc, owned) catch |err| {
                 self.freeEntry(owned);
@@ -745,27 +759,27 @@ const PersistentObjectRangeCacheState = struct {
         bytes: []const u8,
     ) PersistentObjectRangeCacheEnqueueResult {
         const disk_bytes = persistentObjectRangeEncodedLen(cache_key.len, bytes.len) orelse
-            return self.recordDropped(bytes.len);
+            return self.recordDropped(bytes.len, .policy);
         if (cache_key.len > self.policy.max_cache_key_bytes or disk_bytes > self.policy.max_total_bytes) {
-            return self.recordDropped(bytes.len);
+            return self.recordDropped(bytes.len, .policy);
         }
         const memory_bytes = std.math.add(usize, cache_key.len, bytes.len) catch
-            return self.recordDropped(bytes.len);
+            return self.recordDropped(bytes.len, .policy);
         var memory_reservation: ?resource_manager_mod.Reservation = if (self.resource_manager) |manager|
             manager.reserve(.lake_range_cache_queue, @intCast(memory_bytes)) catch
-                return self.recordDropped(bytes.len)
+                return self.recordDropped(bytes.len, .memory)
         else
             null;
 
         const owned_key = self.alloc.dupe(u8, cache_key) catch {
             releaseMemoryReservation(&memory_reservation);
-            return self.recordDropped(bytes.len);
+            return self.recordDropped(bytes.len, .allocation);
         };
 
         const io = self.io;
         self.mutex.lockUncancelable(io);
         if (self.closing) {
-            _ = self.recordDroppedLocked(bytes.len);
+            _ = self.recordDroppedLocked(bytes.len, .closing);
             self.mutex.unlock(io);
             self.alloc.free(owned_key);
             releaseMemoryReservation(&memory_reservation);
@@ -782,15 +796,25 @@ const PersistentObjectRangeCacheState = struct {
             memory_bytes > self.policy.max_write_queue_bytes or
             self.pending_bytes > self.policy.max_write_queue_bytes - memory_bytes)
         {
-            _ = self.recordDroppedLocked(bytes.len);
+            _ = self.recordDroppedLocked(bytes.len, .queue);
             self.mutex.unlock(io);
             self.alloc.free(owned_key);
             releaseMemoryReservation(&memory_reservation);
             return .dropped;
         }
 
+        if (self.worker == null) {
+            self.worker = io.concurrent(persistentObjectRangeWorkerMain, .{self}) catch {
+                _ = self.recordDroppedLocked(bytes.len, .queue);
+                self.mutex.unlock(io);
+                self.alloc.free(owned_key);
+                releaseMemoryReservation(&memory_reservation);
+                return .dropped;
+            };
+        }
+
         self.pending.put(self.alloc, owned_key, {}) catch {
-            _ = self.recordDroppedLocked(bytes.len);
+            _ = self.recordDroppedLocked(bytes.len, .allocation);
             self.mutex.unlock(io);
             self.alloc.free(owned_key);
             releaseMemoryReservation(&memory_reservation);
@@ -810,7 +834,7 @@ const PersistentObjectRangeCacheState = struct {
             _ = self.pending.remove(owned_key);
             decrementSaturating(&self.pending_bytes, memory_bytes);
             decrementSaturating(&self.pending_count, 1);
-            _ = self.recordDroppedLocked(bytes.len);
+            _ = self.recordDroppedLocked(bytes.len, .allocation);
             self.condition.broadcast(io);
             self.mutex.unlock(io);
             self.alloc.free(owned_key);
@@ -843,23 +867,26 @@ const PersistentObjectRangeCacheState = struct {
         _ = self.pending.remove(owned_key);
         decrementSaturating(&self.pending_bytes, memory_bytes);
         decrementSaturating(&self.pending_count, 1);
-        _ = self.recordDroppedLocked(payload_bytes);
+        _ = self.recordDroppedLocked(payload_bytes, .allocation);
         self.condition.broadcast(io);
         self.mutex.unlock(io);
         self.alloc.free(owned_key);
         releaseMemoryReservation(memory_reservation);
     }
 
-    fn recordDropped(self: *PersistentObjectRangeCacheState, byte_len: usize) PersistentObjectRangeCacheEnqueueResult {
+    fn recordDropped(self: *PersistentObjectRangeCacheState, byte_len: usize, reason: CacheDropReason) PersistentObjectRangeCacheEnqueueResult {
         const io = self.io;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        return self.recordDroppedLocked(byte_len);
+        return self.recordDroppedLocked(byte_len, reason);
     }
 
-    fn recordDroppedLocked(self: *PersistentObjectRangeCacheState, byte_len: usize) PersistentObjectRangeCacheEnqueueResult {
+    fn recordDroppedLocked(self: *PersistentObjectRangeCacheState, byte_len: usize, reason: CacheDropReason) PersistentObjectRangeCacheEnqueueResult {
         self.stats.writes_dropped += 1;
         self.stats.dropped_bytes +|= byte_len;
+        switch (reason) {
+            inline else => |tag| @field(self.stats, "drops_" ++ @tagName(tag)) +|= 1,
+        }
         return .dropped;
     }
 
@@ -1136,8 +1163,7 @@ fn persistentObjectRangeWorkerMain(state: *PersistentObjectRangeCacheState) void
         if (outcome) |result| switch (result) {
             .written, .already_present => state.stats.writes_completed += 1,
             .capacity_unavailable => {
-                state.stats.writes_dropped += 1;
-                state.stats.dropped_bytes +|= task.bytes.len;
+                _ = state.recordDroppedLocked(task.bytes.len, .capacity);
             },
         } else {
             state.stats.write_errors += 1;
@@ -1652,6 +1678,23 @@ pub const OwnedBatch = struct {
     null_bitmaps: [][]u8,
 
     pub fn deinit(self: *OwnedBatch, alloc: Allocator) void {
+        var columns: OwnedColumns = .{ .row_count = self.row_refs.len, .columns = self.columns, .column_names = self.column_names, .decoded_columns = self.decoded_columns, .null_bitmaps = self.null_bitmaps };
+        columns.deinit(alloc);
+        alloc.free(self.row_refs);
+        self.* = undefined;
+    }
+};
+
+/// Decoded columns retain no row identities. Page cursors create identities
+/// once, after aligning columns, for their bounded output batches.
+pub const OwnedColumns = struct {
+    row_count: usize,
+    columns: []rowsource.ColumnVector,
+    column_names: [][]u8,
+    decoded_columns: []DecodedColumn,
+    null_bitmaps: [][]u8,
+
+    pub fn deinit(self: *OwnedColumns, alloc: Allocator) void {
         for (self.column_names) |name| alloc.free(name);
         alloc.free(self.column_names);
         for (self.decoded_columns) |*column| column.deinit(alloc);
@@ -1661,16 +1704,17 @@ pub const OwnedBatch = struct {
         }
         alloc.free(self.null_bitmaps);
         alloc.free(self.columns);
-        alloc.free(self.row_refs);
         self.* = undefined;
     }
 };
 
 const DecodedColumn = union(enum) {
+    decimal128: rowsource.Decimal128,
     i64: []i64,
     f64: []f64,
     bool: []bool,
     bytes: [][]u8,
+    packed_bytes: parquet_page.PackedByteArrays,
     dictionary_bytes: rowsource.DictionaryBytes,
     borrowed_dictionary_bytes: rowsource.DictionaryBytes,
     dictionary_i64: rowsource.DictionaryNumeric(i64),
@@ -1678,10 +1722,12 @@ const DecodedColumn = union(enum) {
 
     pub fn deinit(self: *DecodedColumn, alloc: Allocator) void {
         switch (self.*) {
+            .decimal128 => |values| alloc.free(values.values),
             .i64 => |values| alloc.free(values),
             .f64 => |values| alloc.free(values),
             .bool => |values| alloc.free(values),
             .bytes => |values| parquet_page.freePlainByteArrays(alloc, values),
+            .packed_bytes => |*values| values.deinit(alloc),
             .dictionary_bytes => |values| values.deinit(alloc),
             .borrowed_dictionary_bytes => |values| alloc.free(values.indices),
             inline .dictionary_i64, .dictionary_f64 => |values| values.deinit(alloc),
@@ -1995,11 +2041,19 @@ const PlainI64ModeRequest = union(enum) {
     from_inventory,
 };
 
+pub fn admitColumnMaterialization(raw_row_count: u64, projected_column_count: usize, limits: MaterializationLimits) !usize {
+    return admitMaterializationInternal(raw_row_count, projected_column_count, limits, false);
+}
+
 pub fn admitMaterialization(
     raw_row_count: u64,
     projected_column_count: usize,
     limits: MaterializationLimits,
 ) !usize {
+    return admitMaterializationInternal(raw_row_count, projected_column_count, limits, true);
+}
+
+fn admitMaterializationInternal(raw_row_count: u64, projected_column_count: usize, limits: MaterializationLimits, include_row_refs: bool) !usize {
     try limits.validate();
     if (projected_column_count == 0) return error.InvalidParquetRowGroupBatch;
     const row_count = std.math.cast(usize, raw_row_count) orelse return error.ParquetRowGroupTooLarge;
@@ -2008,7 +2062,7 @@ pub fn admitMaterialization(
         return error.ParquetRowGroupTooLarge;
     if (projected_cells > limits.max_projected_cells) return error.ParquetRowGroupTooLarge;
 
-    var estimated_bytes = std.math.mul(usize, row_count, @sizeOf(rowsource.RowRef)) catch
+    var estimated_bytes = std.math.mul(usize, row_count, if (include_row_refs) @sizeOf(rowsource.RowRef) else 0) catch
         return error.ParquetRowGroupTooLarge;
     const column_metadata_bytes = std.math.mul(
         usize,
@@ -2074,17 +2128,49 @@ fn buildPlainI64RowGroupBatchAlloc(
     if (projected_chunks.len == 0) return error.InvalidParquetRowGroupBatch;
     const file = inventory.fileById(file_id) orelse return error.ExternalSourceFileNotFound;
     if (row_group_ordinal >= file.row_groups.len) return error.ExternalSourceRowOutOfBounds;
-    const row_group = file.row_groups[row_group_ordinal];
-    const row_count = try admitMaterialization(limits.page_row_count orelse row_group.row_count, projected_chunks.len, limits);
-    try preflightColumnChunks(projected_chunks, row_count, limits);
-    const binding = rowsource_bridge.bindingFromValidatedInventory(inventory);
-
-    const row_refs = try alloc.alloc(rowsource.RowRef, row_count);
+    _ = try admitMaterialization(limits.page_row_count orelse file.row_groups[row_group_ordinal].row_count, projected_chunks.len, limits);
+    var decoded = try buildPlainColumnsAlloc(alloc, inventory, file_id, row_group_ordinal, projected_chunks, mode_request, limits);
+    errdefer decoded.deinit(alloc);
+    const row_refs = try alloc.alloc(rowsource.RowRef, decoded.row_count);
     errdefer alloc.free(row_refs);
-    for (row_refs, 0..) |*row_ref, idx| {
-        row_ref.* = try rowsource_external.makeRowRef(binding, file_id, row_group_ordinal, idx);
-    }
+    const binding = rowsource_bridge.bindingFromValidatedInventory(inventory);
+    for (row_refs, 0..) |*row_ref, idx| row_ref.* = try rowsource_external.makeRowRef(binding, file_id, row_group_ordinal, idx);
+    const batch = rowsource.ColumnBatch{ .snapshot = binding.snapshot(), .row_refs = row_refs, .columns = decoded.columns };
+    try rowsource_bridge.validateBatchAgainstInventoryAlloc(alloc, inventory, batch);
+    return .{ .batch = batch, .row_refs = row_refs, .columns = decoded.columns, .column_names = decoded.column_names, .decoded_columns = decoded.decoded_columns, .null_bitmaps = decoded.null_bitmaps };
+}
 
+/// Column-only decoding preserves the same physical interpretation and limits;
+/// an aligned cursor supplies row identities for its output instead of retaining
+/// one complete row-reference array for every physical column page.
+pub fn buildSupportedColumnsAllocWithLimits(
+    alloc: Allocator,
+    inventory: external_source.Inventory,
+    file_id: []const u8,
+    row_group_ordinal: u32,
+    projected_chunks: []const ColumnChunkInput,
+    limits: MaterializationLimits,
+) !OwnedColumns {
+    return buildPlainColumnsAlloc(alloc, inventory, file_id, row_group_ordinal, projected_chunks, .from_inventory, limits);
+}
+
+fn buildPlainColumnsAlloc(
+    alloc: Allocator,
+    inventory: external_source.Inventory,
+    file_id: []const u8,
+    row_group_ordinal: u32,
+    projected_chunks: []const ColumnChunkInput,
+    mode_request: PlainI64ModeRequest,
+    limits: MaterializationLimits,
+) !OwnedColumns {
+    try inventory.validate();
+    if (projected_chunks.len == 0) return error.InvalidParquetRowGroupBatch;
+    const file = inventory.fileById(file_id) orelse return error.ExternalSourceFileNotFound;
+    if (row_group_ordinal >= file.row_groups.len) return error.ExternalSourceRowOutOfBounds;
+    const row_group = file.row_groups[row_group_ordinal];
+    if (limits.page_row_count) |count| if (count > row_group.row_count) return error.ExternalSourceRowOutOfBounds;
+    const row_count = try admitColumnMaterialization(limits.page_row_count orelse row_group.row_count, projected_chunks.len, limits);
+    try preflightColumnChunks(projected_chunks, row_count, limits);
     const columns = try alloc.alloc(rowsource.ColumnVector, projected_chunks.len);
     errdefer alloc.free(columns);
     const column_names = try alloc.alloc([]u8, projected_chunks.len);
@@ -2114,6 +2200,10 @@ fn buildPlainI64RowGroupBatchAlloc(
         var chunk = findColumnChunk(row_group, input.column_id) orelse return error.ParquetColumnNotFound;
         if (limits.page_encoding) |encoding| chunk.encoding = switch (encoding) {
             .plain => @constCast("plain"),
+            .delta_binary_packed => @constCast("delta_binary_packed"),
+            .delta_length_byte_array => @constCast("delta_length_byte_array"),
+            .delta_byte_array => @constCast("delta_byte_array"),
+            .byte_stream_split => @constCast("byte_stream_split"),
             .plain_dictionary => @constCast("plain_dictionary"),
             .rle_dictionary => @constCast("rle_dictionary"),
             else => return error.UnsupportedParquetPage,
@@ -2289,7 +2379,12 @@ fn buildPlainI64RowGroupBatchAlloc(
                 },
             },
             .decimal => |decimal_mode| {
-                if (limits.decimal_representation == .exact_string) {
+                if (limits.decimal_representation == .native_decimal) {
+                    if (row_count > (limits.max_decoded_bytes / projected_chunks.len) / (@sizeOf(i128) * 2 + @sizeOf([]u8) + 1)) return error.ParquetRowGroupTooLarge;
+                    const decoded = try scanDecimalNativeAlloc(alloc, input.bytes, compression, decimal_mode, input.dictionary);
+                    decoded_columns[idx] = .{ .decimal128 = decoded.values };
+                    null_bitmaps[idx] = decoded.nulls;
+                } else if (limits.decimal_representation == .exact_string) {
                     // Admit the expanded text, slice/null directories and
                     // temporary unscaled values before allocating output.
                     const bytes_per_row = @sizeOf([]u8) + @sizeOf(i128) + 1 + @as(usize, @intCast(decimal_mode.precision)) + 3;
@@ -2317,14 +2412,23 @@ fn buildPlainI64RowGroupBatchAlloc(
             },
             .bytes => |byte_mode| switch (byte_mode) {
                 .required => {
-                    decoded_columns[idx] = .{ .bytes = try parquet_page.scanPlainByteArrayColumnChunkAlloc(alloc, input.bytes, compression) };
+                    if (try parquet_page.scanPackedByteArraysAlloc(alloc, input.bytes, compression, false)) |byte_block| {
+                        decoded_columns[idx] = .{ .packed_bytes = byte_block };
+                    } else decoded_columns[idx] = .{ .bytes = try parquet_page.scanPlainByteArrayColumnChunkAlloc(alloc, input.bytes, compression) };
                     null_bitmaps[idx] = &.{};
                 },
                 .optional => {
-                    var decoded = try parquet_page.scanOptionalPlainByteArrayColumnChunkAlloc(alloc, input.bytes, compression);
-                    decoded_columns[idx] = .{ .bytes = decoded.values };
-                    null_bitmaps[idx] = decoded.nulls;
-                    decoded = undefined;
+                    if (try parquet_page.scanPackedByteArraysAlloc(alloc, input.bytes, compression, true)) |packed_| {
+                        var byte_block = packed_;
+                        null_bitmaps[idx] = byte_block.nulls;
+                        byte_block.nulls = &.{};
+                        decoded_columns[idx] = .{ .packed_bytes = byte_block };
+                    } else {
+                        var decoded = try parquet_page.scanOptionalPlainByteArrayColumnChunkAlloc(alloc, input.bytes, compression);
+                        decoded_columns[idx] = .{ .bytes = decoded.values };
+                        null_bitmaps[idx] = decoded.nulls;
+                        decoded = undefined;
+                    }
                 },
                 .dictionary_required => {
                     if (limits.preserve_dictionary and input.dictionary != null) {
@@ -2359,6 +2463,10 @@ fn buildPlainI64RowGroupBatchAlloc(
         initialized_decoded += 1;
         initialized_nulls += 1;
         columns[idx] = switch (decoded_columns[idx]) {
+            .decimal128 => |values| blk: {
+                if (values.values.len != row_count) return error.ParquetRowGroupRowCountMismatch;
+                break :blk .{ .name = column_names[idx], .values = .{ .decimal128 = values }, .nulls = .{ .bytes = null_bitmaps[idx] } };
+            },
             .i64 => |values| blk: {
                 if (values.len != row_count) return error.ParquetRowGroupRowCountMismatch;
                 break :blk .{
@@ -2395,6 +2503,10 @@ fn buildPlainI64RowGroupBatchAlloc(
                 if (values.indices.len != row_count) return error.ParquetRowGroupRowCountMismatch;
                 break :blk .{ .name = column_names[idx], .values = .{ .dictionary_bytes = values }, .nulls = .{ .bytes = null_bitmaps[idx] } };
             },
+            .packed_bytes => |byte_block| blk: {
+                if (byte_block.values.len != row_count) return error.ParquetRowGroupRowCountMismatch;
+                break :blk .{ .name = column_names[idx], .values = .{ .bytes = byte_block.values }, .nulls = .{ .bytes = null_bitmaps[idx] } };
+            },
             .bytes => |values| blk: {
                 if (values.len != row_count) return error.ParquetRowGroupRowCountMismatch;
                 break :blk .{
@@ -2406,21 +2518,8 @@ fn buildPlainI64RowGroupBatchAlloc(
         };
     }
 
-    const batch = rowsource.ColumnBatch{
-        .snapshot = binding.snapshot(),
-        .row_refs = row_refs,
-        .columns = columns,
-    };
-    try rowsource_bridge.validateBatchAgainstInventoryAlloc(alloc, inventory, batch);
-
-    return .{
-        .batch = batch,
-        .row_refs = row_refs,
-        .columns = columns,
-        .column_names = column_names,
-        .decoded_columns = decoded_columns,
-        .null_bitmaps = null_bitmaps,
-    };
+    try rowsource.validateColumns(columns, row_count);
+    return .{ .row_count = row_count, .columns = columns, .column_names = column_names, .decoded_columns = decoded_columns, .null_bitmaps = null_bitmaps };
 }
 
 pub fn buildRequiredPlainI64RowGroupBatchFromObjectRangeReaderAlloc(
@@ -3197,7 +3296,19 @@ fn timestampI64ModeForColumnChunk(chunk: external_source.ColumnChunk, unit: Time
     return error.UnsupportedParquetPage;
 }
 
-fn supportedColumnModeForColumnChunk(chunk: external_source.ColumnChunk) !SupportedColumnMode {
+fn supportedColumnModeForColumnChunk(input: external_source.ColumnChunk) !SupportedColumnMode {
+    var chunk = input;
+    const delta_integer = std.mem.eql(u8, chunk.encoding, "delta_binary_packed");
+    const delta_bytes = std.mem.eql(u8, chunk.encoding, "delta_length_byte_array") or std.mem.eql(u8, chunk.encoding, "delta_byte_array");
+    const split = std.mem.eql(u8, chunk.encoding, "byte_stream_split");
+    if (delta_integer or delta_bytes or split) {
+        const integer = std.mem.eql(u8, chunk.physical_type, "int32") or std.mem.eql(u8, chunk.physical_type, "int64");
+        const bytes = std.mem.eql(u8, chunk.physical_type, "byte_array");
+        const fixed = std.mem.eql(u8, chunk.physical_type, "fixed_len_byte_array") and std.mem.eql(u8, chunk.logical_type, "decimal");
+        const number = std.mem.eql(u8, chunk.physical_type, "float") or std.mem.eql(u8, chunk.physical_type, "double");
+        if ((delta_integer and !integer) or (delta_bytes and !bytes) or (split and !integer and !number and !fixed)) return error.UnsupportedParquetPage;
+        chunk.encoding = @constCast("plain");
+    }
     if (std.mem.startsWith(u8, chunk.logical_type, "uint") or std.mem.eql(u8, chunk.logical_type, "unsupported")) return error.UnsupportedParquetPage;
     if (std.mem.startsWith(u8, chunk.logical_type, "int")) {
         const physical = if (std.mem.eql(u8, chunk.logical_type, "int64")) "int64" else "int32";
@@ -3448,6 +3559,33 @@ fn scanDecimalBytesAlloc(alloc: Allocator, bytes: []const u8, compression: parqu
         };
     };
     return decoded;
+}
+fn scanDecimalNativeAlloc(alloc: Allocator, bytes: []const u8, compression: parquet_page.CompressionCodec, mode: DecimalMode, dictionary: ?*const parquet_page.Dictionary) !struct { values: rowsource.Decimal128, nulls: []u8 } {
+    const decimal = @import("lake_decimal.zig");
+    if (mode.physical == .int32 or mode.physical == .int64) {
+        var input = if (mode.physical == .int32) try scanDecimalInt32UnscaledAlloc(alloc, bytes, compression, mode, dictionary) else try scanDecimalInt64UnscaledAlloc(alloc, bytes, compression, mode, dictionary);
+        defer input.deinit(alloc);
+        const values = try alloc.alloc(i128, input.values.len);
+        errdefer alloc.free(values);
+        for (input.values, values, 0..) |value, *out, index| {
+            out.* = if (input.nulls.len != 0 and input.nulls[index] != 0) 0 else value;
+            try decimal.validateCoefficient(out.*, mode.precision, mode.scale);
+        }
+        const nulls = input.nulls;
+        input.nulls = &.{};
+        return .{ .values = .{ .values = values, .precision = mode.precision, .scale = mode.scale }, .nulls = nulls };
+    }
+    var input = try scanDecimalBytesAlloc(alloc, bytes, compression, mode, dictionary);
+    defer input.deinit(alloc);
+    const values = try alloc.alloc(i128, input.values.len);
+    errdefer alloc.free(values);
+    for (input.values, values, 0..) |value, *out, index| {
+        out.* = if (input.nulls.len != 0 and input.nulls[index] != 0) 0 else try decimal.signedBigEndian(value);
+        try decimal.validateCoefficient(out.*, mode.precision, mode.scale);
+    }
+    const nulls = input.nulls;
+    input.nulls = &.{};
+    return .{ .values = .{ .values = values, .precision = mode.precision, .scale = mode.scale }, .nulls = nulls };
 }
 fn scanDecimalAsStringsAlloc(alloc: Allocator, bytes: []const u8, compression: parquet_page.CompressionCodec, mode: DecimalMode, dictionary: ?*const parquet_page.Dictionary) !parquet_page.NullableByteArrayValues {
     const decimal = @import("lake_decimal.zig");
@@ -4866,7 +5004,7 @@ test "parquet row group batch assembles decoded i64 columns with external row re
     try std.testing.expectEqual(@as(usize, 3), owned.batch.rowCount());
     try std.testing.expectEqualStrings("amount", owned.batch.columns[0].name);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 20, 30 }, owned.batch.columns[0].values.i64);
-    const first_ref = owned.batch.row_refs[0].external;
+    const first_ref = owned.batch.rowRef(0).external;
     try std.testing.expectEqualStrings("events", first_ref.source_id);
     try std.testing.expectEqualStrings("sha256:objects", first_ref.snapshot_id);
     try std.testing.expectEqualStrings("part-a.parquet", first_ref.file_id);
@@ -4924,7 +5062,7 @@ test "parquet row group batch assembles optional i64 columns with null bitmap" {
     try std.testing.expect(!owned.batch.columns[0].nulls.isNull(0));
     try std.testing.expect(owned.batch.columns[0].nulls.isNull(1));
     try std.testing.expect(!owned.batch.columns[0].nulls.isNull(2));
-    const null_ref = owned.batch.row_refs[1].external;
+    const null_ref = owned.batch.rowRef(1).external;
     try std.testing.expectEqualStrings("part-a.parquet", null_ref.file_id);
     try std.testing.expectEqual(@as(u64, 1), null_ref.row_ordinal);
 }
@@ -4977,7 +5115,7 @@ test "parquet row group batch assembles dictionary i64 columns" {
     try std.testing.expectEqual(@as(usize, 4), owned.batch.rowCount());
     try std.testing.expectEqualSlices(i64, &[_]i64{ 11, 22, 11, 33 }, owned.batch.columns[0].values.i64);
     try std.testing.expectEqual(@as(usize, 0), owned.batch.columns[0].nulls.bytes.len);
-    const row_ref = owned.batch.row_refs[3].external;
+    const row_ref = owned.batch.rowRef(3).external;
     try std.testing.expectEqualStrings("part-a.parquet", row_ref.file_id);
     try std.testing.expectEqual(@as(u64, 3), row_ref.row_ordinal);
 }
@@ -6710,6 +6848,8 @@ test "lake persistent object range cache bounds write-behind admission" {
     const stats = persistent.statsSnapshot();
     try std.testing.expectEqual(@as(usize, 1), stats.writes_dropped);
     try std.testing.expectEqual(@as(usize, 7), stats.dropped_bytes);
+    try std.testing.expectEqual(@as(usize, 1), stats.drops_queue);
+    try std.testing.expectEqual(@as(usize, 0), stats.drops_policy);
     try std.testing.expectEqual(@as(usize, 0), stats.queued_entries);
     try std.testing.expect((try persistent.readAlloc(alloc, "long", 1)) == null);
     try std.testing.expectEqual(@as(usize, 1), persistent.statsSnapshot().read_misses);
@@ -6756,6 +6896,31 @@ test "lake persistent cache admits native-clock capacity with an offset Io awake
     try std.testing.expectEqual(@as(usize, 1), restarted.statsSnapshot().read_hits);
 }
 
+test "lake persistent object range cache retains asynchronous write error reasons" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/writes", .{tmp.sub_path});
+    defer a.free(root);
+    const moved = try std.fmt.allocPrint(a, "{s}-moved", .{root});
+    defer a.free(moved);
+    var disk = try PersistentObjectRangeCache.init(io, root);
+    defer disk.deinit();
+    // Move only this test's private cache directory. The worker still owns
+    // its lock but the configured write destination no longer exists.
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), root, std.Io.Dir.cwd(), moved, io);
+    try std.testing.expectEqual(PersistentObjectRangeCacheEnqueueResult.enqueued, disk.enqueueWrite("key", "data"));
+    disk.flush();
+    const stats = disk.statsSnapshot();
+    try std.testing.expectEqual(@as(usize, 1), stats.write_errors);
+    try std.testing.expectEqualStrings("FileNotFound", stats.last_write_error.?);
+    try std.testing.expectEqual(@as(usize, 0), stats.writes_dropped);
+    try std.testing.expectEqual(@as(usize, 0), stats.queued_entries);
+}
 test "lake persistent object range cache evicts least recently used entries within disk ceilings" {
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
@@ -9740,9 +9905,12 @@ test "parquet page cursor reuses decoded dictionaries aligns nullable columns an
         if (position == 0) dictionary_address = address;
         try std.testing.expectEqual(dictionary_address, address);
         try std.testing.expectEqual(address, @intFromPtr(cursor.columns[1].dictionary_lease.?.item.payload.dictionary.bytes.ptr));
-        if (position == 0) try std.testing.expectEqual(amount_page_len + optional_page_len, reader.prefetch_bytes);
+        if (position == 0) {
+            try std.testing.expect(reader.prefetch_bytes >= amount_page_len + optional_page_len);
+            try std.testing.expect(reader.prefetch_bytes <= bytes.items.len);
+        }
         for (0..batch.rowCount()) |index| {
-            try std.testing.expectEqual(@as(u64, position), batch.row_refs[index].external.row_ordinal);
+            try std.testing.expectEqual(@as(u64, position), batch.rowRef(index).external.row_ordinal);
             try std.testing.expectEqual(@as(i64, if (position % 3 == 0) 10 else 20), try batch.columns[0].integerAt(index));
             try std.testing.expectEqualStrings(if ((position / 8) % 2 == 0) "alpha" else "beta", batch.columns[1].values.dictionary_bytes.at(index));
             try std.testing.expectEqual(position % 3 == 1, batch.columns[2].nulls.bytes[index] != 0);
@@ -9845,7 +10013,6 @@ test "external lake speculative page prefetch defers errors and preserves reques
         offset: u64,
         mode: Mode,
         signal: std.atomic.Value(bool) = .init(false),
-        reader: ?*shared.Reader = null,
         vtable: storage.ObjectStorage.VTable,
         fn iface(self: *@This()) storage.ObjectStorage {
             self.vtable.get_object = get;
@@ -9860,7 +10027,6 @@ test "external lake speculative page prefetch defers errors and preserves reques
                     return error.Canceled;
                 },
                 .expired => {
-                    self.reader.?.context.deadline_ns = 0;
                     return error.ProviderUnavailable;
                 },
                 else => {},
@@ -9875,16 +10041,24 @@ test "external lake speculative page prefetch defers errors and preserves reques
         defer cache.deinit();
         var fault: Fault = .{ .base = client, .offset = next_offset, .mode = mode, .vtable = client.vtable.* };
         var reader: shared.Reader = .{ .cache = &cache, .base = @import("lake_object_reader.zig").ObjectStorageRangeReader.init(fault.iface()), .scope = @splat(0), .context = .{ .io = std.testing.io, .cancellation = storage.CancellationToken.fromAtomic(&fault.signal) } };
-        fault.reader = &reader;
         defer reader.drain(true);
         var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(a, reader.reader(), inventory, "data", 0, &.{"n"}, .{ .max_input_bytes = if (mode == .disabled or mode == .budget) 128 else 4096 });
         defer cursor.deinit();
         if (mode != .disabled) cursor.shared_reader = &reader;
+        // Header discovery runs asynchronously. Cancellation may arrive in
+        // this pull or the following pull, but must never be swallowed.
+        const first = cursor.next() catch |err| {
+            if (mode != .canceled) return err;
+            try std.testing.expectEqual(error.Canceled, err);
+            continue;
+        };
+        const batch = first.?;
         if (mode == .canceled or mode == .expired) {
+            reader.drain(false);
+            if (mode == .expired) reader.context.deadline_ns = 0;
             try std.testing.expectError(if (mode == .canceled) error.Canceled else error.DeadlineExceeded, cursor.next());
             continue;
         }
-        const batch = (try cursor.next()).?;
         try std.testing.expectEqual(@as(i64, 1), batch.columns[0].values.i64[0]);
         try std.testing.expectEqual(@as(usize, 1), cursor.pages_decoded);
         try std.testing.expectError(if (mode == .provider) error.ProviderUnavailable else error.ParquetPageTooLarge, cursor.next());
@@ -10126,4 +10300,399 @@ test "lake persistent cache recovery preserves priority when capacity shrinks" {
         try std.testing.expect(disk.statsSnapshot().entries <= policy.max_entries);
         if (entries) try std.testing.expect((try disk.readAlloc(a, "newer-scan-2", 4)) == null);
     }
+}
+
+test "external lake compact Parquet wide pages retain columns without duplicate row identities" {
+    const a = std.testing.allocator;
+    const row_count = 145186;
+    const values = try a.alloc(i64, row_count);
+    defer a.free(values);
+    for (values, 0..) |*value, index| value.* = @intCast(index);
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    var chunks: [12]external_source.ColumnChunk = undefined;
+    var names: [12][]const u8 = undefined;
+    var name_buffers: [12][16]u8 = undefined;
+    for (&chunks, &names, &name_buffers, 0..) |*chunk, *name, *buffer, index| {
+        name.* = try std.fmt.bufPrint(buffer, "column_{d}", .{index});
+        const offset = bytes.items.len;
+        try appendPlainI64DataPage(&bytes, a, values);
+        chunk.* = .{ .column_id = @constCast(name.*), .file_offset = offset, .compressed_len = bytes.items.len - offset, .uncompressed_len = bytes.items.len - offset, .physical_type = @constCast("int64"), .encoding = @constCast("plain") };
+    }
+    const storage = @import("../../storage/object_storage.zig");
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put = try client.putObject("bucket", "data", bytes.items, .{});
+    defer put.deinit(a);
+    var groups = [_]external_source.RowGroup{.{ .ordinal = 0, .row_count = row_count, .file_offset = 0, .total_byte_len = bytes.items.len, .column_chunks = &chunks }};
+    var files = [_]external_source.FileEntry{.{ .file_id = @constCast("data"), .object_uri = @constCast("s3://bucket/data"), .etag = put.etag.?, .byte_len = bytes.items.len, .row_count = row_count, .row_groups = &groups }};
+    const inventory: external_source.Inventory = .{ .format = .parquet, .source_id = @constCast("events"), .source_uri = @constCast("s3://bucket"), .snapshot_id = @constCast("v1"), .schema_fingerprint = @constCast("v1"), .files = &files };
+    const inputs = [_]ColumnChunkInput{.{ .column_id = names[0], .bytes = bytes.items[0..chunks[0].compressed_len] }};
+    const share = 32 * 1024 * 1024 / chunks.len;
+    // Complete batches still account for their physical row-reference arrays.
+    try std.testing.expectError(error.ParquetRowGroupTooLarge, buildSupportedI64RowGroupBatchAllocWithLimits(a, inventory, "data", 0, &inputs, .{ .max_struct_allocation_bytes = share }));
+    // Decoded payload and structural allocations have independent 32 MiB limits.
+    var budget: @import("../../sql/memory_budget.zig") = .{ .backing = a, .limit = share * 2 };
+    var decoded = try buildSupportedColumnsAllocWithLimits(budget.allocator(), inventory, "data", 0, &inputs, .{ .max_struct_allocation_bytes = share });
+    defer decoded.deinit(budget.allocator());
+    try std.testing.expect(budget.peak <= share * 2);
+    std.debug.print("Column page: rows={d} peak_bytes={d} per_column_budget={d}\n", .{ row_count, budget.peak, share * 2 });
+    try std.testing.expectEqual(@as(usize, row_count), decoded.row_count);
+    try std.testing.expectEqual(@as(i64, row_count - 1), try decoded.columns[0].integerAt(row_count - 1));
+    try std.testing.expectError(error.ParquetRowGroupTooLarge, buildSupportedColumnsAllocWithLimits(a, inventory, "data", 0, &inputs, .{ .max_struct_allocation_bytes = 1024 }));
+    const shared = @import("lake_serving_cache.zig");
+    var cache = shared.Cache.init(a);
+    defer cache.deinit();
+    var reader: shared.Reader = .{ .cache = &cache, .base = @import("lake_object_reader.zig").ObjectStorageRangeReader.init(client), .scope = @splat(0), .context = .{ .io = std.testing.io } };
+    defer reader.drain(true);
+    for ([_]bool{ false, true }) |cached| {
+        var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(a, reader.reader(), inventory, "data", 0, &names, .{ .max_input_bytes = 32 * 1024 * 1024, .max_decoded_bytes = 32 * 1024 * 1024, .max_struct_allocation_bytes = 32 * 1024 * 1024 });
+        defer cursor.deinit();
+        if (cached) cursor.shared_reader = &reader;
+        var position: usize = 0;
+        while (try cursor.next()) |batch| {
+            try batch.validate();
+            try std.testing.expect(batch.rowCount() <= 4096);
+            try std.testing.expect(batch.external_span != null);
+            try std.testing.expectEqual(@as(usize, 0), batch.row_refs.len);
+            for (0..batch.rowCount()) |index| {
+                const ref = batch.rowRef(index);
+                try std.testing.expectEqual(@as(u64, position + index), ref.external.row_ordinal);
+                for (batch.columns) |column| try std.testing.expectEqual(@as(i64, @intCast(position + index)), try column.integerAt(index));
+            }
+            position += batch.rowCount();
+        }
+        try std.testing.expectEqual(@as(usize, row_count), position);
+        try std.testing.expectEqual(@as(usize, chunks.len), cursor.pages_decoded);
+    }
+}
+
+test "lake persistent cache keeps restart reads and retries writer admission after executor pressure" {
+    if (comptime @import("builtin").os.tag == .freestanding or @import("builtin").os.tag == .wasi or @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const Gate = struct {
+        var base: std.Io = undefined;
+        var denied: bool = true;
+        fn concurrent(userdata: ?*anyopaque, result_len: usize, result_alignment: std.mem.Alignment, context: []const u8, context_alignment: std.mem.Alignment, start: *const fn (*const anyopaque, *anyopaque) void) std.Io.ConcurrentError!*std.Io.AnyFuture {
+            if (denied) return error.ConcurrencyUnavailable;
+            return base.vtable.concurrent(userdata, result_len, result_alignment, context, context_alignment, start);
+        }
+    };
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/writer-pressure", .{tmp.sub_path});
+    defer a.free(root);
+    {
+        var cache = try PersistentObjectRangeCache.init(io, root);
+        defer cache.deinit();
+        try std.testing.expectEqual(.enqueued, cache.enqueueWrite("existing", "data"));
+        cache.flush();
+    }
+    Gate.base = io;
+    Gate.denied = true;
+    var vtable = io.vtable.*;
+    vtable.concurrent = Gate.concurrent;
+    var cache = try PersistentObjectRangeCache.init(.{ .userdata = io.userdata, .vtable = &vtable }, root);
+    defer cache.deinit();
+    try std.testing.expect(cache.state.worker == null);
+    const bytes = (try cache.readAlloc(a, "existing", 4)).?;
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("data", bytes);
+    try std.testing.expectEqual(.dropped, cache.enqueueWrite("new", "next"));
+    cache.flush();
+    try std.testing.expectEqual(@as(usize, 0), cache.statsSnapshot().queued_entries);
+    Gate.denied = false;
+    try std.testing.expectEqual(.enqueued, cache.enqueueWrite("new", "next"));
+    cache.flush();
+    try std.testing.expectEqual(@as(usize, 1), cache.statsSnapshot().writes_completed);
+    const next = (try cache.readAlloc(a, "new", 4)).?;
+    defer a.free(next);
+    try std.testing.expectEqualStrings("next", next);
+}
+
+test "external lake OffsetIndex reads large pages once and validates lengths and ordinals" {
+    const a = std.testing.allocator;
+    const storage = @import("../../storage/object_storage.zig");
+    for ([_]bool{ false, true }) |dictionary| for (0..4) |fault| {
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(a);
+        if (dictionary) try appendPlainI64DictionaryPage(&bytes, a, &.{ 10, 20 });
+        var starts: [2]usize = undefined;
+        var lengths: [2]usize = undefined;
+        for (&starts, &lengths) |*start, *len| {
+            start.* = bytes.items.len;
+            if (dictionary) try appendDictionaryI64DataPage(&bytes, a, 128, 1, &.{ 0x80, 0x02, 1 }) else try appendPlainI64DataPage(&bytes, a, &@as([128]i64, @splat(20)));
+            len.* = bytes.items.len - start.*;
+        }
+        const data_end = bytes.items.len;
+        var field: i16 = 0;
+        try appendField(&bytes, a, &field, 1, .list);
+        try appendListHeader(&bytes, a, .struct_, 2);
+        for (starts, lengths, 0..) |start, len, index| {
+            var id: i16 = 0;
+            try appendField(&bytes, a, &id, 1, .i64);
+            try appendI64(&bytes, a, @intCast(start));
+            try appendField(&bytes, a, &id, 2, .i32);
+            try appendI32(&bytes, a, @intCast(len - @intFromBool(fault == 1 and index == 0)));
+            try appendField(&bytes, a, &id, 3, .i64);
+            try appendI64(&bytes, a, @intCast(index * 128 + @intFromBool(fault == 2 and index == 1)));
+            try appendStop(&bytes, a);
+        }
+        if (fault == 3) {
+            // A valid optional extension makes the index larger than the
+            // admitted data-page read. Fall back without fetching this index.
+            try appendField(&bytes, a, &field, 4, .binary);
+            try appendBinary(&bytes, a, &@as([4096]u8, @splat(0)));
+        }
+        try appendStop(&bytes, a);
+        var memory = storage.MemoryObjectStorage.init(a);
+        defer memory.deinit();
+        var client = memory.client();
+        try client.makeBucket("bucket");
+        var put = try client.putObject("bucket", "data", bytes.items, .{});
+        defer put.deinit(a);
+        const Provider = struct {
+            base: storage.ObjectStorage,
+            vtable: storage.ObjectStorage.VTable,
+            calls: usize = 0,
+            bytes: usize = 0,
+            fn get(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.calls += 1;
+                var base = self.base;
+                base.allocator = alloc;
+                const result = try base.getObject(bucket, key, options);
+                self.bytes += result.body.len;
+                return result;
+            }
+        };
+        var provider: Provider = .{ .base = client, .vtable = client.vtable.* };
+        provider.vtable.get_object = Provider.get;
+        var reader = @import("lake_object_reader.zig").ObjectStorageRangeReader.init(.{ .allocator = a, .ptr = &provider, .vtable = &provider.vtable });
+        var chunks = [_]external_source.ColumnChunk{.{ .column_id = @constCast("n"), .file_offset = 0, .compressed_len = data_end, .uncompressed_len = data_end, .physical_type = @constCast("int64"), .encoding = @constCast(if (dictionary) "rle_dictionary" else "plain"), .offset_index_offset = data_end, .offset_index_length = @intCast(bytes.items.len - data_end) }};
+        var groups = [_]external_source.RowGroup{.{ .ordinal = 0, .row_count = 256, .file_offset = 0, .total_byte_len = data_end, .column_chunks = &chunks }};
+        var files = [_]external_source.FileEntry{.{ .file_id = @constCast("data"), .object_uri = @constCast("s3://bucket/data"), .etag = put.etag.?, .byte_len = bytes.items.len, .row_count = 256, .row_groups = &groups }};
+        const inventory: external_source.Inventory = .{ .format = .parquet, .source_id = @constCast("events"), .source_uri = @constCast("s3://bucket"), .snapshot_id = @constCast("v1"), .schema_fingerprint = @constCast("v1"), .files = &files };
+        var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(a, reader.parquetReader(), inventory, "data", 0, &.{"n"}, .{ .max_input_bytes = 2048 });
+        defer cursor.deinit();
+        if (fault == 1 or fault == 2) {
+            try std.testing.expectError(error.InvalidParquetMetadata, cursor.next());
+            continue;
+        }
+        var rows: usize = 0;
+        while (try cursor.next()) |batch| {
+            for (0..batch.rowCount()) |index| try std.testing.expectEqual(@as(i64, 20), try batch.columns[0].integerAt(index));
+            rows += batch.rowCount();
+        }
+        try std.testing.expectEqual(@as(usize, 256), rows);
+        try std.testing.expectEqual(if (fault == 3) @as(usize, if (dictionary) 3 else 4) else @as(usize, 3) + @intFromBool(dictionary), provider.calls);
+        try std.testing.expectEqual(@as(usize, 2), cursor.pages_decoded);
+        if (fault != 0) continue;
+        // Evict all encoded residency while retaining immutable decoded pages.
+        // Warm scans must not refetch payloads, including async lookahead.
+        const shared = @import("lake_serving_cache.zig");
+        var cache = shared.Cache.initWithMemoryLimit(a, 0);
+        defer cache.deinit();
+        var shared_reader: shared.Reader = .{ .cache = &cache, .base = reader, .scope = @splat(0), .context = .{} };
+        for (0..3) |pass| {
+            if (pass == 2) shared_reader.context.io = std.testing.io;
+            const before = provider.bytes;
+            var warm = try @import("lake_parquet_cursor.zig").Cursor.init(a, shared_reader.reader(), inventory, "data", 0, &.{"n"}, .{ .max_input_bytes = 2048 });
+            defer warm.deinit();
+            warm.shared_reader = &shared_reader;
+            var warm_rows: usize = 0;
+            while (try warm.next()) |batch| {
+                warm_rows += batch.rowCount();
+                for (0..batch.rowCount()) |index| try std.testing.expectEqual(@as(i64, 20), try batch.columns[0].integerAt(index));
+            }
+            shared_reader.drain(false);
+            try std.testing.expectEqual(@as(usize, 256), warm_rows);
+            if (pass != 0) {
+                try std.testing.expectEqual(@as(usize, 0), warm.pages_decoded);
+                // A dictionary prelude can still require its bounded probe.
+                try std.testing.expect(provider.bytes - before <= (if (dictionary) @as(usize, 512) else 0));
+            }
+        }
+        shared_reader.context.io = null;
+        var strict = try @import("lake_parquet_cursor.zig").Cursor.init(a, shared_reader.reader(), inventory, "data", 0, &.{"n"}, .{ .max_decoded_bytes = 8 });
+        defer strict.deinit();
+        strict.shared_reader = &shared_reader;
+        try std.testing.expectError(error.ParquetPageTooLarge, strict.next());
+    };
+}
+
+test "external lake page prefetch bounds mixed header discovery to four columns" {
+    const a = std.testing.allocator;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    const names = [_][]const u8{ "a", "b", "c", "d", "e" };
+    var chunks: [5]external_source.ColumnChunk = undefined;
+    var next_offsets: [5]u64 = undefined;
+    for (&chunks, &next_offsets, names) |*chunk, *next, name| {
+        const start = bytes.items.len;
+        try appendPlainI64DataPage(&bytes, a, &.{1});
+        next.* = bytes.items.len;
+        try appendPlainI64DataPage(&bytes, a, &@as([32]i64, @splat(2)));
+        chunk.* = .{ .column_id = @constCast(name), .file_offset = start, .compressed_len = bytes.items.len - start, .uncompressed_len = bytes.items.len - start, .physical_type = @constCast("int64"), .encoding = @constCast("plain") };
+    }
+    const storage = @import("../../storage/object_storage.zig");
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put = try client.putObject("bucket", "data", bytes.items, .{});
+    defer put.deinit(a);
+    const Provider = struct {
+        base: storage.ObjectStorage,
+        vtable: storage.ObjectStorage.VTable,
+        offsets: [5]u64,
+        ready: std.Io.Event = .unset,
+        fn get(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (options.range) |range| for (self.offsets) |offset| {
+                if (range.offset == offset) try self.ready.wait(std.testing.io);
+            };
+            var base = self.base;
+            base.allocator = alloc;
+            return base.getObject(bucket, key, options);
+        }
+    };
+    var provider: Provider = .{ .base = client, .vtable = client.vtable.*, .offsets = next_offsets };
+    provider.vtable.get_object = Provider.get;
+    var groups = [_]external_source.RowGroup{.{ .ordinal = 0, .row_count = 33, .file_offset = 0, .total_byte_len = bytes.items.len, .column_chunks = &chunks }};
+    var files = [_]external_source.FileEntry{.{ .file_id = @constCast("data"), .object_uri = @constCast("s3://bucket/data"), .etag = put.etag.?, .byte_len = bytes.items.len, .row_count = 33, .row_groups = &groups }};
+    const inventory: external_source.Inventory = .{ .format = .parquet, .source_id = @constCast("events"), .source_uri = @constCast("s3://bucket"), .snapshot_id = @constCast("v1"), .schema_fingerprint = @constCast("v1"), .files = &files };
+    const shared = @import("lake_serving_cache.zig");
+    var cache = shared.Cache.init(a);
+    defer cache.deinit();
+    var reader: shared.Reader = .{ .cache = &cache, .base = @import("lake_object_reader.zig").ObjectStorageRangeReader.init(.{ .allocator = a, .ptr = &provider, .vtable = &provider.vtable }), .scope = @splat(0), .context = .{ .io = std.testing.io } };
+    var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(a, reader.reader(), inventory, "data", 0, &names, .{});
+    defer {
+        provider.ready.set(std.testing.io);
+        reader.drain(true);
+        cursor.deinit();
+    }
+    cursor.shared_reader = &reader;
+    try std.testing.expectEqual(@as(usize, 1), (try cursor.next()).?.rowCount());
+    var pending: usize = 0;
+    for (reader.pending) |job| if (job != null) {
+        pending += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 4), pending);
+    provider.ready.set(std.testing.io);
+    reader.drain(false);
+    const batch = (try cursor.next()).?;
+    try std.testing.expectEqual(@as(usize, 32), batch.rowCount());
+    for (batch.columns) |column| for (0..batch.rowCount()) |row| try std.testing.expectEqual(@as(i64, 2), try column.integerAt(row));
+    try std.testing.expect((try cursor.next()) == null);
+}
+
+test "external lake optional OffsetIndex local admission falls back to bounded sequential pages" {
+    const a = std.testing.allocator;
+    const storage = @import("../../storage/object_storage.zig");
+    for ([_]bool{false}) |dictionary| for (0..1) |fault| {
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(a);
+        if (dictionary) try appendPlainI64DictionaryPage(&bytes, a, &.{ 10, 20 });
+        var starts: [256]usize = undefined;
+        var lengths: [256]usize = undefined;
+        for (&starts, &lengths) |*start, *len| {
+            start.* = bytes.items.len;
+            if (dictionary) try appendDictionaryI64DataPage(&bytes, a, 1, 1, &.{ 0x80, 0x02, 1 }) else try appendPlainI64DataPage(&bytes, a, &@as([1]i64, @splat(20)));
+            len.* = bytes.items.len - start.*;
+        }
+        const data_end = bytes.items.len;
+        var field: i16 = 0;
+        try appendField(&bytes, a, &field, 1, .list);
+        try appendListHeader(&bytes, a, .struct_, 256);
+        for (starts, lengths, 0..) |start, len, index| {
+            var id: i16 = 0;
+            try appendField(&bytes, a, &id, 1, .i64);
+            try appendI64(&bytes, a, @intCast(start));
+            try appendField(&bytes, a, &id, 2, .i32);
+            try appendI32(&bytes, a, @intCast(len - @intFromBool(fault == 1 and index == 0)));
+            try appendField(&bytes, a, &id, 3, .i64);
+            try appendI64(&bytes, a, @intCast(index * 1 + @intFromBool(fault == 2 and index == 1)));
+            try appendStop(&bytes, a);
+        }
+        if (fault == 3) {
+            // A valid optional extension makes the index larger than the
+            // admitted data-page read. Fall back without fetching this index.
+            try appendField(&bytes, a, &field, 4, .binary);
+            try appendBinary(&bytes, a, &@as([4096]u8, @splat(0)));
+        }
+        try appendStop(&bytes, a);
+        var memory = storage.MemoryObjectStorage.init(a);
+        defer memory.deinit();
+        var client = memory.client();
+        try client.makeBucket("bucket");
+        var put = try client.putObject("bucket", "data", bytes.items, .{});
+        defer put.deinit(a);
+        const Provider = struct {
+            base: storage.ObjectStorage,
+            vtable: storage.ObjectStorage.VTable,
+            calls: usize = 0,
+            bytes: usize = 0,
+            fn get(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.calls += 1;
+                var base = self.base;
+                base.allocator = alloc;
+                const result = try base.getObject(bucket, key, options);
+                self.bytes += result.body.len;
+                return result;
+            }
+        };
+        var provider: Provider = .{ .base = client, .vtable = client.vtable.* };
+        provider.vtable.get_object = Provider.get;
+        var reader = @import("lake_object_reader.zig").ObjectStorageRangeReader.init(.{ .allocator = a, .ptr = &provider, .vtable = &provider.vtable });
+        var chunks = [_]external_source.ColumnChunk{.{ .column_id = @constCast("n"), .file_offset = 0, .compressed_len = data_end, .uncompressed_len = data_end, .physical_type = @constCast("int64"), .encoding = @constCast(if (dictionary) "rle_dictionary" else "plain"), .offset_index_offset = data_end, .offset_index_length = @intCast(bytes.items.len - data_end) }};
+        var groups = [_]external_source.RowGroup{.{ .ordinal = 0, .row_count = 256, .file_offset = 0, .total_byte_len = data_end, .column_chunks = &chunks }};
+        var files = [_]external_source.FileEntry{.{ .file_id = @constCast("data"), .object_uri = @constCast("s3://bucket/data"), .etag = put.etag.?, .byte_len = bytes.items.len, .row_count = 256, .row_groups = &groups }};
+        const inventory: external_source.Inventory = .{ .format = .parquet, .source_id = @constCast("events"), .source_uri = @constCast("s3://bucket"), .snapshot_id = @constCast("v1"), .schema_fingerprint = @constCast("v1"), .files = &files };
+        var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(a, reader.parquetReader(), inventory, "data", 0, &.{"n"}, .{ .max_input_bytes = 64 * 1024 });
+        defer cursor.deinit();
+        if (fault == 1 or fault == 2) {
+            try std.testing.expectError(error.InvalidParquetMetadata, cursor.next());
+            continue;
+        }
+        var rows: usize = 0;
+        while (try cursor.next()) |batch| {
+            for (0..batch.rowCount()) |index| try std.testing.expectEqual(@as(i64, 20), try batch.columns[0].integerAt(index));
+            rows += batch.rowCount();
+        }
+        try std.testing.expectEqual(@as(usize, 256), rows);
+        try std.testing.expectEqual(@as(usize, 257), provider.calls);
+        try std.testing.expectEqual(@as(usize, 256), cursor.pages_decoded);
+        if (fault != 0) continue;
+        // Evict all encoded residency while retaining immutable decoded pages.
+        // Warm scans must not refetch payloads, including async lookahead.
+        const shared = @import("lake_serving_cache.zig");
+        var cache = shared.Cache.initWithMemoryLimit(a, 0);
+        defer cache.deinit();
+        cache.decoded.max_loading_bytes = 8192;
+        var shared_reader: shared.Reader = .{ .cache = &cache, .base = reader, .scope = @splat(0), .context = .{} };
+        for (0..1) |pass| {
+            if (pass == 2) shared_reader.context.io = std.testing.io;
+            const before = provider.bytes;
+            var warm = try @import("lake_parquet_cursor.zig").Cursor.init(a, shared_reader.reader(), inventory, "data", 0, &.{"n"}, .{ .max_input_bytes = 64 * 1024 });
+            defer warm.deinit();
+            warm.shared_reader = &shared_reader;
+            var warm_rows: usize = 0;
+            while (try warm.next()) |batch| {
+                warm_rows += batch.rowCount();
+                for (0..batch.rowCount()) |index| try std.testing.expectEqual(@as(i64, 20), try batch.columns[0].integerAt(index));
+            }
+            shared_reader.drain(false);
+            try std.testing.expectEqual(@as(usize, 256), warm_rows);
+            if (pass != 0) {
+                try std.testing.expectEqual(@as(usize, 0), warm.pages_decoded);
+                // A dictionary prelude can still require its bounded probe.
+                try std.testing.expect(provider.bytes - before <= (if (dictionary) @as(usize, 512) else 0));
+            }
+        }
+    };
 }

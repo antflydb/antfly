@@ -1,0 +1,690 @@
+{
+  "format": 1,
+  "collation": "C",
+  "entries": [
+    {
+      "id": "unicode-captures",
+      "pattern": "([A-Z])([0-9]+)",
+      "input": "雪😀A1B22",
+      "flags": 3,
+      "start": 0,
+      "captures": 2,
+      "options": "",
+      "matched": true,
+      "spans": [
+        {
+          "start": 2,
+          "end": 4,
+          "text": "A1"
+        },
+        {
+          "start": 2,
+          "end": 3,
+          "text": "A"
+        },
+        {
+          "start": 3,
+          "end": 4,
+          "text": "1"
+        }
+      ]
+    },
+    {
+      "id": "unicode-next",
+      "pattern": "([A-Z])([0-9]+)",
+      "input": "雪😀A1B22",
+      "flags": 3,
+      "start": 4,
+      "captures": 2,
+      "options": "",
+      "matched": true,
+      "spans": [
+        {
+          "start": 4,
+          "end": 7,
+          "text": "B22"
+        },
+        {
+          "start": 4,
+          "end": 5,
+          "text": "B"
+        },
+        {
+          "start": 5,
+          "end": 7,
+          "text": "22"
+        }
+      ]
+    },
+    {
+      "id": "longest-alternative",
+      "pattern": "a|ab",
+      "input": "abc",
+      "flags": 3,
+      "start": 0,
+      "captures": 0,
+      "options": "",
+      "matched": true,
+      "spans": [
+        {
+          "start": 0,
+          "end": 2,
+          "text": "ab"
+        }
+      ]
+    },
+    {
+      "id": "shortest-quantifier",
+      "pattern": "a+?",
+      "input": "aaa",
+      "flags": 3,
+      "start": 0,
+      "captures": 0,
+      "options": "",
+      "matched": true,
+      "spans": [
+        {
+          "start": 0,
+          "end": 1,
+          "text": "a"
+        }
+      ]
+    },
+    {
+      "id": "empty-pattern",
+      "pattern": "",
+      "input": "雪",
+      "flags": 3,
+      "start": 0,
+      "captures": 0,
+      "options": "",
+      "matched": true,
+      "spans": [
+        {
+          "start": 0,
+          "end": 0,
+          "text": ""
+        }
+      ]
+    },
+    {
+      "id": "empty-end",
+      "pattern": "$",
+      "input": "雪😀",
+      "flags": 3,
+      "start": 1,
+      "captures": 0,
+      "options": "",
+      "matched": true,
+      "spans": [
+        {
+          "start": 2,
+          "end": 2,
+          "text": ""
+        }
+      ]
+    },
+    {
+      "id": "original-start-anchor",
+      "pattern": "^a",
+      "input": "ba",
+      "flags": 3,
+      "start": 1,
+      "captures": 0,
+      "options": "",
+      "matched": false,
+      "spans": [
+        {
+          "start": -1,
+          "end": -1,
+          "text": null
+        }
+      ]
+    },
+    {
+      "id": "unicode-dot",
+      "pattern": ".",
+      "input": "😀",
+      "flags": 3,
+      "start": 0,
+      "captures": 0,
+      "options": "",
+      "matched": true,
+      "spans": [
+        {
+          "start": 0,
+          "end": 1,
+          "text": "😀"
+        }
+      ]
+    },
+    {
+      "id": "unicode-lookaround",
+      "pattern": "(?<=雪)😀(?=A)",
+      "input": "雪😀A",
+      "flags": 3,
+      "start": 0,
+      "captures": 0,
+      "options": "",
+      "matched": true,
+      "spans": [
+        {
+          "start": 1,
+          "end": 2,
+          "text": "😀"
+        }
+      ]
+    },
+    {
+      "id": "backreference",
+      "pattern": "([a-z]+)-\\1",
+      "input": "x cat-cat y",
+      "flags": 3,
+      "start": 0,
+      "captures": 1,
+      "options": "",
+      "matched": true,
+      "spans": [
+        {
+          "start": 2,
+          "end": 9,
+          "text": "cat-cat"
+        },
+        {
+          "start": 2,
+          "end": 5,
+          "text": "cat"
+        }
+      ]
+    },
+    {
+      "id": "unmatched-capture",
+      "pattern": "(a)?(b)",
+      "input": "b",
+      "flags": 3,
+      "start": 0,
+      "captures": 2,
+      "options": "",
+      "matched": true,
+      "spans": [
+        {
+          "start": 0,
+          "end": 1,
+          "text": "b"
+        },
+        {
+          "start": -1,
+          "end": -1,
+          "text": null
+        },
+        {
+          "start": 0,
+          "end": 1,
+          "text": "b"
+        }
+      ]
+    },
+    {
+      "id": "nested-capture-precedence",
+      "pattern": "(a|ab)(b*)",
+      "input": "abb",
+      "flags": 3,
+      "start": 0,
+      "captures": 2,
+      "options": "",
+      "matched": true,
+      "spans": [
+        {
+          "start": 0,
+          "end": 3,
+          "text": "abb"
+        },
+        {
+          "start": 0,
+          "end": 2,
+          "text": "ab"
+        },
+        {
+          "start": 2,
+          "end": 3,
+          "text": "b"
+        }
+      ]
+    },
+    {
+      "id": "C-class",
+      "pattern": "[[:alpha:]]+",
+      "input": "雪😀Ab9",
+      "flags": 3,
+      "start": 0,
+      "captures": 0,
+      "options": "",
+      "matched": true,
+      "spans": [
+        {
+          "start": 2,
+          "end": 4,
+          "text": "Ab"
+        }
+      ]
+    },
+    {
+      "id": "C-case",
+      "pattern": "abc",
+      "input": "雪ABC",
+      "flags": 11,
+      "start": 0,
+      "captures": 0,
+      "options": "i",
+      "matched": true,
+      "spans": [
+        {
+          "start": 1,
+          "end": 4,
+          "text": "ABC"
+        }
+      ]
+    },
+    {
+      "id": "quoted-pattern",
+      "pattern": "a.b",
+      "input": "xa.by",
+      "flags": 4,
+      "start": 0,
+      "captures": 0,
+      "options": "q",
+      "matched": true,
+      "spans": [
+        {
+          "start": 1,
+          "end": 4,
+          "text": "a.b"
+        }
+      ]
+    },
+    {
+      "id": "expanded-pattern",
+      "pattern": "a # comment\n b",
+      "input": "zab",
+      "flags": 35,
+      "start": 0,
+      "captures": 0,
+      "options": "x",
+      "matched": true,
+      "spans": [
+        {
+          "start": 1,
+          "end": 3,
+          "text": "ab"
+        }
+      ]
+    },
+    {
+      "id": "newline-default",
+      "pattern": ".+",
+      "input": "a\nb",
+      "flags": 3,
+      "start": 0,
+      "captures": 0,
+      "options": "",
+      "matched": true,
+      "spans": [
+        {
+          "start": 0,
+          "end": 3,
+          "text": "a\nb"
+        }
+      ]
+    },
+    {
+      "id": "newline-sensitive",
+      "pattern": ".+",
+      "input": "a\nb",
+      "flags": 195,
+      "start": 0,
+      "captures": 0,
+      "options": "n",
+      "matched": true,
+      "spans": [
+        {
+          "start": 0,
+          "end": 1,
+          "text": "a"
+        }
+      ]
+    },
+    {
+      "id": "newline-anchors",
+      "pattern": "^b$",
+      "input": "a\nb\nc",
+      "flags": 195,
+      "start": 0,
+      "captures": 0,
+      "options": "n",
+      "matched": true,
+      "spans": [
+        {
+          "start": 2,
+          "end": 3,
+          "text": "b"
+        }
+      ]
+    },
+    {
+      "id": "counted-quantifier",
+      "pattern": "a{2,3}",
+      "input": "aaaa",
+      "flags": 3,
+      "start": 0,
+      "captures": 0,
+      "options": "",
+      "matched": true,
+      "spans": [
+        {
+          "start": 0,
+          "end": 3,
+          "text": "aaa"
+        }
+      ]
+    },
+    {
+      "id": "noncapturing",
+      "pattern": "(?:a|ab)+",
+      "input": "abab",
+      "flags": 3,
+      "start": 0,
+      "captures": 0,
+      "options": "",
+      "matched": true,
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "text": "abab"
+        }
+      ]
+    },
+    {
+      "id": "word-boundary",
+      "pattern": "\\mcat\\M",
+      "input": "bobcat cat!",
+      "flags": 3,
+      "start": 0,
+      "captures": 0,
+      "options": "",
+      "matched": true,
+      "spans": [
+        {
+          "start": 7,
+          "end": 10,
+          "text": "cat"
+        }
+      ]
+    },
+    {
+      "id": "ordered-sensitive",
+      "pattern": "abc",
+      "input": "ABC",
+      "flags": 3,
+      "start": 0,
+      "captures": 0,
+      "options": "ic",
+      "matched": false,
+      "spans": [
+        {
+          "start": -1,
+          "end": -1,
+          "text": null
+        }
+      ]
+    },
+    {
+      "id": "ordered-insensitive",
+      "pattern": "abc",
+      "input": "ABC",
+      "flags": 11,
+      "start": 0,
+      "captures": 0,
+      "options": "ci",
+      "matched": true,
+      "spans": [
+        {
+          "start": 0,
+          "end": 3,
+          "text": "ABC"
+        }
+      ]
+    },
+    {
+      "id": "ordered-single-line",
+      "pattern": ".+",
+      "input": "a\nb",
+      "flags": 3,
+      "start": 0,
+      "captures": 0,
+      "options": "ns",
+      "matched": true,
+      "spans": [
+        {
+          "start": 0,
+          "end": 3,
+          "text": "a\nb"
+        }
+      ]
+    },
+    {
+      "id": "ordered-newline",
+      "pattern": ".+",
+      "input": "a\nb",
+      "flags": 195,
+      "start": 0,
+      "captures": 0,
+      "options": "sn",
+      "matched": true,
+      "spans": [
+        {
+          "start": 0,
+          "end": 1,
+          "text": "a"
+        }
+      ]
+    },
+    {
+      "id": "partial-newline",
+      "pattern": ".+",
+      "input": "a\nb",
+      "flags": 67,
+      "start": 0,
+      "captures": 0,
+      "options": "np",
+      "matched": true,
+      "spans": [
+        {
+          "start": 0,
+          "end": 1,
+          "text": "a"
+        }
+      ]
+    },
+    {
+      "id": "newline-anchors-only",
+      "pattern": "^b",
+      "input": "a\nb",
+      "flags": 131,
+      "start": 0,
+      "captures": 0,
+      "options": "nw",
+      "matched": true,
+      "spans": [
+        {
+          "start": 2,
+          "end": 3,
+          "text": "b"
+        }
+      ]
+    },
+    {
+      "id": "ordered-tight",
+      "pattern": "a b",
+      "input": "ab a b",
+      "flags": 3,
+      "start": 0,
+      "captures": 0,
+      "options": "xt",
+      "matched": true,
+      "spans": [
+        {
+          "start": 3,
+          "end": 6,
+          "text": "a b"
+        }
+      ]
+    },
+    {
+      "id": "ordered-expanded",
+      "pattern": "a b",
+      "input": "ab a b",
+      "flags": 35,
+      "start": 0,
+      "captures": 0,
+      "options": "tx",
+      "matched": true,
+      "spans": [
+        {
+          "start": 0,
+          "end": 2,
+          "text": "ab"
+        }
+      ]
+    },
+    {
+      "id": "basic-flavor",
+      "pattern": "a+",
+      "input": "aaa a+",
+      "flags": 0,
+      "start": 0,
+      "captures": 0,
+      "options": "b",
+      "matched": true,
+      "spans": [
+        {
+          "start": 4,
+          "end": 6,
+          "text": "a+"
+        }
+      ]
+    },
+    {
+      "id": "server-extended-transition",
+      "pattern": "a+",
+      "input": "aaa a+",
+      "flags": 0,
+      "start": 0,
+      "captures": 0,
+      "options": "e",
+      "matched": true,
+      "spans": [
+        {
+          "start": 4,
+          "end": 6,
+          "text": "a+"
+        }
+      ]
+    },
+    {
+      "id": "ordered-quoted-flavor",
+      "pattern": "(a)",
+      "input": "(a)",
+      "flags": 4,
+      "start": 0,
+      "captures": 0,
+      "options": "eq",
+      "matched": true,
+      "spans": [
+        {
+          "start": 0,
+          "end": 3,
+          "text": "(a)"
+        }
+      ]
+    },
+    {
+      "id": "ordered-basic-flavor",
+      "pattern": "a+",
+      "input": "a+",
+      "flags": 0,
+      "start": 0,
+      "captures": 0,
+      "options": "qb",
+      "matched": true,
+      "spans": [
+        {
+          "start": 0,
+          "end": 2,
+          "text": "a+"
+        }
+      ]
+    },
+    {
+      "id": "ordered-basic-insensitive",
+      "pattern": "A+",
+      "input": "a+",
+      "flags": 8,
+      "start": 0,
+      "captures": 0,
+      "options": "qib",
+      "matched": true,
+      "spans": [
+        {
+          "start": 0,
+          "end": 2,
+          "text": "a+"
+        }
+      ]
+    },
+    {
+      "id": "greedy-backtrack-capture",
+      "pattern": "(a|ab|abc)+\\1",
+      "input": "x abcabc y",
+      "flags": 3,
+      "start": 0,
+      "captures": 1,
+      "options": "",
+      "matched": true,
+      "spans": [
+        {
+          "start": 2,
+          "end": 8,
+          "text": "abcabc"
+        },
+        {
+          "start": 2,
+          "end": 5,
+          "text": "abc"
+        }
+      ]
+    },
+    {
+      "id": "shortest-backtrack-capture",
+      "pattern": "(a|ab|abc)+?\\1",
+      "input": "x abcabc y",
+      "flags": 3,
+      "start": 0,
+      "captures": 1,
+      "options": "",
+      "matched": true,
+      "spans": [
+        {
+          "start": 2,
+          "end": 8,
+          "text": "abcabc"
+        },
+        {
+          "start": 2,
+          "end": 5,
+          "text": "abc"
+        }
+      ]
+    }
+  ]
+}

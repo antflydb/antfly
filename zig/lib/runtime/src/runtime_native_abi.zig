@@ -22,9 +22,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-// Routed writers and Raft batchers now carry their owning error-domain
-// dispatcher. Reject older native handles before reading the added field.
-pub const abi_version: u32 = 8;
+// Tokenizer vtables include additive token-byte decoding. Reject older
+// native handles before interpreting the added callback slot.
+pub const abi_version: u32 = 10;
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 
 pub const TypeContract = extern struct {
@@ -160,7 +160,7 @@ pub fn shallowLayoutId(comptime T: type) u64 {
         .error_union => |error_union| hashBytes(&hash, @typeName(error_union.payload)),
         .pointer => |pointer| {
             hashBytes(&hash, @tagName(pointer.size));
-            hashInteger(&hash, pointer.attrs.@"align" orelse @alignOf(pointer.child));
+            hashInteger(&hash, pointer.attrs.@"align" orelse if (pointer.child == anyopaque) 1 else @alignOf(pointer.child));
             hashInteger(&hash, @intFromBool(pointer.attrs.@"const"));
             hashInteger(&hash, @intFromBool(pointer.attrs.@"volatile"));
             hashBytes(&hash, @typeName(pointer.child));
@@ -196,10 +196,17 @@ fn hashInteger(hash: *u64, comptime value: anytype) void {
 pub fn assertUniqueMethodIds(comptime VTable: type) void {
     @setEvalBranchQuota(1_000_000);
     const fields = @typeInfo(VTable).@"struct".field_names;
-    inline for (fields, 0..) |left, left_index| {
-        inline for (fields[left_index + 1 ..]) |right| {
-            if (stableId(left) == stableId(right))
-                @compileError("native ABI method-id collision between " ++ left ++ " and " ++ right);
+    // Hash once per method. Re-hashing both names for every pair makes
+    // large coarse-operation contracts spend their evaluation budget on names.
+    const ids = comptime blk: {
+        var values: [fields.len]u64 = undefined;
+        for (fields, 0..) |name, index| values[index] = stableId(name);
+        break :blk values;
+    };
+    inline for (ids, 0..) |left, left_index| {
+        inline for (ids[left_index + 1 ..], left_index + 1..) |right, right_index| {
+            if (left == right)
+                @compileError("native ABI method-id collision between " ++ fields[left_index] ++ " and " ++ fields[right_index]);
         }
     }
 }
@@ -224,6 +231,12 @@ test "native shallow layout fingerprints include field order" {
     const Left = extern struct { first: u32, second: u64 };
     const Right = extern struct { second: u64, first: u32 };
     try std.testing.expect(shallowLayoutId(Left) != shallowLayoutId(Right));
+}
+
+test "native opaque pointer contracts preserve explicit alignment" {
+    const plain = TypeContract.of(*anyopaque);
+    try std.testing.expect(plain.matches(TypeContract.of(*anyopaque)));
+    try std.testing.expect(!plain.matches(TypeContract.of(*align(16) anyopaque)));
 }
 
 test "native method identifiers are deterministic" {

@@ -15,8 +15,9 @@
 
 """PEP 249 interface to embedded Antfly. Positional parameters use :1, :2, …; native $1 syntax is also accepted.
 
-Connections use READ COMMITTED transactions and own independent native
-handles and SQL sessions. Writer ownership is scoped to native operations. CREATE/DROP TABLE
+Connections use READ COMMITTED transactions and own independent
+SQL sessions, sharing a process storage owner for compatible file connections.
+Writer ownership is scoped to native operations. CREATE/DROP TABLE
 outside an active transaction execute immediately; transactional DDL and
 stronger isolation are rejected by the engine.
 """

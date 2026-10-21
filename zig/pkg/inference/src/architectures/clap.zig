@@ -102,6 +102,11 @@ fn audioEncoderForwardWithGraphTail(
     if (channels == 0) return error.InvalidInputShape;
     if (channels > 1 and !ac.enable_fusion) return error.InvalidInputShape;
 
+    if (batch == 0 or time_frames == 0 or ac.patch_size == 0 or ac.patch_stride[0] == 0 or ac.patch_stride[1] == 0 or ac.spec_size < ac.patch_size) return error.InvalidInputShape;
+    const count = std.math.mul(usize, batch, channels) catch return error.InvalidInputShape;
+    const frames = std.math.mul(usize, count, time_frames) catch return error.InvalidInputShape;
+    const elements = std.math.mul(usize, frames, mel_bins) catch return error.InvalidInputShape;
+    if (input_features.len != elements) return error.InvalidInputShape;
     const batch_normed = try batchNormInput(allocator, cb, input_features, batch, channels, time_frames, mel_bins);
     defer allocator.free(batch_normed);
 
@@ -110,10 +115,31 @@ fn audioEncoderForwardWithGraphTail(
 
     var height: usize = ac.spec_size;
     var width: usize = ac.spec_size;
+    const out_height = (height - ac.patch_size) / ac.patch_stride[0] + 1;
+    const out_width = (width - ac.patch_size) / ac.patch_stride[1] + 1;
+    // Explicit graph strategies retain their selected execution path.
+    if (graph_tail_strategy == null and supportsResidentClapAudio(cb)) {
+        var has_long_item = false;
+        for (0..batch) |b| {
+            if (ac.enable_fusion and channels >= 4 and b < is_longer.len and is_longer[b] != 0) has_long_item = true;
+        }
+        const input = if (!has_long_item)
+            try clapPatchEmbedTensor(cb, allocator, image, batch, channels, height, width, ac)
+        else blk: {
+            // Fused AFF frontend compatibility is one boundary before the
+            // resident Swin encoder, rather than one boundary at every block.
+            const patches = try patchEmbed(cb, allocator, image, batch, channels, height, width, ac, is_longer, null);
+            defer allocator.free(patches);
+            break :blk try clapUpload(cb, patches, &.{ @intCast(batch * out_height * out_width), @intCast(ac.patch_embeds_hidden_size) });
+        };
+        defer cb.free(input);
+        const result = try audioEncoderFromPatchTokensTensor(cb, allocator, cfg, input, batch, out_height, out_width);
+        defer cb.free(result);
+        return cb.toFloat32(result, allocator);
+    }
     var hidden = try patchEmbed(cb, allocator, image, batch, channels, height, width, ac, is_longer, graph_tail_strategy);
-
-    height = (height - ac.patch_size) / ac.patch_stride[0] + 1;
-    width = (width - ac.patch_size) / ac.patch_stride[1] + 1;
+    height = out_height;
+    width = out_width;
 
     for (0..ac.depths.len) |stage| {
         for (0..ac.depths[stage]) |block| {
@@ -1713,4 +1739,359 @@ fn addInPlace(dst: []f32, src: []const f32) void {
 
 fn fmtAlloc(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ![]u8 {
     return std.fmt.allocPrint(allocator, fmt, args);
+}
+
+fn supportsResidentClapAudio(cb: *const ComputeBackend) bool {
+    return (cb.kind() == .metal or cb.kind() == .cuda) and cb.vtable.takeRows != null and cb.vtable.reshapeOp != null and cb.vtable.transposeOp != null and cb.vtable.reduceMeanOp != null and cb.vtable.broadcastInDimOp != null;
+}
+
+fn clapPatchEmbedTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, image: []const f32, batch: usize, channels: usize, height: usize, width: usize, ac: clap_mod.Config.AudioConfig) !CT {
+    const pixels = try allocator.alloc(f32, batch * height * width);
+    defer allocator.free(pixels);
+    for (0..batch) |b| @memcpy(pixels[b * height * width ..][0 .. height * width], image[b * channels * height * width ..][0 .. height * width]);
+    const input = try clapUpload(cb, pixels, &.{ @intCast(batch), 1, @intCast(height), @intCast(width) });
+    defer cb.free(input);
+    const weight = try cb.getWeight("audio_model.audio_encoder.patch_embed.proj.weight");
+    defer cb.free(weight);
+    const bias = try cb.getWeight("audio_model.audio_encoder.patch_embed.proj.bias");
+    defer cb.free(bias);
+    const conv = try cb.conv2d(input, weight, bias, batch, 1, ac.patch_embeds_hidden_size, height, width, ac.patch_size, ac.patch_size, ac.patch_stride[0], ac.patch_stride[1], 0, 0, 1);
+    defer cb.free(conv);
+    const tokens = ((height - ac.patch_size) / ac.patch_stride[0] + 1) * ((width - ac.patch_size) / ac.patch_stride[1] + 1);
+    const layout = [_]i64{ @intCast(batch), @intCast(ac.patch_embeds_hidden_size), @intCast(tokens) };
+    const shaped = try cb.primReshape(conv, &layout);
+    defer cb.free(shaped);
+    const transposed = try cb.primTranspose(shaped, &.{ 0, 2, 1 }, &layout);
+    defer cb.free(transposed);
+    const rows = try cb.primReshape(transposed, &.{ @intCast(batch * tokens), @intCast(ac.patch_embeds_hidden_size) });
+    if (!ac.enable_patch_layer_norm) return rows;
+    defer cb.free(rows);
+    return clapNormTensor(cb, rows, ac.patch_embeds_hidden_size, "audio_model.audio_encoder.patch_embed.norm.weight", "audio_model.audio_encoder.patch_embed.norm.bias", ac.layer_norm_eps);
+}
+
+fn clapUpload(cb: *const ComputeBackend, data: []const f32, shape: []const i32) !CT {
+    return cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(data, shape));
+}
+
+fn clapLinearTensor(cb: *const ComputeBackend, input: CT, rows: usize, in_dim: usize, out_dim: usize, weight_name: []const u8, bias_name: []const u8) !CT {
+    const weight = try cb.getWeight(weight_name);
+    defer cb.free(weight);
+    const bias = try cb.getWeight(bias_name);
+    defer cb.free(bias);
+    return cb.linear(input, weight, bias, rows, in_dim, out_dim);
+}
+
+fn clapNormTensor(cb: *const ComputeBackend, input: CT, dim: usize, weight_name: []const u8, bias_name: []const u8, eps: f32) !CT {
+    const weight = try cb.getWeight(weight_name);
+    defer cb.free(weight);
+    const bias = try cb.getWeight(bias_name);
+    defer cb.free(bias);
+    return cb.layerNorm(input, weight, bias, dim, eps);
+}
+
+// Host indices contain only layout metadata. Forward and inverse maps use
+// both dimensions, so rectangular shifted windows wrap each axis correctly.
+fn clapWindowRows(allocator: std.mem.Allocator, batch: usize, height: usize, width: usize, window: usize, shift: usize, inverse: bool) ![]u32 {
+    if (window == 0 or height % window != 0 or width % window != 0) return error.InvalidInputShape;
+    const ids = try allocator.alloc(u32, batch * height * width);
+    var i: usize = 0;
+    for (0..batch) |b| for (0..height / window) |wy| for (0..width / window) |wx| for (0..window) |y| for (0..window) |x| {
+        const row = (b * height + (wy * window + y + shift) % height) * width + (wx * window + x + shift) % width;
+        if (inverse) ids[row] = @intCast(i) else ids[i] = @intCast(row);
+        i += 1;
+    };
+    return ids;
+}
+
+fn clapTakeRows(cb: *const ComputeBackend, input: CT, ids: []const u32, dim: usize) !CT {
+    return try cb.takeRows(input, ids, ids.len, dim) orelse error.UnsupportedResidentClapAudio;
+}
+
+fn clapWindowBiasTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, name: []const u8, windows: usize, heads: usize, window: usize, height: usize, width: usize, shift: usize) !CT {
+    const area = window * window;
+    const ids = try allocator.alloc(u32, area * area);
+    defer allocator.free(ids);
+    for (0..area) |i| for (0..area) |j| {
+        const dy = i / window + window - 1 - j / window;
+        const dx = i % window + window - 1 - j % window;
+        ids[i * area + j] = @intCast(dy * (2 * window - 1) + dx);
+    };
+    const rel_weight = cb.getWeight(name) catch |err| switch (err) {
+        error.MissingWeight, error.WeightNotFound => blk: {
+            const zeros = try allocator.alloc(f32, (2 * window - 1) * (2 * window - 1) * heads);
+            defer allocator.free(zeros);
+            @memset(zeros, 0);
+            break :blk try cb.fromFloat32Shape(zeros, &.{ @intCast((2 * window - 1) * (2 * window - 1)), @intCast(heads) });
+        },
+        else => return err,
+    };
+    const rel = try cb.ensureDeviceResidentOwned(rel_weight);
+    defer cb.free(rel);
+    const selected = try clapTakeRows(cb, rel, ids, heads);
+    defer cb.free(selected);
+    const transposed = try cb.primTranspose(selected, &.{ 1, 0 }, &.{ @intCast(area * area), @intCast(heads) });
+    defer cb.free(transposed);
+    const shaped = try cb.primReshape(transposed, &.{ @intCast(heads), @intCast(area), @intCast(area) });
+    defer cb.free(shaped);
+    const target = [_]i64{ @intCast(windows), @intCast(heads), @intCast(area), @intCast(area) };
+    const bias = try cb.primBroadcastInDim(shaped, &target, &.{ 1, 2, 3 }, &.{ @intCast(heads), @intCast(area), @intCast(area) });
+    if (shift == 0) return bias;
+    defer cb.free(bias);
+    const masks = try buildShiftedWindowMask(allocator, height, width, window, shift);
+    defer allocator.free(masks);
+    const data = try allocator.alloc(f32, windows * area * area);
+    defer allocator.free(data);
+    for (0..windows) |win| @memcpy(data[win * area * area ..][0 .. area * area], masks[(win % (height * width / area)) * area * area ..][0 .. area * area]);
+    const mask = try clapUpload(cb, data, &.{ @intCast(windows), @intCast(area), @intCast(area) });
+    defer cb.free(mask);
+    const expanded = try cb.primBroadcastInDim(mask, &target, &.{ 0, 2, 3 }, &.{ @intCast(windows), @intCast(area), @intCast(area) });
+    defer cb.free(expanded);
+    return cb.add(bias, expanded);
+}
+
+fn clapAudioBlockTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, batch: usize, height: usize, width: usize, dim: usize, heads: usize, window: usize, shift: usize, eps: f32, stage: usize, block: usize) !CT {
+    try cb.checkExecutionControl();
+    const prefix = try fmtAlloc(allocator, "audio_model.audio_encoder.layers.{d}.blocks.{d}", .{ stage, block });
+    defer allocator.free(prefix);
+    var buf_w: [256]u8 = undefined;
+    var buf_b: [256]u8 = undefined;
+    const Names = struct {
+        fn get(buf: []u8, p: []const u8, suffix: []const u8) ![]const u8 {
+            return std.fmt.bufPrint(buf, "{s}.{s}", .{ p, suffix });
+        }
+    };
+    const rows = batch * height * width;
+    const normed = try clapNormTensor(cb, input, dim, try Names.get(&buf_w, prefix, "layernorm_before.weight"), try Names.get(&buf_b, prefix, "layernorm_before.bias"), eps);
+    defer cb.free(normed);
+    const map = try clapWindowRows(allocator, batch, height, width, window, shift, false);
+    defer allocator.free(map);
+    const windows = try clapTakeRows(cb, normed, map, dim);
+    defer cb.free(windows);
+    const q = try clapLinearTensor(cb, windows, rows, dim, dim, try Names.get(&buf_w, prefix, "attention.self.query.weight"), try Names.get(&buf_b, prefix, "attention.self.query.bias"));
+    defer cb.free(q);
+    const k = try clapLinearTensor(cb, windows, rows, dim, dim, try Names.get(&buf_w, prefix, "attention.self.key.weight"), try Names.get(&buf_b, prefix, "attention.self.key.bias"));
+    defer cb.free(k);
+    const v = try clapLinearTensor(cb, windows, rows, dim, dim, try Names.get(&buf_w, prefix, "attention.self.value.weight"), try Names.get(&buf_b, prefix, "attention.self.value.bias"));
+    defer cb.free(v);
+    const area = window * window;
+    const n_windows = rows / area;
+    const bias = try clapWindowBiasTensor(cb, allocator, try Names.get(&buf_w, prefix, "attention.self.relative_position_bias_table"), n_windows, heads, window, height, width, shift);
+    defer cb.free(bias);
+    const mask = try allocator.alloc(i64, n_windows * area);
+    defer allocator.free(mask);
+    @memset(mask, 1);
+    const attention = try cb.scaledDotProductAttention(q, k, v, mask, bias, n_windows, area, heads, dim / heads);
+    defer cb.free(attention);
+    const projected = try clapLinearTensor(cb, attention, rows, dim, dim, try Names.get(&buf_w, prefix, "attention.output.dense.weight"), try Names.get(&buf_b, prefix, "attention.output.dense.bias"));
+    defer cb.free(projected);
+    const inverse = try clapWindowRows(allocator, batch, height, width, window, shift, true);
+    defer allocator.free(inverse);
+    const unpartitioned = try clapTakeRows(cb, projected, inverse, dim);
+    defer cb.free(unpartitioned);
+    const residual = try cb.add(input, unpartitioned);
+    defer cb.free(residual);
+    const after = try clapNormTensor(cb, residual, dim, try Names.get(&buf_w, prefix, "layernorm_after.weight"), try Names.get(&buf_b, prefix, "layernorm_after.bias"), eps);
+    defer cb.free(after);
+    const up = try clapLinearTensor(cb, after, rows, dim, 4 * dim, try Names.get(&buf_w, prefix, "intermediate.dense.weight"), try Names.get(&buf_b, prefix, "intermediate.dense.bias"));
+    defer cb.free(up);
+    const act = try cb.gelu(up);
+    defer cb.free(act);
+    const down = try clapLinearTensor(cb, act, rows, 4 * dim, dim, try Names.get(&buf_w, prefix, "output.dense.weight"), try Names.get(&buf_b, prefix, "output.dense.bias"));
+    defer cb.free(down);
+    return cb.add(residual, down);
+}
+
+fn clapPatchMergeTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, batch: usize, height: usize, width: usize, dim: usize, stage: usize) !CT {
+    if (height % 2 != 0 or width % 2 != 0) return error.InvalidInputShape;
+    const rows = batch * height * width / 4;
+    const ids = try allocator.alloc(u32, rows * 4);
+    defer allocator.free(ids);
+    var token: usize = 0;
+    for (0..batch) |b| for (0..height / 2) |y| for (0..width / 2) |x| {
+        for ([_][2]usize{ .{ 0, 0 }, .{ 1, 0 }, .{ 0, 1 }, .{ 1, 1 } }, 0..) |xy, part| ids[token * 4 + part] = @intCast((b * height + y * 2 + xy[0]) * width + x * 2 + xy[1]);
+        token += 1;
+    };
+    const gathered = try clapTakeRows(cb, input, ids, dim);
+    defer cb.free(gathered);
+    const packed_rows = try cb.primReshape(gathered, &.{ @intCast(rows), @intCast(4 * dim) });
+    defer cb.free(packed_rows);
+    const w = try fmtAlloc(allocator, "audio_model.audio_encoder.layers.{d}.downsample.norm.weight", .{stage});
+    defer allocator.free(w);
+    const b = try fmtAlloc(allocator, "audio_model.audio_encoder.layers.{d}.downsample.norm.bias", .{stage});
+    defer allocator.free(b);
+    const normed = try clapNormTensor(cb, packed_rows, dim * 4, w, b, 1e-5);
+    defer cb.free(normed);
+    const reduction = try fmtAlloc(allocator, "audio_model.audio_encoder.layers.{d}.downsample.reduction.weight", .{stage});
+    defer allocator.free(reduction);
+    const weight = try cb.getWeight(reduction);
+    defer cb.free(weight);
+    return cb.linearNoBias(normed, weight, rows, dim * 4, dim * 2);
+}
+
+/// Borrows patch tokens and returns an owned projected audio embedding tensor.
+pub fn audioEncoderFromPatchTokensTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: clap_mod.Config, input: CT, batch: usize, initial_height: usize, initial_width: usize) !CT {
+    const ac = cfg.audio_config;
+    if (batch == 0 or ac.depths.len == 0 or ac.depths.len != ac.num_attention_heads.len or initial_height == 0 or initial_width == 0) return error.InvalidInputShape;
+    if (cb.vtable.takeRows == null or cb.vtable.reshapeOp == null or cb.vtable.transposeOp == null or cb.vtable.reduceMeanOp == null or cb.vtable.broadcastInDimOp == null) return error.UnsupportedResidentClapAudio;
+    const area = std.math.mul(usize, initial_height, initial_width) catch return error.InvalidInputShape;
+    const initial_rows = std.math.mul(usize, batch, area) catch return error.InvalidInputShape;
+    if (initial_rows > std.math.maxInt(i32) or ac.hidden_size != ac.stageDim(ac.depths.len - 1)) return error.InvalidInputShape;
+    if (!(try cb.tensorShapeMatches(input, &.{ @intCast(initial_rows), @intCast(ac.patch_embeds_hidden_size) }) orelse false)) return error.InvalidInputShape;
+    var height = initial_height;
+    var width = initial_width;
+    var hidden = try cb.primReshape(input, &.{ @intCast(batch * height * width), @intCast(ac.patch_embeds_hidden_size) });
+    defer cb.free(hidden);
+    for (0..ac.depths.len) |stage| {
+        const dim = ac.stageDim(stage);
+        const heads = ac.num_attention_heads[stage];
+        if (heads == 0 or dim % heads != 0) return error.InvalidInputShape;
+        for (0..ac.depths[stage]) |block| {
+            const shift = if (block % 2 == 1 and @min(height, width) > ac.window_size) ac.window_size / 2 else 0;
+            const next = try clapAudioBlockTensor(cb, allocator, hidden, batch, height, width, dim, heads, ac.window_size, shift, ac.layer_norm_eps, stage, block);
+            cb.free(hidden);
+            hidden = next;
+        }
+        if (stage + 1 < ac.depths.len) {
+            const next = try clapPatchMergeTensor(cb, allocator, hidden, batch, height, width, dim, stage);
+            cb.free(hidden);
+            hidden = next;
+            height /= 2;
+            width /= 2;
+        }
+    }
+    const normed = try clapNormTensor(cb, hidden, ac.hidden_size, "audio_model.audio_encoder.norm.weight", "audio_model.audio_encoder.norm.bias", ac.layer_norm_eps);
+    defer cb.free(normed);
+    const layout = [_]i64{ @intCast(batch), @intCast(height * width), @intCast(ac.hidden_size) };
+    const shaped = try cb.primReshape(normed, &layout);
+    defer cb.free(shaped);
+    const pooled = try cb.primReduceMean(shaped, &.{1}, &layout);
+    defer cb.free(pooled);
+    const pooled_rows = try cb.primReshape(pooled, &.{ @intCast(batch), @intCast(ac.hidden_size) });
+    defer cb.free(pooled_rows);
+    const first = try clapLinearTensor(cb, pooled_rows, batch, ac.hidden_size, cfg.projection_dim, "audio_projection.linear1.weight", "audio_projection.linear1.bias");
+    defer cb.free(first);
+    const act = switch (cfg.projection_hidden_act) {
+        .relu => try cb.relu(first),
+        .gelu => try cb.gelu(first),
+    };
+    defer cb.free(act);
+    return clapLinearTensor(cb, act, batch, cfg.projection_dim, cfg.projection_dim, "audio_projection.linear2.weight", "audio_projection.linear2.bias");
+}
+
+const resident_clap_test_config = clap_mod.Config{
+    .projection_dim = 3,
+    .audio_config = .{ .patch_embeds_hidden_size = 4, .hidden_size = 32, .window_size = 2, .depths = .{ 2, 1, 1, 1 }, .num_attention_heads = .{ 1, 2, 4, 8 } },
+};
+
+fn populateResidentClapWeights(store: *@import("../ops/native_compute.zig").WeightStore) !void {
+    const fixture = @import("../ops/media_residency_test.zig");
+    const allocator = store.allocator;
+    const cfg = resident_clap_test_config;
+    const ac = cfg.audio_config;
+    for (0..ac.depths.len) |stage| {
+        const dim = ac.stageDim(stage);
+        for (0..ac.depths[stage]) |block| {
+            const prefix = try fmtAlloc(allocator, "audio_model.audio_encoder.layers.{d}.blocks.{d}", .{ stage, block });
+            defer allocator.free(prefix);
+            var buf: [256]u8 = undefined;
+            for ([_][]const u8{ "layernorm_before", "layernorm_after" }) |norm| {
+                try fixture.putWeight(store, try std.fmt.bufPrint(&buf, "{s}.{s}.weight", .{ prefix, norm }), &.{dim}, 1);
+                try fixture.putWeight(store, try std.fmt.bufPrint(&buf, "{s}.{s}.bias", .{ prefix, norm }), &.{dim}, 0);
+            }
+            for ([_][]const u8{ "attention.self.query", "attention.self.key", "attention.self.value", "attention.output.dense", "intermediate.dense", "output.dense" }) |linear| {
+                const in_dim = if (std.mem.eql(u8, linear, "output.dense")) dim * 4 else dim;
+                const out_dim = if (std.mem.eql(u8, linear, "intermediate.dense")) dim * 4 else dim;
+                try fixture.putWeight(store, try std.fmt.bufPrint(&buf, "{s}.{s}.weight", .{ prefix, linear }), &.{ out_dim, in_dim }, null);
+                try fixture.putWeight(store, try std.fmt.bufPrint(&buf, "{s}.{s}.bias", .{ prefix, linear }), &.{out_dim}, null);
+            }
+            try fixture.putWeight(store, try std.fmt.bufPrint(&buf, "{s}.attention.self.relative_position_bias_table", .{prefix}), &.{ 9, ac.num_attention_heads[stage] }, null);
+        }
+        if (stage + 1 < ac.depths.len) {
+            var buf: [256]u8 = undefined;
+            try fixture.putWeight(store, try std.fmt.bufPrint(&buf, "audio_model.audio_encoder.layers.{d}.downsample.norm.weight", .{stage}), &.{4 * dim}, 1);
+            try fixture.putWeight(store, try std.fmt.bufPrint(&buf, "audio_model.audio_encoder.layers.{d}.downsample.norm.bias", .{stage}), &.{4 * dim}, 0);
+            try fixture.putWeight(store, try std.fmt.bufPrint(&buf, "audio_model.audio_encoder.layers.{d}.downsample.reduction.weight", .{stage}), &.{ 2 * dim, 4 * dim }, null);
+        }
+    }
+    try fixture.putWeight(store, "audio_model.audio_encoder.patch_embed.proj.weight", &.{ 4, 1, 4, 4 }, null);
+    try fixture.putWeight(store, "audio_model.audio_encoder.patch_embed.proj.bias", &.{4}, null);
+    try fixture.putWeight(store, "audio_model.audio_encoder.patch_embed.norm.weight", &.{4}, 1);
+    try fixture.putWeight(store, "audio_model.audio_encoder.patch_embed.norm.bias", &.{4}, 0);
+    try fixture.putWeight(store, "audio_model.audio_encoder.norm.weight", &.{32}, 1);
+    try fixture.putWeight(store, "audio_model.audio_encoder.norm.bias", &.{32}, 0);
+    try fixture.putWeight(store, "audio_projection.linear1.weight", &.{ 3, 32 }, null);
+    try fixture.putWeight(store, "audio_projection.linear1.bias", &.{3}, null);
+    try fixture.putWeight(store, "audio_projection.linear2.weight", &.{ 3, 3 }, null);
+    try fixture.putWeight(store, "audio_projection.linear2.bias", &.{3}, null);
+}
+
+fn clapHostFromPatchTokens(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: clap_mod.Config, input: []const f32, batch: usize, initial_height: usize, initial_width: usize) ![]f32 {
+    var hidden = try allocator.dupe(f32, input);
+    defer allocator.free(hidden);
+    const ac = cfg.audio_config;
+    var height = initial_height;
+    var width = initial_width;
+    for (0..ac.depths.len) |stage| {
+        for (0..ac.depths[stage]) |block| {
+            const shift = if (block % 2 == 1 and @min(height, width) > ac.window_size) ac.window_size / 2 else 0;
+            hidden = try clapAudioLayer(cb, allocator, hidden, batch, height, width, ac.stageDim(stage), ac.num_attention_heads[stage], ac.window_size, shift, ac.layer_norm_eps, stage, block, null);
+        }
+        if (stage + 1 < ac.depths.len) {
+            const next = try patchMerge(cb, allocator, hidden, batch, height, width, ac.stageDim(stage), stage);
+            allocator.free(hidden);
+            hidden = next;
+            height /= 2;
+            width /= 2;
+        }
+    }
+    const normed = try layerNormData(cb, allocator, hidden, batch * height * width, ac.hidden_size, "audio_model.audio_encoder.norm.weight", "audio_model.audio_encoder.norm.bias", ac.layer_norm_eps);
+    defer allocator.free(normed);
+    const pooled = try avgPoolTokens(allocator, normed, batch, height * width, ac.hidden_size);
+    return projectAudio(cb, allocator, cfg, pooled, batch);
+}
+
+fn checkClapAudioResidency(cb: ComputeBackend, reference: ComputeBackend) !void {
+    const allocator = std.testing.allocator;
+    const fixture = @import("../ops/media_residency_test.zig");
+    for ([_]usize{ 1, 2 }) |batch| {
+        const data = try allocator.alloc(f32, batch * 16 * 16 * 4);
+        defer allocator.free(data);
+        for (data, 0..) |*v, i| v.* = (@as(f32, @floatFromInt((i * 7) % 31)) - 15) * 0.03;
+        const input = try clapUpload(&cb, data, &.{ @intCast(batch * 16 * 16), 4 });
+        defer cb.free(input);
+        const pixels = try allocator.alloc(f32, batch * 64 * 64);
+        defer allocator.free(pixels);
+        for (pixels, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 31)) * 0.02;
+        const before_patch = fixture.Transfers.snapshot(cb);
+        const patch_tensor = try clapPatchEmbedTensor(&cb, allocator, pixels, batch, 1, 64, 64, resident_clap_test_config.audio_config);
+        defer cb.free(patch_tensor);
+        try before_patch.expectUnchanged(cb);
+        const actual_patches = try cb.toFloat32(patch_tensor, allocator);
+        defer allocator.free(actual_patches);
+        const expected_patches = try patchEmbed(&reference, allocator, pixels, batch, 1, 64, 64, resident_clap_test_config.audio_config, &.{}, null);
+        defer allocator.free(expected_patches);
+        for (expected_patches, actual_patches) |e, value| try std.testing.expectApproxEqAbs(e, value, 1e-5);
+        const before = fixture.Transfers.snapshot(cb);
+        const output = try audioEncoderFromPatchTokensTensor(&cb, allocator, resident_clap_test_config, input, batch, 16, 16);
+        defer cb.free(output);
+        try before.expectUnchanged(cb);
+        const actual = try cb.toFloat32(output, allocator);
+        defer allocator.free(actual);
+        const expected = try clapHostFromPatchTokens(&reference, allocator, resident_clap_test_config, data, batch, 16, 16);
+        defer allocator.free(expected);
+        try std.testing.expectEqual(expected.len, actual.len);
+        for (expected, actual) |e, a| try std.testing.expectApproxEqAbs(e, a, 2e-4);
+    }
+}
+
+test "media residency CLAP audio native parity" {
+    try @import("../ops/media_residency_test.zig").onNative(populateResidentClapWeights, checkClapAudioResidency);
+}
+
+test "media residency CLAP audio Metal parity" {
+    try @import("../ops/media_residency_test.zig").onMetal(populateResidentClapWeights, checkClapAudioResidency);
+}
+
+test "media residency CLAP audio CUDA parity" {
+    try @import("../ops/media_residency_test.zig").onCuda(populateResidentClapWeights, checkClapAudioResidency);
 }

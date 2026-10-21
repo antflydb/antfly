@@ -13,6 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#define _DEFAULT_SOURCE 1
+#define _DARWIN_C_SOURCE 1
 #include "antfly.h"
 
 #include <stdbool.h>
@@ -20,6 +22,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__unix__) || defined(__APPLE__)
+#include <signal.h>
+#include <unistd.h>
+#endif
 
 static antfly_slice slice_from_cstr(const char *value) {
     antfly_slice slice;
@@ -130,7 +136,51 @@ static int run_inference_smoke(void) {
     return 0;
 }
 
+/* Exercise the public shared-library boundary: two independent Lite owners
+ * must not restore the host signal disposition while a peer can still wake. */
+static int run_signal_lifetime_smoke(void) {
+#if defined(SIGIO)
+    char directory[1024], first_path[1100], second_path[1100];
+    const char *tmp = getenv("TMPDIR");
+    if (snprintf(directory, sizeof(directory), "%s/antfly-signal-XXXXXX", tmp ? tmp : "/tmp") >= (int)sizeof(directory) || !mkdtemp(directory)) return 1;
+    snprintf(first_path, sizeof(first_path), "%s/first.aflite", directory);
+    snprintf(second_path, sizeof(second_path), "%s/second.aflite", directory);
+    struct sigaction ignored = {0}, original, active;
+    ignored.sa_handler = SIG_IGN;
+    sigemptyset(&ignored.sa_mask);
+    if (sigaction(SIGIO, &ignored, &original) != 0) {
+        rmdir(directory);
+        return 1;
+    }
+    antfly_db *first = NULL, *second = NULL;
+    int failed = expect_ok(antfly_lite_create(first_path, &first), "signal first open");
+    if (!failed) failed = expect_ok(antfly_lite_create(second_path, &second), "signal second open");
+    antfly_db_close(first);
+    if (!failed) {
+        sigaction(SIGIO, NULL, &active);
+        failed = active.sa_handler == SIG_IGN || active.sa_handler == SIG_DFL;
+        if (!failed) raise(SIGIO);
+    }
+    antfly_db_close(second);
+    sigaction(SIGIO, NULL, &active);
+    if (active.sa_handler != SIG_IGN) failed = 1;
+    sigaction(SIGIO, &original, NULL);
+    remove(first_path);
+    remove(second_path);
+    snprintf(first_path, sizeof(first_path), "%s/first.aflite.lock", directory);
+    snprintf(second_path, sizeof(second_path), "%s/second.aflite.lock", directory);
+    remove(first_path);
+    remove(second_path);
+    if (rmdir(directory) != 0) failed = 1;
+    if (failed) fprintf(stderr, "foreign executor signal lifetime was not retained/restored\n");
+    return failed;
+#else
+    return 0;
+#endif
+}
+
 int main(void) {
+    if (run_signal_lifetime_smoke() != 0) return 1;
     if (run_inference_smoke() != 0) {
         return 1;
     }
@@ -145,7 +195,7 @@ int main(void) {
     (void)remove(missing_path);
     (void)remove(bad_path);
 
-    if (antfly_abi_version() != 2) {
+    if (antfly_abi_version() != 3) {
         fprintf(stderr, "unexpected Antfly ABI version: %u\n", antfly_abi_version());
         return 1;
     }

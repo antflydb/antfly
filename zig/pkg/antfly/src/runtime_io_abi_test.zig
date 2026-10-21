@@ -44,6 +44,44 @@ test "executor archive boundary cancels futures and drains group ownership" {
     try std.testing.expect(cleaned.load(.acquire));
 }
 
+test "executor archive boundary wakes shutdown events with cancellation signals blocked" {
+    if (comptime std.posix.Sigaction == void or !@hasField(std.posix.SIG, "IO")) return error.SkipZigTest;
+    // Host executors may mask signals. Workers inherit that mask, so this
+    // test cannot pass by interrupting a sleep with SIGIO.
+    var mask = std.posix.sigemptyset();
+    std.posix.sigaddset(&mask, .IO);
+    var old_mask: std.posix.sigset_t = undefined;
+    std.posix.sigprocmask(std.posix.SIG.BLOCK, &mask, &old_mask);
+    defer std.posix.sigprocmask(std.posix.SIG.SETMASK, &old_mask, null);
+    var borrow: bridge.Borrow = undefined;
+    runtime_io_abi_test_borrow(&borrow);
+    defer runtime_io_abi_test_destroy(&borrow);
+    var executor = try borrow.receive();
+    const io = executor.io();
+    const Worker = struct {
+        fn run(task_io: std.Io, stop: *std.Io.Event, cleaned: *std.atomic.Value(bool)) void {
+            defer cleaned.store(true, .release);
+            stop.waitTimeout(task_io, .{ .duration = .{ .raw = .fromSeconds(60), .clock = .awake } }) catch {};
+        }
+    };
+    var stop: std.Io.Event = .unset;
+    var cleaned: std.atomic.Value(bool) = .init(false);
+    var group: std.Io.Group = .init;
+    try group.concurrent(io, Worker.run, .{ io, &stop, &cleaned });
+    defer group.cancel(io);
+    defer stop.set(io);
+    const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+    while (@atomicLoad(std.Io.Event, &stop, .acquire) != .waiting) {
+        try std.testing.expect(std.Io.Clock.awake.now(std.testing.io).nanoseconds < deadline.nanoseconds);
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    const start = std.Io.Clock.awake.now(std.testing.io);
+    stop.set(io);
+    group.cancel(io);
+    try std.testing.expect(cleaned.load(.acquire));
+    try std.testing.expect(start.durationTo(std.Io.Clock.awake.now(std.testing.io)).toMilliseconds() < 1000);
+}
+
 test "executor archive boundary preserves file errors and cancellation" {
     var borrow: bridge.Borrow = undefined;
     runtime_io_abi_test_borrow(&borrow);
@@ -128,3 +166,72 @@ test "executor archive boundary round trips real batched file IO and task result
 
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
+
+const retained_io = @import("antfly_local_sources").storage_lsm_backend_storage_io;
+extern fn runtime_io_abi_test_retained_source(output: *retained_io.Storage.Lease) callconv(.c) @import("antfly_runtime_abi").error_abi.Status;
+
+test "executor archive boundary opens retained immutable sources and preserves their leases" {
+    var lease: retained_io.Storage.Lease = undefined;
+    const status = runtime_io_abi_test_retained_source(&lease);
+    if (!status.isOk()) return @import("antfly_runtime_abi").error_abi.errorFromStatus(status);
+    var leased = true;
+    defer if (leased) lease.deinit();
+    var source = try lease.view.openLeasedImmutableSource(std.testing.allocator, "/retained/runs/1.sst");
+    defer source.close();
+    // The source must retain its immutable owner after the storage view closes.
+    lease.deinit();
+    leased = false;
+    var bytes: [4]u8 = undefined;
+    try source.readInto(2, &bytes);
+    try std.testing.expectEqualStrings("cdef", &bytes);
+    try std.testing.expectError(error.EndOfStream, source.readInto(7, &bytes));
+}
+
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
+extern fn runtime_io_abi_test_checkpoint(*CancellationToken, u8) callconv(.c) void;
+extern fn runtime_io_abi_test_consume_checkpoint(*const CancellationToken) callconv(.c) @import("antfly_runtime_abi").error_abi.Status;
+
+test "executor archive boundary checkpoints retain deadline lease and connection error identity" {
+    for ([_]anyerror{ error.DeadlineExceeded, error.SessionLeaseLost, error.ConnectionRefused, error.Canceled }, 0..) |expected, i| {
+        var token: CancellationToken = undefined;
+        runtime_io_abi_test_checkpoint(&token, @intCast(i));
+        try std.testing.expectError(expected, token.check());
+        try std.testing.expect(token.isCancelled());
+    }
+    const Local = struct {
+        fn check(_: *const anyopaque) !void {
+            return error.ConnectionRefused;
+        }
+    };
+    var marker: u8 = 0;
+    const local_token: CancellationToken = .{ .ptr = &marker, .check_fn = Local.check };
+    const status = runtime_io_abi_test_consume_checkpoint(&local_token);
+    try std.testing.expectEqual(error.ConnectionRefused, @import("antfly_runtime_abi").error_abi.errorFromStatus(status));
+}
+
+const InferenceControl = @import("inference_checkpoint_control").InferenceExecutionControl;
+extern fn runtime_io_abi_test_inference_control(output: *InferenceControl, failure: u8) callconv(.c) void;
+extern fn runtime_io_abi_test_consume_inference_control(control: *const InferenceControl) callconv(.c) @import("antfly_runtime_abi").error_abi.Status;
+test "executor archive boundary composes inference checkpoints in both error domains" {
+    const abi = @import("antfly_runtime_abi");
+    const Combined = struct {
+        parent: InferenceControl,
+        calls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            try self.parent.check();
+            return error.ConnectionRefused;
+        }
+    };
+    for ([_]anyerror{ error.DeadlineExceeded, error.SessionLeaseLost, error.ConnectionRefused, error.Canceled, error.ConnectionRefused }, 0..) |expected, i| {
+        var parent: InferenceControl = undefined;
+        runtime_io_abi_test_inference_control(&parent, @intCast(i));
+        var combined: Combined = .{ .parent = parent };
+        const rebound = parent.withCheckpoint(&combined, Combined.check);
+        try std.testing.expectError(expected, rebound.check());
+        const status = runtime_io_abi_test_consume_inference_control(&rebound);
+        try std.testing.expectEqual(expected, abi.error_abi.errorFromStatus(status));
+        try std.testing.expectEqual(@as(usize, 2), combined.calls);
+    }
+}

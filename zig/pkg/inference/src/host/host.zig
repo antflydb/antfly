@@ -113,10 +113,7 @@ const LinkedResourceBudgetContext = struct {
 
 const InferenceRuntimeConfig = struct {
     embedded_enabled: bool = true,
-    /// False runs every backend in this process, even those whose calls can
-    /// only be stopped by killing the process. For library hosts (libantfly),
-    /// whose process is the caller's program and cannot be restarted.
-    process_isolation: bool = true,
+    /// Environment forwarded only when a server host launches its worker.
     worker_environment: []const worker_runtime.EnvironmentEntry = &.{},
     max_concurrent_requests: ?usize = null,
     kernel_jit: inference.graph.kernel_jit.Config = .{},
@@ -699,6 +696,7 @@ fn convertWarmModels(
                 out[i] = .{
                     .kind = parseWarmModelKind(model.kind.slice()) orelse return error.InvalidArguments,
                     .name = model.name.slice(),
+                    .cuda_precision = if (model.cuda_precision.slice()) |value| std.meta.stringToEnum(@typeInfo(@FieldType(inference.server.WarmModel, "cuda_precision")).optional.child, value) orelse return error.InvalidArguments else null,
                     .backend = inference.backends.BackendType.parseOptional(model.backend.slice()) catch
                         return error.InvalidArguments,
                     .format = model.format.slice(),
@@ -735,6 +733,19 @@ test "standalone preload bridge preserves A4B residency controls" {
     try std.testing.expectEqual(@as(usize, 1), resolved.items.len);
     try std.testing.expectEqual(inference.ops.A4bResidencyMode.streamed, resolved.items[0].residency_mode.?);
     try std.testing.expectEqual(@as(?u32, 4096), resolved.items[0].memory_budget_mb);
+
+    var decision_model = inference_bridge.WarmModel{
+        .kind = .init("extractor"),
+        .name = .init("fastino/GLiNER2.5-Decide-1B"),
+        .backend = .init("cuda"),
+        .cuda_precision = .init("fp32"),
+    };
+    context.preload_ptr = @ptrCast(&decision_model);
+    var decision = try convertWarmModels(std.testing.allocator, &context);
+    defer decision.deinit(std.testing.allocator);
+    try std.testing.expectEqual(.fp32, decision.items[0].cuda_precision.?);
+    decision_model.cuda_precision = .init("int4");
+    try std.testing.expectError(error.InvalidArguments, convertWarmModels(std.testing.allocator, &context));
 }
 
 pub fn parseKeepAliveMs(raw: []const u8) !u64 {
@@ -828,11 +839,10 @@ pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext
     errdefer runtime_config.deinit();
     try runtime_config.value.kernel_jit.validate();
     try runtime_config.value.prompt_cache.validate();
-    if (!runtime_config.value.process_isolation) inference.execution_control.allowUninterruptibleInProcess();
     const use_worker = !supervised and !@import("builtin").is_test and
         runtime_config.value.embedded_enabled and
-        runtime_config.value.process_isolation and
-        inference.backends.BackendRuntime.availableRequiresProcessIsolation();
+        context.execution_host == .server and
+        inference.backends.BackendRuntime.availableHasUninterruptibleCalls();
 
     const state = try alloc.create(LinkedInferenceState);
     errdefer alloc.destroy(state);
@@ -871,6 +881,7 @@ pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext
         },
         .resource_ownership = .external_required,
         .process_termination_available = supervised,
+        .native_call_policy = if (context.execution_host == .embedded) .in_process else .require_supervision,
         .inference_proxy = use_worker,
         .tokenizer_cache = .{
             .bulk_slots_per_shard = 16 * 1024,
@@ -1556,7 +1567,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             defer parsed.deinit();
             var input = parsed.value.input;
             switch (input) {
-                .text => if (parsed.value.attachment_count != 0 or context.binary_payloads_len != 0 or context.attachment_refs_len != 0)
+                .text, .source => if (parsed.value.attachment_count != 0 or context.binary_payloads_len != 0 or context.attachment_refs_len != 0)
                     return error.InvalidArguments,
                 .binary => |*binary| {
                     if (parsed.value.attachment_count != 1 or context.binary_payloads_len != 1 or
@@ -1571,61 +1582,81 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 },
             }
             const cfg = parsed.value.config;
-            const chunk_capabilities = try localModelCapabilities(&state.node, state.io, parsed.value.model, .chunk);
-            var chunk_shape = inference_work.InvocationShape{ .item_count = 1 };
-            switch (input) {
-                .text => |text_value| {
-                    chunk_shape.modalities.text = true;
-                    chunk_shape.text_bytes = text_value.len;
-                    chunk_shape.max_text_bytes_per_item = text_value.len;
-                    try chunk_capabilities.validateMimeType("text/plain");
-                },
-                .binary => |binary| {
-                    chunk_shape.encoded_media_bytes = binary.data.len;
-                    chunk_shape.max_media_parts_per_item = 1;
-                    const essence = inference_work.mimeTypeEssence(binary.mime_type) catch
-                        return error.UnsupportedInferenceMimeType;
-                    if (std.ascii.startsWithIgnoreCase(essence, "audio/"))
-                        chunk_shape.modalities.audio = true
-                    else if (std.ascii.startsWithIgnoreCase(essence, "image/"))
-                        chunk_shape.modalities.image = true
-                    else
-                        chunk_shape.modalities.document = true;
-                    try chunk_capabilities.validateMimeType(binary.mime_type);
-                },
-            }
-            try chunk_capabilities.validateInvocation(.chunk, chunk_shape);
-            const result = try state.node.chunkInputDirectWithContext(deadline_ns, alloc, parsed.value.model, input, .{
-                .model = if (cfg.model.len > 0) cfg.model else "fixed",
-                .max_chunks = @intCast(cfg.max_chunks), // 0 = unlimited
-                .threshold = cfg.threshold,
-                .text = .{
-                    .target_tokens = cfg.defaultedTargetTokens(),
-                    .overlap_tokens = cfg.defaultedOverlapTokens(),
-                    .separator = cfg.defaultedSeparator(),
-                },
-                .audio = .{
-                    .window_duration_ms = if (cfg.audio.window_duration_ms > 0) cfg.audio.window_duration_ms else 30_000,
-                    .overlap_duration_ms = cfg.audio.overlap_duration_ms,
-                },
-            });
+            const result = if (cfg.embedding) |target| aware: {
+                const wire = inference.server.chunk_response;
+                const model_request: wire.Request = .{ .input = input, .policy = try wire.parsePolicy(if (cfg.policy) |policy| convert: {
+                    var converted = wire.WirePolicy{};
+                    inline for (@typeInfo(wire.WirePolicy).@"struct".field_names) |name| @field(converted, name) = @field(policy, name);
+                    break :convert converted;
+                } else null), .max_chunks = cfg.max_chunks, .include_content = false, .native_content = true, .execute = target.execute orelse true, .allow_partial = false };
+                const model_target = wire.Target{ .model = target.model, .model_identity = target.model_identity, .task_type = target.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (target.dimensions) |d| std.math.cast(usize, d) orelse return error.InvalidArguments else null };
+                if (cfg.replay) |replay| {
+                    var replay_request = model_request;
+                    replay_request.source_version = replay.source_version;
+                    break :aware try state.node.replayModelChunkDirect(alloc, state.io, execution_control, replay_request, model_target, replay.plan_id, replay.source_fingerprint, replay.ordinal);
+                }
+                break :aware try state.node.chunkModelInputDirect(alloc, state.io, execution_control, model_request, model_target);
+            } else legacy: {
+                const chunk_capabilities = try localModelCapabilities(&state.node, state.io, parsed.value.model, .chunk);
+                var chunk_shape = inference_work.InvocationShape{ .item_count = 1 };
+                switch (input) {
+                    .source => return error.ModelAwareChunkProviderRequired,
+                    .text => |text_value| {
+                        chunk_shape.modalities.text = true;
+                        chunk_shape.text_bytes = text_value.len;
+                        chunk_shape.max_text_bytes_per_item = text_value.len;
+                        try chunk_capabilities.validateMimeType("text/plain");
+                    },
+                    .binary => |binary| {
+                        chunk_shape.encoded_media_bytes = binary.data.len;
+                        chunk_shape.max_media_parts_per_item = 1;
+                        const essence = inference_work.mimeTypeEssence(binary.mime_type) catch
+                            return error.UnsupportedInferenceMimeType;
+                        if (std.ascii.startsWithIgnoreCase(essence, "audio/"))
+                            chunk_shape.modalities.audio = true
+                        else if (std.ascii.startsWithIgnoreCase(essence, "image/"))
+                            chunk_shape.modalities.image = true
+                        else
+                            chunk_shape.modalities.document = true;
+                        try chunk_capabilities.validateMimeType(binary.mime_type);
+                    },
+                }
+                try chunk_capabilities.validateInvocation(.chunk, chunk_shape);
+                break :legacy try state.node.chunkInputDirectWithContext(deadline_ns, alloc, parsed.value.model, input, .{
+                    .model = if (cfg.model.len > 0) cfg.model else "fixed",
+                    .max_chunks = @intCast(cfg.max_chunks), // 0 = unlimited
+                    .threshold = cfg.threshold,
+                    .text = .{
+                        .target_tokens = cfg.defaultedTargetTokens(),
+                        .overlap_tokens = cfg.defaultedOverlapTokens(),
+                        .separator = cfg.defaultedSeparator(),
+                    },
+                    .audio = .{
+                        .window_duration_ms = if (cfg.audio.window_duration_ms > 0) cfg.audio.window_duration_ms else 30_000,
+                        .overlap_duration_ms = cfg.audio.overlap_duration_ms,
+                    },
+                });
+            };
             defer inference_chunker.types.freeChunks(alloc, result);
             // JSON parsing allocates text/data in the receiving allocator. Mark
             // the wire copy as owning those allocations, then restore the
             // borrowed direct result before its local destructor runs.
-            const ownership = try alloc.alloc(struct { mime_type: bool, text: bool, data: bool }, result.len);
+            const ownership = try alloc.alloc(struct { mime_type: bool, text: bool, data: bool, metadata: bool }, result.len);
             defer alloc.free(ownership);
             for (result, ownership) |*chunk, *original| {
                 original.* = .{
                     .mime_type = chunk.owns_mime_type,
                     .text = chunk.owns_text,
                     .data = chunk.owns_data,
+                    .metadata = chunk.owns_metadata,
                 };
+                chunk.owns_metadata = chunk.metadata != null;
                 chunk.owns_mime_type = true;
                 chunk.owns_text = chunk.text != null;
                 chunk.owns_data = chunk.data != null;
             }
             defer for (result, ownership) |*chunk, original| {
+                chunk.owns_metadata = original.metadata;
                 chunk.owns_mime_type = original.mime_type;
                 chunk.owns_text = original.text;
                 chunk.owns_data = original.data;
@@ -1791,12 +1822,17 @@ test "standalone numeric result ABI retains native rows until response destructi
 }
 
 pub fn linkedInferenceRegisterRoutesOn(handle: *anyopaque, server: *httpx.Server) !void {
+    return linkedInferenceRegisterRoutesOnExcept(handle, server, &.{});
+}
+
+pub fn linkedInferenceRegisterRoutesOnExcept(handle: *anyopaque, server: *httpx.Server, excluded: []const []const u8) !void {
     const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
     if (state.worker != null) {
         var entries: ?[*]const inference_bridge.RouteManifestEntry = null;
         var length: usize = 0;
         try linkedInferenceRouteManifest(&.{ .abi_version = inference_bridge.abi_version, .handle = handle, .out_entries = &entries, .out_len = &length });
         for (state.route_manifest.items) |entry| {
+            if (excludedRoute(entry.path.slice(), excluded)) continue;
             try server.routeWithData(switch (entry.method) {
                 .get => .GET,
                 .post => .POST,
@@ -1807,7 +1843,7 @@ pub fn linkedInferenceRegisterRoutesOn(handle: *anyopaque, server: *httpx.Server
         }
         return;
     }
-    var registrar = DirectServer{ .owner = state, .server = server };
+    var registrar = DirectServer{ .owner = state, .server = server, .excluded = excluded };
     try state.node.registerRoutesOn(inference.server.public_api_prefix, &registrar);
     try state.node.registerAiRoutesOn(inference.server.ai_api_prefix, &registrar);
 }
@@ -1902,6 +1938,7 @@ const RouteMetadata = struct {
 };
 
 fn routeMetadata(method: http_abi.HttpMethod, path: []const u8) RouteMetadata {
+    if (method == .post and std.mem.endsWith(u8, path, "/stream") and std.mem.indexOf(u8, path, "/transcription/sessions/") != null) return .{ .request_body = .streaming_raw, .streaming_response = true };
     const method_name = switch (method) {
         .get => "GET",
         .post => "POST",
@@ -1969,11 +2006,18 @@ test "route templates match registered path-parameter patterns" {
     try std.testing.expectEqual(http_abi.RequestBodyMode.none, status.request_body);
 }
 
+fn excludedRoute(path: []const u8, excluded: []const []const u8) bool {
+    for (excluded) |entry| if (std.mem.eql(u8, path, entry)) return true;
+    return false;
+}
+
 const DirectServer = struct {
+    excluded: []const []const u8 = &.{},
     owner: *LinkedInferenceState,
     server: *httpx.Server,
 
     fn register(self: *const DirectServer, method: http_abi.HttpMethod, comptime path: []const u8, handler: httpx.Handler) !void {
+        if (excludedRoute(path, self.excluded)) return;
         const route = try self.owner.alloc.create(RouteState);
         errdefer self.owner.alloc.destroy(route);
         route.* = .{ .owner = self.owner, .handler = handler };
@@ -2156,6 +2200,29 @@ pub fn linkedInferenceRequestAdmissionStats(handle: *anyopaque) inference_bridge
         .in_flight = stats.in_flight_requests,
         .peak_in_flight = stats.peak_in_flight_requests,
         .rejected_total = stats.rejected_requests_total,
+    };
+}
+
+pub fn linkedInferenceMemoryAdmissionStats(handle: *anyopaque) !inference_bridge.MemoryAdmissionStats {
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    // A proxy's empty controller cannot describe the child's memory pressure.
+    if (state.worker != null) return error.UnsupportedOperation;
+    const diagnostic = state.node.model_manager.memoryAdmissionDiagnostic();
+    return .{
+        .pressure = std.meta.stringToEnum(@FieldType(inference_bridge.MemoryAdmissionStats, "pressure"), diagnostic.pressure) orelse .unknown,
+        .denied_count = diagnostic.denied_count,
+        .last_denied_ns = diagnostic.last_denied_ns,
+        .request_count = diagnostic.request_count,
+        .requested_host_bytes = diagnostic.requested_host_bytes,
+        .requested_backend_bytes = diagnostic.requested_backend_bytes,
+        .requested_kv_bytes = diagnostic.requested_kv_bytes,
+        .requested_scratch_bytes = diagnostic.requested_scratch_bytes,
+        .admitted_host_bytes = diagnostic.admitted_host_bytes,
+        .admitted_backend_bytes = diagnostic.admitted_backend_bytes,
+        .host_limit_bytes = diagnostic.host_limit_bytes,
+        .backend_limit_bytes = diagnostic.backend_limit_bytes,
+        .combined_limit_bytes = diagnostic.combined_limit_bytes,
+        .available_memory_bytes = diagnostic.available_memory_bytes,
     };
 }
 
@@ -3050,6 +3117,8 @@ fn localModelCapabilitiesInScope(
             inference_work.PromptPolicy,
             inference.server.resolvedTaskPromptPolicy(@tagName(task)),
         ).?,
+        .generation_grammar_v1 = task == .generate and inference.server.resolvedExecutorKind("generate", &manifest) == .native_generation,
+        .generation_token_logprobs_v1 = task == .generate and inference.server.resolvedExecutorKind("generate", &manifest) == .native_generation,
         .borrowed_attachments = task == .read or task == .generate or task == .embed or task == .extract,
         .borrowed_rasters = (task == .read and manifest.native_arch_hint == .florence) or
             (task == .embed and modalities.image),
@@ -3064,6 +3133,19 @@ fn localModelCapabilitiesInScope(
                 return error.InvalidInferenceCapabilities;
             }
             try result.accepted_mime_types.add(mime_type);
+        }
+    }
+    if (task == .embed) result.model_aware_chunking_v1 = true;
+    if (task == .embed or task == .generate) {
+        // Identity inspection reads the receipt/manifest, never model weights.
+        // Prefer the immutable loaded generation if it already exists.
+        if (node.model_manager.acquireLoadedModel(model_path)) |cached| {
+            var loaded = cached;
+            defer loaded.release();
+            result.model_revision = loaded.get().resolution_revision;
+            if (result.model_revision == null and task == .generate) result.model_revision = try node.model_manager.modelIdentityForManifest(model_path, manifest);
+        } else {
+            result.model_revision = try node.model_manager.modelIdentityForManifest(model_path, manifest);
         }
     }
     try result.validate();
@@ -3592,6 +3674,7 @@ pub fn linkedInferencePullModel(context: *const inference_bridge.PullModelContex
 }
 
 fn pullErrorMessage(err: anyerror) []const u8 {
+    if (inference.pull_diagnostics.glinerMessage(err)) |message| return message;
     return switch (err) {
         error.HubModelNotFound => "the model was not found on the hub",
         error.HubAccessDenied => "the hub denied access; the model may be private or gated, so set token or HF_TOKEN",
@@ -3688,4 +3771,49 @@ test "standalone raster embedding control preserves dimensions pins and borrowed
     try std.testing.expectEqualStrings(&identity, decoded.metadata.value.model_identity.?);
     try std.testing.expectEqual(@as(usize, 12), decoded.images[0].stride_bytes);
     try std.testing.expectEqual(@intFromPtr(bytes[0..].ptr), @intFromPtr(decoded.images[0].bytes.ptr));
+}
+
+test "standalone inference host placement keeps embedded policy local" {
+    var out: ?*anyopaque = null;
+    const io = std.testing.io;
+    var context = inference_bridge.CreateContext{
+        .abi_version = inference_bridge.abi_version,
+        .data_dir_ptr = ".".ptr,
+        .data_dir_len = 1,
+        .models_dir = .{},
+        .ml_dir = .{},
+        .host_limit_bytes = 0,
+        .backend_limit_bytes = 0,
+        .combined_limit_bytes = 0,
+        .kv_limit_bytes = 0,
+        .scratch_limit_bytes = 0,
+        .process_memory_limit_bytes = 0,
+        .preload_ptr = null,
+        .preload_len = 0,
+        .keep_alive = .{},
+        .max_loaded_models = 0,
+        .has_max_loaded_models = 0,
+        .content_security_json = .{},
+        .s3_credentials_json = .{},
+        .runtime_config_json = .init("{}"),
+        .executor = .init(&io),
+        .out_handle = &out,
+        .execution_host = .embedded,
+    };
+    const embedded = try linkedInferenceCreate(&context);
+    defer linkedInferenceDestroy(embedded);
+    const embedded_state: *LinkedInferenceState = @ptrCast(@alignCast(embedded));
+    try std.testing.expect(embedded_state.worker == null);
+    try std.testing.expect(!embedded_state.node.session_manager.process_termination_available);
+    try std.testing.expectEqual(inference.execution_control.NativeCallPolicy.in_process, embedded_state.node.session_manager.native_call_policy);
+    context.execution_host = .server;
+    const server = try linkedInferenceCreate(&context);
+    defer linkedInferenceDestroy(server);
+    const server_state: *LinkedInferenceState = @ptrCast(@alignCast(server));
+    try std.testing.expectEqual(inference.execution_control.NativeCallPolicy.require_supervision, server_state.node.session_manager.native_call_policy);
+    try std.testing.expectEqual(inference.execution_control.NativeCallPolicy.in_process, embedded_state.node.session_manager.native_call_policy);
+    const diagnostic = try linkedInferenceMemoryAdmissionStats(embedded);
+    try std.testing.expectEqual(@as(u64, 0), diagnostic.denied_count);
+    context.runtime_config_json = .init("{\"process_isolation\":false}");
+    try std.testing.expectError(error.UnknownField, linkedInferenceCreate(&context));
 }

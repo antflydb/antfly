@@ -1,0 +1,149 @@
+{
+  "entries": [
+    {
+      "sql": "UPDATE target t SET n=t.n+s.delta,cold='new' FROM source s WHERE t.id=s.id RETURNING t.n,s.delta,(SELECT row_number() OVER (ORDER BY x.delta) FROM source x WHERE x.id=s.id) AS d",
+      "rows": [
+        [
+          "11",
+          "10",
+          "1"
+        ],
+        [
+          "22",
+          "20",
+          "1"
+        ]
+      ],
+      "scans": 3
+    },
+    {
+      "sql": "UPDATE target t SET n=t.n+s.delta,cold='new' FROM source s WHERE t.id=s.id RETURNING t.n,s.delta,(SELECT max(x.delta) FROM source x WHERE x.id=s.id) AS d",
+      "rows": [
+        [
+          "11",
+          "10",
+          "10"
+        ],
+        [
+          "22",
+          "20",
+          "20"
+        ]
+      ],
+      "scans": 3
+    },
+    {
+      "sql": "DELETE FROM target t USING source s WHERE t.id=s.id RETURNING t.n,s.delta,(SELECT x.delta FROM source x WHERE x.id=s.id) AS d",
+      "rows": [
+        [
+          "1",
+          "10",
+          "10"
+        ],
+        [
+          "2",
+          "20",
+          "20"
+        ]
+      ],
+      "scans": 3
+    },
+    {
+      "sql": "UPDATE target t SET n=t.n+s.delta,cold='new' FROM source s WHERE t.id=s.id RETURNING t.n,s.delta,(SELECT s.delta) AS d",
+      "rows": [
+        [
+          "11",
+          "10",
+          "10"
+        ],
+        [
+          "22",
+          "20",
+          "20"
+        ]
+      ],
+      "scans": 2
+    },
+    {
+      "sql": "UPDATE target t SET n=t.n+s.delta,cold='new' FROM source s WHERE t.id=s.id RETURNING t.n,s.delta,(SELECT max(x.delta) FROM source x WHERE x.delta<=t.n) AS d",
+      "rows": [
+        [
+          "11",
+          "10",
+          "10"
+        ],
+        [
+          "22",
+          "20",
+          "20"
+        ]
+      ],
+      "scans": 3
+    },
+    {
+      "sql": "UPDATE target t SET n=t.n+s.delta,cold='new' FROM source s WHERE t.id=s.id RETURNING t.n,s.delta,CASE WHEN s.delta>0 THEN t.n ELSE (SELECT 1/(x.delta-x.delta) FROM source x WHERE x.id=s.id) END AS d",
+      "rows": [
+        [
+          "11",
+          "10",
+          "11"
+        ],
+        [
+          "22",
+          "20",
+          "22"
+        ]
+      ],
+      "scans": 3,
+      "read_rows": 4
+    },
+    {
+      "sql": "UPDATE target t SET n=t.n+s.delta,cold='new' FROM source s WHERE t.id=s.id RETURNING t.n,s.delta,(SELECT x.delta FROM source x WHERE x.id='absent') AS d",
+      "rows": [
+        [
+          "11",
+          "10",
+          null
+        ],
+        [
+          "22",
+          "20",
+          null
+        ]
+      ],
+      "scans": 3
+    },
+    {
+      "sql": "UPDATE target t SET n=t.n+s.delta,cold='new' FROM (SELECT id,delta FROM source) s WHERE t.id=s.id RETURNING t.n,s.delta,(SELECT s.delta) AS d",
+      "rows": [
+        [
+          "11",
+          "10",
+          "10"
+        ],
+        [
+          "22",
+          "20",
+          "20"
+        ]
+      ],
+      "scans": 2
+    },
+    {
+      "sql": "WITH src AS (SELECT id,delta FROM source) UPDATE target t SET n=t.n+s.delta,cold='new' FROM src s WHERE t.id=s.id RETURNING t.n,s.delta,(SELECT s.delta) AS d",
+      "rows": [
+        [
+          "11",
+          "10",
+          "10"
+        ],
+        [
+          "22",
+          "20",
+          "20"
+        ]
+      ],
+      "scans": 2
+    }
+  ]
+}

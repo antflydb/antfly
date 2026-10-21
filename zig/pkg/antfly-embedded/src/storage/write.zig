@@ -17,7 +17,8 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
-const scraping = if (builtin.os.tag == .freestanding) @import("db/scraping_stub.zig") else @import("antfly_scraping");
+const storage_engine = @import("engine.zig");
+pub const scraping = if (builtin.os.tag == .freestanding) @import("db/scraping_stub.zig") else @import("antfly_scraping");
 const common_secrets = @import("../common/secrets.zig");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const backups_api = @import("../api/backups.zig");
@@ -319,6 +320,7 @@ pub fn corruptEmbeddingArtifactInDb(
     doc_key: []const u8,
     index_name: []const u8,
 ) !bool {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeCorruptEmbeddingArtifactInDb", .{ alloc, db, doc_key, index_name });
     const dense_name = db.core.index_manager.denseEmbeddingName(index_name);
     const sparse_name = db.core.index_manager.sparseEmbeddingName(index_name);
     const candidate_names = [_]?[]const u8{
@@ -416,6 +418,7 @@ pub const ManagedDbOpenOptions = struct {
 /// Install the exact private reservation before an owner is adopted. A
 /// canceled owner may only reopen for authenticated cancellation recovery.
 pub fn configureRestoreOwnerDb(alloc: std.mem.Allocator, db: *db_mod.DB, bootstrap: @import("db/restore_staging_contract.zig").OwnerBootstrap, allow_canceled: bool, hot_standby_replay: bool) !void {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeConfigureRestoreOwnerDb", .{ alloc, db, bootstrap, allow_canceled, hot_standby_replay });
     if (allow_canceled and hot_standby_replay) return error.InvalidRestoreStagingCommand;
     try bootstrap.validate();
     if (!db.core.identity_namespace.eql(bootstrap.scope.target_namespace)) return error.RestoreStagingScopeChanged;
@@ -455,6 +458,7 @@ pub const ManagedDbEnrichmentSet = struct {
     generated: bool = false,
 
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        if (comptime storage_engine.enabled) return storage_engine.call("managedDbEnrichmentSetDeinit", .{ self, allocator }) catch @panic("incompatible storage owner");
         if (self.dense) |owned| owned.deinit(allocator);
         if (self.sparse) |owned| owned.deinit(allocator);
         if (self.asset_runtime) |runtime| {
@@ -545,6 +549,7 @@ pub fn createManagedDbEnrichments(
     store: ?*common_secrets.FileStore,
     remote: ?*const scraping.RemoteContentConfig,
 ) !ManagedDbEnrichmentSet {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeCreateManagedDbEnrichments", .{ allocator, raw_indexes_json, runtime, local_provider, remote_capability_cache, inference_api_url, source_table, store, remote });
     // Managed HTTP providers use a concurrent watchdog to enforce the
     // whole-request deadline. Reuse the table's backend executor so write
     // enrichment never falls back to the process-global single-threaded I/O,
@@ -577,7 +582,7 @@ pub fn createManagedDbEnrichments(
 }
 
 pub fn reconfigureManagedDbEnrichmentRuntime(
-    _: std.mem.Allocator,
+    ignored_allocator: std.mem.Allocator,
     db: *db_mod.DB,
     indexes_json: []const u8,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
@@ -588,6 +593,7 @@ pub fn reconfigureManagedDbEnrichmentRuntime(
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
 ) !void {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeReconfigureManagedDbEnrichmentRuntime", .{ ignored_allocator, db, indexes_json, backend_runtime, antfly_provider, remote_capability_cache, inference_api_url, source_table, secret_store, remote_content });
     var enrichments = try createManagedDbEnrichments(
         db.runtime_alloc,
         indexes_json,
@@ -616,6 +622,7 @@ pub fn prepareManagedSchemaBeforeIndexLoad(
     mode: ManagedDbOpenMode,
     schema_json: ?[]const u8,
 ) !?db_mod.SchemaBeforeIndexLoad {
+    if (comptime storage_engine.enabled) return storage_engine.call("writePrepareManagedSchemaBeforeIndexLoad", .{ alloc, mode, schema_json });
     if (mode == .query_readonly or mode == .status_only) return null;
     // A restore descriptor binds the source's exact schema, including the
     // absence of one. Applying table-creation defaults here changes both the
@@ -658,6 +665,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
     identity_namespace: ?doc_identity.Namespace,
     options: ManagedDbOpenOptions,
 ) !db_mod.DB {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeOpenManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions", .{ alloc, path, indexes_json, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, antfly_provider, secret_store, remote_content, identity_namespace, options });
     const reconcile_mode: ManagedDbOpenMode = if (options.reconcile_for_replicated_apply) .restore_repair else mode;
     var reconcile_options = options;
     if (options.reconcile_for_replicated_apply) {
@@ -1077,6 +1085,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
 }
 
 pub fn loadLocalTableSchemaJson(alloc: std.mem.Allocator, db: *db_mod.DB) !?[]u8 {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeLoadLocalTableSchemaJson", .{ alloc, db });
     return db.core.store.get(alloc, local_schema_json_key) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
@@ -1238,10 +1247,12 @@ pub fn exportPortableBackupShard(
     group_id: u64,
     shared_io: ?std.Io,
 ) ![]backups_api.ShardSnapshot {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeExportPortableBackupShard", .{ alloc, db, backup_root, backup_id, group_id, shared_io });
     return exportPortableBackupShardWithSeal(alloc, db, backup_root, backup_id, group_id, shared_io, null, .none);
 }
 
 pub fn exportPortableBackupShardWithSeal(alloc: std.mem.Allocator, db: *db_mod.DB, backup_root: []const u8, backup_id: []const u8, group_id: u64, shared_io: ?std.Io, sealed: ?@import("../api/backup_contract.zig").SealedHandle, cancellation: db_mod.types.CancellationToken) ![]backups_api.ShardSnapshot {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeExportPortableBackupShardWithSeal", .{ alloc, db, backup_root, backup_id, group_id, shared_io, sealed, cancellation });
     try cancellation.check();
     const shards = try alloc.alloc(backups_api.ShardSnapshot, 1);
     errdefer alloc.free(shards);
@@ -1282,6 +1293,7 @@ pub fn populateAcceptedGenerationSummary(namespace: @import("db/doc_identity.zig
 pub const NativeBackupShardSnapshot = struct {
     snapshot_root: []const u8,
     snapshot_attempt: NativeSnapshotAttempt,
+    owned_io_receiver: ?*@import("antfly_runtime_abi").io_abi.Receiver = null,
     dest_root: []const u8,
     io: std.Io,
     cancellation: db_mod.types.CancellationToken,
@@ -1289,11 +1301,13 @@ pub const NativeBackupShardSnapshot = struct {
     owns_shard: bool = true,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (comptime storage_engine.enabled) return storage_engine.call("nativeBackupSnapshotDeinit", .{ self, alloc }) catch @panic("incompatible storage owner");
         deleteLocalNativeSnapshot(self.io, self.snapshot_root);
         self.snapshot_attempt.deinit();
         alloc.free(@constCast(self.snapshot_root));
         alloc.free(@constCast(self.dest_root));
         if (self.owns_shard) self.shard.deinit(alloc);
+        if (self.owned_io_receiver) |receiver| alloc.destroy(receiver);
         self.* = undefined;
     }
 
@@ -1323,6 +1337,7 @@ pub fn prepareNativeBackupShardSnapshot(
     group_id: u64,
     plan: backups_api.TableBackupPlan,
 ) !NativeBackupShardSnapshot {
+    if (comptime storage_engine.enabled) return storage_engine.call("writePrepareNativeBackupShardSnapshot", .{ alloc, db, db_path, group_id, plan });
     std.debug.assert(plan.format == .native);
 
     const snapshot_io = plan.io orelse db.backend_runtime.filesystemIo() orelse
@@ -1380,6 +1395,7 @@ pub fn copyPreparedNativeBackupShardSnapshot(
     alloc: std.mem.Allocator,
     native_snapshot: *NativeBackupShardSnapshot,
 ) ![]backups_api.ShardSnapshot {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeCopyPreparedNativeBackupShardSnapshot", .{ alloc, native_snapshot });
     runTestBeforeNativeBackupCopyHook();
     var integrity = try backups_api.copyNativeDirectoryWithIntegrityUsingIo(
         alloc,
@@ -1412,10 +1428,12 @@ pub fn backupStorageKernelOwnerDb(
     backup_id: []const u8,
     format: backups_api.BackupFormat,
 ) ![]backups_api.ShardSnapshot {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeBackupStorageKernelOwnerDb", .{ alloc, db, db_path, group_id, backup_root, backup_id, format });
     return backupStorageKernelOwnerDbWithControl(alloc, db, db_path, group_id, backup_root, backup_id, format, null, null, .{ .deadline_ns = std.math.maxInt(u64) });
 }
 
 pub fn backupStorageKernelOwnerDbWithControl(alloc: std.mem.Allocator, db: *db_mod.DB, db_path: []const u8, group_id: u64, backup_root: []const u8, backup_id: []const u8, format: backups_api.BackupFormat, cohort: ?@import("db/relational_integrity_topology_contract.zig").Fence, sealed: ?@import("db/native_backup_seal_contract.zig").Handle, control: backups_api.BackupOperationControl) ![]backups_api.ShardSnapshot {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeBackupStorageKernelOwnerDbWithControl", .{ alloc, db, db_path, group_id, backup_root, backup_id, format, cohort, sealed, control });
     try control.ensureActive();
     if (cohort) |fence| {
         const proof = sealed orelse return error.BackupSealMismatch;
@@ -1448,6 +1466,7 @@ pub fn backupStorageKernelOwnerDbWithControl(alloc: std.mem.Allocator, db: *db_m
 }
 
 pub fn exportPortableBackupFile(alloc: std.mem.Allocator, store: *db_mod.docstore.DocStore, path: []const u8, shared_io: ?std.Io) !void {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeExportPortableBackupFile", .{ alloc, store, path, shared_io });
     if (shared_io) |io| return try exportPortableBackupFileWithIo(alloc, store, path, io);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -1455,6 +1474,7 @@ pub fn exportPortableBackupFile(alloc: std.mem.Allocator, store: *db_mod.docstor
 }
 
 pub fn exportPortableBackupFileWithIo(alloc: std.mem.Allocator, store: *db_mod.docstore.DocStore, path: []const u8, io: std.Io) !void {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeExportPortableBackupFileWithIo", .{ alloc, store, path, io });
     return exportPortableBackupFileWithSource(alloc, store, path, io, null);
 }
 
@@ -1465,6 +1485,7 @@ pub fn resolveWritesForSchemaValidation(
     deletes: []const []const u8,
     transforms: []const db_mod.types.DocumentTransform,
 ) ![]db_mod.types.BatchWrite {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeResolveWritesForSchemaValidation", .{ alloc, db, base_writes, deletes, transforms });
     var state = SchemaValidationWriteState{};
     defer state.deinit(alloc);
 
@@ -1496,6 +1517,49 @@ pub fn resolveWritesForSchemaValidation(
     return try state.toOwnedWrites(alloc);
 }
 
+/// Reject invalid selected group members before an authoritative Raft proposal.
+/// Tables without grouping take only the immutable plan lease; they do not
+/// repeat row parsing or relational preparation.
+pub fn validateGroupedSourceBatch(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    writes: []const db_mod.types.BatchWrite,
+    deletes: []const []const u8,
+    transforms: []const db_mod.types.DocumentTransform,
+) !void {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeValidateGroupedSourceBatch", .{ alloc, db, writes, deletes, transforms });
+    if (writes.len == 0 and transforms.len == 0) return;
+    var pinned = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer pinned.release();
+    const plan = pinned.plan().group_sources orelse return;
+    if (plan.entries.len == 0) return;
+    const effective = try resolveWritesForSchemaValidation(alloc, db, writes, deletes, transforms);
+    defer freeOwnedBatchWrites(alloc, effective);
+    var schema = db.core.acquireSchemaView();
+    defer if (schema) |*view| view.release();
+    for (effective) |write| {
+        if (write.key.len > 0 and (write.key[0] == 0 or write.key[0] == 1)) continue;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        if (schema) |view| if (view.storageMode() == .relational) {
+            var prepared = try @import("db/document_mapper.zig").PreparedRelationalWrite.init(scratch, write.key, write.value, view.validator(), view.tableSchema().*, view.physicalLayout());
+            defer prepared.deinit(scratch);
+            try prepared.requireLogicalRoot();
+            _ = plan.prepareRow(scratch, write.key, prepared.parsedValue()) catch |err| switch (err) {
+                error.InvalidGroupedSourceMember, error.GroupedSourceMemberTooLarge => return error.InvalidBatchRequest,
+                else => return err,
+            };
+            continue;
+        };
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, write.value, .{});
+        _ = plan.prepareRow(scratch, write.key, value) catch |err| switch (err) {
+            error.InvalidGroupedSourceMember, error.GroupedSourceMemberTooLarge => return error.InvalidBatchRequest,
+            else => return err,
+        };
+    }
+}
+
 pub fn validateTableBatchAgainstLocalSchema(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
@@ -1503,7 +1567,9 @@ pub fn validateTableBatchAgainstLocalSchema(
     deletes: []const []const u8,
     transforms: []const db_mod.types.DocumentTransform,
 ) !void {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeValidateTableBatchAgainstLocalSchema", .{ alloc, db, writes, deletes, transforms });
     if (writes.len == 0 and deletes.len == 0 and transforms.len == 0) return;
+    try validateGroupedSourceBatch(alloc, db, writes, deletes, transforms);
     // Relational writes are validated authoritatively by DB.batch after its
     // final transform resolution and while holding the schema generation's
     // apply lock. Repeating the API-level load/parse/transform pass doubles
@@ -1528,6 +1594,7 @@ pub fn applyLocalTableSchemaJson(
     db: *db_mod.DB,
     schema_json: []const u8,
 ) !void {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeApplyLocalTableSchemaJson", .{ alloc, db, schema_json });
     // The absent/empty catalog contract has the same canonical schema as
     // table creation. Never overwrite only the public marker: its validator
     // and the durable runtime layout must be committed in the same epoch.
@@ -1565,6 +1632,7 @@ pub const OwnerManagedConfig = struct {
 };
 
 pub fn prepareOwnerSchemaBeforeIndexLoad(alloc: std.mem.Allocator, schema_json: []const u8) !?db_mod.SchemaBeforeIndexLoad {
+    if (comptime storage_engine.enabled) return storage_engine.call("writePrepareOwnerSchemaBeforeIndexLoad", .{ alloc, schema_json });
     if (schema_json.len == 0) return null;
     var parsed = try tables_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
@@ -1587,6 +1655,7 @@ pub fn configureStorageKernelOwnerDb(
     remote_content: ?*const scraping.RemoteContentConfig,
     installed: ?*OwnerManagedConfig,
 ) !void {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeConfigureStorageKernelOwnerDb", .{ alloc, db, table_name, schema_json, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content, installed });
     _ = try configureStorageKernelOwnerDbAtOpen(alloc, db, table_name, schema_json, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content, installed, false);
 }
 
@@ -1606,6 +1675,7 @@ pub fn configureStorageKernelOwnerDbAtOpen(
     installed: ?*OwnerManagedConfig,
     historical_ordered_apply: bool,
 ) !bool {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeConfigureStorageKernelOwnerDbAtOpen", .{ alloc, db, table_name, schema_json, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content, installed, historical_ordered_apply });
     if (historical_ordered_apply) {
         const stored = try loadOwnerCatalogContract(alloc, db);
         defer if (stored) |value| alloc.free(value);
@@ -1742,6 +1812,7 @@ pub fn openStorageKernelRestoreDb(
     identity_namespace: ?doc_identity.Namespace,
     prepared_restore: *const backup_restore.PreparedRestore,
 ) !db_mod.DB {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeOpenStorageKernelRestoreDb", .{ alloc, path, indexes_json, lsm_root_generation, backend_runtime, identity_namespace, prepared_restore });
     return try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
         alloc,
         path,
@@ -1771,6 +1842,7 @@ pub fn repairStorageKernelRestoreDb(
     indexes_json: []const u8,
     cancellation: db_mod.types.CancellationToken,
 ) !void {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeRepairStorageKernelRestoreDb", .{ alloc, db, group_id, schema_json, indexes_json, cancellation });
     try configureStorageKernelOwnerDb(alloc, db, "", schema_json, indexes_json, null, null, null, null, null);
     const io = db.backend_runtime.filesystemIo() orelse std.Io.Threaded.global_single_threaded.io();
     var repair_cancellation = db_mod.types.RepairCancellation{ .token = cancellation };
@@ -1826,6 +1898,7 @@ pub fn reconcileStorageKernelOwnerDb(
     antfly_provider: ?managed_embedder.AntflyProvider,
     installed: ?*OwnerManagedConfig,
 ) !StorageKernelReconcileResult {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeReconcileStorageKernelOwnerDb", .{ alloc, db, table_name, schema_json, indexes_json, target_index_name, advance_index_repair, backend_runtime, antfly_provider, installed });
     if (schema_json.len > 0 and try db.childGenerationSourcePinsSchemaJson(schema_json))
         return .{ .state = .busy };
     if (try db.childGenerationSourceDefersOwnerCatalog())
@@ -1918,6 +1991,7 @@ pub fn repairStorageKernelOwnerDb(
     advance_index_repair: bool,
     options: db_mod.types.ArtifactRepairRunOptions,
 ) !StorageKernelReconcileResult {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeRepairStorageKernelOwnerDb", .{ alloc, db, target_index_name, advance_index_repair, options });
     var result: StorageKernelReconcileResult = .{};
     var repair_summary = db.indexRepairIntentSummaryForIndex(alloc, target_index_name) catch |err| switch (err) {
         error.DurableIndexRepairStateUnavailable => if (target_index_name != null or advance_index_repair) return err else db_mod.DB.IndexRepairIntentSummary{},
@@ -1962,6 +2036,7 @@ pub fn validateProvisionedDbIdentityNamespaceWithPolicy(
     validation: StartupCatchUpMetadata.IdentityValidation,
     db: *const db_mod.DB,
 ) !void {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeValidateProvisionedDbIdentityNamespaceWithPolicy", .{ expected, validation, db });
     const namespace = expected orelse return;
     const valid = switch (validation) {
         .exact => db.core.identity_namespace.eql(namespace),
@@ -2067,6 +2142,7 @@ test "native backup never reclaims an old attempt with a live lease" {
 }
 
 pub fn batchUsesDurableTransactionContract(alloc: std.mem.Allocator, db: *db_mod.DB, req: db_mod.types.BatchRequest) !bool {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeBatchUsesDurableTransactionContract", .{ alloc, db, req });
     const mutation = req.transaction orelse return false;
     return switch (mutation) {
         .prepare => |prepare| try transactionUsesDurableContract(alloc, db, prepare.txn_id),
@@ -2075,6 +2151,7 @@ pub fn batchUsesDurableTransactionContract(alloc: std.mem.Allocator, db: *db_mod
 }
 
 pub fn transactionUsesDurableContract(alloc: std.mem.Allocator, db: *db_mod.DB, txn_id: db_mod.types.TxnId) !bool {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeTransactionUsesDurableContract", .{ alloc, db, txn_id });
     if (try db.core.transactionSchemaBinding(alloc, txn_id) != null) return true;
     const status = db.getTransactionStatus(txn_id) catch |err| switch (err) {
         error.TxnNotFound => return false,
@@ -2090,6 +2167,7 @@ pub fn applyGraphMetricActionToDb(
     metric_name: []const u8,
     action: []const u8,
 ) !db_mod.types.GraphMetricStatus {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeApplyGraphMetricActionToDb", .{ alloc, db, index_name, metric_name, action });
     if (std.mem.eql(u8, action, "refresh")) return try db.scheduleGraphMetricBuild(alloc, index_name, metric_name, false);
     if (std.mem.eql(u8, action, "rebuild")) return try db.scheduleGraphMetricBuild(alloc, index_name, metric_name, true);
     if (std.mem.eql(u8, action, "delete")) return try db.deleteGraphMetricMaterialization(alloc, index_name, metric_name);
@@ -2106,6 +2184,7 @@ pub fn runGraphMetricMaintenanceOrActionJsonAlloc(
     db: *db_mod.DB,
     body: []const u8,
 ) ![]u8 {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeRunGraphMetricMaintenanceOrActionJsonAlloc", .{ alloc, db, body });
     var parsed = std.json.parseFromSlice(GraphMetricGroupActionRequest, alloc, body, .{ .ignore_unknown_fields = true }) catch
         return try db.runGraphMetricServiceMaintenanceJsonAlloc(alloc, body);
     defer parsed.deinit();
@@ -2128,7 +2207,7 @@ pub fn runGraphMetricMaintenanceOrActionJsonAlloc(
 }
 
 pub fn reconfigureManagedDbEnrichmentRuntimePaused(
-    _: std.mem.Allocator,
+    ignored_allocator: std.mem.Allocator,
     db: *db_mod.DB,
     indexes_json: []const u8,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
@@ -2139,6 +2218,7 @@ pub fn reconfigureManagedDbEnrichmentRuntimePaused(
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
 ) !void {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeReconfigureManagedDbEnrichmentRuntimePaused", .{ ignored_allocator, db, indexes_json, backend_runtime, antfly_provider, remote_capability_cache, inference_api_url, source_table, secret_store, remote_content });
     var enrichments = try createManagedDbEnrichments(
         db.runtime_alloc,
         indexes_json,
@@ -2162,6 +2242,7 @@ pub const PortableCohortSource = struct {
 };
 
 pub fn exportPortableBackupFileWithSource(alloc: std.mem.Allocator, store: *db_mod.docstore.DocStore, path: []const u8, io: std.Io, sealed: ?PortableCohortSource) !void {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeExportPortableBackupFileWithSource", .{ alloc, store, path, io, sealed });
     const summary_output = if (sealed) |source| source.source_generation_summary_output else null;
     if (summary_output) |output| output.* = null;
     errdefer if (summary_output) |output| if (output.*) |entries| {

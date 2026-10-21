@@ -6,6 +6,7 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
+from ...models.catalog_mutation_visibility_pending import CatalogMutationVisibilityPending
 from ...models.create_query_source_body import CreateQuerySourceBody
 from ...models.error import Error
 from ...models.saved_query_source import SavedQuerySource
@@ -36,14 +37,15 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Any | Error | SavedQuerySource | None:
+) -> Any | CatalogMutationVisibilityPending | Error | SavedQuerySource | None:
     if response.status_code == 201:
         response_201 = SavedQuerySource.from_dict(response.json())
 
         return response_201
 
     if response.status_code == 202:
-        response_202 = cast(Any, None)
+        response_202 = CatalogMutationVisibilityPending.from_dict(response.json())
+
         return response_202
 
     if response.status_code == 400:
@@ -63,7 +65,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[Any | Error | SavedQuerySource]:
+) -> Response[Any | CatalogMutationVisibilityPending | Error | SavedQuerySource]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -77,7 +79,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: CreateQuerySourceBody,
-) -> Response[Any | Error | SavedQuerySource]:
+) -> Response[Any | CatalogMutationVisibilityPending | Error | SavedQuerySource]:
     """Create saved query source
 
      Creates an immutable union or keyed overlay in the Antfly metadata catalog. Reads require permission
@@ -93,7 +95,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | Error | SavedQuerySource]
+        Response[Any | CatalogMutationVisibilityPending | Error | SavedQuerySource]
     """
 
     kwargs = _get_kwargs(
@@ -113,7 +115,7 @@ def sync(
     *,
     client: AuthenticatedClient,
     body: CreateQuerySourceBody,
-) -> Any | Error | SavedQuerySource | None:
+) -> Any | CatalogMutationVisibilityPending | Error | SavedQuerySource | None:
     """Create saved query source
 
      Creates an immutable union or keyed overlay in the Antfly metadata catalog. Reads require permission
@@ -129,7 +131,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | Error | SavedQuerySource
+        Any | CatalogMutationVisibilityPending | Error | SavedQuerySource
     """
 
     return sync_detailed(
@@ -144,7 +146,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: CreateQuerySourceBody,
-) -> Response[Any | Error | SavedQuerySource]:
+) -> Response[Any | CatalogMutationVisibilityPending | Error | SavedQuerySource]:
     """Create saved query source
 
      Creates an immutable union or keyed overlay in the Antfly metadata catalog. Reads require permission
@@ -160,7 +162,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | Error | SavedQuerySource]
+        Response[Any | CatalogMutationVisibilityPending | Error | SavedQuerySource]
     """
 
     kwargs = _get_kwargs(
@@ -178,7 +180,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     body: CreateQuerySourceBody,
-) -> Any | Error | SavedQuerySource | None:
+) -> Any | CatalogMutationVisibilityPending | Error | SavedQuerySource | None:
     """Create saved query source
 
      Creates an immutable union or keyed overlay in the Antfly metadata catalog. Reads require permission
@@ -194,7 +196,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | Error | SavedQuerySource
+        Any | CatalogMutationVisibilityPending | Error | SavedQuerySource
     """
 
     return (

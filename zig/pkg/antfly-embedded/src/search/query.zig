@@ -43,6 +43,8 @@ const synonyms_mod = @import("../section/synonyms.zig");
 // A failed read must never be converted into an empty filter result.
 pub const FilterError = anyerror;
 
+pub const ExecutionControl = @import("execution_control.zig").ExecutionControl;
+
 const geo_filter_earth_radius_meters: f64 = 6371008.8;
 
 /// A filter that produces a bitmap of matching document IDs.
@@ -68,10 +70,28 @@ pub const Filter = union(enum) {
     match_none: void,
     match_all: void,
 
+    pub fn withControl(self: Filter, control: ExecutionControl) Filter {
+        var result = self;
+        switch (result) {
+            .bool_filter => |*f| f.control = control,
+            .prefix => |*f| f.control = control,
+            .fuzzy => |*f| f.control = control,
+            .wildcard => |*f| f.control = control,
+            .regexp => |*f| f.control = control,
+            .term_range => |*f| f.control = control,
+            else => {},
+        }
+        return result;
+    }
+
     /// Execute this filter against a single segment, returning matching doc IDs.
     pub fn execute(self: Filter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
         seg.beginAccess();
         defer seg.endAccess();
+        switch (self) {
+            inline .prefix, .wildcard, .regexp, .fuzzy => |filter| if (filter.control.pattern_cache) |cache| return cache.execute(alloc, self, seg, filter.control),
+            else => {},
+        }
         return switch (self) {
             .term => |f| f.execute(alloc, seg),
             .bool_filter => |f| f.execute(alloc, seg),
@@ -118,6 +138,285 @@ pub const Filter = union(enum) {
     }
 };
 
+/// Query-owned immutable programs. Only compilation runs under the lock;
+/// dictionary I/O and private DFA execution never hold it. Full/oversized
+/// caches decline reuse and preserve the ordinary per-consumer execution path.
+pub const PatternPrograms = struct {
+    const Kind = enum { regexp, wildcard, fuzzy };
+    const Entry = struct {
+        key: [32]u8,
+        pattern: []u8,
+        program: union(Kind) { regexp: regex_mod.RegexAutomaton, wildcard: wildcard_mod.SearchPlan, fuzzy: levenshtein.LevenshteinAutomaton },
+        executions: [4]?*Execution = @splat(null),
+    };
+    const Execution = struct {
+        budget: @import("../sql/memory_budget.zig"),
+        program: union(enum) { regexp: regex_mod.RegexAutomaton, fuzzy: levenshtein.LevenshteinAutomaton },
+        busy: bool = false,
+        fn deinit(self: *@This()) void {
+            switch (self.program) {
+                inline else => |*program| program.deinit(),
+            }
+            std.debug.assert(self.budget.live == 0);
+        }
+    };
+    const ExecutionLease = struct {
+        owner: *PatternPrograms,
+        execution: *Execution,
+        fn release(self: @This()) void {
+            @import("antfly_platform").sync.lockYielding(&self.owner.mutex);
+            defer self.owner.mutex.unlock();
+            self.execution.busy = false;
+            // A parent allocator can refuse growth without exhausting the
+            // child budget. Failed DFA tables are never reusable, regardless
+            // of which admission owner rejected their allocation.
+            const failed = switch (self.execution.program) {
+                inline else => |program| program.allocation_failed,
+            };
+            if (failed or self.execution.budget.isLocallyExhausted()) {
+                for (self.owner.entries) |entry| if (entry) |held| {
+                    for (&held.executions) |*slot| if (slot.* == self.execution) {
+                        slot.* = null;
+                        self.execution.deinit();
+                        self.owner.budget.allocator().destroy(self.execution);
+                        return;
+                    };
+                };
+                unreachable;
+            }
+        }
+    };
+    /// Mutable DFA tables are exclusive to one traversal, but survive between
+    /// segments. Slots and their allocations belong to this bounded query owner.
+    fn checkout(self: *@This(), entry: *Entry, control: ExecutionControl) !?ExecutionLease {
+        try control.check();
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        for (entry.executions) |slot| if (slot) |execution| if (!execution.busy and !execution.budget.isLocallyExhausted()) {
+            execution.busy = true;
+            self.execution_hits += 1;
+            return .{ .owner = self, .execution = execution };
+        };
+        const slot = for (&entry.executions) |*candidate| {
+            if (candidate.* == null) break candidate;
+        } else return null;
+        const a = self.budget.allocator();
+        const execution = a.create(Execution) catch |err| {
+            if (self.budget.isExhausted()) return null;
+            return err;
+        };
+        execution.* = .{ .budget = .{ .backing = a, .limit = @min(256 * 1024, self.budget.limit / 4) }, .program = undefined, .busy = true };
+        execution.program = switch (entry.program) {
+            .regexp => |*program| .{ .regexp = program.fork(execution.budget.allocator()) },
+            .fuzzy => |program| .{ .fuzzy = .{ .term = program.term, .max_distance = program.max_distance, .alloc = execution.budget.allocator() } },
+            .wildcard => unreachable,
+        };
+        slot.* = execution;
+        self.execution_builds += 1;
+        return .{ .owner = self, .execution = execution };
+    }
+    budget: @import("../sql/memory_budget.zig"),
+    entries: [16]?*Entry = @splat(null),
+    mutex: std.atomic.Mutex = .unlocked,
+    builds: usize = 0,
+    hits: usize = 0,
+    execution_builds: usize = 0,
+    execution_hits: usize = 0,
+    pub fn init(a: Allocator, bytes: usize) @This() {
+        return .{ .budget = .{ .backing = a, .limit = bytes } };
+    }
+    pub fn deinit(self: *@This()) void {
+        const a = self.budget.allocator();
+        for (self.entries) |entry| if (entry) |held| {
+            for (held.executions) |slot| if (slot) |execution| {
+                std.debug.assert(!execution.busy);
+                execution.deinit();
+                a.destroy(execution);
+            };
+            switch (held.program) {
+                .regexp => |*program| program.deinit(),
+                .wildcard => |*program| program.deinit(a),
+                .fuzzy => |*program| program.deinit(),
+            }
+            a.free(held.pattern);
+            a.destroy(held);
+        };
+        std.debug.assert(self.budget.live == 0);
+    }
+    fn get(self: *@This(), kind: Kind, pattern: []const u8, control: ExecutionControl) !?*Entry {
+        return self.getDistance(kind, pattern, 0, control);
+    }
+    fn getDistance(self: *@This(), kind: Kind, pattern: []const u8, distance: u8, control: ExecutionControl) !?*Entry {
+        try control.check();
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update(@tagName(kind));
+        if (kind == .fuzzy) hasher.update(&.{distance});
+        hasher.update(pattern);
+        var key: [32]u8 = undefined;
+        hasher.final(&key);
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.entries) |entry| if (entry) |held| if (std.mem.eql(u8, &held.key, &key)) {
+            self.hits += 1;
+            return held;
+        };
+        const slot = for (&self.entries) |*entry| {
+            if (entry.* == null) break entry;
+        } else return null;
+        const built = self.build(kind, pattern, key, distance) catch |err| {
+            if (err == error.OutOfMemory and self.budget.isExhausted()) return null;
+            return err;
+        };
+        slot.* = built;
+        self.builds += 1;
+        try control.check();
+        return built;
+    }
+    fn build(self: *@This(), kind: Kind, pattern: []const u8, key: [32]u8, distance: u8) !*Entry {
+        const a = self.budget.allocator();
+        const entry = try a.create(Entry);
+        errdefer a.destroy(entry);
+        const owned = try a.dupe(u8, pattern);
+        errdefer a.free(owned);
+        entry.* = .{ .key = key, .pattern = owned, .program = switch (kind) {
+            .regexp => .{ .regexp = try regex_mod.compile(a, owned) },
+            .wildcard => .{ .wildcard = try wildcard_mod.searchPlanAlloc(a, owned) },
+            .fuzzy => .{ .fuzzy = .{ .term = owned, .max_distance = distance } },
+        } };
+        return entry;
+    }
+};
+
+/// Bounded query-owned pattern leaves for one immutable corpus/pack. Keys own
+/// only digests; encoded segments and request syntax are never retained. Each
+/// mutable caller receives a private bitmap. Scorers can instead pin immutable
+/// membership until their independent iterators close, preventing eviction.
+pub const PatternMembership = struct {
+    const Bitmap = roaring.RoaringBitmap;
+    const Entry = struct { key: [32]u8, bitmap: Bitmap, age: u64, pins: usize = 0 };
+    /// Cache lifetime encloses every scorer. Pinned slots cannot be evicted;
+    /// consumers own independent iterators over immutable segment-local IDs.
+    pub const Pin = struct {
+        cache: *PatternMembership,
+        slot: usize,
+        pub fn bitmap(self: Pin) *const Bitmap {
+            return &self.cache.entries[self.slot].?.bitmap;
+        }
+        pub fn release(self: Pin) void {
+            self.cache.lock();
+            defer self.cache.mutex.unlock();
+            std.debug.assert(self.cache.entries[self.slot].?.pins != 0);
+            self.cache.entries[self.slot].?.pins -= 1;
+        }
+    };
+    budget: @import("../sql/memory_budget.zig"),
+    entries: [32]?Entry = @splat(null),
+    mutex: std.atomic.Mutex = .unlocked,
+    tick: u64 = 0,
+    hits: usize = 0,
+    builds: usize = 0,
+    pub fn init(a: Allocator, bytes: usize) PatternMembership {
+        return .{ .budget = .{ .backing = a, .limit = bytes } };
+    }
+    fn lock(self: *@This()) void {
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+    }
+    fn evict(self: *@This()) bool {
+        var oldest: ?usize = null;
+        for (self.entries, 0..) |entry, i| if (entry) |held| {
+            if (held.pins != 0) continue;
+            if (oldest == null or held.age < self.entries[oldest.?].?.age) oldest = i;
+        };
+        const index = oldest orelse return false;
+        self.entries[index].?.bitmap.deinit();
+        self.entries[index] = null;
+        return true;
+    }
+    pub fn deinit(self: *@This()) void {
+        while (self.evict()) {}
+        for (self.entries) |entry| std.debug.assert(entry == null);
+        std.debug.assert(self.budget.live == 0);
+    }
+    pub fn pin(self: *@This(), filter: Filter, seg: *const index_mod.SegmentEntry, control: ExecutionControl) !?Pin {
+        switch (filter) {
+            .prefix, .wildcard, .regexp, .fuzzy => {},
+            else => return null,
+        }
+        try control.check();
+        const key = identity(filter, seg);
+        self.lock();
+        defer self.mutex.unlock();
+        self.tick +%= 1;
+        for (&self.entries, 0..) |*entry, i| if (entry.*) |*held| if (std.mem.eql(u8, &held.key, &key)) {
+            held.pins += 1;
+            held.age = self.tick;
+            self.hits += 1;
+            return .{ .cache = self, .slot = i };
+        };
+        return null;
+    }
+    fn identity(filter: Filter, seg: *const index_mod.SegmentEntry) [32]u8 {
+        var buffer: [1024]u8 = undefined;
+        var writer: std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256) = .init(&buffer);
+        std.json.Stringify.value(.{ seg.id, seg.reader.doc_count, @tagName(filter) }, .{}, &writer.writer) catch unreachable;
+        switch (filter) {
+            inline .prefix, .wildcard, .regexp, .fuzzy => |value| inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |name| {
+                if (comptime !std.mem.eql(u8, name, "control")) {
+                    std.json.Stringify.value(@field(value, name), .{}, &writer.writer) catch unreachable;
+                    writer.writer.writeByte(0) catch unreachable;
+                }
+            },
+            else => unreachable,
+        }
+        writer.writer.flush() catch unreachable;
+        var digest: [32]u8 = undefined;
+        writer.hasher.final(&digest);
+        return digest;
+    }
+    fn execute(self: *@This(), a: Allocator, filter: Filter, seg: *const index_mod.SegmentEntry, control: ExecutionControl) !Bitmap {
+        try control.check();
+        const key = identity(filter, seg);
+        self.lock();
+        self.tick +%= 1;
+        for (&self.entries) |*entry| if (entry.*) |*held| if (std.mem.eql(u8, &held.key, &key)) {
+            held.age = self.tick;
+            const result = held.bitmap.clone(a);
+            self.hits += 1;
+            self.mutex.unlock();
+            var owned = try result;
+            errdefer owned.deinit();
+            try control.check();
+            return owned;
+        };
+        self.mutex.unlock();
+        var uncached = control;
+        uncached.pattern_cache = null;
+        var result = try filter.withControl(uncached).execute(a, seg);
+        errdefer result.deinit();
+        try control.check();
+        self.lock();
+        defer self.mutex.unlock();
+        self.builds += 1;
+        while (true) {
+            var free: ?usize = null;
+            for (self.entries, 0..) |entry, i| if (entry == null) {
+                free = i;
+                break;
+            };
+            if (free == null) {
+                if (!self.evict()) return result;
+                continue;
+            }
+            const copy = result.clone(self.budget.allocator()) catch {
+                if (!self.evict()) return result;
+                continue;
+            };
+            self.entries[free.?] = .{ .key = key, .bitmap = copy, .age = self.tick };
+            return result;
+        }
+    }
+};
+
 /// Exact term match: extracts the posting bitmap for a single term.
 /// If the segment has a synonym section for the field, synonyms are automatically expanded.
 pub const TermFilter = struct {
@@ -147,10 +446,16 @@ pub const TermFilter = struct {
 
         // Synonym expansion: check if field has a synonym section
         if (try seg.reader.getSection(self.field, .synonym)) |syn_data| {
-            var syn_reader = synonyms_mod.SynonymReader.init(alloc, syn_data) catch return result;
+            var syn_reader = synonyms_mod.SynonymReader.init(alloc, syn_data) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return result,
+            };
             defer syn_reader.deinit();
 
-            const expanded = syn_reader.expandTerm(alloc, self.term) catch return result;
+            const expanded = syn_reader.expandTerm(alloc, self.term) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return result,
+            };
             if (expanded) |terms| {
                 defer {
                     for (terms) |t| alloc.free(t);
@@ -186,6 +491,7 @@ pub const TermFilter = struct {
 /// If both must and should are empty, matches nothing.
 /// If must is empty but should is non-empty, should results are the base.
 pub const BoolFilter = struct {
+    control: ExecutionControl = .{},
     must: []const Filter,
     should: []const Filter,
     must_not: []const Filter,
@@ -202,7 +508,8 @@ pub const BoolFilter = struct {
 
         // Process must clauses (AND)
         for (self.must) |clause| {
-            var clause_bm = if (clause == .doc_num) try clause.doc_num.refine(alloc, seg, doc_offset, if (result) |*r| r else null) else try clause.executeWithOffset(alloc, seg, doc_offset);
+            try self.control.check();
+            var clause_bm = if (clause == .doc_num) try clause.doc_num.refine(alloc, seg, doc_offset, if (result) |*r| r else null) else try clause.withControl(self.control).executeWithOffset(alloc, seg, doc_offset);
             if (result) |*r| {
                 r.andWith(&clause_bm);
                 clause_bm.deinit();
@@ -215,7 +522,7 @@ pub const BoolFilter = struct {
         if (self.should.len > 0) {
             const required_should: u32 = if (self.min_should_match == 0 and result == null) 1 else self.min_should_match;
             if (required_should > 0) {
-                var should_bm = try executeShouldClauses(alloc, self.should, required_should, seg, doc_offset);
+                var should_bm = try executeShouldClauses(alloc, self.should, required_should, seg, doc_offset, self.control);
                 errdefer should_bm.deinit();
                 if (result) |*r| {
                     r.andWith(&should_bm);
@@ -233,7 +540,8 @@ pub const BoolFilter = struct {
 
         // Process must_not clauses (ANDNOT)
         for (self.must_not) |clause| {
-            var clause_bm = if (clause == .doc_num) try clause.doc_num.refine(alloc, seg, doc_offset, &result.?) else try clause.executeWithOffset(alloc, seg, doc_offset);
+            try self.control.check();
+            var clause_bm = if (clause == .doc_num) try clause.doc_num.refine(alloc, seg, doc_offset, &result.?) else try clause.withControl(self.control).executeWithOffset(alloc, seg, doc_offset);
             defer clause_bm.deinit();
             result.?.andNotWith(&clause_bm);
         }
@@ -248,6 +556,7 @@ fn executeShouldClauses(
     min_should_match: u32,
     seg: *const index_mod.SegmentEntry,
     doc_offset: u32,
+    control: ExecutionControl,
 ) FilterError!roaring.RoaringBitmap {
     if (min_should_match > should.len) {
         return roaring.RoaringBitmap.init(alloc);
@@ -257,7 +566,8 @@ fn executeShouldClauses(
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
         for (should) |clause| {
-            var clause_bm = try clause.executeWithOffset(alloc, seg, doc_offset);
+            try control.check();
+            var clause_bm = try clause.withControl(control).executeWithOffset(alloc, seg, doc_offset);
             defer clause_bm.deinit();
             try result.orWith(&clause_bm);
         }
@@ -268,11 +578,15 @@ fn executeShouldClauses(
     defer counts.deinit(alloc);
 
     for (should) |clause| {
-        var clause_bm = try clause.executeWithOffset(alloc, seg, doc_offset);
+        try control.check();
+        var clause_bm = try clause.withControl(control).executeWithOffset(alloc, seg, doc_offset);
         defer clause_bm.deinit();
 
         var iter = clause_bm.iterator();
+        var visited: usize = 0;
         while (iter.next()) |doc_id| {
+            if (visited % 256 == 0) try control.check();
+            visited += 1;
             const entry = try counts.getOrPut(alloc, doc_id);
             if (!entry.found_existing) entry.value_ptr.* = 0;
             entry.value_ptr.* += 1;
@@ -282,7 +596,10 @@ fn executeShouldClauses(
     var result = roaring.RoaringBitmap.init(alloc);
     errdefer result.deinit();
     var iter = counts.iterator();
+    var visited: usize = 0;
     while (iter.next()) |entry| {
+        if (visited % 256 == 0) try control.check();
+        visited += 1;
         if (entry.value_ptr.* >= min_should_match) {
             try result.add(entry.key_ptr.*);
         }
@@ -293,6 +610,7 @@ fn executeShouldClauses(
 /// Prefix match: finds all terms starting with a prefix via FST range iteration.
 /// Returns the union of posting bitmaps for all matching terms.
 pub const PrefixFilter = struct {
+    control: ExecutionControl = .{},
     field: []const u8,
     prefix: []const u8,
     indexed_field: ?[]const u8 = null,
@@ -353,6 +671,7 @@ pub const PrefixFilter = struct {
         // lexicographically earlier terms, which turns type-ahead queries into
         // a full term-dictionary scan as the corpus vocabulary grows.
         var term_iter = try inv_reader.rangeTermIterator(self.prefix, null);
+        term_iter.setControl(self.control);
         defer term_iter.deinit();
 
         var result = roaring.RoaringBitmap.init(alloc);
@@ -371,17 +690,8 @@ pub const PrefixFilter = struct {
                 continue;
             }
             if (comptime collect_stats) stats.?.matching_terms += 1;
-            // Term matches prefix — union its postings
-            switch (entry.result) {
-                .postings => |p| {
-                    var bm = try p.docBitmap(alloc);
-                    defer bm.deinit();
-                    try result.orWith(&bm);
-                },
-                .one_hit => |h| {
-                    try result.add(h.doc_num);
-                },
-            }
+            try self.control.check();
+            try unionTermEntry(alloc, &result, entry, self.control);
         }
 
         return result;
@@ -565,12 +875,19 @@ pub const AutomatonExecutionStats = struct {
 };
 
 /// Union the postings of one dictionary entry into `result`.
-fn unionTermEntry(alloc: Allocator, result: *roaring.RoaringBitmap, entry: inverted.TermIterator.Entry) FilterError!void {
+fn unionTermEntry(alloc: Allocator, result: *roaring.RoaringBitmap, entry: inverted.TermIterator.Entry, control: ExecutionControl) FilterError!void {
+    try control.check();
     switch (entry.result) {
         .postings => |p| {
-            var bm = try p.docBitmap(alloc);
-            defer bm.deinit();
-            try result.orWith(&bm);
+            var postings = try p.iterator(alloc);
+            defer postings.deinit();
+            postings.decode_positions = false;
+            var visited: usize = 0;
+            while (try postings.next()) |hit| {
+                if (visited % 256 == 0) try control.check();
+                visited += 1;
+                try result.add(hit.doc_id);
+            }
         },
         .one_hit => |h| {
             try result.add(h.doc_num);
@@ -589,7 +906,9 @@ fn collectAutomatonTerms(
     comptime collect_stats: bool,
     stats: ?*AutomatonExecutionStats,
 ) FilterError!void {
+    term_iter.setControl(context.control);
     while (true) {
+        try context.control.check();
         const next_entry = if (comptime collect_stats)
             try term_iter.nextWithDecodedCount(&stats.?.dictionary_terms_decoded)
         else
@@ -597,13 +916,14 @@ fn collectAutomatonTerms(
         const entry = next_entry orelse break;
         if (!accept(context, entry.term)) continue;
         if (comptime collect_stats) stats.?.matching_terms += 1;
-        try unionTermEntry(alloc, result, entry);
+        try unionTermEntry(alloc, result, entry, context.control);
     }
     if (comptime collect_stats) stats.?.blocks_pruned = term_iter.blocksPruned();
 }
 
 /// Fuzzy match: finds all terms within Levenshtein edit distance via FST automaton search.
 pub const FuzzyFilter = struct {
+    control: ExecutionControl = .{},
     field: []const u8,
     term: []const u8,
     max_edits: u8 = 1,
@@ -630,13 +950,31 @@ pub const FuzzyFilter = struct {
         return fuzzyPrefixMatches(self.term, term, self.prefix_len);
     }
 
-    fn executeInternal(
+    fn executeInternal(self: FuzzyFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, comptime collect_stats: bool, stats: ?*ExecutionStats) FilterError!roaring.RoaringBitmap {
+        const original_stats = if (stats) |value| value.* else null;
+        return self.executeAttempt(alloc, seg, collect_stats, stats) catch |err| switch (err) {
+            error.PatternProgramBudgetExceeded => blk: {
+                // The failed attempt has released its reader, iterator and
+                // execution lease before the private traversal starts.
+                var fallback = self;
+                fallback.control.pattern_programs = null;
+                if (stats) |value| value.* = original_stats.?;
+                break :blk fallback.executeAttempt(alloc, seg, collect_stats, stats) catch |failure| switch (failure) {
+                    error.PatternProgramBudgetExceeded => unreachable,
+                    else => return failure,
+                };
+            },
+            else => return err,
+        };
+    }
+
+    fn executeAttempt(
         self: FuzzyFilter,
         alloc: Allocator,
         seg: *const index_mod.SegmentEntry,
         comptime collect_stats: bool,
         stats: ?*ExecutionStats,
-    ) FilterError!roaring.RoaringBitmap {
+    ) (FilterError || error{PatternProgramBudgetExceeded})!roaring.RoaringBitmap {
         var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
         defer inv_reader.deinit();
@@ -645,14 +983,24 @@ pub const FuzzyFilter = struct {
         // shared prefix is already more than `max_edits` away are skipped
         // without decoding, and each decoded term only feeds its front-coded
         // leaf bytes through the DFA.
-        var lev = levenshtein.LevenshteinAutomaton{ .term = self.term, .max_distance = self.max_edits, .alloc = alloc };
-        defer lev.deinit();
+        const cached = if (self.control.pattern_programs) |programs| try programs.getDistance(.fuzzy, self.term, self.max_edits, self.control) else null;
+        const execution = if (cached) |entry| try self.control.pattern_programs.?.checkout(entry, self.control) else null;
+        defer if (execution) |lease| lease.release();
+        var local = levenshtein.LevenshteinAutomaton{ .term = self.term, .max_distance = self.max_edits, .alloc = alloc };
+        defer local.deinit();
+        const lev = if (execution) |lease| &lease.execution.program.fuzzy else &local;
         var term_iter = try inv_reader.fstSearchIterator(lev.automaton());
         defer term_iter.deinit();
 
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
         try collectAutomatonTerms(alloc, &term_iter, &result, self, acceptTerm, collect_stats, stats);
+        if (lev.allocation_failed) {
+            if (execution) |lease| if (lease.execution.budget.isExhausted() or lease.owner.budget.isExhausted()) {
+                return error.PatternProgramBudgetExceeded;
+            };
+            return error.OutOfMemory;
+        }
         return result;
     }
 };
@@ -681,6 +1029,7 @@ fn editDistance(a: []const u8, b: []const u8) u32 {
 
 /// Regex filter: matches terms against a regular expression using FST automaton search.
 pub const RegexpFilter = struct {
+    control: ExecutionControl = .{},
     field: []const u8,
     pattern: []const u8,
     boost: f32 = 1.0,
@@ -705,22 +1054,49 @@ pub const RegexpFilter = struct {
         return true;
     }
 
-    fn executeInternal(
+    fn executeInternal(self: RegexpFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, comptime collect_stats: bool, stats: ?*ExecutionStats) FilterError!roaring.RoaringBitmap {
+        const original_stats = if (stats) |value| value.* else null;
+        return self.executeAttempt(alloc, seg, collect_stats, stats) catch |err| switch (err) {
+            error.PatternProgramBudgetExceeded => blk: {
+                // The failed attempt has released its reader, iterator and
+                // execution lease before the private traversal starts.
+                var fallback = self;
+                fallback.control.pattern_programs = null;
+                if (stats) |value| value.* = original_stats.?;
+                break :blk fallback.executeAttempt(alloc, seg, collect_stats, stats) catch |failure| switch (failure) {
+                    error.PatternProgramBudgetExceeded => unreachable,
+                    else => return failure,
+                };
+            },
+            else => return err,
+        };
+    }
+
+    fn executeAttempt(
         self: RegexpFilter,
         alloc: Allocator,
         seg: *const index_mod.SegmentEntry,
         comptime collect_stats: bool,
         stats: ?*ExecutionStats,
-    ) FilterError!roaring.RoaringBitmap {
+    ) (FilterError || error{PatternProgramBudgetExceeded})!roaring.RoaringBitmap {
         var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
         defer inv_reader.deinit();
 
         // Compile regex → automaton; the dictionary walk prunes whole blocks
         // whose shared prefix cannot reach an accepting state.
-        var regex = regex_mod.compile(alloc, self.pattern) catch
-            return roaring.RoaringBitmap.init(alloc);
-        defer regex.deinit();
+        const cached = if (self.control.pattern_programs) |programs| programs.get(.regexp, self.pattern, self.control) catch |err| switch (err) {
+            error.InvalidRegex => return roaring.RoaringBitmap.init(alloc),
+            else => return err,
+        } else null;
+        const execution = if (cached) |entry| try self.control.pattern_programs.?.checkout(entry, self.control) else null;
+        defer if (execution) |lease| lease.release();
+        var local = if (execution != null) null else if (cached) |entry| entry.program.regexp.fork(alloc) else regex_mod.compile(alloc, self.pattern) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return roaring.RoaringBitmap.init(alloc),
+        };
+        defer if (local) |*program| program.deinit();
+        const regex = if (execution) |lease| &lease.execution.program.regexp else &local.?;
 
         var term_iter = try inv_reader.fstSearchIterator(regex.automaton());
         defer term_iter.deinit();
@@ -728,6 +1104,12 @@ pub const RegexpFilter = struct {
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
         try collectAutomatonTerms(alloc, &term_iter, &result, self, acceptTerm, collect_stats, stats);
+        if (regex.allocation_failed) {
+            if (execution) |lease| if (lease.execution.budget.isExhausted() or lease.owner.budget.isExhausted()) {
+                return error.PatternProgramBudgetExceeded;
+            };
+            return error.OutOfMemory;
+        }
         return result;
     }
 };
@@ -735,6 +1117,7 @@ pub const RegexpFilter = struct {
 /// Lexicographic term range filter: matches docs containing any term in [min, max].
 /// Unlike RangeFilter (numeric on doc values), this operates on FST term strings.
 pub const TermRangeFilter = struct {
+    control: ExecutionControl = .{},
     field: []const u8,
     min: ?[]const u8 = null,
     max: ?[]const u8 = null,
@@ -763,6 +1146,7 @@ pub const TermRangeFilter = struct {
         } else null;
 
         var term_iter = try inv_reader.rangeTermIterator(start, end);
+        term_iter.setControl(self.control);
         defer term_iter.deinit();
 
         var result = roaring.RoaringBitmap.init(alloc);
@@ -775,14 +1159,7 @@ pub const TermRangeFilter = struct {
                     if (std.mem.eql(u8, entry.term, m)) continue;
                 }
             }
-            switch (entry.result) {
-                .postings => |p| {
-                    var bm = try p.docBitmap(alloc);
-                    defer bm.deinit();
-                    try result.orWith(&bm);
-                },
-                .one_hit => |h| try result.add(h.doc_num),
-            }
+            try unionTermEntry(alloc, &result, entry, self.control);
         }
 
         return result;
@@ -1547,7 +1924,10 @@ fn collectFuzzyCandidateTerms(
     defer term_iter.deinit();
 
     var out = std.ArrayListUnmanaged([]const u8).empty;
-    errdefer out.deinit(alloc);
+    errdefer {
+        for (out.items) |text| alloc.free(text);
+        out.deinit(alloc);
+    }
 
     while (try term_iter.next()) |entry| {
         if (!fuzzyPrefixMatches(term, entry.term, prefix_len)) continue;
@@ -1558,10 +1938,17 @@ fn collectFuzzyCandidateTerms(
                 break;
             }
         }
-        if (!seen) try out.append(alloc, try alloc.dupe(u8, entry.term));
+        if (!seen) {
+            try out.ensureUnusedCapacity(alloc, 1);
+            out.appendAssumeCapacity(try alloc.dupe(u8, entry.term));
+        }
     }
 
-    if (out.items.len == 0) try out.append(alloc, try alloc.dupe(u8, term));
+    if (lev.allocation_failed) return error.OutOfMemory;
+    if (out.items.len == 0) {
+        try out.ensureUnusedCapacity(alloc, 1);
+        out.appendAssumeCapacity(try alloc.dupe(u8, term));
+    }
     return out.toOwnedSlice(alloc);
 }
 
@@ -1611,6 +1998,7 @@ pub const DateRangeFilter = struct {
 /// Wildcard match: glob-style `*` (any chars) and `?` (single char) matching.
 /// Iterates FST terms and matches against the pattern.
 pub const WildcardFilter = struct {
+    control: ExecutionControl = .{},
     field: []const u8,
     pattern: []const u8,
     boost: f32 = 1.0,
@@ -1655,15 +2043,16 @@ pub const WildcardFilter = struct {
         // lookup; otherwise seek to the literal prefix and stop as soon as
         // the sorted dictionary leaves it. Only a leading operator still has
         // to walk the whole dictionary.
-        var plan = try wildcard_mod.searchPlanAlloc(alloc, self.pattern);
-        defer plan.deinit(alloc);
+        const cached = if (self.control.pattern_programs) |programs| try programs.get(.wildcard, self.pattern, self.control) else null;
+        var plan = if (cached) |entry| entry.program.wildcard else try wildcard_mod.searchPlanAlloc(alloc, self.pattern);
+        defer if (cached == null) plan.deinit(alloc);
         const literal_prefix = plan.literal_prefix;
 
         if (plan.exact) {
             if (comptime collect_stats) stats.?.exact_lookup = true;
             if ((try inv_reader.lookup(literal_prefix))) |lookup| {
                 if (comptime collect_stats) stats.?.matching_terms = 1;
-                try unionTermEntry(alloc, &result, .{ .term = literal_prefix, .result = lookup });
+                try unionTermEntry(alloc, &result, .{ .term = literal_prefix, .result = lookup }, self.control);
             }
             return result;
         }
@@ -1672,6 +2061,7 @@ pub const WildcardFilter = struct {
             try inv_reader.rangeTermIterator(literal_prefix, null)
         else
             try inv_reader.termIterator();
+        term_iter.setControl(self.control);
         defer term_iter.deinit();
 
         while (true) {
@@ -1686,9 +2076,11 @@ pub const WildcardFilter = struct {
                 if (std.mem.order(u8, entry.term, literal_prefix) == .gt) break;
                 continue;
             }
+            try self.control.check();
             if (!wildcardMatch(self.pattern, entry.term)) continue;
             if (comptime collect_stats) stats.?.matching_terms += 1;
-            try unionTermEntry(alloc, &result, entry);
+            try self.control.check();
+            try unionTermEntry(alloc, &result, entry, self.control);
         }
 
         return result;
@@ -1732,6 +2124,9 @@ pub const DocIdFilter = struct {
 pub const DocNumProducer = struct {
     ptr: *anyopaque,
     produce: *const fn (*anyopaque, Allocator, u32, u32, ?*const roaring.RoaringBitmap) anyerror!roaring.RoaringBitmap,
+    /// Optional complete segment-local membership. The consumer releases its
+    /// pin after synchronous use; a miss must not evaluate or read sources.
+    borrow: ?*const fn (*anyopaque, u32, u32) anyerror!?roaring.BorrowedBitmap = null,
     /// Borrow a complete global membership after adaptive materialization.
     /// The borrowed bitmap stays immutable and valid until the owner is released.
     /// Candidate-local answers must never be exposed through this hook.
@@ -1815,7 +2210,10 @@ pub fn executeFilter(
     defer all_ids.deinit(alloc);
 
     var doc_offset: u32 = 0;
-    for (snap.segments) |*seg| {
+    for (snap.segments, 0..) |_, segment_idx| {
+        var segment_lease = try snap.leaseSegment(segment_idx);
+        defer segment_lease.deinit();
+        const seg = segment_lease.entry;
         var bm = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer bm.deinit();
 
@@ -1850,7 +2248,10 @@ pub fn executeFilterBitmap(
 
     var doc_offset: u32 = 0;
     var has_result = false;
-    for (snap.segments) |*seg| {
+    for (snap.segments, 0..) |_, segment_idx| {
+        var segment_lease = try snap.leaseSegment(segment_idx);
+        defer segment_lease.deinit();
+        const seg = segment_lease.entry;
         var local = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer local.deinit();
         {
@@ -1886,7 +2287,10 @@ pub fn countFilterIntersection(
 ) !usize {
     var total: usize = 0;
     var doc_offset: u32 = 0;
-    for (snap.segments) |*seg| {
+    for (snap.segments, 0..) |_, segment_idx| {
+        var segment_lease = try snap.leaseSegment(segment_idx);
+        defer segment_lease.deinit();
+        const seg = segment_lease.entry;
         var local = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer local.deinit();
         {
@@ -1906,6 +2310,233 @@ pub fn countFilterIntersection(
     return total;
 }
 
+/// A bounded postfix program over immutable word streams. Dense words use
+/// bitwise operations; sparse inputs skip absent words. Optional cache misses,
+/// oversized expressions and unsupported leaves use the ordinary executor.
+const BorrowedCount = struct {
+    const Op = union(enum) { input: usize, all, none, intersect, subtract, threshold: struct { count: usize, required: u32 } };
+    ops: [128]Op = undefined,
+    op_count: usize = 0,
+    pins: [64]roaring.BorrowedBitmap = undefined,
+    pin_count: usize = 0,
+    controls: [32]ExecutionControl = undefined,
+    control_count: usize = 0,
+    word_steps: ?*usize = null, // Test instrumentation; no production increments.
+    fn deinit(self: *@This()) void {
+        for (self.pins[0..self.pin_count]) |*pin| pin.deinit();
+    }
+    fn append(self: *@This(), op: Op) !void {
+        if (self.op_count == self.ops.len) return error.BorrowedCountUnavailable;
+        self.ops[self.op_count] = op;
+        self.op_count += 1;
+    }
+    fn compile(self: *@This(), filter: Filter, offset: u32, count: u32, depth: usize) anyerror!void {
+        if (depth == 32) return error.BorrowedCountUnavailable;
+        switch (filter) {
+            .match_all => try self.append(.all),
+            .match_none => try self.append(.none),
+            .doc_num => |f| {
+                const producer = f.producer orelse return error.BorrowedCountUnavailable;
+                if (f.bitmap != null or f.doc_nums.len != 0) return error.InvalidArgument;
+                const borrow = producer.borrow orelse return error.BorrowedCountUnavailable;
+                if (self.pin_count == self.pins.len) return error.BorrowedCountUnavailable;
+                const pin = try borrow(producer.ptr, offset, count) orelse return error.BorrowedCountUnavailable;
+                self.pins[self.pin_count] = pin;
+                self.pin_count += 1;
+                try self.append(.{ .input = self.pin_count - 1 });
+            },
+            .bool_filter => |f| {
+                try f.control.check();
+                if (self.control_count == self.controls.len) return error.BorrowedCountUnavailable;
+                self.controls[self.control_count] = f.control;
+                self.control_count += 1;
+                var positive = false;
+                for (f.must, 0..) |child, i| {
+                    if (child == .match_all and (positive or i + 1 < f.must.len)) continue;
+                    try self.compile(child.withControl(f.control), offset, count, depth + 1);
+                    if (positive) try self.append(.intersect);
+                    positive = true;
+                }
+                if (f.should.len != 0) {
+                    const required = if (f.min_should_match == 0 and !positive) 1 else f.min_should_match;
+                    if (required != 0) {
+                        if (required > f.should.len) {
+                            try self.append(.none);
+                        } else {
+                            for (f.should) |child| try self.compile(child.withControl(f.control), offset, count, depth + 1);
+                            try self.append(.{ .threshold = .{ .count = f.should.len, .required = required } });
+                        }
+                        if (positive) try self.append(.intersect);
+                        positive = true;
+                    }
+                }
+                // Match the ordinary executor's empty-positive semantics.
+                if (!positive) {
+                    try self.append(.none);
+                    return;
+                }
+                for (f.must_not) |child| {
+                    try self.compile(child.withControl(f.control), offset, count, depth + 1);
+                    try self.append(.subtract);
+                }
+            },
+            else => return error.BorrowedCountUnavailable,
+        }
+    }
+    fn evaluate(self: *const @This(), inputs: []const u64) u64 {
+        var stack: [128]u64 = undefined;
+        var length: usize = 0;
+        for (self.ops[0..self.op_count]) |op| switch (op) {
+            .input => |i| {
+                stack[length] = inputs[i];
+                length += 1;
+            },
+            .all => {
+                stack[length] = ~@as(u64, 0);
+                length += 1;
+            },
+            .none => {
+                stack[length] = 0;
+                length += 1;
+            },
+            .intersect, .subtract => {
+                length -= 1;
+                stack[length - 1] &= if (op == .subtract) ~stack[length] else stack[length];
+            },
+            .threshold => |threshold| {
+                const start = length - threshold.count;
+                var bits: u64 = 0;
+                if (threshold.required == 1) {
+                    for (stack[start..length]) |value| bits |= value;
+                } else {
+                    // Bit-sliced counters evaluate 64 document thresholds at
+                    // once, without per-document hash maps or counter arrays.
+                    var planes: [8]u64 = @splat(0);
+                    for (stack[start..length]) |value| {
+                        var carry = value;
+                        for (&planes) |*plane| {
+                            const next = plane.* & carry;
+                            plane.* ^= carry;
+                            carry = next;
+                        }
+                    }
+                    var equal: u64 = ~@as(u64, 0);
+                    var greater: u64 = 0;
+                    var index: usize = planes.len;
+                    while (index != 0) {
+                        index -= 1;
+                        if (threshold.required & (@as(u32, 1) << @intCast(index)) == 0) {
+                            greater |= equal & planes[index];
+                            equal &= ~planes[index];
+                        } else equal &= planes[index];
+                    }
+                    bits = greater | equal;
+                }
+                stack[start] = bits;
+                length = start + 1;
+            },
+        };
+        std.debug.assert(length == 1);
+        return stack[0];
+    }
+    fn cardinality(self: *const @This(), count: u32, deleted: ?*const roaring.RoaringBitmap) !usize {
+        for (self.controls[0..self.control_count]) |control| try control.check();
+        // The common binary operations use compressed container kernels. The
+        // general word program remains for nested and threshold expressions.
+        if (self.op_count == 3 and self.ops[0] == .input and self.ops[1] == .input) {
+            const left = self.pins[self.ops[0].input].bitmap;
+            const right = self.pins[self.ops[1].input].bitmap;
+            const op = self.ops[2];
+            const conjunction = op == .intersect or (op == .threshold and op.threshold.required == 2);
+            const disjunction = op == .threshold and op.threshold.required == 1;
+            if ((conjunction or disjunction or op == .subtract) and (left.maximum() orelse 0) < count and (right.maximum() orelse 0) < count) {
+                // Producer contracts are segment-local; no range rebasing is
+                // necessary on this complete immutable membership path.
+                const left_count = self.pins[self.ops[0].input].cached_cardinality;
+                if (left == right) {
+                    if (op == .subtract) return 0;
+                    return (left_count orelse left.cardinality()) - (if (deleted) |d| left.intersectionCardinality(d) else 0);
+                }
+                const intersection = left.intersectionCardinalityExcluding(right, deleted);
+                if (conjunction) return intersection;
+                const left_live = (left_count orelse left.cardinality()) - (if (deleted) |d| left.intersectionCardinality(d) else 0);
+                if (op == .subtract) return left_live - intersection;
+                const right_live = (self.pins[self.ops[1].input].cached_cardinality orelse right.cardinality()) - (if (deleted) |d| right.intersectionCardinality(d) else 0);
+                return left_live - intersection + right_live;
+            }
+        }
+        // Boolean operations are bitwise: outside the input union their
+        // value equals evaluation on zero inputs. Count a true default from
+        // the live-document cardinality and subtract only sparse exceptions.
+        // Complements therefore never walk absent document-number words.
+        const empty_inputs: [64]u64 = @splat(0);
+        const universe = self.evaluate(empty_inputs[0..self.pin_count]) != 0;
+        if (self.op_count == 1 and self.ops[0] == .all) return count - (if (deleted) |d| d.rangeCardinality(0, count) else 0);
+        if (self.pin_count == 1) {
+            const pin = self.pins[0];
+            if ((pin.bitmap.maximum() orelse 0) < count) {
+                const present = self.evaluate(&.{~@as(u64, 0)}) != 0;
+                const live: usize = if (universe) count - (if (deleted) |d| d.rangeCardinality(0, count) else 0) else 0;
+                // A one-variable Boolean expression is constant, the input,
+                // or its complement. Reuse publication-time cardinality.
+                if (universe == present) return if (universe) live else 0;
+                const matched = (pin.cached_cardinality orelse pin.bitmap.cardinality()) - (if (deleted) |d| pin.bitmap.intersectionCardinality(d) else 0);
+                return if (universe) live - matched else matched;
+            }
+        }
+        var iterators: [64]roaring.RoaringBitmap.WordIterator = undefined;
+        var current: [64]?roaring.RoaringBitmap.Word = @splat(null);
+        for (self.pins[0..self.pin_count], 0..) |pin, i| {
+            iterators[i] = pin.bitmap.wordIterator();
+            current[i] = iterators[i].next();
+        }
+        var deleted_iterator = if (deleted) |d| d.wordIterator() else null;
+        var deleted_word = if (deleted_iterator) |*it| it.next() else null;
+        var total: usize = 0;
+        var steps: usize = 0;
+        while (true) {
+            var next: u64 = count;
+            for (current[0..self.pin_count]) |word| if (word) |value| {
+                next = @min(next, value.base);
+            };
+            if (next >= count) break;
+            if (steps % 256 == 0) for (self.controls[0..self.control_count]) |control| try control.check();
+            steps += 1;
+            if (@import("builtin").is_test) if (self.word_steps) |counter| {
+                counter.* += 1;
+            };
+            var inputs: [64]u64 = @splat(0);
+            for (current[0..self.pin_count], 0..) |word, i| if (word) |value| {
+                if (value.base == next) {
+                    inputs[i] = value.bits;
+                    current[i] = iterators[i].next();
+                }
+            };
+            const result = self.evaluate(inputs[0..self.pin_count]);
+            var bits = if (universe) ~result else result;
+            while (deleted_word != null and deleted_word.?.base < next) deleted_word = deleted_iterator.?.next();
+            if (deleted_word) |word| if (word.base == next) {
+                bits &= ~word.bits;
+            };
+            if (count - next < 64) bits &= (@as(u64, 1) << @intCast(count - next)) - 1;
+            total += @popCount(bits);
+        }
+        return if (universe) (count - (if (deleted) |d| d.rangeCardinality(0, count) else 0)) - total else total;
+    }
+};
+
+fn countBorrowedBoolean(seg: *index_mod.SegmentEntry, filter: Filter, offset: u32) !?usize {
+    var program: BorrowedCount = .{};
+    defer program.deinit();
+    program.compile(filter, offset, seg.reader.doc_count, 0) catch |err| switch (err) {
+        error.BorrowedCountUnavailable => return null,
+        else => return err,
+    };
+    seg.shared.lockDeletionShared();
+    defer seg.shared.unlockDeletionShared();
+    return try program.cardinality(seg.reader.doc_count, if (seg.shared.deleted) |*d| d else null);
+}
+
 /// Count a filter across all segments without materializing matching document IDs.
 ///
 /// The filter implementation still builds its per-segment bitmap, which is also
@@ -1919,8 +2550,29 @@ pub fn countFilter(
 ) !usize {
     var total: usize = 0;
     var doc_offset: u32 = 0;
-    for (snap.segments) |*seg| {
+    for (snap.segments, 0..) |_, segment_idx| {
+        var seg = &snap.segments[segment_idx];
         const next_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch return error.CountOverflow;
+        if (filter == .bool_filter) if (try countBorrowedBoolean(seg, filter, doc_offset)) |count| {
+            total = std.math.add(usize, total, count) catch return error.CountOverflow;
+            doc_offset = next_offset;
+            continue;
+        };
+        if (filter == .doc_num and filter.doc_num.producer != null) {
+            if (filter.doc_num.bitmap != null or filter.doc_num.doc_nums.len != 0) return error.InvalidArgument;
+            const producer = filter.doc_num.producer.?;
+            if (producer.borrow) |borrow| if (try borrow(producer.ptr, doc_offset, seg.reader.doc_count)) |view| {
+                var held = view;
+                defer held.deinit();
+                seg.shared.lockDeletionShared();
+                defer seg.shared.unlockDeletionShared();
+                var count = held.cached_cardinality orelse held.bitmap.cardinality();
+                if (seg.shared.deleted) |*deleted| count -= held.bitmap.intersectionCardinality(deleted);
+                total = std.math.add(usize, total, count) catch return error.CountOverflow;
+                doc_offset = next_offset;
+                continue;
+            };
+        }
         if (filter == .doc_num and filter.doc_num.bitmap != null and filter.doc_num.producer == null and filter.doc_num.doc_nums.len == 0) {
             seg.shared.lockDeletionShared();
             defer seg.shared.unlockDeletionShared();
@@ -1930,6 +2582,9 @@ pub fn countFilter(
                 continue;
             }
         }
+        var segment_lease = try snap.leaseSegment(segment_idx);
+        defer segment_lease.deinit();
+        seg = segment_lease.entry;
         var bm = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer bm.deinit();
 
@@ -2908,6 +3563,39 @@ fn buildLargeDictionarySegmentForTest(alloc: Allocator, extra_terms: []const []c
     return buildTestSegmentWithTerms(alloc, &.{.{ .terms = hits.items }});
 }
 
+test "dictionary expansion cancels during nonmatching scans and nested boolean evaluation" {
+    const alloc = testing.allocator;
+    const bytes = try buildLargeDictionarySegmentForTest(alloc, &.{"zz-target"});
+    defer alloc.free(bytes);
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const snapshot = writer.snapshot();
+    const Cancel = struct {
+        calls: usize = 0,
+        fn check(ptr: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            self.calls += 1;
+            return self.calls >= 20;
+        }
+    };
+    const filters = [_]Filter{
+        .{ .wildcard = .{ .field = "body", .pattern = "*never-present" } },
+        .{ .regexp = .{ .field = "body", .pattern = ".*never-present" } },
+        .{ .prefix = .{ .field = "body", .prefix = "catalog" } },
+        .{ .fuzzy = .{ .field = "body", .term = "catalog-00000", .max_edits = 2 } },
+        .{ .term_range = .{ .field = "body", .min = "catalog" } },
+    };
+    for (filters) |filter| {
+        var cancel = Cancel{};
+        const control: ExecutionControl = .{ .cancellation = .{ .ptr = &cancel, .is_cancelled_fn = Cancel.check } };
+        const clauses = [_]Filter{filter};
+        const nested: Filter = .{ .bool_filter = .{ .must = &clauses, .should = &.{}, .must_not = &.{} } };
+        try testing.expectError(error.Canceled, nested.withControl(control).execute(alloc, &snapshot.segments[0]));
+        try testing.expect(cancel.calls <= 22);
+    }
+}
+
 test "wildcard filter seeks by literal prefix in large term dictionary" {
     const alloc = testing.allocator;
 
@@ -3734,7 +4422,7 @@ test "geo shape filter point in polygon" {
     try testing.expect(contains.isEmpty());
 }
 
-test "term filter with synonym expansion" {
+test "external lake metadata navigation term filter keeps synonym membership complete under pressure" {
     const alloc = testing.allocator;
 
     // Build inverted index: doc0 has "fast", doc1 has "quick"
@@ -3778,4 +4466,384 @@ test "term filter with synonym expansion" {
     try testing.expect(bm.contains(0)); // "fast" — direct match
     try testing.expect(bm.contains(1)); // "quick" — synonym expansion
     try testing.expect(!bm.contains(2)); // "slow" — not a synonym
+    const Checked = struct {
+        fn run(a: Allocator, segment: *const index_mod.SegmentEntry) !void {
+            var matches = try (Filter{ .term = .{ .field = "text", .term = "fast" } }).execute(a, segment);
+            defer matches.deinit();
+            try testing.expectEqual(@as(usize, 2), matches.cardinality());
+            try testing.expect(matches.contains(0) and matches.contains(1));
+        }
+    };
+    try testing.checkAllAllocationFailures(alloc, Checked.run, .{seg});
+}
+
+test "external lake metadata navigation pattern leaves reuse immutable membership and honor controls" {
+    const a = testing.allocator;
+    const bytes = try buildTestSegmentWithTerms(a, &.{
+        .{ .terms = &.{ .{ .term = "alpine", .freq = 1, .norm = 2 }, .{ .term = "common", .freq = 1, .norm = 2 } } },
+        .{ .terms = &.{.{ .term = "beta", .freq = 1, .norm = 1 }} },
+    });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const segment = &writer.snapshot().segments[0];
+    var memo = PatternMembership.init(a, 1024 * 1024);
+    defer memo.deinit();
+    const leaves = [_]Filter{
+        .{ .prefix = .{ .field = "body", .prefix = "alp" } },
+        .{ .wildcard = .{ .field = "body", .pattern = "alp*" } },
+        .{ .regexp = .{ .field = "body", .pattern = "alp.*" } },
+        .{ .fuzzy = .{ .field = "body", .term = "alpine" } },
+    };
+    for (leaves) |leaf| {
+        const filter = leaf.withControl(.{ .pattern_cache = &memo });
+        var first = try filter.execute(a, segment);
+        defer first.deinit();
+        try first.remove(0);
+        var second = try filter.execute(a, segment);
+        defer second.deinit();
+        try testing.expectEqual(@as(usize, 1), second.cardinality());
+        try testing.expect(second.contains(0));
+        try testing.expectError(error.Timeout, leaf.withControl(.{ .pattern_cache = &memo, .deadline_ns = 0 }).execute(a, segment));
+    }
+    try testing.expectEqual(@as(usize, 4), memo.builds);
+    try testing.expectEqual(@as(usize, 4), memo.hits);
+    const pin = (try memo.pin(leaves[0], segment, .{})).?;
+    const immutable = pin.bitmap();
+    try testing.expect(immutable.contains(0));
+    while (memo.evict()) {}
+    try testing.expect(pin.bitmap() == immutable and immutable.contains(0));
+    try testing.expect(!memo.evict());
+    pin.release();
+    try testing.expect(memo.evict());
+    try testing.expectError(error.Timeout, memo.pin(leaves[0], segment, .{ .deadline_ns = 0 }));
+    var pressure = PatternMembership.init(a, 1);
+    defer pressure.deinit();
+    for (0..2) |_| {
+        var result = try leaves[0].withControl(.{ .pattern_cache = &pressure }).execute(a, segment);
+        defer result.deinit();
+        try testing.expect(result.contains(0));
+    }
+    try testing.expectEqual(@as(usize, 2), pressure.builds);
+    try testing.expectEqual(@as(usize, 0), pressure.budget.live);
+    const Failure = struct {
+        fn run(alloc: Allocator, seg: *const index_mod.SegmentEntry, leaf: Filter) !void {
+            var local = PatternMembership.init(alloc, 1024 * 1024);
+            defer local.deinit();
+            for (0..2) |_| {
+                var matches = try leaf.withControl(.{ .pattern_cache = &local }).execute(alloc, seg);
+                defer matches.deinit();
+                try testing.expect(matches.contains(0));
+            }
+        }
+    };
+    try testing.checkAllAllocationFailures(a, Failure.run, .{ segment, leaves[0] });
+}
+
+test "external lake metadata navigation compiled programs share immutable plans across segments" {
+    const a = std.testing.allocator;
+    const data = try buildTestSegmentWithTerms(a, &.{
+        .{ .terms = &.{.{ .term = "alpine", .freq = 1, .norm = 1 }} },
+        .{ .terms = &.{.{ .term = "beta", .freq = 1, .norm = 1 }} },
+    });
+    defer a.free(data);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    for (0..4) |_| try writer.addSegment(data);
+    var programs = PatternPrograms.init(a, 1024 * 1024);
+    defer programs.deinit();
+    const leaves = [_]Filter{
+        .{ .regexp = .{ .field = "body", .pattern = "alp.*" } },
+        .{ .wildcard = .{ .field = "body", .pattern = "al\\p*" } },
+        .{ .fuzzy = .{ .field = "body", .term = "alpina", .max_edits = 1 } },
+    };
+    const Worker = struct {
+        fn run(alloc: Allocator, leaf: Filter, segment: *const index_mod.SegmentEntry) anyerror!void {
+            var matches = try leaf.execute(alloc, segment);
+            defer matches.deinit();
+            try testing.expect(matches.contains(0));
+            try testing.expect(!matches.contains(1));
+        }
+    };
+    for (leaves) |leaf| {
+        const controlled = leaf.withControl(.{ .pattern_programs = &programs });
+        var futures: [4]std.Io.Future(anyerror!void) = undefined;
+        for (&futures, 0..) |*future, index| future.* = std.Io.async(std.testing.io, Worker.run, .{ a, controlled, &writer.snapshot().segments[index] });
+        var failure: ?anyerror = null;
+        for (&futures) |*future| future.await(std.testing.io) catch |err| {
+            failure = failure orelse err;
+        };
+        if (failure) |err| return err;
+        try testing.expectError(error.Timeout, leaf.withControl(.{ .pattern_programs = &programs, .deadline_ns = 0 }).execute(a, &writer.snapshot().segments[0]));
+    }
+    try testing.expectEqual(@as(usize, 3), programs.builds);
+    try testing.expectEqual(@as(usize, 9), programs.hits);
+    const built = programs.execution_builds;
+    for (leaves) |leaf| for (writer.snapshot().segments) |*segment| try Worker.run(a, leaf.withControl(.{ .pattern_programs = &programs }), segment);
+    try testing.expectEqual(built, programs.execution_builds);
+    try testing.expect(programs.execution_hits >= 8);
+    const entry = (try programs.get(.regexp, "alp.*", .{})).?;
+    var leases: [4]?PatternPrograms.ExecutionLease = @splat(null);
+    defer for (leases) |lease| if (lease) |held| held.release();
+    for (&leases) |*lease| lease.* = (try programs.checkout(entry, .{})).?;
+    try testing.expect((try programs.checkout(entry, .{})) == null);
+    try Worker.run(a, leaves[0].withControl(.{ .pattern_programs = &programs }), &writer.snapshot().segments[0]);
+    for (&leases) |*lease| {
+        lease.*.?.release();
+        lease.* = null;
+    }
+    for ([_]bool{ false, true }) |fuzzy| {
+        var bounded = PatternPrograms.init(a, 1024 * 1024);
+        defer bounded.deinit();
+        const plan = (try bounded.getDistance(if (fuzzy) .fuzzy else .regexp, if (fuzzy) "alpina" else "alp.*", if (fuzzy) 1 else 0, .{})).?;
+        const lease = (try bounded.checkout(plan, .{})).?;
+        lease.execution.budget.limit = 0;
+        lease.release();
+        try Worker.run(a, leaves[if (fuzzy) 2 else 0].withControl(.{ .pattern_programs = &bounded }), &writer.snapshot().segments[0]);
+        try testing.expect(plan.executions[0] == null);
+    }
+    for ([_]bool{ false, true }) |fuzzy| {
+        var pressure = PatternPrograms.init(a, 1024 * 1024);
+        defer pressure.deinit();
+        const plan = (try pressure.getDistance(if (fuzzy) .fuzzy else .regexp, if (fuzzy) "alpina" else "alp.*", if (fuzzy) 1 else 0, .{})).?;
+        const lease = (try pressure.checkout(plan, .{})).?;
+        const initial_live = pressure.budget.live;
+        pressure.budget.limit = initial_live;
+        lease.release();
+        try Worker.run(a, leaves[if (fuzzy) 2 else 0].withControl(.{ .pattern_programs = &pressure }), &writer.snapshot().segments[0]);
+        try testing.expect(pressure.budget.isExhausted());
+        try testing.expect(plan.executions[0] == null);
+        try testing.expect(pressure.budget.live < initial_live);
+        // Restoring headroom builds a healthy execution, then reuses it.
+        pressure.budget.limit = 1024 * 1024;
+        try Worker.run(a, leaves[if (fuzzy) 2 else 0].withControl(.{ .pattern_programs = &pressure }), &writer.snapshot().segments[0]);
+        const builds = pressure.execution_builds;
+        try Worker.run(a, leaves[if (fuzzy) 2 else 0].withControl(.{ .pattern_programs = &pressure }), &writer.snapshot().segments[1]);
+        try testing.expectEqual(builds, pressure.execution_builds);
+        try testing.expect(pressure.execution_hits > 0);
+    }
+    // Optional cache admission never makes a valid pattern disappear.
+    var tiny = PatternPrograms.init(a, 0);
+    defer tiny.deinit();
+    try Worker.run(a, leaves[0].withControl(.{ .pattern_programs = &tiny }), &writer.snapshot().segments[0]);
+    const Failure = struct {
+        fn run(alloc: Allocator, segment: *const index_mod.SegmentEntry) !void {
+            var cache = PatternPrograms.init(alloc, 1024 * 1024);
+            defer cache.deinit();
+            var matches = try (Filter{ .regexp = .{ .field = "body", .pattern = "alp.*", .control = .{ .pattern_programs = &cache } } }).execute(alloc, segment);
+            defer matches.deinit();
+            try testing.expect(matches.contains(0));
+        }
+    };
+    try testing.checkAllAllocationFailures(a, Failure.run, .{&writer.snapshot().segments[0]});
+}
+
+test "logical value borrowed counts allocate nothing and respect deletions and errors" {
+    const a = testing.allocator;
+    const bytes = try buildTestSegmentWithTerms(a, &.{ .{ .terms = &.{} }, .{ .terms = &.{} }, .{ .terms = &.{} } });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const State = struct {
+        bitmap: roaring.RoaringBitmap,
+        releases: usize = 0,
+        cancel: bool = false,
+        fn borrow(raw: *anyopaque, _: u32, _: u32) anyerror!?roaring.BorrowedBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.cancel) return error.Canceled;
+            return .{ .bitmap = &self.bitmap, .context = .{ self, self }, .release = release };
+        }
+        fn release(context: [2]*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context[0]));
+            self.releases += 1;
+        }
+        fn produce(_: *anyopaque, _: Allocator, _: u32, _: u32, _: ?*const roaring.RoaringBitmap) anyerror!roaring.RoaringBitmap {
+            return error.UnexpectedMaterialization;
+        }
+    };
+    var state: State = .{ .bitmap = roaring.RoaringBitmap.init(a) };
+    defer state.bitmap.deinit();
+    try state.bitmap.addRange(0, 3);
+    var empty: [0]u8 = .{};
+    var no_alloc = std.heap.FixedBufferAllocator.init(&empty);
+    const filter: Filter = .{ .doc_num = .{ .doc_nums = &.{}, .producer = .{ .ptr = &state, .produce = State.produce, .borrow = State.borrow } } };
+    try testing.expectEqual(@as(usize, 3), try countFilter(no_alloc.allocator(), writer.snapshot(), filter));
+    try testing.expect(try writer.deleteById("1"));
+    try testing.expectEqual(@as(usize, 2), try countFilter(no_alloc.allocator(), writer.snapshot(), filter));
+    try testing.expectEqual(@as(usize, 2), state.releases);
+    state.cancel = true;
+    try testing.expectError(error.Canceled, countFilter(no_alloc.allocator(), writer.snapshot(), filter));
+    try testing.expectEqual(@as(usize, 2), state.releases);
+}
+
+test "logical value borrowed boolean words agree with owned execution without allocations" {
+    const a = testing.allocator;
+    var docs: [127]TestTermDocument = @splat(.{ .terms = &.{} });
+    const bytes = try buildTestSegmentWithTerms(a, &docs);
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const State = struct {
+        bitmap: roaring.RoaringBitmap,
+        releases: usize = 0,
+        missing: bool = false,
+        fn borrow(raw: *anyopaque, _: u32, _: u32) anyerror!?roaring.BorrowedBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.missing) return null;
+            return .{ .bitmap = &self.bitmap, .context = .{ self, self }, .release = release };
+        }
+        fn release(context: [2]*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context[0]));
+            self.releases += 1;
+        }
+        fn produce(raw: *anyopaque, alloc: Allocator, _: u32, _: u32, _: ?*const roaring.RoaringBitmap) anyerror!roaring.RoaringBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.bitmap.cloneExact(alloc);
+        }
+        fn filter(self: *@This()) Filter {
+            return .{ .doc_num = .{ .doc_nums = &.{}, .producer = .{ .ptr = self, .produce = produce, .borrow = borrow } } };
+        }
+    };
+    var states: [3]State = undefined;
+    for (&states) |*state| state.* = .{ .bitmap = roaring.RoaringBitmap.init(a) };
+    defer for (&states) |*state| state.bitmap.deinit();
+    for (0..docs.len) |i| {
+        if (i % 2 == 0) try states[0].bitmap.add(@intCast(i));
+        if (i % 3 == 0) try states[1].bitmap.add(@intCast(i));
+        if (i % 5 == 0) try states[2].bitmap.add(@intCast(i));
+    }
+    try testing.expect(try writer.deleteById("6"));
+    const leaves = [_]Filter{ states[0].filter(), states[1].filter(), states[2].filter() };
+    var empty: [0]u8 = .{};
+    var no_alloc = std.heap.FixedBufferAllocator.init(&empty);
+    for (0..5) |minimum| {
+        for ([_]bool{ false, true }) |with_must| {
+            const inner: Filter = .{ .bool_filter = .{ .must = if (with_must) leaves[0..1] else &.{}, .should = &leaves, .must_not = leaves[2..], .min_should_match = @intCast(minimum) } };
+            const filter: Filter = .{ .bool_filter = .{ .must = &.{.match_all}, .should = &.{inner}, .must_not = &.{}, .min_should_match = 1 } };
+            var owned = try filter.executeWithOffset(a, &writer.snapshot().segments[0], 0);
+            defer owned.deinit();
+            if (writer.snapshot().segments[0].shared.deleted) |*deleted| owned.andNotWith(deleted);
+            try testing.expectEqual(owned.cardinality(), try countFilter(no_alloc.allocator(), writer.snapshot(), filter));
+        }
+    }
+    // A miss releases every already acquired pin and uses the owned executor.
+    states[1].missing = true;
+    const before = states[0].releases;
+    const filter: Filter = .{ .bool_filter = .{ .must = leaves[0..2], .should = &.{}, .must_not = &.{} } };
+    try testing.expectEqual(@as(usize, 21), try countFilter(a, writer.snapshot(), filter));
+    try testing.expectEqual(before + 1, states[0].releases);
+}
+
+test "logical value borrowed boolean dense threshold and sparse high words" {
+    const a = testing.allocator;
+    var first = roaring.RoaringBitmap.init(a);
+    defer first.deinit();
+    var second = roaring.RoaringBitmap.init(a);
+    defer second.deinit();
+    var deleted = roaring.RoaringBitmap.init(a);
+    defer deleted.deinit();
+    try first.addRange(1000, 90000);
+    try second.addRange(40000, 130000);
+    try deleted.addRange(50000, 55000);
+    try first.add(0xffff_fffe);
+    const Release = struct {
+        fn call(_: [2]*anyopaque) void {}
+    };
+    var program: BorrowedCount = .{};
+    program.pin_count = 2;
+    program.pins[0] = .{ .bitmap = &first, .context = .{ &first, &first }, .release = Release.call };
+    program.pins[1] = .{ .bitmap = &second, .context = .{ &second, &second }, .release = Release.call };
+    defer program.deinit();
+    try program.append(.{ .input = 0 });
+    try program.append(.{ .input = 1 });
+    try program.append(.{ .threshold = .{ .count = 2, .required = 2 } });
+    try testing.expectEqual(@as(usize, 45000), try program.cardinality(140003, &deleted));
+    program.ops[2] = .{ .threshold = .{ .count = 2, .required = 1 } };
+    try testing.expectEqual(@as(usize, 124000), try program.cardinality(140003, &deleted));
+    try testing.expectEqual(@as(usize, 129001), try program.cardinality(std.math.maxInt(u32), null));
+    try first.remove(0xffff_fffe);
+    program.ops[2] = .intersect;
+    try testing.expectEqual(@as(usize, 45000), try program.cardinality(140003, &deleted));
+    program.ops[2] = .subtract;
+    try testing.expectEqual(@as(usize, 39000), try program.cardinality(140003, &deleted));
+    program.ops[2] = .{ .threshold = .{ .count = 2, .required = 1 } };
+    try testing.expectEqual(@as(usize, 124000), try program.cardinality(140003, &deleted));
+}
+
+test "logical value borrowed sparse conjunction skips absent universe words" {
+    var bitmap = roaring.RoaringBitmap.init(testing.allocator);
+    defer bitmap.deinit();
+    try bitmap.add(3);
+    const Release = struct {
+        fn call(_: [2]*anyopaque) void {}
+    };
+    var steps: usize = 0;
+    var program: BorrowedCount = .{ .word_steps = &steps };
+    program.pin_count = 1;
+    program.pins[0] = .{ .bitmap = &bitmap, .context = .{ &bitmap, &bitmap }, .release = Release.call };
+    defer program.deinit();
+    try program.append(.all);
+    try program.append(.{ .input = 0 });
+    try program.append(.intersect);
+    try testing.expectEqual(@as(usize, 1), try program.cardinality(std.math.maxInt(u32), null));
+    try testing.expectEqual(@as(usize, 0), steps);
+    program.ops[2] = .subtract;
+    steps = 0;
+    try testing.expectEqual(@as(usize, 126), try program.cardinality(127, null));
+    try testing.expectEqual(@as(usize, 0), steps);
+    steps = 0;
+    const started = @import("antfly_platform").time.monotonicNs();
+    try testing.expectEqual(@as(usize, std.math.maxInt(u32) - 1), try program.cardinality(std.math.maxInt(u32), null));
+    std.debug.print("SPARSE_COMPLEMENT words={d} elapsed_ns={d}\n", .{ steps, @import("antfly_platform").time.monotonicNs() - started });
+    try testing.expectEqual(@as(usize, 0), steps);
+}
+
+test "logical value borrowed sparse complement counts exceptions and clips deleted ranges" {
+    var left = roaring.RoaringBitmap.init(testing.allocator);
+    defer left.deinit();
+    var right = roaring.RoaringBitmap.init(testing.allocator);
+    defer right.deinit();
+    var deleted = roaring.RoaringBitmap.init(testing.allocator);
+    defer deleted.deinit();
+    for ([_]u32{ 3, 65 }) |id| try left.add(id);
+    for ([_]u32{ 3, 128 }) |id| try right.add(id);
+    for ([_]u32{ 7, 126, 127, std.math.maxInt(u32) }) |id| try deleted.add(id);
+    const Release = struct {
+        fn call(_: [2]*anyopaque) void {}
+    };
+    var steps: usize = 0;
+    var program: BorrowedCount = .{ .word_steps = &steps };
+    program.pin_count = 2;
+    program.pins[0] = .{ .bitmap = &left, .context = .{ &left, &left }, .release = Release.call };
+    program.pins[1] = .{ .bitmap = &right, .context = .{ &right, &right }, .release = Release.call };
+    defer program.deinit();
+    try program.append(.all);
+    try program.append(.{ .input = 0 });
+    try program.append(.{ .input = 1 });
+    try program.append(.intersect);
+    try program.append(.subtract);
+    // NOT(left AND right): absent words match by default; only the
+    // intersection at document 3 differs, even across the full u32 domain.
+    const started = @import("antfly_platform").time.monotonicNs();
+    try testing.expectEqual(@as(usize, std.math.maxInt(u32) - 4), try program.cardinality(std.math.maxInt(u32), &deleted));
+    std.debug.print("SPARSE_BOOLEAN_COMPLEMENT words={d} elapsed_ns={d}\n", .{ steps, @import("antfly_platform").time.monotonicNs() - started });
+    try testing.expectEqual(@as(usize, 3), steps);
+    steps = 0;
+    try testing.expectEqual(@as(usize, 124), try program.cardinality(127, &deleted));
+    try testing.expectEqual(@as(usize, 2), steps);
+    try deleted.add(3);
+    try testing.expectEqual(@as(usize, 124), try program.cardinality(127, &deleted));
+    // Exercise the one-input cached-cardinality fast path with deletions,
+    // including deletion IDs outside the current segment's document domain.
+    program.pins[1].deinit();
+    program.pin_count = 1;
+    program.op_count = 3;
+    program.ops[2] = .subtract;
+    program.pins[0].cached_cardinality = 2;
+    steps = 0;
+    try testing.expectEqual(@as(usize, 123), try program.cardinality(127, &deleted));
+    try testing.expectEqual(@as(usize, 0), steps);
 }

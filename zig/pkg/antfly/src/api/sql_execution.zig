@@ -108,8 +108,13 @@ fn rejectTransactionalDdl(statement: ast.Statement) !void {
     if (@import("antfly_local_sources").sql_ddl_runtime.accepts(statement)) return error.UnsupportedSqlExecution;
 }
 
+const ReceiptWaitBudget = @import("antfly_local_sources").sql_read_requirements.WaitBudget;
+
 pub const Adapter = struct {
     lake_visibility: enum { committed, accepted } = .committed,
+    read_requirements: @import("antfly_local_sources").sql_read_requirements.Requirements = .{},
+    receipt_wait_budget: ReceiptWaitBudget = .{},
+    shared_receipt_wait_budget: ?*ReceiptWaitBudget = null,
     /// A transport may consume borrowed result columns within the same policy,
     /// settings and snapshot scope as ordinary execution. Mutation and active
     /// transaction paths continue to own their acknowledgement result.
@@ -122,6 +127,8 @@ pub const Adapter = struct {
     context: operation.RequestContext,
     database: []const u8 = "default",
     namespace: []const u8 = "public",
+    /// Borrowed from the pinned connection request, never retained by a plan.
+    ddl_search_path: ?*const @import("../pgwire/search_path.zig").Path = null,
     decision_provider: ?@import("antfly_local_sources").functions_decisions.DecisionProvider = null,
     /// Pgwire retains the original durable owner scope independently of its
     /// mutable, freshly authorized lookup namespace. HTTP leaves this null.
@@ -170,6 +177,7 @@ pub const Adapter = struct {
                     .secret_store = self.server.cfg.secret_store,
                     .antfly_provider = self.server.antfly_provider,
                     .antfly_url = config.inference.api_url,
+                    .antfly_api_key = config.inference.api_key,
                 };
             }
         }
@@ -177,7 +185,12 @@ pub const Adapter = struct {
     }
 
     pub fn execute(self: *Adapter, alloc: std.mem.Allocator, compiled: *const @import("antfly_local_sources").sql_compiler.Compiled, parameters: []const std.json.Value, limits: @import("antfly_local_sources").sql_runtime.Limits, guarded_backend: ?catalog.Backend) !@import("antfly_local_sources").sql_runtime.Result {
+        const previous_receipt_wait_budget = self.receipt_wait_budget;
+        self.receipt_wait_budget = .{};
+        defer self.receipt_wait_budget = previous_receipt_wait_budget;
         const previous_visibility = self.lake_visibility;
+        try self.read_requirements.validate(.sql);
+        if (self.read_requirements.visibility) |visibility| self.lake_visibility = if (visibility == .accepted) .accepted else .committed;
         const previous_context = self.context;
         defer self.lake_visibility = previous_visibility;
         defer self.context = previous_context;
@@ -262,6 +275,10 @@ pub const Adapter = struct {
             self.result_session_id = if (session.transaction_id) |id| std.fmt.bytesToHex(id, .lower) else null;
         }
         errdefer if (zig017_return_error) |err| if (err != error.SqlWriteCapacityUnavailable) session.statementFailed() catch {};
+        if ((compiled.statement == .select or compiled.statement == .explain) and self.read_requirements.visibility == .committed and inherited != null and inherited.?.metadata.accepted_lake_reads) return zig017_failure: {
+            zig017_return_error = error.ReadSnapshotTooOld;
+            break :zig017_failure error.ReadSnapshotTooOld;
+        };
         if (compiled.statement == .set_constraints) {
             if (parameters.len != 0) return zig017_failure: {
                 zig017_return_error = error.InvalidSqlParameters;
@@ -541,7 +558,10 @@ pub const Adapter = struct {
     }
 
     pub fn backend(self: *Adapter) catalog.Backend {
-        return .{ .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
+        // Each new backend starts an execution scope; binding, cursor selection
+        // and fallback execution within that scope share the receipt budget.
+        self.receipt_wait_budget = .{};
+        return .{ .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
     }
 
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {
@@ -566,17 +586,17 @@ pub const Adapter = struct {
         return @import("antfly_local_sources").storage_row_identity.generate(alloc, self.server.sharedApiIo() orelse return error.UnsupportedSqlExecution);
     }
 
-    fn resolveConflictOwners(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, columns: []const []const u8, expressions: []const catalog.ConflictExpression, conditions: []const catalog.Condition, mutations: []const catalog.Mutation) ![]const catalog.ConflictOwner {
+    fn resolveConflictOwners(ptr: *anyopaque, alloc: std.mem.Allocator, scratch_alloc: std.mem.Allocator, table: catalog.Table, target: catalog.ConflictTarget, mutations: []const catalog.Mutation) ![]const catalog.ConflictOwner {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         try self.verify(alloc, table);
         const integrity = @import("antfly_local_sources").api_relational_integrity_commit;
-        const predicates = try @import("antfly_local_sources").sql_conflict_predicate.toNative(alloc, conditions);
-        const keys = try @import("antfly_local_sources").sql_conflict_predicate.expressionsToNative(alloc, expressions);
+        const predicates = try @import("antfly_local_sources").sql_conflict_predicate.toNative(alloc, target.conditions);
+        const keys = try @import("antfly_local_sources").sql_conflict_predicate.expressionsToNative(alloc, target.expressions);
         var snapshot = (try self.server.source.adminSnapshot()) orelse return error.IntegrityCatalogUnavailable;
         defer self.server.source.freeAdminSnapshot(&snapshot);
         const writes = try @import("antfly_local_sources").sql_mutation_images.writes(db_types.BatchWrite, alloc, mutations);
         const previous = if (self.staged) |staged| try staged.distributedTables(alloc) else &.{};
-        const owners = try integrity.resolveConflictOwners(alloc, self.server.table_reads orelse return error.UnsupportedSqlExecution, snapshot.tables, snapshot.ranges, table.physical_name, table.schema_version, columns, keys, predicates, writes, previous, self.context);
+        const owners = try integrity.resolveConflictTargetOwnersWithScratch(alloc, scratch_alloc, self.server.table_reads orelse return error.UnsupportedSqlExecution, snapshot.tables, snapshot.ranges, table.physical_name, table.schema_version, .{ .columns = target.columns, .expressions = keys, .predicate = predicates, .constraint_name = target.constraint_name }, writes, previous, self.context);
         try self.verify(alloc, table);
         const result = try alloc.alloc(catalog.ConflictOwner, owners.len);
         for (owners, result) |*owner, *out| out.* = .{ .key = owner.key, .identity = owner.identity, .identities = owner.identities, .guard = owner };
@@ -597,14 +617,19 @@ pub const Adapter = struct {
         return if (generation) |version| .{ .generation_set = version, .commands = commands.items } else null;
     }
 
-    fn ddl(ptr: *anyopaque, alloc: std.mem.Allocator, input: catalog.Ddl) !catalog.DdlOutcome {
+    fn ddl(ptr: *anyopaque, allocators: catalog.DdlAllocators, input: catalog.Ddl) !catalog.DdlOutcome {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
-        return @import("sql_catalog.zig").execute(self.server, self.identity.*, self.context, self.database, self.namespace, alloc, input);
+        return @import("sql_catalog.zig").executeWithAllocators(self.server, self.identity.*, self.context, self.database, self.namespace, allocators, input, self.ddl_search_path);
     }
 
     fn checkpoint(ptr: *anyopaque) !void {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         try self.context.ensureActive();
+    }
+
+    fn scalarCheckpoint(ptr: ?*anyopaque) !void {
+        // Explicitly non-suspending: only cancellation/deadline inspection.
+        try checkpoint(ptr.?);
     }
 
     fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
@@ -810,26 +835,73 @@ pub const Adapter = struct {
         adapter: *Adapter,
         schema_version: u32,
         require_primary_digest: bool = false,
+        projection: @import("antfly_local_sources").sql_document_row.Projection,
         view: @import("antfly_local_sources").api_table_read_source.RelationalReadView,
+        column_page: ?catalog.Page = null,
+        fn retireColumns(self: *@This()) void {
+            if (self.column_page) |*page| page.deinit();
+            self.column_page = null;
+        }
+        fn nextColumns(ptr: *anyopaque, _: std.mem.Allocator, limit: u32) !catalog.ColumnPage {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            // Mutation reads need per-row version/digest metadata, which the
+            // native column-page interface does not carry.
+            if (self.require_primary_digest) return error.UnsupportedSqlExecution;
+            self.column_page = try next(ptr, @import("antfly_local_sources").sql_memory_budget.reclaimingAllocator(self.alloc), limit);
+            errdefer self.retireColumns();
+            const a = self.column_page.?.storage_page.?.arena.allocator();
+            const Reader = struct {
+                rows: []const catalog.Row,
+                columns: []const catalog.Column,
+                fn cell(raw: *anyopaque, _: std.mem.Allocator, row: usize, column: usize) !catalog.Row.Cell {
+                    const view_: *@This() = @ptrCast(@alignCast(raw));
+                    return view_.rows[row].cell(if (column == view_.columns.len) "_id" else view_.columns[column].name);
+                }
+                fn frozen(raw: *anyopaque, row: usize, column: usize) !?@import("antfly_local_sources").sql_execution_batch.FrozenJson {
+                    const view_: *@This() = @ptrCast(@alignCast(raw));
+                    if (column == view_.columns.len or view_.columns[column].type != .json) return null;
+                    return view_.rows[row].frozenJson(view_.columns[column].name);
+                }
+                fn json(raw: *anyopaque, row: usize, column: usize) !?[]const u8 {
+                    const view_: *@This() = @ptrCast(@alignCast(raw));
+                    if (column == view_.columns.len or view_.columns[column].type != .json) return null;
+                    return view_.rows[row].encodedJson(view_.columns[column].name);
+                }
+            };
+            const reader = try a.create(Reader);
+            reader.* = .{ .rows = self.column_page.?.rows, .columns = self.projection.columns };
+            const values = try a.create(@import("antfly_local_sources").sql_execution_batch.Batch);
+            values.* = .{ .reader = .{ .ptr = reader, .read = Reader.cell, .read_json = Reader.json, .read_frozen = Reader.frozen, .count = reader.rows.len, .width = reader.columns.len + 1 } };
+            const names = try a.alloc([]const u8, values.width());
+            for (self.projection.columns, names[0..self.projection.columns.len]) |column, *name| name.* = column.name;
+            names[names.len - 1] = "_id";
+            const selection = try a.alloc(usize, values.len());
+            for (selection, 0..) |*position, i| position.* = i;
+            return .{ .native = .{ .values = values, .names = names }, .selection = selection, .after = self.column_page.?.after };
+        }
 
         fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
             const self: *ReadCursor = @ptrCast(@alignCast(ptr));
+            self.retireColumns();
             try self.adapter.context.ensureActive();
             var page = try self.view.next(alloc, limit);
             errdefer page.deinit();
             if (page.rows.len > limit) return error.InvalidSqlBackendResponse;
             const rows = try page.arena.allocator().alloc(catalog.Row, page.rows.len);
+            const layout = try self.projection.pageLayout(page.arena.allocator());
             for (page.rows, rows) |row, *out| {
                 if (row.schema_version != self.schema_version) return error.CatalogGenerationChanged;
                 if (self.require_primary_digest and row.expected_content_digest == null) return error.InvalidSqlBackendResponse;
-                out.* = .{ .id = row.id, .version = row.version, .value = row.value, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest, .document = row.document };
+                out.* = try self.projection.adaptBorrowed(page.arena.allocator(), layout, row.sqlRow());
             }
-            return .{ .rows = rows, .after = page.after, .owned_arena = page.arena };
+            return .{ .rows = rows, .after = page.after, .storage_page = page };
         }
 
         fn close(ptr: *anyopaque) void {
             const self: *ReadCursor = @ptrCast(@alignCast(ptr));
+            self.retireColumns();
             self.view.deinit();
+            self.projection.deinit(self.alloc);
             self.alloc.destroy(self);
         }
     };
@@ -842,9 +914,14 @@ pub const Adapter = struct {
             errdefer statement.close(statement.ptr);
             const wrapper = try alloc.create(SingleStatementCursor);
             wrapper.* = .{ .alloc = alloc, .statement = statement };
-            return .{ .ptr = wrapper, .next = SingleStatementCursor.next, .close = SingleStatementCursor.close };
+            return wrapper.asCursor();
         }
-        if (self.staged) |staged| {
+        // Predicate-only entries and writes to unrelated physical tables do
+        // not require merging this scan. Preserve native index selection
+        // while fencing matching schema epochs even on read-only entries.
+        // Guarded isolation above still owns its separate proof admission.
+        if (self.staged != null and try @import("sql_session_overlay.zig").needsMerge(self.staged.?, table)) {
+            const staged = self.staged.?;
             // A session SELECT needs one native statement snapshot. Multi-owner
             // sources without that guarantee remain explicitly unsupported.
             const row_filter = try http_server.resolveEffectiveRowFilterJson(alloc, self.identity.*, table.physical_name);
@@ -855,7 +932,12 @@ pub const Adapter = struct {
             errdefer native_cursor.close(native_cursor.ptr);
             return try @import("sql_session_overlay.zig").open(alloc, native_cursor, staged, table, ordered, row_filter);
         }
-        return openNativeScan(ptr, alloc, table, request);
+        const native_cursor = try openNativeScan(ptr, alloc, table, request);
+        // Empty overlays still need one retained statement view. A session
+        // must never fall back to stateless pages from multiple visibility
+        // cuts merely because it has not staged its first write yet.
+        if (self.staged != null and native_cursor == null) return error.UnsupportedSqlExecution;
+        return native_cursor;
     }
 
     const AggregateArtifactCursor = struct {
@@ -870,6 +952,16 @@ pub const Adapter = struct {
         read_context: @import("antfly_local_sources").serverless_query_lake_read_context.Context,
         child: catalog.AggregatePartialCursor,
         fused: [256]bool = @splat(false),
+        composition: ?*@import("lake_index_aggregate_composition.zig").Composition = null,
+        transferred: bool = false,
+        started: bool = false,
+        final_request: ?catalog.FinalGroupRequest = null,
+        final_page: std.heap.ArenaAllocator,
+        final_rows: []const @import("antfly_local_sources").sql_operators.GroupResult = &.{},
+        final_positions: []const usize = &.{},
+        final_position: usize = 0,
+        scan_quota: catalog.ScanQuota = .{ .capacity = 4096, .row_limit = std.math.maxInt(usize), .page_limit = std.math.maxInt(usize) },
+        final_ordered: bool = false,
         fn canceled(raw: *const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(raw));
             self.adapter.context.ensureActive() catch return true;
@@ -877,6 +969,7 @@ pub const Adapter = struct {
         }
         fn next(raw: *anyopaque, a: std.mem.Allocator, maximum: u32) !?[]const @import("antfly_local_sources").sql_operators.GroupResult {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            self.started = true;
             try self.adapter.verify(a, self.table);
             const cursor = self.child;
             const result = cursor.next(cursor.ptr, a, maximum) catch |err| {
@@ -886,6 +979,86 @@ pub const Adapter = struct {
             try self.adapter.context.ensureActive();
             return result;
         }
+        fn closeCursor(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.transferred) close(raw);
+        }
+        fn adoptFinal(raw: *anyopaque, grouped: *@import("antfly_local_sources").sql_operators.Grouped, request: catalog.FinalGroupRequest) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.started or self.transferred) return error.InvalidSqlBackendResponse;
+            const first = if (self.composition) |composition| try composition.prime() else self.child;
+            const proof = first.final_group_proof orelse return false;
+            if (proof.slots.len != self.recipe.inputs.len or grouped.specs.len != self.recipe.inputs.len) return false;
+            var covered: [256]bool = @splat(false);
+            for (proof.slots) |slot| {
+                if (slot >= self.recipe.inputs.len or covered[slot]) return error.InvalidSqlBackendResponse;
+                covered[slot] = true;
+            }
+            for (grouped.specs, self.recipe.inputs) |spec, input| if (!std.meta.eql(spec, input.spec)) return error.InvalidSqlBackendResponse;
+            try self.adapter.verify(self.a, self.table);
+            if (request.point) |point| if (first.select_point) |select| try select(first.ptr, point);
+            var selection = request.selection;
+            selection.row_limit = request.row_limit;
+            selection.page_limit = request.page_limit;
+            selection.batch_rows = request.batch_rows;
+            const ordered = if (first.select_keys) |select| try select(first.ptr, selection) else false;
+            self.final_ordered = ordered;
+            self.final_request = request;
+            self.scan_quota = .{ .capacity = request.batch_rows, .row_limit = request.row_limit, .page_limit = request.page_limit };
+            try grouped.adoptFinalized(.{ .ptr = self, .count = std.math.cast(usize, proof.count) orelse return error.SqlProgramLimitExceeded, .exact_count = request.predicate == null and request.point == null and !ordered, .ordered = ordered, .batch_rows = request.batch_rows, .next = nextFinal, .close = close }, request.page_limit);
+            self.transferred = true;
+            return true;
+        }
+        fn nextFinal(raw: *anyopaque, a: std.mem.Allocator, maximum: usize, exact: bool) anyerror!?@import("antfly_local_sources").sql_operators.GroupBatch {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const local = @import("antfly_local_sources");
+            const request = self.final_request.?;
+            // Retain one bounded provider page while small result pulls consume it.
+            // Scan credit counts logical batches, independent of result framing.
+            var scratch = std.heap.ArenaAllocator.init(self.a);
+            defer scratch.deinit();
+            while (self.final_position == self.final_positions.len) {
+                _ = self.final_page.reset(.free_all);
+                const pa = self.final_page.allocator();
+                const rows = (try next(raw, pa, if ((self.final_ordered and request.selection.maximum_groups == null) or (request.selection.unordered_prefix and request.predicate == null and request.selection.maximum_groups != null)) @intCast(@min(maximum, request.batch_rows)) else request.batch_rows)) orelse return null;
+                try self.scan_quota.admit(rows.len, false);
+                const positions = try pa.alloc(usize, rows.len);
+                var accepted: usize = 0;
+                for (rows, 0..) |row, index| {
+                    if (row.keys.len != self.recipe.keys.len or try local.sql_aggregate_partial.partialCount(row) != self.recipe.inputs.len) return error.InvalidSqlBackendResponse;
+                    _ = scratch.reset(.free_all);
+                    if (request.predicate) |predicate| if (!try predicate.matches(predicate.ptr, scratch.allocator(), row.keys)) continue;
+                    positions[accepted] = index;
+                    accepted += 1;
+                }
+                self.final_rows = rows;
+                self.final_positions = positions[0..accepted];
+                self.final_position = 0;
+            }
+            const count = @min(maximum, self.final_positions.len - self.final_position);
+            const keys = try a.alloc([]const local.sql_scalar.Datum, count);
+            const values = try a.alloc([]const local.sql_scalar.Datum, self.recipe.inputs.len);
+            for (values) |*column| column.* = try a.alloc(local.sql_scalar.Datum, count);
+            const ordinals = try a.alloc(u64, count);
+            for (self.final_positions[self.final_position..][0..count], 0..) |index, output| {
+                const row = self.final_rows[index];
+                var populated: [256]bool = @splat(false);
+                _ = scratch.reset(.free_all);
+                for (0..values.len) |logical| {
+                    const slot = if (row.aggregate_slots) |map| map[logical] else logical;
+                    if (slot >= values.len or populated[slot]) return error.InvalidSqlBackendResponse;
+                    populated[slot] = true;
+                    @constCast(values[slot])[output] = if (exact) try local.sql_aggregate_partial.cell(a, try local.sql_aggregate_partial.read(scratch.allocator(), row, logical, self.recipe.inputs[slot].spec)) else try local.sql_aggregate_partial.finish(a, scratch.allocator(), row, logical, self.recipe.inputs[slot].spec);
+                }
+                const key_cells = try a.alloc(local.sql_scalar.Datum, row.keys.len);
+                for (key_cells, row.keys) |*cell, input| cell.* = try local.sql_operators.cloneDatum(a, input);
+                keys[output] = key_cells;
+                ordinals[output] = row.ordinal;
+            }
+            self.final_position += count;
+            return .{ .keys = .{ .rows = keys }, .aggregates = .{ .vectors = .{ .values = values, .count = count } }, .ordinals = ordinals };
+        }
+
         fn close(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const cursor = self.child;
@@ -898,6 +1071,7 @@ pub const Adapter = struct {
         fn destroyControl(self: *@This()) void {
             const a = self.a;
             if (self.reader_lease) |lease| lease.deinit();
+            self.final_page.deinit();
             self.arena.deinit();
             a.destroy(self);
         }
@@ -923,7 +1097,7 @@ pub const Adapter = struct {
     };
     fn openAggregatePartials(raw: *anyopaque, a: std.mem.Allocator, table: catalog.Table, recipe: @import("antfly_local_sources").sql_aggregate_materialization.Recipe) !?catalog.AggregatePartialCursor {
         const self: *Adapter = @ptrCast(@alignCast(raw));
-        if (self.lake_visibility == .accepted or table.external_base_source == null or table.external_indexes == null) return null;
+        if (self.read_requirements.after_write != null or self.lake_visibility == .accepted or table.external_base_source == null or table.external_indexes == null) return null;
         const local = @import("antfly_local_sources");
         const artifact_api = @import("lake_index_aggregate_artifact.zig");
         var scratch = std.heap.ArenaAllocator.init(a);
@@ -948,12 +1122,13 @@ pub const Adapter = struct {
         const normalized = try self.context.platformDeadline();
         var context: local.serverless_query_lake_read_context.Context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
         const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store };
-        var source = try local.serverless_query_lake_serving.ServingSource.openCached(a, .{ .storage_mode = .relational, .external_base_source = table.external_base_source }, options.lakeOptions(), context, &self.server.lake_read_cache);
+        var source = try @import("lake_published_navigation.zig").open(a, self.server, table.id, if (table.external_indexes) |indexes| indexes.catalog_json else "", .{ .storage_mode = .relational, .external_base_source = table.external_base_source }, options.lakeOptions(), context, self.context, null);
         defer source.deinit();
         const owner = try a.create(AggregateArtifactCursor);
         owner.a = a;
         owner.reader_lease = null;
         owner.arena = .init(a);
+        owner.final_page = .init(a);
         var keep_owner = false;
         defer if (!keep_owner) owner.destroyControl();
         owner.store = @import("lake_index_store.zig").Store.openNative(a, self.server.cfg.node_config, self.server.cfg.secret_store, true, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir) catch |err| {
@@ -971,7 +1146,7 @@ pub const Adapter = struct {
             };
             context = owner.reader_lease.?.readContext();
         }
-        var selected = (try @import("lake_index_selection.zig").selectCached(sa, table, &source, &owner.store, context, .automatic, &self.server.lake_read_cache)) orelse return null;
+        var selected = (try @import("lake_index_selection.zig").selectCachedWithLease(sa, table, &source, &owner.store, context, .automatic, &self.server.lake_read_cache, owner.reader_lease)) orelse return null;
         defer selected.deinit();
         const owned = owner.arena.allocator();
         const references = try owned.alloc(local.serverless_manifest_artifact_ref.ArtifactRef, identities.len);
@@ -988,6 +1163,15 @@ pub const Adapter = struct {
         // From this point errors propagate: selected immutable state cannot be
         // replaced with a fresh scan halfway through consumption.
         owner.fused = @splat(false);
+        owner.composition = null;
+        owner.transferred = false;
+        owner.started = false;
+        owner.final_request = null;
+        owner.final_rows = &.{};
+        owner.final_positions = &.{};
+        owner.final_position = 0;
+        owner.scan_quota = .{ .capacity = 4096, .row_limit = std.math.maxInt(usize), .page_limit = std.math.maxInt(usize) };
+        owner.final_ordered = false;
         owner.a = a;
         owner.adapter = self;
         owner.table = table;
@@ -996,6 +1180,7 @@ pub const Adapter = struct {
         owner.read_context = context;
         owner.child = (if (recipe.inputs.len == 1) AggregateArtifactCursor.openMember(owner, 0) else composed: {
             const composition = try @import("lake_index_aggregate_composition.zig").Composition.create(a, recipe, .{ .ptr = owner, .open = AggregateArtifactCursor.openMember });
+            owner.composition = composition;
             break :composed composition.cursor();
         }) catch |err| {
             try self.context.ensureActive();
@@ -1003,7 +1188,7 @@ pub const Adapter = struct {
         };
         keep_store = true;
         keep_owner = true;
-        return .{ .ptr = owner, .next = AggregateArtifactCursor.next, .close = AggregateArtifactCursor.close };
+        return .{ .ptr = owner, .next = AggregateArtifactCursor.next, .close = AggregateArtifactCursor.closeCursor, .adopt_final_groups = AggregateArtifactCursor.adoptFinal };
     }
 
     pub fn openLakeScan(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Cursor {
@@ -1108,6 +1293,85 @@ pub const Adapter = struct {
         try self.server.txn_sessions.bindLakeCut(self.server.alloc, id, table.physical_name, table.id, try std.json.Stringify.valueAlloc(a, token, .{}));
     }
 
+    /// Wait before opening or persisting a new snapshot. A retained transaction
+    /// cut is immutable and is checked separately without retrying execution.
+    fn awaitSqlReceipt(self: *Adapter, a: std.mem.Allocator, polling_alloc: std.mem.Allocator, table: catalog.Table) !?@import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.Table {
+        const receipt = self.read_requirements.after_write orelse return null;
+        const generation = if (table.external_indexes) |indexes| indexes.object_generation else 0;
+        if (receipt.table_id != table.id) return null;
+        if (receipt.object_generation != generation) return error.ReadReceiptGenerationMismatch;
+        const binding = table.external_base_source.?.binding;
+        if (binding.write_policy != .iceberg_writer) return error.UnsupportedReadVisibility;
+        const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .catalog_table_id = table.id, .catalog_generation = generation };
+        const normalized = try self.context.platformDeadline();
+        const time = @import("antfly_platform").time;
+        const wait_ms = self.read_requirements.wait_ms orelse 5000;
+        const budget = self.shared_receipt_wait_budget orelse &self.receipt_wait_budget;
+        const wait_deadline = budget.deadline(time.monotonicNs(), wait_ms);
+        const deadline = @min(wait_deadline, normalized.deadline_ns orelse wait_deadline);
+        // Zero permits one readiness check under the statement's I/O budget.
+        // Positive budgets also bound catalog and WAL I/O, not just sleeps.
+        const context: @import("antfly_local_sources").serverless_query_lake_read_context.Context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = if (wait_ms == 0) normalized.deadline_ns else deadline, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
+        var first = true;
+        while (true) {
+            try normalized.ensureActive();
+            if (!first and time.monotonicNs() >= deadline) return error.ReadRequirementNotReady;
+            first = false;
+            context.ensureActive() catch |err| return receiptPollingError(normalized, deadline, err);
+            var attempt = std.heap.ArenaAllocator.init(polling_alloc);
+            defer attempt.deinit();
+            const scratch = attempt.allocator();
+            var current = @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(scratch, binding, options, context, .load) catch |err| return receiptPollingError(normalized, deadline, err);
+            defer current.deinit(scratch);
+            const coverage = try @import("../serverless/lake_ingestion.zig").coverage(scratch, current.table);
+            const covered = if (self.lake_visibility == .accepted) (@import("../serverless/lake_ingestion.zig").pending(scratch, binding, options, context, coverage) catch |err| return receiptPollingError(normalized, deadline, err)).lsn else coverage;
+            context.ensureActive() catch |err| return receiptPollingError(normalized, deadline, err);
+            if (covered >= receipt.wal_lsn) return try std.json.parseFromSliceLeaky(@import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.Table, a, try std.json.Stringify.valueAlloc(scratch, current.table, .{}), .{ .allocate = .alloc_always });
+            const now = time.monotonicNs();
+            if (now >= deadline) return error.ReadRequirementNotReady;
+            try context.io.?.sleep(.fromNanoseconds(@intCast(@min(deadline - now, 50 * std.time.ns_per_ms))), .awake);
+        }
+    }
+
+    fn receiptPollingError(request: operation.RequestContext, deadline: u64, err: anyerror) anyerror {
+        // Caller cancellation and statement expiration retain their SQLSTATE.
+        request.ensureActive() catch |request_err| return request_err;
+        if (@import("antfly_platform").time.monotonicNs() >= deadline) switch (err) {
+            error.DeadlineExceeded, error.Canceled, error.Timeout => return error.ReadRequirementNotReady,
+            else => {},
+        };
+        return err;
+    }
+
+    fn validateReadReceiptBinding(raw: *anyopaque, alloc: std.mem.Allocator, binding: @import("antfly_local_sources").sql_describe.BoundStatement) !void {
+        const self: *Adapter = @ptrCast(@alignCast(raw));
+        const receipt = self.read_requirements.after_write orelse return;
+        if (binding.relation) |relation| {
+            for (relation.scans) |scan_request| if (scan_request.table.id == receipt.table_id) return self.validateReceiptTable(alloc, scan_request.table);
+        } else if (binding.table) |table| if (table.id == receipt.table_id) return self.validateReceiptTable(alloc, table);
+        return error.ReadReceiptGenerationMismatch;
+    }
+
+    fn validateReceiptTable(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table) !void {
+        const source = table.external_base_source orelse return error.UnsupportedReadVisibility;
+        if (source.binding.write_policy != .iceberg_writer) return error.UnsupportedReadVisibility;
+        const generation = if (table.external_indexes) |indexes| indexes.object_generation else 0;
+        if (self.read_requirements.after_write.?.object_generation != generation) return error.ReadReceiptGenerationMismatch;
+        // A zero-row plan can finish without opening any scan. Enforce the
+        // receipt here too; actual scans still verify their selected read cut.
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        try self.checkLakeRead(a, table);
+        if (self.lake_visibility == .accepted and self.active_transaction != null) {
+            if (try self.loadSqlLakeCut(a, table)) |cut| {
+                try self.read_requirements.requireCoverage(table.id, cut.object_generation, cut.pending.lsn, true);
+                return;
+            }
+        }
+        _ = try self.awaitSqlReceipt(a, alloc, table);
+    }
+
     fn fillLakeStatement(self: *Adapter, alloc: std.mem.Allocator, owner: *LakeStatement, requests: []const catalog.StatementScan) !catalog.StatementRead {
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
@@ -1127,9 +1391,11 @@ pub const Adapter = struct {
                     if (owner.overlay_arena == null) owner.overlay_arena = .init(alloc);
                     retained = try self.loadSqlLakeCut(owner.overlay_arena.?.allocator(), request.table);
                 }
+                if (retained) |cut| if (self.read_requirements.after_write) |receipt| if (receipt.table_id == request.table.id) try self.read_requirements.requireCoverage(request.table.id, cut.object_generation, cut.pending.lsn, true);
+                const ready_metadata = if (retained == null) try self.awaitSqlReceipt(scratch.allocator(), alloc, request.table) else null;
                 const normalized = try self.context.platformDeadline();
-                const lake_options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .retained_catalog_metadata = if (retained) |cut| .{ .metadata_location = @constCast(cut.metadata_location), .metadata_json = @constCast(cut.metadata_json) } else null, .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .catalog_table_id = request.table.id, .catalog_generation = if (request.table.external_indexes) |indexes| indexes.object_generation else 0 };
-                source.* = try @import("antfly_local_sources").serverless_query_lake_serving.ServingSource.openCached(alloc, schema, lake_options.lakeOptions(), .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, &self.server.lake_read_cache);
+                const lake_options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .retained_catalog_metadata = if (retained) |cut| .{ .metadata_location = @constCast(cut.metadata_location), .metadata_json = @constCast(cut.metadata_json) } else ready_metadata, .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .catalog_table_id = request.table.id, .catalog_generation = if (request.table.external_indexes) |indexes| indexes.object_generation else 0 };
+                source.* = try @import("lake_published_navigation.zig").open(alloc, self.server, request.table.id, if (request.table.external_indexes) |indexes| indexes.catalog_json else "", schema, lake_options.lakeOptions(), .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, self.context, null);
                 errdefer source.deinit();
                 try source.attachCache(&self.server.lake_read_cache, schema.external_base_source.?.binding, .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) });
                 if (retained) |cut| {
@@ -1137,7 +1403,7 @@ pub const Adapter = struct {
                     const oa = owner.overlay_arena.?.allocator();
                     const overlay = try oa.create(@import("lake_sql_overlay.zig").Cut);
                     overlay.* = try @import("lake_sql_overlay.zig").Cut.initForTable(oa, cut.pending, request.table);
-                    if (cut.pending.changes.len != 0) try owner.overlays.put(alloc, request.table.id, overlay);
+                    if (cut.pending.count() != 0) try owner.overlays.put(alloc, request.table.id, overlay);
                 } else if (self.lake_visibility == .accepted and schema.external_base_source.?.binding.write_policy == .iceberg_writer) {
                     if (owner.overlay_arena == null) owner.overlay_arena = .init(alloc);
                     const oa = owner.overlay_arena.?.allocator();
@@ -1154,8 +1420,9 @@ pub const Adapter = struct {
                     if (!std.mem.eql(u8, uuid, try @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.metadata.str(try @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.metadata.get(current_root, "table-uuid")))) return error.CatalogGenerationChanged;
                     const cut = try @import("lake_search_overlay.zig").snapshotCoverage(root, source.inventory.snapshot_id);
                     const pending = try @import("../serverless/lake_ingestion.zig").pending(oa, binding, lake_options, context, cut);
+                    if (self.read_requirements.after_write) |receipt| if (receipt.table_id == request.table.id) try self.read_requirements.requireCoverage(request.table.id, lake_options.catalog_generation, pending.lsn, false);
                     const overlay = try oa.create(@import("lake_sql_overlay.zig").Cut);
-                    if (pending.changes.len != 0) try @import("lake_search_overlay.zig").requireNativeAncestry(current_root, source.inventory.snapshot_id);
+                    if (pending.count() != 0) try @import("lake_search_overlay.zig").requireNativeAncestry(current_root, source.inventory.snapshot_id);
                     // Persist the unmodified physical WAL before SQL converts
                     // timestamp values to its logical representation.
                     if (self.active_transaction != null) try self.saveSqlLakeCut(oa, request.table, .{
@@ -1171,7 +1438,7 @@ pub const Adapter = struct {
                         .pending = pending,
                     }, lake_options, context);
                     overlay.* = try @import("lake_sql_overlay.zig").Cut.initForTable(oa, pending, request.table);
-                    if (pending.changes.len != 0) try owner.overlays.put(alloc, request.table.id, overlay);
+                    if (pending.count() != 0) try owner.overlays.put(alloc, request.table.id, overlay);
                 }
                 try owner.sources.put(alloc, request.table.id, source);
             } else try native.append(scratch.allocator(), request);
@@ -1194,6 +1461,7 @@ pub const Adapter = struct {
                         break :fallback try @import("lake_sql_cursor.zig").openPinned(alloc, request.table, physical_scan, self.context, owner.sources.get(request.table.id).?);
                     };
                 errdefer cursor.close(cursor.ptr);
+                if (!owner.overlays.contains(request.table.id)) cursor.* = try @import("lake_index_sql_rows.zig").wrapDynamic(alloc, self.server, request.table, request.request, self.context, owner.sources.get(request.table.id).?, cursor.*);
                 try self.verify(scratch.allocator(), request.table);
             } else {
                 cursor.* = owner.native.?.cursors[native_index];
@@ -1216,12 +1484,15 @@ pub const Adapter = struct {
                 .close = close,
                 .next_columns = if (child.next_columns != null) nextColumns else null,
                 .set_dynamic_filter = if (child.set_dynamic_filter != null) setDynamicFilter else null,
+                .wants_exact_filter = if (child.wants_exact_filter != null) wantsExactFilter else null,
                 .count_rows = if (child.count_rows != null) countRows else null,
                 // Cursor's contract keeps children inside their parent's lifetime.
                 // The statement therefore pins their shared source until close.
                 .split_scan = if (child.split_scan != null) splitScan else null,
                 .split_ordered = if (child.split_ordered != null) splitOrdered else null,
                 .order_satisfied = child.order_satisfied,
+                .column_statistics = child.column_statistics,
+                .estimated_filtered_rows = child.estimated_filtered_rows,
                 .estimated_rows = child.estimated_rows,
                 .estimated_bytes = child.estimated_bytes,
                 .ordered_split_bytes = child.ordered_split_bytes,
@@ -1246,6 +1517,11 @@ pub const Adapter = struct {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const cursor = self.statement.cursors[0];
             return cursor.next(cursor.ptr, alloc, limit);
+        }
+        fn wantsExactFilter(raw: *anyopaque, columns: []const @import("antfly_local_sources").sql_dynamic_filter.Column) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const cursor = self.statement.cursors[0];
+            return cursor.wants_exact_filter.?(cursor.ptr, columns);
         }
         fn setDynamicFilter(raw: *anyopaque, filter: *const @import("antfly_local_sources").sql_dynamic_filter.Filter) !bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -1280,9 +1556,11 @@ pub const Adapter = struct {
         // the provider's independently resolved routing fence. Replacement or
         // restore under the same physical name must fail before publication.
         try self.verify(scratch.allocator(), table);
+        const projection = try @import("antfly_local_sources").sql_document_row.Projection.init(alloc, table, request.fields);
+        errdefer projection.deinit(alloc);
         const cursor = try alloc.create(ReadCursor);
-        cursor.* = .{ .alloc = alloc, .adapter = self, .schema_version = table.schema_version, .require_primary_digest = request.include_primary_digest, .view = view };
-        return .{ .ptr = cursor, .next = ReadCursor.next, .close = ReadCursor.close };
+        cursor.* = .{ .alloc = alloc, .adapter = self, .schema_version = table.schema_version, .require_primary_digest = request.include_primary_digest, .view = view, .projection = projection };
+        return .{ .ptr = cursor, .next = ReadCursor.next, .next_columns = if (request.include_primary_digest) null else ReadCursor.nextColumns, .close = ReadCursor.close };
     }
 
     const StatementRead = struct {
@@ -1297,7 +1575,12 @@ pub const Adapter = struct {
         fn close(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.overlays) for (self.cursors) |cursor| cursor.close(cursor.ptr);
+            for (self.wrappers) |*wrapper| wrapper.retireColumns();
             self.native.deinit();
+            for (self.wrappers) |*wrapper| {
+                wrapper.retireColumns();
+                wrapper.projection.deinit(self.alloc);
+            }
             self.alloc.free(self.cursors);
             self.alloc.free(self.wrappers);
             self.alloc.destroy(self);
@@ -1316,7 +1599,12 @@ pub const Adapter = struct {
         fn close(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.overlays) for (self.cursors[0..self.opened]) |cursor| cursor.close(cursor.ptr);
+            for (self.wrappers[0..self.opened]) |*wrapper| wrapper.retireColumns();
             for (self.views[0..self.view_count]) |view| view.deinit();
+            for (self.wrappers) |*wrapper| {
+                wrapper.retireColumns();
+                wrapper.projection.deinit(self.alloc);
+            }
             self.alloc.free(self.cursors);
             self.alloc.free(self.wrappers);
             self.alloc.free(self.views);
@@ -1335,6 +1623,12 @@ pub const Adapter = struct {
         errdefer alloc.free(views);
         const wrappers = try alloc.alloc(ReadCursor, requests.len);
         errdefer alloc.free(wrappers);
+        var projected: usize = 0;
+        errdefer for (wrappers[0..projected]) |wrapper| wrapper.projection.deinit(alloc);
+        for (requests, wrappers) |request, *wrapper| {
+            wrapper.projection = try @import("antfly_local_sources").sql_document_row.Projection.init(alloc, request.table, request.request.fields);
+            projected += 1;
+        }
         const cursors = try alloc.alloc(catalog.Cursor, requests.len);
         errdefer alloc.free(cursors);
         const overlay_staged = self.staged != null and self.staged.?.tables.len != 0;
@@ -1387,8 +1681,8 @@ pub const Adapter = struct {
             const scope = request.table.scope orelse return error.InvalidSqlBackendResponse;
             const logical = try (system_catalog.Target{ .database = scope.database, .namespace = scope.namespace, .table = scope.name }).resourceNameAlloc(temporary);
             try observed.observeRanges(self.server.alloc, logical, bound_table, request.table.schema_version, guarded.owner_proofs);
-            wrapper.* = .{ .alloc = alloc, .adapter = self, .schema_version = request.table.schema_version, .require_primary_digest = request.request.include_primary_digest, .view = view.* };
-            cursor.* = .{ .ptr = wrapper, .next = ReadCursor.next, .close = StatementRead.borrowedClose };
+            wrapper.* = .{ .alloc = alloc, .adapter = self, .schema_version = request.table.schema_version, .require_primary_digest = request.request.include_primary_digest, .view = view.*, .projection = wrapper.projection };
+            cursor.* = .{ .ptr = wrapper, .next = ReadCursor.next, .next_columns = if (request.request.include_primary_digest) null else ReadCursor.nextColumns, .close = StatementRead.borrowedClose };
             if (if (overlay_staged) self.staged else null) |staged| {
                 const row_filter = try http_server.resolveEffectiveRowFilterJson(temporary, self.identity.*, bound_table);
                 cursor.* = try @import("sql_session_overlay.zig").open(alloc, cursor.*, staged, request.table, query, row_filter);
@@ -1419,6 +1713,12 @@ pub const Adapter = struct {
         errdefer alloc.destroy(retained);
         const wrappers = try alloc.alloc(ReadCursor, requests.len);
         errdefer alloc.free(wrappers);
+        var projected: usize = 0;
+        errdefer for (wrappers[0..projected]) |wrapper| wrapper.projection.deinit(alloc);
+        for (requests, wrappers) |request, *wrapper| {
+            wrapper.projection = try @import("antfly_local_sources").sql_document_row.Projection.init(alloc, request.table, request.request.fields);
+            projected += 1;
+        }
         const cursors = try alloc.alloc(catalog.Cursor, requests.len);
         errdefer alloc.free(cursors);
         const native = read_source.openRelationalStatement(alloc, scans, .read_index) catch |err| blk: {
@@ -1463,8 +1763,8 @@ pub const Adapter = struct {
                 const logical = try (system_catalog.Target{ .database = scope.database, .namespace = scope.namespace, .table = scope.name }).resourceNameAlloc(temporary);
                 try observed.observeRanges(self.server.alloc, logical, request.table.physical_name, request.table.schema_version, proofs);
             }
-            wrapper.* = .{ .alloc = alloc, .adapter = self, .schema_version = request.table.schema_version, .require_primary_digest = request.request.include_primary_digest, .view = view };
-            cursor.* = .{ .ptr = wrapper, .next = ReadCursor.next, .close = StatementRead.borrowedClose };
+            wrapper.* = .{ .alloc = alloc, .adapter = self, .schema_version = request.table.schema_version, .require_primary_digest = request.request.include_primary_digest, .view = view, .projection = wrapper.projection };
+            cursor.* = .{ .ptr = wrapper, .next = ReadCursor.next, .next_columns = if (request.request.include_primary_digest) null else ReadCursor.nextColumns, .close = StatementRead.borrowedClose };
             if (if (overlay_staged) self.staged else null) |staged| {
                 const row_filter = try http_server.resolveEffectiveRowFilterJson(temporary, self.identity.*, request.table.physical_name);
                 var ordered = request.request;
@@ -1478,36 +1778,13 @@ pub const Adapter = struct {
     }
 
     fn scan(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Page {
-        // The stateless wire fallback is relational-only. Document SQL needs
-        // its retained native view to preserve projection/null and TTL semantics.
-        if (table.storage_mode != .relational or request.include_primary_digest) return error.UnsupportedSqlExecution;
-        const self: *Adapter = @ptrCast(@alignCast(ptr));
-        const scan_request = try self.prepareScan(alloc, table, request);
-        const source = self.server.table_reads orelse return error.TableNotFound;
-        var response = (try source.scan(alloc, table.physical_name, scan_request.from, scan_request.to, scan_request.opts, .read_index)) orelse return error.TableNotFound;
-        defer response.deinit(alloc);
-        var rows: std.ArrayList(catalog.Row) = .empty;
-        var lines = std.mem.splitScalar(u8, response.ndjson, '\n');
-        while (lines.next()) |line| {
-            if (line.len == 0) continue;
-            if (rows.items.len >= request.limit) return error.InvalidSqlBackendResponse;
-            const row = try std.json.parseFromSliceLeaky(wire.RelationalRow, alloc, line, .{ .parse_numbers = false, .allocate = .alloc_always });
-            if (request.primary_key) |key| {
-                if (rows.items.len != 0 or !std.mem.eql(u8, row._id, key)) return error.InvalidSqlBackendResponse;
-            }
-            if (row.schema_version != table.schema_version) return error.CatalogGenerationChanged;
-            const sql_nulls = try alloc.alloc(bool, row.row.map.count());
-            for (row.row.map.values(), sql_nulls) |value, *is_null| is_null.* = value == .null;
-            for (row.json_null_fields orelse &.{}) |field| {
-                const column = table.column(field) catch return error.InvalidSqlBackendResponse;
-                if (column.type != .json) return error.InvalidSqlBackendResponse;
-                const index = row.row.map.getIndex(field) orelse return error.InvalidSqlBackendResponse;
-                if (!sql_nulls[index]) return error.InvalidSqlBackendResponse;
-                sql_nulls[index] = false;
-            }
-            try rows.append(alloc, .{ .id = row._id, .version = try std.fmt.parseInt(u64, row.version, 10), .value = .{ .object = row.row.map }, .sql_nulls = sql_nulls });
-        }
-        return .{ .rows = rows.items, .after = if (request.primary_key == null and rows.items.len == request.limit) rows.items[rows.items.len - 1].id else null };
+        // SQL execution requires retained typed pages. Public HTTP/NDJSON
+        // scans have no statement snapshot or native-cell ownership contract;
+        // do not silently choose that transport when a provider lacks SQL.
+        _ = ptr;
+        _ = alloc;
+        if (table.storage_mode == .document or request.include_primary_digest) return error.UnsupportedSqlExecution;
+        return error.SqlStatementSnapshotRequired;
     }
 
     fn prepareMutations(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) ![]const catalog.Mutation {
@@ -1542,15 +1819,15 @@ pub const Adapter = struct {
         return result;
     }
 
-    fn mutate(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
-        return mutateInternal(ptr, alloc, table, input, false);
+    fn mutate(ptr: *anyopaque, alloc: std.mem.Allocator, scratch: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
+        return mutateInternal(ptr, alloc, scratch, table, input, false);
     }
 
-    fn mutatePrepared(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
-        return mutateInternal(ptr, alloc, table, input, true);
+    fn mutatePrepared(ptr: *anyopaque, alloc: std.mem.Allocator, scratch: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
+        return mutateInternal(ptr, alloc, scratch, table, input, true);
     }
 
-    fn mutateInternal(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation, already_prepared: bool) !catalog.MutationOutcome {
+    fn mutateInternal(ptr: *anyopaque, alloc: std.mem.Allocator, scratch: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation, already_prepared: bool) !catalog.MutationOutcome {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         try self.verify(alloc, table);
         const guards = try conflictGuards(alloc, input);
@@ -1626,9 +1903,9 @@ pub const Adapter = struct {
                 try writes.append(alloc, .{ .key = mutation.key, .value = try std.json.Stringify.valueAlloc(alloc, row, .{}), .json_null_fields = if (table.storage_mode == .document) &.{} else mutation.json_null_fields });
             } else try deletes.append(alloc, mutation.key);
         }
-        var response = @import("public_table_http.zig").handleNativeTableBatch(alloc, table.physical_name, .{ .schema_version = if (table.storage_mode == .document) table.schema_version else null, .relational_schema_version = if (table.storage_mode == .relational) table.schema_version else null, .writes = writes.items, .deletes = deletes.items, .predicates = predicates, .integrity_commands = if (guards) |value| value.commands else &.{}, .relational_integrity_generation_set = if (guards) |value| value.generation_set else null }, self.server.tableApi(self.context)) catch
+        var response = @import("public_table_http.zig").handleNativeTableBatch(scratch, table.physical_name, .{ .schema_version = if (table.storage_mode == .document) table.schema_version else null, .relational_schema_version = if (table.storage_mode == .relational) table.schema_version else null, .writes = writes.items, .deletes = deletes.items, .predicates = predicates, .integrity_commands = if (guards) |value| value.commands else &.{}, .relational_integrity_generation_set = if (guards) |value| value.generation_set else null }, self.server.tableApi(self.context)) catch
             return error.SqlMutationOutcomeUnknown;
-        defer response.deinit(alloc);
+        defer response.deinit(scratch);
         self.outcome_transaction_id = mutationTransactionId(response.body);
         if (response.status == 200 or response.status == 201) return .committed;
         if (response.status == 202) return try committedMutationOutcome(response.body);
@@ -1720,6 +1997,8 @@ fn classifyMutationFailure(status: u16, body: []const u8) MutationFailure {
     if (parsed.value.status) |state| if (std.mem.startsWith(u8, state, "committed") or std.mem.eql(u8, state, "unknown"))
         return .{ .err = error.SqlMutationOutcomeUnknown, .transaction_id = id };
     if (status == 503) if (parsed.value.code) |code| {
+        if (std.mem.eql(u8, code, "transaction_precommit_read_unavailable") and parsed.value.transaction_id == null and parsed.value.status == null)
+            return .{ .err = error.SqlStatementReadUnavailable };
         if (std.mem.eql(u8, code, "constraint_activation_pending")) return .{ .err = error.SqlWriteCapacityUnavailable, .transaction_id = id };
     };
     return .{ .err = definiteMutationFailure(status, parsed.value.@"error" orelse "") orelse error.SqlMutationOutcomeUnknown, .transaction_id = id };
@@ -1738,6 +2017,7 @@ fn definiteMutationFailure(status: u16, native: []const u8) ?anyerror {
         if (std.mem.eql(u8, native, "RelationalCheckViolation")) return error.RelationalCheckViolation;
         if (std.mem.eql(u8, native, "RelationalExpressionOverflow")) return error.RelationalExpressionOverflow;
         if (std.mem.eql(u8, native, "RelationalExpressionDivisionByZero")) return error.RelationalExpressionDivisionByZero;
+        if (std.mem.eql(u8, native, "SqlFeatureNotSupported")) return error.SqlFeatureNotSupported;
     }
     if (status == 400) return error.SqlTypeMismatch;
     if (status == 403) return error.Forbidden;
@@ -1758,6 +2038,8 @@ pub fn characterPosition(statement: []const u8, byte_offset: usize) ?i64 {
 
 test "SQL diagnostics preserve SQLSTATE and Unicode character positions" {
     try std.testing.expectEqualStrings("42601", sqlState(error.InvalidSqlSyntax));
+    try std.testing.expectEqualStrings("0A000", sqlState(error.SqlFeatureNotSupported));
+    try std.testing.expectEqual(error.SqlFeatureNotSupported, definiteMutationFailure(400, "SqlFeatureNotSupported").?);
     try std.testing.expectEqual(@as(u16, 501), httpStatus(error.UnsupportedSqlShape));
     try std.testing.expectEqual(@as(u16, 409), httpStatus(error.SqlMutationOutcomeUnknown));
     try std.testing.expectEqual(@as(?i64, 4), characterPosition("éé x", 5));
@@ -1862,6 +2144,67 @@ test "SQL require-index equality uses exact native bounds only inside a guarded 
     fake = 3;
     const disabled = try adapter.prepareScan(alloc, table, request);
     try std.testing.expectEqualStrings("", disabled.opts.row_policy_principal_proof);
+}
+
+test "SQL API empty transaction overlays preserve native index planning" {
+    const reads = @import("antfly_local_sources").api_table_read_source;
+    const Fake = struct {
+        auto_index: bool = true,
+        opens: usize = 0,
+        closes: usize = 0,
+        fn resolve(_: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            if (call == .policy_publication_status) return alloc.dupe(u8, "null");
+            return alloc.dupe(u8, "{\"revision\":3,\"tables\":[{\"table_id\":7,\"name\":\"physical\"}]}");
+        }
+        fn open(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, opts: db_types.ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.RelationalReadView {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(self.auto_index, opts.relational_query.?.auto_index);
+            self.opens += 1;
+            return .{ .ptr = ptr, .vtable = &.{ .next = unexpectedNext, .close = close } };
+        }
+        fn unexpectedNext(_: *anyopaque, _: std.mem.Allocator, _: u32) !reads.RelationalReadView.Page {
+            return error.UnexpectedRead;
+        }
+        fn close(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.closes += 1;
+        }
+    };
+    var fake: Fake = .{};
+    var server: http_server.ApiHttpServer = undefined;
+    server.alloc = std.testing.allocator;
+    server.source = .{ .ptr = &fake, .vtable = &.{ .status = undefined, .system_catalog = Fake.resolve } };
+    server.table_reads = .{ .ptr = &fake, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .open_relational_read = Fake.open } };
+    var identity: ?http_server.AuthenticatedIdentity = null;
+    var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{} };
+    const table: catalog.Table = .{ .id = 7, .physical_name = "physical", .schema_version = 9, .columns = &.{.{ .name = "id", .path = "id", .type = .string }}, .scope = .{ .database = "d", .namespace = "n", .name = "logical", .revision = 3 } };
+    const request: catalog.Scan = .{ .fields = &.{"id"}, .limit = 8 };
+    var staged: @import("transactions.zig").OwnedTransactionCommitRequest = .{};
+    var staged_table: @import("transactions.zig").TableCommitRequest = .{ .table_name = @constCast("physical") };
+    for (0..5) |step| {
+        adapter.staged = if (step == 0) null else &staged;
+        if (step >= 2) staged.tables = (&staged_table)[0..1];
+        if (step == 3) {
+            staged_table.table_name = @constCast("other");
+            staged_table.batch.deletes = @constCast(&[_][]const u8{"a"});
+        }
+        if (step == 4) staged_table.table_name = @constCast("physical");
+        fake.auto_index = step != 4;
+        const cursor = (try Adapter.openScan(&adapter, std.testing.allocator, table, request)) orelse return error.MissingSqlCursor;
+        cursor.close(cursor.ptr);
+    }
+    try std.testing.expectEqual(@as(usize, 5), fake.opens);
+    try std.testing.expectEqual(fake.opens, fake.closes);
+    staged_table.batch.deletes = &.{};
+    staged_table.schema_version = 8;
+    try std.testing.expectError(error.CatalogGenerationChanged, Adapter.openScan(&adapter, std.testing.allocator, table, request));
+    try std.testing.expectEqual(@as(usize, 5), fake.opens);
+    staged.tables = &.{};
+    adapter.staged = &staged;
+    server.table_reads.?.vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined };
+    try std.testing.expectError(error.UnsupportedSqlExecution, Adapter.openScan(&adapter, std.testing.allocator, table, request));
+    adapter.staged = null;
+    try std.testing.expect((try Adapter.openScan(&adapter, std.testing.allocator, table, request)) == null);
 }
 
 test "SQL API document preparation uses native normalization and retains mutation fences" {
@@ -3096,7 +3439,7 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
     try std.testing.expectEqual(attempts_before_proof_failure, fake.commit_attempts);
 }
 
-test "SQL document reads reject the relational stateless fallback before transport" {
+test "SQL stateless fallback rejects JSON scans before transport" {
     var identity: ?http_server.AuthenticatedIdentity = null;
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
@@ -3105,6 +3448,7 @@ test "SQL document reads reject the relational stateless fallback before transpo
     // poisoned so rejected requests cannot touch those authorities.
     server.embedding_provider_runtime.io = io_impl.io();
     var adapter = Adapter{ .server = &server, .identity = &identity, .context = .{} };
+    try std.testing.expectError(error.SqlStatementSnapshotRequired, Adapter.scan(&adapter, std.testing.allocator, .{ .id = 1, .physical_name = "rows", .schema_version = 1, .storage_mode = .relational, .columns = &.{} }, .{ .fields = &.{}, .limit = 1 }));
     try std.testing.expectError(error.UnsupportedSqlExecution, Adapter.scan(&adapter, std.testing.allocator, .{
         .id = 1,
         .physical_name = "docs",
@@ -3150,6 +3494,13 @@ test "SQL unknown mutation keeps native reconciliation receipt without allocatio
     try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", &receipt.transaction_id.?);
     try std.testing.expectEqual(error.DuplicateSqlRow, classifyMutationFailure(409, "{\"error\":\"UniqueConstraintViolation\"}").err);
     try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(503, "write unavailable").err);
+    try std.testing.expectEqual(error.SqlStatementReadUnavailable, classifyMutationFailure(503, "{\"code\":\"transaction_precommit_read_unavailable\"}").err);
+    inline for (.{
+        "{\"code\":\"transaction_precommit_read_unavailable\",\"status\":\"committed_pending\"}",
+        "{\"code\":\"transaction_precommit_read_unavailable\",\"transaction_id\":\"0123456789abcdef0123456789abcdef\"}",
+        "{\"code\":\"transaction_precommit_read_unavailable\",\"transaction_id\":\"invalid\"}",
+    }) |body| try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(503, body).err);
+    try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(500, "{\"code\":\"transaction_precommit_read_unavailable\"}").err);
     try std.testing.expectEqual(error.SqlWriteCapacityUnavailable, classifyMutationFailure(503, "{\"code\":\"constraint_activation_pending\"}").err);
     try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(503, "{\"code\":\"constraint_activation_pending\",\"status\":\"committed_pending\"}").err);
     try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(503, "write committed locally; standby durability acknowledgment pending").err);
@@ -3484,10 +3835,85 @@ test "lake SQL failed aggregate admission releases control before its descriptor
             owner.a = a;
             owner.reader_lease = null;
             owner.arena = .init(a);
+            owner.final_page = .init(a);
             defer owner.destroyControl();
             _ = try owner.arena.allocator().alloc(u8, 128);
             return error.NativeArtifactStorageRequired;
         }
     };
     try std.testing.expectError(error.NativeArtifactStorageRequired, FailedOpen.open(std.testing.allocator));
+}
+
+test "SQL receipt polling expiration preserves caller cancellation and statement deadlines" {
+    try std.testing.expectEqual(error.ReadRequirementNotReady, Adapter.receiptPollingError(.{}, 0, error.DeadlineExceeded));
+    try std.testing.expectEqual(error.DeadlineExceeded, Adapter.receiptPollingError(.{ .deadline_ns = 0 }, 0, error.DeadlineExceeded));
+    var signal = std.atomic.Value(bool).init(true);
+    try std.testing.expectEqual(error.Canceled, Adapter.receiptPollingError(.{ .cancellation = operation.CancellationToken.fromAtomic(&signal) }, 0, error.DeadlineExceeded));
+    try std.testing.expectEqual(error.LakeCatalogForbidden, Adapter.receiptPollingError(.{}, 0, error.LakeCatalogForbidden));
+}
+
+test "SQL receipt readiness shares one deadline across preflight and scan checks" {
+    var budget: ReceiptWaitBudget = .{};
+    const start: u64 = 100 * std.time.ns_per_ms;
+    const deadline = budget.deadline(start, 10);
+    try std.testing.expectEqual(start + 10 * std.time.ns_per_ms, deadline);
+    // Time spent obtaining the preflight result remains spent when the scan
+    // checks readiness again, including after the original deadline expires.
+    try std.testing.expectEqual(deadline, budget.deadline(start + 9 * std.time.ns_per_ms, 10));
+    try std.testing.expectEqual(deadline, budget.deadline(start + 11 * std.time.ns_per_ms, 10));
+    budget = .{};
+    try std.testing.expectEqual(start + 30 * std.time.ns_per_ms, budget.deadline(start + 20 * std.time.ns_per_ms, 10));
+    budget = .{};
+    try std.testing.expectEqual(start, budget.deadline(start, 0));
+    try std.testing.expect(budget.deadline_ns == null);
+    try std.testing.expectEqual(std.math.maxInt(u64), budget.deadline(std.math.maxInt(u64) - 1, 10));
+}
+
+test "SQL pgwire native read cursor keeps transported JSON encoded through column pages and retires cache owners" {
+    const Sources = @import("antfly_local_sources");
+    const View = Sources.storage_relational_read_view.View;
+    const Payload = @import("retained_read_page.zig");
+    const Fixture = struct {
+        bytes: []const u8,
+        delivered: bool = false,
+        fn next(raw: *anyopaque, a: std.mem.Allocator, _: u32) !View.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.delivered) return .{ .arena = .init(a), .rows = &.{}, .after = null };
+            self.delivered = true;
+            return Payload.decode(a, self.bytes, 1, 3, 1);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    const a = std.testing.allocator;
+    var source = std.heap.ArenaAllocator.init(a);
+    defer source.deinit();
+    const sa = source.allocator();
+    const json = try std.json.parseFromSliceLeaky(std.json.Value, sa, "{\"x\":[9007199254740993]}", .{ .parse_numbers = false });
+    const layout = try catalog.Row.TypedLayout.init(sa, &.{"j"});
+    const encoded_page = try Payload.encodeVersion(sa, 1, &.{.{ .id = "key", .version = 1, .schema_version = 3, .value = .null, .typed_cells = .{ .layout = layout, .values = &.{Sources.sql_scalar.Datum.json(json)} } }}, null, .v2);
+    var fixture: Fixture = .{ .bytes = encoded_page };
+    var adapter: Adapter = undefined;
+    adapter.context = .{};
+    const table: catalog.Table = .{ .id = 1, .physical_name = "docs", .schema_version = 3, .columns = &.{.{ .name = "j", .path = "j", .type = .json }} };
+    var projection = try Sources.sql_document_row.Projection.init(a, table, &.{"j"});
+    defer projection.deinit(a);
+    var budget: Sources.sql_memory_budget = .{ .backing = a, .limit = 1 << 20 };
+    var cursor: Adapter.ReadCursor = .{ .alloc = budget.allocator(), .adapter = &adapter, .schema_version = 3, .projection = projection, .view = .{ .ptr = &fixture, .vtable = &.{ .next = Fixture.next, .close = Fixture.close } } };
+    defer cursor.retireColumns();
+    cursor.require_primary_digest = true;
+    try std.testing.expectError(error.UnsupportedSqlExecution, Adapter.ReadCursor.nextColumns(&cursor, a, 1));
+    try std.testing.expect(!fixture.delivered);
+    cursor.require_primary_digest = false;
+    const columns = try Adapter.ReadCursor.nextColumns(&cursor, a, 1);
+    try std.testing.expectEqualStrings("{\"x\":[9007199254740993]}", (try columns.encodedJson(0, "j")).?);
+    try std.testing.expectEqualStrings("key", (try columns.cell(sa, 0, "_id")).value.string);
+    const page_row = cursor.column_page.?.rows[0];
+    const columnar = page_row.typed_cells.?.columnar.?.blocks[0];
+    const range = (try columnar.frozenJson(0, 0, false)).?;
+    const frozen = columnar.json_owner.?.cached.get(@intFromPtr(range.bytes.ptr)).?;
+    try std.testing.expect(frozen.value == null);
+    const end = try Adapter.ReadCursor.nextColumns(&cursor, a, 1);
+    try std.testing.expectEqual(@as(usize, 0), end.selection.len);
+    cursor.retireColumns();
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
 }

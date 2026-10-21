@@ -119,12 +119,7 @@ fn ensureSource(alloc: std.mem.Allocator, env: Environment, input: Request, owne
         {
             defer decoder.close();
             if (program) |compiled| {
-                var scratch = std.heap.ArenaAllocator.init(alloc);
-                defer scratch.deinit();
-                var read = try decoder.core.store.beginReadTxn();
-                defer read.abort();
-                const manifest = try @import("antfly_local_sources").storage_db_relational_rewrite_manifest.read(scratch.allocator(), &read, context.cancellation);
-                try compiled.requireSourceManifest(alloc, manifest, try read.get("\x00\x00__metadata__:schema_json"));
+                try decoder.requireRewriteSourceManifest(alloc, compiled, context.cancellation);
             }
         }
         const portable_marker = try std.fmt.allocPrint(alloc, "{s}/restore-source.scope", .{files});
@@ -1034,7 +1029,18 @@ fn testVerifiedDecoder(comptime portable: bool) !void {
     try std.testing.expectEqual(staging.Phase.imported, last.phase);
     try std.testing.expectEqual(@as(u64, 3), last.rows);
     _ = try executeResident(alloc, &target, env, .{ .scope = scope, .action = .validate }, .{});
-    const published = try executeResident(alloc, &target, env, .{ .scope = scope, .action = .publish }, .{});
+    // Publication advances a bounded replay window per call. Portable imports
+    // can require several windows; a slow host may also exhaust a turn's time
+    // slice. Resume the same durable scope until coverage is complete.
+    const published = publish: {
+        for (0..128) |_| {
+            break :publish executeResident(alloc, &target, env, .{ .scope = scope, .action = .publish }, .{}) catch |err| switch (err) {
+                error.RestoreValidationPending => continue,
+                else => return err,
+            };
+        }
+        return error.TestUnexpectedResult;
+    };
     try std.testing.expectEqual(staging.Phase.published, published.phase);
     try std.testing.expect(target.restore_decoder_cache.decoder == null);
     try std.testing.expect(!try generation.hasPublishedGenerationReadWithIo(cache_path, std.testing.io));

@@ -1,0 +1,18 @@
+MASSIVE public test examples
+
+Source: Amazon Science, MASSIVE: A 1M-Example Multilingual Natural Language
+Understanding Dataset with 51 Typologically-Diverse Languages (2022).
+https://www.amazon.science/code-and-datasets/massive
+https://huggingface.co/datasets/AmazonScience/massive
+Revision: 1a5b2b362bcb4a6f5694396ee1ab577f91583ce2
+License: Creative Commons Attribution 4.0 International
+https://creativecommons.org/licenses/by/4.0/
+
+Changes: select 200 distinct test utterances per language using SHA-256 of
+source row IDs; retain utterance text and intent label vocabulary; remove
+annotation/worker fields; group into batches of eight. Selection is performed
+before inference and is independent of model output. Exact parquet source
+hashes are in source.json. Reproduce with prepare_family_holdout.py.
+
+These fixtures measure native/Fastino implementation agreement, not accuracy
+against gold labels, and make no claim about checkpoint training data.

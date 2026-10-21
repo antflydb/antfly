@@ -191,12 +191,23 @@ test "external lake native cursor capability fences recipe incarnation scope and
     var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
     defer fs.deinit();
     var store = fs.artifactStore();
+    const original_vtable = store.vtable;
+    var unavailable_collection = original_vtable.*;
+    unavailable_collection.visit_scoped_uploads = struct {
+        fn denied(_: *anyopaque, _: [32]u8, _: @import("../serverless/artifacts/store.zig").ScopedUploadVisitor, _: @import("antfly_cancellation").CancellationToken) !void {
+            return error.TestCollectionUnavailable;
+        }
+    }.denied;
+    store.vtable = &unavailable_collection;
     const retained = @import("native_retained_cut.zig");
     var table: local.common_topology_records.TableRecord = .{ .table_id = 7, .name = "current", .schema_json = "{}", .indexes_json = "{}" };
     const Range = @typeInfo(@FieldType(@typeInfo(@FieldType(local.storage_db_types.SearchRequest, "native_query_cut")).optional.child, "cover")).pointer.child;
     const cover: [1]Range = .{.{ .group_id = 10, .namespace = .{ .table_id = 7, .shard_id = 10, .range_id = 11 }, .start_key = "" }};
     const token = try retained.saveWithCover(a, &store, @splat(1), std.testing.io, table, 100, @import("lake_retained_cut.zig").ttl_ms, &cover, .none);
     defer a.free(token);
+    // Publication and replay need no listing/delete capability. Explicit
+    // maintenance still surfaces a collector failure rather than hiding it.
+    try std.testing.expectError(error.TestCollectionUnavailable, retained.collect(&store, 7, @splat(1), 101, .none));
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const descriptor = try retained.load(arena.allocator(), &store, @splat(1), token, table, 101, .none);
@@ -214,6 +225,32 @@ test "external lake native cursor capability fences recipe incarnation scope and
     table.table_id = 7;
     table.indexes_json = "{\"changed\":{}}";
     try std.testing.expectError(error.CatalogGenerationChanged, retained.load(arena.allocator(), &store, @splat(1), token, table, 101, .none));
+}
+
+test "external lake background cursor collection discovers a failed physical capture" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("native-cursor-orphan-discovery");
+    defer directory.cleanup();
+    const repository_api = @import("native_query_repository.zig");
+    var repository = try repository_api.Repository.init(a, null, null, .standalone, directory.path());
+    defer repository.deinit();
+    const Range = @typeInfo(@FieldType(local.storage_db_native_query_cut.Request, "cover")).pointer.child;
+    const cover = [_]Range{.{ .group_id = 1, .namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .start_key = "" }};
+    const table: local.common_topology_records.TableRecord = .{ .table_id = 7, .name = "current", .schema_json = "{}", .indexes_json = "{}" };
+    const token = try repository_api.saveWithCover(a, &repository.store, std.testing.io, table, 100, 60_000, &cover, .none);
+    defer a.free(token);
+    const split = std.mem.lastIndexOfScalar(u8, token, ':').?;
+    const artifact = token[@import("native_retained_cut.zig").prefix.len..split];
+    var store = repository.store.artifactStore();
+    // No physical generation is ever uploaded. The discovery witness alone
+    // must let the supervised collector retain and later retire this artifact.
+    const live_next = try repository.collectNext(a, null, 101, 128, .none);
+    defer if (live_next) |value| a.free(value);
+    const bytes = try store.getAlloc(artifact);
+    store.allocator.free(bytes);
+    const retired_next = try repository.collectNext(a, null, 90_102, 128, .none);
+    defer if (retired_next) |value| a.free(value);
+    try std.testing.expectError(error.FileNotFound, store.getAlloc(artifact));
 }
 
 test {

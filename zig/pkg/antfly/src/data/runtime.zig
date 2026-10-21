@@ -1329,6 +1329,8 @@ const RaftTableApplyStateMachine = struct {
         InvalidRelationalGeneratedValue,
         GeneratedColumnRewriteRequired,
         InitialChildProvisionAlreadyCommitted,
+        SqlFeatureNotSupported,
+        SqlArraySubscriptError,
 
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
             inline for (@typeInfo(@import("antfly_local_sources").storage_db_online_source_contract.Rejection).error_set.error_names.?) |field| {
@@ -1935,8 +1937,22 @@ const RaftTableApplyStateMachine = struct {
         if (comptime linked_storage) {
             const owner_source = self.kernel_owner_source orelse
                 return error.StorageKernelOwnerUnavailable;
-            const descriptor = storage_owner_descriptor orelse
-                return error.MissingStorageKernelOwnerDescriptor;
+            const descriptor = storage_owner_descriptor orelse {
+                // Released v0.2.1+ Raft commands did not pin owner descriptors.
+                // Use the already-prepared resident owner, as those writers
+                // did. This never resolves metadata on the progress thread;
+                // startup/control must open it first, or apply yields. The
+                // original atomic term/index receipt still prevents replay.
+                _ = try self.write_source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(
+                    self.alloc,
+                    group_id,
+                    table_name,
+                    req,
+                    entry,
+                );
+                if (@import("builtin").is_test) self.test_faults.document_apply_successes += 1;
+                return;
+            };
             try owner_source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(
                 self.alloc,
                 group_id,
@@ -2570,6 +2586,10 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_rejected_admissions_total", "counter", "Query embedding results rejected by cache admission control", api_request_stats.query_embedding_cache.rejected_admissions);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_entries", "gauge", "Live query embedding cache entries", api_request_stats.query_embedding_cache.entries);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_live_bytes", "gauge", "Accounted live query embedding cache bytes", api_request_stats.query_embedding_cache.live_bytes);
+        try @import("../api/lake_query_metrics.zig").append(writer, api_request_stats.lake_range_cache, api_request_stats.lake_disk_cache, api_request_stats.lake_query);
+        inline for (.{ "attempts", "failures", "pages", "nanoseconds" }) |field| {
+            try health_metrics.appendPromMetric(writer, "antfly_lake_navigation_warming_" ++ field ++ "_total", "counter", "Bounded lake navigation warming " ++ field, @field(api_request_stats.lake_navigation_warming, field));
+        }
         try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_hits_total", "counter", "Durable incoming-graph route directory hits", api_request_stats.incoming_graph_routes.durable_hits);
         try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_misses_total", "counter", "Durable incoming-graph route directory misses, including stale fences", api_request_stats.incoming_graph_routes.durable_misses);
         try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_read_failures_total", "counter", "Durable incoming-graph route directory read or decode failures", api_request_stats.incoming_graph_routes.durable_read_failures);
@@ -4828,6 +4848,13 @@ fn isSupersededHotStandbyStandbyReplicationRound(err: anyerror) bool {
         err == error.HAStandbyStateChanged;
 }
 
+fn isCooperativeHotStandbyStandbyReplicationRound(err: anyerror) bool {
+    // A bounded local publication proof yields with the durable received tail
+    // intact. It is neither transport degradation nor an acknowledged apply.
+    return err == error.CatalogPublicationProofPending or
+        isSupersededHotStandbyStandbyReplicationRound(err);
+}
+
 fn isRetryableMetadataBootstrapError(err: anyerror) bool {
     if (isRetryableControlPlaneTransportError(err)) return true;
     // Preserve the metadata layer's shared linearizable-authority contract.
@@ -5475,6 +5502,9 @@ pub const DataServer = struct {
     initial_fk_retirement_running: std.atomic.Value(bool) = .init(false),
     graph_cleanup_running: std.atomic.Value(bool) = .init(false),
     graph_cleanup_sweep: @import("graph_cleanup_sweep.zig").Sweep = .{},
+    group_source_sweep: @import("graph_cleanup_sweep.zig").Sweep = .{},
+    group_source_running: std.atomic.Value(bool) = .init(false),
+    group_source_worker: ?@import("antfly_local_sources").storage_db_group_source_worker.Worker = null,
     initial_fk_retirement_last_at_ms: u64 = 0,
     initial_fk_retirement_deadline_ns: u64 = 0,
     initial_fk_retirement_recovery_cursor: @import("fk_retirement_worker.zig").RecoveryCursor = .{},
@@ -6445,32 +6475,198 @@ pub const DataServer = struct {
         return !self.background_jobs_shutdown.load(.acquire) and platform_time.monotonicNs() < self.initial_fk_retirement_deadline_ns;
     }
 
+    const GroupSourceJob = struct {
+        server: *DataServer,
+        table: []const u8,
+        group_id: u64,
+        route: []const u8,
+        deadline_ns: u64 = 0,
+        definition: ?@import("antfly_local_sources").storage_db_group_source_worker.Definition = null,
+    };
+    /// One bounded background slice per server. The control/Raft loops retain
+    /// no owner leases and never wait on a remote source or model provider.
+    fn runGroupSourceRound(self: *DataServer) !void {
+        const runtime = self.backend_runtime orelse return;
+        if (runtime.durable_jobs.executesInline() or self.background_jobs_shutdown.load(.acquire)) return;
+        if (self.group_source_running.swap(true, .acq_rel)) return;
+        var scheduled = false;
+        defer if (!scheduled) self.group_source_running.store(false, .release);
+        const deadline = self.write_source.catalog.budget(null).nowNs() +| 100 * std.time.ns_per_ms;
+        for (0..8) |_| {
+            const visit = (try self.group_source_sweep.next(self.alloc, self.write_source.catalog, deadline)) orelse return;
+            const table = visit.table orelse continue;
+            if (self.data_raft) |raft| {
+                lockAtomic(&self.data_raft_mutex);
+                const leader = raft.host.http_host.host.isLocalLeader(visit.range.group_id);
+                self.data_raft_mutex.unlock();
+                if (!leader) continue;
+            }
+            const job = try self.alloc.create(GroupSourceJob);
+            errdefer self.alloc.destroy(job);
+            const name = try self.alloc.dupe(u8, table.name);
+            errdefer self.alloc.free(name);
+            const route = try self.alloc.dupe(u8, visit.range.start_key);
+            errdefer self.alloc.free(route);
+            job.* = .{ .server = self, .table = name, .group_id = visit.range.group_id, .route = route };
+            try runtime.durable_jobs.submit(.{ .owner_id = try self.dataServerBackgroundOwnerId(runtime), .class = .maintenance, .ptr = job, .run = runGroupSourceJob, .deinit = deinitGroupSourceJob });
+            scheduled = true;
+            return;
+        }
+    }
+    fn deinitGroupSourceJob(ptr: *anyopaque) void {
+        const job: *GroupSourceJob = @ptrCast(@alignCast(ptr));
+        const server = job.server;
+        server.alloc.free(job.table);
+        server.alloc.free(job.route);
+        server.alloc.destroy(job);
+        server.group_source_running.store(false, .release);
+    }
+    fn checkGroupSourceJob(job: *GroupSourceJob) !void {
+        const server = job.server;
+        if (server.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+        if (platform_time.monotonicNs() >= job.deadline_ns) return error.Timeout;
+        if (server.hotStandbyWriteGate()) |gate| try gate.check();
+        if (server.group_leadership_source) |leadership| if (!leadership.isLocalLeader(job.group_id)) return error.NotLeader;
+    }
+    fn runGroupSourceJob(ptr: *anyopaque) !void {
+        const job: *GroupSourceJob = @ptrCast(@alignCast(ptr));
+        const server = job.server;
+        job.deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
+        try checkGroupSourceJob(job);
+        var budget = resource_manager_mod.BudgetedAllocator.init(&server.provisioned_storage.resource_manager, .shard_transition_working_set, server.alloc, 1);
+        defer budget.deinit();
+        var arena = std.heap.ArenaAllocator.init(budget.allocator());
+        defer arena.deinit();
+        const a = arena.allocator();
+        const work = @import("antfly_local_sources").storage_db_group_source_worker;
+        const raw = try groupSourceQuery(job, a, job.route, "{\"action\":\"definitions\"}");
+        const definitions = try std.json.parseFromSliceLeaky([]work.Definition, a, raw, .{ .allocate = .alloc_always });
+        if (definitions.len == 0) return;
+        if (definitions.len > 33) return error.ResourceBudgetExceeded;
+        if (server.group_source_worker == null) server.group_source_worker = .{ .allocator = server.alloc, .identity = @import("antfly_local_sources").storage_db_group_sources.digest(try std.json.Stringify.valueAlloc(a, .{ definitions[0].source_owner, server.backgroundRealtimeMs() }, .{})) };
+        const worker = &server.group_source_worker.?;
+        const selected = try worker.nextDefinition(definitions[0].namespace, definitions.len);
+        const definition = definitions[selected];
+        job.definition = definition;
+        const ports = work.Ports{ .ptr = job, .query_fn = groupSourceQuery, .submit_fn = groupSourceSubmit, .fan_in_fn = groupSourceFanIn, .settled_fn = groupSourceSettled };
+        try worker.sourceStep(a, ports, definition);
+        try worker.groupStep(a, ports, definition, server.backgroundRealtimeMs());
+    }
+    fn groupSourceQuery(ptr: *anyopaque, a: std.mem.Allocator, logical: []const u8, request: []const u8) ![]const u8 {
+        const job: *GroupSourceJob = @ptrCast(@alignCast(ptr));
+        try checkGroupSourceJob(job);
+        const catalog = @import("../api/table_catalog.zig");
+        const route = try catalog.routedGroupSnapshotUntil(a, job.server.write_source.catalog, job.table, logical, job.server.write_source.catalog.deadlineFrom(.{ .deadline_ns = job.deadline_ns }));
+        const selected = route.route orelse return error.TopologyChanged;
+        var source = job.server.read_source.source();
+        source.route_fence = route.fence();
+        var response = (try source.lookupGroupLocal(a, selected.group_id, job.table, logical, .{ .group_source_query_json = request, .execution_deadline_ns = job.deadline_ns, .cancellation = .fromAtomic(&job.server.background_jobs_shutdown) }, .read_index)) orelse return error.NotFound;
+        defer response.deinit(a);
+        if (response.json.len > 8 * 1024 * 1024) return error.ResourceBudgetExceeded;
+        return a.dupe(u8, response.json);
+    }
+    fn groupSourceSubmit(ptr: *anyopaque, command: @import("antfly_local_sources").storage_db_group_source_contract.Command) !void {
+        const job: *GroupSourceJob = @ptrCast(@alignCast(ptr));
+        try checkGroupSourceJob(job);
+        var arena = std.heap.ArenaAllocator.init(job.server.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const logical = try command.routeAlloc(a);
+        const catalog = @import("../api/table_catalog.zig");
+        const route = try catalog.routedGroupSnapshotUntil(a, job.server.write_source.catalog, job.table, logical, job.server.write_source.catalog.deadlineFrom(.{ .deadline_ns = job.deadline_ns }));
+        const selected = route.route orelse return error.TopologyChanged;
+        var namespace: [24]u8 = undefined;
+        std.mem.writeInt(u64, namespace[0..8], selected.identity_namespace.table_id, .big);
+        std.mem.writeInt(u64, namespace[8..16], selected.identity_namespace.shard_id, .big);
+        std.mem.writeInt(u64, namespace[16..24], selected.identity_namespace.range_id, .big);
+        if (!std.mem.eql(u8, &namespace, &command.namespace) or command.definition.table_incarnation != selected.identity_namespace.table_id) return error.TopologyChanged;
+        if (command.publish) |publication| if (publication.topology_epoch != route.topology_epoch) return error.TopologyChanged;
+        if (job.server.data_raft == null) {
+            const applied = try job.server.write_source.source().batchGroupLocal(a, selected.group_id, job.table, .{ .group_source = command, .sync_level = .write });
+            if (applied == null) return error.StorageKernelOwnerUnavailable;
+            return;
+        }
+        const remaining_ns = job.deadline_ns -| platform_time.monotonicNs();
+        try job.server.proposeRaftBatchGroupWithLeaderWait(a, selected.group_id, job.table, .{ .group_source = command, .sync_level = .write }, .{ .discovery = .cached, .allow_remote_forward = true, .admission_deadline_ns = job.server.dataRaftMonotonicNs() +| remaining_ns, .write_route_fence = route.fence(), .visibility_cancellation = .fromAtomic(&job.server.background_jobs_shutdown) }, remaining_ns);
+    }
+    fn groupSourceFanIn(ptr: *anyopaque, a: std.mem.Allocator, definition: @import("antfly_local_sources").storage_db_group_source_worker.Definition, partition: @import("antfly_local_sources").storage_db_group_source_index.Partition, ordinal: i64) !@import("antfly_local_sources").storage_db_group_source_worker.FanIn {
+        const job: *GroupSourceJob = @ptrCast(@alignCast(ptr));
+        try checkGroupSourceJob(job);
+        const catalog = @import("../api/table_catalog.zig");
+        var routes = try catalog.routedSpanSnapshotUntil(a, job.server.write_source.catalog, job.table, "", "", job.server.write_source.catalog.deadlineFrom(.{ .deadline_ns = job.deadline_ns }));
+        defer routes.deinit(a);
+        if (routes.routes.len == 0 or routes.routes.len > 256 or routes.table_id != definition.definition.table_incarnation) return error.GroupedSourceTopologyUnavailable;
+        const collected = try @import("group_source_fan_in.zig").collect(job, a, definition, partition, ordinal, routes, job.server.dataRaftIo() orelse return error.BackendRuntimeUnavailable, checkGroupSourceJob);
+        // A topology replacement during the scatter invalidates even a
+        // successful set of pages; absence is certified by every current owner.
+        var after = try catalog.routedSpanSnapshotUntil(a, job.server.write_source.catalog, job.table, "", "", job.server.write_source.catalog.deadlineFrom(.{ .deadline_ns = job.deadline_ns }));
+        defer after.deinit(a);
+        if (after.topology_epoch != routes.topology_epoch or after.table_id != routes.table_id or after.routes.len != routes.routes.len) return error.TopologyChanged;
+        for (routes.routes, after.routes) |before, current| if (!std.meta.eql(before, current)) return error.TopologyChanged;
+        return collected;
+    }
+    fn groupSourceSettled(ptr: *anyopaque, sequence: u64, units: []const []const u8) !bool {
+        const job: *GroupSourceJob = @ptrCast(@alignCast(ptr));
+        const definition = job.definition orelse return error.InvalidArgument;
+        var arena = std.heap.ArenaAllocator.init(job.server.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const request = try std.json.Stringify.valueAlloc(a, .{ .action = "settled", .artifact = definition.artifact, .definition = definition.definition, .documents = units, .through_sequence = sequence }, .{});
+        const raw = try groupSourceQuery(job, a, definition.route.value, request);
+        return std.json.parseFromSliceLeaky(bool, a, raw, .{});
+    }
+
+    const GraphCleanupJob = struct {
+        server: *DataServer,
+        table: []const u8,
+        group_id: u64,
+    };
+    // Dispatch only: waiting for an applied cleanup entry here would prevent
+    // the control/Raft driver from advancing that very entry.
     fn runGraphEndpointCleanupRound(self: *DataServer) !void {
         const raft = self.data_raft orelse return;
+        const runtime = self.backend_runtime orelse return;
+        if (runtime.durable_jobs.executesInline() or self.background_jobs_shutdown.load(.acquire)) return;
         if (self.graph_cleanup_running.swap(true, .acq_rel)) return;
-        defer self.graph_cleanup_running.store(false, .release);
-        if (self.background_jobs_shutdown.load(.acquire)) return;
-        // At most eight range probes per round; one indexed routing capture
-        // per sweep, with current leadership checked before every proposal.
+        var scheduled = false;
+        defer if (!scheduled) self.graph_cleanup_running.store(false, .release);
         const catalog = self.write_source.catalog;
         const deadline = catalog.budget(null).nowNs() +| 100 * std.time.ns_per_ms;
         for (0..8) |_| {
             const visit = (try self.graph_cleanup_sweep.next(self.alloc, catalog, deadline)) orelse return;
-            const range = visit.range;
             lockAtomic(&self.data_raft_mutex);
-            const leader = raft.host.http_host.host.isLocalLeader(range.group_id);
+            const leader = raft.host.http_host.host.isLocalLeader(visit.range.group_id);
             self.data_raft_mutex.unlock();
             if (!leader) continue;
             const table = visit.table orelse continue;
-            var response = (try self.read_source.source().lookupGroupLocal(self.alloc, range.group_id, table.name, "", .{ .relational_topology_json = "{\"mode\":\"graph_endpoint_cleanup\"}" }, .leader_lease)) orelse continue;
-            defer response.deinit(self.alloc);
-            var status = try std.json.parseFromSlice(antfly.db.types.GraphEndpointCleanupStatus, self.alloc, response.json, .{});
-            defer status.deinit();
-            if (status.value.pending) {
-                try self.proposeRaftBatchGroupWithLeaderWait(self.alloc, range.group_id, table.name, status.value.request(), .{ .discovery = .cached, .allow_remote_forward = false, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) }, 100 * std.time.ns_per_ms);
-                return;
-            }
+            const job = try self.alloc.create(GraphCleanupJob);
+            errdefer self.alloc.destroy(job);
+            const name = try self.alloc.dupe(u8, table.name);
+            errdefer self.alloc.free(name);
+            job.* = .{ .server = self, .table = name, .group_id = visit.range.group_id };
+            try runtime.durable_jobs.submit(.{ .owner_id = try self.dataServerBackgroundOwnerId(runtime), .class = .maintenance, .ptr = job, .run = runGraphCleanupJob, .deinit = deinitGraphCleanupJob });
+            scheduled = true;
+            return;
         }
+    }
+    fn deinitGraphCleanupJob(ptr: *anyopaque) void {
+        const job: *GraphCleanupJob = @ptrCast(@alignCast(ptr));
+        const server = job.server;
+        server.alloc.free(job.table);
+        server.alloc.destroy(job);
+        server.graph_cleanup_running.store(false, .release);
+    }
+    fn runGraphCleanupJob(ptr: *anyopaque) !void {
+        const job: *GraphCleanupJob = @ptrCast(@alignCast(ptr));
+        const server = job.server;
+        if (server.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+        if (server.hotStandbyWriteGate()) |gate| try gate.check();
+        if (server.group_leadership_source) |leadership| if (!leadership.isLocalLeader(job.group_id)) return error.NotLeader;
+        var response = (try server.read_source.source().lookupGroupLocal(server.alloc, job.group_id, job.table, "", .{ .relational_topology_json = "{\"mode\":\"graph_endpoint_cleanup\"}", .execution_deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s, .cancellation = .fromAtomic(&server.background_jobs_shutdown) }, .leader_lease)) orelse return;
+        defer response.deinit(server.alloc);
+        var status = try std.json.parseFromSlice(antfly.db.types.GraphEndpointCleanupStatus, server.alloc, response.json, .{});
+        defer status.deinit();
+        if (status.value.pending) try server.proposeRaftBatchGroupWithLeaderWait(server.alloc, job.group_id, job.table, status.value.request(), .{ .discovery = .cached, .allow_remote_forward = false, .visibility_cancellation = .fromAtomic(&server.background_jobs_shutdown), .admission_deadline_ns = server.dataRaftMonotonicNs() +| 5 * std.time.ns_per_s }, 5 * std.time.ns_per_s);
     }
 
     fn runInitialFkRetirementRound(self: *DataServer) !void {
@@ -6697,6 +6893,7 @@ pub const DataServer = struct {
         // Distributed session/publication routes may resolve to another data
         // owner, including a hidden initial-FK child not yet publicly listed.
         // Reuse the Raft host's transport unless the caller supplied one.
+        if (api_server_cfg.session_router == null) api_server_cfg.session_router = self.dataReadGroupRouter();
         if (api_server_cfg.session_executor == null) {
             if (self.data_raft) |raft| api_server_cfg.session_executor = raft.host.http_host.request_executor;
         }
@@ -6815,7 +7012,7 @@ pub const DataServer = struct {
         // shard owns the entity table, then hand it to the write source(s) that
         // open managed DBs. Captures `read_source.source()` (ptr+vtable), so
         // later read-source mutations remain visible.
-        self.distributed_candidate_source = .{ .reads = self.read_source.source(), .catalog_binding = .{ .ptr = self, .bind_fn = bindSystemCatalogTables } };
+        self.distributed_candidate_source = .{ .io = self.dataRaftIo(), .producer_options = .{ .ptr = self, .get = resolverAdjudicationOptions }, .reads = self.read_source.source(), .catalog_binding = .{ .ptr = self, .bind_fn = bindSystemCatalogTables } };
         const candidate_source = self.distributed_candidate_source.?.candidateSource();
         _ = self.write_source.withResolutionCandidateSource(candidate_source);
         if (self.data_raft_apply) |apply_sm| {
@@ -6828,7 +7025,7 @@ pub const DataServer = struct {
         // that open managed DBs.
         // Require atomic promotion: one fenced batch for a single shard and
         // 2PC only when the entity set spans multiple shards.
-        self.distributed_entity_sink = .{ .writes = self.write_source.source(), .reads = self.read_source.source(), .atomic_batch_required = true, .catalog_binding = .{ .ptr = self, .bind_fn = bindSystemCatalogTables } };
+        self.distributed_entity_sink = .{ .writes = self.write_source.source(), .reads = self.read_source.source(), .io = if (self.backend_runtime) |runtime| runtime.io() else null, .atomic_batch_required = true, .catalog_binding = .{ .ptr = self, .bind_fn = bindSystemCatalogTables } };
         const entity_sink = self.distributed_entity_sink.?.entitySink();
         _ = self.write_source.withEntitySink(entity_sink);
         if (self.data_raft_apply) |apply_sm| {
@@ -7495,7 +7692,7 @@ pub const DataServer = struct {
             received_count += result.received_count;
             applied_count += result.applied_count;
 
-            if (result.end_of_wal) {
+            if (try antfly.hot_standby.http_replication_client.catchUpComplete(result)) {
                 return .{
                     .iterations = iterations,
                     .received_count = received_count,
@@ -7505,9 +7702,6 @@ pub const DataServer = struct {
                     .last_sent_lsn = result.last_sent_lsn,
                     .next_lsn = result.next_lsn,
                 };
-            }
-            if (result.received_count == 0 and result.applied_count == 0) {
-                return error.InternalReplicationDidNotAdvance;
             }
         }
     }
@@ -8907,6 +9101,11 @@ pub const DataServer = struct {
         }
     }
 
+    fn resolverAdjudicationOptions(ptr: *anyopaque) @import("antfly_local_sources").asset_producer_runtime.Runtime.Options {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return .{ .antfly_provider = self.read_source.antfly_provider, .inference_api_url = self.read_source.inference_api_url, .secret_store = self.read_source.secret_store };
+    }
+
     pub fn setAntflyProvider(
         self: *DataServer,
         provider: ?antfly.inference.managed_embedder.AntflyProvider,
@@ -9210,6 +9409,9 @@ pub const DataServer = struct {
         // Durable cleanup epochs survive transient allocation/queue failures;
         // the control loop is their allocation-free watchdog.
         self.write_source.maintainDroppedTableRecovery();
+        self.runGroupSourceRound() catch |err| {
+            std.log.warn("group source dispatch deferred err={s}", .{@errorName(err)});
+        };
         self.runGraphEndpointCleanupRound() catch |err| {
             std.log.warn("graph endpoint cleanup deferred err={s}", .{@errorName(err)});
         };
@@ -9222,7 +9424,7 @@ pub const DataServer = struct {
                 self.clearHotStandbyStandbyReplicationRetry();
                 self.clearHotStandbyStandbyReplicationError();
             } else |err| {
-                if (isSupersededHotStandbyStandbyReplicationRound(err)) {
+                if (isCooperativeHotStandbyStandbyReplicationRound(err)) {
                     self.clearHotStandbyStandbyReplicationRetry();
                     self.clearHotStandbyStandbyReplicationError();
                 } else {
@@ -9560,6 +9762,8 @@ pub const DataServer = struct {
             self.alloc.destroy(executor);
             self.distributed_read_http_executor = null;
         }
+        self.group_source_sweep.deinit();
+        if (self.group_source_worker) |*worker| worker.deinit();
         self.graph_cleanup_sweep.deinit();
         self.initial_fk_retirement_recovery_cursor.deinit();
         self.initial_fk_retirement_gc_cursor.deinit();
@@ -12252,7 +12456,7 @@ pub const DataServer = struct {
         // Source-bound pages carry certified per-row timestamps. Ordered
         // artifact admission is a catalog-only command with no row timestamp.
         // A wall-clock override would change either command's replay contract.
-        if (proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null) return proposal_req;
+        if (proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null or proposal_req.group_source != null or proposal_req.resolver_review != null) return proposal_req;
         // DB.batch treats zero as "read realtime now". Materialize that value
         // once before any forwarding or Raft encoding so every replica applies
         // identical document versions and TTL deadlines. Preserve zero as the
@@ -12275,6 +12479,15 @@ pub const DataServer = struct {
     }
 
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        if (req.artifact_publication) |command| if (command.completion) |page| if (page.group_producers) return @import("../common/data_raft_protocol.zig").batch_group_source_protocol_version;
+        if (req.artifact_catalog) |command| if (command.binding.effect_protocol == 16) return @import("../common/data_raft_protocol.zig").batch_group_source_protocol_version;
+        if (req.online_source) |command| if (command == .admit) {
+            if (command.admit.artifact_catalog) |binding| if (binding.effect_protocol == 16) return @import("../common/data_raft_protocol.zig").batch_group_source_protocol_version;
+        };
+        if (req.merge_page) |page| if (page.source.artifact_catalog) |binding| if (binding.effect_protocol == 16) return @import("../common/data_raft_protocol.zig").batch_group_source_protocol_version;
+        if (req.merge_checkpoint) |checkpoint| if (checkpoint.page_source) |source| if (source.artifact_catalog) |binding| if (binding.effect_protocol == 16) return @import("../common/data_raft_protocol.zig").batch_group_source_protocol_version;
+        if (req.resolver_review != null) return @import("../common/data_raft_protocol.zig").batch_resolver_review_protocol_version;
+        if (req.group_source != null) return @import("../common/data_raft_protocol.zig").batch_group_source_protocol_version;
         if (antfly.db.types.requiresGraphRelationshipProtocol(req)) return @import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version;
         if (@import("antfly_local_sources").api_batch.requiresRowSemanticsEnvelope(req.writes, req.predicates))
             return @import("../common/data_raft_protocol.zig").batch_row_semantics_protocol_version;
@@ -12893,7 +13106,16 @@ pub const DataServer = struct {
                 protocol_activation_entry = activation_entry;
                 if (activation_entry.protocol_version.load(.acquire) >= required_protocol_version) {
                     protocol_preflight.activatable_version = activation_entry.protocol_version.load(.acquire);
-                } else if (activation_entry.activation_mutex.tryLock()) {
+                } else {
+                    // An in-flight capability probe is not evidence that the
+                    // members lack this decoder. Required-format commands,
+                    // including transaction resolution, must join the bounded
+                    // activation singleflight rather than report unsupported
+                    // while another caller is still establishing its barrier.
+                    while (!activation_entry.activation_mutex.tryLock()) {
+                        if (!self.dataRaftProtocolProbeActive(deadline_ns, route.cancellation)) return error.LeaderUnavailable;
+                        try self.sleepDataRaftRetry(std.time.ns_per_ms);
+                    }
                     protocol_activation_lock_owned = true;
                     const durable_version = self.durableDataRaftBatchProtocolVersion(group_id) catch |err| {
                         std.log.warn("data raft pre-admission failed group_id={} phase=protocol_marker err={s}", .{ group_id, @errorName(err) });
@@ -12998,6 +13220,8 @@ pub const DataServer = struct {
                 // exact private owner was checked before reaching Raft.
                 if (req.restore_staging_scope == null and route.initial_child_bootstrap == null and needsDenseRepairWritePreflight(req))
                     try admission_source.preflightDenseRepairWriteAdmission(group_id, table_name);
+                if (req.restore_staging_scope == null and route.initial_child_bootstrap == null and req.merge_page == null and req.split_replication == null and req.merge_replication == null and (req.writes.len != 0 or req.transforms.len != 0))
+                    try admission_source.preflightGroupedSourceWriteAdmission(alloc, group_id, table_name, req);
                 if (comptime linked_storage) {
                     if (restore_owner_descriptor == null) {
                         const owner_source = try self.ensureKernelOwnerSource();
@@ -15381,7 +15605,7 @@ pub const DataServer = struct {
                         if (!try onlineMergePeerEligible(try client.fetchDataRaftBatchProtocolVersion(remote.base_uri, 10000, null)))
                             return error.GuardedMergeCopyReceiptUnsupported;
                     }
-                    var response = try client.fetchGroupLookupWithMode(remote.base_uri, group_id, table_name, "", null, "read_index", 10000, null, false, false, "", "", "", request, null, null, false);
+                    var response = try client.fetchGroupLookupWithMode(remote.base_uri, group_id, table_name, "", null, "read_index", 10000, null, false, false, "", "", "", request, "", null, null, false);
                     defer response.deinit(alloc);
                     return std.json.parseFromSlice(T, alloc, response.body, .{ .allocate = .alloc_always });
                 },
@@ -22930,7 +23154,10 @@ pub const DataServer = struct {
         table_filter: ?[]const []const u8,
     ) !RuntimeStatusRefreshCollection {
         const registration = self.store_registration orelse return error.UnsupportedOperation;
-        var snapshot = (try self.status_source.adminSnapshot()) orelse return error.UnsupportedOperation;
+        // Local status is collected below; fetching every store's diagnostic
+        // payload here creates a polling feedback loop and can monopolize the
+        // bounded diagnostic transfer lane. Use the fenced control authority.
+        var snapshot = (try self.adminSnapshotForMaintenance()) orelse return error.UnsupportedOperation;
         defer self.status_source.freeAdminSnapshot(&snapshot);
 
         var filter_map = std.StringHashMapUnmanaged(void).empty;
@@ -23938,12 +24165,7 @@ pub const DataServer = struct {
                     try context.ensureWithRuntime(.{ .io = &borrow, .memory_limit_bytes = cfg.process_memory_limit_bytes });
                 } else try context.ensure();
                 storage_kernel_context = context;
-                const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(
-                    alloc,
-                    cfg.api_server_cfg.remote_content,
-                );
-                defer alloc.free(security_json);
-                try storage_kernel_context.?.configureRemoteContentSecurity(security_json);
+                try storage_kernel_context.?.configureRemoteContent(cfg.api_server_cfg.remote_content);
                 try storage_kernel_context.?.configureSecrets(cfg.api_server_cfg.secret_store);
                 if (cfg.api_server_cfg.node_config != null and cfg.api_server_cfg.node_config.?.storage.artifacts.connection != null) {
                     const retained_setup = try @import("../api/native_query_repository.zig").Repository.setupJsonAlloc(alloc, cfg.api_server_cfg.node_config, cfg.api_server_cfg.deployment_mode, cfg.api_server_cfg.native_lake_artifact_base_dir);
@@ -24135,6 +24357,17 @@ pub const DataServer = struct {
 // These tests inspect private apply/admission state and belong to the physical
 // implementation partition, not to both linked test inventories.
 const activation_admission_tests = if (@import("builtin").is_test and implementation_tests_only) struct {
+    test "SQL expression apply failures preserve exact semantic rejections" {
+        const Failure = RaftTableApplyStateMachine.ExpectedApplyFailure;
+        inline for (@typeInfo(@import("antfly_local_sources").schema_relational_expression_errors.Error).error_set.error_names.?) |field| {
+            const reason = @field(@import("antfly_local_sources").schema_relational_expression_errors.Error, field);
+            const classified = Failure.fromError(reason) orelse return error.TestExpectedSemanticRejection;
+            try std.testing.expectEqual(reason, classified.toError());
+        }
+        inline for (.{ error.OutOfMemory, error.ResourceBudgetExceeded, error.Corrupted }) |reason|
+            try std.testing.expectEqual(@as(?Failure, null), Failure.fromError(reason));
+    }
+
     test "ordinary unpublished placement does not require a private initial FK owner snapshot" {
         const snapshot: antfly.metadata_api.AdminSnapshot = .{
             .status = undefined,
@@ -25972,8 +26205,10 @@ const RemoteMetadataSource = struct {
             .vtable = &.{
                 .system_catalog = remoteSystemCatalog,
                 .supports_query_definitions = true,
+                .supports_resolver_catalog_read = true,
                 .status = remoteStatus,
                 .admin_snapshot = remoteAdminSnapshot,
+                .control_snapshot = remoteControlSnapshot,
                 .acquire_join_planning = remoteAcquireJoinPlanning,
                 .cached_admin_snapshot = remoteCachedAdminSnapshot,
                 .linearizable_snapshot = remoteLinearizableSnapshot,
@@ -26807,6 +27042,11 @@ const RemoteMetadataSource = struct {
         return null;
     }
 
+    fn remoteControlSnapshot(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        return try self.fetchSnapshotForHead(try self.fetchHead());
+    }
+
     fn remoteAdminSnapshot(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         if (try self.cachedDiagnosticSnapshot()) |snapshot| return snapshot;
@@ -27617,7 +27857,7 @@ const RemoteMetadataSource = struct {
                 ));
                 const read = client.readSystemCatalog(self.base_uris[index], input, attempt_ms, &cancellation) catch |err| {
                     switch (err) {
-                        error.InvalidCatalogName, error.CatalogNotFound, error.CatalogGenerationChanged, error.GenerationPublicationNotFound, error.GenerationPublicationChanged, error.InvalidGenerationPublication, error.CatalogCommandTooLarge, error.OutOfMemory, error.Cancelled, error.Canceled => return err,
+                        error.InvalidCatalogName, error.CatalogNotFound, error.CatalogGenerationChanged, error.GenerationPublicationNotFound, error.GenerationPublicationChanged, error.InvalidGenerationPublication, error.CatalogPublicationProofPending, error.CatalogCommandTooLarge, error.OutOfMemory, error.Cancelled, error.Canceled => return err,
                         else => {
                             if (!antfly.metadata.authority.isRetryableError(err) and
                                 !isRetryableControlPlaneTransportError(err) and err != error.RemoteUnavailable)
@@ -30884,9 +31124,7 @@ pub fn runFromIterator(
             .memory_limit_bytes = process_memory_limit_bytes,
         });
         process_storage_kernel_context = context;
-        const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
-        defer alloc.free(security_json);
-        try process_storage_kernel_context.?.configureRemoteContentSecurity(security_json);
+        try process_storage_kernel_context.?.configureRemoteContent(remote_content);
         try process_storage_kernel_context.?.configureSecrets(if (secret_store_initialized) &secret_store else null);
         if (loaded_config) |*cfg| if (cfg.storage.artifacts.connection != null) {
             const retained_setup = try @import("../api/native_query_repository.zig").Repository.setupJsonAlloc(alloc, cfg, .distributed, null);
@@ -30896,31 +31134,32 @@ pub fn runFromIterator(
     }
 
     var auth_backend: ?LegacyAuthBackend = null;
+    defer if (comptime !linked_storage) if (auth_backend) |*backend| backend.close();
     var auth_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    defer if (auth_runtime) |*runtime| runtime.deinit();
     var kernel_auth_users_store: ?antfly.storage_backend_erased.Store = null;
+    defer if (kernel_auth_users_store) |*store| store.deinit();
     var kernel_auth_casbin_store: ?antfly.storage_backend_erased.Store = null;
+    defer if (kernel_auth_casbin_store) |*store| store.deinit();
     var kernel_auth_users_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    defer if (kernel_auth_users_runtime) |*runtime| runtime.deinit();
     var kernel_auth_casbin_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    defer if (kernel_auth_casbin_runtime) |*runtime| runtime.deinit();
     var auth_user_store: ?antfly.usermgr.StorageUserStore = null;
     var auth_casbin_store: ?antfly.usermgr.StorageCasbinAdapter = null;
     var user_manager: ?antfly.usermgr.UserManager = null;
+    defer if (user_manager) |*manager| manager.deinit();
     if (auth_enabled) {
         if (comptime linked_storage) {
             kernel_auth_users_store = try process_storage_kernel_context.?.systemStore(alloc, "system/auth-users");
-            errdefer kernel_auth_users_store.?.deinit();
             kernel_auth_casbin_store = try process_storage_kernel_context.?.systemStore(alloc, "system/auth-casbin");
-            errdefer kernel_auth_casbin_store.?.deinit();
             kernel_auth_users_runtime = try kernel_owner_client.singleNamespaceStore(alloc, &kernel_auth_users_store.?, "usermgr_users");
-            errdefer kernel_auth_users_runtime.?.deinit();
             kernel_auth_casbin_runtime = try kernel_owner_client.singleNamespaceStore(alloc, &kernel_auth_casbin_store.?, "usermgr_casbin");
-            errdefer kernel_auth_casbin_runtime.?.deinit();
             auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, kernel_auth_users_runtime.?);
             auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, kernel_auth_casbin_runtime.?);
         } else {
             auth_backend = try antfly.lsm_backend.BackendHandle.open(alloc, resolved.auth_store_root_dir, .{});
-            errdefer if (auth_backend) |*backend| backend.close();
             auth_runtime = try auth_backend.?.backend.runtimeNamespaceStore(alloc);
-            errdefer if (auth_runtime) |*runtime| runtime.deinit();
             auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, auth_runtime.?);
             auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, auth_runtime.?);
         }
@@ -30930,7 +31169,6 @@ pub fn runFromIterator(
             auth_user_store.?.iface(),
             try antfly.usermgr.initDefaultEnforcer(alloc, auth_casbin_store.?.iface()),
         );
-        errdefer if (user_manager) |*manager| manager.deinit();
         // This seeds only the local auth store and must remain auth-gated.
         // Raft-backed metadata writes during metadata bootstrap can block
         // clustered startup before raft listeners are running.
@@ -30939,13 +31177,6 @@ pub fn runFromIterator(
             return err;
         };
     }
-    defer if (comptime !linked_storage) if (auth_backend) |*backend| backend.close();
-    defer if (auth_runtime) |*runtime| runtime.deinit();
-    defer if (kernel_auth_users_store) |*store| store.deinit();
-    defer if (kernel_auth_casbin_store) |*store| store.deinit();
-    defer if (kernel_auth_users_runtime) |*runtime| runtime.deinit();
-    defer if (kernel_auth_casbin_runtime) |*runtime| runtime.deinit();
-    defer if (user_manager) |*manager| manager.deinit();
 
     const trusted_principal_issuer = try resolveTrustedPrincipalIssuer(
         alloc,
@@ -33993,7 +34224,7 @@ fn consumerTests() type {
                 .read_source = antfly.public_api.ProvisionedTableReadSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource(), antfly.raft.read_gate.alreadyReadSafeBarrier()),
                 .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource()),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .nothing,
                 .listener_cfg = undefined,
             };
@@ -34116,7 +34347,7 @@ fn consumerTests() type {
                 .read_source = antfly.public_api.ProvisionedTableReadSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource(), antfly.raft.read_gate.alreadyReadSafeBarrier()),
                 .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource()),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .nothing,
                 .listener_cfg = undefined,
             };
@@ -34170,7 +34401,7 @@ fn consumerTests() type {
                 .read_source = antfly.public_api.ProvisionedTableReadSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource(), antfly.raft.read_gate.alreadyReadSafeBarrier()),
                 .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource()),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .nothing,
                 .listener_cfg = undefined,
             };
@@ -34236,7 +34467,7 @@ fn consumerTests() type {
                     .read_source = antfly.public_api.ProvisionedTableReadSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource(), antfly.raft.read_gate.alreadyReadSafeBarrier()),
                     .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource()),
                     .status_source = undefined,
-                    .api_server_cfg = undefined,
+                    .api_server_cfg = .{},
                     .query_async_limit = .nothing,
                     .listener_cfg = undefined,
                 };
@@ -34729,7 +34960,7 @@ fn consumerTests() type {
                     antfly.public_api.table_catalog.emptyCatalogSource(),
                 ),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .nothing,
                 .listener_cfg = undefined,
             };
@@ -34944,7 +35175,7 @@ fn consumerTests() type {
                     antfly.public_api.table_catalog.emptyCatalogSource(),
                 ),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .limited(8),
                 .listener_cfg = undefined,
                 .backend_runtime = backend_runtime.ptr(),
@@ -35814,7 +36045,7 @@ fn consumerTests() type {
                 .read_source = antfly.public_api.ProvisionedTableReadSource.init(".", catalog, antfly.raft.read_gate.alreadyReadSafeBarrier()),
                 .write_source = antfly.public_api.ProvisionedTableWriteSource.init(".", catalog),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .limited(1),
                 .backend_runtime = runtime.ptr(),
                 .listener_cfg = undefined,
@@ -37453,13 +37684,25 @@ fn consumerTests() type {
 
             // A durable size rejection must not wedge the shard behind the rejected
             // entry (or prevent the coordinator's later abort from applying).
+            // Admission is durable table policy, independent of the worker's
+            // preparation-memory budget. Keep each value within the wire limit,
+            // while exceeding the logical cap with distinct prepared intents.
             const payload = try alloc.alloc(u8, 3 * 1024 * 1024);
             defer alloc.free(payload);
             @memset(payload, 'x');
             const oversized_json = try std.json.Stringify.valueAlloc(alloc, .{ .title = payload }, .{});
             defer alloc.free(oversized_json);
+            var oversized_arena = std.heap.ArenaAllocator.init(alloc);
+            defer oversized_arena.deinit();
+            const fixture_alloc = oversized_arena.allocator();
+            const admission_bytes = @import("antfly_local_sources").storage_db_table_catalog.default_transaction_admission_bytes;
+            const oversized_writes = try fixture_alloc.alloc(std.meta.Child(@FieldType(antfly.db.types.BatchRequest, "writes")), @intCast(admission_bytes / payload.len + 1));
+            for (oversized_writes, 0..) |*write, i| write.* = .{
+                .key = try std.fmt.allocPrint(fixture_alloc, "doc:oversized:{d}", .{i}),
+                .value = oversized_json,
+            };
             const oversized = try data_raft_batch.encodeWithStorageOwnerDescriptor(alloc, "docs", .{
-                .writes = &.{.{ .key = "doc:oversized", .value = oversized_json }},
+                .writes = oversized_writes,
                 .transaction = .{ .prepare = .{ .txn_id = txn_version, .topology_epoch = 1 } },
             }, if (descriptor) |*value| value.view() else null);
             defer alloc.free(oversized);
@@ -37476,6 +37719,7 @@ fn consumerTests() type {
             try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &after_limit, &.{});
             try std.testing.expectEqual(@as(u64, 12), apply_sm.appliedIndex(group_id));
             const rejected = apply_sm.takeApplyOutcome(group_id, 10).?;
+            try std.testing.expectEqual(.failed, std.meta.activeTag(rejected));
             try std.testing.expectEqual(error.TransactionTooLarge, rejected.failed.toError());
             try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 11).?);
             try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 12).?);
@@ -39200,7 +39444,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u64, 12), groups[0].doc_count);
         }
 
-        test "data runtime status refresh publishes synthetic missing status for absent local group db" {
+        test "data runtime status refresh uses control metadata to publish synthetic missing status" {
             const alloc = std.testing.allocator;
 
             var tmp = std.testing.tmpDir(.{});
@@ -39216,13 +39460,22 @@ fn consumerTests() type {
                         .ptr = undefined,
                         .vtable = &.{
                             .status = status,
-                            .admin_snapshot = adminSnapshot,
+                            .admin_snapshot = rejectDiagnosticSnapshot,
+                            .cached_admin_snapshot = cachedControlSnapshot,
                             .free_admin_snapshot = freeAdminSnapshot,
                             .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
                             .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
                             .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                         },
                     };
+                }
+
+                fn rejectDiagnosticSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+                    return error.UnexpectedDiagnosticSnapshot;
+                }
+
+                fn cachedControlSnapshot(ptr: *anyopaque) !?antfly.metadata_api.AdminSnapshot {
+                    return try adminSnapshot(ptr);
                 }
 
                 fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
@@ -39967,7 +40220,7 @@ fn consumerTests() type {
                 .read_source = undefined,
                 .write_source = undefined,
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .limited(8),
                 .listener_cfg = undefined,
             };
@@ -41412,6 +41665,8 @@ fn consumerTests() type {
             try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_raft_writer_unavailable_logs_suppressed_total 7") != null);
             try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_api_first_request_elapsed_ms") != null);
             try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_hits_total 0") != null);
+            try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lake_cache_disk_ready 0") != null);
+            try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lake_query_hydration_calls_total 0") != null);
             try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_coalesced_waiters_total 0") != null);
             try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_uncached_computations_total 0") != null);
             try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_producer_compute_ns_total 0") != null);
@@ -43972,6 +44227,15 @@ fn consumerTests() type {
             try std.testing.expect(DataServer.hot_standby_replication_default_apply_window_ns <= std.time.ns_per_s);
         }
 
+        test "data runtime publication proof yields without transport failure backoff" {
+            try std.testing.expect(isCooperativeHotStandbyStandbyReplicationRound(error.CatalogPublicationProofPending));
+            try std.testing.expect(isCooperativeHotStandbyStandbyReplicationRound(error.HAStandbyStateChanged));
+            try std.testing.expect(isCooperativeHotStandbyStandbyReplicationRound(error.HAStandbyNotConfigured));
+            try std.testing.expect(!isCooperativeHotStandbyStandbyReplicationRound(error.InvalidCatalogRecord));
+            try std.testing.expect(!isCooperativeHotStandbyStandbyReplicationRound(error.ConnectionResetByPeer));
+            try std.testing.expect(!isCooperativeHotStandbyStandbyReplicationRound(error.InternalReplicationDidNotAdvance));
+        }
+
         test "data runtime HA apply window does not report caught up with pending or deferred WAL" {
             const caught_up = antfly.hot_standby.standby.Progress{
                 .received_lsn = 10,
@@ -46446,7 +46710,7 @@ fn consumerTests() type {
                     antfly.public_api.table_catalog.emptyCatalogSource(),
                 ),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .nothing,
                 .listener_cfg = undefined,
             };
@@ -46797,7 +47061,7 @@ fn implementationTests() type {
                     FakeCatalog.iface(),
                 ),
                 .status_source = FakeStatus.iface(),
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .limited(8),
                 .listener_cfg = undefined,
             };
@@ -47602,7 +47866,7 @@ fn implementationTests() type {
                 .read_source = antfly.public_api.ProvisionedTableReadSource.init("/tmp/unused-upload-handoff", antfly.public_api.table_catalog.emptyCatalogSource(), antfly.raft.read_gate.alreadyReadSafeBarrier()),
                 .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-upload-handoff", antfly.public_api.table_catalog.emptyCatalogSource()),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .nothing,
                 .listener_cfg = undefined,
             };
@@ -47708,7 +47972,7 @@ fn implementationTests() type {
                 .read_source = antfly.public_api.ProvisionedTableReadSource.init("/tmp/unused-ttl-admission", antfly.public_api.table_catalog.emptyCatalogSource(), antfly.raft.read_gate.alreadyReadSafeBarrier()),
                 .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-ttl-admission", antfly.public_api.table_catalog.emptyCatalogSource()),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .nothing,
                 .listener_cfg = undefined,
             };
@@ -48044,7 +48308,7 @@ fn implementationTests() type {
                         antfly.public_api.table_catalog.emptyCatalogSource(),
                     ),
                     .status_source = undefined,
-                    .api_server_cfg = undefined,
+                    .api_server_cfg = .{},
                     .query_async_limit = .limited(8),
                     .work_cost_port = .{ .ptr = &attempts, .charge_fn = Attempts.charge },
                     .listener_cfg = undefined,
@@ -48271,7 +48535,7 @@ fn implementationTests() type {
                     antfly.public_api.table_catalog.emptyCatalogSource(),
                 ),
                 .status_source = remote_metadata.statusSource(),
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .limited(8),
                 .backend_runtime = backend_runtime.ptr(),
                 .listener_cfg = undefined,
@@ -49001,7 +49265,7 @@ fn implementationTests() type {
                     antfly.public_api.table_catalog.emptyCatalogSource(),
                 ),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .limited(8),
                 .work_cost_port = adapter.iface(),
                 .listener_cfg = undefined,
@@ -56179,7 +56443,7 @@ fn implementationTests() type {
                     FakeCatalog.iface(),
                 ),
                 .status_source = FakeStatus.iface(),
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .limited(8),
                 .listener_cfg = undefined,
             };
@@ -56281,4 +56545,14 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "grouped source protocol dominates coexisting graph envelope features" {
+    const protocol = @import("../common/data_raft_protocol.zig");
+    const request: antfly.db.types.BatchRequest = .{ .artifact_catalog = .{
+        .namespace = @splat(1),
+        .catalogs = .{},
+        .binding = .{ .epoch = 1, .digest = @splat(2), .semantic_digest = @splat(3), .effect_protocol = 16 },
+    }, .graph_endpoint_cleanup = true };
+    try std.testing.expectEqual(protocol.batch_group_source_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
 }

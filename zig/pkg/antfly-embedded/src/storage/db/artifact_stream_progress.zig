@@ -475,6 +475,32 @@ test "ordered artifact inventory authored vectors close provider scope without r
             try std.testing.expect(!try token.accepted(&read));
             try std.testing.expectError(error.ArtifactPublicationPending, prepareDocumentClosure(alloc, &read, db.root_incarnation, request, pin.plan()));
         }
+        // A request planned before a newer durable reprocess must not bind
+        // itself to that newer input snapshot and suppress the newer work.
+        const intent = @import("artifact_reprocess_intent.zig");
+        const intent_key = try intent.embeddingKeyAlloc(alloc, request.doc_key, @import("enrichment/enrichment_types.zig").requestEmbeddingName(request));
+        defer alloc.free(intent_key);
+        var old_snapshot = try db.core.store.beginReadTxn();
+        defer old_snapshot.abort();
+        const generation = intent.encode(request.producer_json, 1);
+        try db.core.store.put(intent_key, &generation);
+        {
+            // A pinned older view remains self-consistent. Ordered apply
+            // separately fences results if the primary input revision changes.
+            var old = (try input.capture(alloc, &old_snapshot, db.root_incarnation, request, pin.plan(), primary, raw, null)).?;
+            defer old.deinit();
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectError(error.EnrichmentSourceChanged, input.capture(alloc, &read, db.root_incarnation, request, pin.plan(), primary, raw, null));
+            request.reprocess_generation = 1;
+            var current = (try input.capture(alloc, &read, db.root_incarnation, request, pin.plan(), primary, raw, null)).?;
+            defer current.deinit();
+            // Reprocess state is document-owned, not a catalog mutation.
+            try std.testing.expect(try input.authorizeDocument(alloc, &read, request, pin.plan()) != null);
+            var canonical = request;
+            canonical.reprocess_generation = 0;
+            try std.testing.expect(try input.authorizeDocument(alloc, &read, canonical, pin.plan()) != null);
+        }
     }
 }
 

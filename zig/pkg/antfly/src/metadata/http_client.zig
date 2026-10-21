@@ -1178,7 +1178,7 @@ pub const MetadataHttpClient = struct {
                 error.CatalogGenerationChanged,
             413 => error.CatalogCommandTooLarge,
             426 => error.TableTopologyProtocolUpgradeRequired,
-            503 => error.NotLeader,
+            503 => if (std.mem.eql(u8, response.body, "CatalogPublicationProofPending")) error.CatalogPublicationProofPending else error.NotLeader,
             else => error.RemoteUnavailable,
         };
         const group = responseHeader(response, "x-antfly-catalog-metadata-group") orelse return error.MetadataIncarnationUnavailable;
@@ -1231,7 +1231,13 @@ pub const MetadataHttpClient = struct {
                 error.InvalidCatalogMutation,
             403 => error.Forbidden,
             404 => error.CatalogNotFound,
-            409 => if ((input == .store_root_enroll or input == .store_root_enrollment_status) and std.mem.eql(u8, response.body, "StoreRootEnrollmentChanged"))
+            405 => if ((input == .relation_replace or input == .relation_schema_mutate) and std.mem.eql(u8, response.body, "ExtensionOwnedObject"))
+                error.ExtensionOwnedObject
+            else
+                error.TableTopologyProtocolUpgradeRequired,
+            409 => if (std.mem.eql(u8, response.body, "ResolverCurationConflict"))
+                error.ResolverCurationConflict
+            else if ((input == .store_root_enroll or input == .store_root_enrollment_status) and std.mem.eql(u8, response.body, "StoreRootEnrollmentChanged"))
                 error.StoreRootEnrollmentChanged
             else
                 error.CatalogGenerationChanged,
@@ -1382,11 +1388,15 @@ pub const MetadataHttpClient = struct {
                 .group_ids = try self.alloc.alloc(u64, 0),
             };
         }
+        // Status text alone cannot certify rejection after possible admission.
+        if (outcome != .not_proposed) return error.MetadataMutationOutcomeUnknown;
         return switch (resp.status) {
             400 => if (kind == .create_table) error.InvalidCreateTableRequest else error.InvalidTableName,
             404 => error.TableNotFound,
             405 => error.UnsupportedOperation,
-            409 => if (kind == .create_table)
+            409 => if (std.mem.eql(u8, resp.body, "ResolverCurationConflict"))
+                error.ResolverCurationConflict
+            else if (kind == .create_table)
                 error.TableAlreadyExists
             else if (responseHeader(resp, routes.Routes.table_mutation_error_header)) |value|
                 if (std.mem.eql(u8, value, routes.Routes.table_mutation_error_extension_owned))
@@ -3363,6 +3373,7 @@ fn consumerTests() type {
                 header_value: []const u8,
                 outcome_value: []const u8,
                 status: u16 = 503,
+                response_body: []const u8 = "metadata authority unavailable",
                 attempts: usize = 0,
 
                 fn ownedHeader(
@@ -3399,7 +3410,7 @@ fn consumerTests() type {
                         self.outcome_value,
                     );
                     initialized += 1;
-                    const body = try alloc.dupe(u8, "metadata authority unavailable");
+                    const body = try alloc.dupe(u8, self.response_body);
                     return .{ .status = self.status, .headers = headers, .body = body };
                 }
             };
@@ -3456,6 +3467,21 @@ fn consumerTests() type {
                 topology_too_large_client.dropTableForwarded("http://127.0.0.1:9000", "docs"),
             );
             try std.testing.expectEqual(@as(usize, 1), topology_too_large.attempts);
+            for ([_][]const u8{ routes.Routes.raft_mutation_outcome_not_proposed, routes.Routes.raft_mutation_outcome_unknown, routes.Routes.raft_mutation_outcome_committed }) |outcome| {
+                var conflict = RejectingExecutor{
+                    .header_name = "Retry-After",
+                    .header_value = "0",
+                    .outcome_value = outcome,
+                    .status = 409,
+                    .response_body = "ResolverCurationConflict",
+                };
+                var conflict_client = MetadataHttpClient.init(std.testing.allocator, conflict.executor());
+                try std.testing.expectError(
+                    if (std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_not_proposed)) error.ResolverCurationConflict else error.MetadataMutationOutcomeUnknown,
+                    conflict_client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
+                );
+                try std.testing.expectEqual(@as(usize, 1), conflict.attempts);
+            }
             // The new proof is distinct from non-admission. Incompatible status or
             // unknown outcomes must not authorize a replay, including a success code.
             for ([_]u16{ 200, 409, 500, 503 }) |status| {
@@ -4463,6 +4489,7 @@ test "system catalog direct read carries identity and deadline without a discove
     const Executor = struct {
         calls: usize = 0,
         valid_identity: bool = true,
+        unavailable_body: ?[]const u8 = null,
         fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
@@ -4473,7 +4500,7 @@ test "system catalog direct read carries identity and deadline without a discove
             const headers = try a.alloc(http_common.Header, 2);
             headers[0] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-group"), .value = try a.dupe(u8, "9") };
             headers[1] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-incarnation"), .value = try a.dupe(u8, if (self.valid_identity) "11111111111111111111111111111111" else "invalid") };
-            return .{ .status = 200, .headers = headers, .body = try a.dupe(u8, "null") };
+            return .{ .status = if (self.unavailable_body == null) 200 else 503, .headers = headers, .body = try a.dupe(u8, self.unavailable_body orelse "null") };
         }
     };
     var executor = Executor{};
@@ -4489,6 +4516,11 @@ test "system catalog direct read carries identity and deadline without a discove
     try std.testing.expectError(error.Timeout, client.readSystemCatalog("http://metadata.invalid", .snapshot, 0, null));
     try std.testing.expectError(error.InvalidCatalogMutation, client.readSystemCatalog("http://metadata.invalid", .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .database, .name = "denied" } } }, 25, null));
     try std.testing.expectEqual(@as(usize, 2), executor.calls);
+    executor.unavailable_body = "CatalogPublicationProofPending";
+    try std.testing.expectError(error.CatalogPublicationProofPending, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
+    executor.unavailable_body = "NotLeader";
+    try std.testing.expectError(error.NotLeader, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
+    try std.testing.expectEqual(@as(usize, 4), executor.calls);
 }
 
 test "store-root enrollment status is a body-bound admin read and preserves absent identity" {
@@ -4512,6 +4544,53 @@ test "store-root enrollment status is a body-bound admin read and preserves abse
         .public_key = @splat(1),
     };
     try std.testing.expectError(error.StoreRootEnrollmentChanged, client.readSystemCatalog("http://metadata.invalid", .{ .store_root_enrollment_status = identity }, 25, null));
+}
+
+test "system catalog relation replacement preserves private grants and definitive ownership rejection" {
+    const alloc = std.testing.allocator;
+    const authority = @import("../system_catalog/setting_authority.zig");
+    const Executor = struct {
+        outcome: []const u8 = routes.Routes.raft_mutation_outcome_not_proposed,
+        response_status: u16 = 405,
+        response_body: []const u8 = "ExtensionOwnedObject",
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try authority.verify("relation-admin-secret", "relation-admin-issuer", .admin, request.body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)), request.header(authority.header_name) orelse return error.TestUnexpectedResult);
+            const body = try a.dupe(u8, self.response_body);
+            errdefer a.free(body);
+            const headers = try a.alloc(http_common.Header, 1);
+            errdefer a.free(headers);
+            const name = try a.dupe(u8, routes.Routes.raft_mutation_outcome_header);
+            errdefer a.free(name);
+            headers[0] = .{ .name = name, .value = try a.dupe(u8, self.outcome) };
+            return .{ .status = self.response_status, .body = body, .headers = headers };
+        }
+    };
+    var executor: Executor = .{};
+    var client = MetadataHttpClient.init(alloc, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    _ = client.withSettingAuthority("relation-admin-secret", "relation-admin-issuer");
+    const table: @import("table_manager.zig").TableRecord = .{ .table_id = 7, .name = "physical" };
+    const call: @import("../system_catalog/server_call.zig").Call = .{ .relation_replace = .{
+        .guard = .{ .target = .{ .name = "idx" }, .logical_table = "logical", .owner = .{ .table_id = 7, .schema_version = 1, .schema_digest = @splat(1), .kind = .index }, .incarnation = @splat(1) },
+        .expected = table,
+        .replacement = table,
+    } };
+    const forwarding: raft_mutation_forwarding.Context = .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true };
+    try std.testing.expectError(error.Forbidden, client.forwardSystemCatalog("http://metadata.invalid", call, forwarding, false));
+    try std.testing.expectError(error.InvalidCatalogMutation, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
+    try std.testing.expectError(error.ExtensionOwnedObject, client.forwardSystemCatalog("http://metadata.invalid", call, forwarding, true));
+    executor.outcome = routes.Routes.raft_mutation_outcome_unknown;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.forwardSystemCatalog("http://metadata.invalid", call, forwarding, true));
+    executor.outcome = routes.Routes.raft_mutation_outcome_not_proposed;
+    executor.response_status = 409;
+    executor.response_body = "ResolverCurationConflict";
+    try std.testing.expectError(error.ResolverCurationConflict, client.forwardSystemCatalog("http://metadata.invalid", call, forwarding, true));
+    executor.outcome = routes.Routes.raft_mutation_outcome_unknown;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.forwardSystemCatalog("http://metadata.invalid", call, forwarding, true));
+    try std.testing.expectEqual(@as(u16, 409), system_catalog.httpStatus(error.ResolverCurationConflict));
+    try std.testing.expectEqual(@as(u16, 405), system_catalog.httpStatus(error.ExtensionOwnedObject));
+    try std.testing.expectEqual(@as(u16, 426), system_catalog.httpStatus(error.TableTopologyUpgradeRequired));
+    try std.testing.expectEqual(@as(u16, 503), system_catalog.httpStatus(error.CatalogPublicationProofPending));
 }
 
 test "system catalog policy publication status preserves explicit absence without reclassifying policy conflicts" {

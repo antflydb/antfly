@@ -340,7 +340,7 @@ test "gliner boundary v2 pinned small HTTP handler qualification and atomic reco
         // request lease. Native CPU execution itself remains cooperative.
         {
             const control = Control{ .io = std.testing.io, .hard_cancellation = node.hard_cancellation_watchdog.?.boundary(), .deadline_ns = platform.time.monotonicNs() + 180 * std.time.ns_per_s };
-            var guard = try control.enterUninterruptible(.process_required);
+            var guard = try control.enterUninterruptible(.uninterruptible);
             guard.deinit();
             _ = try idle(&node);
         }
@@ -631,24 +631,15 @@ fn throughputCorpusShape(backend: enum { auto, native, metal }, environment: [:0
     try std.testing.expectEqual(@as(usize, 0), errors);
 }
 
-// Slices out the section starting at `heading` and running to the next
-// Markdown heading line or end of file. Mirrors the section boundaries
-// examples/dogfood's docsaf.MarkdownProcessor produces (a new section at
-// every heading), duplicated locally (rather than imported from
-// extractors/gliner_boundary_qualification.zig) to avoid a cross-package
-// test-only dependency from server/ into extractors/.
-fn extractHeadingSection(full: []const u8, heading: []const u8) ![]const u8 {
-    const start = std.mem.indexOf(u8, full, heading) orelse return error.MissingFixtureSection;
-    var end = full.len;
-    var cursor = start + heading.len;
-    while (cursor + 1 < full.len) : (cursor += 1) {
-        if (full[cursor] == '\n' and full[cursor + 1] == '#') {
-            end = cursor;
-            break;
-        }
-    }
-    return full[start..end];
-}
+// Long-document probe inputs: frozen, byte-for-byte snapshots (at commit
+// 3ce5aff4ea) of two real design-doc sections, cut exactly as examples/dogfood's
+// docsaf.MarkdownProcessor would cut them (from the heading line up to, but
+// excluding, the next line starting with '#'). Frozen as fixtures so editing
+// or slimming zig/VOPR.md and zig/PDF.md never changes these tests' inputs.
+// Paths are relative to the inference-test binary's working directory
+// (zig/pkg/inference, per zig/TESTING.md's build steps).
+const vopr_completion_claim_audit_fixture = "testdata/gliner25/long_document_probe/vopr_completion_claim_audit.txt";
+const pdf_review_findings_fixture = "testdata/gliner25/long_document_probe/pdf_review_findings.txt";
 
 // Resolves an `ANTFLY_GLINER25_*_MODEL_DIR`-style environment variable to a
 // `Node.init`-ready `models_dir`/model `name` pair, so the long-document
@@ -721,7 +712,7 @@ fn longExecutorHttpCanonicalShape(metal: bool, environment: [:0]const u8) !void 
         .max_loaded_models = 1,
         .max_concurrent_requests = 1,
         // Metal is a process-required backend (backends.zig's
-        // requiresProcessIsolation); ModelManager refuses to close/reopen
+        // hasUninterruptibleCalls); ModelManager refuses to close/reopen
         // such a session unless the harness opts in here (mirrors
         // gliner_boundary_metal_socket_test.zig's Node.init config).
         .process_termination_available = true,
@@ -736,11 +727,9 @@ fn longExecutorHttpCanonicalShape(metal: bool, environment: [:0]const u8) !void 
     }
     try node.attachIo(std.testing.io);
 
-    // Path relative to the inference-test binary's working directory
-    // (zig/pkg/inference, per zig/TESTING.md's build steps).
-    const full = try @import("../util/c_file.zig").readFile(a, "../../VOPR.md");
-    defer a.free(full);
-    const section = try extractHeadingSection(full, "### Completion-Claim Audit");
+    // Frozen snapshot of zig/VOPR.md's "Completion-Claim Audit" section.
+    const section = try @import("../util/c_file.zig").readFile(a, vopr_completion_claim_audit_fixture);
+    defer a.free(section);
 
     const schema_source =
         \\{"entities":["component","subsystem","file","test","invariant","decision","person","model","backend","format","protocol"],"relations":[{"type":"depends_on"},{"type":"owns"},{"type":"implements"},{"type":"supersedes"},{"type":"tested_by"},{"type":"documented_in"}]}
@@ -909,9 +898,10 @@ fn longExecutorProviderCanonicalShape(metal: bool, environment: [:0]const u8) !v
 }
 
 // Corpus-maximum-scale companion to the two windowed tests above: zig/PDF.md's
-// "Review findings and required fixes" is the largest single section
-// examples/dogfood's real docsaf.MarkdownProcessor splitting currently
-// produces across the whole ingest corpus (measured directly in
+// "Review findings and required fixes" (frozen as
+// testdata/gliner25/long_document_probe/pdf_review_findings.txt at commit
+// 3ce5aff4ea) was the largest single section
+// examples/dogfood's real docsaf.MarkdownProcessor splitting produced across the whole ingest corpus (measured directly in
 // extractors/gliner_boundary_qualification.zig's long-document geometry
 // test: ~92KB body, 15 windows at the wire's 1024-word default), so this
 // exercises the merge path at real production scale through both entries a
@@ -941,11 +931,9 @@ fn corpusMaximumHttpCanonicalShape(environment: [:0]const u8) !void {
     useNativeBackend(&node);
     try node.attachIo(std.testing.io);
 
-    // Path relative to the inference-test binary's working directory
-    // (zig/pkg/inference, per zig/TESTING.md's build steps).
-    const full = try @import("../util/c_file.zig").readFile(a, "../../PDF.md");
-    defer a.free(full);
-    const section = try extractHeadingSection(full, "## Review findings and required fixes");
+    // Frozen snapshot of zig/PDF.md's "Review findings and required fixes".
+    const section = try @import("../util/c_file.zig").readFile(a, pdf_review_findings_fixture);
+    defer a.free(section);
     try std.testing.expect(section.len > 90000);
 
     const schema_source =
@@ -1027,9 +1015,9 @@ fn corpusMaximumProviderCanonicalShape(environment: [:0]const u8) !void {
     useNativeBackend(&node);
     try node.attachIo(std.testing.io);
 
-    const full = try @import("../util/c_file.zig").readFile(a, "../../PDF.md");
-    defer a.free(full);
-    const section = try extractHeadingSection(full, "## Review findings and required fixes");
+    // Frozen snapshot of zig/PDF.md's "Review findings and required fixes".
+    const section = try @import("../util/c_file.zig").readFile(a, pdf_review_findings_fixture);
+    defer a.free(section);
     try std.testing.expect(section.len > 90000);
     const content_json = try std.json.Stringify.valueAlloc(a, section, .{});
     defer a.free(content_json);
@@ -1146,7 +1134,8 @@ fn corpusMinimumProviderShape(metal: bool, environment: [:0]const u8) !void {
 // fp32-vs-fp16_encoder numerical parity through the long executor, on the
 // SAME real documents the correctness/shape tests above exercise (not a
 // synthetic fixture): the 37KB VOPR.md multi-window document, the ~99KB
-// PDF.md corpus-maximum section, and both corpus-minimum documents. Unlike
+// PDF.md corpus-maximum section (both frozen snapshots at commit 3ce5aff4ea under
+// testdata/gliner25/long_document_probe/), and both corpus-minimum documents. Unlike
 // the shape tests, this compares the two precisions' outputs to each other
 // directly -- every entity/relation decision (label, text, span, and which
 // window-merge outcome won) must be byte-identical, and every confidence
@@ -1365,12 +1354,10 @@ fn longDocumentPrecisionParity(metal: bool) !void {
         \\{"include_confidence":true,"include_spans":true,"long_document":{"mode":"window"}}
     ;
 
-    const vopr_full = try @import("../util/c_file.zig").readFile(a, "../../VOPR.md");
-    defer a.free(vopr_full);
-    const vopr_section = try extractHeadingSection(vopr_full, "### Completion-Claim Audit");
-    const pdf_full = try @import("../util/c_file.zig").readFile(a, "../../PDF.md");
-    defer a.free(pdf_full);
-    const pdf_section = try extractHeadingSection(pdf_full, "## Review findings and required fixes");
+    const vopr_section = try @import("../util/c_file.zig").readFile(a, vopr_completion_claim_audit_fixture);
+    defer a.free(vopr_section);
+    const pdf_section = try @import("../util/c_file.zig").readFile(a, pdf_review_findings_fixture);
+    defer a.free(pdf_section);
     try std.testing.expect(pdf_section.len > 90000);
 
     const documents = [_]LongDocumentCase{

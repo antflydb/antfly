@@ -49,6 +49,11 @@ pub const AntflyRootImports = struct {
     inference_runtime_paths: *std.Build.Module,
     inference_query_embedding_cache: *std.Build.Module,
     inference_host: *std.Build.Module,
+    inference_engine: *std.Build.Module,
+    shared_inference_core: bool = false,
+    darwin_release_memory: bool = false,
+    darwin_shared_storage_sdk27: bool = false,
+    sanitize_thread: bool = false,
     boundary_profile: @import("../embedded/storage_boundary.zig").Profile = .all,
     build_info: @import("../../lib/build_info/build_support.zig").BuildInfo,
     build_options: *std.Build.Step.Options,
@@ -106,8 +111,10 @@ pub const AntflyRootImports = struct {
     casbin: *std.Build.Module,
     fst: *std.Build.Module,
     regex: *std.Build.Module,
+    sql_regex: *std.Build.Module,
     json: *std.Build.Module,
     jsonschema: *std.Build.Module,
+    structured: *std.Build.Module,
     mcp: *std.Build.Module,
     toon: *std.Build.Module,
     a2a: *std.Build.Module,
@@ -184,8 +191,10 @@ pub const AntflyRootImports = struct {
         .{ .name = "antfly_casbin", .field = "casbin" },
         .{ .name = "antfly_fst", .field = "fst" },
         .{ .name = "antfly_regex", .field = "regex" },
+        .{ .name = "antfly_sql_regex", .field = "sql_regex" },
         .{ .name = "antfly-json", .field = "json" },
         .{ .name = "antfly_jsonschema", .field = "jsonschema" },
+        .{ .name = "antfly_structured", .field = "structured" },
         .{ .name = "antfly_mcp", .field = "mcp" },
         .{ .name = "antfly_toon", .field = "toon" },
         .{ .name = "antfly_a2a", .field = "a2a" },
@@ -212,6 +221,7 @@ pub const AntflyRootImports = struct {
         // archives use the owner constructors below to keep caches independent.
         self.configureBase(mod, link_libc);
         mod.addImport("antfly_inference_host", self.inference_host);
+        mod.addImport("antfly_inference_engine", self.inference_engine);
         self.configureServerContracts(mod);
         mod.addImport("antfly_lite_options", self.lite_options);
         inline for (import_table) |entry| mod.addImport(entry.name, @field(self, entry.field));
@@ -269,6 +279,7 @@ pub const AntflyRootImports = struct {
         mod.addImport("antfly_inference_runtime_paths", self.inference_runtime_paths);
         mod.addImport("antfly_inference_query_embedding_cache", self.inference_query_embedding_cache);
         mod.addImport("antfly_inference_host", self.inference_host);
+        mod.addImport("antfly_inference_engine", self.inference_engine);
         inline for (.{
             "httpx",              "common_openapi",  "inference_config_openapi", "logging_openapi",
             "middleware_openapi", "scraping",        "scraping_openapi",         "s3_openapi",
@@ -277,7 +288,7 @@ pub const AntflyRootImports = struct {
             "reranking",          "chunking",        "json",                     "handlebars",
             "openai_api",         "indexes_openapi", "embeddings_openapi",       "embeddings",
             "inference_chunker",  "vector",          "structlog",                "hash",
-            "image",
+            "image",              "structured",
         }) |field| self.addImport(mod, field);
         mod.link_libc = link_libc;
     }
@@ -298,26 +309,28 @@ pub const AntflyRootImports = struct {
     fn configureDatabase(self: @This(), mod: *std.Build.Module, link_libc: bool) void {
         self.configureBase(mod, link_libc);
         inline for (.{
-            "bloom",          "chunking",           "common_openapi",    "credentials",
-            "embeddings",     "embeddings_openapi", "extracting",        "generating",
-            "google",         "handlebars",         "hash",              "httpx",
-            "image",          "indexes_openapi",    "inference_chunker", "inference_api",
-            "json",           "logging_openapi",    "metadata_openapi",  "objectstore",
-            "openai_api",     "pdf",                "query_openapi",     "reader_config",
-            "readers",        "regex",              "reranking",         "scraping",
-            "synthesizing",   "transcribing",       "vector",            "fst",
-            "schema_openapi",
+            "bloom",            "chunking",           "common_openapi",    "credentials",
+            "embeddings",       "embeddings_openapi", "extracting",        "generating",
+            "google",           "handlebars",         "hash",              "httpx",
+            "image",            "indexes_openapi",    "inference_chunker", "inference_api",
+            "json",             "jsonschema",         "structured",        "logging_openapi",
+            "metadata_openapi", "objectstore",        "openai_api",        "pdf",
+            "query_openapi",    "reader_config",      "readers",           "regex",
+            "reranking",        "scraping",           "synthesizing",      "transcribing",
+            "vector",           "fst",                "schema_openapi",    "sql_regex",
+            "resolver",
         }) |field| self.addImport(mod, field);
     }
 
     const storage_imports = .{
         "admin_openapi",            "casbin",           "extraction_openapi",
         "inference_config_openapi", "internal_openapi", "matcher",
-        "middleware_openapi",       "raft_engine",      "resolver",
-        "s3_openapi",               "scraping_openapi", "vectorindex",
+        "middleware_openapi",       "raft_engine",      "s3_openapi",
+        "scraping_openapi",         "vectorindex",
     };
     const api_imports = .{
         "inference_api",
+        "extraction_openapi",
         "exa_api",
         "tavily_api",
         "websearch_openapi",
@@ -341,16 +354,16 @@ pub const AntflyRootImports = struct {
     const object_runtime_imports = .{
         "inference_api", "inference_config_openapi", "middleware_openapi",
         "s3_openapi",    "scraping_openapi",         "vectorindex",
-        "matcher",
+        "matcher",       "resolver",
     };
 
     /// Public local C API: no server provisioning, quorum observer, or routers.
     pub fn configureEmbedded(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
         self.configureDatabase(mod, link_libc);
         inline for (.{
-            "casbin",     "extraction_openapi", "inference_config_openapi",
-            "matcher",    "middleware_openapi", "resolver",
-            "s3_openapi", "scraping_openapi",   "vectorindex",
+            "casbin",           "extraction_openapi", "inference_config_openapi",
+            "matcher",          "middleware_openapi", "s3_openapi",
+            "scraping_openapi", "vectorindex",
         }) |field| self.addImport(mod, field);
         mod.addImport("antfly_lite_options", self.lite_options);
         mod.addImport("antfly_font", self.font);
@@ -380,7 +393,10 @@ pub const AntflyRootImports = struct {
         mod.addOptions("build_options", options);
         // Document/media compute has no physical storage handle, including in
         // the independently compiled public embedded enrichment archive.
-        self.storage_boundary.configureProfile(mod, true, false, self.boundary_profile);
+        // This constructor also builds the shared embedded compute archive,
+        // whose caller may carry the default full storage profile. Declare
+        // only compute contracts so storage ABI edits cannot invalidate it.
+        self.storage_boundary.configureProfile(mod, true, false, .enrichment);
         mod.addImport("antfly_platform", self.platform);
         mod.addImport("antfly_cancellation", self.cancellation);
         mod.addImport("antfly_template_content", self.template_content);
@@ -401,6 +417,7 @@ pub const AntflyRootImports = struct {
     }
 
     pub fn configureServerless(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
+        mod.addImport("antfly_resolver", self.resolver);
         self.configureDatabase(mod, link_libc);
         mod.addImport("antfly_provision_contract", self.provision_contract);
         inline for (object_runtime_imports) |field| self.addImport(mod, field);
@@ -410,6 +427,7 @@ pub const AntflyRootImports = struct {
     /// This driver exercises storage and HTTP API implementations in one root.
     pub fn configureStorageBenchmark(self: @This(), b: *std.Build, mod: *std.Build.Module) void {
         mod.addImport("antfly_inference_host", self.inference_host);
+        mod.addImport("antfly_inference_engine", self.inference_engine);
         self.configureStorageDependencies(b, mod, true);
         inline for (api_imports) |field| self.addImport(mod, field);
         mod.addImport("antfly_openapi_specs", self.embedded_openapi);

@@ -267,6 +267,16 @@ fn hashRelationalCellCanonical(
         return;
     }
     switch (column.column_type) {
+        .numeric => {
+            hasher.update("N");
+            const view = try @import("../../common/sql_numeric_layout.zig").View.openAuthenticated(cell.value.bytes_val, .{});
+            view.updateLogicalHash(hasher);
+        },
+        .sql_array => {
+            const kind = column.sql_element_type orelse return error.InvalidBatchRequest;
+            const view = try @import("../../common/sql_array_layout.zig").View.openAuthenticated(kind, cell.value.bytes_val, .{});
+            view.updateLogicalHash(hasher);
+        },
         .string, .blob, .geoshape => {
             hasher.update("s");
             hashBytes(hasher, cell.value.bytes_val);
@@ -308,37 +318,110 @@ fn hashCanonicalJsonBytes(hasher: *std.crypto.hash.Blake3, encoded: []const u8) 
 pub fn canonicalJsonValueAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(alloc);
     errdefer writer.deinit();
-    try writeCanonicalJsonValue(alloc, &writer.writer, value);
+    // This writer only targets an allocating memory buffer, never external IO.
+    // Preserve allocation-failure semantics for callers' quota/fault handling.
+    writeCanonicalJsonValue(alloc, &writer.writer, value) catch |err| return switch (err) {
+        error.WriteFailed => error.OutOfMemory,
+        else => err,
+    };
     return try writer.toOwnedSlice();
 }
 
+/// Heap-backed traversal preserves canonical bytes without consuming the call
+/// stack for nested documents or forward-compatible configuration fields.
 fn writeCanonicalJsonValue(alloc: std.mem.Allocator, writer: *std.Io.Writer, value: std.json.Value) !void {
+    const Frame = union(enum) {
+        array: struct { items: []const std.json.Value, index: usize = 0 },
+        object: struct { map: std.json.ObjectMap, keys: [][]const u8, index: usize = 0 },
+    };
+    // Most canonical values are shallow. Keep their traversal frames inline,
+    // spilling to the caller's allocator only when nesting outgrows this buffer.
+    var inline_frames: [2048]u8 align(@alignOf(Frame)) = undefined;
+    var frame_allocator = std.heap.BufferFirstAllocator.init(&inline_frames, alloc);
+    const frame_alloc = frame_allocator.allocator();
+    var frames: std.ArrayListUnmanaged(Frame) = .empty;
+    defer {
+        for (frames.items) |frame| switch (frame) {
+            .object => |object| alloc.free(object.keys),
+            .array => {},
+        };
+        frames.deinit(frame_alloc);
+    }
+    var current: ?std.json.Value = value;
+    while (true) {
+        if (current) |node| {
+            current = null;
+            switch (node) {
+                .array => |array| {
+                    if (array.items.len == 0) {
+                        try writer.writeAll("[]");
+                    } else {
+                        try frames.append(frame_alloc, .{ .array = .{ .items = array.items } });
+                        try writer.writeByte('[');
+                    }
+                },
+                .object => |object| {
+                    if (object.count() == 0) {
+                        try writer.writeAll("{}");
+                    } else {
+                        const keys = try alloc.alloc([]const u8, object.count());
+                        @memcpy(keys, object.keys());
+                        std.mem.sort([]const u8, keys, {}, lessThanString);
+                        frames.append(frame_alloc, .{ .object = .{ .map = object, .keys = keys } }) catch |err| {
+                            alloc.free(keys);
+                            return err;
+                        };
+                        try writer.writeByte('{');
+                    }
+                },
+                else => try writeCanonicalJsonScalar(alloc, writer, node),
+            }
+            continue;
+        }
+        if (frames.items.len == 0) break;
+        switch (frames.items[frames.items.len - 1]) {
+            .array => |*array| {
+                if (array.index == array.items.len) {
+                    try writer.writeByte(']');
+                    _ = frames.pop();
+                } else {
+                    if (array.index > 0) try writer.writeByte(',');
+                    current = array.items[array.index];
+                    array.index += 1;
+                }
+            },
+            .object => |*object| {
+                if (object.index == object.keys.len) {
+                    try writer.writeByte('}');
+                    alloc.free(object.keys);
+                    _ = frames.pop();
+                } else {
+                    if (object.index > 0) try writer.writeByte(',');
+                    const key = object.keys[object.index];
+                    try std.json.Stringify.value(key, .{}, writer);
+                    try writer.writeByte(':');
+                    current = object.map.get(key).?;
+                    object.index += 1;
+                }
+            },
+        }
+    }
+}
+
+fn writeCanonicalJsonScalar(alloc: std.mem.Allocator, writer: *std.Io.Writer, value: std.json.Value) !void {
     switch (value) {
-        .array => |array| {
-            try writer.writeByte('[');
-            for (array.items, 0..) |item, index| {
-                if (index != 0) try writer.writeByte(',');
-                try writeCanonicalJsonValue(alloc, writer, item);
-            }
-            try writer.writeByte(']');
-        },
-        .object => |object| {
-            const keys = try alloc.alloc([]const u8, object.count());
-            defer alloc.free(keys);
-            var index: usize = 0;
-            var iterator = object.iterator();
-            while (iterator.next()) |entry| : (index += 1) keys[index] = entry.key_ptr.*;
-            std.mem.sort([]const u8, keys, {}, lessThanString);
-            try writer.writeByte('{');
-            for (keys, 0..) |key, key_index| {
-                if (key_index != 0) try writer.writeByte(',');
-                try std.json.Stringify.value(key, .{}, writer);
-                try writer.writeByte(':');
-                try writeCanonicalJsonValue(alloc, writer, object.get(key).?);
-            }
-            try writer.writeByte('}');
-        },
         .number_string => |number| try writeCanonicalJsonNumber(alloc, writer, number),
+        .float => |number| {
+            // The same logical JSONB value can arrive as a native float or
+            // an exact parsed number token. Normalize both with the identical
+            // decimal codec so encoding always passes strict restore checks.
+            const parts = try @import("../../common/json_float_decimal.zig").Parts.init(number);
+            var coefficient_buffer: [768]u8 = undefined;
+            const coefficient = try parts.coefficientText(&coefficient_buffer);
+            var buffer: [800]u8 = undefined;
+            const raw = std.fmt.bufPrint(&buffer, "{s}{s}e{d}", .{ if (parts.negative) "-" else "", coefficient, parts.decimalExponent() }) catch unreachable;
+            try writeCanonicalJsonNumber(alloc, writer, raw);
+        },
         else => try std.json.Stringify.value(value, .{}, writer),
     }
 }
@@ -596,6 +679,27 @@ fn hashRelationalColumnValue(
         return;
     }
     switch (column.column_type) {
+        .sql_array => {
+            const kind = column.sql_element_type orelse return error.InvalidBatchRequest;
+            var decoded = try @import("../../sql/array_wire.zig").decodeBorrowedWithModifier(alloc, kind, value, column.numeric_modifier, .{});
+            defer decoded.deinit();
+            const bytes = try @import("../../sql/array_storage.zig").encodeAlloc(alloc, decoded.value, .{});
+            defer alloc.free(bytes);
+            const view = try @import("../../common/sql_array_layout.zig").View.open(kind, bytes, .{});
+            view.updateLogicalHash(hasher);
+        },
+        .numeric => {
+            const numeric = @import("../../sql/numeric_value.zig");
+            var ctx: numeric.Context = .{ .alloc = alloc };
+            var parsed = try @import("../../sql/numeric_storage.zig").fromJson(&ctx, value);
+            defer parsed.deinit();
+            hasher.update("N");
+            if (column.numeric_modifier) |modifier| {
+                var constrained = try numeric.applyTypeModifier(&ctx, parsed.value, modifier);
+                defer constrained.deinit();
+                try numeric.hash(&ctx, constrained.value, hasher);
+            } else try numeric.hash(&ctx, parsed.value, hasher);
+        },
         .string, .blob, .geoshape => switch (value) {
             .string => |text| {
                 hasher.update("s");
@@ -826,6 +930,30 @@ test "canonical JSON normalizes equivalent number spellings losslessly" {
     try std.testing.expectEqualStrings("1e999999999999999999999", canonical_huge);
 }
 
+test "canonical JSON retains exact native float bytes across strict token decoding" {
+    const alloc = std.testing.allocator;
+    for ([_]struct { value: f64, expected: []const u8 }{
+        .{ .value = -0.0, .expected = "0" },
+        .{ .value = 0.5, .expected = "0.5" },
+        .{ .value = 0.1, .expected = "0.1000000000000000055511151231257827021181583404541015625" },
+        .{ .value = 1000000000000000128.0, .expected = "1000000000000000128" },
+    }) |case| {
+        const canonical = try canonicalJsonValueAlloc(alloc, .{ .float = case.value });
+        defer alloc.free(canonical);
+        try std.testing.expectEqualStrings(case.expected, canonical);
+    }
+    for ([_]f64{ @bitCast(@as(u64, 1)), -std.math.floatMin(f64), std.math.floatMax(f64) }) |value| {
+        const canonical = try canonicalJsonValueAlloc(alloc, .{ .float = value });
+        defer alloc.free(canonical);
+        var decoded = try std.json.parseFromSlice(std.json.Value, alloc, canonical, .{ .parse_numbers = false });
+        defer decoded.deinit();
+        const encoded = try canonicalJsonValueAlloc(alloc, decoded.value);
+        defer alloc.free(encoded);
+        try std.testing.expectEqualStrings(canonical, encoded);
+        try std.testing.expectEqual(@as(u64, @bitCast(value)), @as(u64, @bitCast(try std.fmt.parseFloat(f64, canonical))));
+    }
+}
+
 test "relational JSON semantic hash ignores number spelling" {
     const schema = runtime_schema.TableSchema{
         .version = 9,
@@ -844,4 +972,55 @@ test "relational JSON semantic hash ignores number spelling" {
     const left = try hashRelationalJson(std.testing.allocator, "{\"payload\":{\"n\":1}}", schema);
     const right = try hashRelationalJson(std.testing.allocator, "{\"payload\":{\"n\":1.0e0}}", schema);
     try std.testing.expectEqualSlices(u8, &left, &right);
+}
+
+test "canonical JSON iterative traversal preserves nested bytes and allocation cleanup" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"z\":1e0,\"a\":[{\"b\":2.0,\"a\":0.5},[],{},null,true,\"x\\n\"]}", .{ .parse_numbers = false });
+    defer parsed.deinit();
+    const Case = struct {
+        fn run(alloc: std.mem.Allocator, value: std.json.Value) !void {
+            const output = try canonicalJsonValueAlloc(alloc, value);
+            defer alloc.free(output);
+            try std.testing.expectEqualStrings("{\"a\":[{\"a\":0.5,\"b\":2},[],{},null,true,\"x\\n\"],\"z\":1}", output);
+        }
+    };
+    try Case.run(a, parsed.value);
+    try std.testing.checkAllAllocationFailures(a, Case.run, .{parsed.value});
+}
+
+test "canonical JSON deeply nested objects use heap frames" {
+    const a = std.testing.allocator;
+    const depth = 20000;
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    defer input.deinit(a);
+    for (0..depth) |_| try input.appendSlice(a, "{\"v\":");
+    try input.appendSlice(a, "null");
+    try input.appendNTimes(a, '}', depth);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, input.items, .{});
+    defer parsed.deinit();
+    const output = try canonicalJsonValueAlloc(a, parsed.value);
+    defer a.free(output);
+    try std.testing.expectEqualStrings(input.items, output);
+}
+
+test "canonical JSON spilled traversal frames release failed allocations" {
+    const a = std.testing.allocator;
+    const depth = 128;
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    defer input.deinit(a);
+    for (0..depth) |i| try input.appendSlice(a, if (i % 2 == 0) "[" else "{\"v\":");
+    try input.appendSlice(a, "null");
+    for (0..depth) |i| try input.append(a, if ((depth - i - 1) % 2 == 0) ']' else '}');
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, input.items, .{});
+    defer parsed.deinit();
+    const Case = struct {
+        fn run(alloc: std.mem.Allocator, value: std.json.Value, expected: []const u8) !void {
+            const output = try canonicalJsonValueAlloc(alloc, value);
+            defer alloc.free(output);
+            try std.testing.expectEqualStrings(expected, output);
+        }
+    };
+    try Case.run(a, parsed.value, input.items);
+    try std.testing.checkAllAllocationFailures(a, Case.run, .{ parsed.value, input.items });
 }

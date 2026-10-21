@@ -514,7 +514,7 @@ const Vp8MacroblockGrid = struct {
     height: u32,
 };
 
-const Vp8FramePlanes = struct {
+pub const Vp8FramePlanes = struct {
     y: []u8,
     u: []u8,
     v: []u8,
@@ -551,6 +551,9 @@ const Vp8MacroblockFilterInfo = struct {
     segment: u2 = 0,
     is_i4x4: bool = false,
     has_coeffs: bool = false,
+    reference: u2 = 0,
+    mode_delta: u2 = 0,
+    inter_frame: bool = false,
 };
 
 const Vp8LoopFilterParams = struct {
@@ -580,6 +583,7 @@ const Vp8EntropyHeader = struct {
 };
 
 const Vp8KeyframeControl = struct {
+    segment_map: ?[]u2 = null,
     syntax: Vp8FirstPartitionSyntax,
     entropy: Vp8EntropyHeader,
     mode_reader: Vp8BoolReader,
@@ -907,8 +911,8 @@ fn vp8LoopFilterParamsFor(syntax: Vp8FirstPartitionSyntax, info: Vp8MacroblockFi
     filter_level = vp8ClipFilterLevel(filter_level);
 
     if (syntax.loop_filter.use_lf_delta) {
-        filter_level += syntax.loop_filter.ref_lf_delta[0];
-        if (info.is_i4x4) filter_level += syntax.loop_filter.mode_lf_delta[0];
+        filter_level += syntax.loop_filter.ref_lf_delta[info.reference];
+        if (info.reference != 0 or info.is_i4x4) filter_level += syntax.loop_filter.mode_lf_delta[info.mode_delta];
     }
     filter_level = vp8ClipFilterLevel(filter_level);
 
@@ -921,6 +925,7 @@ fn vp8LoopFilterParamsFor(syntax: Vp8FirstPartitionSyntax, info: Vp8MacroblockFi
 
     var hev_threshold: i32 = if (filter_level >= 15) 1 else 0;
     if (filter_level >= 40) hev_threshold += 1;
+    if (info.inter_frame and filter_level >= 20) hev_threshold += 1;
 
     return .{
         .edge_limit = filter_level,
@@ -1126,13 +1131,13 @@ fn vp8ApplyLoopFilter(planes: *Vp8FramePlanes, syntax: Vp8FirstPartitionSyntax, 
     }
 }
 
-fn assembleVp8KeyframeRgba(
+fn assembleVp8KeyframePlanes(
     alloc: Allocator,
     frame: Vp8FrameHeader,
     control: Vp8KeyframeControl,
     token_partitions: []const []const u8,
     luma4_probs: *const Vp8Luma4Probs,
-) !DecodedImage {
+) !Vp8FramePlanes {
     if (frame.horizontal_scale != 0 or frame.vertical_scale != 0) return error.UnsupportedWebpFormat;
     if (control.syntax.color_space) return error.UnsupportedWebpFormat;
     if (token_partitions.len != control.syntax.token_partition_count) return error.WebpDecodeFailed;
@@ -1180,6 +1185,7 @@ fn assembleVp8KeyframeRgba(
                 luma4_probs,
             );
 
+            if (control.segment_map) |map| map[mb_y * grid_width + mb_x] = header.segment;
             var token_context = vp8MergeTokenContext(above_token_contexts[mb_x], left_token_context);
             const coeffs = try vp8ReadMacroblockCoeffs(
                 &token_readers[row_partition],
@@ -1205,9 +1211,36 @@ fn assembleVp8KeyframeRgba(
     }
 
     try vp8ApplyLoopFilter(&planes, control.syntax, filter_infos, grid);
-    const decoded = try vp8PlanesToRgbaAlloc(alloc, planes);
-    planes.deinit(alloc);
-    return decoded;
+    return planes;
+}
+
+fn assembleVp8KeyframeRgba(
+    alloc: Allocator,
+    frame: Vp8FrameHeader,
+    control: Vp8KeyframeControl,
+    token_partitions: []const []const u8,
+    luma4_probs: *const Vp8Luma4Probs,
+) !DecodedImage {
+    var planes = try assembleVp8KeyframePlanes(alloc, frame, control, token_partitions, luma4_probs);
+    defer planes.deinit(alloc);
+    return vp8PlanesToRgbaAlloc(alloc, planes);
+}
+
+/// Raw VP8 displayed keyframes, without a WebP/RIFF envelope or RGB conversion.
+/// Reference-dependent interframes are explicitly unsupported. The caller may
+/// impose a counting allocator to bound padded planes and entropy workspace.
+pub fn decodeVp8KeyframePlanesLimited(alloc: Allocator, payload: []const u8, limits: DecodeLimits) !Vp8FramePlanes {
+    if (payload.len < 3) return error.WebpDecodeFailed;
+    if (payload[0] & 1 != 0) return error.UnsupportedVp8Interframe;
+    const frame = try parseVp8FrameHeader(payload);
+    if (frame.version > 3 or !frame.show_frame) return error.UnsupportedWebpFormat;
+    try limits.validate(frame.width, frame.height);
+    const first_partition_size: usize = @intCast(frame.first_partition_size);
+    if (first_partition_size > payload.len - vp8_keyframe_header_len) return error.WebpDecodeFailed;
+    const control = try parseVp8KeyframeControl(payload[vp8_keyframe_header_len..][0..first_partition_size]);
+    const partitions = try parseVp8PartitionInfo(alloc, payload, control.syntax.token_partition_count);
+    defer alloc.free(partitions.token_partitions);
+    return assembleVp8KeyframePlanes(alloc, frame, control, partitions.token_partitions, &vp8_default_luma4_probs);
 }
 
 fn assembleVp8KeyframeDefaultRgba(
@@ -1232,11 +1265,11 @@ fn vp8YuvToRgba(y: u8, u: u8, v: u8, alpha: u8) [4]u8 {
 }
 
 fn vp8TransformAc3Mul1(value: i32) i32 {
-    return ((value * vp8_transform_ac3_c1) >> 16) + value;
+    return @intCast(((@as(i64, value) * vp8_transform_ac3_c1) >> 16) + value);
 }
 
 fn vp8TransformAc3Mul2(value: i32) i32 {
-    return (value * vp8_transform_ac3_c2) >> 16;
+    return @intCast((@as(i64, value) * vp8_transform_ac3_c2) >> 16);
 }
 
 fn vp8StoreTransformPixel(dst: []u8, index: usize, value: i32) void {
@@ -1436,8 +1469,8 @@ fn vp8PredictAndApplyChroma(planes: *Vp8FramePlanes, mb_x: u32, mb_y: u32, heade
         u_left = u_left_buf[0..];
         v_left = v_left_buf[0..];
     }
-    const u_top_left = if (has_top and has_left) planes.u[uv_start - planes.uv_stride - 1] else 0x80;
-    const v_top_left = if (has_top and has_left) planes.v[uv_start - planes.uv_stride - 1] else 0x80;
+    const u_top_left = if (!has_top) @as(u8, 127) else if (!has_left) @as(u8, 129) else planes.u[uv_start - planes.uv_stride - 1];
+    const v_top_left = if (!has_top) @as(u8, 127) else if (!has_left) @as(u8, 129) else planes.v[uv_start - planes.uv_stride - 1];
     try vp8PredictChroma(header.chroma_mode, planes.u[uv_start..], planes.uv_stride, uv_top_u, u_left, u_top_left);
     try vp8PredictChroma(header.chroma_mode, planes.v[uv_start..], planes.uv_stride, uv_top_v, v_left, v_top_left);
 
@@ -1594,7 +1627,7 @@ fn vp8PredictMacroblock16x16(planes: *Vp8FramePlanes, mb_x: u32, mb_y: u32, head
         try vp8CollectLeftSamples(y_left_buf[0..], planes.y, planes.y_stride, y_start, 16);
         y_left = y_left_buf[0..];
     }
-    const y_top_left = if (has_top and has_left) planes.y[y_start - planes.y_stride - 1] else 0x80;
+    const y_top_left = if (!has_top) @as(u8, 127) else if (!has_left) @as(u8, 129) else planes.y[y_start - planes.y_stride - 1];
     const luma_mode = try vp8NormalizeLuma16Mode(header.luma16_mode.?, has_top, has_left);
     try vp8PredictLuma16(luma_mode, planes.y[y_start..], planes.y_stride, y_top, y_left, y_top_left);
 
@@ -1618,8 +1651,8 @@ fn vp8PredictMacroblock16x16(planes: *Vp8FramePlanes, mb_x: u32, mb_y: u32, head
         u_left = u_left_buf[0..];
         v_left = v_left_buf[0..];
     }
-    const u_top_left = if (has_top and has_left) planes.u[uv_start - planes.uv_stride - 1] else 0x80;
-    const v_top_left = if (has_top and has_left) planes.v[uv_start - planes.uv_stride - 1] else 0x80;
+    const u_top_left = if (!has_top) @as(u8, 127) else if (!has_left) @as(u8, 129) else planes.u[uv_start - planes.uv_stride - 1];
+    const v_top_left = if (!has_top) @as(u8, 127) else if (!has_left) @as(u8, 129) else planes.v[uv_start - planes.uv_stride - 1];
     try vp8PredictChroma(header.chroma_mode, planes.u[uv_start..], planes.uv_stride, uv_top_u, u_left, u_top_left);
     try vp8PredictChroma(header.chroma_mode, planes.v[uv_start..], planes.uv_stride, uv_top_v, v_left, v_top_left);
 }
@@ -2307,17 +2340,27 @@ const BitReader = struct {
         return .{ .bytes = bytes };
     }
 
-    fn readBits(self: *BitReader, count: u5) !u32 {
+    fn peekBits(self: *const BitReader, count: u5) !u32 {
+        if (count > self.bytes.len * 8 -| self.bit_pos) return error.WebpDecodeFailed;
         var value: u32 = 0;
+        var remaining: usize = count;
+        var position = self.bit_pos;
         var shift: u5 = 0;
-        while (shift < count) : (shift += 1) {
-            if (self.bit_pos >= self.bytes.len * 8) return error.WebpDecodeFailed;
-            const byte = self.bytes[self.bit_pos / 8];
-            const bit_index: u3 = @intCast(self.bit_pos & 7);
-            const bit = (byte >> bit_index) & 1;
-            value |= @as(u32, bit) << shift;
-            self.bit_pos += 1;
+        while (remaining != 0) {
+            const offset: u3 = @intCast(position & 7);
+            const take = @min(remaining, 8 - @as(usize, offset));
+            const mask = (@as(u32, 1) << @as(u5, @intCast(take))) - 1;
+            value |= ((@as(u32, self.bytes[position / 8]) >> offset) & mask) << shift;
+            position += take;
+            remaining -= take;
+            if (remaining != 0) shift += @intCast(take);
         }
+        return value;
+    }
+
+    fn readBits(self: *BitReader, count: u5) !u32 {
+        const value = try self.peekBits(count);
+        self.bit_pos += count;
         return value;
     }
 };
@@ -2349,13 +2392,13 @@ const vp8l_code_to_plane = [_]u8{
 };
 
 const PrefixCode = struct {
-    const Entry = struct {
-        code: u16,
-        bits: u4,
-        symbol: u16,
-    };
-
-    entries: [max_vp8l_symbol_count]Entry = undefined,
+    // Symbols in canonical length order, with an LSB-first short-code lookup.
+    // Borrow this table in symbol loops instead of copying it for each pixel.
+    symbols: [max_vp8l_symbol_count]u16 = undefined,
+    counts: [vp8l_max_code_bits + 1]u16 = @splat(0),
+    first_code: [vp8l_max_code_bits + 1]u16 = @splat(0),
+    first_symbol: [vp8l_max_code_bits + 1]u16 = @splat(0),
+    short_codes: [256]u32 = @splat(0),
     entry_count: usize = 0,
     max_bits: u4 = 0,
 
@@ -2467,32 +2510,46 @@ const PrefixCode = struct {
             next_code[bits] = code;
         }
 
-        var out = PrefixCode{ .max_bits = max_bits };
+        var out = PrefixCode{ .max_bits = max_bits, .counts = counts, .first_code = next_code, .entry_count = nonzero_count };
+        var offset: u16 = 0;
+        for (1..vp8l_max_code_bits + 1) |bits| {
+            out.first_symbol[bits] = offset;
+            offset += counts[bits];
+        }
         for (lengths, 0..) |raw_len, symbol| {
             if (raw_len == 0) continue;
             const bits: u4 = @intCast(raw_len);
             const canonical = next_code[bits];
             next_code[bits] += 1;
-            out.entries[out.entry_count] = .{
-                .code = reverseBits(canonical, bits),
-                .bits = bits,
-                .symbol = @intCast(symbol),
-            };
-            out.entry_count += 1;
+            out.symbols[out.first_symbol[bits] + canonical - out.first_code[bits]] = @intCast(symbol);
+            if (bits <= 8) {
+                var prefix: usize = reverseBits(canonical, bits);
+                const step = @as(usize, 1) << bits;
+                const entry = (@as(u32, bits) << 16) | @as(u32, @intCast(symbol));
+                while (prefix < out.short_codes.len) : (prefix += step) out.short_codes[prefix] = entry;
+            }
         }
         return out;
     }
 
-    fn readSymbol(self: PrefixCode, reader: *BitReader) !u16 {
-        if (self.entry_count == 1) return self.entries[0].symbol;
-
+    fn readSymbol(self: *const PrefixCode, reader: *BitReader) !u16 {
+        if (self.entry_count == 1) return self.symbols[0];
+        if (reader.bytes.len * 8 -| reader.bit_pos >= 8) {
+            const entry = self.short_codes[try reader.peekBits(8)];
+            const bits: u4 = @intCast(entry >> 16);
+            if (bits != 0) {
+                reader.bit_pos += bits;
+                return @truncate(entry);
+            }
+        }
+        // Convert the wire's LSB-first sequence back into canonical order.
+        // Length ranges avoid scanning the whole alphabet for long codes/tails.
         var code: u16 = 0;
-        var bits: u4 = 1;
-        while (bits <= self.max_bits) : (bits += 1) {
-            const bit = try reader.readBits(1);
-            code |= @as(u16, @intCast(bit)) << (bits - 1);
-            for (self.entries[0..self.entry_count]) |entry| {
-                if (entry.bits == bits and entry.code == code) return entry.symbol;
+        for (1..@as(usize, self.max_bits) + 1) |bits| {
+            code = (code << 1) | @as(u16, @intCast(try reader.readBits(1)));
+            const first = self.first_code[bits];
+            if (code >= first and code - first < self.counts[bits]) {
+                return self.symbols[self.first_symbol[bits] + code - first];
             }
         }
         return error.WebpDecodeFailed;
@@ -5489,4 +5546,546 @@ test "probe rejects reserved vp8x feature bits" {
     var bytes = webp_vp8x_animated_1x1;
     bytes[20] = 0x01;
     try std.testing.expectError(error.UnsupportedWebpFormat, probe(&bytes));
+}
+
+/// Stateful raw VP8 video decoding. Reference and entropy updates commit only
+/// after reconstruction, filtering and all retained allocations succeed. The
+/// allocator must remain valid until deinit; returned planes belong to caller.
+pub const Vp8Decoder = struct {
+    /// Decoder-owned immutable pictures; slots naming the same picture alias.
+    /// Returned decode planes remain independently owned and may be mutated.
+    references: [3]?Vp8FramePlanes = .{ null, null, null },
+    segments: []u2 = &.{},
+    segmentation: Vp8SegmentationHeader = .{},
+    filter: Vp8LoopFilterHeader = .{},
+    probabilities: ?Vp8CoeffProbs = null,
+    motion_probs: [2][19]u8 = vp8_video_mv_defaults,
+    y_probs: [4]u8 = .{ 112, 86, 140, 37 },
+    uv_probs: [3]u8 = .{ 162, 101, 204 },
+    decoded: usize = 0,
+    /// Successfully committed reference plane copies, including padded rows.
+    reference_copy_bytes: u64 = 0,
+    /// Diagnostics count coded macroblocks, not a claimed coverage guarantee.
+    modes: [5]usize = @splat(0),
+    split_shapes: [4]usize = @splat(0),
+
+    pub fn deinit(self: *Vp8Decoder, a: Allocator) void {
+        vp8ReleaseReferences(a, self.references, .{ null, null, null });
+        a.free(self.segments);
+        self.* = .{};
+    }
+    pub fn retainedBytes(self: *const Vp8Decoder) usize {
+        var total = self.segments.len;
+        for (self.references, 0..) |p, i| if (p) |planes| {
+            if (!vp8ReferenceContains(self.references[0..i], planes))
+                total += planes.y.len + planes.u.len + planes.v.len;
+        };
+        return total;
+    }
+    pub fn decode(self: *Vp8Decoder, a: Allocator, payload: []const u8, limits: DecodeLimits) !Vp8FramePlanes {
+        try @import("work_control.zig").check();
+        if (payload.len < 3) return error.WebpDecodeFailed;
+        const tag = @as(u32, payload[0]) | (@as(u32, payload[1]) << 8) | (@as(u32, payload[2]) << 16);
+        const key = tag & 1 == 0;
+        const version = (tag >> 1) & 7;
+        if (version > 3) return error.UnsupportedWebpFormat;
+        const start: usize = if (key) 10 else 3;
+        if (payload.len < start) return error.WebpDecodeFailed;
+        const frame = if (key) try parseVp8FrameHeader(payload) else Vp8FrameHeader{
+            .keyframe = false,
+            .version = @intCast(version),
+            .show_frame = tag & 16 != 0,
+            .first_partition_size = tag >> 5,
+            .width = (self.references[0] orelse return error.MissingVp8Reference).width,
+            .height = self.references[0].?.height,
+            .horizontal_scale = 0,
+            .vertical_scale = 0,
+        };
+        try limits.validate(frame.width, frame.height);
+        if (frame.horizontal_scale != 0 or frame.vertical_scale != 0) return error.UnsupportedWebpFormat;
+        const size: usize = frame.first_partition_size;
+        if (size > payload.len - start) return error.WebpDecodeFailed;
+        const grid = vp8MacroblockGrid(frame);
+        const map = try a.alloc(u2, @as(usize, grid.width) * grid.height);
+        errdefer a.free(map);
+        if (key) @memset(map, 0) else {
+            if (map.len != self.segments.len) return error.WebpDecodeFailed;
+            @memcpy(map, self.segments);
+        }
+        var syntax: Vp8FirstPartitionSyntax = undefined;
+        var entropy: Vp8EntropyHeader = undefined;
+        var reader = Vp8BoolReader.init(payload[start..][0..size]);
+        var refresh = [3]bool{ true, true, true };
+        var copies = [2]u2{ 0, 0 };
+        var sign_bias = [4]bool{ false, false, false, false };
+        var mv_probs = if (key) vp8_video_mv_defaults else self.motion_probs;
+        var y_probs = if (key) [4]u8{ 112, 86, 140, 37 } else self.y_probs;
+        var uv_probs = if (key) [3]u8{ 162, 101, 204 } else self.uv_probs;
+        var planes: Vp8FramePlanes = undefined;
+        var mode_counts = self.modes;
+        var split_counts = self.split_shapes;
+        if (key) {
+            var control = try parseVp8KeyframeControl(payload[start..][0..size]);
+            syntax = control.syntax;
+            entropy = control.entropy;
+            control.segment_map = map;
+            const partitions = try parseVp8PartitionInfo(a, payload, syntax.token_partition_count);
+            defer a.free(partitions.token_partitions);
+            planes = try assembleVp8KeyframePlanes(a, frame, control, partitions.token_partitions, &vp8_default_luma4_probs);
+        } else {
+            const segmentation = try vp8VideoSegmentation(&reader, self.segmentation);
+            const filter = try vp8VideoFilter(&reader, self.filter);
+            const partitions: usize = @as(usize, 1) << @as(u3, @intCast(try reader.readValue(2)));
+            const quant = try parseVp8QuantHeader(&reader);
+            refresh[1] = try reader.readBit();
+            refresh[2] = try reader.readBit();
+            if (!refresh[1]) copies[0] = @intCast(try reader.readValue(2));
+            if (!refresh[2]) copies[1] = @intCast(try reader.readValue(2));
+            if (copies[0] == 3 or copies[1] == 3) return error.WebpDecodeFailed;
+            sign_bias[2] = try reader.readBit();
+            sign_bias[3] = try reader.readBit();
+            const refresh_entropy = try reader.readBit();
+            refresh[0] = try reader.readBit();
+            syntax = .{ .color_space = false, .clamp_type = false, .segmentation = segmentation, .loop_filter = filter, .token_partition_count = partitions, .quant = quant, .refresh_entropy_probs = refresh_entropy };
+            const updates = vp8CoeffUpdateProbs();
+            entropy = try vp8ReadEntropyHeader(&reader, self.probabilities orelse return error.MissingVp8Reference, &updates);
+            const reference_probs = [3]u8{ @intCast(try reader.readValue(8)), @intCast(try reader.readValue(8)), @intCast(try reader.readValue(8)) };
+            if (try reader.readBit()) for (&y_probs) |*p| {
+                p.* = @intCast(try reader.readValue(8));
+            };
+            if (try reader.readBit()) for (&uv_probs) |*p| {
+                p.* = @intCast(try reader.readValue(8));
+            };
+            for (&mv_probs, vp8_video_mv_updates) |*axis, updates_axis| for (axis, updates_axis) |*p, update| {
+                if (try reader.readBool(update)) {
+                    const value = try reader.readValue(7);
+                    p.* = if (value == 0) 1 else @intCast(value * 2);
+                }
+            };
+            const table_size = (partitions - 1) * 3;
+            const end = start + size;
+            if (table_size > payload.len - end) return error.WebpDecodeFailed;
+            var token_slices: [8][]const u8 = undefined;
+            var cursor = end + table_size;
+            for (0..partitions) |i| {
+                const length = if (i + 1 == partitions) payload.len - cursor else @as(usize, payload[end + i * 3]) | (@as(usize, payload[end + i * 3 + 1]) << 8) | (@as(usize, payload[end + i * 3 + 2]) << 16);
+                if (length > payload.len - cursor) return error.WebpDecodeFailed;
+                token_slices[i] = payload[cursor..][0..length];
+                cursor += length;
+            }
+            planes = try vp8VideoReconstruct(a, frame, syntax, entropy, &reader, token_slices[0..partitions], map, self.references, reference_probs, sign_bias, mv_probs, y_probs, uv_probs, &mode_counts, &split_counts);
+        }
+        errdefer planes.deinit(a);
+        try @import("work_control.zig").check();
+        // Reference-copy commands precede refresh commands. ALTREF copy is
+        // applied before GOLDEN copy, which may name the newly copied ALTREF.
+        var sources: [3]?Vp8FramePlanes = self.references;
+        if (!key) {
+            if (copies[1] != 0) sources[2] = sources[if (copies[1] == 1) @as(usize, 0) else 1];
+            if (copies[0] != 0) sources[1] = sources[if (copies[0] == 1) @as(usize, 0) else 2];
+        }
+        for (&sources, refresh) |*source, replace| if (replace) {
+            source.* = planes;
+        };
+        // Retained pictures are immutable: unchanged slots and reference-copy
+        // commands reuse their existing allocation. Clone a refreshed picture
+        // only once, even when all three slots refresh (including keyframes).
+        // The caller's output stays separate from every decoder reference.
+        var retained: [3]?Vp8FramePlanes = .{ null, null, null };
+        var refreshed: ?Vp8FramePlanes = null;
+        errdefer if (refreshed) |*owned| owned.deinit(a);
+        for (&retained, sources) |*out, source| {
+            const picture = source orelse return error.MissingVp8Reference;
+            if (picture.y.ptr == planes.y.ptr) {
+                if (refreshed == null) refreshed = try vp8VideoClone(a, planes);
+                out.* = refreshed.?;
+            } else out.* = picture;
+        }
+        // No operation after this checkpoint may fail: references, entropy and
+        // segmentation commit together, preserving retry after allocation or
+        // cancellation failure even when several old slots share a picture.
+        try @import("work_control.zig").check();
+        vp8ReleaseReferences(a, self.references, retained);
+        a.free(self.segments);
+        if (refreshed) |picture| self.reference_copy_bytes +|= picture.y.len + picture.u.len + picture.v.len;
+        self.references = retained;
+        self.segments = map;
+        self.segmentation = syntax.segmentation;
+        self.filter = syntax.loop_filter;
+        if (syntax.refresh_entropy_probs or key) {
+            self.probabilities = if (syntax.refresh_entropy_probs) entropy.coeff_probs else vp8DefaultCoeffProbs();
+            self.motion_probs = mv_probs;
+            self.y_probs = y_probs;
+            self.uv_probs = uv_probs;
+        }
+        self.decoded += 1;
+        self.modes = mode_counts;
+        self.split_shapes = split_counts;
+        return planes;
+    }
+};
+fn vp8ReferenceContains(references: []const ?Vp8FramePlanes, picture: Vp8FramePlanes) bool {
+    for (references) |reference| if (reference) |p| {
+        if (p.y.ptr == picture.y.ptr) return true;
+    };
+    return false;
+}
+/// Release each obsolete picture exactly once; aliases in retained slots keep
+/// the owner alive. No heap reference-count object or failure-prone retain step.
+fn vp8ReleaseReferences(a: Allocator, references: [3]?Vp8FramePlanes, retained: [3]?Vp8FramePlanes) void {
+    for (references, 0..) |reference, i| if (reference) |picture| {
+        if (vp8ReferenceContains(references[0..i], picture) or vp8ReferenceContains(&retained, picture)) continue;
+        var owned = picture;
+        owned.deinit(a);
+    };
+}
+
+fn vp8VideoClone(a: Allocator, p: Vp8FramePlanes) !Vp8FramePlanes {
+    var out = p;
+    out.y = try a.dupe(u8, p.y);
+    errdefer a.free(out.y);
+    out.u = try a.dupe(u8, p.u);
+    errdefer a.free(out.u);
+    out.v = try a.dupe(u8, p.v);
+    return out;
+}
+fn vp8VideoSegmentation(r: *Vp8BoolReader, previous: Vp8SegmentationHeader) !Vp8SegmentationHeader {
+    var header = previous;
+    header.enabled = try r.readBit();
+    header.update_map = false;
+    header.update_data = false;
+    if (!header.enabled) return header;
+    header.update_map = try r.readBit();
+    header.update_data = try r.readBit();
+    if (header.update_data) {
+        header.absolute_delta = try r.readBit();
+        for (&header.quantizer) |*q| q.* = if (try r.readBit()) try r.readSignedValue(7) else 0;
+        for (&header.filter_strength) |*f| f.* = if (try r.readBit()) try r.readSignedValue(6) else 0;
+    }
+    if (header.update_map) for (&header.segment_probs) |*p| {
+        p.* = if (try r.readBit()) @intCast(try r.readValue(8)) else 255;
+    };
+    return header;
+}
+fn vp8VideoFilter(r: *Vp8BoolReader, previous: Vp8LoopFilterHeader) !Vp8LoopFilterHeader {
+    var header = previous;
+    header.simple = try r.readBit();
+    header.level = @intCast(try r.readValue(6));
+    header.sharpness = @intCast(try r.readValue(3));
+    header.use_lf_delta = try r.readBit();
+    if (header.use_lf_delta and try r.readBit()) {
+        for (&header.ref_lf_delta) |*d| if (try r.readBit()) {
+            d.* = try r.readSignedValue(6);
+        };
+        for (&header.mode_lf_delta) |*d| if (try r.readBit()) {
+            d.* = try r.readSignedValue(6);
+        };
+    }
+    return header;
+}
+const vp8_video_mv_defaults = [2][19]u8{
+    .{ 162, 128, 225, 146, 172, 147, 214, 39, 156, 128, 129, 132, 75, 145, 178, 206, 239, 254, 254 },
+    .{ 164, 128, 204, 170, 119, 235, 140, 230, 228, 128, 130, 130, 74, 148, 180, 203, 236, 254, 254 },
+};
+const vp8_video_mv_updates = [2][19]u8{
+    .{ 237, 246, 253, 253, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 250, 250, 252, 254, 254 },
+    .{ 231, 243, 245, 253, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 251, 251, 254, 254, 254 },
+};
+const Vp8VideoMotion = struct {
+    reference: u2 = 0,
+    mode: u3 = 0, // zero, nearest, near, new, split
+    mv: [2]i32 = .{ 0, 0 }, // row, column in eighth pixels
+    blocks: [16][2]i32 = @splat(.{ 0, 0 }),
+};
+fn vp8VideoMotionComponent(r: *Vp8BoolReader, probs: [19]u8) !i32 {
+    var magnitude: i32 = 0;
+    if (try r.readBool(probs[0])) {
+        for (0..3) |bit| magnitude |= @as(i32, @intFromBool(try r.readBool(probs[9 + bit]))) << @as(u5, @intCast(bit));
+        var bit: usize = 9;
+        while (bit > 3) : (bit -= 1) magnitude |= @as(i32, @intFromBool(try r.readBool(probs[9 + bit]))) << @as(u5, @intCast(bit));
+        if (magnitude & 0xfff0 == 0 or try r.readBool(probs[12])) magnitude += 8;
+    } else {
+        const high: usize = @intFromBool(try r.readBool(probs[2]));
+        const mid: usize = @intFromBool(try r.readBool(probs[if (high == 0) @as(usize, 3) else 6]));
+        const low = @intFromBool(try r.readBool(probs[if (high == 0) 4 + mid else 7 + mid]));
+        magnitude = @intCast(high * 4 + mid * 2 + low);
+    }
+    if (magnitude != 0 and try r.readBool(probs[1])) magnitude = -magnitude;
+    return magnitude * 2;
+}
+fn vp8VideoNewMotion(r: *Vp8BoolReader, probs: [2][19]u8, best: [2]i32) ![2]i32 {
+    return .{ best[0] + try vp8VideoMotionComponent(r, probs[0]), best[1] + try vp8VideoMotionComponent(r, probs[1]) };
+}
+fn vp8VideoClamp(mv: [2]i32, x: usize, y: usize, grid: Vp8MacroblockGrid) [2]i32 {
+    return .{
+        std.math.clamp(mv[0], -@as(i32, @intCast(y * 128)) - 128, @as(i32, @intCast((grid.height - 1 - y) * 128)) + 128),
+        std.math.clamp(mv[1], -@as(i32, @intCast(x * 128)) - 128, @as(i32, @intCast((grid.width - 1 - x) * 128)) + 128),
+    };
+}
+fn vp8VideoReadMotion(r: *Vp8BoolReader, reference: u2, neighbors: [3]Vp8VideoMotion, sign_bias: [4]bool, probs: [2][19]u8, x: usize, y: usize, grid: Vp8MacroblockGrid, split_counts: *[4]usize) !Vp8VideoMotion {
+    const contexts = [6][4]u8{ .{ 7, 1, 1, 143 }, .{ 14, 18, 14, 107 }, .{ 135, 64, 57, 68 }, .{ 60, 56, 128, 65 }, .{ 159, 134, 128, 34 }, .{ 234, 188, 128, 28 } };
+    var counts = [4]usize{ 0, 0, 0, 0 };
+    var candidates: [4][2]i32 = @splat(.{ 0, 0 });
+    var current: usize = 0;
+    for (neighbors, [3]usize{ 2, 2, 1 }) |neighbor, weight| {
+        if (neighbor.reference == 0) continue;
+        var mv = neighbor.mv;
+        if (sign_bias[reference] != sign_bias[neighbor.reference]) mv = .{ -mv[0], -mv[1] };
+        if (mv[0] == 0 and mv[1] == 0) {
+            counts[0] += weight;
+            continue;
+        }
+        if (!std.mem.eql(i32, &mv, &candidates[current])) {
+            current += 1;
+            candidates[current] = mv;
+        }
+        counts[current] += weight;
+    }
+    if (current == 3 and std.mem.eql(i32, &candidates[3], &candidates[1])) counts[1] += 1;
+    if (counts[2] > counts[1]) {
+        std.mem.swap(usize, &counts[1], &counts[2]);
+        std.mem.swap([2]i32, &candidates[1], &candidates[2]);
+    }
+    var out = Vp8VideoMotion{ .reference = reference };
+    if (!try r.readBool(contexts[counts[0]][0])) return out;
+    if (!try r.readBool(contexts[counts[1]][1])) {
+        out.mode = 1;
+        out.mv = vp8VideoClamp(candidates[1], x, y, grid);
+        return out;
+    }
+    if (!try r.readBool(contexts[counts[2]][2])) {
+        out.mode = 2;
+        out.mv = vp8VideoClamp(candidates[2], x, y, grid);
+        return out;
+    }
+    const best = vp8VideoClamp(candidates[if (counts[1] >= counts[0]) @as(usize, 1) else 0], x, y, grid);
+    const splits = @as(usize, @intFromBool(neighbors[0].mode == 4)) * 2 + @as(usize, @intFromBool(neighbors[1].mode == 4)) * 2 + @intFromBool(neighbors[2].mode == 4);
+    if (!try r.readBool(contexts[splits][3])) {
+        out.mode = 3;
+        out.mv = try vp8VideoNewMotion(r, probs, best);
+        return out;
+    }
+    out.mode = 4;
+    const shape: usize = if (!try r.readBool(110)) 3 else if (!try r.readBool(111)) 2 else @intFromBool(try r.readBool(150));
+    split_counts[shape] += 1;
+    const groups: [4][16]u4 = .{
+        .{ 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1 },
+        .{ 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1 },
+        .{ 0, 0, 1, 1, 0, 0, 1, 1, 2, 2, 3, 3, 2, 2, 3, 3 },
+        .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
+    };
+    const group_count = [4]usize{ 2, 2, 4, 16 };
+    for (0..group_count[shape]) |group| {
+        var k: usize = 0;
+        while (groups[shape][k] != group) : (k += 1) {}
+        const left = if (k % 4 != 0) out.blocks[k - 1] else if (neighbors[1].mode == 4) neighbors[1].blocks[k + 3] else neighbors[1].mv;
+        const above = if (k >= 4) out.blocks[k - 4] else if (neighbors[0].mode == 4) neighbors[0].blocks[k + 12] else neighbors[0].mv;
+        const probabilities: [3]u8 = if (std.mem.eql(i32, &left, &above))
+            (if (left[0] == 0 and left[1] == 0) .{ 208, 1, 1 } else .{ 223, 1, 34 })
+        else if (above[0] == 0 and above[1] == 0) .{ 179, 121, 1 } else if (left[0] == 0 and left[1] == 0) .{ 106, 145, 1 } else .{ 147, 136, 18 };
+        const mv: [2]i32 = if (!try r.readBool(probabilities[0])) left else if (!try r.readBool(probabilities[1])) above else if (!try r.readBool(probabilities[2])) .{ 0, 0 } else try vp8VideoNewMotion(r, probs, best);
+        for (&out.blocks, groups[shape]) |*block, id| if (id == group) {
+            block.* = mv;
+        };
+    }
+    out.mv = out.blocks[15];
+    return out;
+}
+fn vp8VideoReconstruct(a: Allocator, frame: Vp8FrameHeader, syntax: Vp8FirstPartitionSyntax, entropy: Vp8EntropyHeader, r: *Vp8BoolReader, partitions: []const []const u8, map: []u2, references: [3]?Vp8FramePlanes, reference_probs: [3]u8, sign_bias: [4]bool, mv_probs: [2][19]u8, y_probs: [4]u8, uv_probs: [3]u8, mode_counts: *[5]usize, split_counts: *[4]usize) !Vp8FramePlanes {
+    const grid = vp8MacroblockGrid(frame);
+    const width: usize = grid.width;
+    var planes = try allocateVp8FramePlanes(a, frame);
+    errdefer planes.deinit(a);
+    const motions = try a.alloc(Vp8VideoMotion, map.len);
+    defer a.free(motions);
+    const infos = try a.alloc(Vp8MacroblockFilterInfo, map.len);
+    defer a.free(infos);
+    const above = try a.alloc(Vp8MacroblockTokenContext, width);
+    defer a.free(above);
+    @memset(above, .{});
+    var tokens: [8]Vp8BoolReader = undefined;
+    for (partitions, 0..) |p, i| tokens[i] = Vp8BoolReader.init(p);
+    const matrices = vp8BuildSegmentQuantMatrices(syntax);
+    for (0..grid.height) |y| {
+        try @import("work_control.zig").check();
+        var left = Vp8MacroblockTokenContext{};
+        for (0..width) |x| {
+            const index = y * width + x;
+            if (syntax.segmentation.enabled and syntax.segmentation.update_map) map[index] = try vp8ReadSegmentId(r, syntax.segmentation);
+            var header = Vp8MacroblockHeader{ .segment = if (syntax.segmentation.enabled) map[index] else 0, .skip = if (entropy.skip_probability) |p| try r.readBool(p) else false, .is_i4x4 = false, .luma16_mode = null, .luma4_modes = null, .chroma_mode = .dc };
+            var motion = Vp8VideoMotion{};
+            if (try r.readBool(reference_probs[0])) {
+                const reference: u2 = if (!try r.readBool(reference_probs[1])) 1 else 2 + @as(u2, @intFromBool(try r.readBool(reference_probs[2])));
+                motion = try vp8VideoReadMotion(r, reference, .{
+                    if (y == 0) .{} else motions[index - width],               if (x == 0) .{} else motions[index - 1],
+                    if (x == 0 or y == 0) .{} else motions[index - width - 1],
+                }, sign_bias, mv_probs, x, y, grid, split_counts);
+                header.is_i4x4 = motion.mode == 4; // SPLITMV omits Y2 like B_PRED.
+                mode_counts[motion.mode] += 1;
+            } else {
+                const mode: u3 = if (!try r.readBool(y_probs[0])) 0 else if (!try r.readBool(y_probs[1]))
+                    (if (!try r.readBool(y_probs[2])) @as(u3, 1) else 2)
+                else if (!try r.readBool(y_probs[3])) 3 else 4;
+                header.is_i4x4 = mode == 4;
+                if (header.is_i4x4) {
+                    var modes: [16]Vp8Luma4Mode = undefined;
+                    for (&modes) |*m| m.* = try vp8ReadLuma4Mode(r, &.{ 120, 90, 79, 133, 87, 85, 80, 111, 151 });
+                    header.luma4_modes = modes;
+                } else header.luma16_mode = switch (mode) {
+                    0 => .dc,
+                    1 => .vertical,
+                    2 => .horizontal,
+                    else => .true_motion,
+                };
+                header.chroma_mode = if (!try r.readBool(uv_probs[0])) .dc else if (!try r.readBool(uv_probs[1])) .vertical else if (!try r.readBool(uv_probs[2])) .horizontal else .true_motion;
+            }
+            motions[index] = motion;
+            var context = vp8MergeTokenContext(above[x], left);
+            const coeffs = try vp8ReadMacroblockCoeffs(&tokens[y % partitions.len], &entropy.coeff_probs, header, matrices[header.segment], &context);
+            vp8StoreAboveTokenContext(&above[x], context);
+            vp8StoreLeftTokenContext(&left, context);
+            infos[index] = .{ .segment = header.segment, .is_i4x4 = header.is_i4x4, .has_coeffs = vp8MacroblockHasCoeffs(&coeffs), .reference = motion.reference, .mode_delta = if (motion.reference == 0) 0 else if (motion.mode == 4) 3 else if (motion.mode == 0) 1 else 2, .inter_frame = true };
+            if (motion.reference != 0) {
+                const ref = references[motion.reference - 1] orelse return error.MissingVp8Reference;
+                vp8VideoPredict(&planes, ref, motion, x, y, frame.version);
+                try vp8ApplyMacroblockResidual16x16(&planes, @intCast(x), @intCast(y), &coeffs);
+            } else if (header.is_i4x4) try vp8ReconstructMacroblock4x4(&planes, @intCast(x), @intCast(y), header, &coeffs) else {
+                try vp8PredictMacroblock16x16(&planes, @intCast(x), @intCast(y), header);
+                try vp8ApplyMacroblockResidual16x16(&planes, @intCast(x), @intCast(y), &coeffs);
+            }
+        }
+    }
+    var effective = syntax;
+    if (frame.version >= 2) effective.loop_filter.level = 0;
+    if (frame.version == 1) effective.loop_filter.simple = true;
+    try vp8ApplyLoopFilter(&planes, effective, infos, grid);
+    return planes;
+}
+const vp8_video_six_tap = [8][6]i32{
+    .{ 0, 0, 128, 0, 0, 0 },     .{ 0, -6, 123, 12, -1, 0 }, .{ 2, -11, 108, 36, -8, 1 }, .{ 0, -9, 93, 50, -6, 0 },
+    .{ 3, -16, 77, 77, -16, 3 }, .{ 0, -6, 50, 93, -9, 0 },  .{ 1, -8, 36, 108, -11, 2 }, .{ 0, -1, 12, 123, -6, 0 },
+};
+fn vp8VideoSample(p: []const u8, stride: usize, height: usize, x: i32, y: i32) i32 {
+    return p[@as(usize, @intCast(std.math.clamp(y, 0, @as(i32, @intCast(height)) - 1))) * stride + @as(usize, @intCast(std.math.clamp(x, 0, @as(i32, @intCast(stride)) - 1)))];
+}
+fn vp8VideoPredictBlock(dst: []u8, stride: usize, ref: []const u8, ref_height: usize, x: usize, y: usize, mv: [2]i32, version: u3) void {
+    const dy = @divFloor(mv[0], 8);
+    const dx = @divFloor(mv[1], 8);
+    const fy: usize = @intCast(@mod(mv[0], 8));
+    const fx: usize = @intCast(@mod(mv[1], 8));
+    const hx: [6]i32 = if (version == 0) vp8_video_six_tap[fx] else .{ 0, 0, @intCast(128 - fx * 16), @intCast(fx * 16), 0, 0 };
+    const vy: [6]i32 = if (version == 0) vp8_video_six_tap[fy] else .{ 0, 0, @intCast(128 - fy * 16), @intCast(fy * 16), 0, 0 };
+    var scratch: [9][4]i32 = undefined;
+    for (&scratch, 0..) |*row, sy| for (row, 0..) |*value, sx| {
+        var sum: i32 = 0;
+        for (hx, 0..) |tap, t| sum += tap * vp8VideoSample(ref, stride, ref_height, @as(i32, @intCast(x + sx)) + dx + @as(i32, @intCast(t)) - 2, @as(i32, @intCast(y + sy)) + dy - 2);
+        value.* = std.math.clamp((sum + 64) >> 7, 0, 255);
+    };
+    for (0..4) |sy| for (0..4) |sx| {
+        var sum: i32 = 0;
+        for (vy, 0..) |tap, t| sum += tap * scratch[sy + t][sx];
+        dst[(y + sy) * stride + x + sx] = @intCast(std.math.clamp((sum + 64) >> 7, 0, 255));
+    };
+}
+fn vp8VideoPredict(p: *Vp8FramePlanes, ref: Vp8FramePlanes, motion: Vp8VideoMotion, x: usize, y: usize, version: u3) void {
+    for (0..16) |i| {
+        const mv = if (motion.mode == 4) motion.blocks[i] else motion.mv;
+        vp8VideoPredictBlock(p.y, p.y_stride, ref.y, ref.y_padded_height, x * 16 + i % 4 * 4, y * 16 + i / 4 * 4, mv, version);
+    }
+    for (0..4) |i| {
+        var mv = motion.mv;
+        if (motion.mode == 4) {
+            mv = .{ 0, 0 };
+            const first = i / 2 * 8 + i % 2 * 2;
+            for ([_]usize{ first, first + 1, first + 4, first + 5 }) |j| {
+                mv[0] += motion.blocks[j][0];
+                mv[1] += motion.blocks[j][1];
+            }
+            for (&mv) |*v| v.* = @divTrunc(v.* + (if (v.* < 0) @as(i32, -4) else 4), 8);
+        } else {
+            for (&mv) |*v| v.* = @divTrunc(v.* + (if (v.* < 0) @as(i32, -1) else 1), 2);
+        }
+        if (version == 3) for (&mv) |*v| {
+            v.* &= ~@as(i32, 7);
+        };
+        vp8VideoPredictBlock(p.u, p.uv_stride, ref.u, ref.uv_padded_height, x * 8 + i % 2 * 4, y * 8 + i / 2 * 4, mv, version);
+        vp8VideoPredictBlock(p.v, p.uv_stride, ref.v, ref.uv_padded_height, x * 8 + i % 2 * 4, y * 8 + i / 2 * 4, mv, version);
+    }
+}
+
+test "vp8l prefix lookup matches linear decoding for every sixteen-bit prefix" {
+    // A complete tree with codes at every length through 15 bits. Permute
+    // symbols so wire order differs from symbol order.
+    var lengths: [16]u8 = @splat(0);
+    for (0..14) |i| lengths[(i * 7) % 16] = @intCast(i + 1);
+    lengths[(14 * 7) % 16] = 15;
+    lengths[(15 * 7) % 16] = 15;
+    const table = try PrefixCode.build(&lengths);
+    var codes: [16]u16 = undefined;
+    var next: u16 = 0;
+    for (1..16) |width| {
+        for (lengths, 0..) |length, symbol| {
+            if (length == width) {
+                codes[symbol] = reverseBits(next, @intCast(width));
+                next += 1;
+            }
+        }
+        if (width != 15) next <<= 1;
+    }
+    for (0..65536) |raw| {
+        const bytes = [_]u8{ @truncate(raw), @truncate(raw >> 8) };
+        var fast = BitReader.init(&bytes);
+        var expected_symbol: ?u16 = null;
+        var expected_bits: usize = 0;
+        for (lengths, 0..) |length, symbol| {
+            const mask = (@as(usize, 1) << @as(u4, @intCast(length))) - 1;
+            if (raw & mask == codes[symbol]) {
+                expected_symbol = @intCast(symbol);
+                expected_bits = length;
+                break;
+            }
+        }
+        try std.testing.expectEqual(expected_symbol.?, try table.readSymbol(&fast));
+        try std.testing.expectEqual(expected_bits, fast.bit_pos);
+    }
+}
+
+test "vp8l prefix lookup accepts short tails and zero-bit single-symbol trees" {
+    const pair = try PrefixCode.build(&.{ 1, 1 });
+    for (0..8) |offset| {
+        var reader = BitReader{ .bytes = &.{0xa5}, .bit_pos = offset };
+        for (offset..8) |bit| {
+            try std.testing.expectEqual(@as(u16, (@as(u8, 0xa5) >> @as(u3, @intCast(bit))) & 1), try pair.readSymbol(&reader));
+        }
+        try std.testing.expectError(error.WebpDecodeFailed, pair.readSymbol(&reader));
+    }
+    const single = try PrefixCode.build(&.{ 0, 7, 0 });
+    var empty = BitReader.init(&.{});
+    try std.testing.expectEqual(@as(u16, 1), try single.readSymbol(&empty));
+    try std.testing.expectEqual(@as(usize, 0), empty.bit_pos);
+    const long = try PrefixCode.build(&.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 15 });
+    var truncated = BitReader.init(&.{0xff});
+    try std.testing.expectError(error.WebpDecodeFailed, long.readSymbol(&truncated));
+}
+
+test "vp8l bulk bit reader matches scalar bits at every byte offset and count" {
+    const bytes = [_]u8{ 0xb5, 0x43, 0xff, 0x00, 0x69, 0xde };
+    for (0..49) |position| {
+        for (0..32) |count| {
+            var reader = BitReader{ .bytes = &bytes, .bit_pos = position };
+            if (position + count > bytes.len * 8) {
+                try std.testing.expectError(error.WebpDecodeFailed, reader.readBits(@intCast(count)));
+                continue;
+            }
+            var expected: u32 = 0;
+            for (0..count) |bit| {
+                const at = position + bit;
+                expected |= @as(u32, (bytes[at / 8] >> @as(u3, @intCast(at % 8))) & 1) << @as(u5, @intCast(bit));
+            }
+            try std.testing.expectEqual(expected, try reader.peekBits(@intCast(count)));
+            try std.testing.expectEqual(position, reader.bit_pos);
+            try std.testing.expectEqual(expected, try reader.readBits(@intCast(count)));
+            try std.testing.expectEqual(position + count, reader.bit_pos);
+        }
+    }
 }

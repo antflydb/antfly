@@ -144,7 +144,13 @@ fn fill(allocator: std.mem.Allocator, ledger: *Ledger, count: usize) !void {
 
 test "ledger reclamation snapshot capture and retirement survive every allocation failure" {
     const Fixture = struct {
-        fn check(allocator: std.mem.Allocator) !void {
+        fn check(backing: std.mem.Allocator) !void {
+            // In-place growth depends on OS mapping state. Enumerate every
+            // allocation failure through the deterministic allocate/copy path.
+            var vtable = backing.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const allocator: std.mem.Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
             const Backend = @import("../lsm_backend.zig").Backend;
             var backend = Backend.init(allocator, .{});
             defer backend.close();

@@ -25,8 +25,13 @@ pub fn build(b: *std.Build) void {
 
 pub fn buildDependency(b: *std.Build, comptime asking_build_zig: type) void {
     defer @import("antfly_platform").finalizeMacosSdk(b);
-    defer source_owner.finalize(b);
     const shared = dependencies.create(b, asking_build_zig) orelse return;
+    defer {
+        source_owner.finalize(b);
+        // Shared providers and their callers must use the same debug/tracing
+        // profile, including the independent embedded packaging composition.
+        if (shared.strip) @import("build_support/embedded/shared_library.zig").stripBuildGraph(b);
+    }
     b.modules.put(b.allocator, "antfly-inference", shared.inference_graph.inference_mod) catch @panic("OOM");
     const local_module = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/embedded_root.zig"),
@@ -43,7 +48,6 @@ pub fn buildDependency(b: *std.Build, comptime asking_build_zig: type) void {
         .antfly_imports = shared.production_antfly_imports,
         .antfly_mod = local_module,
     });
-    shared.build_info.link(embedded.libantfly_link_mod);
     const lite_module = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/lite_main.zig"),
         .target = shared.target,
@@ -52,12 +56,14 @@ pub fn buildDependency(b: *std.Build, comptime asking_build_zig: type) void {
     shared.antfly_imports.configureEmbedded(b, lite_module, shared.link_libc);
     lite_module.addImport("antfly-client", embedded.antfly_client_pkg_mod);
     lite_module.addImport("antfly_inference_host", shared.antfly_imports.inference_host);
+    lite_module.addImport("antfly_inference_engine", shared.antfly_imports.inference_engine);
     lite_module.linkLibrary(embedded.native_inference);
     lite_module.linkLibrary(embedded.native_enrichment);
     shared.build_info.link(lite_module);
     const lite = b.addExecutable(.{
         .name = "antfly-lite",
         .root_module = lite_module,
+        .use_llvm = @import("build_support/embedded/shared_library.zig").llvmBackend(shared.target.result),
         .max_rss = 12 * 1024 * 1024 * 1024,
     });
     const install_lite = b.addInstallArtifact(lite, .{});

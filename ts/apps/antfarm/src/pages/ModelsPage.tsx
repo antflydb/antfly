@@ -52,6 +52,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ErrorState, NoResultsState } from "@/components/branded-empty-state";
 import { ConnectedProvidersSummary } from "@/components/ConnectedProvidersSummary";
+import { RuntimeProfiles } from "@/components/models/RuntimeProfiles";
 import { isProductEnabled } from "@/config/products";
 import {
   type Backend,
@@ -75,6 +76,9 @@ import { cn } from "@/lib/utils";
 
 // Icon mapping for model types
 const MODEL_TYPE_ICONS: Record<ModelType, React.FC<{ className?: string }>> = {
+  decider: Sparkles,
+  synthesizer: AudioLines,
+  predictor: Fingerprint,
   embedder: Fingerprint,
   reranker: ArrowUpDown,
   chunker: Scissors,
@@ -442,7 +446,7 @@ const ModelCard: React.FC<{
           {model.inRegistry ? (
             <span className="inline-flex items-center gap-1">
               <Zap className="w-3 h-3" />
-              Ready
+              {model.freshness === "configured" ? "Configured" : "Ready"}
             </span>
           ) : (
             <span className="inline-flex items-center gap-1">
@@ -558,7 +562,7 @@ const ModelDetailSheet: React.FC<{
               {model.inRegistry ? (
                 <span className="inline-flex items-center gap-1 px-2 py-1 rounded-none text-xs font-medium bg-success/10 text-success dark:text-success border border-success/20">
                   <Zap className="w-3 h-3" />
-                  Ready
+                  {model.freshness === "configured" ? "Configured" : "Ready"}
                 </span>
               ) : (
                 <span className="inline-flex items-center gap-1 px-2 py-1 rounded-none text-xs bg-muted text-muted-foreground border border-border">
@@ -802,7 +806,17 @@ const ModelDetailSheet: React.FC<{
           </div>
 
           {/* Open in Playground button */}
-          {model.inRegistry && model.provider === "antfly" && MODEL_TYPE_PLAYGROUND[model.type] ? (
+          {model.connectionId === "named-inference" ? (
+            <Button
+              onClick={() =>
+                navigate(`/inference/gateway?model=${encodeURIComponent(model.source)}`)
+              }
+            >
+              Try in gateway
+            </Button>
+          ) : model.inRegistry &&
+            model.provider === "antfly" &&
+            MODEL_TYPE_PLAYGROUND[model.type] ? (
             <Button
               className="w-full"
               onClick={() => {
@@ -911,7 +925,7 @@ const TypeContextBanner: React.FC<{
 // Main page component
 const ModelsPage: React.FC = () => {
   const { models, types, quantizationOptions, loading, error, retry } = useInferenceRegistry();
-  const { apiUrl } = useApiConfig();
+  const { apiUrl, inferenceApiUrl } = useApiConfig();
   const navigate = useNavigate();
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedType, setSelectedType] = useState<ModelType | "all">("all");
@@ -967,6 +981,9 @@ const ModelsPage: React.FC = () => {
 
   const modelsByType = useMemo(() => {
     const grouped: Record<ModelType, InferenceModel[]> = {
+      decider: [],
+      synthesizer: [],
+      predictor: [],
       embedder: [],
       reranker: [],
       chunker: [],
@@ -986,6 +1003,9 @@ const ModelsPage: React.FC = () => {
 
   const modelCounts = useMemo(() => {
     const counts: Record<ModelType, number> = {
+      decider: 0,
+      synthesizer: 0,
+      predictor: 0,
       embedder: 0,
       reranker: 0,
       chunker: 0,
@@ -1186,6 +1206,15 @@ const ModelsPage: React.FC = () => {
           ))}
         </div>
       </DashboardToolbar>
+
+      {filteredModels.length > 0 && (
+        <RuntimeProfiles
+          key={JSON.stringify([apiUrl, inferenceApiUrl])}
+          models={filteredModels}
+          endpointKey={JSON.stringify([apiUrl, inferenceApiUrl])}
+          onDetails={handleModelClick}
+        />
+      )}
 
       {/* Type Context Banner - shows when a specific type is selected */}
       {selectedType !== "all" && (

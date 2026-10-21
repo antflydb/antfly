@@ -118,12 +118,30 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     // type-specific fields (external, dimension, edge_types, etc.) that the
     // generated IndexConfig struct doesn't capture.
     var parsed = metadata_server_openapi.server.parseCreateTableBody(alloc, body) catch {
-        var fallback = try tables_api.parseCreateTableRequest(alloc, body);
+        // Normalize validated public indexes before compatibility admission.
+        // Otherwise SDK nulls reach strict coverage/runtime validators first.
+        var fallback = fallback: {
+            if (raw_root.get("indexes")) |indexes_value| {
+                if (indexes_value != .null) {
+                    const normalized_indexes = try normalizeCreateTableIndexesWithDefaults(alloc, indexes_value, !external_source);
+                    defer alloc.free(normalized_indexes);
+                    var indexes = try std.json.parseFromSlice(std.json.Value, alloc, normalized_indexes, .{});
+                    defer indexes.deinit();
+                    // Preserve exact schema literal tokens while replacing only
+                    // the index object. Neither parsed arena owns the other.
+                    var exact = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false });
+                    defer exact.deinit();
+                    exact.value.object.getPtr("indexes").?.* = indexes.value;
+                    const normalized_body = try stringifyJsonAlloc(alloc, exact.value);
+                    defer alloc.free(normalized_body);
+                    // Only our validated normalizer introduced private durable
+                    // identities; public input was checked before this branch.
+                    break :fallback try tables_api.parseStoredCreateTableRequest(alloc, normalized_body);
+                }
+            }
+            break :fallback try tables_api.parseCreateTableRequest(alloc, body);
+        };
         errdefer fallback.deinit(alloc);
-        // Raw public fields were validated above. The compatibility parser
-        // adds private coverage incarnations, so re-running the public
-        // allow-list against its normalized output would reject trusted
-        // metadata that the caller never supplied.
         try validateCreateTableIndexSemantics(
             alloc,
             fallback.indexes_json orelse tables_api.default_indexes_json,
@@ -564,6 +582,17 @@ fn appendNormalizedGraphResolversField(alloc: std.mem.Allocator, out: *std.Array
     for (value.array.items, 0..) |item, i| {
         if (i != 0) try out.append(alloc, ',');
         if (item != .object) return error.InvalidCreateIndexRequest;
+        if (item.object.get("suppress")) |policy| if (policy != .null) {
+            const raw = try stringifyJsonAlloc(alloc, policy);
+            defer alloc.free(raw);
+            @import("antfly_resolver").curation.validateConfig(alloc, raw) catch |err| return if (err == error.OutOfMemory) err else error.InvalidCreateIndexRequest;
+        };
+        if (item.object.get("adjudicate")) |policy| if (policy != .null) {
+            const raw = try stringifyJsonAlloc(alloc, policy);
+            defer alloc.free(raw);
+            @import("antfly_local_sources").functions_resolver_adjudication.validate(alloc, raw) catch |err| return if (err == error.OutOfMemory) err else error.InvalidCreateIndexRequest;
+            if (item.object.get("scorer") == null and item.object.get("scorer_json") == null) return error.InvalidCreateIndexRequest;
+        };
         const scorer = item.object.get("scorer");
         if (scorer == null or scorer.? == .null) {
             if (item.object.get("scorer_json")) |legacy| {
@@ -996,6 +1025,41 @@ fn validatePublicArtifactEnrichmentField(field: []const u8, value: std.json.Valu
     }
 }
 
+test "resolver adjudication public policy validates and redacts frozen credentials" {
+    const a = std.testing.allocator;
+    const request =
+        \\{"type":"graph","resolvers":[{"name":"concepts","table":"entities","source_artifact":"kg","resolution_artifact":"resolved","key_template":"{{_entity.text}}","scorer":{"comparisons":[]},"adjudicate":{"decider":{"provider":"antfly","model":"fixture","api_key":"private-key"},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Are these the same entity?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9}}}]}
+    ;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var value = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), request, .{});
+    const normalized = try normalizeIndexConfigJson(a, value.object, "g", .{ .include_name = true, .default_type = true });
+    defer a.free(normalized);
+    const public = try indexes_api.encodeCreatedIndexConfig(a, "g", normalized);
+    defer a.free(public);
+    try std.testing.expect(std.mem.indexOf(u8, public, "private-key") == null);
+    try std.testing.expect(std.mem.indexOf(u8, public, "\"adjudicate\":") != null);
+    const resolver = &value.object.getPtr("resolvers").?.array.items[0];
+    try resolver.object.getPtr("adjudicate").?.object.put(arena.allocator(), "silent_typo", .{ .bool = true });
+    try std.testing.expectError(error.InvalidCreateIndexRequest, normalizeIndexConfigJson(a, value.object, "g", .{ .include_name = true, .default_type = true }));
+}
+
+test "resolver curation public policy preserves suppression and rejects misspelled rules" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var value = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(),
+        \\{"type":"graph","resolvers":[{"name":"concepts","table":"entities","source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{uslug _entity.text}}","suppress":{"keys":["concept/note"],"texts":["content"],"min_text_chars":3}}]}
+    , .{});
+    const normalized = try normalizeIndexConfigJson(a, value.object, "g", .{ .include_name = true, .default_type = true });
+    defer a.free(normalized);
+    const public = try indexes_api.encodeCreatedIndexConfig(a, "g", normalized);
+    defer a.free(public);
+    try std.testing.expect(std.mem.indexOf(u8, public, "\"suppress\":") != null);
+    try value.object.getPtr("resolvers").?.array.items[0].object.getPtr("suppress").?.object.put(arena.allocator(), "min_chars", .{ .integer = 3 });
+    try std.testing.expectError(error.InvalidCreateIndexRequest, normalizeIndexConfigJson(a, value.object, "g", .{ .include_name = true, .default_type = true }));
+}
+
 test "typed enrichment producer and graph scorer normalize to legacy storage fields" {
     const alloc = std.testing.allocator;
     const enrichment = try parseArtifactEnrichmentRequest(alloc, "units",
@@ -1170,7 +1234,7 @@ fn appendDefaultFullTextIndexEntry(
 }
 
 fn validateCreateTableIndexName(index_name: []const u8) !void {
-    if (index_name.len == 0) return error.InvalidCreateTableRequest;
+    if (index_name.len == 0 or (std.mem.eql(u8, index_name, "_resolver_curation") or std.mem.eql(u8, index_name, "_resolver_namespaces") or std.mem.eql(u8, index_name, "_curation_proposals"))) return error.InvalidCreateTableRequest;
     if (isReservedFullTextIndexName(index_name)) return error.InvalidCreateTableRequest;
 }
 
@@ -1179,7 +1243,7 @@ fn isReservedFullTextIndexName(index_name: []const u8) bool {
 }
 
 fn isReservedPublicCreateIndexName(index_name: []const u8) bool {
-    return isReservedFullTextIndexName(index_name) or
+    return (std.mem.eql(u8, index_name, "_resolver_curation") or std.mem.eql(u8, index_name, "_resolver_namespaces") or std.mem.eql(u8, index_name, "_curation_proposals")) or isReservedFullTextIndexName(index_name) or
         std.mem.eql(u8, index_name, "default");
 }
 
@@ -1282,7 +1346,13 @@ test "table contract parses create table via generated openapi type" {
     defer req.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(?u32, 1), req.num_shards);
     try std.testing.expectEqualStrings("docs", req.description.?);
-    try std.testing.expectEqualStrings(tables_api.default_indexes_json, req.indexes_json.?);
+    var indexes = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.indexes_json.?, .{});
+    defer indexes.deinit();
+    try std.testing.expectEqual(@as(usize, 1), indexes.value.object.count());
+    const default_index = indexes.value.object.get(tables_api.default_full_text_index_name).?;
+    try std.testing.expectEqualStrings(tables_api.default_full_text_index_name, default_index.object.get("name").?.string);
+    try std.testing.expectEqualStrings("full_text", default_index.object.get("type").?.string);
+    try std.testing.expect(coverage_policy.incarnation(default_index) != null);
     try std.testing.expect(std.mem.indexOf(u8, req.schema_json.?, "\"default_type\":\"doc\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req.schema_json.?, "\"version\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, req.schema_json.?, "\"version\":null") == null);
@@ -1523,6 +1593,24 @@ test "table contract rejects malformed multi-source members" {
     }
 }
 
+test "table contract retains pinned embedding identity through table and index admission and responses" {
+    const a = std.testing.allocator;
+    const identity = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const index = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"google/embeddinggemma-2\",\"api_url\":\"http://localhost:8082\",\"model_identity\":\"" ++ identity ++ "\"}}";
+    var table = try parseCreateTableRequest(a, "{\"indexes\":{\"vectors\":" ++ index ++ "}}");
+    defer table.deinit(a);
+    var catalog = try std.json.parseFromSlice(std.json.Value, a, table.indexes_json.?, .{});
+    defer catalog.deinit();
+    try std.testing.expectEqualStrings(identity, catalog.value.object.get("vectors").?.object.get("embedder").?.object.get("model_identity").?.string);
+    const normalized = try parseCreateIndexRequest(a, "vectors", index);
+    defer a.free(normalized);
+    const response = try indexes_api.encodeCreatedIndexConfig(a, "vectors", normalized);
+    defer a.free(response);
+    var created = try std.json.parseFromSlice(std.json.Value, a, response, .{});
+    defer created.deinit();
+    try std.testing.expectEqualStrings(identity, created.value.object.get("embedder").?.object.get("model_identity").?.string);
+}
+
 test "table contract public response omits unknown nested provider fields" {
     const config_json = try parseCreateIndexRequest(
         std.testing.allocator,
@@ -1548,10 +1636,10 @@ test "table contract canonicalizes generated optional null fields" {
     defer request.deinit(std.testing.allocator);
     var indexes = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, request.indexes_json.?, .{});
     defer indexes.deinit();
-    const embedding = indexes.value.object.getPtr("title_body") orelse return error.TestUnexpectedResult;
-    switch (embedding.*) {
-        .object => |*object| _ = object.swapRemove(coverage_policy.incarnation_field),
-        else => return error.TestUnexpectedResult,
+    var index_it = indexes.value.object.iterator();
+    while (index_it.next()) |entry| {
+        try std.testing.expect(coverage_policy.incarnation(entry.value_ptr.*) != null);
+        _ = entry.value_ptr.object.swapRemove(coverage_policy.incarnation_field);
     }
     try ant_json.testing.expectEqualJsonValue(
         std.testing.allocator,
@@ -1750,6 +1838,36 @@ test "table contract treats nullable nested index fields as omitted" {
     );
 }
 
+test "external lake public table contract preserves boolean stored text source" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "true", "false" }) |value| {
+        const config = try std.fmt.allocPrint(a, "{{\"type\":\"full_text\",\"field\":\"body\",\"store_source\":{s}}}", .{value});
+        defer a.free(config);
+        const body = try std.fmt.allocPrint(a, "{{\"indexes\":{{\"body_text\":{s}}}}}", .{config});
+        defer a.free(body);
+        var request = try parseCreateTableRequest(a, body);
+        defer request.deinit(a);
+        var indexes = try std.json.parseFromSlice(std.json.Value, a, request.indexes_json.?, .{});
+        defer indexes.deinit();
+        try std.testing.expectEqual(std.mem.eql(u8, value, "true"), indexes.value.object.get("body_text").?.object.get("store_source").?.bool);
+        const index = try parseCreateIndexRequest(a, "body_text", config);
+        defer a.free(index);
+        const public = try indexes_api.encodeCreatedIndexConfig(a, "body_text", index);
+        defer a.free(public);
+        var response = try std.json.parseFromSlice(std.json.Value, a, public, .{});
+        defer response.deinit();
+        try std.testing.expectEqual(std.mem.eql(u8, value, "true"), response.value.object.get("store_source").?.bool);
+    }
+    for ([_][]const u8{ "1", "\"true\"", "[]", "{}" }) |value| {
+        const config = try std.fmt.allocPrint(a, "{{\"type\":\"full_text\",\"store_source\":{s}}}", .{value});
+        defer a.free(config);
+        try std.testing.expectError(error.InvalidCreateIndexRequest, parseCreateIndexRequest(a, "body_text", config));
+        const body = try std.fmt.allocPrint(a, "{{\"indexes\":{{\"body_text\":{s}}}}}", .{config});
+        defer a.free(body);
+        try std.testing.expectError(error.InvalidCreateTableRequest, parseCreateTableRequest(a, body));
+    }
+}
+
 test "table contract rejects unsupported index kinds before admission" {
     const supported = [_][]const u8{
         "{\"indexes\":{\"search\":{\"type\":\"full_text\"}}}",
@@ -1828,11 +1946,11 @@ test "table contract maps the default alias and preserves named full-text indexe
     try std.testing.expectEqualStrings("full_text_index_v0", full_text.get("name").?.string);
     try std.testing.expectEqualStrings("full_text", full_text.get("type").?.string);
     const body_search = indexes.value.object.get("body_search").?.object;
-    try std.testing.expect(body_search.get("name") == null);
+    try std.testing.expectEqualStrings("body_search", body_search.get("name").?.string);
     try std.testing.expectEqualStrings("full_text", body_search.get("type").?.string);
     try std.testing.expectEqualStrings("body", body_search.get("field").?.string);
     const embedding = indexes.value.object.get("embed_idx").?.object;
-    try std.testing.expect(embedding.get("name") == null);
+    try std.testing.expectEqualStrings("embed_idx", embedding.get("name").?.string);
     try std.testing.expectEqualStrings("embeddings", embedding.get("type").?.string);
     try std.testing.expectEqual(@as(i64, 384), embedding.get("dimension").?.integer);
     try std.testing.expect(coverage_policy.incarnation(.{ .object = embedding }) != null);
@@ -2176,9 +2294,14 @@ test "table contract preserves named full text indexes with matching name fields
         "{\"num_shards\":1,\"indexes\":{\"search_idx\":{\"name\":\"search_idx\",\"type\":\"full_text\"},\"embed_idx\":{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"external\":true,\"dimension\":3}}}",
     );
     defer req.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.indexOf(u8, req.indexes_json.?, "\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, req.indexes_json.?, "\"search_idx\":{\"name\":\"search_idx\",\"type\":\"full_text\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, req.indexes_json.?, "\"embed_idx\"") != null);
+    var indexes = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.indexes_json.?, .{});
+    defer indexes.deinit();
+    for ([_][]const u8{ "full_text_index_v0", "search_idx", "embed_idx" }) |name| {
+        const config = indexes.value.object.get(name).?;
+        try std.testing.expectEqualStrings(name, config.object.get("name").?.string);
+        try std.testing.expectEqualStrings(if (std.mem.eql(u8, name, "embed_idx")) "embeddings" else "full_text", config.object.get("type").?.string);
+        try std.testing.expect(coverage_policy.incarnation(config) != null);
+    }
 }
 
 test "table contract preserves arbitrary public full text names in table-definition indexes" {
@@ -2309,4 +2432,73 @@ test "external lake public contract admits typed aggregate recipes and SDK optio
     var after = try std.json.parseFromSlice(std.json.Value, a, regenerated, .{});
     defer after.deinit();
     try std.testing.expectEqual(@as(usize, 2), after.value.object.get("stats").?.object.get("materializations").?.array.items.len);
+}
+
+test "external lake public full text source storage round trips boolean opt in" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "true", "false", "null" }) |value| {
+        const config = try std.fmt.allocPrint(a, "{{\"type\":\"full_text\",\"field\":\"body\",\"store_source\":{s}}}", .{value});
+        defer a.free(config);
+        const normalized = try parseCreateIndexRequest(a, "text", config);
+        defer a.free(normalized);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, normalized, .{});
+        defer parsed.deinit();
+        if (std.mem.eql(u8, value, "null")) {
+            try std.testing.expect(!parsed.value.object.contains("store_source"));
+        } else {
+            try std.testing.expectEqual(std.mem.eql(u8, value, "true"), parsed.value.object.get("store_source").?.bool);
+        }
+        // Exercise typed scalar parsing and the compatibility path used
+        // when required OpenAPI scalars such as num_shards are omitted.
+        for ([_][]const u8{ "", "\"num_shards\":1," }) |prefix| {
+            const body = try std.fmt.allocPrint(a, "{{{s}\"indexes\":{{\"text\":{s}}}}}", .{ prefix, config });
+            defer a.free(body);
+            var request = try parseCreateTableRequest(a, body);
+            defer request.deinit(a);
+            var indexes = try std.json.parseFromSlice(std.json.Value, a, request.indexes_json.?, .{});
+            defer indexes.deinit();
+            const stored = indexes.value.object.get("text").?.object.get("store_source");
+            if (std.mem.eql(u8, value, "null")) try std.testing.expect(stored == null) else try std.testing.expectEqual(std.mem.eql(u8, value, "true"), stored.?.bool);
+        }
+    }
+    for ([_][]const u8{ "\"true\"", "1", "[]", "{}" }) |value| {
+        const config = try std.fmt.allocPrint(a, "{{\"type\":\"full_text\",\"store_source\":{s}}}", .{value});
+        defer a.free(config);
+        try std.testing.expectError(error.InvalidCreateIndexRequest, parseCreateIndexRequest(a, "text", config));
+    }
+}
+
+test "external lake public compatibility normalization preserves exact schema literals and private admission" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var request = try parseCreateTableRequest(a,
+                \\{"indexes":{"text":{"type":"full_text","field":"body","store_source":null}},"schema":{"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"amount":{"type":"number","default":9007199254740993.1}}}}}}}
+            );
+            defer request.deinit(a);
+            try std.testing.expect(std.mem.indexOf(u8, request.schema_json.?, "9007199254740993.1") != null);
+            try std.testing.expect(std.mem.indexOf(u8, request.indexes_json.?, "store_source") == null);
+        }
+    };
+    try Check.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try std.testing.expectError(error.InvalidCreateTableRequest, parseCreateTableRequest(std.testing.allocator,
+        \\{"indexes":{"text":{"type":"full_text","store_source":true,"_index_incarnation":7}}}
+    ));
+}
+
+test "grouped enrichment public normalization retains typed source and finite prior policy" {
+    const a = std.testing.allocator;
+    const group = try parseArtifactEnrichmentRequest(a, "turns",
+        \\{"kind":"group","source":{"group_by":"thread","order_by":"ordinal","segment_by":"turn","field":"text","filter":{"term":{"speaker":["user","assistant"]}},"max_bytes":32768}}
+    );
+    defer a.free(group);
+    const consumer = try parseArtifactEnrichmentRequest(a, "claims",
+        \\{"kind":"asset","source_artifact_name":"turns","prior_context":{"artifact":"claims","render":"{{id}}","horizon_segments":8},"producer":{"type":"generator","config":{}}}
+    );
+    defer a.free(consumer);
+    try std.testing.expect(std.mem.indexOf(u8, group, "group_by") != null);
+    try std.testing.expect(std.mem.indexOf(u8, consumer, "prior_context") != null);
+    try std.testing.expectError(error.InvalidArtifactEnrichmentRequest, parseArtifactEnrichmentRequest(a, "turns",
+        \\{"kind":"group","source":{"group_by":"thread","order_by":"ordinal","field":"text","max_bytez":1}}
+    ));
 }

@@ -52,6 +52,9 @@ from .errors import (
     InvalidArgumentError,
     NotFoundError,
     OutcomeUnknownError,
+    ReplacementConfigurationMismatchError,
+    ReplacementFailedError,
+    ReplacementPendingError,
     StalledError,
     TxnNotFoundError,
     UnsupportedError,
@@ -83,6 +86,9 @@ __all__ = [
     "OutcomeUnknownError",
     "UnsupportedError",
     "StalledError",
+    "ReplacementFailedError",
+    "ReplacementPendingError",
+    "ReplacementConfigurationMismatchError",
     "CancelledError",
     "InternalError",
     "MIN_THREAD_STACK_SIZE",
@@ -194,6 +200,7 @@ class OpenOptions:
     remote_provider_configured: bool = False
     local_runtime_configured: bool = False
     generated_enrichment_replay: bool = False
+    models_dir: str | os.PathLike[str] | None = None
     map_size: int = 0
     ttl_cleanup: TTLCleanupOptions | None = None
     host_budget_mb: int = 0
@@ -263,6 +270,9 @@ def _build_c_options(opts: OpenOptions) -> tuple[_ffi.AntflyOpenOptions, object]
 
     flags = 0
     keep_alive: object = None
+    models_keep_alive: object = None
+    if opts.models_dir is not None:
+        c_opts.models_dir, models_keep_alive = _ffi.make_slice(os.fsencode(opts.models_dir))
     if opts.no_sync:
         flags |= _ffi.OPEN_FLAG_NO_SYNC
     if opts.remote_provider_configured:
@@ -283,7 +293,7 @@ def _build_c_options(opts: OpenOptions) -> tuple[_ffi.AntflyOpenOptions, object]
         owner_slice, keep_alive = _ffi.make_slice(encode_text(ttl.owner_id))
         c_opts.ttl_cleanup_owner_id = owner_slice
     c_opts.flags = flags
-    return c_opts, keep_alive
+    return c_opts, (keep_alive, models_keep_alive)
 
 
 def open_with_options(path: str | os.PathLike[str], options: OpenOptions) -> Database:

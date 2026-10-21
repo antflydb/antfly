@@ -203,7 +203,8 @@ pub fn appendRelationItem(
     // replay re-renders it. With no resolver configured no canonical key
     // will ever arrive, so the source keeps the owning document instead of
     // losing the edge (zig/GRAPH.md's V1 extractor-only graph). A source
-    // that matches no extraction entity keeps the legacy document source.
+    // that matches no extraction entity must provide an explicit document
+    // reference; an unbound inline mention cannot invent a document source.
     var source_table: ?[]const u8 = null;
     const source_doc = blk: {
         if (mapped_source) |value| break :blk value;
@@ -221,12 +222,11 @@ pub fn appendRelationItem(
             break :blk canonical;
         }
         // A plain-string source matching no extraction entity is an external
-        // node id; any other unresolvable shape (e.g. legacy inline endpoint
-        // objects) keeps the owning document as the source, the historical
-        // contract.
+        // node id. Inline objects must carry an explicit document reference.
         break :blk switch (source_value) {
             .string => |external| if (external.len > 0) external else doc_key,
-            else => doc_key,
+            .object => |endpoint| if (jsonStringField(.{ .object = endpoint }, "document_id") orelse jsonStringField(.{ .object = endpoint }, "doc_key") orelse jsonStringField(.{ .object = endpoint }, "key")) |explicit| explicit else return,
+            else => return,
         };
     };
     if (source_doc.len == 0) return error.InvalidGraphEdges;
@@ -317,7 +317,7 @@ pub fn appendRelationItem(
     });
 }
 
-fn renderGraphArtifactTemplateAlloc(
+pub fn renderGraphArtifactTemplateAlloc(
     alloc: Allocator,
     template_source: []const u8,
     doc_key: []const u8,
@@ -585,7 +585,23 @@ fn resolveGraphEndpointEntity(value: std.json.Value, artifact_value: std.json.Va
         .string => return findGraphArtifactEntity(artifact_value, value.string),
         .object => {
             if (jsonIntegerField(value, "entity_index")) |entity_index| return graphArtifactEntityAtIndex(artifact_value, entity_index);
-            const entity_id = jsonStringField(value, "entity_id") orelse jsonStringField(value, "id") orelse jsonStringField(value, "local_id") orelse return null;
+            const entity_id = jsonStringField(value, "entity_id") orelse jsonStringField(value, "id") orelse jsonStringField(value, "local_id") orelse {
+                const text = jsonStringField(value, "text") orelse return null;
+                if (artifact_value != .object) return null;
+                const entities = artifact_value.object.get("entities") orelse return null;
+                if (entities != .array) return null;
+                var found: ?std.json.Value = null;
+                var found_index: usize = 0;
+                for (entities.array.items, 0..) |entity, index| {
+                    const surface = jsonStringField(entity, "text") orelse continue;
+                    if (!std.mem.eql(u8, surface, text)) continue;
+                    if (found != null) return null;
+                    found = entity;
+                    found_index = index;
+                }
+                if (found != null) return graphArtifactEntityAtIndex(artifact_value, @intCast(found_index));
+                return null;
+            };
             return findGraphArtifactEntity(artifact_value, entity_id);
         },
         else => return null,
@@ -631,7 +647,7 @@ fn graphArtifactEntityAtIndex(artifact_value: std.json.Value, entity_index: i64)
         // The injected resolution map is keyed by mention local id. An
         // id-less extraction entity (GLiNER2.5's positional payloads) was
         // resolved under its decimal array position — the same identity
-        // lib/resolver's parseExtractionEntities assigns it.
+        // pkg/antfly-embedded/resolver's parseExtractionEntities assigns it.
         var buf: [20]u8 = undefined;
         const positional_id = std.fmt.bufPrint(&buf, "{d}", .{index}) catch unreachable;
         const local_id = if (raw_entity) |entity|
@@ -742,4 +758,17 @@ test "graph restore page planner owns nested templates and resumes raw ordinals 
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, F.run, .{});
+}
+
+test "graph restore text endpoints resolve unique canonical mentions and drop ambiguity" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"entities":[{"id":"e0","text":"Antfly"},{"id":"e1","text":"git"},{"id":"e2","text":"ambiguous"},{"id":"e3","text":"ambiguous"}],"_entities":{"e0":{"id":"e0","text":"Antfly","document_id":"concept/antfly"},"e1":{"id":"e1","text":"git","document_id":"concept/git"}},"endpoint":{"text":"Antfly"},"ambiguous":{"text":"ambiguous"},"unknown":{"text":"missing"}}
+    , .{});
+    defer parsed.deinit();
+    const artifact = parsed.value;
+    const endpoint = resolveGraphEndpointEntity(artifact.object.get("endpoint").?, artifact).?;
+    try std.testing.expectEqualStrings("concept/antfly", jsonEndpointDocumentId(endpoint).?);
+    try std.testing.expect(resolveGraphEndpointEntity(artifact.object.get("ambiguous").?, artifact) == null);
+    try std.testing.expect(resolveGraphEndpointEntity(artifact.object.get("unknown").?, artifact) == null);
 }

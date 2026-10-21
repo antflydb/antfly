@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const storage_engine = @import("../storage/engine_selection.zig");
 
 pub const Slice = extern struct {
     pub fn fromSlice(value: []const u8) Slice {
@@ -95,7 +96,9 @@ pub const OpenOptions = extern struct {
     // database's writer lock (ANTFLY_BUSY), like sqlite3_busy_timeout. 0
     // fails immediately.
     busy_timeout_ms: u64 = 0,
-    reserved: [8]u64 = @splat(0),
+    reserved: [6]u64 = @splat(0),
+    /// Base directory for models used by database enrichments.
+    models_dir: Slice = .{},
 };
 
 /// Options for `antfly_inference_open`. Same prefix-compatible contract as
@@ -249,9 +252,12 @@ pub const ErrorCode = enum(c_int) {
     /// succeed. See `antfly_db_run_until_idle_json`
     /// for the stuck index name and indexed/expected counters.
     stalled = 9,
-    /// The caller cancelled the call, by returning false from its progress
-    /// or stream callback.
+    /// The operation was cancelled, including a pending replacement or a
+    /// progress/stream callback returning false.
     cancelled = 10,
+    replacement_failed = 11,
+    replacement_pending = 12,
+    replacement_configuration_mismatch = 13,
     internal = 255,
 };
 
@@ -268,6 +274,9 @@ pub fn errorCodeName(code: c_int) [*:0]const u8 {
         @backingInt(ErrorCode.unsupported) => "ANTFLY_UNSUPPORTED",
         @backingInt(ErrorCode.stalled) => "ANTFLY_STALLED",
         @backingInt(ErrorCode.cancelled) => "ANTFLY_CANCELLED",
+        @backingInt(ErrorCode.replacement_failed) => "ANTFLY_REPLACEMENT_FAILED",
+        @backingInt(ErrorCode.replacement_pending) => "ANTFLY_REPLACEMENT_PENDING",
+        @backingInt(ErrorCode.replacement_configuration_mismatch) => "ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH",
         @backingInt(ErrorCode.internal) => "ANTFLY_INTERNAL",
         else => "ANTFLY_UNKNOWN_ERROR",
     };
@@ -284,21 +293,130 @@ pub fn errorCodeDescription(code: c_int) [*:0]const u8 {
         @backingInt(ErrorCode.busy) => "the requested resource is temporarily busy or changed during streaming; stabilize it and retry",
         @backingInt(ErrorCode.outcome_unknown) => "the operation was published, but crash durability could not be confirmed; inspect the destination and do not retry automatically",
         @backingInt(ErrorCode.unsupported) => "the operation requires a capability that is not supported by this platform or filesystem",
-        @backingInt(ErrorCode.stalled) => "a bounded drain made no forward progress for its configured stall window and gave up",
+        @backingInt(ErrorCode.stalled) => "derived work stalled or failed; inspect pending-work diagnostics and repair or reopen the database",
         @backingInt(ErrorCode.cancelled) => "the caller cancelled the operation",
+        @backingInt(ErrorCode.replacement_failed) => "replacement failed after its retry budget; inspect diagnostics and cancel before retrying",
+        @backingInt(ErrorCode.replacement_pending) => "index name is reserved by a pending replacement",
+        @backingInt(ErrorCode.replacement_configuration_mismatch) => "replacement configuration differs from the reserved request",
         @backingInt(ErrorCode.internal) => "an internal error occurred",
         else => "unknown Antfly error code",
     };
 }
 
+// Thread-local diagnostics, valid until the next error-returning C call.
+// Bindings must copy the detail on the same OS thread as the native call.
+threadlocal var last_error_code: ErrorCode = .ok;
+threadlocal var last_error_detail: [:0]const u8 = "";
+
+pub fn clearLastError() void {
+    if (comptime storage_engine.enabled) return antfly_storage_error_clear_v1();
+    last_error_code = .ok;
+    last_error_detail = "";
+}
+
+pub fn lastErrorDetail() [*:0]const u8 {
+    if (comptime storage_engine.enabled) return antfly_storage_error_detail_v1();
+    return last_error_detail.ptr;
+}
+
+pub fn lastErrorCode() ErrorCode {
+    if (comptime storage_engine.enabled) return antfly_storage_error_code_v1();
+    return last_error_code;
+}
+
+threadlocal var last_error_buffer: [2048]u8 = undefined;
+
+/// Copy a diagnostic before temporary request/SQL storage is released.
+pub fn recordError(code: ErrorCode, detail: []const u8) ErrorCode {
+    if (comptime storage_engine.enabled) {
+        antfly_storage_error_set_v1(code, detail.ptr, detail.len);
+        return code;
+    }
+    last_error_code = code;
+    const count = @min(detail.len, last_error_buffer.len - 1);
+    if (detail.ptr != last_error_buffer[0..].ptr) @memcpy(last_error_buffer[0..count], detail[0..count]);
+    last_error_buffer[count] = 0;
+    last_error_detail = last_error_buffer[0..count :0];
+    return code;
+}
+
+pub fn ensureError(code: ErrorCode, context: []const u8) ErrorCode {
+    if (code == .ok) {
+        clearLastError();
+        return code;
+    }
+    if (lastErrorCode() == code and std.mem.span(lastErrorDetail()).len != 0) return code;
+    return recordError(code, context);
+}
+
+pub fn mapErrorContext(err: anyerror, context: []const u8) ErrorCode {
+    const code = classifyError(err);
+    const detail = std.fmt.bufPrint(&last_error_buffer, "{s}: {s}", .{ context, @errorName(err) }) catch @errorName(err);
+    return recordError(code, detail);
+}
+
 pub fn mapError(err: anyerror) ErrorCode {
+    if (err == error.StandaloneLiteCatalogRequiresApi)
+        return mapErrorContext(err, "this Lite catalog is owned by standalone; use antfly standalone and the /db/v1 API for catalog changes");
+    const code = classifyError(err);
+    if (comptime storage_engine.enabled) return recordError(code, @errorName(err));
+    last_error_detail = @errorName(err);
+    last_error_code = code;
+    return code;
+}
+
+fn classifyError(err: anyerror) ErrorCode {
     if (err == error.GeneratedColumnRewriteRequired) return .intent_conflict;
     return switch (err) {
+        error.IndexReplacementFailed => .replacement_failed,
+        error.IndexReplacementPending => .replacement_pending,
+        error.IndexReplacementConfigurationMismatch => .replacement_configuration_mismatch,
+        error.Canceled, error.Cancelled => .cancelled,
         error.VersionConflict => .version_conflict,
+        error.StandaloneLiteCatalogRequiresApi, error.SqlFeatureNotSupported, error.UnsupportedOperation, error.UnsupportedResolverCatalogVersion, error.UnsupportedDatabaseReaderVersion => .unsupported,
         error.IntentConflict, error.DecisionConflict, error.SchemaInUse => .intent_conflict,
         error.TxnNotFound => .txn_not_found,
         error.NotFound, error.IndexNotFound, error.TableNotFound => .not_found,
+        error.InvalidGraphMetricDirection,
+        error.GraphMetricDirectionRequiresSeeds,
+        error.SyntaxError,
+        error.UnexpectedEndOfInput,
+        error.DuplicateField,
+        error.InvalidNumber,
+        error.Overflow,
+        error.InvalidUtf8,
+        error.InvalidCharacter,
+        error.InvalidPadding,
+        error.UnexpectedToken,
+        error.UnknownField,
+        error.MissingField,
+        error.InvalidEnumTag,
+        error.InvalidResolverAlias,
+        error.InvalidResolverAliasCycle,
+        error.ResolverMergeNamespaceChange,
+        error.ResolverAlreadyExists,
+        error.ResolverArtifactAlreadyExists,
+        error.ResolverLabelRoutingConflict,
+        error.ResolverReplacementOwnershipConflict,
+        error.ResolverReplacementRequiresFreshArtifacts,
+        error.ResolverSourceArtifactImmutable,
+        error.ResolverArtifactImmutable,
+        error.InvalidResolverConfig,
+        error.InvalidAdjudicationConfig,
+        error.InvalidAdjudicationDescriptions,
+        error.InvalidResolverSuppression,
+        error.InvalidResolverDistinctPair,
+        error.InvalidResolverCurationKey,
+        error.InvalidResolverCurationVersion,
+        error.InvalidResolverCurationRequest,
+        error.ResolverCurationLimitExceeded,
+        error.ResolverRedirectExists,
+        error.SuppressedResolverRedirectTarget,
+        error.ResolverDistinctPair,
+        error.ResolverIdentityActive,
+        error.EmptyEntityKey,
         error.InvalidArgument,
+        error.SqlArraySubscriptError,
         error.RelationalExpressionOverflow,
         error.RelationalExpressionDivisionByZero,
         error.RelationalExpressionBudgetExceeded,
@@ -309,6 +427,7 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.UnsupportedBatchRequestEncoding,
         error.ValueTooLong,
         error.InvalidQueryRequest,
+        error.InvalidRelationshipFilter,
         error.InvalidSchemaUpdateRequest,
         error.UnsupportedQueryRequest,
         error.UnsupportedHierarchyGrouping,
@@ -376,6 +495,11 @@ pub fn mapError(err: anyerror) ErrorCode {
         // actual bug from the caller's side of the C ABI.
         error.InvalidCreateTableRequest,
         error.UnsupportedCreateTableRequest,
+        error.InvalidIndexRequest,
+        error.InvalidIndexName,
+        error.MissingIndexName,
+        error.InvalidIndexType,
+        error.MissingIndexType,
         error.InvalidIndexConfig,
         error.InvalidEnrichmentConfig,
         error.ConflictingEnrichmentConfig,
@@ -387,6 +511,9 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.ModelNotFound,
         => .invalid_argument,
         error.FileNotFound => .not_found,
+        error.Busy,
+        error.ResolverCurationConflict,
+        error.IndexArtifactCleanupPending,
         error.WouldBlock,
         error.WriterLocked,
         error.FileBusy,
@@ -416,8 +543,14 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.InferenceRuntimeStartupFailed,
         => .unsupported,
         error.InferenceProviderCallCapacityExhausted => .busy,
-        error.DurabilityOutcomeUnknown => .outcome_unknown,
-        error.RunUntilIdleNoProgress, error.EnrichmentWaitTimeout => .stalled,
+        error.DurabilityOutcomeUnknown,
+        error.OutcomeUnknown,
+        error.WriteOutcomeUnknown,
+        error.SqlTransactionOutcomeUnknown,
+        error.SqlMutationOutcomeUnknown,
+        error.CommitDecisionUnknown,
+        => .outcome_unknown,
+        error.RunUntilIdleNoProgress, error.EnrichmentWaitTimeout, error.AsyncWorkerFailed => .stalled,
         // A dimension probe against a live embedder hit an operational
         // (network/transport) failure rather than a malformed request --
         // matches `managed_embedder.isOperationalEmbeddingProbeError`'s
@@ -437,6 +570,7 @@ test "run until idle no-progress error maps to a dedicated stalled ABI code, not
     // stall must be distinguishable at the C ABI from an opaque server fault.
     try std.testing.expectEqual(ErrorCode.stalled, mapError(error.RunUntilIdleNoProgress));
     try std.testing.expectEqual(ErrorCode.stalled, mapError(error.EnrichmentWaitTimeout));
+    try std.testing.expectEqual(ErrorCode.stalled, mapError(error.AsyncWorkerFailed));
     try std.testing.expect(ErrorCode.stalled != ErrorCode.internal);
     try std.testing.expectEqualStrings("ANTFLY_STALLED", std.mem.span(errorCodeName(@backingInt(ErrorCode.stalled))));
     try std.testing.expectEqualStrings(
@@ -457,5 +591,41 @@ test "unauthenticated Lite access to an RLS table is a nonretryable capability e
 test "bounded Lite retirement admission is retryable while uncertain publication is not" {
     try std.testing.expectEqual(ErrorCode.busy, mapError(error.LiteRetirementBacklogExceeded));
     try std.testing.expectEqual(ErrorCode.busy, mapError(error.FileBusy));
-    try std.testing.expectEqual(ErrorCode.outcome_unknown, mapError(error.OutcomeUnknown));
+    inline for (.{ error.DurabilityOutcomeUnknown, error.OutcomeUnknown, error.WriteOutcomeUnknown, error.SqlTransactionOutcomeUnknown, error.SqlMutationOutcomeUnknown, error.CommitDecisionUnknown }) |err| {
+        try std.testing.expectEqual(ErrorCode.outcome_unknown, mapError(err));
+    }
 }
+
+test "capi C ABI retains codes for generic failures and copies contextual diagnostics" {
+    clearLastError();
+    try std.testing.expectEqual(ErrorCode.busy, recordError(.busy, "SQL session limit reached"));
+    try std.testing.expectEqual(ErrorCode.busy, lastErrorCode());
+    try std.testing.expectEqualStrings("SQL session limit reached", std.mem.span(lastErrorDetail()));
+    try std.testing.expectEqual(ErrorCode.invalid_argument, mapErrorContext(error.InvalidCharacter, "scan: invalid base64 key"));
+    _ = mapErrorContext(error.InvalidArgument, "add_index: sparse must be boolean");
+    try std.testing.expectEqualStrings("add_index: sparse must be boolean: InvalidArgument", std.mem.span(lastErrorDetail()));
+    _ = ensureError(.internal, "serialization failed");
+    try std.testing.expectEqual(ErrorCode.internal, lastErrorCode());
+    clearLastError();
+    try std.testing.expectEqual(ErrorCode.ok, lastErrorCode());
+    try std.testing.expectEqualStrings("", std.mem.span(lastErrorDetail()));
+}
+
+test "capi query retry errors retain the busy ABI diagnostic" {
+    try std.testing.expectEqual(ErrorCode.busy, mapErrorContext(error.Busy, "resolver changed; retry"));
+    try std.testing.expectEqual(ErrorCode.busy, last_error_code);
+}
+
+test "capi resolver replacement preconditions have distinct ABI codes" {
+    try std.testing.expectEqual(ErrorCode.cancelled, mapError(error.Cancelled));
+    try std.testing.expectEqual(ErrorCode.cancelled, mapError(error.Canceled));
+    try std.testing.expectEqual(ErrorCode.replacement_failed, mapError(error.IndexReplacementFailed));
+    try std.testing.expectEqual(ErrorCode.replacement_pending, mapError(error.IndexReplacementPending));
+    try std.testing.expectEqual(ErrorCode.replacement_configuration_mismatch, mapError(error.IndexReplacementConfigurationMismatch));
+}
+
+// C-layout-only error state calls keep physical DB declarations out of control roots.
+extern fn antfly_storage_error_clear_v1() callconv(.c) void;
+extern fn antfly_storage_error_code_v1() callconv(.c) ErrorCode;
+extern fn antfly_storage_error_detail_v1() callconv(.c) [*:0]const u8;
+extern fn antfly_storage_error_set_v1(ErrorCode, [*]const u8, usize) callconv(.c) void;

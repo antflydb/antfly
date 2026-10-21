@@ -75,7 +75,7 @@ fn authorize(alloc: std.mem.Allocator, txn: anytype, plan: *const Plan) !publica
     var ordered = (try inventory.load(alloc, txn)) orelse return error.ArtifactCatalogDrift;
     defer ordered.deinit();
     const command = ordered.value.command;
-    if (command.binding.effect_protocol != 15 or command.binding.epoch != active.epoch or
+    if (command.binding.effect_protocol < 15 or command.binding.epoch != active.epoch or
         !std.mem.eql(u8, &command.binding.digest, &active.catalog_digest) or !std.mem.eql(u8, &command.namespace, &active.namespace)) return error.ArtifactCatalogDrift;
     const catalogs = try inventory.catalogs(txn);
     if (!std.mem.eql(u8, &catalogs.digest(), &active.catalog_digest) or !plan.matchesArtifactInventory(catalogs)) return error.ArtifactCatalogDrift;
@@ -409,7 +409,7 @@ test "ordered artifact inventory native census resumes authored inventory and re
                 try std.testing.expectEqual(@as(usize, 1), step.page.visits);
             }
         };
-        try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ &read, db.root_incarnation, pin.plan() });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ &read, db.root_incarnation, pin.plan() });
     }
     {
         var txn = try db.core.store.beginWriteTxn();

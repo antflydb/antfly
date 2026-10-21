@@ -81,6 +81,12 @@ that durable decisions and dated evidence remain distinguishable.
    `long_document: {mode: "window"}`. An unqualified checkpoint answers
    `MODEL_NOT_QUALIFIED`.
 
+   For a reproducible pull, use
+   `antfly inference pull "fastino/gliner2.5-base-v1:safetensors@54785d51df8d86a0d8f2eb212fec15871aad2c4d"`.
+   This installs a separate explicit variant; pass
+   `-extract-model "fastino/gliner2.5-base-v1:safetensors@54785d51df8d86a0d8f2eb212fec15871aad2c4d"`
+   to `dogfood ingest` and `dogfood status` when using it.
+
    In-process inference budgets (host, backend, combined, KV, scratch) are
    derived from the host memory policy the way `antfly inference run` derives
    its defaults, and can be overridden on `embedded.OpenOptions`.
@@ -225,8 +231,8 @@ What remains:
 - Entity nodes are canonical label-free `entity/<slug>` keys minted
   deterministically by the resolver (`entity/raft`); `dogfood entity`
   slugifies a bare name into that namespace. Canonical entity *documents* are minted for
-  the `entities` table by the promotion stage, which stays pending in
-  embedded Lite (no cross-table entity sink); the graph topology, mention
+  the `entities` table by the atomic promotion stage in embedded Lite;
+  `runUntilIdle` drains recursive enrichment across named tables. The graph topology, mention
   edges, and canonical keys do not depend on it.
 - Re-ingesting without `-reset` reconciles changed sections but does not
   discover deleted files (path/heading-derived keys are upsert-only);

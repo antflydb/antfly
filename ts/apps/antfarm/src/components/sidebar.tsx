@@ -393,6 +393,24 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
                   </SidebarMenuButton>
                 </SidebarMenuItem>
 
+                <SidebarMenuItem>
+                  <SidebarMenuButton
+                    asChild
+                    isActive={isPath("/inference/gateway")}
+                    tooltip="Inference gateway"
+                  >
+                    <a
+                      href="/inference/gateway"
+                      onClick={(event) => {
+                        event.preventDefault();
+                        navigate("/inference/gateway");
+                      }}
+                    >
+                      <Library className="size-4" />
+                      <span>Gateway</span>
+                    </a>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
                 <div className="px-2 py-1.5 mono-label text-sidebar-foreground/50 group-data-[collapsible=icon]:hidden">
                   Tools
                 </div>

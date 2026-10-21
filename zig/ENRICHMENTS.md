@@ -17,9 +17,19 @@ The shared direction is:
 
 ## Artifact Identity And Lookup
 
+The [model-aware media chunking](../docs/plans/model-aware-media-chunking.md)
+operation returns chunk provenance and optional embeddings together. It maps
+into existing chunk and embedding artifact families, retaining source version,
+coordinates and plan identity. Fusing inference does not bypass leader ownership,
+durable publication or readiness checks; an inference completion record alone
+does not certify database coverage. Compatible vectors enter the existing result
+cache; ordered media replay binds the retained source, model and plan before the
+normal guarded embedding publication. Chunk descriptors remain in `_chunk`
+metadata; vectors remain separate embedding artifacts.
+
 This repo has two artifact identity layers:
 
-- Internal storage keys: binary LMDB/DocStore keys. These are private
+- Internal storage keys: binary DocStore keys. These are private
   implementation details.
 - Public artifact identity: `ArtifactRef` plus an opaque `artifact_id` token.
 

@@ -350,7 +350,9 @@ for row in cursor.execute("SELECT id,name FROM people"):
 connection.close()
 ```
 
-Connections own independent native handles and use READ COMMITTED transactions.
+Connections own independent SQL sessions and use READ COMMITTED transactions.
+Compatible connections to the same canonical file path share a process storage
+owner, catalog/index caches, and maintenance worker.
 By default, the first data statement starts a transaction; `commit()` and
 `rollback()` finish it. `autocommit=True` executes statements independently.
 DDL outside an active transaction commits immediately. Closing a connection

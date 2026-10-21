@@ -13,12 +13,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub const pull_diagnostics = @import("registry/pull_diagnostics.zig");
+
 const build_options = @import("build_options");
 pub const gliner_boundary_export = @import("gliner_boundary_export.zig");
 pub const gliner_span_v2_executor = @import("extractors/gliner_span_v2_executor.zig");
 
 pub const platform = @import("antfly_platform");
 pub const backends = @import("backends/backends.zig");
+pub const hard_cancellation_watchdog = @import("hard_cancellation_watchdog.zig");
 pub const execution_control = @import("execution_control.zig");
 pub const InferenceExecutionControl = execution_control.InferenceExecutionControl;
 pub const HardCancellationWatchdog = @import("hard_cancellation_watchdog.zig").HardCancellationWatchdog;
@@ -46,7 +49,11 @@ pub const server = struct {
     pub const model_manager = @import("server/model_manager.zig");
 };
 pub const pipelines = struct {
+    pub const image = @import("pipelines/image.zig");
+    pub const media_chunking = @import("pipelines/media_chunking.zig");
     pub const embedding_gemma2 = @import("pipelines/embedding_gemma2.zig");
+    pub const embedding_gemma2_video = @import("pipelines/embedding_gemma2_video.zig");
+    pub const audio = @import("pipelines/audio.zig");
     pub const embedding = @import("pipelines/embedding.zig");
     pub const gliner = @import("pipelines/gliner.zig");
     pub const extraction_schema = @import("pipelines/extraction_schema.zig");
@@ -54,6 +61,24 @@ pub const pipelines = struct {
     pub const gliner_boundary_pipeline = @import("pipelines/gliner_boundary_pipeline.zig");
 };
 pub const finetune = struct {
+    pub const embedding_gemma2_job = @import("finetune/embedding_gemma2_job.zig");
+    pub const embedding_gemma2_runner = @import("finetune/embedding_gemma2_runner.zig");
+    pub const embedding_gemma2_data = @import("finetune/embedding_gemma2_data.zig");
+    pub const embedding_gemma2_batch = @import("finetune/embedding_gemma2_batch.zig");
+    pub const embedding_gemma2_loss = @import("finetune/embedding_gemma2_loss.zig");
+    pub const embedding_gemma2_training = @import("finetune/embedding_gemma2_training.zig");
+    pub const embedding_gemma2_graph = @import("finetune/embedding_gemma2_graph.zig");
+    pub const embedding_gemma2_real_autodiff = @import("finetune/embedding_gemma2_real_autodiff.zig");
+    pub const embedding_gemma2_cuda = @import("finetune/embedding_gemma2_cuda.zig");
+    pub const embedding_gemma2_cuda_session = @import("finetune/embedding_gemma2_cuda_session.zig");
+    pub const embedding_gemma2_cuda_objective = @import("finetune/embedding_gemma2_cuda_objective.zig");
+    pub const embedding_gemma2_cuda_encoder = @import("finetune/embedding_gemma2_cuda_encoder.zig");
+    pub const embedding_gemma2_cuda_tape = @import("finetune/embedding_gemma2_cuda_tape.zig");
+    pub const embedding_gemma2_cuda_projection = @import("finetune/embedding_gemma2_cuda_projection.zig");
+    pub const embedding_gemma2_cuda_attention = @import("finetune/embedding_gemma2_cuda_attention.zig");
+    pub const embedding_gemma2_export = @import("finetune/embedding_gemma2_export.zig");
+    pub const embedding_gemma2_checkpoint = @import("finetune/embedding_gemma2_checkpoint.zig");
+    pub const embedding_gemma2_adapter_state = @import("finetune/embedding_gemma2_adapter_state.zig");
     pub const laya_job = @import("finetune/laya/job.zig");
     pub const laya_evaluate = @import("finetune/laya/evaluate.zig");
     pub const gliner_boundary_training_source = @import("finetune/gliner/boundary_training_source.zig");
@@ -99,7 +124,10 @@ pub const finetune = struct {
     pub const runners = @import("finetune/runners.zig");
     pub const tokenizer_batch = @import("finetune/tokenizer_batch.zig");
 };
+pub const RunPermit = @import("backends/session.zig").RunPermit;
+pub const antfly_image = @import("antfly_image");
 pub const architectures = struct {
+    pub const gemma4_projector = @import("architectures/gemma4_projector.zig");
     pub const gliner_boundary_engine = @import("architectures/gliner/boundary_engine.zig");
     pub const gliner_boundary_request_device = @import("architectures/gliner/boundary_request_device.zig");
     pub const gliner_boundary_head = @import("architectures/gliner/boundary_head.zig");
@@ -121,6 +149,7 @@ pub const architectures = struct {
     pub const gliner_head_graph = @import("architectures/gliner_head_graph.zig");
 };
 pub const models = struct {
+    pub const embedding_gemma2 = @import("models/embedding_gemma2.zig");
     pub const gliner_decide_qualification = @import("models/gliner_decide_qualification.zig");
     pub const tensor_store = @import("models/tensor_store.zig");
     pub const manifest = @import("models/manifest.zig");
@@ -138,6 +167,7 @@ pub const native_compute = struct {
     pub const native = @import("ops/native_compute.zig");
     pub const gpu_hosted_store = @import("ops/gpu_hosted_store.zig");
     pub const metal = if (build_options.enable_metal) @import("ops/metal_compute.zig") else struct {};
+    pub const cuda_video = @import("ops/cuda/video.zig");
     pub const cuda = if (build_options.enable_cuda) @import("ops/cuda/cuda_compute.zig") else struct {};
     pub const wasm = if (build_options.enable_wasm) @import("ops/wasm_compute.zig") else struct {};
 };
@@ -146,7 +176,24 @@ pub const gguf = struct {
     pub const tensor_types = @import("gguf/tensor_types.zig");
 };
 
+// This root also owns the focused test-video-model gate; external module tests
+// are not collected merely by importing a namespace from a separate test root.
+test "embeddinggemma2 video module declarations" {
+    _ = pipelines.embedding_gemma2;
+    _ = pipelines.embedding_gemma2_video;
+    if (build_options.enable_metal) _ = native_compute.metal;
+}
+
 test "GLiNER Decide artifact test reachability" {
     _ = models.gliner_decide_qualification;
     _ = models.tensor_store;
+}
+
+test "model aware media module declarations" {
+    _ = pipelines.media_chunking;
+    _ = @import("backends/admitted_allocator.zig");
+}
+
+test "model aware media audio projector declarations" {
+    _ = @import("architectures/gemma4_projector.zig");
 }

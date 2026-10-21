@@ -29,6 +29,18 @@ const Compiled = Graph.CompiledPatternFilter;
 /// request allocator is an arena. Each slot uses a fixed buffer, not an arena
 /// whose freed objects would remain resident in the request's parent arena.
 pub const LiveRowsCache = struct {
+    const decoded = @import("lake_index_decoded_metadata.zig");
+    const FileSlot = struct {
+        digest: [32]u8 = @splat(0),
+        group: ?corpus.FileGroup = null,
+        row_count: u64 = 0,
+        shared: ?decoded.Owned(corpus.FileGroup) = null,
+        used: u64 = 0,
+        fn clear(self: *@This()) void {
+            if (self.shared) |owned| owned.release();
+            self.* = .{};
+        }
+    };
     const slot_bytes = 1024 * 1024;
     const Slot = struct {
         buffer: ?[]u8 = null,
@@ -38,11 +50,39 @@ pub const LiveRowsCache = struct {
         used: u64 = 0,
         byte_len: u64 = 0,
     };
+    /// Stable cache owner; callers may use a different scratch arena per seek.
+    backing: ?A = null,
+    files: [4]FileSlot = @splat(.{}),
     slots: [4]Slot = @splat(.{}),
     clock: u64 = 0,
     pub fn deinit(self: *@This(), a: A) void {
-        for (&self.slots) |*slot| if (slot.buffer) |buffer| a.free(buffer);
+        for (&self.files) |*entry| entry.clear();
+        for (&self.slots) |*slot| if (slot.buffer) |buffer| (self.backing orelse a).free(buffer);
         self.* = .{};
+    }
+    fn file(self: *@This(), store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, ref: local.serverless_manifest_artifact_ref.ArtifactRef) !*const FileSlot {
+        try cached.context.ensureActive();
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update(&cached.scope);
+        hash.update(ref.artifact_id);
+        hash.update(ref.checksum);
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        self.clock += 1;
+        var victim: *FileSlot = &self.files[0];
+        for (&self.files) |*slot| {
+            if (slot.group != null and std.mem.eql(u8, &slot.digest, &digest)) {
+                slot.used = self.clock;
+                return slot;
+            }
+            if (slot.used < victim.used) victim = slot;
+        }
+        victim.clear();
+        const owned = try decoded.acquire(corpus.FileGroup, cached, store, ref, .none, corpus.loadCachedFile);
+        errdefer owned.release();
+        const count = try corpus.physical.validate(owned.value.rows);
+        victim.* = .{ .digest = digest, .group = owned.value.*, .row_count = count, .shared = owned, .used = self.clock };
+        return victim;
     }
     fn load(self: *@This(), a: A, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, block: corpus.physical.Block) !*const Bitmap {
         const ref = block.bitmap orelse return error.InvalidNativeLakeTextCorpus;
@@ -60,7 +100,11 @@ pub const LiveRowsCache = struct {
             }
             if (slot.used < victim.used) victim = slot;
         }
-        if (victim.buffer == null) victim.buffer = try a.alloc(u8, slot_bytes);
+        if (victim.buffer == null) {
+            const backing = self.backing orelse a;
+            victim.buffer = try backing.alloc(u8, slot_bytes);
+            self.backing = backing;
+        }
         victim.fixed = .init(victim.buffer.?);
         victim.bitmap = null;
         victim.used = 0;
@@ -81,17 +125,109 @@ pub const LiveRowsCache = struct {
 /// Version 8 maps compressed physical rows directly to pinned native ordinals.
 /// Directory storage scales with files/groups/blocks and compressed delete holes.
 pub const Identities = struct {
-    const Span = struct { lower: u32, upper: u32, rows: []const corpus.physical.Block };
+    const Span = struct {
+        lower: u32,
+        upper: u32,
+        rows: []const corpus.physical.Block,
+        intervals: []const Mapping = &.{},
+        manifest: ?local.serverless_manifest_artifact_ref.ArtifactRef = null,
+        expected_rows: ?u32 = null,
+        const Mapping = struct { file_lower: u32, lower: u32, upper: u32 };
+        fn localOrdinal(self: @This(), ordinal_value: u32) ?u32 {
+            if (self.intervals.len == 0) return if (ordinal_value < self.upper - self.lower) self.lower + ordinal_value else null;
+            var lo: usize = 0;
+            var hi = self.intervals.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const interval = self.intervals[mid];
+                if (@as(u64, interval.file_lower) + interval.upper - interval.lower <= ordinal_value) lo = mid + 1 else hi = mid;
+            }
+            if (lo == self.intervals.len or ordinal_value < self.intervals[lo].file_lower) return null;
+            return self.intervals[lo].lower + ordinal_value - self.intervals[lo].file_lower;
+        }
+        fn original(self: @This(), ordinal_value: u32) !u32 {
+            if (ordinal_value < self.lower or ordinal_value >= self.upper) return error.InvalidNativeLakeTextCorpus;
+            if (self.intervals.len == 0) return ordinal_value - self.lower;
+            var lo: usize = 0;
+            var hi = self.intervals.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (self.intervals[mid].upper <= ordinal_value) lo = mid + 1 else hi = mid;
+            }
+            if (lo == self.intervals.len) return error.InvalidNativeLakeTextCorpus;
+            const interval = self.intervals[lo];
+            return interval.file_lower + ordinal_value - interval.lower;
+        }
+        fn addRange(self: @This(), result: *Bitmap, lower: u32, upper: u64) !void {
+            if (self.intervals.len == 0) return result.addRange(try std.math.add(u32, self.lower, lower), @as(u64, self.lower) + upper);
+            for (self.intervals) |interval| {
+                const start = @max(lower, interval.file_lower);
+                const end = @min(upper, @as(u64, interval.file_lower) + interval.upper - interval.lower);
+                if (start < end) try result.addRange(interval.lower + start - interval.file_lower, @as(u64, interval.lower) + end - interval.file_lower);
+            }
+        }
+        fn addBitmap(self: @This(), a: A, result: *Bitmap, bitmap: *const Bitmap) !void {
+            if (self.intervals.len == 0) {
+                var shifted = try bitmap.addOffset(self.lower);
+                defer shifted.deinit();
+                return result.orWith(&shifted);
+            }
+            for (self.intervals) |interval| {
+                var ranks = try bitmap.sliceRebased(a, interval.file_lower, @as(u64, interval.file_lower) + interval.upper - interval.lower);
+                defer ranks.deinit();
+                var shifted = try ranks.addOffset(interval.lower);
+                defer shifted.deinit();
+                try result.orWith(&shifted);
+            }
+        }
+        /// Invert only one physical block at a time, including sparse segment
+        /// intervals. A broad file must not create a file-sized bitmap copy.
+        fn fileRanks(self: @This(), a: A, selected: *const Bitmap, lower: u32, upper: u64) !Bitmap {
+            if (self.intervals.len == 0) return selected.sliceRebased(a, try std.math.add(u32, self.lower, lower), @as(u64, self.lower) + upper);
+            var result = Bitmap.init(a);
+            errdefer result.deinit();
+            var lo: usize = 0;
+            var hi = self.intervals.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const interval = self.intervals[mid];
+                if (@as(u64, interval.file_lower) + interval.upper - interval.lower <= lower) lo = mid + 1 else hi = mid;
+            }
+            for (self.intervals[lo..]) |interval| {
+                if (interval.file_lower >= upper) break;
+                const start = @max(lower, interval.file_lower);
+                const end = @min(upper, @as(u64, interval.file_lower) + interval.upper - interval.lower);
+                if (start >= end) continue;
+                var ranks = try selected.sliceRebased(a, interval.lower + start - interval.file_lower, @as(u64, interval.lower) + end - interval.file_lower);
+                defer ranks.deinit();
+                var shifted = try ranks.addOffset(start - lower);
+                defer shifted.deinit();
+                try result.orWith(&shifted);
+            }
+            return result;
+        }
+        fn blocks(self: @This(), cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, file_id: []const u8) ![]const corpus.physical.Block {
+            const ref = self.manifest orelse return self.rows;
+            const held = try cache.file(store, cached, ref);
+            const group = held.group.?;
+            if (!std.mem.eql(u8, group.file.id, file_id) or held.row_count != (self.expected_rows orelse self.upper - self.lower)) return error.InvalidNativeLakeTextCorpus;
+            return group.rows;
+        }
+    };
     const FileSpan = struct { file: []const u8, span: Span };
+    partial_inventory: bool = false,
     files: std.StringHashMapUnmanaged(Span) = .empty,
     spans: []const FileSpan = &.{},
     offsets: []const u32,
+    segment_ids: []const [32]u8 = &.{},
+    tie_rank: ?local.search_scorer.TieRank = null,
     pub fn init(a: A, root: corpus.Root, snapshot: *const local.index.IndexSnapshot) !Identities {
         if (root.version != corpus.metadata_version or (root.file_groups.len == 0 and snapshot.segments.len != 0)) return error.InvalidNativeLakeTextCorpus;
         const offsets = try a.alloc(u32, snapshot.segments.len + 1);
         offsets[0] = 0;
         for (snapshot.segments, 0..) |segment, i| offsets[i + 1] = try std.math.add(u32, offsets[i], segment.reader.doc_count);
-        var result: Identities = .{ .offsets = offsets };
+        for (root.file_groups) |group| if (group.sources.len != 0) return initPacked(a, root, snapshot, offsets);
+        var result: Identities = .{ .offsets = offsets, .partial_inventory = root.partial_inventory };
         const spans = try a.alloc(FileSpan, root.file_groups.len);
         var segment: usize = 0;
         for (root.file_groups, 0..) |group, group_index| {
@@ -100,38 +236,183 @@ pub const Identities = struct {
             if (segment > snapshot.segments.len) return error.InvalidNativeLakeTextCorpus;
             const entry = try result.files.getOrPut(a, try a.dupe(u8, group.file.id));
             if (entry.found_existing) return error.InvalidNativeLakeTextCorpus;
-            if (try corpus.physical.validate(group.rows) != offsets[segment] - offsets[start]) return error.InvalidNativeLakeTextCorpus;
+            if (group.selected.len == 0 and root.routing.len == 0 and try corpus.physical.validate(group.rows) != offsets[segment] - offsets[start]) return error.InvalidNativeLakeTextCorpus;
             const physical_rows = try a.dupe(corpus.physical.Block, group.rows);
             for (physical_rows) |*block| if (block.bitmap) |*ref| {
                 ref.artifact_id = try a.dupe(u8, ref.artifact_id);
                 ref.checksum = try a.dupe(u8, ref.checksum);
             };
             entry.value_ptr.* = .{ .lower = offsets[start], .upper = offsets[segment], .rows = physical_rows };
+            if (group.selected.len != 0) {
+                if (group.selected.len != group.segments.len) return error.InvalidNativeLakeTextCorpus;
+                const intervals = try a.alloc(Span.Mapping, group.selected.len);
+                for (intervals, group.selected, 0..) |*interval, source, index| {
+                    if (source.count != offsets[start + index + 1] - offsets[start + index]) return error.InvalidNativeLakeTextCorpus;
+                    interval.* = .{ .file_lower = source.lower, .lower = offsets[start + index], .upper = offsets[start + index + 1] };
+                }
+                entry.value_ptr.intervals = intervals;
+            } else if (root.routing.len != 0) {
+                const ref = group.physical_manifest orelse root.manifests[group_index];
+                entry.value_ptr.manifest = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = try a.dupe(u8, ref.artifact_id), .checksum = try a.dupe(u8, ref.checksum), .byte_len = ref.byte_len };
+            }
             spans[group_index] = .{ .file = entry.key_ptr.*, .span = entry.value_ptr.* };
         }
         if (segment != snapshot.segments.len) return error.InvalidNativeLakeTextCorpus;
         result.spans = spans;
         return result;
     }
+    const TieContext = struct {
+        spans: []const FileSpan,
+        file_ranks: []const u32,
+        file_count: usize,
+        archive_docs: u32,
+        fn rank(raw: *const anyopaque, doc: u32) u64 {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (doc >= self.archive_docs) return (@as(u64, self.file_count) << 32) | (doc - self.archive_docs);
+            var lo: usize = 0;
+            var hi = self.spans.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (self.spans[mid].span.upper <= doc) lo = mid + 1 else hi = mid;
+            }
+            if (lo == self.spans.len) return std.math.maxInt(u64);
+            const item = self.spans[lo];
+            return (@as(u64, self.file_ranks[lo]) << 32) | (item.span.original(doc) catch return std.math.maxInt(u64));
+        }
+    };
+    fn initPacked(a: A, root: corpus.Root, snapshot: *const local.index.IndexSnapshot, offsets: []const u32) !Identities {
+        var result: Identities = .{ .offsets = offsets, .partial_inventory = root.partial_inventory };
+        const Mapping = Span.Mapping;
+        var mappings: std.StringHashMapUnmanaged(std.ArrayList(Mapping)) = .empty;
+        defer {
+            var it = mappings.valueIterator();
+            while (it.next()) |v| v.deinit(std.heap.page_allocator);
+            mappings.deinit(std.heap.page_allocator);
+        }
+        var spans: std.ArrayList(FileSpan) = .empty;
+        var segment: usize = 0;
+        for (root.file_groups) |group| {
+            if (group.sources.len == 0 or group.segments.len != 1 or segment >= snapshot.segments.len) return error.InvalidNativeLakeTextCorpus;
+            try corpus.source_spans.validate(group.sources, snapshot.segments[segment].reader.doc_count, root.domain);
+            for (group.sources) |source| {
+                const owned = try std.json.Stringify.valueAlloc(a, source, .{});
+                defer a.free(owned);
+                const src = try std.json.parseFromSliceLeaky(corpus.source_spans.Span, a, owned, .{ .allocate = .alloc_always });
+                const lower = try std.math.add(u32, offsets[segment], src.pack_lower);
+                const upper = try std.math.add(u32, lower, src.count);
+                const mapping = try a.dupe(Mapping, &.{.{ .file_lower = src.file_lower, .lower = lower, .upper = upper }});
+                const ref: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = src.physical.artifact_id, .checksum = src.physical.checksum, .byte_len = src.physical.byte_len };
+                const span: Span = .{ .lower = lower, .upper = upper, .rows = &.{}, .intervals = mapping, .manifest = ref, .expected_rows = src.file_rows };
+                try spans.append(a, .{ .file = src.file.id, .span = span });
+                const entry = try result.files.getOrPut(a, src.file.id);
+                if (!entry.found_existing) entry.value_ptr.* = span else {
+                    const old = entry.value_ptr;
+                    if (old.expected_rows != span.expected_rows or !std.mem.eql(u8, old.manifest.?.artifact_id, span.manifest.?.artifact_id)) return error.InvalidNativeLakeTextCorpus;
+                    old.lower = @min(old.lower, lower);
+                    old.upper = @max(old.upper, upper);
+                }
+                const list = try mappings.getOrPut(std.heap.page_allocator, src.file.id);
+                if (!list.found_existing) list.value_ptr.* = .empty;
+                try list.value_ptr.append(std.heap.page_allocator, mapping[0]);
+            }
+            segment += 1;
+        }
+        if (segment != snapshot.segments.len) return error.InvalidNativeLakeTextCorpus;
+        var it = mappings.iterator();
+        while (it.next()) |entry| {
+            std.mem.sort(Mapping, entry.value_ptr.items, {}, struct {
+                fn less(_: void, l: Mapping, r: Mapping) bool {
+                    return l.file_lower < r.file_lower;
+                }
+            }.less);
+            for (entry.value_ptr.items, 0..) |m, i| if (i != 0 and @as(u64, entry.value_ptr.items[i - 1].file_lower) + entry.value_ptr.items[i - 1].upper - entry.value_ptr.items[i - 1].lower > m.file_lower) return error.InvalidNativeLakeTextCorpus;
+            result.files.getPtr(entry.key_ptr.*).?.intervals = try a.dupe(Mapping, entry.value_ptr.items);
+        }
+        result.spans = try spans.toOwnedSlice(a);
+        const hashes = try a.alloc([32]u8, result.files.count());
+        var keys = result.files.keyIterator();
+        for (hashes) |*hash| hash.* = corpus.term_directory.identity(keys.next().?.*);
+        std.mem.sort([32]u8, hashes, {}, struct {
+            fn less(_: void, l: [32]u8, r: [32]u8) bool {
+                return std.mem.order(u8, &l, &r) == .lt;
+            }
+        }.less);
+        const tie = try a.create(TieContext);
+        const ranks = try a.alloc(u32, result.spans.len);
+        for (result.spans, ranks) |item, *rank| {
+            const id = corpus.term_directory.identity(item.file);
+            var lo: usize = 0;
+            var hi = hashes.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (std.mem.order(u8, &hashes[mid], &id) == .lt) lo = mid + 1 else hi = mid;
+            }
+            rank.* = @intCast(lo);
+        }
+        a.free(hashes);
+        tie.* = .{ .spans = result.spans, .file_ranks = ranks, .file_count = result.files.count(), .archive_docs = offsets[segment] };
+        result.tie_rank = .{ .ptr = tie, .rank = TieContext.rank };
+        return result;
+    }
+    /// Stable logical ranking position shares predicate/hydration translation.
+    /// Admission and physical packing must never define the public tie order.
+    pub fn logicalPosition(self: Identities, ordinal_value: u32) !@import("lake_index_text_directory.zig").Position {
+        var lo: usize = 0;
+        var hi = self.spans.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.spans[mid].span.upper <= ordinal_value) lo = mid + 1 else hi = mid;
+        }
+        if (lo == self.spans.len) return error.InvalidNativeLakeTextCorpus;
+        const item = self.spans[lo];
+        return .{ .file = corpus.term_directory.identity(item.file), .rank = try item.span.original(ordinal_value) };
+    }
+    /// Translate a query-wide compressed physical tombstone set into just the
+    /// admitted native window. Keep each temporary bitmap within one 2^20 block.
+    pub fn bitmapForPhysical(self: Identities, a: A, selected: *const @import("lake_index_physical_set.zig").Set, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead) !Bitmap {
+        var result = Bitmap.init(a);
+        errdefer result.deinit();
+        var cache: LiveRowsCache = .{ .backing = a };
+        defer cache.deinit(a);
+        var file_it = self.files.iterator();
+        while (file_it.next()) |entry| {
+            const item: FileSpan = .{ .file = entry.key_ptr.*, .span = entry.value_ptr.* };
+            const selected_blocks = selected.files.getPtr(item.file) orelse continue;
+            for (try item.span.blocks(&cache, store, cached, item.file)) |block| {
+                try cached.context.ensureActive();
+                const physical_base = block.high << corpus.physical.shift;
+                const bitmap = selected_blocks.getPtr(.{ .group = block.group, .high = @intCast(physical_base >> 32) }) orelse continue;
+                const lower: u32 = @truncate(physical_base);
+                var sliced = try bitmap.sliceRebased(a, lower, @as(u64, lower) + (1 << corpus.physical.shift));
+                defer sliced.deinit();
+                if (!sliced.isEmpty()) try self.addBlock(a, a, &cache, store, cached, .{ .file = item.file, .group = block.group, .base = physical_base, .selection = .{ .bitmap = sliced } }, &result);
+            }
+        }
+        return result;
+    }
     fn liveRows(a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, block: corpus.physical.Block) !*const Bitmap {
         return cache.load(a, store, cached, block);
     }
     fn addBlock(self: Identities, a: A, temporary: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, selected: @import("lake_index_predicate_blocks.zig").Block, result: *Bitmap) !void {
-        const file = self.files.get(selected.file) orelse return error.ExternalLakeSnapshotMismatch;
-        const index = corpus.physical.find(file.rows, selected.group, selected.base) orelse return;
-        const block = file.rows[index];
-        const base = try std.math.add(u32, file.lower, block.base);
+        const file = self.files.get(selected.file) orelse {
+            if (self.partial_inventory) return;
+            return error.ExternalLakeSnapshotMismatch;
+        };
+        const blocks = try file.blocks(cache, store, cached, selected.file);
+        const index = corpus.physical.find(blocks, selected.group, selected.base) orelse return;
+        const block = blocks[index];
+        const base = block.base;
         switch (selected.selection) {
             .interval => |span| {
                 if (block.bitmap != null) {
                     const live = try liveRows(a, cache, store, cached, block);
                     const lower: u32 = @intCast(live.rank(span.lower));
                     const upper: u32 = @intCast(live.rank(span.lower + span.count));
-                    try result.addRange(try std.math.add(u32, base, lower), @as(u64, base) + upper);
+                    try file.addRange(result, try std.math.add(u32, base, lower), @as(u64, base) + upper);
                 } else {
                     const lower = @max(span.lower, block.lower);
                     const upper = @min(span.lower + span.count, block.lower + block.count);
-                    if (upper > lower) try result.addRange(try std.math.add(u32, base, lower - block.lower), @as(u64, base) + upper - block.lower);
+                    if (upper > lower) try file.addRange(result, try std.math.add(u32, base, lower - block.lower), @as(u64, base) + upper - block.lower);
                 }
             },
             .bitmap => |bitmap| {
@@ -141,7 +422,7 @@ pub const Identities = struct {
                     const live = try liveRows(a, cache, store, cached, block);
                     intersection.andWith(live);
                     var iterator = intersection.iterator();
-                    while (iterator.next()) |row| try result.add(try std.math.add(u32, base, @intCast(live.rank(row))));
+                    while (iterator.next()) |row| if (file.localOrdinal(try std.math.add(u32, base, @intCast(live.rank(row))))) |ordinal_value| try result.add(ordinal_value);
                 } else {
                     var extent = Bitmap.init(temporary);
                     defer extent.deinit();
@@ -149,7 +430,7 @@ pub const Identities = struct {
                     intersection.andWith(&extent);
                     var shifted = try intersection.addOffset(base -% block.lower);
                     defer shifted.deinit();
-                    try result.orWith(&shifted);
+                    try file.addBitmap(temporary, result, &shifted);
                 }
             },
         }
@@ -157,9 +438,117 @@ pub const Identities = struct {
     pub fn ordinal(self: Identities, a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, row: local.storage_rowsource_types.RowRef) !?u32 {
         if (row != .external) return error.InvalidNativeLakeRowIndex;
         const ref = row.external;
-        const span = self.files.get(ref.file_id) orelse return error.ExternalLakeSnapshotMismatch;
-        const index = corpus.physical.find(span.rows, ref.row_group_ordinal, ref.row_ordinal) orelse return null;
-        const block = span.rows[index];
+        const span = self.files.get(ref.file_id) orelse {
+            if (self.partial_inventory) return null;
+            return error.ExternalLakeSnapshotMismatch;
+        };
+        return span.localOrdinal((try sourceRank(a, cache, store, cached, span, row)) orelse return null);
+    }
+    pub fn sourceOrdinal(a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, physical: @import("lake_index_aggregate_artifact.zig").ChunkRef, count: u32, row: local.storage_rowsource_types.RowRef) !?u32 {
+        const span: Span = .{ .lower = 0, .upper = count, .rows = &.{}, .manifest = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = physical.artifact_id, .checksum = physical.checksum, .byte_len = physical.byte_len }, .expected_rows = count };
+        return sourceRank(a, cache, store, cached, span, row);
+    }
+    pub const SourceBounds = struct { lower: u32, upper: u32 };
+    /// Conservative rank bounds from compressed physical selections. Deleted
+    /// endpoints can widen a proof but can never exclude a matching live row.
+    pub fn sourceBounds(a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, physical: @import("lake_index_aggregate_artifact.zig").ChunkRef, count: u32, selected: *const PhysicalSet, file_id: []const u8) !?SourceBounds {
+        const span: Span = .{ .lower = 0, .upper = count, .rows = &.{}, .manifest = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = physical.artifact_id, .checksum = physical.checksum, .byte_len = physical.byte_len }, .expected_rows = count };
+        const chosen = selected.files.getPtr(file_id) orelse return null;
+        var bounds: ?SourceBounds = null;
+        const blocks = try span.blocks(cache, store, cached, file_id);
+        var selections = chosen.iterator();
+        while (selections.next()) |selection| {
+            const key = selection.key_ptr.*;
+            const first_high = @as(u64, key.high) << (32 - corpus.physical.shift);
+            const after_high = (@as(u64, key.high) + 1) << (32 - corpus.physical.shift);
+            var lower: usize = 0;
+            var upper = blocks.len;
+            while (lower < upper) {
+                const mid = lower + (upper - lower) / 2;
+                if (blocks[mid].group < key.group or (blocks[mid].group == key.group and blocks[mid].high < first_high)) lower = mid + 1 else upper = mid;
+            }
+            for (blocks[lower..]) |block| {
+                if (block.group != key.group or block.high >= after_high) break;
+                try cached.context.ensureActive();
+                const base = block.high << corpus.physical.shift;
+                const bitmap = selection.value_ptr;
+                const offset: u32 = @truncate(base);
+                try bitmap.prepareRead();
+                const first = bitmap.rank(offset + block.lower);
+                const last = bitmap.rank(@intCast(@as(u64, offset) + (1 << corpus.physical.shift) - 1)) + @intFromBool(bitmap.contains(@intCast(@as(u64, offset) + (1 << corpus.physical.shift) - 1)));
+                if (first == last) continue;
+                const low = bitmap.read_rank.?.select(first).? - offset;
+                const high = bitmap.read_rank.?.select(last - 1).? - offset;
+                const ranks: SourceBounds = if (block.bitmap != null) deleted: {
+                    const live = try liveRows(a, cache, store, cached, block);
+                    break :deleted .{ .lower = block.base + @as(u32, @intCast(live.rank(low))), .upper = block.base + @as(u32, @intCast(live.rank(high + 1))) };
+                } else .{ .lower = block.base + @min(block.count, low - block.lower), .upper = block.base + @min(block.count, high - block.lower + 1) };
+                if (ranks.lower == ranks.upper) continue;
+                if (bounds) |*value| {
+                    value.lower = @min(value.lower, ranks.lower);
+                    value.upper = @max(value.upper, ranks.upper);
+                } else bounds = ranks;
+            }
+        }
+        return bounds;
+    }
+    /// Test a pack span using rank/select and bitmap range cardinality. Work is
+    /// proportional to immutable blocks/spans, never to matching row count.
+    pub fn sourceRangeSelected(a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, physical: @import("lake_index_aggregate_artifact.zig").ChunkRef, count: u32, selected: *const PhysicalSet, file_id: []const u8, lower: u32, length: u32, work: *usize) !bool {
+        const span: Span = .{ .lower = 0, .upper = count, .rows = &.{}, .manifest = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = physical.artifact_id, .checksum = physical.checksum, .byte_len = physical.byte_len }, .expected_rows = count };
+        const chosen = selected.files.getPtr(file_id) orelse return false;
+        const upper = @as(u64, lower) + length;
+        const blocks = try span.blocks(cache, store, cached, file_id);
+        var first_block: usize = 0;
+        var end_block = blocks.len;
+        while (first_block < end_block) {
+            const mid = first_block + (end_block - first_block) / 2;
+            if (@as(u64, blocks[mid].base) + blocks[mid].count <= lower) first_block = mid + 1 else end_block = mid;
+        }
+        for (blocks[first_block..]) |block| {
+            try cached.context.ensureActive();
+            if (work.* == 65536) return error.QueryCandidateBudgetExceeded;
+            work.* += 1;
+            if (@as(u64, block.base) + block.count <= lower) continue;
+            if (block.base >= upper) break;
+            const base = block.high << corpus.physical.shift;
+            const bitmap = chosen.getPtr(.{ .group = block.group, .high = @intCast(base >> 32) }) orelse continue;
+            const first = @max(lower, block.base) - block.base;
+            const last: u32 = @intCast(@min(upper, @as(u64, block.base) + block.count) - block.base);
+            const extent = if (block.bitmap != null) deleted: {
+                const live = try liveRows(a, cache, store, cached, block);
+                break :deleted SourceBounds{ .lower = live.read_rank.?.select(first).?, .upper = live.read_rank.?.select(last - 1).? + 1 };
+            } else SourceBounds{ .lower = block.lower + first, .upper = block.lower + last };
+            const offset: u32 = @truncate(base);
+            if (bitmap.rangeCardinality(offset + extent.lower, @as(u64, offset) + extent.upper) == 0) continue;
+            if (block.bitmap == null) return true;
+            const live = try liveRows(a, cache, store, cached, block);
+            var navigation = bitmap.iterator();
+            var target: u64 = extent.lower;
+            while (target < extent.upper) {
+                try cached.context.ensureActive();
+                if (work.* == 65536) return error.QueryCandidateBudgetExceeded;
+                work.* += 1;
+                const next = navigation.seekTo(offset + @as(u32, @intCast(target))) orelse break;
+                target = next - offset;
+                if (target >= extent.upper) break;
+                // Physical blocks are aligned to whole words. Intersect the
+                // two borrowed coordinate systems directly, without bitmap
+                // copies or allocation inside a non-fallible set operation.
+                const word = bitmap.wordMask(next) & live.wordMask(@intCast(target)) &
+                    (@as(u64, std.math.maxInt(u64)) << @as(u6, @truncate(target)));
+                if (word != 0 and (target & ~@as(u64, 63)) + @ctz(word) < extent.upper) return true;
+                target = (target & ~@as(u64, 63)) + 64;
+            }
+        }
+        return false;
+    }
+    fn sourceRank(a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, span: Span, row: local.storage_rowsource_types.RowRef) !?u32 {
+        if (row != .external) return error.InvalidNativeLakeRowIndex;
+        const ref = row.external;
+        const blocks = try span.blocks(cache, store, cached, ref.file_id);
+        const index = corpus.physical.find(blocks, ref.row_group_ordinal, ref.row_ordinal) orelse return null;
+        const block = blocks[index];
         const low: u32 = @intCast(ref.row_ordinal & ((1 << corpus.physical.shift) - 1));
         const rank: u32 = if (block.bitmap) |artifact| blk: {
             _ = artifact;
@@ -170,7 +559,7 @@ pub const Identities = struct {
             if (low < block.lower or low - block.lower >= block.count) return null;
             break :blk low - block.lower;
         };
-        return try std.math.add(u32, span.lower, try std.math.add(u32, block.base, rank));
+        return try std.math.add(u32, block.base, rank);
     }
     /// Binary searches keep native-to-physical lookup logarithmic in files and
     /// physical blocks. Delete holes use the same authenticated rank directory.
@@ -183,17 +572,18 @@ pub const Identities = struct {
         }
         if (lo == self.spans.len) return error.InvalidNativeLakeTextCorpus;
         const file = self.spans[lo];
+        const blocks = try file.span.blocks(cache, store, cached, file.file);
         if (ordinal_value < file.span.lower) return error.InvalidNativeLakeTextCorpus;
-        const relative = ordinal_value - file.span.lower;
+        const relative = try file.span.original(ordinal_value);
         lo = 0;
-        hi = file.span.rows.len;
+        hi = blocks.len;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            const block = file.span.rows[mid];
+            const block = blocks[mid];
             if (@as(u64, block.base) + block.count <= relative) lo = mid + 1 else hi = mid;
         }
-        if (lo == file.span.rows.len) return error.InvalidNativeLakeTextCorpus;
-        const block = file.span.rows[lo];
+        if (lo == blocks.len) return error.InvalidNativeLakeTextCorpus;
+        const block = blocks[lo];
         if (relative < block.base) return error.InvalidNativeLakeTextCorpus;
         const rank = relative - block.base;
         const low = if (block.bitmap != null) blk: {
@@ -202,23 +592,28 @@ pub const Identities = struct {
         } else try std.math.add(u32, block.lower, rank);
         return .{ .external = .{ .source_id = source, .snapshot_id = snapshot, .file_id = file.file, .row_group_ordinal = block.group, .row_ordinal = (block.high << corpus.physical.shift) | low } };
     }
+    pub fn sourcePhysicalRow(a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, span: corpus.source_spans.Span, ordinal_value: u32, source: []const u8, snapshot: []const u8) !local.storage_rowsource_types.RowRef {
+        const item: FileSpan = .{ .file = span.file.id, .span = .{ .lower = 0, .upper = span.file_rows, .rows = &.{}, .manifest = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = span.physical.artifact_id, .checksum = span.physical.checksum, .byte_len = span.physical.byte_len }, .expected_rows = span.file_rows } };
+        const identities: Identities = .{ .offsets = &.{}, .spans = &.{item} };
+        return identities.physicalRow(a, cache, store, cached, ordinal_value, source, snapshot);
+    }
     /// Invert only selected ordinal blocks. Contiguous extents stay compressed;
     /// delete holes are resolved within their authenticated physical block.
     fn physicalSelection(self: Identities, a: A, selected: *const Bitmap, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead) !PhysicalSet {
         var result = PhysicalSet.init(a);
         errdefer result.deinit();
-        var cache: LiveRowsCache = .{};
+        var cache: LiveRowsCache = .{ .backing = a };
         defer cache.deinit(a);
         var files = self.files.iterator();
         while (files.next()) |file| {
             const span = file.value_ptr.*;
             if (selected.rangeCardinality(span.lower, span.upper) == 0) continue;
-            for (span.rows) |block| {
-                const lower = try std.math.add(u32, span.lower, block.base);
+            for (try span.blocks(&cache, store, cached, file.key_ptr.*)) |block| {
+                const lower = block.base;
                 const upper = @as(u64, lower) + block.count;
-                if (selected.rangeCardinality(lower, upper) == 0) continue;
-                var ranks = try selected.sliceRebased(a, lower, upper);
+                var ranks = try span.fileRanks(a, selected, lower, upper);
                 defer ranks.deinit();
+                if (ranks.cardinality() == 0) continue;
                 var physical = if (block.bitmap != null) blk: {
                     const live = try liveRows(a, &cache, store, cached, block);
                     if (ranks.cardinality() == block.count) break :blk try live.clone(a);
@@ -263,6 +658,217 @@ fn PredicateResolver(comptime Set: type) type {
         read_context: local.serverless_query_lake_read_context.Context,
         pinned: ?rows.PredicateContext = null,
         allow_partial: bool = true,
+
+        /// Query-owned exact physical membership, adaptive between point probes
+        /// and the existing whole-predicate index/scan planner.
+        pub const Membership = struct {
+            a: A,
+            resolver: Self,
+            arena: std.heap.ArenaAllocator,
+            json: []const u8,
+            predicates: std.ArrayList(rows.Predicate) = .empty,
+            complete: ?PhysicalSet = null,
+            spent: u64 = 0,
+            budget: u64 = 0,
+            pub fn deinit(self: *@This()) void {
+                self.closePredicates();
+                if (self.complete) |*set| set.deinit();
+                self.arena.deinit();
+            }
+            fn closePredicates(self: *@This()) void {
+                for (self.predicates.items) |*predicate| predicate.deinit();
+                self.predicates.clearRetainingCapacity();
+            }
+            fn materialize(self: *@This()) !void {
+                if (self.complete != null) return;
+                // A selective exact driver is cheaper than walking a broad
+                // second index or scanning its Parquet column. Probe remaining
+                // exact predicates only over these bounded physical candidates.
+                if (self.predicates.items.len != 0 and self.predicates.items[0].estimatedRows() <= 4096) {
+                    try self.materializeSelective();
+                    self.closePredicates();
+                    return;
+                }
+                const resolved = (try self.resolver.resolve(self.a, self.json)) orelse return error.UnsupportedQueryRequest;
+                self.complete = resolved.bitmap;
+                self.closePredicates();
+            }
+            fn materializeSelective(self: *@This()) !void {
+                var candidates = try self.resolver.consume(self.a, &self.predicates.items[0]);
+                errdefer candidates.deinit();
+                for (self.predicates.items[1..]) |*predicate| {
+                    const count = candidates.boundedCardinality(4096) orelse return error.InvalidNativeLakeRowIndex;
+                    if (count == 0) break;
+                    if (64 *| count >= predicate.work or !predicate.canProbeMembership()) {
+                        var next = try self.resolver.consume(self.a, predicate);
+                        defer next.deinit();
+                        candidates.andWith(&next);
+                        continue;
+                    }
+                    var selected = PhysicalSet.init(self.a);
+                    defer selected.deinit();
+                    var exhausted = false;
+                    var files = candidates.files.iterator();
+                    outer: while (files.next()) |file| {
+                        var blocks = file.value_ptr.iterator();
+                        while (blocks.next()) |block| {
+                            var rows_it = block.value_ptr.iterator();
+                            while (rows_it.next()) |low| {
+                                try self.resolver.context.ensureActive();
+                                try self.resolver.read_context.ensureActive();
+                                if (!predicate.canProbeMembership()) {
+                                    exhausted = true;
+                                    break :outer;
+                                }
+                                const ref: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = self.resolver.source.inventory.source_id, .snapshot_id = self.resolver.source.inventory.snapshot_id, .identity_version = self.resolver.source.inventory.row_identity_version, .file_id = file.key_ptr.*, .row_group_ordinal = block.key_ptr.group, .row_ordinal = (@as(u64, block.key_ptr.high) << 32) | low } };
+                                if (try predicate.contains(ref)) try selected.addRow(ref.external.file_id, ref.external.row_group_ordinal, ref.external.row_ordinal);
+                            }
+                        }
+                    }
+                    if (exhausted) {
+                        // Point and tuple walks have independent read budgets;
+                        // discard partial probe output before an exact index walk.
+                        var next = try self.resolver.consume(self.a, predicate);
+                        defer next.deinit();
+                        candidates.andWith(&next);
+                    } else {
+                        candidates.deinit();
+                        candidates = selected;
+                        selected = PhysicalSet.init(self.a);
+                    }
+                }
+                self.complete = candidates;
+            }
+            pub fn allows(self: *@This(), ref: local.storage_rowsource_types.RowRef) !bool {
+                try self.resolver.context.ensureActive();
+                try self.resolver.read_context.ensureActive();
+                if (self.complete == null) {
+                    const cost = std.math.mul(u64, 64, self.predicates.items.len) catch std.math.maxInt(u64);
+                    var probe = self.predicates.items.len != 0 and cost <= self.budget -| self.spent;
+                    for (self.predicates.items) |predicate| probe = probe and predicate.canProbeMembership();
+                    if (probe) {
+                        // Reserve the complete conjunction's work before probing;
+                        // short circuiting can only spend less than this budget.
+                        self.spent +|= cost;
+                        for (self.predicates.items) |*predicate| if (!try predicate.contains(ref)) return false;
+                        return true;
+                    }
+                    try self.materialize();
+                }
+                if (ref != .external) return error.InvalidNativeLakeRowIndex;
+                const row = ref.external;
+                return self.complete.?.contains(row.file_id, row.row_group_ordinal, row.row_ordinal);
+            }
+        };
+        pub fn openMembership(self: Self, a: A, json: []const u8) !Membership {
+            if (Set != PhysicalSet) @compileError("adaptive physical membership requires physical coordinates");
+            var result: Membership = .{ .a = a, .resolver = self, .arena = .init(a), .json = undefined };
+            errdefer result.deinit();
+            const ca = result.arena.allocator();
+            result.json = try ca.dupe(u8, json);
+            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, ca, json, .{});
+            const compiled = try Graph.compilePatternFilter(ca, parsed);
+            var conditions: std.ArrayList(Condition) = .empty;
+            if (try collectConditions(ca, compiled, &conditions, 0)) {
+                if (try rows.tryOpenPredicateWithContext(a, self.server, self.table, conditions.items, self.context, self.source, self.pinned)) |predicate| {
+                    var owned = predicate;
+                    result.predicates.append(ca, owned) catch |err| {
+                        owned.deinit();
+                        return err;
+                    };
+                } else {
+                    // Independent exact column predicates together prove the
+                    // entire conjunction. No residual/superset becomes membership.
+                    var names: std.StringHashMapUnmanaged(void) = .empty;
+                    for (conditions.items) |condition| {
+                        const entry = try names.getOrPut(ca, condition.column);
+                        if (entry.found_existing) continue;
+                        var subset: std.ArrayList(Condition) = .empty;
+                        for (conditions.items) |other| if (std.mem.eql(u8, condition.column, other.column)) try subset.append(ca, other);
+                        var predicate = (try rows.tryOpenPredicateWithContext(a, self.server, self.table, subset.items, self.context, self.source, self.pinned)) orelse {
+                            result.closePredicates();
+                            break;
+                        };
+                        result.predicates.append(ca, predicate) catch |err| {
+                            predicate.deinit();
+                            return err;
+                        };
+                    }
+                }
+                // Cardinality governs selective ordinal masks independently of
+                // cold metadata setup cost. Cheapest predicates short circuit first.
+                std.mem.sort(rows.Predicate, result.predicates.items, {}, struct {
+                    fn less(_: void, left: rows.Predicate, right: rows.Predicate) bool {
+                        return left.estimatedRows() < right.estimatedRows();
+                    }
+                }.less);
+                var work: u64 = 0;
+                var probe = result.predicates.items.len != 0;
+                for (result.predicates.items) |predicate| {
+                    work +|= predicate.work;
+                    probe = probe and predicate.hasMembership() and predicate.canProbeMembership();
+                }
+                result.budget = @min(work, rows.predicateScanWork(self.source, conditions.items) orelse std.math.maxInt(u64));
+                const selective = result.predicates.items.len != 0 and result.predicates.items[0].estimatedRows() <= 4096;
+                if (probe and !selective and result.budget > 64 *| result.predicates.items.len) return result;
+            }
+            // Selective, unsupported or exhausted plans use the authoritative
+            // exact planner. Small selections are ready before sparse navigation.
+            try result.materialize();
+            return result;
+        }
+
+        /// Optional admission proof. A required native conjunct may bound
+        /// serving packs even when the complete predicate needs a residual.
+        /// Only native index walks participate. Broad proofs require compressed
+        /// blocks; row-wise producers retain the selective bound.
+        pub fn selectivePredicate(self: Self, a: A, json: []const u8, limit: usize) !?rows.Predicate {
+            if (Set != PhysicalSet) @compileError("physical admission requires physical coordinates");
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            const sa = scratch.allocator();
+            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, sa, json, .{});
+            const compiled = try Graph.compilePatternFilter(sa, parsed);
+            var conditions: std.ArrayList(Condition) = .empty;
+            try requiredConditions(sa, compiled, &conditions, 0);
+            if (conditions.items.len == 0 or conditions.items.len > 64) return null;
+            var best: ?rows.Predicate = null;
+            errdefer if (best) |*predicate| predicate.deinit();
+            // Try a compound index first, then independent column indexes.
+            // All these predicates are necessary; full membership is still
+            // evaluated in the selected text windows, including OR/NOT.
+            var names: std.StringHashMapUnmanaged(void) = .empty;
+            var condition_index: usize = 0;
+            while (condition_index <= conditions.items.len) : (condition_index += 1) {
+                try self.context.ensureActive();
+                try self.read_context.ensureActive();
+                var subset: std.ArrayList(Condition) = .empty;
+                const selected = if (condition_index == 0) conditions.items else column_conditions: {
+                    const name = conditions.items[condition_index - 1].column;
+                    if ((try names.getOrPut(sa, name)).found_existing) continue;
+                    for (conditions.items) |condition| if (std.mem.eql(u8, name, condition.column)) try subset.append(sa, condition);
+                    break :column_conditions subset.items;
+                };
+                if (try rows.tryOpenPredicateWithContext(a, self.server, self.table, selected, self.context, self.source, self.pinned)) |candidate| {
+                    var predicate = candidate;
+                    if ((predicate.estimatedRows() <= 4096 or predicate.hasBlocks()) and predicate.estimatedRows() <= limit and (best == null or predicate.estimatedRows() < best.?.estimatedRows())) {
+                        if (best) |*previous| previous.deinit();
+                        best = predicate;
+                    } else predicate.deinit();
+                }
+            }
+            return best;
+        }
+        pub fn selectiveCandidates(self: Self, a: A, json: []const u8, limit: usize) !?PhysicalSet {
+            var best = (try self.selectivePredicate(a, json, limit)) orelse return null;
+            defer best.deinit();
+            var result = try self.consume(a, &best);
+            if (result.boundedCardinality(limit) == null) {
+                result.deinit();
+                return null;
+            }
+            return result;
+        }
 
         pub fn resolve(self: Self, a: A, json: []const u8) !?if (Set == Bitmap) Result else PredicateResult {
             var arena = std.heap.ArenaAllocator.init(a);
@@ -561,7 +1167,7 @@ fn PredicateResolver(comptime Set: type) type {
         fn consume(self: Self, a: A, predicate: *rows.Predicate) !Set {
             var result = Set.init(a);
             errdefer result.deinit();
-            var bitmap_cache: LiveRowsCache = .{};
+            var bitmap_cache: LiveRowsCache = .{ .backing = a };
             defer bitmap_cache.deinit(a);
             var window = std.heap.ArenaAllocator.init(a);
             defer window.deinit();
@@ -616,6 +1222,20 @@ fn PredicateResolver(comptime Set: type) type {
         fn scanSelected(self: Self, a: A, input: Compiled, selected: *const PhysicalSet) !?PredicateResult {
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
+            if (self.source.hasLazyInventory()) {
+                // Physical blocks are keyed by logical file identity. Resolve a
+                // bounded file view before assigning scan-local file ordinals;
+                // neither publication navigation nor a lazy catalog has a flat
+                // inventory until the selected files are explicitly reached.
+                const ids = try arena.allocator().alloc([]const u8, selected.files.count());
+                var files = selected.files.keyIterator();
+                for (ids) |*id| id.* = files.next().?.*;
+                var view = try self.source.selectedFilesView(a, ids, self.read_context);
+                defer view.closeParallelView(self.source);
+                var scoped = self;
+                scoped.source = &view;
+                return scoped.scanSelected(a, input, selected);
+            }
             var fields: std.ArrayList([]const u8) = .empty;
             if (!try @import("lake_index_search_filter.zig").dependencies(arena.allocator(), self.table, input, &fields)) return null;
             var result = Set.init(a);
@@ -645,7 +1265,7 @@ fn PredicateResolver(comptime Set: type) type {
             defer row_arena.deinit();
             var page_arena = std.heap.ArenaAllocator.init(a);
             defer page_arena.deinit();
-            var bitmap_cache: LiveRowsCache = .{};
+            var bitmap_cache: LiveRowsCache = .{ .backing = a };
             defer bitmap_cache.deinit(a);
             while (true) {
                 try self.context.ensureActive();
@@ -657,12 +1277,12 @@ fn PredicateResolver(comptime Set: type) type {
                 if (mask) |matches| try evaluateColumns(page_arena.allocator(), input, page, matches, null);
                 for (page.selection, 0..) |position, row| {
                     if (mask) |matches| {
-                        if (matches[row]) try self.addMatch(a, result, &bitmap_cache, page.batch.row_refs[position]);
+                        if (matches[row]) try self.addMatch(a, result, &bitmap_cache, page.batch.rowRef(position));
                         continue;
                     }
                     _ = row_arena.reset(.retain_capacity);
                     const ra = row_arena.allocator();
-                    const ref = page.batch.row_refs[position];
+                    const ref = page.batch.rowRef(position);
                     const id = try local.storage_rowsource_identity.allocId(ra, ref);
                     var doc: std.json.Value = .{ .object = .empty };
                     try doc.object.put(ra, "_id", .{ .string = id });
@@ -1091,7 +1711,7 @@ test "external lake large ordinal selections invert compressed extents and delet
     try identities.files.put(a, "selected", .{ .lower = 10, .upper = 200014, .rows = &blocks });
     try identities.files.put(a, "unselected", .{ .lower = 300000, .upper = 500004, .rows = &blocks });
     identities.spans = &.{ .{ .file = "selected", .span = identities.files.get("selected").? }, .{ .file = "unselected", .span = identities.files.get("unselected").? } };
-    var live_cache: LiveRowsCache = .{};
+    var live_cache: LiveRowsCache = .{ .backing = a };
     defer live_cache.deinit(a);
     for ([_]u32{ 10, 200010, 200011, 200012, 200013, 300000, 500003 }) |ordinal_value| {
         const row = try identities.physicalRow(a, &live_cache, store, cached, ordinal_value, "source", "snapshot");
@@ -1128,7 +1748,7 @@ test "external lake live row cache evicts within fixed backing storage and prepa
     const backing = try a.alloc(u8, 4 * LiveRowsCache.slot_bytes);
     defer a.free(backing);
     var fixed = std.heap.FixedBufferAllocator.init(backing);
-    var cache: LiveRowsCache = .{};
+    var cache: LiveRowsCache = .{ .backing = fixed.allocator() };
     defer cache.deinit(fixed.allocator());
     for (0..20) |i| {
         var live = Bitmap.init(a);
@@ -1164,4 +1784,59 @@ test "external lake live row cache evicts within fixed backing storage and prepa
         try std.testing.expectError(error.InvalidNativeLakeTextCorpus, cache.load(fixed.allocator(), store, cached, block));
     }
     try std.testing.expectEqual(backing.len, fixed.end_index);
+}
+
+test "external lake selected segment predicates map ranges and bitmaps across file ordinal gaps" {
+    const a = std.testing.allocator;
+    const span: Identities.Span = .{ .lower = 0, .upper = 4, .rows = &.{.{ .group = 0, .high = 0, .base = 0, .count = 6, .lower = 10 }}, .intervals = &.{ .{ .file_lower = 0, .lower = 0, .upper = 1 }, .{ .file_lower = 3, .lower = 1, .upper = 4 } } };
+    var identities: Identities = .{ .offsets = &.{ 0, 1, 4 }, .partial_inventory = true };
+    defer identities.files.deinit(a);
+    try identities.files.put(a, "part", span);
+    var result = Bitmap.init(a);
+    defer result.deinit();
+    var cache: LiveRowsCache = .{ .backing = a };
+    defer cache.deinit(a);
+    // No artifact access is necessary for contiguous physical rows.
+    const store: @import("../serverless/artifacts/store.zig").ArtifactStore = undefined;
+    const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = undefined;
+    try identities.addBlock(a, a, &cache, store, cached, .{ .file = "part", .group = 0, .base = 0, .selection = .{ .interval = .{ .lower = 11, .count = 4 } } }, &result);
+    try std.testing.expectEqual(@as(u64, 2), result.cardinality());
+    try std.testing.expect(result.contains(1) and result.contains(2));
+    result.deinit();
+    result = Bitmap.init(a);
+    var physical = Bitmap.init(a);
+    defer physical.deinit();
+    for ([_]u32{ 10, 12, 13, 15 }) |row| try physical.add(row);
+    try identities.addBlock(a, a, &cache, store, cached, .{ .file = "part", .group = 0, .base = 0, .selection = .{ .bitmap = physical } }, &result);
+    try std.testing.expectEqual(@as(u64, 3), result.cardinality());
+    try std.testing.expect(result.contains(0) and result.contains(1) and result.contains(3));
+    var inverted = try span.fileRanks(a, &result, 0, 6);
+    defer inverted.deinit();
+    try std.testing.expectEqual(@as(u64, 3), inverted.cardinality());
+    try std.testing.expect(inverted.contains(0) and inverted.contains(3) and inverted.contains(5));
+    var block = try span.fileRanks(a, &result, 2, 5);
+    defer block.deinit();
+    try std.testing.expectEqual(@as(u64, 1), block.cardinality());
+    try std.testing.expect(block.contains(1));
+}
+
+test "external lake bounded WAL physical masks preserve selected gaps and high row bits" {
+    const a = std.testing.allocator;
+    const high: u64 = 1 << 40;
+    const span: Identities.Span = .{ .lower = 0, .upper = 4, .rows = &.{.{ .group = 2, .high = high >> corpus.physical.shift, .base = 0, .count = 6, .lower = 10 }}, .intervals = &.{ .{ .file_lower = 0, .lower = 0, .upper = 1 }, .{ .file_lower = 3, .lower = 1, .upper = 4 } } };
+    var identities: Identities = .{ .offsets = &.{ 0, 1, 4 }, .partial_inventory = true, .spans = &.{.{ .file = "part", .span = span }} };
+    defer identities.files.deinit(a);
+    try identities.files.put(a, "part", span);
+    var physical = @import("lake_index_physical_set.zig").Set.init(a);
+    defer physical.deinit();
+    for ([_]u64{ 10, 12, 13, 15, 100 }) |row| try physical.addRow("part", 2, high + row);
+    try physical.addRow("part", 0, high + 10);
+    try physical.addRow("unadmitted", 2, high + 10);
+    // Contiguous physical extents do not access artifact storage.
+    const store: @import("../serverless/artifacts/store.zig").ArtifactStore = undefined;
+    const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = undefined, .scope = @splat(1), .context = .{} };
+    var result = try identities.bitmapForPhysical(a, &physical, store, cached);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u64, 3), result.cardinality());
+    try std.testing.expect(result.contains(0) and result.contains(1) and result.contains(3));
 }

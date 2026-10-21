@@ -31,6 +31,42 @@ const SpecialTokenIds = struct {
     eoa: i32,
 };
 
+/// Gemma4 video uses timestamped, independently bounded vision spans. Internally
+/// use the existing image placeholder for soft slots: it is replaced by projected
+/// rows and masked from PLE, so no dynamic tokenizer vocabulary entry is needed.
+/// This preserves the same per-frame vision mask as upstream video token slots.
+pub fn expandVideoPromptText(allocator: std.mem.Allocator, prompt: []const u8, timestamps_us: []const i64) ![]u8 {
+    const marker = "<|video|>";
+    const offset = std.mem.indexOf(u8, prompt, marker) orelse return error.VideoPlaceholderCountMismatch;
+    if (std.mem.indexOfPos(u8, prompt, offset + marker.len, marker) != null or timestamps_us.len == 0 or timestamps_us.len > 60) return error.VideoPlaceholderCountMismatch;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, prompt[0..offset]);
+    var last: i64 = -1;
+    for (timestamps_us, 0..) |us, i| {
+        if (us < 0 or us <= last or us >= 60_000_000) return error.InvalidVideoTimestamp;
+        last = us;
+        if (i != 0) try out.append(allocator, ' ');
+        var buffer: [32]u8 = undefined;
+        const seconds: u64 = @intCast(@divFloor(us, 1_000_000));
+        try out.appendSlice(allocator, try std.fmt.bufPrint(&buffer, "{d:0>2}:{d:0>2} <|image|>", .{ @divFloor(seconds, 60), @mod(seconds, 60) }));
+    }
+    try out.appendSlice(allocator, prompt[offset + marker.len ..]);
+    return out.toOwnedSlice(allocator);
+}
+
+test "gemma4 video prompt preserves timestamps and frame boundaries" {
+    const a = std.testing.allocator;
+    const result = try expandVideoPromptText(a, "User: <|video|> summarize", &.{ 0, 1_500_000, 59_000_000 });
+    defer a.free(result);
+    try std.testing.expectEqualStrings("User: 00:00 <|image|> 00:01 <|image|> 00:59 <|image|> summarize", result);
+    const expanded = try expandPromptText(a, result, &.{ 2, 1, 2 }, &.{});
+    defer a.free(expanded);
+    try std.testing.expectEqualStrings("User: 00:00 <|image><|image|><|image|><image|> 00:01 <|image><|image|><image|> 00:59 <|image><|image|><|image|><image|> summarize", expanded);
+    try std.testing.expectError(error.VideoPlaceholderCountMismatch, expandVideoPromptText(a, "<|video|><|video|>", &.{0}));
+    try std.testing.expectError(error.InvalidVideoTimestamp, expandVideoPromptText(a, "<|video|>", &.{ 1_000_000, 0 }));
+}
+
 pub fn expandPromptText(
     allocator: std.mem.Allocator,
     prompt: []const u8,
@@ -130,6 +166,40 @@ pub fn prepareExpandedPromptEmbeddings(
     projected_images: ?*const gemma4_projector.ProjectedImages,
     projected_audio: ?*const gemma4_projector.ProjectedAudio,
 ) !gemma3_mm.PreparedPrompt {
+    return preparePromptEmbeddings(cb, allocator, tokenizer, config, expanded_token_ids, if (projected_images) |p| .{ .tokens_per_image = p.tokens_per_image, .hidden_size = p.hidden_size, .host = p.embeddings } else null, projected_audio);
+}
+
+/// Image features and the assembled language prompt remain resident. Audio,
+/// when present, is uploaded once into the same prompt without downloading it.
+pub fn prepareExpandedPromptEmbeddingsResident(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    tokenizer: tokenizer_mod.Tokenizer,
+    config: gpt_mod.Config,
+    expanded_token_ids: []const i32,
+    projected_images: *const gemma4_projector.ResidentProjectedImages,
+    projected_audio: ?*const gemma4_projector.ProjectedAudio,
+) !gemma3_mm.PreparedPrompt {
+    if (!cb.supportsCopyRows2D()) return error.ResidentImageOperationUnavailable;
+    return preparePromptEmbeddings(cb, allocator, tokenizer, config, expanded_token_ids, .{ .tokens_per_image = projected_images.tokens_per_image, .hidden_size = projected_images.hidden_size, .resident = projected_images.embeddings }, projected_audio);
+}
+
+const ImageFeatures = struct {
+    tokens_per_image: []const usize,
+    hidden_size: usize,
+    host: ?[]const f32 = null,
+    resident: ?ops.CT = null,
+};
+
+fn preparePromptEmbeddings(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    tokenizer: tokenizer_mod.Tokenizer,
+    config: gpt_mod.Config,
+    expanded_token_ids: []const i32,
+    projected_images: ?ImageFeatures,
+    projected_audio: ?*const gemma4_projector.ProjectedAudio,
+) !gemma3_mm.PreparedPrompt {
     if (projected_images == null and projected_audio == null) return error.NoMultimodalInputs;
     if (projected_images) |projected| {
         if (projected.tokens_per_image.len == 0) return error.NoImages;
@@ -225,6 +295,32 @@ pub fn prepareExpandedPromptEmbeddings(
     defer cb.free(base_embeddings);
 
     const hidden_size: usize = config.hidden_size;
+    if (projected_images) |projected| if (projected.resident) |features| {
+        const scale = config.tokenEmbeddingScale();
+        const scaled = try cb.multiplyScalar(base_embeddings, scale) orelse return error.ResidentImageOperationUnavailable;
+        const input_embeddings = try cb.ensureDeviceResidentOwned(scaled);
+        errdefer cb.free(input_embeddings);
+        var source_row: usize = 0;
+        for (image_offsets, projected.tokens_per_image) |offset, count| {
+            try cb.checkExecutionControl();
+            if (!try cb.copyRows2D(allocator, input_embeddings, offset, features, source_row, count, hidden_size)) return error.ResidentImageOperationUnavailable;
+            source_row += count;
+        }
+        if (projected_audio) |audio| {
+            var rows: usize = 0;
+            for (audio.tokens_per_audio) |count| rows += count;
+            const shape = [_]i32{ @intCast(rows), @intCast(hidden_size) };
+            const audio_tensor = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(audio.embeddings, &shape));
+            defer cb.free(audio_tensor);
+            source_row = 0;
+            for (audio_offsets, audio.tokens_per_audio) |offset, count| {
+                if (count > 0 and !try cb.copyRows2D(allocator, input_embeddings, offset, audio_tensor, source_row, count, hidden_size)) return error.ResidentImageOperationUnavailable;
+                source_row += count;
+            }
+        }
+        return .{ .allocator = allocator, .token_ids = token_ids, .ple_token_ids = ple_token_ids, .input_embeddings = input_embeddings, .attn_or_mask = null };
+    };
+
     const prompt_embeddings = try cb.toFloat32(base_embeddings, allocator);
     defer allocator.free(prompt_embeddings);
 
@@ -241,7 +337,7 @@ pub fn prepareExpandedPromptEmbeddings(
             const src = src_token_offset * hidden_size;
             @memcpy(
                 prompt_embeddings[dst..][0 .. tokens * hidden_size],
-                projected.embeddings[src..][0 .. tokens * hidden_size],
+                projected.host.?[src..][0 .. tokens * hidden_size],
             );
             src_token_offset += tokens;
         }

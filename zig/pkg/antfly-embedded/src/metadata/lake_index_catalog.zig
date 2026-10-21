@@ -26,7 +26,7 @@ pub const Digest = [32]u8;
 pub const Token = [16]u8;
 pub const DirectoryRef = struct { artifact_id: []const u8, checksum: []const u8, byte_len: u64, count: u32 };
 pub const max_directory_artifacts: usize = 4096;
-pub const native_reader_protocol: u16 = 33;
+pub const native_reader_protocol: u16 = 65;
 
 // Catalog envelopes must remain readable so reconciliation can replace older
 // derived formats. Serving still requires the current reader protocol.
@@ -76,7 +76,11 @@ pub const Attempt = struct {
         if (self.generation == 0 or std.mem.allEqual(u8, &self.token, 0) or self.lease_expires_at_ms <= self.started_at_ms) return error.InvalidLakeIndexCatalog;
     }
 };
+pub const ReductionRange = struct { first: Digest, last: Digest, files: u32 };
 pub const FileContribution = struct {
+    /// Authenticated Patricia-tree bounds permit path-copy file updates.
+    /// Absent on legacy reductions; those reconcile once before delta reuse.
+    radix: ?ReductionRange = null,
     file: Digest,
     recipe: Digest,
     name: []const u8,
@@ -88,10 +92,26 @@ pub const FileContribution = struct {
     /// directories maintain these counts transactionally in the immutable tree.
     references: u32 = 0,
 };
+pub const CloudRetentionCertificate = struct {
+    version: u8 = 1,
+    until_ms: u64,
+    roots: []const Digest,
+    binding: Digest,
+};
+pub const CloudVacuumProgress = struct { cutoff: u64 = 0, proof: ?Digest = null, after: ?Digest = null, done: bool = false };
+pub const CloudGenerations = struct {
+    root: artifacts.ProviderGenerationRef,
+    complete: bool = false,
+    vacuum: CloudVacuumProgress = .{},
+    certificate: ?CloudRetentionCertificate = null,
+};
 pub const Publication = struct {
     /// Zero denotes legacy consumers without renewable reader authority.
     /// Older strict decoders reject this field and fall back to source scans.
     reader_protocol: u16 = 0,
+    /// Recovery checkpoints exclude the unavailable serving publication from
+    /// subsequent attempts while retaining its authority until replacement.
+    reuse_published: bool = true,
     store_locator: ?StoreLocator = null,
     namespace: ?Digest = null,
     generation: u64,
@@ -100,8 +120,10 @@ pub const Publication = struct {
     published_at_ms: u64,
     base_source: base.BaseSourceDescriptor,
     inventory: artifacts.ArtifactRef,
+    source_navigation: ?artifacts.ArtifactRef = null,
     declarations: []const manifest.DeclaredArtifact = &.{},
     directory: ?DirectoryRef = null,
+    cloud_generations: ?CloudGenerations = null,
     file_contributions: []const FileContribution = &.{},
     /// Hydration-only authenticated tree reference; serialization retains the directory.
     contribution_index: ?[]const u8 = null,
@@ -109,13 +131,21 @@ pub const Publication = struct {
     contribution_ownership_version: u16 = 0,
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         if (self.directory) |directory| {
-            try writer.write(.{ .reader_protocol = self.reader_protocol, .store_locator = self.store_locator, .namespace = self.namespace, .generation = self.generation, .token = self.token, .signature = self.signature, .published_at_ms = self.published_at_ms, .base_source = self.base_source, .inventory = self.inventory, .directory = directory });
+            try writer.write(.{ .reader_protocol = self.reader_protocol, .reuse_published = self.reuse_published, .store_locator = self.store_locator, .namespace = self.namespace, .generation = self.generation, .token = self.token, .signature = self.signature, .published_at_ms = self.published_at_ms, .base_source = self.base_source, .inventory = self.inventory, .source_navigation = self.source_navigation, .directory = directory, .cloud_generations = self.cloud_generations });
         } else {
-            try writer.write(.{ .reader_protocol = self.reader_protocol, .store_locator = self.store_locator, .namespace = self.namespace, .generation = self.generation, .token = self.token, .signature = self.signature, .published_at_ms = self.published_at_ms, .base_source = self.base_source, .inventory = self.inventory, .declarations = self.declarations });
+            try writer.write(.{ .reader_protocol = self.reader_protocol, .reuse_published = self.reuse_published, .store_locator = self.store_locator, .namespace = self.namespace, .generation = self.generation, .token = self.token, .signature = self.signature, .published_at_ms = self.published_at_ms, .base_source = self.base_source, .inventory = self.inventory, .source_navigation = self.source_navigation, .declarations = self.declarations, .cloud_generations = self.cloud_generations });
         }
     }
     pub fn validate(self: Publication) !void {
         try validateReaderProtocol(self.reader_protocol);
+        if (self.cloud_generations) |cloud| {
+            if (self.reader_protocol < 36) return error.InvalidLakeIndexCatalog;
+            try cloud.root.validate();
+            if (cloud.certificate) |certificate| {
+                if (!cloud.complete or certificate.version != 1 or certificate.until_ms == 0 or certificate.until_ms > cloud.root.retention_until_ms or certificate.roots.len == 0 or certificate.roots.len > 4096 or std.mem.allEqual(u8, &certificate.binding, 0)) return error.InvalidLakeIndexCatalog;
+                for (certificate.roots, 0..) |root, i| if (i != 0 and std.mem.order(u8, &certificate.roots[i - 1], &root) != .lt) return error.InvalidLakeIndexCatalog;
+            }
+        }
         if (self.store_locator) |locator| try locator.validate();
         if (self.namespace) |namespace| if (std.mem.allEqual(u8, &namespace, 0)) return error.InvalidLakeIndexCatalog;
         if (self.generation == 0 or std.mem.allEqual(u8, &self.token, 0) or self.declarations.len > (if (self.directory != null) max_directory_artifacts else max_artifacts)) return error.InvalidLakeIndexCatalog;
@@ -134,8 +164,18 @@ pub const Publication = struct {
             .external_parquet, .external_iceberg => {},
             else => return error.InvalidLakeIndexCatalog,
         }
+        if (self.source_navigation) |navigation| {
+            if (self.reader_protocol < 46 or navigation.kind != .doc_values or (navigation.metadata_version != 1 and navigation.metadata_version != 2 and navigation.metadata_version != 3 and navigation.metadata_version != 4)) return error.InvalidLakeIndexCatalog;
+            if (navigation.metadata_version == 2 and self.reader_protocol < 47) return error.InvalidLakeIndexCatalog;
+            if (navigation.metadata_version == 4 and self.reader_protocol < 51) return error.InvalidLakeIndexCatalog;
+            if (navigation.metadata_version == 3 and self.reader_protocol < 50) return error.InvalidLakeIndexCatalog;
+            try artifactValid(navigation);
+        }
         try artifactValid(self.inventory);
         if (self.inventory.kind != .external_base_source) return error.InvalidLakeIndexCatalog;
+        // Paged inventory closure is reachable through the mandatory source
+        // navigation root. Older readers cannot interpret its descriptor.
+        if (self.inventory.metadata_version > 1 or (self.inventory.metadata_version == 1 and (self.reader_protocol < 53 or self.source_navigation == null))) return error.InvalidLakeIndexCatalog;
         const source = switch (self.base_source) {
             .external_parquet, .external_iceberg => |v| v,
             else => unreachable,
@@ -160,6 +200,8 @@ pub const State = struct {
     generation: u64 = 0,
     pending: ?Attempt = null,
     published: ?Publication = null,
+    /// Partial roots are resumable build inputs, never a serving publication.
+    checkpoint: ?Publication = null,
     failure: ?Failure = null,
     pub fn validate(self: State) !void {
         if (self.version != 1) return error.InvalidLakeIndexCatalog;
@@ -172,6 +214,12 @@ pub const State = struct {
             try publication.validate();
             if (publication.namespace != null and !std.meta.eql(publication.namespace, self.namespace)) return error.InvalidLakeIndexCatalog;
             if (publication.generation > self.generation or (self.pending != null and publication.generation >= self.pending.?.generation)) return error.InvalidLakeIndexCatalog;
+        }
+        if (self.checkpoint) |saved| {
+            try saved.validate();
+            if (!std.meta.eql(saved.namespace, self.namespace) or saved.generation > self.generation) return error.InvalidLakeIndexCatalog;
+            if (self.pending) |attempt| if (!std.meta.eql(saved.signature, attempt.signature)) return error.InvalidLakeIndexCatalog;
+            if (self.published) |ready| if (saved.generation <= ready.generation) return error.InvalidLakeIndexCatalog;
         }
         if (self.failure) |failure| {
             if (failure.generation != self.generation or failure.reason.len == 0 or failure.reason.len > 512 or std.mem.allEqual(u8, &failure.desired, 0)) return error.InvalidLakeIndexCatalog;
@@ -188,6 +236,31 @@ pub const State = struct {
         next.generation = std.math.add(u64, self.generation, 1) catch return error.LakeIndexGenerationExhausted;
         next.pending = .{ .reader_protocol = native_reader_protocol, .generation = next.generation, .token = token, .signature = signature, .started_at_ms = now_ms, .lease_expires_at_ms = std.math.add(u64, now_ms, lease_ms) catch return error.InvalidLakeIndexCatalog };
         next.failure = null;
+        if (next.checkpoint) |saved| if (!std.meta.eql(saved.signature, signature)) {
+            next.checkpoint = null;
+        };
+        try next.validate();
+        return next;
+    }
+    pub fn saveCheckpoint(self: State, saved: Publication, now_ms: u64) !State {
+        try self.validate();
+        const attempt = self.pending orelse return error.LakeIndexPublicationFenceChanged;
+        if (!std.meta.eql(saved.namespace, self.namespace) or !std.meta.eql(saved.signature, attempt.signature) or
+            saved.generation != attempt.generation or !std.mem.eql(u8, &saved.token, &attempt.token) or
+            now_ms < attempt.started_at_ms or now_ms >= attempt.lease_expires_at_ms or saved.published_at_ms != now_ms or
+            saved.reader_protocol != attempt.reader_protocol or !try locatorEqual(std.heap.page_allocator, saved.store_locator, attempt.store_locator)) return error.LakeIndexPublicationFenceChanged;
+        var next = self;
+        next.checkpoint = saved;
+        try next.validate();
+        return next;
+    }
+    /// Discard unusable derived work without releasing the current build lease.
+    pub fn discardCheckpoint(self: State, token: Token, now_ms: u64) !State {
+        try self.validate();
+        const attempt = self.pending orelse return error.LakeIndexPublicationFenceChanged;
+        if (!std.mem.eql(u8, &attempt.token, &token) or now_ms < attempt.started_at_ms or now_ms >= attempt.lease_expires_at_ms) return error.LakeIndexPublicationFenceChanged;
+        var next = self;
+        next.checkpoint = null;
         try next.validate();
         return next;
     }
@@ -200,6 +273,7 @@ pub const State = struct {
         var next = self;
         next.pending = null;
         next.published = publication;
+        next.checkpoint = null;
         next.failure = null;
         try next.validate();
         return next;
@@ -257,7 +331,9 @@ fn part(hash: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
 /// invalidate an immutable index built for the same target schema.
 pub fn desiredFingerprint(table: anytype) Digest {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("native-lake-index-definition-v9");
+    // v10 rebuilds aggregate publications with the same physical SQL width
+    // identity used by scalar binding (including default integer/float widths).
+    hash.update("native-lake-index-definition-v10");
     var id: [8]u8 = undefined;
     std.mem.writeInt(u64, &id, table.table_id, .little);
     hash.update(&id);
@@ -321,12 +397,21 @@ pub fn transitionAllowed(a: A, before: anytype, after: anytype) !bool {
     if (replacement.generation == previous.generation +| 1 and replacement.generation > previous.generation) {
         if (replacement.pending) |attempt| {
             return std.mem.eql(u8, &attempt.signature.desired, &desiredFingerprint(after)) and
-                replacement.failure == null and try publicationEqual(a, previous.published, replacement.published);
+                replacement.failure == null and try publicationEqual(a, previous.published, replacement.published) and
+                (if (replacement.checkpoint) |saved| std.meta.eql(saved.signature, attempt.signature) and try publicationEqual(a, previous.checkpoint, saved) else true);
         }
-        return replacement.published == null and replacement.failure == null;
+        return replacement.published == null and replacement.failure == null and replacement.checkpoint == null;
     }
     if (replacement.generation != previous.generation) return false;
     const attempt = previous.pending orelse return false;
+    if (!try publicationEqual(a, previous.checkpoint, replacement.checkpoint)) {
+        if (replacement.checkpoint) |saved| {
+            if (replacement.pending == null or saved.generation != attempt.generation or !std.mem.eql(u8, &saved.token, &attempt.token) or
+                !std.meta.eql(saved.signature, attempt.signature) or saved.published_at_ms < attempt.started_at_ms or
+                saved.published_at_ms >= attempt.lease_expires_at_ms or saved.reader_protocol != attempt.reader_protocol or
+                !try locatorEqual(a, saved.store_locator, attempt.store_locator)) return false;
+        } else if (replacement.failure != null) return false;
+    }
     if (replacement.pending) |renewed| {
         return renewed.generation == attempt.generation and std.mem.eql(u8, &renewed.token, &attempt.token) and
             renewed.reader_protocol == attempt.reader_protocol and try locatorEqual(a, renewed.store_locator, attempt.store_locator) and
@@ -370,6 +455,14 @@ test "metadata.lake index publication preserves ready roots and fences changed d
         .inventory = inventory,
         .declarations = &.{},
     };
+    var paged = publication;
+    paged.inventory.metadata_version = 1;
+    try std.testing.expectError(error.InvalidLakeIndexCatalog, paged.validate());
+    paged.namespace = @splat(1);
+    paged.source_navigation = .{ .kind = .doc_values, .metadata_version = 4, .artifact_id = "navigation", .byte_len = 42, .checksum = inventory.checksum };
+    try paged.validate();
+    paged.reader_protocol = 52;
+    try std.testing.expectError(error.InvalidLakeIndexCatalog, paged.validate());
     // A reader upgrade must parse both historical pending attempts and ready
     // publications before it can rebuild them under the current protocol.
     for (24..native_reader_protocol + 1) |protocol| {
@@ -401,6 +494,26 @@ test "metadata.lake index publication preserves ready roots and fences changed d
     var building = table;
     building.lake_index_catalog_json = building_bytes;
     try std.testing.expect(try transitionAllowed(a, table, building));
+    const checkpointed = try attempt.saveCheckpoint(publication, 101);
+    const discarded = try checkpointed.discardCheckpoint(attempt.pending.?.token, 102);
+    try std.testing.expect(discarded.checkpoint == null);
+    try std.testing.expectEqualDeep(attempt.pending, discarded.pending);
+    try std.testing.expectError(error.LakeIndexPublicationFenceChanged, checkpointed.discardCheckpoint(@splat(9), 102));
+    try std.testing.expectError(error.LakeIndexPublicationFenceChanged, checkpointed.discardCheckpoint(attempt.pending.?.token, 99));
+    try std.testing.expectError(error.LakeIndexPublicationFenceChanged, checkpointed.discardCheckpoint(attempt.pending.?.token, 120));
+    const checkpoint_bytes = try encode(a, checkpointed);
+    defer a.free(checkpoint_bytes);
+    var checkpoint_table = building;
+    checkpoint_table.lake_index_catalog_json = checkpoint_bytes;
+    try std.testing.expect(try transitionAllowed(a, building, checkpoint_table));
+    try std.testing.expect(try transitionAllowed(a, checkpoint_table, building));
+    var stolen = discarded;
+    stolen.pending.?.token = @splat(9);
+    const stolen_bytes = try encode(a, stolen);
+    defer a.free(stolen_bytes);
+    var stolen_table = building;
+    stolen_table.lake_index_catalog_json = stolen_bytes;
+    try std.testing.expect(!try transitionAllowed(a, checkpoint_table, stolen_table));
     const ready = try attempt.publish(publication, 101);
     const ready_bytes = try encode(a, ready);
     defer a.free(ready_bytes);

@@ -70,15 +70,17 @@ const remote_fetch_security = scraping.ContentSecurityConfig{
     .max_download_size_bytes = default_remote_fetch_max_download_size_bytes,
 };
 
-fn remoteByteBudget(remote_content: ?*const scraping.RemoteContentConfig) u64 {
-    var snapshot = if (remote_content) |cfg| cfg.acquire() else null;
+fn remoteByteBudget(remote_content: ?*const scraping.RemoteContentConfig) !u64 {
+    var snapshot = if (remote_content) |cfg| try cfg.acquire() else null;
     defer if (snapshot) |*held| held.deinit();
 
     const configured = if (snapshot) |held|
         if (held.config.security) |security| security.max_download_size_bytes else null
     else
         null;
-    return @min(default_remote_fetch_max_download_size_bytes, configured orelse default_remote_fetch_max_download_size_bytes);
+    // An explicit operator setting may raise or lower the budget; the default
+    // applies only when nothing is configured.
+    return configured orelse default_remote_fetch_max_download_size_bytes;
 }
 
 test "template remote byte budget reads the reloadable config snapshot" {
@@ -86,7 +88,7 @@ test "template remote byte budget reads the reloadable config snapshot" {
         config: scraping.RemoteContentConfig,
         releases: usize = 0,
 
-        fn acquire(context: *anyopaque) ?scraping.RemoteContentConfig.Snapshot {
+        fn acquire(context: *anyopaque) anyerror!scraping.RemoteContentConfig.Snapshot {
             const self: *@This() = @ptrCast(@alignCast(context));
             return .{
                 .config = &self.config,
@@ -124,8 +126,12 @@ test "template remote byte budget reads the reloadable config snapshot" {
         },
     };
 
-    try std.testing.expectEqual(@as(u64, 4096), remoteByteBudget(&facade));
+    try std.testing.expectEqual(@as(u64, 4096), try remoteByteBudget(&facade));
     try std.testing.expectEqual(@as(usize, 1), harness.releases);
+    harness.config.security.?.max_download_size_bytes = 1024 * 1024 * 1024;
+    try std.testing.expectEqual(@as(u64, 1024 * 1024 * 1024), try remoteByteBudget(&facade));
+    harness.config.security.?.max_download_size_bytes = null;
+    try std.testing.expectEqual(default_remote_fetch_max_download_size_bytes, try remoteByteBudget(&facade));
 }
 
 pub fn renderJsonToText(
@@ -150,7 +156,7 @@ pub fn renderJsonToTextWithConfig(
         .io = config.io,
         .deadline_ns = config.deadline_ns,
         .cancellation = config.cancellation,
-        .remote_bytes_remaining = remoteByteBudget(config.remote_content),
+        .remote_bytes_remaining = try remoteByteBudget(config.remote_content),
         .max_media_parts = config.max_media_parts,
     };
     try ensureRenderActive(&render_ctx);
@@ -240,7 +246,7 @@ pub fn renderJsonToPartsWithConfig(
     return try template_mod.textToParts(alloc, rendered);
 }
 
-fn validateRenderedTemplate(alloc: Allocator, rendered: []const u8) !void {
+pub fn validateRenderedTemplate(alloc: Allocator, rendered: []const u8) !void {
     const directives = try template_mod.parseErrorDirectives(alloc, rendered);
     defer template_mod.freeErrorDirectives(alloc, directives);
     if (directives.len == 0) return;
@@ -484,7 +490,7 @@ fn remotePdfHelperImpl(ctx: hbs.HelperContext) anyerror!hbs.Value {
 }
 
 fn credentialName(ctx: hbs.HelperContext) !?[]const u8 {
-    const value = ctx.hash.get("credentials") orelse return null;
+    const value = ctx.hash.get(template_mod.remote_credentials_argument) orelse return null;
     return switch (value) {
         .string => |text| if (text.len > 0) text else error.InvalidCredentialName,
         else => error.InvalidCredentialName,
@@ -511,7 +517,7 @@ fn downloadRemoteContentOutcomeAlloc(
     credential_name: ?[]const u8,
 ) !scraping.DownloadOutcome {
     if (render_ctx.remote_bytes_remaining == 0) return error.StreamTooLong;
-    var snapshot = if (render_ctx.remote_content) |remote_content| remote_content.acquire() else null;
+    var snapshot = if (render_ctx.remote_content) |remote_content| try remote_content.acquire() else null;
     defer if (snapshot) |*held| held.deinit();
     const remote_content = if (snapshot) |*held| held.config else null;
     var resolved = try resolveRemoteContentFetchOptions(render_ctx.alloc, remote_content, render_ctx.secret_store, url, credential_name);
@@ -733,7 +739,7 @@ pub fn downloadRemoteContentOutcomeAllocWithRenderConfig(
         .io = config.io,
         .deadline_ns = config.deadline_ns,
         .cancellation = config.cancellation,
-        .remote_bytes_remaining = remoteByteBudget(config.remote_content),
+        .remote_bytes_remaining = try remoteByteBudget(config.remote_content),
         .max_media_parts = config.max_media_parts,
     };
     try ensureRenderActive(&render_ctx);
@@ -756,7 +762,7 @@ fn downloadRemoteContentOutcomeAllocWithExecutor(
     credential_name: ?[]const u8,
     executor: RemoteContentDownloadExecutor,
 ) !scraping.DownloadOutcome {
-    var snapshot = if (remote_content) |configured| configured.acquire() else null;
+    var snapshot = if (remote_content) |configured| try configured.acquire() else null;
     defer if (snapshot) |*held| held.deinit();
     const effective_remote_content = if (snapshot) |*held| held.config else null;
     var resolved = try resolveRemoteContentFetchOptions(alloc, effective_remote_content, secret_store, url, credential_name);
@@ -2007,7 +2013,7 @@ test "template remote enforces one aggregate byte budget across helpers" {
             .max_download_size_bytes = 4,
         },
     };
-    try std.testing.expectEqual(@as(u64, 4), remoteByteBudget(&remote_content));
+    try std.testing.expectEqual(@as(u64, 4), try remoteByteBudget(&remote_content));
 
     const exact = try renderJsonToTextWithConfig(
         alloc,

@@ -167,17 +167,7 @@ class Controller:
                 raise Conflict("catalog admission is fenced")
             # The load occurred outside admission. Writer exclusion plus an
             # authoritative reread below prevents pinning a raced incarnation.
-            if len(state["readers"]) >= self.config.get("max_readers", 1024):
-                expired = [
-                    key
-                    for key, value in state["readers"].items()
-                    if value["expires_ns"] + 30_000_000_000 < self.now_ns()
-                ]
-                for key in expired:
-                    del state["readers"][key]
-            if len(state["readers"]) >= self.config.get("max_readers", 1024):
-                raise Unavailable("reader admission budget exceeded")
-            state["readers"][identifier] = lease
+            self._add_reader(state, lease, "reader admission budget exceeded")
 
         self.store.mutate(self.key("HEAD.json"), admit)
         latest = self.provider.load(namespace, name)
@@ -402,14 +392,29 @@ class Controller:
                 self._finish_writer(operation)
             raise
 
+    def _add_reader(self, state, lease, budget_error):
+        limit = self.config.get("max_readers", 1024)
+        if len(state["readers"]) >= limit:
+            now = self.now_ns()
+            expired = [
+                key
+                for key, value in state["readers"].items()
+                if value["expires_ns"] + 30_000_000_000 < now
+            ]
+            for key in expired:
+                del state["readers"][key]
+        if len(state["readers"]) >= limit:
+            raise Unavailable(budget_error)
+        state["readers"][lease["id"]] = lease
+
     def _finish_writer(self, operation, lease=None):
         def finish(state):
             if not state["writer"] or state["writer"]["operation"] != operation:
                 raise Conflict("writer admission changed")
             if lease is not None:
-                if len(state["readers"]) >= self.config.get("max_readers", 1024):
-                    raise Unavailable("commit reader admission budget exceeded")
-                state["readers"][lease["id"]] = lease
+                self._add_reader(
+                    state, lease, "commit reader admission budget exceeded"
+                )
             state["writer"] = None
 
         self.store.mutate(self.key("HEAD.json"), finish)
@@ -507,16 +512,33 @@ class Controller:
 
     def _native_pins(self, registry):
         active = set()
-        count = 0
+        reclaimed = 0
+        limit = self.config.get("max_readers", 1024)
         for obj in self.store.inventory(registry + "pins/"):
-            count += 1
-            if count > self.config.get("max_readers", 1024):
-                raise Unavailable("native reader inventory budget exceeded")
             result = self.store.get(obj.uri)
             if result is None:
-                raise Unavailable("native reader inventory changed")
-            if int(result[0]) + 30_000_000_000 >= self.now_ns():
-                active.add(obj.uri.rsplit("/", 1)[-1])
+                # Another bounded cleanup turn may have removed this pin.
+                continue
+            if int(result[0]) + 30_000_000_000 < self.now_ns():
+                if reclaimed == limit:
+                    # Prior removals make durable progress. Replaying this
+                    # admission rescans active pins before retiring anything.
+                    raise PlanningPending()
+                try:
+                    self.store.delete_current(obj.uri, result[1])
+                except Conflict:
+                    raise PlanningPending() from None
+                reclaimed += 1
+                # GCS exact-generation deletion can remove an old generation
+                # after renewal. Include the current pin if one now exists.
+                result = self.store.get(obj.uri)
+                if result is None:
+                    continue
+                if int(result[0]) + 30_000_000_000 < self.now_ns():
+                    raise PlanningPending()
+            active.add(obj.uri.rsplit("/", 1)[-1])
+            if len(active) > limit:
+                raise Unavailable("native reader inventory budget exceeded")
         return active
 
     def run_job(self, request_hash, body):
@@ -650,7 +672,11 @@ class Controller:
                 self.store.immutable(
                     registry + "retired/" + digest(snapshot.encode()), snapshot.encode()
                 )
-            if self._native_pins(registry) & {
+            try:
+                active_pins = self._native_pins(registry)
+            except PlanningPending:
+                return {**base, "state": "running"}
+            if active_pins & {
                 digest(item.encode()) for item in plan["retired_snapshots"]
             }:
                 return {**base, "state": "running"}

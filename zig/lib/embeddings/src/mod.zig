@@ -101,6 +101,7 @@ pub const Inputs = struct {
 };
 
 pub const Config = struct {
+    sparse: ?bool = null,
     rate_limit: ?openapi.RateLimitConfig = null,
     provider: Provider,
     model: []const u8 = "",
@@ -129,6 +130,7 @@ pub const Config = struct {
     pub fn clone(self: Config, alloc: Allocator) !Config {
         return .{
             .rate_limit = self.rate_limit,
+            .sparse = self.sparse,
             .provider = self.provider,
             .model = if (self.model.len > 0) try alloc.dupe(u8, self.model) else "",
             .model_identity = if (self.model_identity.len > 0) try alloc.dupe(u8, self.model_identity) else "",
@@ -230,6 +232,26 @@ pub fn parseConfigFromSlice(alloc: Allocator, raw: []const u8) !Config {
     return try configFromOpenApi(alloc, parsed.value);
 }
 
+test "antfly model identity survives config admission cloning and serialization" {
+    const a = std.testing.allocator;
+    const identity = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const raw = "{\"provider\":\"antfly\",\"model\":\"google/embeddinggemma-2\",\"api_url\":\"http://localhost:8082\",\"model_identity\":\"" ++ identity ++ "\"}";
+    var config = try parseConfigFromSlice(a, raw);
+    defer config.deinit(a);
+    var cloned = try config.clone(a);
+    defer cloned.deinit(a);
+    const encoded = try stringifyAlloc(a, cloned);
+    defer a.free(encoded);
+    var restored = try parseConfigFromSlice(a, encoded);
+    defer restored.deinit(a);
+    try std.testing.expectEqualStrings(identity, restored.model_identity);
+    try std.testing.expectEqualStrings(config.url, restored.url);
+    inline for (.{ "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }) |invalid| {
+        try std.testing.expectError(error.InvalidEmbedderConfig, parseConfigFromSlice(a, "{\"provider\":\"antfly\",\"model\":\"m\",\"model_identity\":\"" ++ invalid ++ "\"}"));
+    }
+    try std.testing.expectError(error.InvalidEmbedderConfig, parseConfigFromSlice(a, "{\"provider\":\"openai\",\"model\":\"m\",\"model_identity\":\"" ++ identity ++ "\"}"));
+}
+
 pub fn parseConfigFromValue(alloc: Allocator, value: json.Value) !Config {
     const parsed = try json.parseFromValue(openapi.EmbedderConfig, alloc, value, .{});
     defer parsed.deinit();
@@ -258,6 +280,7 @@ pub fn configFromOpenApi(alloc: Allocator, generated: openapi.EmbedderConfig) !C
     );
     var cfg = Config{
         .rate_limit = generated.rate_limit,
+        .sparse = generated.sparse,
         .provider = std.meta.stringToEnum(Provider, provider_name) orelse return error.InvalidEmbedderConfig,
         .model = if (generated.model) |model| try alloc.dupe(u8, model) else "",
         .model_identity = if (generated.model_identity) |identity| try alloc.dupe(u8, identity) else "",
@@ -301,6 +324,7 @@ pub fn configFromOpenApi(alloc: Allocator, generated: openapi.EmbedderConfig) !C
 pub fn openApiFromConfig(cfg: Config) openapi.EmbedderConfig {
     return .{
         .rate_limit = cfg.rate_limit,
+        .sparse = cfg.sparse,
         .provider = @tagName(cfg.provider),
         .model = if (cfg.model.len > 0) cfg.model else null,
         .request_format = if (cfg.request_format.len > 0) cfg.request_format else null,

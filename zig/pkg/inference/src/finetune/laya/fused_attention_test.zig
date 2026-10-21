@@ -548,7 +548,7 @@ fn segmentOp(a: std.mem.Allocator, cb: *const ops.ComputeBackend, attrs: ml.Segm
     return .{ forward_values, try cb.toFloat32(backward, a) };
 }
 
-test "fused segment attention runs on the Metal device kernels without dropout and matches the CPU op" {
+test "fused segment attention runs on the Metal device kernels with and without dropout and matches the CPU op" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -572,11 +572,12 @@ test "fused segment attention runs on the Metal device kernels without dropout a
     defer a.free(d_out);
     for (d_out) |*v| v.* = prng.random().floatNorm(f32);
 
-    // Global and local layers, then a dropout call that must use the host bridge.
+    // Global and local layers, then a dropout call: head_dim 32 is flash
+    // eligible, so the dropout mask runs on device too, not the host bridge.
     for ([_]struct { window: u32, dropout: f32, device: bool }{
         .{ .window = std.math.maxInt(u32), .dropout = 0, .device = true },
         .{ .window = 4, .dropout = 0, .device = true },
-        .{ .window = std.math.maxInt(u32), .dropout = 0.1, .device = false },
+        .{ .window = std.math.maxInt(u32), .dropout = 0.1, .device = true },
     }) |case| {
         const attrs = ml.SegmentTrainingAttentionAttrs{
             .batch = 2,

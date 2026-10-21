@@ -47,6 +47,14 @@ pub const Source = struct {
     ctx: *anyopaque,
     next_batch: NextBatchFn,
     deinit_fn: ?DeinitFn = null,
+    /// Optional immutable payload ownership for the last returned batch.
+    /// Callers must copy descriptors, identities and null maps before pulling
+    /// again. Encoded/mutable sources decline and retain ordinary borrowing.
+    retain_columns: ?*const fn (*anyopaque, Allocator) anyerror!?ColumnOwner = null,
+
+    pub fn retainColumns(self: Source, alloc: Allocator) !?ColumnOwner {
+        return if (self.retain_columns) |retain| retain(self.ctx, alloc) else null;
+    }
 
     pub fn next(self: Source, alloc: Allocator) !?ColumnBatch {
         const batch = try self.next_batch(self.ctx, alloc);
@@ -71,6 +79,7 @@ pub const ServerlessRowRef = struct {
 };
 
 pub const ExternalRowRef = struct {
+    identity_version: u8 = 1,
     source_id: []const u8,
     snapshot_id: []const u8,
     file_id: []const u8,
@@ -94,12 +103,15 @@ pub const ColumnKind = enum(u8) {
     dictionary_bytes = 7,
     dictionary_i64 = 8,
     dictionary_f64 = 9,
+    decimal128 = 10,
+    encoded = 11,
 
     pub fn logical(self: ColumnKind) ColumnKind {
         return switch (self) {
             .dictionary_bytes => .bytes,
             .dictionary_i64 => .i64,
             .dictionary_f64 => .f64,
+            .decimal128 => .bytes,
             else => self,
         };
     }
@@ -113,7 +125,7 @@ pub const DictionaryBytes = struct {
     pub fn at(self: DictionaryBytes, row: usize) []const u8 {
         return self.values[self.indices[row]];
     }
-    pub fn deinit(self: DictionaryBytes, a: Allocator) void {
+    pub fn deinit(self: DictionaryBytes, a: std.mem.Allocator) void {
         for (self.values) |value| a.free(value);
         a.free(self.values);
         a.free(self.indices);
@@ -130,13 +142,49 @@ pub fn DictionaryNumeric(comptime T: type) type {
         pub fn at(self: @This(), row: usize) T {
             return self.values[self.indices[row]];
         }
-        pub fn deinit(self: @This(), a: Allocator) void {
+        pub fn deinit(self: @This(), a: std.mem.Allocator) void {
             if (self.owned) a.free(self.values);
             a.free(self.indices);
         }
     };
 }
 
+/// Fixed scale belongs to the column; coefficients never pass through text
+/// inside the SQL pipeline. Payload ownership follows the enclosing page.
+pub const Decimal128 = struct {
+    pub const max_text_bytes = 41;
+    values: []const i128,
+    precision: i32,
+    scale: i32,
+    pub fn text(self: @This(), a: std.mem.Allocator, row: usize) ![]u8 {
+        return @import("../../common/decimal128.zig").formatAlloc(a, self.values[row], self.precision, self.scale);
+    }
+    pub fn slice(self: @This(), begin: usize, count: usize) @This() {
+        var result = self;
+        result.values = self.values[begin..][0..count];
+        return result;
+    }
+};
+/// Borrowed encoded page evidence. Callbacks interpret only requested lanes;
+/// producers materialize survivors before returning an owning result batch.
+pub const EncodedOp = enum { eq, neq, lt, lte, gt, gte };
+pub const FloatDomain = @import("../../common/float_domain.zig").Domain;
+pub const EncodedValues = struct {
+    ptr: *const anyopaque,
+    begin: usize,
+    count: usize,
+    kind: ColumnKind,
+    read: *const fn (*const anyopaque, usize) anyerror!std.json.Value,
+    dictionary_id: ?*const fn (*const anyopaque, usize) ?u32 = null,
+    mask: ?*const fn (*const anyopaque, usize, []bool, std.json.Value, EncodedOp) anyerror!bool = null,
+    /// Exact numeric masks carry the consumer's comparison domain. Encoded
+    /// producers normalize dictionary/repeated values once and keep operands wide.
+    mask_number: ?*const fn (*const anyopaque, usize, []bool, f64, EncodedOp, FloatDomain) anyerror!bool = null,
+    pub fn at(self: @This(), row: usize) !std.json.Value {
+        if (row >= self.count) return error.RowSourceColumnLengthMismatch;
+        return self.read(self.ptr, std.math.add(usize, self.begin, row) catch return error.RowSourceColumnLengthMismatch);
+    }
+};
 pub const ColumnValues = union(ColumnKind) {
     bytes: []const []const u8,
     json: []const []const u8,
@@ -147,13 +195,53 @@ pub const ColumnValues = union(ColumnKind) {
     dictionary_bytes: DictionaryBytes,
     dictionary_i64: DictionaryNumeric(i64),
     dictionary_f64: DictionaryNumeric(f64),
+    decimal128: Decimal128,
+    encoded: EncodedValues,
+    pub fn jsonAt(self: @This(), a: std.mem.Allocator, row: usize) !std.json.Value {
+        return switch (self) {
+            .i64 => |v| .{ .integer = v[row] },
+            .dictionary_i64 => |v| .{ .integer = v.at(row) },
+            .f64 => |v| .{ .float = v[row] },
+            .dictionary_f64 => |v| .{ .float = v.at(row) },
+            .bool => |v| .{ .bool = v[row] },
+            .bytes => |v| .{ .string = v[row] },
+            .dictionary_bytes => |v| .{ .string = v.at(row) },
+            .decimal128 => |v| .{ .string = try v.text(a, row) },
+            .encoded => |v| try v.at(row),
+            .json => |v| try std.json.parseFromSliceLeaky(std.json.Value, a, v[row], .{ .parse_numbers = false }),
+            .vector_f32 => return error.RowSourceColumnKindMismatch,
+        };
+    }
 };
 
 pub const NullBitmap = struct {
     /// One byte per row for now. Zero means present, non-zero means null.
     bytes: []const u8 = &.{},
 
+    /// Borrowed retained-store validity, with a bit offset for sliced columns.
+    bits: ?struct { words: []const u64, offset: usize = 0 } = null,
+    pub fn validate(self: NullBitmap, count: usize) !void {
+        if (self.bits) |bits| {
+            if (self.bytes.len != 0 or bits.offset > bits.words.len *| 64 or count > bits.words.len *| 64 - bits.offset) return error.RowSourceNullBitmapLengthMismatch;
+        } else if (self.bytes.len != 0 and self.bytes.len != count) return error.RowSourceNullBitmapLengthMismatch;
+    }
+    pub fn slice(self: NullBitmap, begin: usize, count: usize) NullBitmap {
+        if (self.bits) |bits| return .{ .bits = .{ .words = bits.words, .offset = bits.offset + begin } };
+        return .{ .bytes = if (self.bytes.len == 0) &.{} else self.bytes[begin..][0..count] };
+    }
+    /// Owning row-source boundaries materialize borrowed validity once.
+    pub fn dupeBytes(self: NullBitmap, a: std.mem.Allocator, count: usize) ![]u8 {
+        try self.validate(count);
+        if (self.bits == null) return a.dupe(u8, self.bytes);
+        const bytes = try a.alloc(u8, count);
+        for (bytes, 0..) |*byte, row| byte.* = @intFromBool(self.isNull(row));
+        return bytes;
+    }
     pub fn isNull(self: NullBitmap, row: usize) bool {
+        if (self.bits) |bits| {
+            const index = bits.offset + row;
+            return index / 64 < bits.words.len and bits.words[index / 64] & (@as(u64, 1) << @as(u6, @intCast(index % 64))) != 0;
+        }
         return self.bytes.len > row and self.bytes[row] != 0;
     }
 };
@@ -183,6 +271,16 @@ pub const ColumnVector = struct {
         };
     }
 
+    /// Raw/string consumers can format fixed decimals into caller scratch;
+    /// semantic NUMERIC consumers keep the coefficient vector instead.
+    pub fn bytesAtScratch(self: ColumnVector, row: usize, scratch: []u8) ![]const u8 {
+        if (self.values == .decimal128) {
+            var buffer = std.heap.FixedBufferAllocator.init(scratch);
+            return self.values.decimal128.text(buffer.allocator(), row);
+        }
+        return self.bytesAt(row);
+    }
+
     /// Dictionary identity is local to this column's retained page. Null slots
     /// do not reference an entry and may contain an arbitrary physical id.
     pub fn dictionaryId(self: ColumnVector, row: usize) !?u32 {
@@ -194,6 +292,7 @@ pub const ColumnVector = struct {
                 if (id >= dictionary.values.len) return error.RowSourceDictionaryIndexOutOfBounds;
                 break :blk id;
             },
+            .encoded => |values| if (values.dictionary_id) |id| id(values.ptr, std.math.add(usize, values.begin, row) catch return error.RowSourceColumnLengthMismatch) else null,
             else => null,
         };
     }
@@ -205,38 +304,72 @@ pub const ColumnVector = struct {
             .json => |values| values.len,
             .i64 => |values| values.len,
             .f64 => |values| values.len,
+            .decimal128 => |values| values.values.len,
+            .encoded => |values| values.count,
             .bool => |values| values.len,
             .vector_f32 => |values| values.len,
         };
     }
 };
 
+/// Validate decoded vectors independently of row-reference ownership.
+pub fn validateColumns(columns: []const ColumnVector, row_count: usize) !void {
+    for (columns) |column| {
+        if (column.values == .dictionary_bytes) {
+            const dictionary = column.values.dictionary_bytes;
+            for (dictionary.indices, 0..) |id, index| if (!column.nulls.isNull(index) and id >= dictionary.values.len) return error.RowSourceDictionaryIndexOutOfBounds;
+        }
+        switch (column.values) {
+            inline .dictionary_i64, .dictionary_f64 => |dictionary| for (dictionary.indices, 0..) |id, index| {
+                if (!column.nulls.isNull(index) and id >= dictionary.values.len) return error.RowSourceDictionaryIndexOutOfBounds;
+            },
+            else => {},
+        }
+        if (column.rowCount() != row_count) return error.RowSourceColumnLengthMismatch;
+        try column.nulls.validate(row_count);
+    }
+}
+
 pub const ColumnBatch = struct {
     snapshot: SnapshotRef,
-    row_refs: []const RowRef,
+    /// Explicit identities remain available for arbitrary/noncontiguous input.
+    row_refs: []const RowRef = &.{},
+    /// A scan shares immutable source identity and synthesizes only requested
+    /// row references. This is borrowed with the same lifetime as column data.
+    external_span: ?struct { first: ExternalRowRef, count: usize } = null,
     columns: []const ColumnVector,
 
     pub fn rowCount(self: ColumnBatch) usize {
-        return self.row_refs.len;
+        return if (self.external_span) |span| span.count else self.row_refs.len;
     }
 
     pub fn validate(self: ColumnBatch) !void {
-        for (self.columns) |column| {
-            if (column.values == .dictionary_bytes) {
-                const dictionary = column.values.dictionary_bytes;
-                for (dictionary.indices, 0..) |id, index| if (!column.nulls.isNull(index) and id >= dictionary.values.len) return error.RowSourceDictionaryIndexOutOfBounds;
-            }
-            switch (column.values) {
-                inline .dictionary_i64, .dictionary_f64 => |dictionary| for (dictionary.indices, 0..) |id, index| {
-                    if (!column.nulls.isNull(index) and id >= dictionary.values.len) return error.RowSourceDictionaryIndexOutOfBounds;
-                },
-                else => {},
-            }
-            if (column.rowCount() != self.row_refs.len) return error.RowSourceColumnLengthMismatch;
-            if (column.nulls.bytes.len != 0 and column.nulls.bytes.len != self.row_refs.len) {
-                return error.RowSourceNullBitmapLengthMismatch;
-            }
+        if (self.external_span) |span| {
+            if (self.row_refs.len != 0 or span.first.source_id.len == 0 or span.first.snapshot_id.len == 0 or span.first.file_id.len == 0 or
+                !std.mem.eql(u8, span.first.source_id, self.snapshot.table_id) or !std.mem.eql(u8, span.first.snapshot_id, self.snapshot.snapshot_id)) return error.InvalidExternalRowSource;
+            if (span.count != 0) _ = std.math.add(u64, span.first.row_ordinal, span.count - 1) catch return error.InvalidExternalRowSource;
         }
+        try validateColumns(self.columns, self.rowCount());
+    }
+
+    pub fn rowRef(self: ColumnBatch, index: usize) RowRef {
+        std.debug.assert(index < self.rowCount());
+        if (self.external_span) |span| {
+            var ref = span.first;
+            ref.row_ordinal += index;
+            return .{ .external = ref };
+        }
+        return self.row_refs[index];
+    }
+    pub fn identitySlice(self: ColumnBatch, begin: usize, end: usize, columns: []const ColumnVector) !ColumnBatch {
+        if (begin > end or end > self.rowCount()) return error.RowSourceColumnLengthMismatch;
+        var result = self;
+        result.columns = columns;
+        if (self.external_span) |span| {
+            result.external_span = .{ .first = span.first, .count = end - begin };
+            if (begin != end) result.external_span.?.first.row_ordinal = std.math.add(u64, span.first.row_ordinal, begin) catch return error.InvalidExternalRowSource;
+        } else result.row_refs = self.row_refs[begin..end];
+        return result;
     }
 
     pub fn findColumn(self: ColumnBatch, name: []const u8) ?ColumnVector {
@@ -317,4 +450,26 @@ test "row source validates batches returned by adapters" {
     const batch = (try source.next(std.testing.allocator)).?;
     try std.testing.expectEqual(@as(usize, 1), batch.rowCount());
     try std.testing.expect((try source.next(std.testing.allocator)) == null);
+}
+
+test "external lake compact identity spans preserve coordinates slices and validation" {
+    const first: ExternalRowRef = .{ .source_id = "source", .snapshot_id = "snapshot", .file_id = "file", .row_group_ordinal = 7, .row_ordinal = 99 };
+    const batch: ColumnBatch = .{ .snapshot = .{ .table_id = "source", .snapshot_id = "snapshot" }, .external_span = .{ .first = first, .count = 4096 }, .columns = &.{} };
+    try batch.validate();
+    try std.testing.expectEqual(@as(usize, 0), batch.row_refs.len);
+    try std.testing.expectEqual(@as(usize, 4096), batch.rowCount());
+    const sliced = try batch.identitySlice(17, 31, &.{});
+    try sliced.validate();
+    for (0..sliced.rowCount()) |index| try std.testing.expectEqualDeep(batch.rowRef(index + 17), sliced.rowRef(index));
+    const explicit: ColumnBatch = .{ .snapshot = batch.snapshot, .row_refs = &.{ batch.rowRef(4), batch.rowRef(7) }, .columns = &.{} };
+    try std.testing.expectEqualDeep(explicit.rowRef(1), (try explicit.identitySlice(1, 2, &.{})).rowRef(0));
+    var bad = batch;
+    bad.row_refs = explicit.row_refs;
+    try std.testing.expectError(error.InvalidExternalRowSource, bad.validate());
+    bad = batch;
+    bad.external_span.?.first.row_ordinal = std.math.maxInt(u64);
+    try std.testing.expectError(error.InvalidExternalRowSource, bad.validate());
+    bad = batch;
+    bad.snapshot.snapshot_id = "other";
+    try std.testing.expectError(error.InvalidExternalRowSource, bad.validate());
 }

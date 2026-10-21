@@ -28,6 +28,7 @@ pub const gguf = @import("../gguf/root.zig");
 pub const bert = @import("bert.zig");
 pub const t5 = @import("t5.zig");
 pub const gpt = @import("gpt.zig");
+pub const embedding_gemma2 = @import("embedding_gemma2.zig");
 pub const whisper = @import("whisper.zig");
 pub const florence = @import("florence.zig");
 pub const clip = @import("clip.zig");
@@ -35,6 +36,7 @@ pub const clap = @import("clap.zig");
 pub const manifest = @import("manifest.zig");
 pub const compatibility = @import("compatibility.zig");
 pub const gliner_boundary = @import("gliner_boundary.zig");
+pub const gliner_encoder = @import("gliner_encoder.zig");
 pub const gliner_boundary_artifact = @import("gliner_boundary_artifact.zig");
 pub const gliner_boundary_bundle = @import("gliner_boundary_bundle.zig");
 
@@ -47,6 +49,7 @@ test {
     _ = bert;
     _ = t5;
     _ = gpt;
+    _ = embedding_gemma2;
     _ = whisper;
     _ = florence;
     _ = clip;
@@ -54,6 +57,7 @@ test {
     _ = manifest;
     _ = compatibility;
     _ = gliner_boundary;
+    _ = gliner_encoder;
     _ = gliner_boundary_artifact;
     _ = gliner_boundary_bundle;
 }

@@ -288,7 +288,10 @@ fn countIntersectedCandidateRefs(
     const first = try firstUsableCandidateSet(descriptor, sidecars, desired, policy, candidate_sets) orelse return 0;
     var total: u64 = 0;
     for (first.row_refs, 0..) |row_ref, row_idx| {
-        if (containsRowRef(first.row_refs[0..row_idx], row_ref)) continue;
+        const duplicate = for (0..row_idx) |prior| {
+            if (containsRowRef(&.{first.row_refs[prior]}, row_ref)) break true;
+        } else false;
+        if (duplicate) continue;
         if (!try rowRefInEveryUsableCandidateSet(descriptor, sidecars, desired, policy, candidate_sets, row_ref)) continue;
         total += 1;
     }
@@ -526,6 +529,13 @@ fn chooseCacheClass(
             else => .row_fragment_data,
         },
     };
+}
+
+test "lake explain counts ordered indexes as sidecars" {
+    var accounting: ArtifactAccounting = .{};
+    try accountArtifact(&accounting, .{ .kind = .ordered_row_index, .artifact_id = "ordered", .byte_len = 40, .checksum = "len:40" });
+    try std.testing.expectEqual(@as(u32, 1), accounting.search_sidecar_count);
+    try std.testing.expectEqual(@as(u64, 40), accounting.manifest_accounted_bytes);
 }
 
 test "lake explain accounts for Antfly row fragments and stats" {

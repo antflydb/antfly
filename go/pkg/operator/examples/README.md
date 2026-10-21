@@ -307,3 +307,43 @@ kubectl delete antflycluster simple-antfly-cluster
 To remove the operator:
 ```bash
 kubectl delete -f https://antfly.io/antfly-operator-install.yaml
+```
+
+### Standalone Lite storage
+
+A new standalone deployment can use the single-file backend with:
+
+```yaml
+spec:
+  mode: Standalone
+  standalone:
+    replicas: 1
+  storage:
+    engine: lite
+    liteFileName: database.aflite
+    standaloneStorage: 5Gi
+    standaloneAccessMode: ReadWriteOncePod
+```
+
+`standaloneAccessMode` defaults to `ReadWriteOnce` for existing configurations.
+`ReadWriteOncePod` requires a CSI driver that supports it and restricts the
+volume to one pod across the cluster. The operator preserves the requested
+mode for both claim templates and explicit recovery claims. The mode is
+immutable; moving an existing volume to another mode requires a separate
+volume and a snapshot transfer. Lite also enforces its process-level writer
+lock. This example does not establish driver support or deployment availability.
+
+Set `spec.standalone.suspend: true` to stop standalone compute while retaining
+its StatefulSet identity and PVC. Clear the flag to resume on the same volume.
+`status.phase: Suspended` requires fresh API observations: the StatefulSet must
+acknowledge its current zero-replica generation and all workload Pods must be
+absent, including pending and terminating Pods. A scale-down request alone is
+not reported as suspended.
+Suspension overrides the StatefulSet's scale-down retention policy to `Retain`;
+normal configured retention applies again on resume. The hold also retains
+claims if the StatefulSet is deleted while suspended; configured deletion
+retention applies again after resume.
+
+The controller verifies the actual access mode of an existing retained claim
+before creating or resuming a workload. Recreating a StatefulSet with a stronger
+claim template does not upgrade an old PVC's access mode.

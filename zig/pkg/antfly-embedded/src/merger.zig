@@ -37,6 +37,18 @@ pub const MergePolicy = struct {
     skew_weight: f64 = 1.0,
     size_weight: f64 = 1.0,
     delete_reclaim_weight: f64 = 2.0,
+    /// Within the segment budget, merge only to reclaim deletions once at
+    /// least this fraction of a window's documents are deleted. Without a
+    /// floor, a single deleted document makes every window eligible and a
+    /// stream of small updates keeps rewriting the whole index.
+    min_reclaim_delete_ratio: f64 = 0.2,
+    /// Skip windows whose largest segment (actual bytes, not floored) exceeds
+    /// this multiple of the rest of the window combined, unless the merge
+    /// reclaims deletions. Floor-equalized scoring otherwise keeps folding a
+    /// growing sub-floor segment into every handful of tiny new segments,
+    /// rewriting it on each publication. Over-budget indexes that find no
+    /// eligible window still drain through the force-drain path.
+    max_merge_rewrite_skew: f64 = 4.0,
 
     /// Plan a merge: pick the best set of segments to merge.
     /// Returns owned segment indices, or null if no merge is needed.
@@ -72,6 +84,7 @@ pub const MergePolicy = struct {
 
         for (0..candidates.len) |start| {
             var total_size: u64 = 0;
+            var actual_total_size: u64 = 0;
             var total_docs: u64 = 0;
             var total_deleted: u64 = 0;
             var largest_size: u64 = 0;
@@ -86,6 +99,7 @@ pub const MergePolicy = struct {
                 if (offset > 0 and total_size + effective_size > self.max_segment_size) break;
 
                 total_size += effective_size;
+                actual_total_size += candidate.size;
                 total_docs += candidate.doc_count;
                 total_deleted += candidate.deleted_count;
                 largest_size = @max(largest_size, effective_size);
@@ -94,7 +108,21 @@ pub const MergePolicy = struct {
 
                 const len = offset + 1;
                 if (len < 2) continue;
-                if (segments.len <= self.max_segments_per_tier and !has_candidate_deletions) continue;
+
+                const delete_ratio = if (total_docs == 0)
+                    0.0
+                else
+                    @as(f64, @floatFromInt(total_deleted)) / @as(f64, @floatFromInt(total_docs));
+                if (segments.len <= self.max_segments_per_tier) {
+                    if (!has_candidate_deletions) continue;
+                    if (total_docs > 0 and delete_ratio < self.min_reclaim_delete_ratio) continue;
+                }
+                if (delete_ratio < self.min_reclaim_delete_ratio) {
+                    // Candidates are sorted by size, so this one is the window's largest.
+                    const largest_actual: f64 = @floatFromInt(candidate.size);
+                    const rest_actual: f64 = @floatFromInt(actual_total_size - candidate.size);
+                    if (largest_actual > self.max_merge_rewrite_skew * rest_actual) continue;
+                }
 
                 const skew = if (smallest_size == 0)
                     1.0
@@ -104,10 +132,6 @@ pub const MergePolicy = struct {
                     1.0
                 else
                     @as(f64, @floatFromInt(total_size)) / @as(f64, @floatFromInt(self.max_segment_size));
-                const delete_ratio = if (total_docs == 0)
-                    0.0
-                else
-                    @as(f64, @floatFromInt(total_deleted)) / @as(f64, @floatFromInt(total_docs));
                 const floor_bonus: f64 = if (largest_size <= self.floor_segment_size) 0.25 else 0.0;
                 const max_segments_per_tier: usize = @max(@as(usize, 1), @as(usize, self.max_segments_per_tier));
                 const budget_pressure: f64 = if (segments.len > max_segments_per_tier)
@@ -673,6 +697,28 @@ test "merge policy skips idle index within tier budget" {
     try std.testing.expect(planned == null);
 }
 
+test "merge policy ignores tiny deletion debt and skewed rewrite windows" {
+    const alloc = std.testing.allocator;
+    const policy = MergePolicy{ .max_segments_per_tier = 10, .floor_segment_size = 16 * 1024 * 1024 };
+    const stale = [_]SegmentInfo{
+        .{ .index = 0, .size = 100_000, .doc_count = 10_000, .deleted_count = 1, .has_deletions = true },
+        .{ .index = 1, .size = 100_000, .doc_count = 10_000, .deleted_count = 0, .has_deletions = false },
+    };
+    try std.testing.expect((try policy.plan(alloc, &stale)) == null);
+    const skewed = [_]SegmentInfo{
+        .{ .index = 0, .size = 1024, .doc_count = 10, .deleted_count = 0, .has_deletions = false },
+        .{ .index = 1, .size = 8 * 1024 * 1024, .doc_count = 10_000, .deleted_count = 0, .has_deletions = false },
+    };
+    var pressured = policy;
+    pressured.max_segments_per_tier = 1;
+    try std.testing.expect((try pressured.plan(alloc, &skewed)) == null);
+    var reclaimable = stale;
+    reclaimable[0].deleted_count = 5000;
+    const plan = (try policy.plan(alloc, &reclaimable)).?;
+    defer alloc.free(plan);
+    try std.testing.expectEqual(@as(usize, 2), plan.len);
+}
+
 test "merge policy reclaims deleted docs within tier budget" {
     const alloc = std.testing.allocator;
     const policy = MergePolicy{
@@ -850,7 +896,7 @@ test "merge mapper-built multi-field text segments" {
     try std.testing.expectEqualStrings("doc2", doc1.id);
     try std.testing.expectEqualStrings("doc3", doc2.id);
 
-    var seg_shared = index_mod.SegmentShared{ .ref_count = 1 };
+    var seg_shared = index_mod.SegmentShared{ .ref_count = 1, .allocator = alloc };
     var seg_entry: index_mod.SegmentEntry = .{
         .id = 0,
         .data = index_mod.SegmentData.fromOwnedHeap(try alloc.dupe(u8, merged)),

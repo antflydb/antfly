@@ -22,7 +22,20 @@ const parquet = @import("lake_parquet_rowgroup.zig");
 const external = @import("../external_source/mod.zig");
 const storage = @import("../../storage/object_storage.zig");
 const A = std.mem.Allocator;
-pub const Column = struct { name: []const u8, kind: []const u8, required: bool, field_id: ?i32 = null, iceberg_type: []const u8 = "" };
+pub const Column = struct {
+    name: []const u8,
+    kind: []const u8,
+    required: bool,
+    field_id: ?i32 = null,
+    iceberg_type: []const u8 = "",
+    /// Declared NUMERIC consumes exact physical integers or decimal lexemes.
+    /// Ordinary number retains its strict floating source contract; rounded
+    /// physical floats cannot silently become exact NUMERIC values.
+    pub fn accepts(self: Column, actual: []const u8) bool {
+        if (std.mem.eql(u8, self.kind, "numeric")) return std.mem.eql(u8, actual, "integer") or std.mem.eql(u8, actual, "string");
+        return std.mem.eql(u8, actual, self.kind);
+    }
+};
 pub const Detected = struct {
     arena: std.heap.ArenaAllocator,
     columns: []const Column,
@@ -64,35 +77,93 @@ pub fn parquetKind(column: metadata.SchemaColumn) ![]const u8 {
         else => error.UnsupportedExternalLakeSchemaType,
     };
 }
+const Context = @import("lake_read_context.zig").Context;
+const scheduler = @import("../../sql/parallel_scheduler.zig");
+fn activeFooter(a: A, reader: parquet.ObjectRangeReader, file: external.FileEntry, context: Context) !metadata.ParsedFooter {
+    try context.ensureActive();
+    var footer = try readFooter(a, reader, file);
+    errdefer footer.deinit(a);
+    try context.ensureActive();
+    return footer;
+}
+fn boundedFooter(a: A, reader: parquet.ObjectRangeReader, file: external.FileEntry, context: Context) anyerror!?metadata.ParsedFooter {
+    var budget: @import("../../sql/memory_budget.zig") = .{ .backing = a, .limit = 8 * 1024 * 1024 };
+    return activeFooter(budget.allocator(), reader, file, context) catch |err| {
+        if (err == error.OutOfMemory and budget.isLocallyExhausted()) return null;
+        return err;
+    };
+}
 pub fn parquetSchema(a: A, inventory: external.Inventory, reader: parquet.ObjectRangeReader) !Detected {
+    return parquetSchemaWithContext(a, inventory, reader, .{});
+}
+/// The reader must support concurrent immutable reads when an I/O context is
+/// supplied. Returned schema ownership never borrows the worker allocator.
+pub fn parquetSchemaWithContext(a: A, inventory: external.Inventory, reader: parquet.ObjectRangeReader, context: Context) !Detected {
     if (inventory.files.len == 0) return error.ExternalLakeSchemaUnavailable;
     var arena = std.heap.ArenaAllocator.init(a);
     errdefer arena.deinit();
     const owned = arena.allocator();
     var columns: std.ArrayList(Column) = .empty;
-    for (inventory.files, 0..) |file, file_index| {
-        var footer = try readFooter(a, reader, file);
-        defer footer.deinit(a);
-        for (columns.items) |*column| {
-            const present = for (footer.schema_columns) |leaf| {
-                if (std.mem.eql(u8, column.name, leaf.column_id)) break true;
-            } else false;
-            if (!present) column.required = false;
+    var locked: scheduler.LockedAllocator = .{ .backing = a };
+    const work = locked.allocator();
+    var offset: usize = 0;
+    while (offset < inventory.files.len) {
+        const count = @min(3, inventory.files.len - offset);
+        var tasks: [3]?scheduler.Task(anyerror!?metadata.ParsedFooter) = @splat(null);
+        var ready: [3]?metadata.ParsedFooter = @splat(null);
+        defer {
+            for (&tasks) |*task| if (task.*) |pending| {
+                var running = pending;
+                if (running.cancel(context.io.?)) |result| {
+                    if (result) |value| {
+                        var footer = value;
+                        footer.deinit(work);
+                    }
+                } else |_| {}
+            };
+            for (&ready) |*result| if (result.*) |*footer| footer.deinit(work);
         }
-        for (footer.schema_columns) |leaf| {
-            const kind = try parquetKind(leaf);
-            if (std.mem.eql(u8, leaf.column_id, "_id") or std.mem.indexOfScalar(u8, leaf.column_id, '.') != null) return error.UnsupportedExternalLakeSchemaType;
-            const prior = for (columns.items) |*column| {
-                if (std.mem.eql(u8, column.name, leaf.column_id)) break column;
-            } else null;
-            if (prior) |column| {
-                if (!std.mem.eql(u8, column.kind, kind)) return error.ExternalLakeSchemaMismatch;
-                column.required = column.required and !leaf.nullable;
-            } else {
-                if (columns.items.len >= 1024) return error.ExternalLakeSchemaTooLarge;
-                try columns.append(owned, .{ .name = try owned.dupe(u8, leaf.column_id), .kind = kind, .required = file_index == 0 and !leaf.nullable });
+        for (inventory.files[offset..][0..count], 0..) |file, slot| {
+            try context.ensureActive();
+            // Three 8 MiB workers fit the node-wide I/O credit pool. A large
+            // footer declines bounded speculation and is decoded serially.
+            if (context.io) |io| tasks[slot] = scheduler.global().submitIoTransient(io, 8 * 1024 * 1024, boundedFooter, .{ work, reader, file, context });
+            if (tasks[slot] == null) ready[slot] = try boundedFooter(work, reader, file, context);
+        }
+        // Drain all jobs before allocating into the returned schema arena.
+        // It retains the caller allocator, never this stack-local lock.
+        for (0..count) |slot| if (tasks[slot]) |pending| {
+            var running = pending;
+            tasks[slot] = null;
+            ready[slot] = try running.await(context.io.?);
+        };
+        for (0..count) |slot| {
+            try context.ensureActive();
+            const file_index = offset + slot;
+            if (ready[slot] == null) ready[slot] = try activeFooter(a, reader, inventory.files[file_index], context);
+            const footer = ready[slot].?;
+            for (columns.items) |*column| {
+                const present = for (footer.schema_columns) |leaf| {
+                    if (std.mem.eql(u8, column.name, leaf.column_id)) break true;
+                } else false;
+                if (!present) column.required = false;
+            }
+            for (footer.schema_columns) |leaf| {
+                const kind = try parquetKind(leaf);
+                if (std.mem.eql(u8, leaf.column_id, "_id") or std.mem.indexOfScalar(u8, leaf.column_id, '.') != null) return error.UnsupportedExternalLakeSchemaType;
+                const prior = for (columns.items) |*column| {
+                    if (std.mem.eql(u8, column.name, leaf.column_id)) break column;
+                } else null;
+                if (prior) |column| {
+                    if (!std.mem.eql(u8, column.kind, kind)) return error.ExternalLakeSchemaMismatch;
+                    column.required = column.required and !leaf.nullable;
+                } else {
+                    if (columns.items.len >= 1024) return error.ExternalLakeSchemaTooLarge;
+                    try columns.append(owned, .{ .name = try owned.dupe(u8, leaf.column_id), .kind = kind, .required = file_index == 0 and !leaf.nullable });
+                }
             }
         }
+        offset += count;
     }
     if (columns.items.len == 0) return error.ExternalLakeSchemaUnavailable;
     std.mem.sort(Column, columns.items, {}, struct {
@@ -179,4 +250,61 @@ test "external lake Iceberg discovery selects pinned schema and preserves requir
     try std.testing.expectError(error.IcebergSnapshotMismatch, icebergSchema(a, bytes, "99"));
     try std.testing.expectError(error.UnsupportedExternalLakeSchemaType, parquetKind(.{ .column_id = @constCast("binary"), .nullable = false, .physical_type = 6 }));
     try std.testing.expectError(error.UnsupportedExternalLakeSchemaType, parquetKind(.{ .column_id = @constCast("nested"), .nullable = false, .physical_type = 2, .nested = true }));
+}
+
+test "external lake typed NUMERIC source contracts admit exact physical inputs only" {
+    const exact: Column = .{ .name = "k", .kind = "numeric", .required = false };
+    try std.testing.expect(exact.accepts("integer"));
+    try std.testing.expect(exact.accepts("string"));
+    try std.testing.expect(!exact.accepts("number"));
+    try std.testing.expect(!exact.accepts("boolean"));
+    const floating: Column = .{ .name = "k", .kind = "number", .required = false };
+    try std.testing.expect(!floating.accepts("integer"));
+    try std.testing.expect(floating.accepts("number"));
+}
+
+test "external lake Parquet schema footer prefetch overlaps bounded reads and preserves ordered inference" {
+    const Fixture = struct {
+        bytes: []const u8,
+        active: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        gate: std.Io.Event = .unset,
+        gated: bool = false,
+        fn read(raw: *anyopaque, a: A, _: []const u8, _: []const u8, offset: u64, len: usize) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const active = self.active.fetchAdd(1, .acq_rel) + 1;
+            defer _ = self.active.fetchSub(1, .acq_rel);
+            _ = self.peak.fetchMax(active, .acq_rel);
+            if (self.gated) {
+                if (active >= 2) self.gate.set(std.testing.io);
+                try self.gate.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromMilliseconds(5000), .clock = .awake } });
+            }
+            if (offset > self.bytes.len or len > self.bytes.len - offset) return error.InvalidLakeRangeRead;
+            return a.dupe(u8, self.bytes[@intCast(offset)..][0..len]);
+        }
+        fn run(a: A, reader: parquet.ObjectRangeReader, inventory: external.Inventory) !void {
+            var schema = try parquetSchema(a, inventory, reader);
+            defer schema.deinit();
+            try std.testing.expectEqual(@as(usize, 1), schema.columns.len);
+        }
+    };
+    const a = std.testing.allocator;
+    const bytes = try parquet.buildTestPlainI64ParquetObjectAlloc(a, &.{.{ .column_id = "n", .values = &.{1}, .field_id = 1 }});
+    defer a.free(bytes);
+    var fixture: Fixture = .{ .bytes = bytes };
+    const reader: parquet.ObjectRangeReader = .{ .ctx = &fixture, .read_range_alloc = Fixture.read };
+    var files: [3]external.FileEntry = undefined;
+    for (&files, [_][]const u8{ "a", "b", "c" }) |*file, id| file.* = .{ .file_id = @constCast(id), .object_uri = @constCast("object://antfly/part.parquet"), .etag = @constCast("e"), .byte_len = bytes.len, .row_count = 1, .row_groups = &.{} };
+    const inventory: external.Inventory = .{ .format = .parquet, .source_id = @constCast("source"), .source_uri = @constCast("object://antfly"), .snapshot_id = @constCast("cut"), .schema_fingerprint = @constCast("auto"), .files = &files };
+    var serial = try parquetSchema(a, inventory, reader);
+    defer serial.deinit();
+    fixture.gated = true;
+    fixture.peak.store(0, .release);
+    var parallel = try parquetSchemaWithContext(a, inventory, reader, .{ .io = std.testing.io });
+    defer parallel.deinit();
+    try std.testing.expectEqualStrings(serial.fingerprint, parallel.fingerprint);
+    try std.testing.expect(fixture.peak.load(.acquire) >= 2 and fixture.peak.load(.acquire) <= 3);
+    try std.testing.expectEqual(@as(usize, 0), fixture.active.load(.acquire));
+    fixture.gated = false;
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.run, .{ reader, inventory });
 }

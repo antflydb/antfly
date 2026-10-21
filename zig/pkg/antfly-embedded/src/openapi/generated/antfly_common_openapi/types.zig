@@ -303,6 +303,8 @@ pub const Config = struct {
     ha: ?HotStandbyConfig = null,
     hot_standby: ?HotStandbyConfig = null,
     metadata: ?MetadataInfo = null,
+    /// Deployment policy for public inference APIs. Does not disable internal database inference.
+    public_inference: ?std.json.Value = null,
     inference: ?antfly_inference_config_openapi.RuntimeConfig = null,
     tls: ?TLSInfo = null,
     remote_content: ?antfly_scraping_openapi.RemoteContentConfig = null,
@@ -343,6 +345,14 @@ pub const Config = struct {
     generators: ?std.json.ArrayHashMap(antfly_generating_openapi.GeneratorConfig) = null,
     /// Named chain configurations for fallback/retry logic. Chains are ordered lists of generators with retry and fallback logic. Each link references a generator by name from the `generators` map. The first chain defined becomes the default when no chain name is specified. **Chain Conditions:** - `on_error`: Try next generator on any error (default) - `on_rate_limit`: Try next only on rate limit (429) errors - `on_timeout`: Try next only on timeout errors - `always`: Always try the next generator **Example:** ```json { "chains": { "default": [ { "generator": "gemini-flash", "retry": { "max_attempts": 3 }, "condition": "on_rate_limit" }, { "generator": "ollama-local" } ], "with-inline": [ { "generator": "gemini-flash" }, { "generator_config": { "provider": "openai", "model": "gpt-4.1" } } ] } } ``` Then in API calls: `chain: "default"` or `chain: "with-inline"`
     chains: ?std.json.ArrayHashMap([]const NamedChainLink) = null,
+    /// Backend capability declarations keyed by canonical target ID. Unknown support never qualifies a feature; declarations are intersected with the adapter contract.
+    inference_capabilities: ?std.json.ArrayHashMap(InferenceTaskCapabilities) = null,
+    /// Named traditional ML predictors bound to an inference connection, preserving its feature schema.
+    predictors: ?std.json.ArrayHashMap(RuntimeTaskBinding) = null,
+    /// Named extraction targets served by existing inference connections.
+    extractors: ?std.json.ArrayHashMap(RuntimeTaskBinding) = null,
+    /// Named rewriting targets served by existing inference connections.
+    rewriters: ?std.json.ArrayHashMap(RuntimeTaskBinding) = null,
     /// Named decision providers for ai_decide and convenience functions.
     deciders: ?std.json.ArrayHashMap(DeciderConfig) = null,
     /// Named reranker configurations for search result reranking. Define named rerankers that can be referenced by indexes, search queries, and API calls. The first reranker defined becomes the default when no reranker name is specified. **Example:** ```json { "rerankers": { "cohere-english": { "provider": "cohere", "model": "rerank-english-v3.0" }, "antfly-local": { "provider": "antfly", "model": "mxbai-rerank-base-v1", "url": "http://localhost:8080" } } } ```
@@ -368,6 +378,7 @@ pub const Config = struct {
         .{ "ha", "ha", true },
         .{ "hot_standby", "hot_standby", true },
         .{ "metadata", "metadata", true },
+        .{ "public_inference", "public_inference", true },
         .{ "inference", "inference", false },
         .{ "tls", "tls", true },
         .{ "remote_content", "remote_content", false },
@@ -390,6 +401,10 @@ pub const Config = struct {
         .{ "embedders", "embedders", true },
         .{ "generators", "generators", true },
         .{ "chains", "chains", true },
+        .{ "inference_capabilities", "inference_capabilities", true },
+        .{ "predictors", "predictors", true },
+        .{ "extractors", "extractors", true },
+        .{ "rewriters", "rewriters", true },
         .{ "deciders", "deciders", true },
         .{ "rerankers", "rerankers", true },
         .{ "chunkers", "chunkers", true },
@@ -470,6 +485,10 @@ pub const Config = struct {
         }
         if (self.metadata) |value| {
             try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        if (self.public_inference) |value| {
+            try jw.objectField("public_inference");
             try jw.write(value);
         }
         if (self.inference) |value| {
@@ -567,6 +586,22 @@ pub const Config = struct {
         }
         if (self.chains) |value| {
             try jw.objectField("chains");
+            try jw.write(value);
+        }
+        if (self.inference_capabilities) |value| {
+            try jw.objectField("inference_capabilities");
+            try jw.write(value);
+        }
+        if (self.predictors) |value| {
+            try jw.objectField("predictors");
+            try jw.write(value);
+        }
+        if (self.extractors) |value| {
+            try jw.objectField("extractors");
+            try jw.write(value);
+        }
+        if (self.rewriters) |value| {
+            try jw.objectField("rewriters");
             try jw.write(value);
         }
         if (self.deciders) |value| {
@@ -696,9 +731,15 @@ pub const ConnectionKind = enum {
 };
 
 pub const DeciderConfig = struct {
-    provider: []const u8,
+    provider: ?[]const u8 = null,
     /// Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities.
     decision_method: ?[]const u8 = null,
+    /// Required with decision_method=generated. Provider configuration belongs here rather than in the outer typed-decider fields.
+    generator: ?antfly_generating_openapi.GeneratorConfig = null,
+    instructions: ?[]const u8 = null,
+    output: ?antfly_generating_openapi.ConstrainedOutput = null,
+    probabilities: ?antfly_generating_openapi.ConstrainedProbabilities = null,
+    batch: ?antfly_generating_openapi.ConstrainedGenerationBatch = null,
     /// Required for Antfly and OpenAI; Jev defaults to jev-latest.
     model: ?[]const u8 = null,
     /// Pin the exact EmbeddingGemma 2 assets and recipe. Requires embedding_similarity.
@@ -716,8 +757,13 @@ pub const DeciderConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "provider", "provider", false },
+        .{ "provider", "provider", true },
         .{ "decision_method", "decision_method", true },
+        .{ "generator", "generator", false },
+        .{ "instructions", "instructions", true },
+        .{ "output", "output", false },
+        .{ "probabilities", "probabilities", false },
+        .{ "batch", "batch", false },
         .{ "model", "model", true },
         .{ "model_identity", "model_identity", true },
         .{ "embedding_options", "embedding_options", true },
@@ -739,11 +785,45 @@ pub const DeciderConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        try jw.objectField("provider");
-        try jw.write(self.provider);
+        if (self.provider) |value| {
+            try jw.objectField("provider");
+            try jw.write(value);
+        }
         if (self.decision_method) |value| {
             try jw.objectField("decision_method");
             try jw.write(value);
+        }
+        if (self.generator) |value| {
+            try jw.objectField("generator");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("generator");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.instructions) |value| {
+            try jw.objectField("instructions");
+            try jw.write(value);
+        }
+        if (self.output) |value| {
+            try jw.objectField("output");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("output");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.probabilities) |value| {
+            try jw.objectField("probabilities");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("probabilities");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.batch) |value| {
+            try jw.objectField("batch");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("batch");
+            try jw.write(@as(?u8, null));
         }
         if (self.model) |value| {
             try jw.objectField("model");
@@ -1701,6 +1781,56 @@ pub const InferenceConnectionVariant = struct {
     }
 };
 
+pub const InferenceTaskCapabilities = struct {
+    streaming: ?[]const u8 = null,
+    tools: ?[]const u8 = null,
+    structured_output: ?[]const u8 = null,
+    images: ?[]const u8 = null,
+    audio: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "streaming", "streaming", true },
+        .{ "tools", "tools", true },
+        .{ "structured_output", "structured_output", true },
+        .{ "images", "images", true },
+        .{ "audio", "audio", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.streaming) |value| {
+            try jw.objectField("streaming");
+            try jw.write(value);
+        }
+        if (self.tools) |value| {
+            try jw.objectField("tools");
+            try jw.write(value);
+        }
+        if (self.structured_output) |value| {
+            try jw.objectField("structured_output");
+            try jw.write(value);
+        }
+        if (self.images) |value| {
+            try jw.objectField("images");
+            try jw.write(value);
+        }
+        if (self.audio) |value| {
+            try jw.objectField("audio");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Disposable node-local cache for versioned Parquet and Iceberg reads.
 pub const LakeCacheConfig = struct {
     enabled: ?bool = null,
@@ -2217,6 +2347,38 @@ pub const QueryAdmissionConfig = struct {
         try jw.beginObject();
         if (self.max_concurrent_requests) |value| {
             try jw.objectField("max_concurrent_requests");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const RuntimeTaskBinding = struct {
+    /// Backend model identity, including any owner prefix.
+    model: []const u8,
+    /// Existing inference connection identity; credentials remain on the connection.
+    connection: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", false },
+        .{ "connection", "connection", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.connection) |value| {
+            try jw.objectField("connection");
             try jw.write(value);
         }
         try jw.endObject();

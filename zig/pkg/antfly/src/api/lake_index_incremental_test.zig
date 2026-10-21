@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const local = @import("antfly_local_sources");
+const stores = @import("../serverless/artifacts/store.zig");
 const publication = @import("lake_index_publication.zig");
 const catalog = local.metadata_lake_index_catalog;
 const serving = local.serverless_query_lake_serving;
@@ -42,7 +43,7 @@ test "external lake incremental native publication appends replaces removes and 
     var uploaded = try client.putObject("antfly", "part.parquet", first, .{});
     uploaded.deinit(a);
     const schema_json = try std.fmt.allocPrint(a,
-        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"lake","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema"}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"body":{{"type":"string"}},"dense":{{"type":"string"}},"sparse":{{"type":"string"}}}},"additionalProperties":false}}}}}}}}
+        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"lake","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema"}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"body":{{"type":"string","x-antfly-field":{{"type":"text"}}}},"dense":{{"type":"string"}},"sparse":{{"type":"string"}}}},"additionalProperties":false}}}}}}}}
     , .{directory.path()});
     defer a.free(schema_json);
     var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema_json)).?;
@@ -55,6 +56,9 @@ test "external lake incremental native publication appends replaces removes and 
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ca = arena.allocator();
+    const analyzed = try local.search_analysis.default_analyzer.analyze(ca, "needle replacement");
+    try std.testing.expectEqual(@as(usize, 2), analyzed.len);
+    const needles = [_][]const u8{ analyzed[0].term, analyzed[1].term, "absent" };
     const Clock = struct {
         fn now(_: *const anyopaque) !u64 {
             return 101;
@@ -72,6 +76,7 @@ test "external lake incremental native publication appends replaces removes and 
     defer constrained_corpora.deinit();
     var prior_snapshot: ?*local.index.IndexSnapshot = null;
     defer if (prior_snapshot) |snapshot| snapshot.release();
+    var unchanged_text_manifest: ?@import("lake_index_aggregate_artifact.zig").ChunkRef = null;
     for (0..5) |phase| {
         switch (phase) {
             1, 4 => {
@@ -88,7 +93,25 @@ test "external lake incremental native publication appends replaces removes and 
         var source = try serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
         defer source.deinit();
         table.lake_index_catalog_json = try publication.begin(ca, std.testing.io, table, &source, @splat(7), .{}, 100, 20);
+        // Appending a file must not decode the unchanged file's maintenance
+        // manifest. Restore it before the independent full-reader oracle below.
+        const hidden = if (phase == 1) unchanged_text_manifest else null;
+        const hidden_bytes = if (hidden) |ref| try store.getAlloc(ref.artifact_id) else null;
+        defer if (hidden_bytes) |bytes| a.free(bytes);
+        var restored = hidden == null;
+        defer if (!restored) {
+            const scope = (stores.uploadScopeFromArtifactId(hidden.?.artifact_id) catch unreachable).?;
+            var replacement_upload = store.putScoped(scope, hidden_bytes.?, .none) catch unreachable;
+            replacement_upload.deinit(a);
+        };
+        if (hidden) |ref| try store.delete(ref.artifact_id);
         table.lake_index_catalog_json = try publication.build(ca, &store, table, &source, @splat(7), .{ .io = std.testing.io }, .none, .{ .ptr = &clock, .now_ms = Clock.now });
+        if (hidden) |ref| {
+            const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)).?;
+            var replacement_upload = try store.putScoped(scope, hidden_bytes.?, .none);
+            replacement_upload.deinit(a);
+            restored = true;
+        }
         var parsed = try catalog.parse(a, table.lake_index_catalog_json);
         defer parsed.deinit();
         try @import("lake_index_directory.zig").hydrate(parsed.arena.allocator(), store, &parsed.value.published.?, .none, null);
@@ -98,7 +121,16 @@ test "external lake incremental native publication appends replaces removes and 
             .text_segment => {
                 const native = @import("lake_index_native_text.zig");
                 const root = try native.loadRoot(ca, store, declaration.artifact, .none, null);
+                // All sibling index uploads finish before publication seals its
+                // evidence. The phase-one restoration invalidates the old scope.
+                try std.testing.expectEqual(phase != 1, try store.retainedClosure(declaration.artifact.artifact_id, .none));
                 try std.testing.expectEqual(expected, root.file_groups.len);
+                if (phase == 0 and std.mem.eql(u8, declaration.name, "body_text")) unchanged_text_manifest = root.manifests[0];
+                try std.testing.expectEqual(@as(u8, 2), root.statistics_version);
+                try std.testing.expect(root.term_statistics != null);
+                try std.testing.expect(root.term_directory.branches != null);
+                try std.testing.expect(root.term_directory.leaves != null);
+                for (root.file_groups) |group| try std.testing.expectEqual(group.segments.len, group.summaries.len);
                 var writer = try native.loadWriter(a, store, root, .none, null, null);
                 defer writer.deinit();
                 const snapshot = writer.acquireSnapshot();
@@ -109,13 +141,41 @@ test "external lake incremental native publication appends replaces removes and 
                 var stored = try std.json.parseFromSlice(std.json.Value, a, doc.data, .{});
                 defer stored.deinit();
                 if (std.mem.eql(u8, declaration.name, "body_text")) {
-                    try std.testing.expect(stored.value.object.contains("body"));
-                    try std.testing.expect(!stored.value.object.contains("dense"));
-                    try std.testing.expect(!stored.value.object.contains("sparse"));
+                    // Stored-source recipe v2 retains the complete declared
+                    // row even when only body contributes searchable text.
+                    try std.testing.expectEqual(@as(usize, 3), stored.value.object.count());
+                    const original = std.mem.eql(u8, stored.value.object.get("body").?.string, "needle");
+                    try std.testing.expectEqualStrings(if (original) "[1,0]" else "[0,1]", stored.value.object.get("dense").?.string);
+                    try std.testing.expectEqualStrings(if (original) "{\"1\":2}" else "{\"2\":3}", stored.value.object.get("sparse").?.string);
                 } else try std.testing.expectEqual(@as(usize, 0), stored.value.object.count());
                 var pooled = try corpora.acquire(std.testing.io, store, declaration.artifact, root, schema_json, .{ .cache = &read_cache, .scope = @splat(1), .context = .{} }, .{}, .none);
                 defer pooled.deinit();
                 try std.testing.expectEqual(expected, pooled.snapshot.liveDocCount());
+                try std.testing.expect(pooled.snapshot.text_statistics != null);
+                const field = "body";
+                var frequencies: [3]u32 = undefined;
+                var authoritative: [3]u32 = undefined;
+                try pooled.snapshot.termDocFreqs(a, field, &needles, &frequencies);
+                try snapshot.termDocFreqs(a, field, &needles, &authoritative);
+                try std.testing.expectEqualSlices(u32, &authoritative, &frequencies);
+                if (frequencies[0] != expected) std.debug.print("statistics phase={d} index={s} field={s} expected={d} actual={d}\n", .{ phase, declaration.name, field, expected, frequencies[0] });
+                try std.testing.expectEqual(@as(u32, @intCast(expected)), frequencies[0]);
+                try std.testing.expectEqual(@as(u32, if (phase >= 2) 1 else 0), frequencies[1]);
+                try std.testing.expectEqual(@as(u32, 0), frequencies[2]);
+                const search = local.search_search;
+                for ([_]local.section_inverted.BM25Config{ .{}, .{ .k1 = 2, .b = 0.25 }, .{ .k1 = 0, .b = 1 } }) |config| for ([_]f32{ 1, 0, -2 }) |boost| {
+                    const request: search.SearchRequest = .{ .query = .{ .bool_query = .{ .must = &.{.{ .term = .{ .field = field, .term = needles[0], .boost = boost } }}, .should = &.{.{ .term = .{ .field = field, .term = needles[1] } }} } }, .k = 10, .include_stored = false, .bm25_config = config };
+                    var direct = try search.execute(a, snapshot, request);
+                    defer direct.deinit();
+                    var persisted = try search.execute(a, pooled.snapshot, request);
+                    defer persisted.deinit();
+                    try std.testing.expectEqual(direct.total_hits, persisted.total_hits);
+                    try std.testing.expectEqual(direct.hits.len, persisted.hits.len);
+                    for (direct.hits, persisted.hits) |left, right| {
+                        try std.testing.expectEqual(left.doc_id, right.doc_id);
+                        try std.testing.expectEqual(@as(u32, @bitCast(left.score)), @as(u32, @bitCast(right.score)));
+                    }
+                };
                 var warm = try corpora.acquire(std.testing.io, store, declaration.artifact, root, schema_json, .{ .cache = &read_cache, .scope = @splat(1), .context = .{} }, .{}, .none);
                 defer warm.deinit();
                 try std.testing.expect(warm.snapshot != pooled.snapshot);
@@ -188,10 +248,17 @@ test "external lake incremental native publication appends replaces removes and 
                 else
                     (try @import("lake_index_native_sparse.zig").loadRoot(ca, store, declaration.artifact, .none, null)).generation;
                 var reused_chunks: usize = 0;
-                for (generation.files) |file| for (file.chunks) |ref| {
-                    if (phase == 0) try retained.put(a, ref.artifact_id, {});
-                    if (phase == 1 and retained.contains(ref.artifact_id)) reused_chunks += 1;
-                };
+                const directory_map = @import("lake_index_native_directory.zig");
+                var access: directory_map.Access = undefined;
+                access.init(store, generation.domain, .none, null);
+                for (try directory_map.entries(ca, generation, store, .none)) |file| {
+                    const chunks = file.bytes / @import("lake_index_native_files.zig").chunk_bytes + @intFromBool(file.bytes % @import("lake_index_native_files.zig").chunk_bytes != 0);
+                    for (0..@intCast(chunks)) |ordinal| {
+                        const ref = try directory_map.chunk(ca, &access, file, ordinal);
+                        if (phase == 0) try retained.put(a, ref.artifact_id, {});
+                        if (phase == 1 and retained.contains(ref.artifact_id)) reused_chunks += 1;
+                    }
+                }
                 if (phase == 1) try std.testing.expect(reused_chunks != 0);
                 var count: u64 = 0;
                 for (states) |file| {

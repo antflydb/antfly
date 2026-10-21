@@ -25,6 +25,10 @@ merge its lasting decisions and instructions into the appropriate section and
 remove the plan. Preserve useful investigations, dated benchmarks, review
 findings, and verification evidence in a topic-specific `history/` directory.
 Give historical records a clear scope or date and a link to the living document.
+Summarize long logs (decisions, rejected approaches, key measurements) and link
+to the full verbatim text at a pinned commit instead of keeping it inline.
 Do not present old checklists or test counts as current product guarantees.
 
 The authoritative product license scope remains in [LICENSING.md](../LICENSING.md).
+
+- [Named inference gateway](reference/inference-gateway.md): task aliases, fallback, sessions, SDKs and Antfarm.

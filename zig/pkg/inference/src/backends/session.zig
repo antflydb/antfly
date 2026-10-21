@@ -86,6 +86,10 @@ pub const RunAdmission = struct {
         intermediate_size: usize = 0,
         attention_heads: usize = 0,
         quadratic_attention: bool = false,
+        embedding_gemma2_cuda: bool = false,
+        qwen_dense_workspace: bool = false,
+        query_width: usize = 0,
+        kv_width: usize = 0,
     };
 
     controller: *memory.AdmissionController,
@@ -174,13 +178,17 @@ pub const RunAdmission = struct {
         };
         const output_bytes = request.output_bytes orelse try estimatedOutputBytes(&reference_shape, output_info);
         if (request.output_kv_bytes > output_bytes) return error.ResourceLimitExceeded;
-        const dynamic_base = try addBytes(input_bytes, output_bytes);
+        const dynamic_base = try addBytes(request.backend_input_bytes orelse input_bytes, output_bytes);
         const dynamic_workspace = try mulBytes(dynamic_base, 6);
+        if (request.workspace_planned and request.workspace_bytes == 0) return error.ResourceLimitExceeded;
         const workspace = @max(
-            @max(self.static_workspace_bytes, request.workspace_bytes),
+            @max(if (request.workspace_planned) @as(usize, 0) else self.static_workspace_bytes, request.workspace_bytes),
             @max(dynamic_workspace, try self.profiledWorkspace(request)),
         );
-        const resident_input_bytes = try addBytes(request.host_preprocess_bytes, input_bytes);
+        const resident_input_bytes = try addBytes(
+            try addBytes(request.host_preprocess_bytes, input_bytes),
+            try self.profiledHostScratch(request),
+        );
         // A preceding host-only permit may remain live across execution. Its
         // retained bytes are an explicit credit, not permission to hide
         // outputs or backend workspace from this run reservation.
@@ -207,7 +215,7 @@ pub const RunAdmission = struct {
                 .backend_scratch_bytes = if (self.backend_workspace_reserved)
                     0
                 else
-                    workspace,
+                    workspace - @min(workspace, request.retained_backend_workspace_bytes),
             },
         };
     }
@@ -217,7 +225,28 @@ pub const RunAdmission = struct {
         if (profile.hidden_size == 0 or request.batch == 0 or request.sequence == 0)
             return 0;
 
-        const tokens = try mulBytes(request.batch, request.sequence);
+        const workspace_sequence = if (profile.embedding_gemma2_cuda)
+            embeddingGemma2AdmissionSequence(request.sequence)
+        else
+            request.sequence;
+        const tokens = try mulBytes(request.batch, workspace_sequence);
+        if (profile.embedding_gemma2_cuda) {
+            // The resident encoder reuses four BF16 [B*S, 2048] arena
+            // buffers across all 24 layers. Account the two persistent
+            // [B*S, 512] activations, request staging, bounded attention and
+            // cuBLASLt workspaces, plus the largest qualified media tower
+            // scratch. No [B,H,S,S] score tensor is materialized.
+            const arena = try mulBytes(try mulBytes(tokens, 4 * 2048), @sizeOf(u16));
+            const states = try mulBytes(try mulBytes(tokens, 2 * 512), @sizeOf(u16));
+            const staging = try addBytes(request.backend_input_bytes orelse request.input_bytes, try mulBytes(tokens, 2 * @sizeOf(i64)));
+            const attention = try mulBytes(workspace_sequence, 4 * 256 * (@sizeOf(f32) + @sizeOf(u16)));
+            // Media runs before the text encoder but its BF16 tower keeps a
+            // ~60 MiB reusable layer arena live alongside the bounded
+            // vision-attention arena and F32 bridge tensors. Reserve their
+            // measured peak plus headroom independently of the Lt workspace.
+            const fixed = 80 * 1024 * 1024 + (if (request.preprocessing_complete) @as(usize, 0) else 384 * 1024 * 1024);
+            return try addBytes(try addBytes(try addBytes(arena, states), staging), try addBytes(attention, fixed));
+        }
         // Attention and FFN phases are sequential, so reserve the larger peak
         // rather than summing mutually exclusive intermediates.
         const attention_floats = try mulBytes(profile.hidden_size, 6);
@@ -226,10 +255,22 @@ pub const RunAdmission = struct {
             try mulBytes(profile.intermediate_size, 3),
         );
         const floats_per_token = @max(attention_floats, ffn_floats);
+        // Qwen's prepared frame retains graph-plan hot slots, head-norm/RoPE
+        // staging, and fp16 K/V. Its Q width may exceed the hidden width.
+        const frame_floats = if (profile.qwen_dense_workspace)
+            // 21 retained slots: 3Q + 4KV + 8max(Q,H) + 5I. Reserve
+            // replacement overlap as well as head staging and fp16 KV.
+            try mulBytes(try addBytes(
+                try addBytes(try mulBytes(profile.query_width, 3), try mulBytes(profile.kv_width, 4)),
+                try addBytes(try mulBytes(@max(profile.query_width, profile.hidden_size), 8), try mulBytes(profile.intermediate_size, 5)),
+            ), 2)
+        else
+            floats_per_token;
         var peak = try mulBytes(
-            try mulBytes(tokens, floats_per_token),
+            try mulBytes(tokens, frame_floats),
             @sizeOf(f32),
         );
+        if (profile.qwen_dense_workspace) peak = try addBytes(peak, try self.qwenTransientWorkspaceBytes(tokens));
 
         if (profile.quadratic_attention and profile.attention_heads > 0) {
             const score_elements = try mulBytes(
@@ -243,22 +284,66 @@ pub const RunAdmission = struct {
         }
         return peak;
     }
+
+    fn profiledHostScratch(self: RunAdmission, request: RunRequest) !usize {
+        if (!self.model_profile.embedding_gemma2_cuda) return 0;
+        const padded_sequence = embeddingGemma2AdmissionSequence(request.sequence);
+        if (padded_sequence == request.sequence) return 0;
+        // The input-embedding route retains the caller's original F32 tensor
+        // while materializing a complete zero-padded `[B,roundedS,512]` copy.
+        // Token-id requests over-reserve this amount, which is preferable to
+        // admitting an embedding request that cannot allocate its staging.
+        return try mulBytes(
+            try mulBytes(try mulBytes(request.batch, padded_sequence), 512),
+            @sizeOf(f32),
+        );
+    }
+
+    /// Retained slots cannot fund fresh upload, head staging, pooling, and
+    /// shape-dependent temporary allocations on a smaller subsequent frame.
+    pub fn qwenTransientWorkspaceBytes(self: RunAdmission, tokens: usize) !usize {
+        const profile = self.model_profile;
+        const floats = try addBytes(try addBytes(try mulBytes(profile.hidden_size, 12), profile.kv_width), try mulBytes(profile.intermediate_size, 4));
+        return addBytes(16 * 1024 * 1024, try mulBytes(try mulBytes(tokens, floats), @sizeOf(f32)));
+    }
 };
+
+/// The qualified SM89 resident encoder rounds medium and long sequences to a
+/// complete 64-query tile. Admission does not depend on a live device probe,
+/// so conservatively reserve that larger shape for every EG2 CUDA session.
+/// Accepted model inputs never exceed the official 8192-token topology.
+fn embeddingGemma2AdmissionSequence(sequence: usize) usize {
+    if (sequence < 128 or sequence % 64 == 0 or sequence >= 8192) return sequence;
+    return ((sequence + 63) / 64) * 64;
+}
 
 pub const RunRequest = struct {
     batch: usize = 1,
     sequence: usize = 1,
     input_bytes: usize = 0,
+    /// Physical backend inputs, independent of retained host source bytes.
+    /// Null preserves conservative legacy admission for other callers.
+    backend_input_bytes: ?usize = null,
     /// Resolved physical stage geometry; null retains graph metadata inference.
     output_bytes: ?usize = null,
     output_kv_bytes: usize = 0,
     workspace_bytes: usize = 0,
+    /// A qualified phase provides its own positive workspace envelope. Physical
+    /// staging and model-profile floors still apply; only the generic allowance
+    /// derived from total model weight size is replaced.
+    workspace_planned: bool = false,
     host_preprocess_bytes: usize = 0,
+    /// Media towers have completed; their transient peak is no longer live.
+    /// Retained model caches carry independent leases.
+    preprocessing_complete: bool = false,
     /// Host input bytes still covered by a separate live permit. This credit
     /// is limited to input + preprocessing residency and lets callers compose
     /// CPU preprocessing with backend execution without a release/reacquire
     /// gap or transient double charge.
     pre_admitted_host_bytes: usize = 0,
+    /// Only an exclusive backend owner may provide this credit. Its retained
+    /// leases remain charged, and fresh allocations are bounded separately.
+    retained_backend_workspace_bytes: usize = 0,
 
     pub fn fromTensors(tensors: []const Tensor) !RunRequest {
         var input_bytes: usize = 0;
@@ -569,6 +654,18 @@ pub const Session = struct {
     broadcast_inputs: []const []const u8 = &.{},
     /// Borrowed from the model/runtime owner; stable for every session copy.
     execution_gate: ?*std.atomic.Mutex = null,
+    cohort_scheduler: ?*@import("../runtime/embedding_scheduler.zig").Scheduler = null,
+
+    /// Queue only ready work; callers own admitted preparation outside this
+    /// scope. Keep the original raw gate for native/backend interoperability.
+    pub fn enterExecutionCohort(self: Session, gate: ?*std.atomic.Mutex, control: InferenceExecutionControl, waiter: *@import("../runtime/embedding_scheduler.zig").Scheduler.Waiter) !void {
+        const lock = gate orelse return;
+        if (self.cohort_scheduler) |scheduler| if (self.execution_gate == lock) return scheduler.enter(waiter, lock, control);
+        try control.lock(lock);
+    }
+    pub fn leaveExecutionCohort(_: Session, gate: ?*std.atomic.Mutex, waiter: *@import("../runtime/embedding_scheduler.zig").Scheduler.Waiter) void {
+        if (waiter.owner != null) @import("../runtime/embedding_scheduler.zig").Scheduler.leave(waiter) else if (gate) |lock| lock.unlock();
+    }
 
     /// Stable planning capacity, shared by all copies of this session. Live
     /// contention is resolved by workspace acquisition after chunk selection.
@@ -740,6 +837,58 @@ pub const Session = struct {
         };
     }
 
+    /// Acquire only a later phase's additional peak while the original lease
+    /// remains live. Counters, live-memory checks and external ownership all
+    /// use ordinary admission; a rejected supplement leaves the base untouched.
+    /// Both owners must outlive every allocation covered by their union.
+    pub fn admitSupplement(self: Session, base: *const RunPermit, target: memory.AdmissionAmounts) !RunPermit {
+        return self.admitSupplementPair(base, null, target);
+    }
+
+    /// Credit two independent live owners without merging external lease
+    /// tokens. Only acquire the component-wise deficit beyond both owners.
+    pub fn admitSupplementPair(self: Session, base: *const RunPermit, other: ?*const RunPermit, target: memory.AdmissionAmounts) !RunPermit {
+        var pressure: ?memory.AdmissionPressure = null;
+        return self.admitSupplementPairWithPressure(base, other, target, &pressure);
+    }
+
+    /// Supplemental admission reports the same denial constraint as initial
+    /// admission, while preserving credit from independently owned live leases.
+    pub fn admitSupplementPairWithPressure(self: Session, base: *const RunPermit, other: ?*const RunPermit, target: memory.AdmissionAmounts, pressure: *?memory.AdmissionPressure) !RunPermit {
+        pressure.* = null;
+        if (base.session.ptr != self.ptr or base.session.vtable != self.vtable or base.execution_yielded) return error.InvalidAdmissionLeaseReduction;
+        const admission = self.run_admission orelse return .{ .session = self, .lease = null };
+        const lease = base.lease orelse return error.InvalidAdmissionLeaseReduction;
+        if (lease.controller != admission.controller or lease.retain_backend_class != admission.backend_class) return error.InvalidAdmissionLeaseReduction;
+        var owned = lease.amounts;
+        if (other) |peer| {
+            if (peer == base or peer.session.ptr != self.ptr or peer.session.vtable != self.vtable or peer.execution_yielded) return error.InvalidAdmissionLeaseReduction;
+            if (peer.lease) |credit| {
+                if (credit.controller != admission.controller or credit.retain_backend_class != admission.backend_class or (credit.external_lease != null and credit.external_lease == lease.external_lease)) return error.InvalidAdmissionLeaseReduction;
+                owned = try owned.merge(credit.amounts);
+            }
+        }
+        var extra = memory.AdmissionAmounts{};
+        inline for (@typeInfo(memory.AdmissionAmounts).@"struct".field_names) |name| @field(extra, name) = @field(target, name) -| @field(owned, name);
+        if (std.meta.eql(extra, memory.AdmissionAmounts{})) return .{ .session = self, .lease = null };
+        if (admission.controller.consumeForcedRunDenialForTesting()) return error.ResourceTemporarilyUnavailable;
+        return .{ .session = self, .lease = try admission.controller.tryAcquireWithPressure(admission.backend_class, admission.limits, extra, admission.check_live_memory, pressure) };
+    }
+
+    /// Preserve the exact denial constraint for bounded batch planning. A
+    /// failed reservation publishes no lease; a fit probe is never a permit.
+    pub fn admitWithPressure(self: Session, request: RunRequest, pressure: *?memory.AdmissionPressure) !RunPermit {
+        pressure.* = null;
+        return .{
+            .session = self,
+            .request = request,
+            .lease = if (self.run_admission) |admission| blk: {
+                if (admission.controller.consumeForcedRunDenialForTesting()) return error.ResourceTemporarilyUnavailable;
+                break :blk try admission.controller.tryAcquireWithPressure(admission.backend_class, admission.limits, try admission.estimateRequest(request, self.outputInfo()), admission.check_live_memory, pressure);
+            } else null,
+        };
+    }
+
     pub fn planRun(self: Session, inputs: []const Tensor, batch_override: ?usize) !RunRequest {
         var request = try RunRequest.fromTensors(inputs);
         if (batch_override) |batch| {
@@ -866,13 +1015,31 @@ pub const Session = struct {
     /// discovering the actual padded sequence length, then admit the backend
     /// run using that length instead of the model's maximum context.
     pub fn admitHostPreprocess(self: Session, host_scratch_bytes: usize) !RunPermit {
+        var pressure: ?memory.AdmissionPressure = null;
+        return self.admitHostPreprocessWithPressure(host_scratch_bytes, &pressure);
+    }
+
+    /// Host-only preflight reports its denial constraint without estimating a
+    /// model run, enabling callers to reclaim relevant optional caches safely.
+    pub fn admitHostPreprocessWithPressure(self: Session, host_scratch_bytes: usize, pressure: *?memory.AdmissionPressure) !RunPermit {
+        pressure.* = null;
         return .{
             .session = self,
-            .lease = if (self.run_admission) |admission|
-                try admission.acquireAmounts(.{ .host_scratch_bytes = host_scratch_bytes })
-            else
-                null,
+            .lease = if (self.run_admission) |admission| blk: {
+                if (admission.controller.consumeForcedRunDenialForTesting()) return error.ResourceTemporarilyUnavailable;
+                break :blk try admission.controller.tryAcquireWithPressure(admission.backend_class, admission.limits, .{ .host_scratch_bytes = host_scratch_bytes }, admission.check_live_memory, pressure);
+            } else null,
         };
+    }
+
+    /// Owned media cache allocations can outlive a single execution permit.
+    /// Charge them independently until eviction, including full device buffers
+    /// retained by views rather than only their logical tensor payload.
+    pub fn admitRetainedMedia(self: Session, host_bytes: usize, device_bytes: usize) !RunPermit {
+        return .{ .session = self, .lease = if (self.run_admission) |admission|
+            try admission.acquireAmounts(.{ .host_scratch_bytes = host_bytes, .backend_scratch_bytes = device_bytes })
+        else
+            null };
     }
 
     pub fn admitResidentInputs(self: Session, inputs: []const ResidentInput) !RunPermit {
@@ -1185,6 +1352,41 @@ pub const RunPermit = struct {
         return run_resident(self.session.ptr, inputs, request, allocator);
     }
 
+    /// Reduce an execution peak after preprocessing/vision has completed.
+    /// Re-estimate with the session profile and retained inputs; a phase may
+    /// never borrow capacity from its predecessor or another concurrent run.
+    /// Reduce two independently owned leases without merging their external
+    /// process-owner tokens. All required capacity must already be admitted.
+    pub fn retainForRunWithSupplement(self: *RunPermit, extra: *RunPermit, request: RunRequest) !void {
+        if (extra.session.ptr != self.session.ptr or extra.session.vtable != self.session.vtable or self.execution_yielded or extra.execution_yielded) return error.InvalidAdmissionLeaseReduction;
+        const admission = self.session.run_admission orelse {
+            self.request = request;
+            return;
+        };
+        const base = if (self.lease) |*lease| lease else return error.InvalidAdmissionLeaseReduction;
+        const needed = try admission.estimateRequest(request, self.session.outputInfo());
+        const available = try base.amounts.merge(if (extra.lease) |lease| lease.amounts else .{});
+        var base_keep = needed;
+        var extra_keep = needed;
+        inline for (@typeInfo(memory.AdmissionAmounts).@"struct".field_names) |name| {
+            if (@field(needed, name) > @field(available, name)) return error.InvalidAdmissionLeaseReduction;
+            @field(base_keep, name) = @min(@field(needed, name), @field(base.amounts, name));
+            @field(extra_keep, name) = @field(needed, name) - @field(base_keep, name);
+        }
+        try base.retain(base_keep);
+        if (extra.lease) |*lease| try lease.retain(extra_keep);
+        self.request = request;
+    }
+
+    pub fn retainForRun(self: *RunPermit, request: RunRequest) !void {
+        if (self.execution_yielded) return error.InvalidAdmissionLeaseReduction;
+        if (self.lease) |*lease| {
+            const admission = self.session.run_admission orelse return error.InvalidAdmissionLeaseReduction;
+            try lease.retain(try admission.estimateRequest(request, self.session.outputInfo()));
+        }
+        self.request = request;
+    }
+
     /// Reduce a host-only preprocessing lease to the bytes that remain live
     /// as model inputs. The retained permit can then be composed with a run
     /// request carrying the same `pre_admitted_host_bytes` credit.
@@ -1418,6 +1620,58 @@ test "controlled blocked backend expires and admission unwinds" {
     try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
 }
 
+test "run admission credits retained Qwen workspace once and keeps hard limits" {
+    var controller = memory.AdmissionController{};
+    const admission = RunAdmission{
+        .controller = &controller,
+        .backend_class = .gpu,
+        .limits = .{ .scratch_limit_bytes = 384 * memory.bytes_per_mib },
+        .static_workspace_bytes = 1,
+        .check_live_memory = false,
+        .model_profile = .{
+            .hidden_size = 1024,
+            .intermediate_size = 3072,
+            .attention_heads = 16,
+            .qwen_dense_workspace = true,
+            .query_width = 2048,
+            .kv_width = 1024,
+        },
+    };
+    const request = RunRequest{ .batch = 2, .sequence = 256, .input_bytes = 512 * 12, .output_bytes = 2 * 1024 * 4 };
+    const peak = try admission.estimateRequest(request, &.{});
+    var narrow = admission;
+    narrow.model_profile.query_width = 1024;
+    try std.testing.expect(peak.backend_scratch_bytes > (try narrow.estimateRequest(request, &.{})).backend_scratch_bytes);
+    var retained = try admission.acquireRequest(request, &.{});
+    defer retained.release();
+    const retained_bytes = 160 * memory.bytes_per_mib;
+    try retained.retain(.{ .backend_scratch_bytes = retained_bytes });
+    var credited = request;
+    credited.retained_backend_workspace_bytes = retained_bytes;
+    var next = try admission.acquireRequest(credited, &.{});
+    defer next.release();
+    try std.testing.expectEqual(peak, controller.snapshot());
+    var larger = credited;
+    larger.batch = 8;
+    larger.input_bytes *= 4;
+    larger.output_bytes = request.output_bytes.? * 4;
+    try std.testing.expectError(error.ResourceLimitExceeded, admission.acquireRequest(larger, &.{}));
+    try std.testing.expectEqual(peak, controller.snapshot());
+    next.release();
+    try std.testing.expectEqual(retained_bytes, controller.snapshot().backend_scratch_bytes);
+    var smaller = RunRequest{ .batch = 7, .sequence = 20, .input_bytes = 140 * 12, .output_bytes = 7 * 1024 * 4 };
+    smaller.retained_backend_workspace_bytes = retained_bytes;
+    const fresh = try admission.qwenTransientWorkspaceBytes(140);
+    smaller.workspace_bytes = retained_bytes + fresh;
+    var small_permit = try admission.acquireRequest(smaller, &.{});
+    defer small_permit.release();
+    try std.testing.expectEqual(fresh, small_permit.amounts.backend_scratch_bytes);
+    try std.testing.expectEqual(retained_bytes + fresh, controller.snapshot().backend_scratch_bytes);
+    small_permit.release();
+    retained.release();
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+}
+
 test "run admission scales dynamic outputs and honors reserved backend workspace" {
     var controller = memory.AdmissionController{};
     var input_bytes = @as([64]u8, @splat(0));
@@ -1501,6 +1755,16 @@ test "run admission scales dynamic outputs and honors reserved backend workspace
         controller.snapshot(),
     );
 
+    var phased = try admitted_session.admit(.{ .batch = 2, .sequence = 32, .input_bytes = 64, .host_preprocess_bytes = 512, .workspace_bytes = 4096, .output_bytes = 256 });
+    const peak = controller.snapshot().host_scratch_bytes;
+    try phased.retainForRun(.{ .batch = 2, .sequence = 4, .input_bytes = 64, .host_preprocess_bytes = 128, .workspace_bytes = 512, .output_bytes = 64 });
+    const retained = controller.snapshot().host_scratch_bytes;
+    try std.testing.expect(retained < peak);
+    try std.testing.expectError(error.InvalidAdmissionLeaseReduction, phased.retainForRun(.{ .workspace_bytes = 16384 }));
+    try std.testing.expectEqual(retained, controller.snapshot().host_scratch_bytes);
+    phased.deinit();
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+
     var preprocess_permit = try admitted_session.admitHostPreprocess(128);
     try std.testing.expectEqual(@as(usize, 128), controller.snapshot().host_scratch_bytes);
     var execution_permit = try admitted_session.admit(.{
@@ -1575,6 +1839,43 @@ test "run admission scales dynamic outputs and honors reserved backend workspace
         .host_preprocess_bytes = 16 * 512 * 32,
     }, &outputs);
     try std.testing.expect(profiled_amounts.host_scratch_bytes > 256 * 1024 * 1024);
+}
+
+test "EmbeddingGemma2 CUDA admission follows the bounded resident arena" {
+    var controller = memory.AdmissionController{};
+    const admission = RunAdmission{
+        .controller = &controller,
+        .backend_class = .gpu,
+        .limits = .{},
+        .static_workspace_bytes = 1024 * 1024 * 1024,
+        .model_profile = .{
+            .hidden_size = 512,
+            .intermediate_size = 2048,
+            .attention_heads = 4,
+            .embedding_gemma2_cuda = true,
+        },
+    };
+    const b8 = try admission.profiledWorkspace(.{ .batch = 8, .sequence = 8192, .input_bytes = 8 * 8192 * 24 });
+    const b32 = try admission.profiledWorkspace(.{ .batch = 32, .sequence = 8192, .input_bytes = 32 * 8192 * 24 });
+    try std.testing.expect(b8 < 2 * 1024 * 1024 * 1024);
+    try std.testing.expect(b32 < 6 * 1024 * 1024 * 1024);
+    try std.testing.expect(b32 > b8);
+    const tail = try admission.profiledWorkspace(.{ .batch = 32, .sequence = 270, .input_bytes = 32 * 270 * 24 });
+    const complete_tile = try admission.profiledWorkspace(.{ .batch = 32, .sequence = 320, .input_bytes = 32 * 270 * 24 });
+    try std.testing.expectEqual(complete_tile, tail);
+    const tail_amounts = try admission.estimateRequest(.{ .batch = 32, .sequence = 8191, .input_bytes = 32 * 8191 * 512 * @sizeOf(f32) }, &.{});
+    try std.testing.expect(tail_amounts.host_scratch_bytes >= 32 * 8192 * 512 * @sizeOf(f32));
+    try std.testing.expectError(
+        error.ResourceLimitExceeded,
+        admission.profiledHostScratch(.{ .batch = std.math.maxInt(usize), .sequence = 8191 }),
+    );
+    try std.testing.expectEqual(@as(usize, 127), embeddingGemma2AdmissionSequence(127));
+    try std.testing.expectEqual(@as(usize, 8192), embeddingGemma2AdmissionSequence(8191));
+    try std.testing.expectEqual(std.math.maxInt(usize), embeddingGemma2AdmissionSequence(std.math.maxInt(usize)));
+    try std.testing.expectError(
+        error.ResourceLimitExceeded,
+        admission.profiledWorkspace(.{ .batch = std.math.maxInt(usize), .sequence = 8192 }),
+    );
 }
 
 test "forced run admission denials are counted and recover" {
@@ -1784,4 +2085,96 @@ test "session output admission has one owner on every allocation failure" {
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{@as(?InferenceExecutionControl, null)});
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{@as(?InferenceExecutionControl, .{})});
+}
+
+test "embeddinggemma2 stage supplements preserve base admission and reject overcommit" {
+    var controller = memory.AdmissionController{};
+    var probe = AdmissionProbeSession{ .controller = &controller };
+    const session = Session{ .ptr = &probe, .vtable = &AdmissionProbeSession.vtable, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .scratch_limit_bytes = 1024 }, .static_workspace_bytes = 0, .check_live_memory = false } };
+    var base = try session.admitHostPreprocess(256);
+    var extra = try session.admitSupplement(&base, .{ .host_scratch_bytes = 768 });
+    try std.testing.expectEqual(@as(usize, 768), controller.snapshot().host_scratch_bytes);
+    extra.deinit();
+    try std.testing.expectEqual(@as(usize, 256), controller.snapshot().host_scratch_bytes);
+    var peer = try session.admitHostPreprocess(256);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, session.admitSupplement(&base, .{ .host_scratch_bytes = 900 }));
+    try std.testing.expectEqual(@as(usize, 512), controller.snapshot().host_scratch_bytes);
+    peer.deinit();
+    var smaller = try session.admitSupplement(&base, .{ .host_scratch_bytes = 128 });
+    smaller.deinit();
+    try std.testing.expectEqual(@as(usize, 256), controller.snapshot().host_scratch_bytes);
+    var retry = try session.admitSupplement(&base, .{ .host_scratch_bytes = 900 });
+    try std.testing.expectEqual(@as(usize, 900), controller.snapshot().host_scratch_bytes);
+    retry.deinit();
+    base.deinit();
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+test "embeddinggemma2 CUDA phased admission retires media peak without borrowing" {
+    var controller = memory.AdmissionController{};
+    const admission = RunAdmission{ .controller = &controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false, .model_profile = .{ .hidden_size = 512, .intermediate_size = 2048, .attention_heads = 4, .embedding_gemma2_cuda = true } };
+    const before = try admission.estimateRequest(.{ .sequence = 1024, .host_preprocess_bytes = 128 * 1024 * 1024 }, &.{});
+    const after = try admission.estimateRequest(.{ .sequence = 64, .host_preprocess_bytes = 1024, .preprocessing_complete = true }, &.{});
+    try std.testing.expect(before.backend_scratch_bytes > after.backend_scratch_bytes + 384 * 1024 * 1024);
+    var lease = try controller.tryAcquire(.gpu, .{}, before, false);
+    defer lease.release();
+    try lease.retain(after);
+    try std.testing.expectEqual(after, controller.snapshot());
+    try std.testing.expectError(error.InvalidAdmissionLeaseReduction, lease.retain(before));
+    try std.testing.expectEqual(after, controller.snapshot());
+}
+
+test "embeddinggemma2 physical backend inputs do not charge retained host rasters as device staging" {
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    const admission = RunAdmission{ .controller = &controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false };
+    const before = try admission.estimateRequest(.{ .input_bytes = 128 * 1024 * 1024, .pre_admitted_host_bytes = 128 * 1024 * 1024, .workspace_bytes = 64 * 1024 * 1024, .output_bytes = 768 * 4 }, &.{});
+    const after = try admission.estimateRequest(.{ .input_bytes = 128 * 1024 * 1024, .backend_input_bytes = 512 * 260 * 4, .pre_admitted_host_bytes = 128 * 1024 * 1024, .workspace_bytes = 64 * 1024 * 1024, .output_bytes = 768 * 4 }, &.{});
+    try std.testing.expectEqual(before.host_scratch_bytes, after.host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), after.backend_scratch_bytes);
+    try std.testing.expect(before.backend_scratch_bytes > after.backend_scratch_bytes + 600 * 1024 * 1024);
+    try std.testing.expectError(error.ResourceLimitExceeded, admission.estimateRequest(.{ .input_bytes = 128, .backend_input_bytes = 0, .pre_admitted_host_bytes = 129 }, &.{}));
+}
+
+test "embeddinggemma2 stage admission reduces independent supplements without borrowing or merging tokens" {
+    const Mock = struct {
+        fn info(_: *anyopaque) []const TensorInfo {
+            return &.{};
+        }
+    };
+    var marker: u8 = 0;
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    const session = Session{ .ptr = &marker, .vtable = &.{ .run = undefined, .inputInfo = Mock.info, .outputInfo = Mock.info, .backend = undefined, .close = undefined }, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false } };
+    const mb = 1024 * 1024;
+    var base = try session.admit(.{ .workspace_bytes = 16 * mb, .output_bytes = 0 });
+    defer base.deinit();
+    var extra = try session.admitSupplement(&base, try session.run_admission.?.estimateRequest(.{ .workspace_bytes = 64 * mb, .output_bytes = 0 }, &.{}));
+    defer extra.deinit();
+    var covered = try session.admitSupplementPair(&base, &extra, try session.run_admission.?.estimateRequest(.{ .workspace_bytes = 64 * mb, .output_bytes = 0 }, &.{}));
+    defer covered.deinit();
+    try std.testing.expect(covered.lease == null);
+    try std.testing.expectError(error.InvalidAdmissionLeaseReduction, session.admitSupplementPair(&base, &base, .{}));
+    try base.retainForRunWithSupplement(&extra, .{ .workspace_bytes = 40 * mb, .output_bytes = 0 });
+    try std.testing.expectEqual(@as(usize, 40 * mb), controller.snapshot().backend_scratch_bytes);
+    const before = controller.snapshot();
+    try std.testing.expectError(error.InvalidAdmissionLeaseReduction, base.retainForRunWithSupplement(&extra, .{ .workspace_bytes = 41 * mb, .output_bytes = 0 }));
+    try std.testing.expectEqual(before, controller.snapshot());
+    extra.deinit();
+    base.deinit();
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().scratchTotalBytes());
+}
+
+test "embeddinggemma2 explicit phase workspace replaces only the generic model allowance" {
+    var controller = memory.AdmissionController{};
+    const admission = RunAdmission{ .controller = &controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 4096, .check_live_memory = false, .model_profile = .{ .hidden_size = 16, .intermediate_size = 32 } };
+    var request = RunRequest{ .workspace_bytes = 128, .backend_input_bytes = 0, .output_bytes = 0 };
+    try std.testing.expectEqual(@as(usize, 4096), (try admission.estimateRequest(request, &.{})).backend_scratch_bytes);
+    request.workspace_planned = true;
+    // The model profile remains a hard floor above the explicit 128 bytes.
+    try std.testing.expectEqual(@as(usize, 512), (try admission.estimateRequest(request, &.{})).backend_scratch_bytes);
+    request.backend_input_bytes = 1024;
+    try std.testing.expectEqual(@as(usize, 6144), (try admission.estimateRequest(request, &.{})).backend_scratch_bytes);
+    request.workspace_bytes = 0;
+    try std.testing.expectError(error.ResourceLimitExceeded, admission.estimateRequest(request, &.{}));
 }

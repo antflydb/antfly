@@ -28,7 +28,12 @@ fn antfly_x86_sgemm_transb_f16(m_start: usize, m_end: usize, n: usize, k: usize,
     core.sgemmTransBF16AddSlice(m_start, m_end, n, k, alpha, a[0 .. m_end * k], b[0 .. n * k], c[0 .. m_end * n]);
 }
 
+fn antfly_x86_sgemm_prepared(start: usize, end: usize, n: usize, k: usize, count: usize, data: [*]f32, a: [*]const f32, c: [*]f32) callconv(.c) void {
+    @import("packed_gemm.zig").rows(.{ .data = data[0..count], .n = n, .k = k }, start, end, a[0 .. end * k], c[0 .. end * n]);
+}
+
 comptime {
+    @export(&antfly_x86_sgemm_prepared, .{ .name = "antfly_x86_sgemm_prepared", .visibility = .hidden });
     @export(&antfly_x86_sgemm, .{ .name = "antfly_x86_sgemm", .visibility = .hidden });
     @export(&antfly_x86_sgemm_transb, .{ .name = "antfly_x86_sgemm_transb", .visibility = .hidden });
     @export(&antfly_x86_sgemm_transb_f16, .{ .name = "antfly_x86_sgemm_transb_f16", .visibility = .hidden });

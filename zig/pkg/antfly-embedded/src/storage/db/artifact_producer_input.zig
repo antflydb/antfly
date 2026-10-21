@@ -48,11 +48,15 @@ fn bindTemplate(alloc: std.mem.Allocator, txn: anytype, request: requests.Genera
     var ordered = (try inventory.load(alloc, txn)) orelse return error.ArtifactCatalogDrift;
     defer ordered.deinit();
     const binding = ordered.value.command.binding;
-    if (binding.effect_protocol != 15 or binding.epoch != authority.epoch or
+    if (binding.epoch != authority.epoch or
         !std.mem.eql(u8, &binding.digest, &authority.catalog_digest) or
         !std.mem.eql(u8, &ordered.value.command.namespace, &authority.namespace)) return error.ArtifactCatalogDrift;
     const local = try inventory.catalogs(txn);
     if (!std.mem.eql(u8, &local.digest(), &binding.digest) or !plan.matchesArtifactInventory(local)) return error.ArtifactCatalogDrift;
+    // Older ordered owners cannot supply receipt-backed stream witnesses.
+    // Preserve pending debt until an ordered protocol upgrade; this is not
+    // evidence of catalog corruption and never authorizes legacy outputs.
+    if (!binding.supportsProducerWitnesses()) return error.OnlineMergeArtifactTailsUnsupported;
     return .{ .authority = authority, .requirement = requirement };
 }
 
@@ -133,7 +137,7 @@ pub const Token = struct {
 };
 
 /// Compare every provider/planning field, excluding only row identity,
-/// owner-local replay position and the derived consumer list. Those three
+/// owner-local replay position, reprocess generation and the derived consumer list. These
 /// fields cannot authorize a different generator definition. Consumer
 /// projections are independently derived from the certified catalog at apply.
 pub fn sameDefinition(a: requests.GeneratedEnrichmentRequest, b: requests.GeneratedEnrichmentRequest) bool {
@@ -149,7 +153,7 @@ pub fn sameDefinition(a: requests.GeneratedEnrichmentRequest, b: requests.Genera
 }
 
 fn definitionField(comptime name: []const u8) bool {
-    return !std.mem.eql(u8, name, "doc_key") and !std.mem.eql(u8, name, "sequence") and !std.mem.eql(u8, name, "consumer_indexes");
+    return !std.mem.eql(u8, name, "doc_key") and !std.mem.eql(u8, name, "sequence") and !std.mem.eql(u8, name, "reprocess_generation") and !std.mem.eql(u8, name, "consumer_indexes");
 }
 
 /// Stable identity for exactly the fields used by sameDefinition. Framed
@@ -164,6 +168,7 @@ pub fn definitionDigest(request: requests.GeneratedEnrichmentRequest) publicatio
         const value = @field(request, reflected_name);
         switch (@typeInfo(field_type)) {
             .pointer => hashDefinitionBytes(&hash, value),
+            .array => |array| if (array.child == u8) hashDefinitionBytes(&hash, &value) else @compileError("producer array needs a canonical field encoding"),
             .@"enum" => hashDefinitionBytes(&hash, @tagName(value)),
             .bool => hash.update(&.{@intFromBool(value)}),
             .int => {
@@ -197,6 +202,7 @@ test "ordered artifact inventory producer definition identity binds every provid
             .@"enum" => @field(changed, reflected_name) = std.meta.tags(field_type)[(@as(usize, @backingInt(@field(request, reflected_name))) + 1) % std.meta.tags(field_type).len],
             .bool => @field(changed, reflected_name) = !@field(request, reflected_name),
             .int => @field(changed, reflected_name) += 1,
+            .array => @field(changed, reflected_name)[0] ^= 1,
             else => unreachable,
         }
         try std.testing.expect(!sameDefinition(request, changed));
@@ -226,6 +232,7 @@ pub fn capture(
     materializer: ?Materializer,
 ) !?Token {
     const authorized = (try authorizeDocument(alloc, txn, request, plan)) orelse return null;
+    try @import("artifact_reprocess_intent.zig").requireEmbeddingGeneration(alloc, txn, request.doc_key, requests.requestEmbeddingName(request), request.producer_json, request.reprocess_generation);
     if (root == 0) return error.DurableRootIncarnationUnavailable;
     const authority = authorized.authority;
     const producer_generation = authorized.generation;
@@ -237,7 +244,7 @@ pub fn capture(
     const logical = if (materializer) |reader| try reader.materialize(reader.ptr, alloc, source_store_key, raw) else null;
     defer if (logical) |value| alloc.free(value);
     if (!std.mem.eql(u8, logical orelse raw, observed_logical_input)) return error.EnrichmentSourceChanged;
-    if (request.sequence != 0) {
+    if (request.sequence != 0 and !keys.isGroupSourceRowKey(source_store_key)) {
         const ordinal = (try identity.lookupOrdinalTxn(alloc, txn, request.doc_key)) orelse return error.EnrichmentSourceChanged;
         const state = (try identity.lookupStateTxn(txn, ordinal)) orelse return error.InvalidDocIdentity;
         if (!state.isLive() or state.created_generation > request.sequence) return error.EnrichmentSourceChanged;
@@ -267,7 +274,9 @@ test "ordered artifact inventory producer template binds every inference field" 
     var request = template;
     request.doc_key = "doc";
     request.sequence = 90;
+    request.reprocess_generation = 3;
     try std.testing.expect(sameDefinition(template, request));
+    try std.testing.expectEqualSlices(u8, &definitionDigest(template), &definitionDigest(request));
     request.source_template = "{{other}}";
     try std.testing.expect(!sameDefinition(template, request));
     request = template;

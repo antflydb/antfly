@@ -2419,6 +2419,8 @@ fn encodeAlgebraicVectorWorkerRequestForSearchRequestAlloc(
             .require_algebraic_filter_resolution = req.filter_query_json.len > 0 or req.exclusion_query_json.len > 0,
             .include_all_fields = req.include_all_fields,
             .defer_stored_projection = req.defer_stored_projection,
+            .document_authority_mode = req.document_authority_mode,
+            .document_authority_group = req.document_authority_group,
             .search_effort = req.search_effort,
             .distance_over = req.distance_over,
             .distance_under = req.distance_under,
@@ -2813,11 +2815,11 @@ pub const BoundTableReadSource = struct {
     fn nextRelationalPage(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !@import("antfly_local_sources").api_table_read_source.RelationalReadView.Page {
         const View = @import("antfly_local_sources").api_table_read_source.RelationalReadView;
         const session: *db_mod.DB.RelationalReadSession = @ptrCast(@alignCast(ptr));
-        var page = try session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024 });
+        var page = try session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024, .native_cells = true });
         errdefer page.deinit();
         const owned = page.arena.allocator();
         const rows = try owned.alloc(View.Row, page.rows.len);
-        for (page.rows, rows) |row, *output| output.* = .{ .id = row.key, .version = row.version, .schema_version = session.reader.active.version(), .value = row.typed orelse return error.InvalidSqlBackendResponse, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest };
+        for (page.rows, rows) |row, *output| output.* = .{ .id = row.key, .version = row.version, .schema_version = session.reader.active.version(), .value = row.typed orelse .null, .typed_cells = row.typed_cells, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest };
         // Reader.after is an opaque physical continuation. It advances even
         // when a bounded page contains only filtered or expired records.
         const after = if (page.more) try owned.dupe(u8, session.reader.after.items) else null;
@@ -3188,17 +3190,7 @@ pub const BoundTableReadSource = struct {
         if (req.topology_epoch != 0) return error.TopologyChanged;
         try distributed_graph.validateGraphEdgesTensorAccessPath(alloc, req);
         const graph_entry = self.db.core.graphIndex(req.index_name) orelse return error.IndexNotFound;
-        const result = try graph_entry.index.getEdgesByTypesBoundedWithStatsAt(
-            alloc,
-            req.key,
-            req.edge_types,
-            req.direction,
-            req.max_edges,
-            req.max_owned_bytes,
-            req.max_scanned_rows,
-            if (req.ttl_now_ns != 0) req.ttl_now_ns else platform_time.realtimeNs(),
-        );
-        return .{ .edges = result.edges, .scanned_rows = @intCast(result.scanned_rows) };
+        return try @import("antfly_local_sources").api_local_graph.readGraphEdgesRequest(alloc, &graph_entry.index, req, if (req.ttl_now_ns != 0) req.ttl_now_ns else platform_time.realtimeNs());
     }
 };
 
@@ -4865,6 +4857,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         try checkQueryDeadline(req);
+        try distributed_graph.validateIncomingStartIdentities(alloc, self.catalog, table_name, req);
         var routing_session = if (requiresAuthoritativeRoutingSession(req))
             try table_catalog.RoutingSession.init(alloc, self.catalog, queryRoutingDeadline(self.catalog, req))
         else
@@ -6392,7 +6385,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}")) and
             !opts.include_primary_digest and !opts.relational_integrity_catalog and !opts.relational_integrity_action and
             !opts.generation_handoff_install_read_index_certified and
-            opts.relational_integrity_jobs_json.len == 0 and opts.relational_index_status_json.len == 0 and
+            opts.relational_integrity_jobs_json.len == 0 and opts.group_source_query_json.len == 0 and opts.relational_index_status_json.len == 0 and
             opts.relational_activation_json.len == 0 and opts.fields.len == 0 and
             opts.restore_staging_scope != null and opts.restore_staging_plan_id != null;
     }
@@ -7349,6 +7342,7 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         var req = requested;
         try checkQueryDeadline(req);
+        try distributed_graph.validateIncomingStartIdentities(alloc, hosted.catalog, table_name, req);
         var routing_session = if (requiresAuthoritativeRoutingSession(req))
             try table_catalog.RoutingSession.init(alloc, hosted.catalog, queryRoutingDeadline(hosted.catalog, req))
         else
@@ -8438,6 +8432,7 @@ fn queryProvisionedAcrossGroupsParallel(
         ) void {
             const arena = slot.arena.allocator();
             var group_req = shard_req_inner.*;
+            if (group_req.document_authority_mode != .none) group_req.document_authority_group = group_id;
             _ = selectLookupKeysForGroup(arena, &group_req, group_id) catch |err| {
                 slot.err = err;
                 return;
@@ -8487,6 +8482,7 @@ fn queryProvisionedAcrossGroupsParallel(
     var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results, coordinator_paging.offset, coordinator_paging.limit);
     errdefer merged.deinit();
     try attachDistributedIdentityGenerations(alloc, &merged, group_ids, result_identity_generations);
+    try hydrateDistributedDocumentWindow(self, alloc, req, table_name, consistency, group_ids, result_identity_generations, null, &merged);
     recordParallelFanout(.query, @intCast(platform_time.monotonicNs() - start_ns));
     return merged;
 }
@@ -8525,6 +8521,7 @@ fn queryHostedAcrossGroupsParallel(
         ) void {
             const arena = slot.arena.allocator();
             var group_req = shard_req_inner.*;
+            if (group_req.document_authority_mode != .none) group_req.document_authority_group = group_id;
             _ = selectLookupKeysForGroup(arena, &group_req, group_id) catch |err| {
                 slot.err = err;
                 return;
@@ -8541,9 +8538,13 @@ fn queryHostedAcrossGroupsParallel(
                     slot.err = err;
                     return;
                 },
-                .remote => |remote| slot.result = queryRemote(source.internalExecutor(), arena, remote.base_uri, group_id, table_name_inner, group_req) catch |err| {
-                    slot.err = normalizeDistributedQueryOperationalError(err);
-                    return;
+                .remote => |remote| {
+                    // Reclaim transport and decoding workspace at callback
+                    // completion; the slot arena retains final results only.
+                    slot.result = queryRemoteWithScratch(source.internalExecutor(), arena, slot.arena.child_allocator, remote.base_uri, group_id, table_name_inner, group_req) catch |err| {
+                        slot.err = normalizeDistributedQueryOperationalError(err);
+                        return;
+                    };
                 },
             }
             if (slot.result == null) slot.err = error.TableNotFound;
@@ -8578,6 +8579,7 @@ fn queryHostedAcrossGroupsParallel(
     var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results, coordinator_paging.offset, coordinator_paging.limit);
     errdefer merged.deinit();
     try attachDistributedIdentityGenerations(alloc, &merged, group_ids, result_identity_generations);
+    try hydrateDistributedDocumentWindow(self, alloc, req, table_name, consistency, group_ids, result_identity_generations, routes, &merged);
     recordParallelFanout(.query, @intCast(platform_time.monotonicNs() - start_ns));
     return merged;
 }
@@ -8809,6 +8811,234 @@ const HostedMatchAnchorPager = struct {
     }
 };
 
+fn canDeferDistributedDocuments(req: db_mod.types.SearchRequest) bool {
+    return req.lake_read == null and req.remote_snapshot == null and req.native_query_cut == null and req.document_authority_mode == .none and req.include_stored and !req.count_only and req.limit != 0 and req.graph_queries.len == 0 and req.highlight == null and !req.hasHitEvaluation() and req.return_mode == .parent and req.hierarchy_children == null and req.hierarchy_group_level == .source and !req.hierarchy_grouped_matches and !req.hierarchy_include_source and !req.hierarchy_include_unit and req.aggregations_json.len == 0;
+}
+
+// Workers serialize allocation operations, not queries. The wrapper has a
+// stack lifetime ending after all workers join; escaping bodies are freed by
+// the underlying response allocator, never by this wrapper.
+const HydrationOutputAllocator = struct {
+    backing: std.mem.Allocator,
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn allocate(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.backing.rawAlloc(len, alignment, ra);
+    }
+    fn resize(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.backing.rawResize(memory, alignment, len, ra);
+    }
+    fn remap(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.backing.rawRemap(memory, alignment, len, ra);
+    }
+    fn free(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.backing.rawFree(memory, alignment, ra);
+    }
+};
+
+fn executeDistributedHydrationBatch(source: anytype, alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, table_name: []const u8, consistency: raft_mod.ReadConsistency, owner: u64, ordinal: usize, keys: []const []const u8, generations: []const ?u64, routes: ?[]const table_router.GroupRoute, body_allocator: ?std.mem.Allocator, exact_output: bool) !db_mod.types.SearchResult {
+    var hydration = distributedSearchShardRequest(req, &.{}, true);
+    hydration.document_authority_mode = .hydrate;
+    hydration.document_output_allocator = body_allocator;
+    hydration.document_output_exact = exact_output;
+    hydration.document_authority_group = owner;
+    hydration.include_stored = false;
+    hydration.query = .{ .match_all = {} };
+    hydration.index_name = null;
+    hydration.full_text = null;
+    hydration.full_text_queries = &.{};
+    hydration.dense = null;
+    hydration.dense_queries = &.{};
+    hydration.sparse = null;
+    hydration.sparse_queries = &.{};
+    hydration.graph_metric_queries = &.{};
+    hydration.graph_metric_rerank = null;
+    hydration.merge_config = null;
+    hydration.order_by = &.{};
+    hydration.search_after = &.{};
+    hydration.search_before = &.{};
+    hydration.filter_doc_ids = keys;
+    hydration.filter_doc_ids_positive = true;
+    hydration.document_lookup_groups = &.{};
+    hydration.limit = @intCast(keys.len);
+    hydration.offset = 0;
+    hydration.identity_read_generation = generations[ordinal] orelse return error.IdentityReadGenerationChanged;
+    return if (comptime @TypeOf(source) == *HostedProvisionedTableReadSource) switch ((routes orelse return error.InvalidQueryRequest)[ordinal]) {
+        .local => (try source.groupLocalSource().searchResultGroupLocal(alloc, owner, table_name, hydration, consistency)) orelse return error.TableNotFound,
+        .remote => |remote| try queryRemote(source.internalExecutor(), alloc, remote.base_uri, owner, table_name, hydration),
+    } else (try source.groupLocalSource().searchResultGroupLocal(alloc, owner, table_name, hydration, consistency)) orelse return error.TableNotFound;
+}
+
+fn hydrateDistributedDocumentWindow(source: anytype, alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, table_name: []const u8, consistency: raft_mod.ReadConsistency, groups: []const u64, generations: []const ?u64, routes: ?[]const table_router.GroupRoute, result: *db_mod.types.SearchResult) !void {
+    const Entry = struct {
+        group: u64,
+        row: usize,
+        fn less(_: void, a: @This(), b: @This()) bool {
+            return if (a.group == b.group) a.row < b.row else a.group < b.group;
+        }
+    };
+    var entries = std.ArrayListUnmanaged(Entry).empty;
+    defer entries.deinit(alloc);
+    for (result.hits, 0..) |*hit, row| if (hit.document_authority) |proof| {
+        if (hit.stored_data != null) {
+            alloc.destroy(proof);
+            hit.document_authority = null;
+        } else try entries.append(alloc, .{ .group = proof.group, .row = row });
+    };
+    if (entries.items.len == 0) return;
+    std.mem.sort(Entry, entries.items, {}, Entry.less);
+    const Source = @typeInfo(@TypeOf(source)).pointer.child;
+    const attached_io: ?FanoutIo = if (@hasField(Source, "io_impl")) source.io_impl else null;
+    const width: usize = if (attached_io) |io| @min(@as(usize, 4), ioAsyncLimitWidth(io, groups.len)) else 1;
+    const Slot = struct {
+        arena: std.heap.ArenaAllocator,
+        live: bool = true,
+        body_allocator: ?std.mem.Allocator = null,
+        exact_output: bool = false,
+        budget: @import("antfly_local_sources").graph_work_budget.WorkBudget = undefined,
+        tracked: @import("antfly_local_sources").graph_work_budget.RetainedAllocator = undefined,
+        output_allocator: ?std.mem.Allocator = null,
+        keys: [256][]const u8 = undefined,
+        begin: usize = 0,
+        end: usize = 0,
+        owner: u64 = 0,
+        ordinal: usize = 0,
+        result: ?db_mod.types.SearchResult = null,
+        err: ?anyerror = null,
+        fn deinit(self: *@This()) void {
+            if (!self.live) return;
+            if (self.result) |*owned| owned.deinit();
+            self.arena.deinit();
+            self.live = false;
+        }
+        fn run(self: *@This(), input: @TypeOf(source), request: db_mod.types.SearchRequest, table: []const u8, read_consistency: raft_mod.ReadConsistency, versions: []const ?u64, locations: ?[]const table_router.GroupRoute) void {
+            self.result = executeDistributedHydrationBatch(input, self.output_allocator orelse self.arena.allocator(), request, table, read_consistency, self.owner, self.ordinal, self.keys[0 .. self.end - self.begin], versions, locations, self.body_allocator, self.exact_output) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+    var synchronized_output: HydrationOutputAllocator = .{ .backing = alloc, .io = if (attached_io) |io| io.io() else undefined };
+    var merge_scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+    defer merge_scratch.deinit();
+    var start: usize = 0;
+    while (start < entries.items.len) {
+        try checkQueryDeadline(req);
+        // Retire each completed wave before admitting another. Independent
+        // arenas never allocate concurrently through the response allocator.
+        var slots: [4]Slot = undefined;
+        var count: usize = 0;
+        defer for (slots[0..count]) |*slot| slot.deinit();
+        while (count < @max(width, 1) and start < entries.items.len) {
+            const slot = &slots[count];
+            slot.* = .{ .arena = .init(std.heap.page_allocator), .begin = start, .end = start, .owner = entries.items[start].group };
+            count += 1;
+            // Each worker has a 64 MiB scratch ceiling. Oversized pages retry
+            // serially through the caller's allocator rather than multiplying
+            // their peak by the fanout width or rejecting a formerly valid read.
+            slot.budget = .initWithLimits(.{ .max_retained_state_bytes = 64 * 1024 * 1024 });
+            slot.tracked = .{ .backing = if (width > 1) std.heap.page_allocator else @import("antfly_platform").allocator.reclaimingScratch(alloc), .budget = if (width > 1) &slot.budget else null };
+            slot.arena = .init(slot.tracked.allocator());
+            if (width <= 1) {
+                slot.output_allocator = alloc;
+            } else {
+                slot.body_allocator = synchronized_output.allocator();
+                const reclaimable = @import("antfly_platform").allocator.reclaimingScratch(alloc);
+                slot.exact_output = reclaimable.ptr != alloc.ptr or reclaimable.vtable != alloc.vtable;
+            }
+            slot.ordinal = for (groups, 0..) |group, i| {
+                if (group == slot.owner) break i;
+            } else return error.InvalidRemoteResponse;
+            var key_bytes: usize = 0;
+            while (slot.end < entries.items.len and slot.end - start < slot.keys.len and entries.items[slot.end].group == slot.owner) {
+                const key = result.hits[entries.items[slot.end].row].id;
+                if (slot.end != start and key.len > 64 * 1024 -| key_bytes) break;
+                slot.keys[slot.end - start] = key;
+                key_bytes +|= key.len;
+                slot.end += 1;
+            }
+            start = slot.end;
+        }
+        if (count == 1) {
+            slots[0].output_allocator = alloc;
+            slots[0].body_allocator = null;
+        }
+        if (attached_io != null and count > 1) {
+            var group: std.Io.Group = .init;
+            const io = attached_io.?.io();
+            for (slots[0..count]) |*slot| group.async(io, Slot.run, .{ slot, source, req, table_name, consistency, generations, routes });
+            group.await(io) catch {};
+        } else for (slots[0..count]) |*slot| slot.run(source, req, table_name, consistency, generations, routes);
+        // No partial page can reach egress: callers own the result errdefer.
+        // First consume successful pages and retire their arenas. Retry cap
+        // denials only after those owners have gone, avoiding wave + retry peaks.
+        for (0..2) |pass| for (slots[0..count]) |*slot| {
+            if (!slot.live) continue;
+            const retry = slot.err != null and slot.err.? == error.OutOfMemory and slot.tracked.denied and slot.output_allocator == null;
+            if (pass == 0 and retry) continue;
+            if (pass == 1 and !retry) continue;
+            if (slot.err != null and slot.err.? == error.OutOfMemory and slot.tracked.denied and slot.output_allocator == null) {
+                slot.arena.deinit();
+                slot.tracked = .{ .backing = @import("antfly_platform").allocator.reclaimingScratch(alloc), .budget = null };
+                slot.arena = .init(slot.tracked.allocator());
+                slot.output_allocator = alloc;
+                slot.body_allocator = null;
+                slot.err = null;
+                try checkQueryDeadline(req);
+                slot.run(source, req, table_name, consistency, generations, routes);
+            }
+            if (slot.err) |err| return err;
+            const hydrated = &slot.result.?;
+            if (hydrated.identity_read_generation != generations[slot.ordinal] or hydrated.document_authority_version != 1) return error.StorageReadTemporarilyUnavailable;
+            if (!merge_scratch.reset(.{ .retain_with_limit = 64 * 1024 })) _ = merge_scratch.reset(.free_all);
+            const scratch = merge_scratch.allocator();
+            var by_id = std.StringHashMapUnmanaged(usize).empty;
+            for (hydrated.hits, 0..) |hit, i| {
+                const entry = try by_id.getOrPut(scratch, hit.id);
+                if (entry.found_existing) return error.InvalidRemoteResponse;
+                entry.value_ptr.* = i;
+            }
+            // Validate all proofs and reject repeated selected identities
+            // before cloning any document from this page.
+            var selected_ids = std.StringHashMapUnmanaged(void).empty;
+            for (entries.items[slot.begin..slot.end]) |entry| {
+                const selected = result.hits[entry.row];
+                if ((try selected_ids.getOrPut(scratch, selected.id)).found_existing) return error.InvalidRemoteResponse;
+                const hit = hydrated.hits[by_id.get(selected.id) orelse return error.StorageReadTemporarilyUnavailable];
+                const proof = hit.document_authority orelse return error.InvalidRemoteResponse;
+                if (!selected.document_authority.?.eql(proof.*) or hit.stored_data == null) return error.StorageReadTemporarilyUnavailable;
+            }
+            for (entries.items[slot.begin..slot.end]) |entry| {
+                const selected = &result.hits[entry.row];
+                const hit = hydrated.hits[by_id.get(selected.id).?];
+                const document = &hydrated.hits[by_id.get(selected.id).?];
+                if (slot.output_allocator != null or hydrated.stored_data_allocator != null) {
+                    selected.stored_data = document.stored_data;
+                    document.stored_data = null;
+                } else selected.stored_data = try alloc.dupe(u8, hit.stored_data.?);
+                alloc.destroy(selected.document_authority.?);
+                selected.document_authority = null;
+            }
+            slot.deinit();
+        };
+    }
+}
+
 fn distributedSearchShardRequest(
     req: db_mod.types.SearchRequest,
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats,
@@ -8818,6 +9048,10 @@ fn distributedSearchShardRequest(
         req
     else
         db_mod.types.canonicalGroupedMatchSelectionRequest(req);
+    if (canDeferDistributedDocuments(req)) {
+        copy.include_stored = false;
+        copy.document_authority_mode = .candidates;
+    }
     copy.offset = 0;
     copy.limit = distributedSearchShardLimit(req);
     copy.distributed_text_stats = distributed_text_stats;
@@ -10687,7 +10921,11 @@ fn queryProvisionedAcrossGroupsPhase(
     result_identity_generations: []?u64,
 ) !db_mod.types.SearchResult {
     try validateDistributedPhaseIdentityGenerations(group_ids.len, required_identity_generations, result_identity_generations);
-    const shard_req = distributedSearchShardRequest(req, distributed_text_stats, expand_selected_groups);
+    var shard_req = distributedSearchShardRequest(req, distributed_text_stats, expand_selected_groups);
+    if (group_ids.len < 2 and shard_req.document_authority_mode == .candidates) {
+        shard_req.document_authority_mode = .none;
+        shard_req.include_stored = req.include_stored;
+    }
     var fan_in_shard_req = try prepareGraphMetricFanInShardRequest(alloc, shard_req);
     defer fan_in_shard_req.deinit(alloc);
 
@@ -10712,6 +10950,7 @@ fn queryProvisionedAcrossGroupsPhase(
 
     for (group_ids, 0..) |group_id, i| {
         var group_req = fan_in_shard_req.req;
+        if (group_req.document_authority_mode != .none) group_req.document_authority_group = group_id;
         if (required_identity_generations) |generations| group_req.identity_read_generation = generations[i].?;
         shard_results[i] = (try self.groupLocalSource().searchResultGroupLocal(
             alloc,
@@ -10736,6 +10975,7 @@ fn queryProvisionedAcrossGroupsPhase(
     if (graph_accumulator) |*accumulator|
         merged.graph_results = try accumulator.toOwned();
     try attachDistributedIdentityGenerations(alloc, &merged, group_ids, result_identity_generations);
+    try hydrateDistributedDocumentWindow(self, alloc, req, table_name, consistency, group_ids, result_identity_generations, null, &merged);
     return merged;
 }
 
@@ -10752,7 +10992,11 @@ fn queryHostedAcrossGroupsPhase(
     result_identity_generations: []?u64,
 ) !db_mod.types.SearchResult {
     try validateDistributedPhaseIdentityGenerations(group_ids.len, required_identity_generations, result_identity_generations);
-    const shard_req = distributedSearchShardRequest(req, distributed_text_stats, expand_selected_groups);
+    var shard_req = distributedSearchShardRequest(req, distributed_text_stats, expand_selected_groups);
+    if (group_ids.len < 2 and shard_req.document_authority_mode == .candidates) {
+        shard_req.document_authority_mode = .none;
+        shard_req.include_stored = req.include_stored;
+    }
     var fan_in_shard_req = try prepareGraphMetricFanInShardRequest(alloc, shard_req);
     defer fan_in_shard_req.deinit(alloc);
 
@@ -10779,6 +11023,7 @@ fn queryHostedAcrossGroupsPhase(
 
     for (group_ids, 0..) |group_id, i| {
         var group_req = fan_in_shard_req.req;
+        if (group_req.document_authority_mode != .none) group_req.document_authority_group = group_id;
         const lookup_keys = try selectLookupKeysForGroup(alloc, &group_req, group_id);
         defer if (lookup_keys) |keys| alloc.free(keys);
         if (required_identity_generations) |generations| group_req.identity_read_generation = generations[i].?;
@@ -10809,6 +11054,7 @@ fn queryHostedAcrossGroupsPhase(
     if (graph_accumulator) |*accumulator|
         merged.graph_results = try accumulator.toOwned();
     try attachDistributedIdentityGenerations(alloc, &merged, group_ids, result_identity_generations);
+    try hydrateDistributedDocumentWindow(self, alloc, req, table_name, consistency, group_ids, result_identity_generations, routes, &merged);
     return merged;
 }
 
@@ -10828,6 +11074,7 @@ const ProvisionedGraphWorkerContext = struct {
                 .execute_graph_expand = executeProvisionedGraphExpand,
                 .execute_graph_hydrate = executeProvisionedGraphHydrate,
                 .execute_graph_get_edges = executeProvisionedGraphGetEdges,
+                .execute_graph_get_edges_batch = executeProvisionedGraphGetEdges,
                 .resolve_incoming_source_groups = resolveProvisionedIncomingSourceGroups,
                 .record_incoming_source_groups = recordProvisionedIncomingSourceGroups,
                 .fanout_io = provisionedGraphFanoutIo,
@@ -10846,6 +11093,7 @@ fn hostedGraphWorker(self: *HostedProvisionedTableReadSource) distributed_graph.
             .execute_graph_expand = executeHostedGraphExpand,
             .execute_graph_hydrate = executeHostedGraphHydrate,
             .execute_graph_get_edges = executeHostedGraphGetEdges,
+            .execute_graph_get_edges_batch = executeHostedGraphGetEdges,
             .resolve_incoming_source_groups = resolveHostedIncomingSourceGroups,
             .record_incoming_source_groups = recordHostedIncomingSourceGroups,
             .fanout_io = hostedGraphFanoutIo,
@@ -11298,18 +11546,7 @@ fn executeProvisionedGraphGetEdgesAttempt(
     defer db_owner.deinit();
     _ = try currentIdentityReadGenerationForDb(req.identity_read_generation, db_owner.db());
     const graph_entry = db_owner.db().core.graphIndex(req.index_name) orelse return error.IndexNotFound;
-    const ttl_now_ns = if (req.ttl_now_ns != 0) req.ttl_now_ns else platform_time.realtimeNs();
-    const result = try graph_entry.index.getEdgesByTypesBoundedWithStatsAt(
-        alloc,
-        req.key,
-        req.edge_types,
-        req.direction,
-        req.max_edges,
-        req.max_owned_bytes,
-        req.max_scanned_rows,
-        ttl_now_ns,
-    );
-    return .{ .edges = result.edges, .scanned_rows = @intCast(result.scanned_rows) };
+    return @import("antfly_local_sources").api_local_graph.readGraphEdgesRequest(alloc, &graph_entry.index, req, if (req.ttl_now_ns != 0) req.ttl_now_ns else platform_time.realtimeNs());
 }
 
 fn executeHostedGraphGetEdges(
@@ -11355,17 +11592,7 @@ fn graphGetEdgesLocal(
     try reads.reads.prepareLookupWithConsistency(group_id, req.key, .{}, consistency);
 
     const graph_entry = db.core.graphIndex(req.index_name) orelse return error.IndexNotFound;
-    const result = try graph_entry.index.getEdgesByTypesBoundedWithStatsAt(
-        alloc,
-        req.key,
-        req.edge_types,
-        req.direction,
-        req.max_edges,
-        req.max_owned_bytes,
-        req.max_scanned_rows,
-        if (req.ttl_now_ns != 0) req.ttl_now_ns else platform_time.realtimeNs(),
-    );
-    return .{ .edges = result.edges, .scanned_rows = @intCast(result.scanned_rows) };
+    return @import("antfly_local_sources").api_local_graph.readGraphEdgesRequest(alloc, &graph_entry.index, req, if (req.ttl_now_ns != 0) req.ttl_now_ns else platform_time.realtimeNs());
 }
 
 fn lookupLocal(
@@ -15385,6 +15612,7 @@ fn lookupRemote(
         opts.relational_activation_json,
         opts.relational_index_status_json,
         opts.relational_topology_json,
+        opts.group_source_query_json,
         opts.restore_staging_scope,
         opts.restore_staging_plan_id,
         opts.include_primary_digest,
@@ -15519,6 +15747,8 @@ fn scanRemoteToSink(
     return error.StorageReadTemporarilyUnavailable;
 }
 
+// Preserve quota wrappers; unwrap only standard arenas whose child allocator
+// can reclaim transient transport and parser allocations independently.
 fn queryRemote(
     executor: http_common.RequestExecutor,
     alloc: std.mem.Allocator,
@@ -15527,10 +15757,51 @@ fn queryRemote(
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
 ) !db_mod.types.SearchResult {
-    var result = try queryResponseRemote(executor, alloc, base_uri, group_id, table_name, req);
-    defer result.deinit(alloc);
-    var parsed = try parseRemoteSearchResult(alloc, result.json);
+    return queryRemoteWithScratch(executor, alloc, @import("antfly_platform").allocator.reclaimingScratch(alloc), base_uri, group_id, table_name, req);
+}
+
+fn queryRemoteWithScratch(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    req: db_mod.types.SearchRequest,
+) !db_mod.types.SearchResult {
+    var result = queryResponseRemote(executor, scratch, base_uri, group_id, table_name, req) catch |err| {
+        if (req.document_authority_mode == .hydrate and err == error.UnexpectedHttpStatus) return error.StorageReadTemporarilyUnavailable;
+        if (req.document_authority_mode != .candidates or err != error.UnexpectedHttpStatus) return err;
+        var legacy = req;
+        legacy.document_authority_mode = .none;
+        legacy.document_authority_group = 0;
+        legacy.include_stored = true;
+        return queryRemoteWithScratch(executor, alloc, scratch, base_uri, group_id, table_name, legacy);
+    };
+    defer result.deinit(scratch);
+    var parsed = if (req.document_authority_mode != .none)
+        try local_query_contract.parseRemoteSearchResultWithAuthority(alloc, scratch, result.json, group_id, req.document_output_allocator)
+    else
+        try local_query_contract.parseRemoteSearchResultWithScratch(alloc, scratch, result.json);
+    errdefer parsed.deinit();
     parsed.identity_read_generation = result.identity_read_generation orelse return error.InvalidQueryRequest;
+    if (req.document_authority_mode != .none) {
+        if (parsed.document_authority_version != 1) {
+            if (req.document_authority_mode != .candidates) return error.StorageReadTemporarilyUnavailable;
+            var legacy = req;
+            legacy.document_authority_mode = .none;
+            legacy.document_authority_group = 0;
+            legacy.include_stored = true;
+            parsed.deinit();
+            // errdefer owns only the live replacement if the fallback fails.
+            parsed = .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
+            return queryRemoteWithScratch(executor, alloc, scratch, base_uri, group_id, table_name, legacy);
+        }
+        for (parsed.hits) |hit| {
+            const proof = hit.document_authority orelse return error.InvalidRemoteResponse;
+            if (proof.group != group_id or (req.document_authority_mode == .hydrate and hit.stored_data == null)) return error.InvalidRemoteResponse;
+        }
+    }
     return parsed;
 }
 
@@ -15565,8 +15836,14 @@ fn queryResponseRemote(
     else
         try client.fetchGroupQueryWithControl(base_uri, group_id, table_name, body, timeout_ms, cancellation_ptr);
     defer result.deinit(alloc);
+    const owner = result.owner_allocator orelse alloc;
+    const json = if (owner.ptr == alloc.ptr and owner.vtable == alloc.vtable) blk: {
+        const owned = result.body;
+        result.body = &.{};
+        break :blk owned;
+    } else try alloc.dupe(u8, result.body);
     return .{
-        .json = try alloc.dupe(u8, result.body),
+        .json = json,
         .identity_read_generation = result.identity_read_generation,
     };
 }
@@ -15867,13 +16144,19 @@ fn graphEdgesRemote(
     table_name: []const u8,
     req: distributed_graph.GraphEdgesRequest,
 ) !distributed_graph.GraphEdgesResponse {
-    var client = http_client.ApiHttpClient.init(alloc, executor);
-    const body = try distributed_graph.encodeGraphEdgesRequest(alloc, req);
-    defer alloc.free(body);
+    const scratch = req.scratch_allocator orelse alloc;
+    var client = http_client.ApiHttpClient.init(scratch, executor);
+    const body = try distributed_graph.encodeGraphEdgesRequest(scratch, req);
+    defer scratch.free(body);
     var cancellation = if (req.cancellation) |token|
         http_common.RequestCancellation.fromToken(token)
     else
         null;
+    if (req.keys.len != 0) {
+        var batch = client.fetchGroupGraphEdgesBatchWithControl(base_uri, group_id, table_name, body, req.timeout_ms, if (cancellation != null) &cancellation.? else null) catch |err| return if (req.allow_partial_keys and err == error.InvalidGraphEdgesWireRequest) error.GraphEdgesBatchUnsupported else err;
+        defer batch.deinit(scratch);
+        return try distributed_graph.parseGraphEdgesResponseWithScratch(alloc, scratch, batch.body);
+    }
     var result = client.fetchGroupGraphEdgesWithControl(
         base_uri,
         group_id,
@@ -15883,8 +16166,8 @@ fn graphEdgesRemote(
         if (cancellation != null) &cancellation.? else null,
     ) catch |err| blk: {
         if (err != error.InvalidGraphEdgesWireRequest or !req.allow_legacy_wire_fallback) return err;
-        const legacy_body = try distributed_graph.encodeLegacyGraphEdgesRequest(alloc, req);
-        defer alloc.free(legacy_body);
+        const legacy_body = try distributed_graph.encodeLegacyGraphEdgesRequest(scratch, req);
+        defer scratch.free(legacy_body);
         break :blk try client.fetchGroupGraphEdgesWithControl(
             base_uri,
             group_id,
@@ -15894,8 +16177,8 @@ fn graphEdgesRemote(
             if (cancellation != null) &cancellation.? else null,
         );
     };
-    defer result.deinit(alloc);
-    return try distributed_graph.parseGraphEdgesResponse(alloc, result.body);
+    defer result.deinit(scratch);
+    return try distributed_graph.parseGraphEdgesResponseWithScratch(alloc, scratch, result.body);
 }
 
 test "graph hydrate and edges remote retry legacy wire safely" {
@@ -16131,6 +16414,7 @@ const parseRemoteSearchResult = local_query_contract.parseRemoteSearchResult;
 const parseRemoteSearchResultInner = local_query_contract.parseRemoteSearchResultInner;
 
 pub const parseStorageKernelSearchResult = local_query_contract.parseStorageKernelSearchResult;
+pub const restoreDocumentAuthority = local_query_contract.restoreDocumentAuthority;
 pub const parseRemoteGraphMetricRerankScoreDetails = local_query_contract.parseRemoteGraphMetricRerankScoreDetails;
 
 pub const parseRemoteGraphMetricRerankStatus = local_query_contract.parseRemoteGraphMetricRerankStatus;
@@ -16317,6 +16601,38 @@ fn scanNdjsonWithConsistencyAlloc(
     return try visitor.out.toOwnedSlice(alloc);
 }
 
+/// Consume a row-local producer before the scan cursor can advance. The sink
+/// owns network backpressure; its exact failure survives both writer adapters.
+fn writeBorrowedScanLine(entry: db_mod.types.ScanVisitEntry, sink: ScanStreamSink, opts: db_mod.types.ScanOptions) !void {
+    const Guard = struct {
+        sink: ScanStreamSink,
+        opts: db_mod.types.ScanOptions,
+        fn start(_: ?*anyopaque) !void {}
+        fn send(ptr: ?*anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            if (self.opts.cancellation) |token| if (token.isCancelled()) return error.Canceled;
+            _ = try scanRemainingTimeoutMs(self.opts);
+            try self.sink.write(bytes);
+        }
+        fn emit(writer: *std.Io.Writer, row: db_mod.types.ScanVisitEntry) !void {
+            try writer.writeAll("{\"_id\":");
+            try std.json.Stringify.value(row.id, .{}, writer);
+            if (row.content_hash) |hash| {
+                try writer.writeAll(",\"_content_hash\":\"");
+                try writer.writeAll(&std.fmt.bytesToHex(hash, .lower));
+                try writer.writeByte('"');
+            }
+            try row.document_stream.?.writeFields(writer);
+            try writer.writeAll("}\n");
+        }
+    };
+    var guard: Guard = .{ .sink = sink, .opts = opts };
+    var output: ScanStreamSink.Writer = undefined;
+    output.init(.{ .context = &guard, .start_fn = Guard.start, .write_fn = Guard.send });
+    Guard.emit(&output.writer, entry) catch |err| return output.failure orelse err;
+    try output.finish();
+}
+
 fn scanNdjsonWithConsistencyToSink(
     alloc: std.mem.Allocator,
     reads: raft_mod.FeatureDBReads,
@@ -16340,9 +16656,10 @@ fn scanNdjsonWithConsistencyToSink(
         alloc: std.mem.Allocator,
         sink: ScanStreamSink,
         line: std.ArrayListUnmanaged(u8) = .empty,
-
+        opts: db_mod.types.ScanOptions,
         fn visit(raw_context: ?*anyopaque, entry: db_mod.types.ScanVisitEntry) anyerror!void {
             const visitor: *@This() = @ptrCast(@alignCast(raw_context orelse return error.InvalidArgument));
+            if (entry.document_stream != null) return writeBorrowedScanLine(entry, visitor.sink, visitor.opts);
             visitor.line.clearRetainingCapacity();
             if (entry.relational_schema_version) |version| {
                 try appendRelationalScanLine(visitor.alloc, &visitor.line, entry, version);
@@ -16357,13 +16674,14 @@ fn scanNdjsonWithConsistencyToSink(
         }
     };
 
-    var visitor = NdjsonVisitor{ .alloc = alloc, .sink = sink };
+    var visitor = NdjsonVisitor{ .alloc = alloc, .sink = sink, .opts = opts };
     defer visitor.line.deinit(alloc);
     try reads.reads.prepareScanWithConsistency(reads.group_id, from_key, to_key, opts, consistency);
     try sink.start();
     try db.scanVisit(alloc, from_key, to_key, opts, .{
         .context = &visitor,
         .visit = NdjsonVisitor.visit,
+        .borrow_documents = true,
     });
 }
 
@@ -17697,8 +18015,12 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 1), parsed.graph_metric_results.len);
             try std.testing.expectEqualStrings("central", parsed.graph_metric_results[0].name);
             try std.testing.expectEqual(@as(usize, 1), parsed.graph_results.len);
-            try std.testing.expectEqual(@as(usize, 2), parsed.graph_results[0].nodes[0].metrics.len);
-            try std.testing.expect(parsed.graph_results[0].nodes[0].metrics[1].score == null);
+            const node = parsed.graph_results[0].nodes[0];
+            try std.testing.expectEqual(@as(usize, 2), node.metricCount());
+            try std.testing.expectEqualStrings("pagerank", node.metricAt(0).name);
+            try std.testing.expectEqual(@as(?f64, 0.7), node.metricAt(0).score);
+            try std.testing.expectEqualStrings("degree", node.metricAt(1).name);
+            try std.testing.expect(node.metricAt(1).score == null);
             const status = parsed.graph_results[0].metric_status[0];
             try std.testing.expectEqual(@as(u32, 2), status.metadata_version);
             try std.testing.expectEqual(std.math.maxInt(u64), status.config_fingerprint);
@@ -26846,6 +27168,365 @@ fn consumerTests() type {
     return Suite;
 }
 
+pub const document_hydration_tests = if (builtin.is_test) struct {
+    test "public graph metric borrowed wire compiled owner preserves admitted document authority and sources" {
+        const Fixture = struct {
+            const document = "{\"customer_id\":\"cust:a\",\"title\":\"row\",\"n\":9007199254740993}";
+            fn parse(alloc: std.mem.Allocator, document_bytes: ?[]const u8) !db_mod.types.SearchResult {
+                const envelope = try db_mod.types.document_authority.encode(alloc, .{ .group = 11, .version = 9, .digest = @splat(0x11) }, document_bytes);
+                defer alloc.free(envelope);
+                const wire = try std.fmt.allocPrint(alloc, "{s}{s}{s}{s}{s}", .{
+                    "{\"responses\":[{\"took\":0,\"status\":200,\"hits\":{\"hits\":[{\"_id\":\"a\",\"_score\":1,\"_source\":",
+                    envelope,
+                    "},{\"_id\":\"b\",\"_score\":1,\"_source\":",
+                    envelope,
+                    "}],\"total\":{\"value\":2,\"relation\":\"exact\"}},\"profile\":{\"document_authority_version\":1}}]}",
+                });
+                defer alloc.free(wire);
+                return parseStorageKernelSearchResult(alloc, wire);
+            }
+            fn run(alloc: std.mem.Allocator) !void {
+                for ([_]db_mod.types.document_authority.Mode{ .candidates, .hydrate }) |mode| {
+                    var result = try parse(alloc, document);
+                    defer result.deinit();
+                    try restoreDocumentAuthority(alloc, alloc, 11, mode, &result);
+                    for (result.hits) |hit| {
+                        try std.testing.expectEqualStrings(document, hit.stored_data.?);
+                        try std.testing.expectEqual(@as(u64, 11), hit.document_authority.?.group);
+                        try std.testing.expectEqual(@as(u64, 9), hit.document_authority.?.version);
+                        try std.testing.expectEqual(@as([32]u8, @splat(0x11)), hit.document_authority.?.digest);
+                    }
+                }
+            }
+        };
+        const a = std.testing.allocator;
+        try Fixture.run(a);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.run, .{});
+        var ordinary = try Fixture.parse(a, Fixture.document);
+        defer ordinary.deinit();
+        try restoreDocumentAuthority(a, a, 11, .none, &ordinary);
+        try std.testing.expect(ordinary.hits[0].document_authority == null);
+        try std.testing.expect(std.mem.indexOf(u8, ordinary.hits[0].stored_data.?, "__antfly_document_authority_v1") != null);
+        try std.testing.expectError(error.InvalidRemoteResponse, restoreDocumentAuthority(a, a, 12, .candidates, &ordinary));
+        ordinary.document_authority_version = 0;
+        try std.testing.expectError(error.StorageReadTemporarilyUnavailable, restoreDocumentAuthority(a, a, 11, .candidates, &ordinary));
+        var deferred = try Fixture.parse(a, null);
+        defer deferred.deinit();
+        try std.testing.expectError(error.InvalidRemoteResponse, restoreDocumentAuthority(a, a, 11, .hydrate, &deferred));
+        try restoreDocumentAuthority(a, a, 11, .candidates, &deferred);
+        try std.testing.expect(deferred.hits[0].stored_data == null);
+        try std.testing.expect(deferred.hits[0].document_authority != null);
+    }
+
+    test "public graph metric borrowed wire document authority captures native primary versions and bounded candidates" {
+        const a = std.testing.allocator;
+        var directory = try TestDirectory.initFast("document-authority-native");
+        defer directory.cleanup();
+        var db = try db_mod.DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
+        defer db.close();
+        const padding = try a.alloc(u8, 16 * 1024);
+        defer a.free(padding);
+        @memset(padding, 'x');
+        const large = try std.fmt.allocPrint(a, "{{\"title\":\"large\",\"padding\":\"{s}\"}}", .{padding});
+        defer a.free(large);
+        try db.batch(.{ .writes = &.{ .{ .key = "a", .value = "{\"title\":\"small\"}" }, .{ .key = "b", .value = large } } });
+        const request: db_mod.types.SearchRequest = .{ .include_stored = false, .document_authority_mode = .candidates, .document_authority_group = 11, .limit = 10 };
+        var selected = try db.search(a, request);
+        defer selected.deinit();
+        try std.testing.expectEqual(@as(u32, 1), selected.document_authority_version);
+        try std.testing.expectEqual(@as(usize, 2), selected.hits.len);
+        const small = for (selected.hits) |hit| {
+            if (std.mem.eql(u8, hit.id, "a")) break hit;
+        } else return error.TestExpectedHit;
+        const deferred = for (selected.hits) |hit| {
+            if (std.mem.eql(u8, hit.id, "b")) break hit;
+        } else return error.TestExpectedHit;
+        try std.testing.expect(small.stored_data != null and deferred.stored_data == null);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(large, &digest, .{});
+        try std.testing.expectEqualSlices(u8, &digest, &deferred.document_authority.?.digest);
+        var hydrate = request;
+        hydrate.document_authority_mode = .hydrate;
+        hydrate.filter_doc_ids = &.{"b"};
+        hydrate.filter_doc_ids_positive = true;
+        hydrate.fields = &.{"title"};
+        hydrate.include_all_fields = false;
+        var before = try db.search(a, hydrate);
+        defer before.deinit();
+        try std.testing.expectEqual(@as(usize, 1), before.hits.len);
+        try std.testing.expect(deferred.document_authority.?.eql(before.hits[0].document_authority.?.*));
+        try std.testing.expectEqualStrings("{\"title\":\"large\"}", before.hits[0].stored_data.?);
+        const Executor = struct {
+            db: *db_mod.DB,
+            fn execute(raw: *anyopaque, alloc: std.mem.Allocator, http_request: http_common.HttpRequest) !http_common.HttpResponse {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                var parsed = try query_contract.parseQueryRequest(alloc, null, "docs", http_request.body);
+                defer parsed.deinit(alloc);
+                try std.testing.expect(!parsed.req.include_stored);
+                var captured = try self.db.searchWithCapturedRequest(alloc, parsed.req);
+                defer captured.result.deinit();
+                var response = try query_contract.encodeQueryResponses(alloc, "docs", captured.request, .{}, captured.result);
+                defer response.deinit(alloc);
+                const headers = try alloc.alloc(http_common.Header, 1);
+                errdefer alloc.free(headers);
+                const name = try alloc.dupe(u8, query_api.QueryResponse.identity_read_generation_header);
+                errdefer alloc.free(name);
+                const value = try std.fmt.allocPrint(alloc, "{d}", .{captured.request.identity_read_generation orelse 0});
+                errdefer alloc.free(value);
+                headers[0] = .{ .name = name, .value = value };
+                return .{ .status = 200, .headers = headers, .body = try alloc.dupe(u8, response.json) };
+            }
+        };
+        var executor: Executor = .{ .db = &db };
+        const transport: http_common.RequestExecutor = .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } };
+        var remote_selected = try queryRemoteWithScratch(transport, a, a, "http://native.test", 11, "docs", request);
+        defer remote_selected.deinit();
+        try std.testing.expectEqual(@as(usize, 2), remote_selected.hits.len);
+        for (remote_selected.hits) |hit| {
+            if (std.mem.eql(u8, hit.id, "b")) try std.testing.expect(hit.stored_data == null and hit.document_authority.?.eql(deferred.document_authority.?.*));
+        }
+        var remote_hydrated = try queryRemoteWithScratch(transport, a, a, "http://native.test", 11, "docs", hydrate);
+        defer remote_hydrated.deinit();
+        try std.testing.expectEqual(@as(usize, 1), remote_hydrated.hits.len);
+        try std.testing.expect(remote_hydrated.hits[0].document_authority.?.eql(deferred.document_authority.?.*));
+        try std.testing.expectEqualStrings("{\"title\":\"large\"}", remote_hydrated.hits[0].stored_data.?);
+        try db.batch(.{ .writes = &.{.{ .key = "b", .value = "{\"title\":\"changed\"}" }} });
+        var after = try db.search(a, hydrate);
+        defer after.deinit();
+        try std.testing.expect(!deferred.document_authority.?.eql(after.hits[0].document_authority.?.*));
+        std.debug.print("DOCUMENT_HYDRATION candidates=2 deferred=1 primary_bytes={d} deferred_body_bytes=0 winner_projection_bytes={d}\n", .{ large.len, before.hits[0].stored_data.?.len });
+    }
+
+    test "public graph metric borrowed wire document authority private controls roundtrip and public admission rejects them" {
+        const a = std.testing.allocator;
+        const request: db_mod.types.SearchRequest = .{ .include_stored = false, .document_authority_mode = .candidates, .document_authority_group = std.math.maxInt(u64), .defer_stored_projection = true };
+        const body = try local_query_contract.encodeQueryRequest(a, request);
+        defer a.free(body);
+        var parsed = try query_contract.parseQueryRequest(a, null, "docs", body);
+        defer parsed.deinit(a);
+        try std.testing.expectEqual(request.document_authority_group, parsed.req.document_authority_group);
+        try std.testing.expectEqual(request.document_authority_mode, parsed.req.document_authority_mode);
+        try std.testing.expect(parsed.req.defer_stored_projection);
+        try std.testing.expect(!parsed.req.include_stored);
+        try std.testing.expectError(error.InvalidQueryRequest, query_contract.parsePublicQueryRequest(a, null, "docs", body));
+        try std.testing.expectError(error.InvalidQueryRequest, query_contract.parsePublicQueryRequest(a, null, "docs", "{\"\\u005fdocument_authority\":{\"mode\":\"candidates\",\"group\":1}}"));
+        try std.testing.expect(!canDeferDistributedDocuments(.{ .remote_snapshot = "lake2:fixture" }));
+        try std.testing.expect(!canDeferDistributedDocuments(.{ .count_only = true }));
+        try std.testing.expect(canDeferDistributedDocuments(.{}));
+    }
+
+    test "public graph metric borrowed wire document authority remote capability fallback and spoof resistance" {
+        const Fixture = struct {
+            capability: bool,
+            calls: usize = 0,
+            fn execute(raw: *anyopaque, a: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.calls += 1;
+                const headers = try a.alloc(http_common.Header, 1);
+                errdefer a.free(headers);
+                const name = try a.dupe(u8, query_api.QueryResponse.identity_read_generation_header);
+                errdefer a.free(name);
+                const value = try a.dupe(u8, "42");
+                errdefer a.free(value);
+                headers[0] = .{ .name = name, .value = value };
+                const proof: db_mod.types.document_authority.Authority = .{ .group = 11, .version = 9, .digest = @splat(0xaa) };
+                const envelope = try db_mod.types.document_authority.encode(a, proof, "{\"title\":\"winner\"}");
+                defer a.free(envelope);
+                const body = try std.fmt.allocPrint(a, "{{\"responses\":[{{\"took\":0,\"status\":200,\"hits\":{{\"total\":{{\"value\":1,\"relation\":\"exact\"}},\"hits\":[{{\"_id\":\"a\",\"_score\":1,\"_source\":{s}}}]}},\"profile\":{s}}}]}}", .{ envelope, if (self.capability) "{\"document_authority_version\":1}" else "{}" });
+                return .{ .status = 200, .headers = headers, .body = body };
+            }
+            fn run(a: std.mem.Allocator, capability: bool) !void {
+                var fixture: @This() = .{ .capability = capability };
+                const executor: http_common.RequestExecutor = .{ .ptr = &fixture, .vtable = &.{ .execute = execute } };
+                var result = try queryRemoteWithScratch(executor, a, a, "http://remote.test", 11, "docs", .{ .include_stored = false, .document_authority_mode = .candidates, .document_authority_group = 11 });
+                defer result.deinit();
+                try std.testing.expectEqual(@as(?u64, 42), result.identity_read_generation);
+                try std.testing.expectEqual(@as(usize, if (capability) 1 else 2), fixture.calls);
+                const hit = result.hits[0];
+                if (capability) {
+                    try std.testing.expectEqual(@as(u64, 9), hit.document_authority.?.version);
+                    try std.testing.expectEqualStrings("{\"title\":\"winner\"}", hit.stored_data.?);
+                } else {
+                    try std.testing.expect(hit.document_authority == null);
+                    try std.testing.expect(std.mem.indexOf(u8, hit.stored_data.?, "__antfly_document_authority_v1") != null);
+                }
+            }
+        };
+        try Fixture.run(std.testing.allocator, true);
+        try Fixture.run(std.testing.allocator, false);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{true});
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{false});
+    }
+
+    test "public graph metric borrowed wire distributed hydration batches winners and rejects changed documents" {
+        const Fixture = struct {
+            calls: usize = 0,
+            changed: bool = false,
+            fn groupLocalSource(self: *@This()) *@This() {
+                return self;
+            }
+            fn searchResultGroupLocal(self: *@This(), alloc: std.mem.Allocator, group: u64, _: []const u8, req: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?db_mod.types.SearchResult {
+                try std.testing.expectEqual(@as(u64, 11), group);
+                try std.testing.expectEqual(db_mod.types.document_authority.Mode.hydrate, req.document_authority_mode);
+                try std.testing.expect(!req.include_stored and req.filter_doc_ids_positive);
+                const hits = try alloc.alloc(db_mod.types.SearchHit, req.filter_doc_ids.len);
+                var initialized: usize = 0;
+                errdefer {
+                    for (hits[0..initialized]) |*hit| hit.deinit(alloc);
+                    alloc.free(hits);
+                }
+                for (req.filter_doc_ids, hits) |key, *hit| {
+                    hit.* = .{ .id = try alloc.dupe(u8, key) };
+                    initialized += 1;
+                    const proof = try alloc.create(db_mod.types.document_authority.Authority);
+                    proof.* = .{ .group = 11, .version = 7, .digest = @splat(if (self.changed) @as(u8, 2) else 1) };
+                    hit.document_authority = proof;
+                    hit.stored_data = try alloc.dupe(u8, "{\"title\":\"winner\"}");
+                }
+                self.calls += 1;
+                return .{ .alloc = alloc, .hits = hits, .total_hits = @intCast(hits.len), .identity_read_generation = 9, .document_authority_version = 1 };
+            }
+            fn run(alloc: std.mem.Allocator, changed: bool) !void {
+                var fixture: @This() = .{ .changed = changed };
+                var hits: [2]db_mod.types.SearchHit = undefined;
+                var initialized: usize = 0;
+                defer for (hits[0..initialized]) |*hit| hit.deinit(alloc);
+                for (&hits, [_][]const u8{ "a", "b" }) |*hit, key| {
+                    hit.* = .{ .id = try alloc.dupe(u8, key) };
+                    initialized += 1;
+                    const proof = try alloc.create(db_mod.types.document_authority.Authority);
+                    proof.* = .{ .group = 11, .version = 7, .digest = @splat(1) };
+                    hit.document_authority = proof;
+                }
+                var result: db_mod.types.SearchResult = .{ .alloc = alloc, .hits = &hits, .total_hits = 6 };
+                if (changed) {
+                    var rejected = false;
+                    hydrateDistributedDocumentWindow(&fixture, alloc, .{}, "docs", .read_index, &.{11}, &.{9}, null, &result) catch |err| {
+                        if (err == error.OutOfMemory) return err;
+                        try std.testing.expectEqual(error.StorageReadTemporarilyUnavailable, err);
+                        rejected = true;
+                    };
+                    try std.testing.expect(rejected);
+                    for (hits) |hit| try std.testing.expect(hit.stored_data == null and hit.document_authority != null);
+                } else {
+                    try hydrateDistributedDocumentWindow(&fixture, alloc, .{}, "docs", .read_index, &.{11}, &.{9}, null, &result);
+                    for (hits) |hit| {
+                        try std.testing.expect(hit.document_authority == null);
+                        try std.testing.expectEqualStrings("{\"title\":\"winner\"}", hit.stored_data.?);
+                    }
+                }
+                try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+            }
+        };
+        try Fixture.run(std.testing.allocator, false);
+        try Fixture.run(std.testing.allocator, true);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{false});
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{true});
+    }
+    test "public graph metric borrowed wire hydration fanout bounds waves preserves order and joins failures" {
+        const Fixture = struct {
+            io_impl: ?FanoutIo,
+            active: std.atomic.Value(u32) = .init(0),
+            peak: std.atomic.Value(u32) = .init(0),
+            calls: std.atomic.Value(u32) = .init(0),
+            changed: bool,
+            oversized: bool,
+            mixed: bool = false,
+            arena_owner: bool = false,
+            scratch_budgets: [8]?*@import("antfly_local_sources").graph_work_budget.WorkBudget = @splat(null),
+            retired_retry_checks: usize = 0,
+            body_pointers: [8]usize = @splat(0),
+            fn groupLocalSource(self: *@This()) *@This() {
+                return self;
+            }
+            fn searchResultGroupLocal(self: *@This(), a: std.mem.Allocator, owner: u64, _: []const u8, req: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?db_mod.types.SearchResult {
+                if (req.document_output_allocator != null) try std.testing.expectEqual(self.arena_owner, req.document_output_exact);
+                const live = self.active.fetchAdd(1, .acq_rel) + 1;
+                defer _ = self.active.fetchSub(1, .acq_rel);
+                _ = self.peak.fetchMax(live, .monotonic);
+                _ = self.calls.fetchAdd(1, .monotonic);
+                try self.io_impl.?.io().sleep(.fromMilliseconds(20), .awake);
+                if (self.mixed and req.document_output_allocator != null) {
+                    const arena: *std.heap.ArenaAllocator = @ptrCast(@alignCast(a.ptr));
+                    const tracked: *@import("antfly_local_sources").graph_work_budget.RetainedAllocator = @ptrCast(@alignCast(arena.child_allocator.ptr));
+                    self.scratch_budgets[owner - 1] = tracked.budget.?;
+                    if (owner != 1) {
+                        const retained = try a.alloc(u8, 8 * 1024 * 1024);
+                        @memset(retained, 0);
+                    }
+                }
+                if (self.mixed and owner == 1 and req.document_output_allocator == null) {
+                    for (self.scratch_budgets[0..4]) |budget| try std.testing.expectEqual(@as(usize, 0), budget.?.retained_state_bytes);
+                    self.retired_retry_checks += 1;
+                }
+                if (self.oversized and (!self.mixed or owner == 1)) {
+                    // The parallel cap refuses this without allocating it;
+                    // the serial retry can reclaim it before building output.
+                    const temporary = try a.alloc(u8, 64 * 1024 * 1024 + 1);
+                    a.free(temporary);
+                }
+                const hits = try a.alloc(db_mod.types.SearchHit, 1);
+                hits[0] = .{ .id = try a.dupe(u8, req.filter_doc_ids[0]) };
+                var result: db_mod.types.SearchResult = .{ .alloc = a, .stored_data_allocator = req.document_output_allocator, .hits = hits, .total_hits = 1, .identity_read_generation = 9, .document_authority_version = 1 };
+                errdefer result.deinit();
+                const proof = try a.create(db_mod.types.document_authority.Authority);
+                proof.* = .{ .group = owner, .version = if (self.changed and owner == 4) 8 else 7, .digest = @splat(1) };
+                hits[0].document_authority = proof;
+                hits[0].stored_data = try (req.document_output_allocator orelse a).dupe(u8, "{\"title\":\"winner\"}");
+                self.body_pointers[owner - 1] = @intFromPtr(hits[0].stored_data.?.ptr);
+                return result;
+            }
+        };
+        const groups = [_]u64{ 1, 2, 3, 4, 5, 6, 7, 8 };
+        const generations: [8]?u64 = @splat(9);
+        const Cases = struct { limit: usize, changed: bool = false, oversized: bool = false, mixed: bool = false, arena_owner: bool = false };
+        for ([_]Cases{ .{ .limit = 4 }, .{ .limit = 4, .arena_owner = true }, .{ .limit = 4, .arena_owner = true, .changed = true }, .{ .limit = 4, .changed = true }, .{ .limit = 1 }, .{ .limit = 1, .changed = true }, .{ .limit = 0 }, .{ .limit = 0, .changed = true }, .{ .limit = 4, .oversized = true }, .{ .limit = 4, .oversized = true, .mixed = true } }) |case| {
+            var output_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer output_arena.deinit();
+            const a = if (case.arena_owner) output_arena.allocator() else std.testing.allocator;
+            const limit = case.limit;
+            const changed = case.changed;
+            var io = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(limit) });
+            defer io.deinit();
+            var fixture = Fixture{ .io_impl = .fromThreaded(&io), .changed = changed, .oversized = case.oversized, .mixed = case.mixed, .arena_owner = case.arena_owner };
+            const hits = try a.alloc(db_mod.types.SearchHit, groups.len);
+            var initialized: usize = 0;
+            defer {
+                for (hits[0..initialized]) |*hit| hit.deinit(a);
+                a.free(hits);
+            }
+            for (hits, 0..) |*hit, index| {
+                const owner = groups[groups.len - index - 1];
+                hit.* = .{ .id = try std.fmt.allocPrint(a, "doc{d}", .{owner}) };
+                initialized += 1;
+                const proof = try a.create(db_mod.types.document_authority.Authority);
+                proof.* = .{ .group = owner, .version = 7, .digest = @splat(1) };
+                hit.document_authority = proof;
+            }
+            var selected: db_mod.types.SearchResult = .{ .alloc = a, .hits = hits, .total_hits = 8 };
+            const started = platform_time.monotonicNs();
+            if (changed) {
+                try std.testing.expectError(error.StorageReadTemporarilyUnavailable, hydrateDistributedDocumentWindow(&fixture, a, .{}, "docs", .stale, &groups, &generations, null, &selected));
+            } else {
+                try hydrateDistributedDocumentWindow(&fixture, a, .{}, "docs", .stale, &groups, &generations, null, &selected);
+                try std.testing.expectEqual(@as(u32, if (case.oversized) (if (case.mixed) 9 else 16) else 8), fixture.calls.load(.monotonic));
+                if (case.mixed) try std.testing.expectEqual(@as(usize, 1), fixture.retired_retry_checks);
+                for (hits, 0..) |hit, index| {
+                    const expected = try std.fmt.allocPrint(a, "doc{d}", .{groups[groups.len - index - 1]});
+                    defer a.free(expected);
+                    try std.testing.expectEqualStrings(expected, hit.id);
+                    try std.testing.expect(hit.stored_data != null and hit.document_authority == null);
+                    try std.testing.expectEqual(fixture.body_pointers[groups[groups.len - index - 1] - 1], @intFromPtr(hit.stored_data.?.ptr));
+                }
+            }
+            try std.testing.expectEqual(@as(u32, 0), fixture.active.load(.acquire));
+            const peak = fixture.peak.load(.monotonic);
+            if (limit <= 1) try std.testing.expectEqual(@as(u32, 1), peak) else try std.testing.expect(peak > 1 and peak <= 4);
+            std.debug.print("HYDRATION_FANOUT async_limit={d} changed={} oversized={} peak={d} elapsed_ms={d}\n", .{ limit, changed, case.oversized, peak, (platform_time.monotonicNs() - started) / std.time.ns_per_ms });
+        }
+    }
+} else struct {};
+
 pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!(builtin.is_test and !control_only_storage_sources)) return struct {};
@@ -26975,13 +27656,13 @@ fn implementationTests() type {
                 var retained_page = try retained.next(alloc, 1);
                 defer retained_page.deinit();
                 try std.testing.expectEqual(@as(usize, 1), retained_page.rows.len);
-                try std.testing.expectEqualStrings("second", retained_page.rows[0].value.object.get("name").?.string);
+                try std.testing.expectEqualStrings("second", (try retained_page.rows[0].cell("name")).value.string);
                 try std.testing.expectEqual(@as(u64, 9007199254740994), retained_page.rows[0].version);
             }
             var page = try view.next(alloc, 1);
             defer page.deinit();
             try std.testing.expectEqual(@as(usize, 1), page.rows.len);
-            try std.testing.expectEqualStrings("second", page.rows[0].value.object.get("name").?.string);
+            try std.testing.expectEqualStrings("second", (try page.rows[0].cell("name")).value.string);
             try std.testing.expectEqual(@as(u64, 9007199254740994), page.rows[0].version);
             var exhausted = try view.next(alloc, 1);
             defer exhausted.deinit();
@@ -27039,7 +27720,7 @@ fn implementationTests() type {
                 defer page.deinit();
                 try std.testing.expectEqual(@as(usize, 1), page.rows.len);
                 try std.testing.expectEqualStrings("a", page.rows[0].id);
-                try std.testing.expectEqualStrings("before", page.rows[0].value.object.get("name").?.string);
+                try std.testing.expectEqualStrings("before", (try page.rows[0].cell("name")).value.string);
             }
             const secondary = table_read_source.RelationalStatementScan{ .table = "rows", .opts = .{
                 .relational_query = .{ .fields = &.{"name"}, .index = "by_name", .schema_version = 1 },
@@ -34454,4 +35135,56 @@ test "native retained routing chooses one carrier after split merge and rejects 
     fixture.tables[0].table_id = 8;
     merged[0].table_id = 8;
     try std.testing.expectError(error.CatalogGenerationChanged, requestRoutedSpanSnapshot(a, source, "docs", "", "", .{ .search = req }, null));
+}
+
+test "public graph metric borrowed wire scan producer sink preserves bytes and failures across writer boundaries" {
+    const a = std.testing.allocator;
+    const Producer = struct {
+        large: bool = false,
+        fn write(ptr: ?*anyopaque, destination: db_mod.types.BorrowedScanDocument.WriterBorrow) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            var receiver = destination.receive();
+            const writer = receiver.writer();
+            try writer.writeAll(",\"title\":\"");
+            if (self.large) try writer.splatByteAll('x', 64 * 1024) else try writer.writeAll("alpha");
+            try writer.writeByte('"');
+            try receiver.finish();
+        }
+    };
+    const Capture = struct {
+        output: std.Io.Writer.Allocating,
+        fail: bool = false,
+        writes: usize = 0,
+        fn start(_: ?*anyopaque) !void {}
+        fn write(ptr: ?*anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.writes += 1;
+            if (self.fail) return error.DeadlineExceeded;
+            try self.output.writer.writeAll(bytes);
+        }
+        fn sink(self: *@This()) ScanStreamSink {
+            return .{ .context = self, .start_fn = start, .write_fn = write };
+        }
+    };
+    var producer: Producer = .{};
+    var capture: Capture = .{ .output = .init(a) };
+    defer capture.output.deinit();
+    var entry: db_mod.types.ScanVisitEntry = .{ .id = "server\"id", .hash = 0, .document_stream = .{ .context = &producer, .write_fields_fn = Producer.write } };
+    try writeBorrowedScanLine(entry, capture.sink(), .{});
+    try std.testing.expectEqualStrings("{\"_id\":\"server\\\"id\",\"title\":\"alpha\"}\n", capture.output.written());
+    capture.fail = true;
+    producer.large = true;
+    capture.writes = 0;
+    try std.testing.expectError(error.DeadlineExceeded, writeBorrowedScanLine(entry, capture.sink(), .{}));
+    try std.testing.expectEqual(@as(usize, 1), capture.writes);
+    const long_id = try a.alloc(u8, 8192);
+    defer a.free(long_id);
+    @memset(long_id, 'x');
+    entry.id = long_id;
+    capture.writes = 0;
+    try std.testing.expectError(error.DeadlineExceeded, writeBorrowedScanLine(entry, capture.sink(), .{}));
+    try std.testing.expectEqual(@as(usize, 1), capture.writes);
+    // An already expired request fails before forwarding buffered bytes.
+    capture.fail = false;
+    try std.testing.expectError(error.DeadlineExceeded, writeBorrowedScanLine(entry, capture.sink(), .{ .execution_deadline_ns = 1 }));
 }

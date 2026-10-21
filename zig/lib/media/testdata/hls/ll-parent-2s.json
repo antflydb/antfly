@@ -1,0 +1,544 @@
+{
+  "source": "../fragmented.mp4",
+  "source_sha256": "8b0d6caa76acfa98258536bce04d1ae058ba2ff2c4dcfb4e109cd289bea8d8be",
+  "parent_sha256": "147391869b5b985e4d607dd35b72d12cba204c0a1937c8cad07251deb94aa6d9",
+  "ffmpeg": "ffmpeg version 9.0.2 Copyright (c) 2000-2026 the FFmpeg developers",
+  "remux_command": "ffmpeg -i fragmented.mp4 -c copy -movflags empty_moov+default_base_moof -frag_duration 2000000 -video_track_timescale 10240 ll-parent-2s.mp4",
+  "moof_offsets": [
+    797,
+    20775,
+    42920
+  ],
+  "native_packet_parity": "All 60 DTS/PTS/duration/size/sync and encoded SHA-256 values match the original",
+  "packets": [
+    {
+      "pts": 2048,
+      "dts": 0,
+      "duration": 1024,
+      "size": "3136",
+      "flags": "K__",
+      "data_hash": "SHA256:74b15ec818727cbd113ff9ed54870a457261ea1438b73a99b905747aa5d79ec8"
+    },
+    {
+      "pts": 5120,
+      "dts": 1024,
+      "duration": 1024,
+      "size": "1285",
+      "flags": "___",
+      "data_hash": "SHA256:fdafea45bfe2a29ec5e8ca25240162751984d746d6a6ea9f949ce55bafdbfbda"
+    },
+    {
+      "pts": 3072,
+      "dts": 2048,
+      "duration": 1024,
+      "size": "533",
+      "flags": "___",
+      "data_hash": "SHA256:2f6eb5374a8b28c1521cd97fc44d2ee54e21fa55cc5bf8346514198eec150518"
+    },
+    {
+      "pts": 4096,
+      "dts": 3072,
+      "duration": 1024,
+      "size": "453",
+      "flags": "___",
+      "data_hash": "SHA256:0e3b305ab8deb8d54872fcbe15e21e4df9206093f9b97cbd37a46507280034f6"
+    },
+    {
+      "pts": 8192,
+      "dts": 4096,
+      "duration": 1024,
+      "size": "1377",
+      "flags": "___",
+      "data_hash": "SHA256:013e098f1feb28ab52679e021eb80eb4a0e81e38991297cb5577ea38425eca1a"
+    },
+    {
+      "pts": 6144,
+      "dts": 5120,
+      "duration": 1024,
+      "size": "701",
+      "flags": "___",
+      "data_hash": "SHA256:2339223797a3ae550e3b212face48095b00c92170f03cff904ae744cf770ac7d"
+    },
+    {
+      "pts": 7168,
+      "dts": 6144,
+      "duration": 1024,
+      "size": "535",
+      "flags": "___",
+      "data_hash": "SHA256:1a4d94aea579540595b9483f8befa6d00ff21b46cfb210aa535b059354b974ea"
+    },
+    {
+      "pts": 11264,
+      "dts": 7168,
+      "duration": 1024,
+      "size": "1114",
+      "flags": "___",
+      "data_hash": "SHA256:04393c16b4a861242a24fdd152f2944b8aeca079b8d07030cd7dca52a9646307"
+    },
+    {
+      "pts": 9216,
+      "dts": 8192,
+      "duration": 1024,
+      "size": "626",
+      "flags": "___",
+      "data_hash": "SHA256:c5b0351b7e5dd99add807d607b1bb4851a490e8e299f2e4f512f65c0e5f87db7"
+    },
+    {
+      "pts": 10240,
+      "dts": 9216,
+      "duration": 1024,
+      "size": "457",
+      "flags": "___",
+      "data_hash": "SHA256:b2a44bd6dd8e850f3f2d024703ea730dc29b47d82a4378fb48396b60e88d86e3"
+    },
+    {
+      "pts": 12288,
+      "dts": 10240,
+      "duration": 1024,
+      "size": "3291",
+      "flags": "K__",
+      "data_hash": "SHA256:62e8d7e20aa84fe3929c6a94be97de171f1dbe16640eacf9a91ccf40ffcd399f"
+    },
+    {
+      "pts": 15360,
+      "dts": 11264,
+      "duration": 1024,
+      "size": "1109",
+      "flags": "___",
+      "data_hash": "SHA256:de78cce134f740ad8f5516f3ec16c337da4eb48e49ee3468d598352c38692aab"
+    },
+    {
+      "pts": 13312,
+      "dts": 12288,
+      "duration": 1024,
+      "size": "498",
+      "flags": "___",
+      "data_hash": "SHA256:0e2cf45c72f615d9c018aab3047ab5607999066569f29d1698e39c27cb8bbbc8"
+    },
+    {
+      "pts": 14336,
+      "dts": 13312,
+      "duration": 1024,
+      "size": "403",
+      "flags": "___",
+      "data_hash": "SHA256:8d28a18142ef784a397e645e40acb7e13f9cc11dc08edf532e4e0eedc33f7851"
+    },
+    {
+      "pts": 18432,
+      "dts": 14336,
+      "duration": 1024,
+      "size": "1050",
+      "flags": "___",
+      "data_hash": "SHA256:1acb595ba36bc2e624966ec4c7e14412a9e3485405ae55eb9f1d3d0f410e7743"
+    },
+    {
+      "pts": 16384,
+      "dts": 15360,
+      "duration": 1024,
+      "size": "616",
+      "flags": "___",
+      "data_hash": "SHA256:c600b9d445e9322e76d14bb197bb6f525cd64dea7e7cd274963b7df53daeb336"
+    },
+    {
+      "pts": 17408,
+      "dts": 16384,
+      "duration": 1024,
+      "size": "436",
+      "flags": "___",
+      "data_hash": "SHA256:6d8ad324986762276dfb3f35741e3bd3f0eaf2e589006d49b999e4f5cce52828"
+    },
+    {
+      "pts": 21504,
+      "dts": 17408,
+      "duration": 1024,
+      "size": "1000",
+      "flags": "___",
+      "data_hash": "SHA256:bdfa2cb85e8ba1c9438a6f5c54d4f33682983cc2482fba794b538587a0d0c2cb"
+    },
+    {
+      "pts": 19456,
+      "dts": 18432,
+      "duration": 1024,
+      "size": "618",
+      "flags": "___",
+      "data_hash": "SHA256:1887b0d891fe584642ceeb8994b5efd7a11fff01d5fec97495cd0e343ca1e453"
+    },
+    {
+      "pts": 20480,
+      "dts": 19456,
+      "duration": 1024,
+      "size": "392",
+      "flags": "___",
+      "data_hash": "SHA256:fc8bff984985636e295dd37b2d94994f88c2f1e54048607495ded54664b1623d"
+    },
+    {
+      "pts": 22528,
+      "dts": 20480,
+      "duration": 1024,
+      "size": "3273",
+      "flags": "K__",
+      "data_hash": "SHA256:7d6cc549520d395e29783a238a9ae34d5f834d73d26c501703f66077ff96e652"
+    },
+    {
+      "pts": 25600,
+      "dts": 21504,
+      "duration": 1024,
+      "size": "1151",
+      "flags": "___",
+      "data_hash": "SHA256:e18ef77860c4caae4a1c997bd0d8a843c9f5c6aa392ee96e4ff95290302a468d"
+    },
+    {
+      "pts": 23552,
+      "dts": 22528,
+      "duration": 1024,
+      "size": "654",
+      "flags": "___",
+      "data_hash": "SHA256:418124adcb6b320c36c407bb351e238fcb672669d080ff08dc2d6d52a6a96338"
+    },
+    {
+      "pts": 24576,
+      "dts": 23552,
+      "duration": 1024,
+      "size": "531",
+      "flags": "___",
+      "data_hash": "SHA256:e20a43063371b853f0aca721a1ddee79bb8f232c2c25b96497551d447920ed8c"
+    },
+    {
+      "pts": 28672,
+      "dts": 24576,
+      "duration": 1024,
+      "size": "1081",
+      "flags": "___",
+      "data_hash": "SHA256:379f5decb9c64476e9d211ab37c37392e8b4be9b1a3dee2b353b1fa8fee8e2eb"
+    },
+    {
+      "pts": 26624,
+      "dts": 25600,
+      "duration": 1024,
+      "size": "680",
+      "flags": "___",
+      "data_hash": "SHA256:16364bca2038d9aabf5f2ed15d06ad39a0ef0e2da9800929565d4047860e03a4"
+    },
+    {
+      "pts": 27648,
+      "dts": 26624,
+      "duration": 1024,
+      "size": "517",
+      "flags": "___",
+      "data_hash": "SHA256:643be36f02e6e61fc344a12dfb040fb08b5f06c9b4671bbaed6ed9c91c8a009a"
+    },
+    {
+      "pts": 31744,
+      "dts": 27648,
+      "duration": 1024,
+      "size": "1285",
+      "flags": "___",
+      "data_hash": "SHA256:1291a890dd641bbe49f9c8014a0de4c300fea6a7f3a98aaee841c31f0c8f229b"
+    },
+    {
+      "pts": 29696,
+      "dts": 28672,
+      "duration": 1024,
+      "size": "658",
+      "flags": "___",
+      "data_hash": "SHA256:73026abcc4a31b33740bd78575896e1767cea787589892abbf68332cc5a4d7f6"
+    },
+    {
+      "pts": 30720,
+      "dts": 29696,
+      "duration": 1024,
+      "size": "635",
+      "flags": "___",
+      "data_hash": "SHA256:2bd5fd0f580ca1e0e80c7831c5353834748261c2fdb77fe7be291b76ad53ed5a"
+    },
+    {
+      "pts": 32768,
+      "dts": 30720,
+      "duration": 1024,
+      "size": "2939",
+      "flags": "K__",
+      "data_hash": "SHA256:e90e949f651150d7d5e1de17944861716922e7e11241f0b63a7e7ff1f735db3d"
+    },
+    {
+      "pts": 35840,
+      "dts": 31744,
+      "duration": 1024,
+      "size": "1476",
+      "flags": "___",
+      "data_hash": "SHA256:7546ae08096baec04f1fe324bfbc3b7388461fa916c26797c31649633a873ddd"
+    },
+    {
+      "pts": 33792,
+      "dts": 32768,
+      "duration": 1024,
+      "size": "720",
+      "flags": "___",
+      "data_hash": "SHA256:de0758da9d4e44b0d78eb3e4f46200f9af225391bcf13ce189684d8fd3260851"
+    },
+    {
+      "pts": 34816,
+      "dts": 33792,
+      "duration": 1024,
+      "size": "716",
+      "flags": "___",
+      "data_hash": "SHA256:7cdd2bc4bc947e16515c3fdc8cddd8a8ac33059d7787d514982a12735547caf1"
+    },
+    {
+      "pts": 38912,
+      "dts": 34816,
+      "duration": 1024,
+      "size": "1351",
+      "flags": "___",
+      "data_hash": "SHA256:14500c07fab57720b77aa39482867c8da82aeb74f4529db0e76d16870aca55b0"
+    },
+    {
+      "pts": 36864,
+      "dts": 35840,
+      "duration": 1024,
+      "size": "687",
+      "flags": "___",
+      "data_hash": "SHA256:b525967325a6e4a0784a3eda557369db49eb83a40e0aeb23f2d914b5af56192e"
+    },
+    {
+      "pts": 37888,
+      "dts": 36864,
+      "duration": 1024,
+      "size": "667",
+      "flags": "___",
+      "data_hash": "SHA256:f5b8fd65aef94f206e993ea427b818b82a57d4ceca7787a0f64e927444e8e6cc"
+    },
+    {
+      "pts": 41984,
+      "dts": 37888,
+      "duration": 1024,
+      "size": "1393",
+      "flags": "___",
+      "data_hash": "SHA256:963562167a6639577b60fda23d6c4254921bc4bcdf84d65b859dd17008fed67e"
+    },
+    {
+      "pts": 39936,
+      "dts": 38912,
+      "duration": 1024,
+      "size": "757",
+      "flags": "___",
+      "data_hash": "SHA256:21ef1644256a6a4937a69ce7d033564f4f84be1e1ea9d8b74f5b7265cfd8877d"
+    },
+    {
+      "pts": 40960,
+      "dts": 39936,
+      "duration": 1024,
+      "size": "626",
+      "flags": "___",
+      "data_hash": "SHA256:9f1257b052fd816e684fad4f278a9446d87d48cd0c19b60941e25f4488e09d11"
+    },
+    {
+      "pts": 43008,
+      "dts": 40960,
+      "duration": 1024,
+      "size": "2932",
+      "flags": "K__",
+      "data_hash": "SHA256:9a3bdb2448efac0293545e22498a18475526993088008969e9329578108ef67d"
+    },
+    {
+      "pts": 46080,
+      "dts": 41984,
+      "duration": 1024,
+      "size": "1636",
+      "flags": "___",
+      "data_hash": "SHA256:ca5bb30e792fd7e50482ec966550f697ed55ca1eb21a28c865c51b1aec77744f"
+    },
+    {
+      "pts": 44032,
+      "dts": 43008,
+      "duration": 1024,
+      "size": "670",
+      "flags": "___",
+      "data_hash": "SHA256:d68c39727e5180ef351b9fb9876fd9f8660a073072661f9b4c8f58b89218634d"
+    },
+    {
+      "pts": 45056,
+      "dts": 44032,
+      "duration": 1024,
+      "size": "530",
+      "flags": "___",
+      "data_hash": "SHA256:dc983fcd64a7946f2a411622e4c461708bab806a226a631d9220e6c389d25e48"
+    },
+    {
+      "pts": 49152,
+      "dts": 45056,
+      "duration": 1024,
+      "size": "1271",
+      "flags": "___",
+      "data_hash": "SHA256:c095d886026e76ce3f04e61943ece689e7bd15a93085b95df8af988b0ba9b0c2"
+    },
+    {
+      "pts": 47104,
+      "dts": 46080,
+      "duration": 1024,
+      "size": "690",
+      "flags": "___",
+      "data_hash": "SHA256:6bb27cc71d09448647ab05a51a0e9bdd8ae1f1f890c0ac680a4f1ba9bc66b1e6"
+    },
+    {
+      "pts": 48128,
+      "dts": 47104,
+      "duration": 1024,
+      "size": "438",
+      "flags": "___",
+      "data_hash": "SHA256:4ba0fc95914be685f0c1b929ce3a6e7301fd3a64a84ac59fd445fe86249f61a5"
+    },
+    {
+      "pts": 52224,
+      "dts": 48128,
+      "duration": 1024,
+      "size": "1101",
+      "flags": "___",
+      "data_hash": "SHA256:a0e6c0aa4b99ab91acd3977a783c6b8a3adeade711aefd4daf64ccda1ded32a5"
+    },
+    {
+      "pts": 50176,
+      "dts": 49152,
+      "duration": 1024,
+      "size": "655",
+      "flags": "___",
+      "data_hash": "SHA256:2e7a675b6345306cd111a86283370034c024df948a782944b837eff7b706cb2e"
+    },
+    {
+      "pts": 51200,
+      "dts": 50176,
+      "duration": 1024,
+      "size": "478",
+      "flags": "___",
+      "data_hash": "SHA256:06745ad653312b0b128bde3c42f916e198769f8ba77f3c305330ba805b6a422e"
+    },
+    {
+      "pts": 53248,
+      "dts": 51200,
+      "duration": 1024,
+      "size": "3429",
+      "flags": "K__",
+      "data_hash": "SHA256:0056ba45f8ac0263bef51a274cdf297b1b318ddbd675258d5790dc564f0b974b"
+    },
+    {
+      "pts": 56320,
+      "dts": 52224,
+      "duration": 1024,
+      "size": "1145",
+      "flags": "___",
+      "data_hash": "SHA256:93711ac035d41b7dfe151162d353424a57e8598b752d3f1093347584a3bb153d"
+    },
+    {
+      "pts": 54272,
+      "dts": 53248,
+      "duration": 1024,
+      "size": "593",
+      "flags": "___",
+      "data_hash": "SHA256:e004929ae5246c2feaf3a8dff2cb53c5101b547c8532cf9f1f14a4e51e31180d"
+    },
+    {
+      "pts": 55296,
+      "dts": 54272,
+      "duration": 1024,
+      "size": "477",
+      "flags": "___",
+      "data_hash": "SHA256:032dbf7666729716f92a1a37bb061f2ce3523edda170914483f62cd51b11a403"
+    },
+    {
+      "pts": 59392,
+      "dts": 55296,
+      "duration": 1024,
+      "size": "1110",
+      "flags": "___",
+      "data_hash": "SHA256:6975dec211ac32036a38a7fecd6b7457ecc6e8f11dd282c3d93deef8233f6265"
+    },
+    {
+      "pts": 57344,
+      "dts": 56320,
+      "duration": 1024,
+      "size": "536",
+      "flags": "___",
+      "data_hash": "SHA256:7674f32ad6bde8e5ed2ea966386fc3a1fdfa8e9bea5bd3b82baf7e02e8559485"
+    },
+    {
+      "pts": 58368,
+      "dts": 57344,
+      "duration": 1024,
+      "size": "355",
+      "flags": "___",
+      "data_hash": "SHA256:0e1fac98e7305e24c3bc8d22f0cfa866d2bfece0974053c7f89dde9eabf85cfc"
+    },
+    {
+      "pts": 62464,
+      "dts": 58368,
+      "duration": 1024,
+      "size": "852",
+      "flags": "___",
+      "data_hash": "SHA256:e8069199af34cd2ed934656ddf04ee46064b84ccd0d455c99715507f83d28d36"
+    },
+    {
+      "pts": 60416,
+      "dts": 59392,
+      "duration": 1024,
+      "size": "440",
+      "flags": "___",
+      "data_hash": "SHA256:aaa83bc4ea27157cdea698de0616e129bac04f6a33561ebfeb8748706a9f56e5"
+    },
+    {
+      "pts": 61440,
+      "dts": 60416,
+      "duration": 1024,
+      "size": "302",
+      "flags": "___",
+      "data_hash": "SHA256:cad3d436b63ff2299a7a3b80a3f74d596a373cdeda3c31af27df8feb1fca439e"
+    }
+  ],
+  "half_second_part": {
+    "source_sha256": "8b0d6caa76acfa98258536bce04d1ae058ba2ff2c4dcfb4e109cd289bea8d8be",
+    "source": "../fragmented.mp4",
+    "command": "ffmpeg -i fragmented.mp4 -c copy -movflags empty_moov+default_base_moof -frag_duration 500000 -video_track_timescale 10240 ll-half-second.mp4; first moof body only",
+    "bytes": 6936,
+    "sha256": "29cc5cd4601964f3234b8cee2a89d6e210100d7a1e1345d0148cff78569eabb6",
+    "expected_native_packets": [
+      {
+        "pts": 2048,
+        "dts": 0,
+        "duration": 1024,
+        "size": "3136",
+        "flags": "K__",
+        "data_hash": "SHA256:74b15ec818727cbd113ff9ed54870a457261ea1438b73a99b905747aa5d79ec8"
+      },
+      {
+        "pts": 5120,
+        "dts": 1024,
+        "duration": 1024,
+        "size": "1285",
+        "flags": "___",
+        "data_hash": "SHA256:fdafea45bfe2a29ec5e8ca25240162751984d746d6a6ea9f949ce55bafdbfbda"
+      },
+      {
+        "pts": 3072,
+        "dts": 2048,
+        "duration": 1024,
+        "size": "533",
+        "flags": "___",
+        "data_hash": "SHA256:2f6eb5374a8b28c1521cd97fc44d2ee54e21fa55cc5bf8346514198eec150518"
+      },
+      {
+        "pts": 4096,
+        "dts": 3072,
+        "duration": 1024,
+        "size": "453",
+        "flags": "___",
+        "data_hash": "SHA256:0e3b305ab8deb8d54872fcbe15e21e4df9206093f9b97cbd37a46507280034f6"
+      },
+      {
+        "pts": 8192,
+        "dts": 4096,
+        "duration": 1024,
+        "size": "1377",
+        "flags": "___",
+        "data_hash": "SHA256:013e098f1feb28ab52679e021eb80eb4a0e81e38991297cb5577ea38425eca1a"
+      }
+    ]
+  }
+}

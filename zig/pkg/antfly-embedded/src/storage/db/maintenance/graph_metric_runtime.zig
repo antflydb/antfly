@@ -332,7 +332,9 @@ pub fn defaultLeaseKey(role: Role) []const u8 {
     };
 }
 
-pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
+// Named branches keep native ABI identities stable across LLVM owners.
+pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) UnsupportedGraphMetricRuntime else PlatformGraphMetricRuntime;
+const UnsupportedGraphMetricRuntime = struct {
     config: Config,
 
     pub fn init(
@@ -399,7 +401,8 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
         _ = self;
         return .{};
     }
-} else struct {
+};
+const PlatformGraphMetricRuntime = struct {
     alloc: Allocator,
     owned_identity: ?[]u8 = null,
     runtime_io: ?Io,
@@ -7756,10 +7759,10 @@ test "db graph metric runtime planned paired hits failed planned rebuild preserv
     try std.testing.expectEqual(@as(usize, 1), traversal_after_failure.graph_results.len);
     try std.testing.expectEqual(@as(usize, 1), traversal_after_failure.graph_results[0].nodes.len);
     try std.testing.expectEqualStrings("doc:authority", traversal_after_failure.graph_results[0].nodes[0].key);
-    try std.testing.expectEqual(@as(usize, 2), traversal_after_failure.graph_results[0].nodes[0].metrics.len);
-    try std.testing.expectEqualStrings("hits_authority", traversal_after_failure.graph_results[0].nodes[0].metrics[0].name);
-    try std.testing.expect(traversal_after_failure.graph_results[0].nodes[0].metrics[0].score != null);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.0), traversal_after_failure.graph_results[0].nodes[0].metrics[0].score.?, 0.001);
+    try std.testing.expectEqual(@as(usize, 2), traversal_after_failure.graph_results[0].nodes[0].metricCount());
+    try std.testing.expectEqualStrings("hits_authority", traversal_after_failure.graph_results[0].nodes[0].metricAt(0).name);
+    try std.testing.expect(traversal_after_failure.graph_results[0].nodes[0].metricAt(0).score != null);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), traversal_after_failure.graph_results[0].nodes[0].metricAt(0).score.?, 0.001);
     try std.testing.expectEqual(@as(usize, 2), traversal_after_failure.graph_results[0].metric_status.len);
     for (traversal_after_failure.graph_results[0].metric_status) |status| {
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, status.state);
@@ -10378,9 +10381,9 @@ test "db graph metric runtime query not ready semantics distinguish projection f
     try std.testing.expectEqual(@as(usize, 1), projection_result.graph_results.len);
     try std.testing.expectEqual(@as(usize, 1), projection_result.graph_results[0].nodes.len);
     try std.testing.expectEqualStrings("doc:b", projection_result.graph_results[0].nodes[0].key);
-    try std.testing.expectEqual(@as(usize, 1), projection_result.graph_results[0].nodes[0].metrics.len);
-    try std.testing.expectEqualStrings("manual_degree", projection_result.graph_results[0].nodes[0].metrics[0].name);
-    try std.testing.expect(projection_result.graph_results[0].nodes[0].metrics[0].score == null);
+    try std.testing.expectEqual(@as(usize, 1), projection_result.graph_results[0].nodes[0].metricCount());
+    try std.testing.expectEqualStrings("manual_degree", projection_result.graph_results[0].nodes[0].metricAt(0).name);
+    try std.testing.expect(projection_result.graph_results[0].nodes[0].metricAt(0).score == null);
     try std.testing.expectEqual(@as(usize, 1), projection_result.graph_results[0].metric_status.len);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.not_ready, projection_result.graph_results[0].metric_status[0].state);
     try std.testing.expectEqual(@as(u64, 0), projection_result.graph_results[0].metric_status[0].published_generation);
@@ -10484,10 +10487,10 @@ test "db graph metric runtime query freshness distinguishes stale projection fro
     try std.testing.expectEqual(@as(usize, 1), published_result.graph_results.len);
     try std.testing.expectEqual(@as(usize, 1), published_result.graph_results[0].nodes.len);
     try std.testing.expectEqualStrings("doc:b", published_result.graph_results[0].nodes[0].key);
-    try std.testing.expectEqual(@as(usize, 1), published_result.graph_results[0].nodes[0].metrics.len);
-    try std.testing.expectEqualStrings("manual_degree", published_result.graph_results[0].nodes[0].metrics[0].name);
-    try std.testing.expect(published_result.graph_results[0].nodes[0].metrics[0].score != null);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.0), published_result.graph_results[0].nodes[0].metrics[0].score.?, 0.001);
+    try std.testing.expectEqual(@as(usize, 1), published_result.graph_results[0].nodes[0].metricCount());
+    try std.testing.expectEqualStrings("manual_degree", published_result.graph_results[0].nodes[0].metricAt(0).name);
+    try std.testing.expect(published_result.graph_results[0].nodes[0].metricAt(0).score != null);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), published_result.graph_results[0].nodes[0].metricAt(0).score.?, 0.001);
     try std.testing.expectEqual(@as(usize, 1), published_result.graph_results[0].metric_status.len);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.stale, published_result.graph_results[0].metric_status[0].state);
     try std.testing.expectEqual(refreshed.published_generation, published_result.graph_results[0].metric_status[0].published_generation);
@@ -10524,10 +10527,10 @@ test "db graph metric runtime query freshness distinguishes stale projection fro
     try std.testing.expectEqual(@as(usize, 1), building_published_result.graph_results.len);
     try std.testing.expectEqual(@as(usize, 1), building_published_result.graph_results[0].nodes.len);
     try std.testing.expectEqualStrings("doc:b", building_published_result.graph_results[0].nodes[0].key);
-    try std.testing.expectEqual(@as(usize, 1), building_published_result.graph_results[0].nodes[0].metrics.len);
-    try std.testing.expectEqualStrings("manual_degree", building_published_result.graph_results[0].nodes[0].metrics[0].name);
-    try std.testing.expect(building_published_result.graph_results[0].nodes[0].metrics[0].score != null);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.0), building_published_result.graph_results[0].nodes[0].metrics[0].score.?, 0.001);
+    try std.testing.expectEqual(@as(usize, 1), building_published_result.graph_results[0].nodes[0].metricCount());
+    try std.testing.expectEqualStrings("manual_degree", building_published_result.graph_results[0].nodes[0].metricAt(0).name);
+    try std.testing.expect(building_published_result.graph_results[0].nodes[0].metricAt(0).score != null);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), building_published_result.graph_results[0].nodes[0].metricAt(0).score.?, 0.001);
     try std.testing.expectEqual(@as(usize, 1), building_published_result.graph_results[0].metric_status.len);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, building_published_result.graph_results[0].metric_status[0].state);
     try std.testing.expectEqual(refreshed.published_generation, building_published_result.graph_results[0].metric_status[0].published_generation);
@@ -10584,10 +10587,10 @@ test "db graph metric runtime query freshness distinguishes stale projection fro
     try std.testing.expectEqual(@as(usize, 1), failed_published_result.graph_results.len);
     try std.testing.expectEqual(@as(usize, 1), failed_published_result.graph_results[0].nodes.len);
     try std.testing.expectEqualStrings("doc:b", failed_published_result.graph_results[0].nodes[0].key);
-    try std.testing.expectEqual(@as(usize, 1), failed_published_result.graph_results[0].nodes[0].metrics.len);
-    try std.testing.expectEqualStrings("manual_degree", failed_published_result.graph_results[0].nodes[0].metrics[0].name);
-    try std.testing.expect(failed_published_result.graph_results[0].nodes[0].metrics[0].score != null);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.0), failed_published_result.graph_results[0].nodes[0].metrics[0].score.?, 0.001);
+    try std.testing.expectEqual(@as(usize, 1), failed_published_result.graph_results[0].nodes[0].metricCount());
+    try std.testing.expectEqualStrings("manual_degree", failed_published_result.graph_results[0].nodes[0].metricAt(0).name);
+    try std.testing.expect(failed_published_result.graph_results[0].nodes[0].metricAt(0).score != null);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), failed_published_result.graph_results[0].nodes[0].metricAt(0).score.?, 0.001);
     try std.testing.expectEqual(@as(usize, 1), failed_published_result.graph_results[0].metric_status.len);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, failed_published_result.graph_results[0].metric_status[0].state);
     try std.testing.expectEqual(refreshed.published_generation, failed_published_result.graph_results[0].metric_status[0].published_generation);
@@ -10990,9 +10993,9 @@ test "db graph metric runtime degree canary runUntilIdle preserves published sco
     try std.testing.expectEqual(@as(usize, 1), traversal.graph_results.len);
     try std.testing.expectEqual(@as(usize, 1), traversal.graph_results[0].nodes.len);
     try std.testing.expectEqualStrings("doc:b", traversal.graph_results[0].nodes[0].key);
-    try std.testing.expectEqual(@as(usize, 1), traversal.graph_results[0].nodes[0].metrics.len);
-    try std.testing.expectEqualStrings("degree", traversal.graph_results[0].nodes[0].metrics[0].name);
-    try std.testing.expectApproxEqAbs(@as(f64, 2.0), traversal.graph_results[0].nodes[0].metrics[0].score orelse return error.TestUnexpectedResult, 0.001);
+    try std.testing.expectEqual(@as(usize, 1), traversal.graph_results[0].nodes[0].metricCount());
+    try std.testing.expectEqualStrings("degree", traversal.graph_results[0].nodes[0].metricAt(0).name);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), traversal.graph_results[0].nodes[0].metricAt(0).score orelse return error.TestUnexpectedResult, 0.001);
     try std.testing.expectEqual(@as(usize, 1), traversal.graph_results[0].metric_status.len);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, traversal.graph_results[0].metric_status[0].state);
     try std.testing.expectEqual(published_generation, traversal.graph_results[0].metric_status[0].published_generation);

@@ -6,6 +6,7 @@ const httpx = @import("httpx");
 const types = @import("antfly_metadata_openapi");
 const antfly_eval_openapi = @import("antfly_eval_openapi");
 const antfly_indexes_openapi = @import("antfly_indexes_openapi");
+const antfly_resolvers_openapi = @import("antfly_resolvers_openapi");
 const antfly_schema_openapi = @import("antfly_schema_openapi");
 
 /// --- Extractors (framework-agnostic) ---
@@ -290,6 +291,66 @@ pub const GetNamespaceRelationalConstraintStatusPathParams = struct {
     table_name: []const u8,
 };
 
+/// listCurationProposals
+pub const NamespaceListCurationProposalsPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+pub const NamespaceListCurationProposalsParams = struct {
+    state: ?[]const u8 = null,
+    action: ?[]const u8 = null,
+    cursor: ?[]const u8 = null,
+    limit: ?[]const u8 = null,
+};
+
+/// proposeCuration
+pub const NamespaceProposeCurationPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for namespaceProposeCuration.
+pub fn parseNamespaceProposeCurationBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.CurationProposalRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.CurationProposalRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// getCurationProposal
+pub const NamespaceGetCurationProposalPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    proposal_id: []const u8,
+};
+
+/// acceptCurationProposal
+pub const NamespaceAcceptCurationProposalPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    proposal_id: []const u8,
+};
+
+/// Parse the JSON request body for namespaceAcceptCurationProposal.
+pub fn parseNamespaceAcceptCurationProposalBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.CurationProposalDecisionRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.CurationProposalDecisionRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// rejectCurationProposal
+pub const NamespaceRejectCurationProposalPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    proposal_id: []const u8,
+};
+
+/// Parse the JSON request body for namespaceRejectCurationProposal.
+pub fn parseNamespaceRejectCurationProposalBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.CurationProposalDecisionRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.CurationProposalDecisionRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Retrieve a document by key from an explicit namespace table
 pub const LookupNamespaceTableDocumentPathParams = struct {
     /// Database name
@@ -308,6 +369,79 @@ pub const LookupNamespaceTableDocumentParams = struct {
     /// Read consistency; defaults to read_index.
     consistency: ?[]const u8 = null,
 };
+
+/// list entity resolver state
+pub const NamespaceListEntityResolverStatePathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    key: []const u8,
+};
+
+/// pinEntitiesDistinct
+pub const NamespacePinEntitiesDistinctPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    key: []const u8,
+};
+
+/// Parse the JSON request body for namespacePinEntitiesDistinct.
+pub fn parseNamespacePinEntitiesDistinctBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.EntityDistinctRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.EntityDistinctRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// merge entity
+pub const NamespaceMergeEntityPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    key: []const u8,
+};
+
+/// Parse the JSON request body for namespaceMergeEntity.
+pub fn parseNamespaceMergeEntityBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.EntityMergeRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.EntityMergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// suppress entity
+pub const NamespaceSuppressEntityPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    key: []const u8,
+};
+
+/// Parse the JSON request body for namespaceSuppressEntity.
+pub fn parseNamespaceSuppressEntityBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.EntitySuppressRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.EntitySuppressRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// unmerge entity
+pub const NamespaceUnmergeEntityPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    key: []const u8,
+};
+
+/// Parse the JSON request body for namespaceUnmergeEntity.
+pub fn parseNamespaceUnmergeEntityBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverUnmergeRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverUnmergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// unsuppress entity
+pub const NamespaceUnsuppressEntityPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    key: []const u8,
+};
+
+/// Parse the JSON request body for namespaceUnsuppressEntity.
+pub fn parseNamespaceUnsuppressEntityBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverUnmergeRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverUnmergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
 
 /// List indexes for an explicit namespace table
 pub const ListNamespaceTableIndexesPathParams = struct {
@@ -427,6 +561,169 @@ pub const RenameNamespaceTablePathParams = struct {
 /// Parse the JSON request body for renameNamespaceTable.
 pub fn parseRenameNamespaceTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RenameCatalogResourceRequest) {
     return std.json.parseFromSlice(types.RenameCatalogResourceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// list resolvers
+pub const NamespaceListResolversPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+/// get resolver
+pub const NamespaceGetResolverPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// drop resolver identity
+pub const NamespaceDropResolverIdentityPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// list resolver redirects
+pub const NamespaceListResolverRedirectsPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// merge resolver keys
+pub const NamespaceMergeResolverKeysPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// Parse the JSON request body for namespaceMergeResolverKeys.
+pub fn parseNamespaceMergeResolverKeysBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverMergeRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverMergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// unmerge resolver key
+pub const NamespaceUnmergeResolverKeyPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    resolver_name: []const u8,
+    key: []const u8,
+};
+
+pub const NamespaceUnmergeResolverKeyParams = struct {
+    pin_distinct: ?[]const u8 = null,
+};
+
+/// Parse the JSON request body for namespaceUnmergeResolverKey.
+pub fn parseNamespaceUnmergeResolverKeyBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverUnmergeRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverUnmergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// list resolver reviews
+pub const NamespaceListResolverReviewsPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+pub const NamespaceListResolverReviewsParams = struct {
+    cursor: ?[]const u8 = null,
+    limit: ?[]const u8 = null,
+};
+
+/// review resolver mention
+pub const NamespaceReviewResolverMentionPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    resolver_name: []const u8,
+    review_id: []const u8,
+};
+
+/// Parse the JSON request body for namespaceReviewResolverMention.
+pub fn parseNamespaceReviewResolverMentionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverReviewDecision) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverReviewDecision, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// list resolver suppressions
+pub const NamespaceListResolverSuppressionsPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// suppress resolver keys
+pub const NamespaceSuppressResolverKeysPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// Parse the JSON request body for namespaceSuppressResolverKeys.
+pub fn parseNamespaceSuppressResolverKeysBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverSuppressionRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverSuppressionRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// unsuppress resolver key
+pub const NamespaceUnsuppressResolverKeyPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    resolver_name: []const u8,
+    key: []const u8,
+};
+
+/// Parse the JSON request body for namespaceUnsuppressResolverKey.
+pub fn parseNamespaceUnsuppressResolverKeyBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverUnmergeRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverUnmergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// set resolver namespace
+pub const NamespaceSetResolverNamespacePathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// Parse the JSON request body for namespaceSetResolverNamespace.
+pub fn parseNamespaceSetResolverNamespaceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverNamespaceRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverNamespaceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// render resolver key
+pub const NamespaceRenderResolverKeyPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// Parse the JSON request body for namespaceRenderResolverKey.
+pub fn parseNamespaceRenderResolverKeyBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverRenderRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverRenderRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// resolve resolver query
+pub const NamespaceResolveResolverQueryPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// Parse the JSON request body for namespaceResolveResolverQuery.
+pub fn parseNamespaceResolveResolverQueryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverResolveRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverResolveRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Restore an explicit namespace table from backup
@@ -750,7 +1047,7 @@ pub const DeleteArtifactEnrichmentPathParams = struct {
     artifact_name: []const u8,
 };
 
-/// Reprocess a derived asset across a table range
+/// Reprocess a derived artifact across a table range
 pub const ReprocessDocumentArtifactRangePathParams = struct {
     /// Name of the table
     table_name: []const u8,
@@ -863,6 +1160,56 @@ pub const GetRelationalConstraintStatusPathParams = struct {
     table_name: []const u8,
 };
 
+/// listCurationProposals
+pub const ListCurationProposalsPathParams = struct {
+    table_name: []const u8,
+};
+
+pub const ListCurationProposalsParams = struct {
+    state: ?[]const u8 = null,
+    action: ?[]const u8 = null,
+    cursor: ?[]const u8 = null,
+    limit: ?[]const u8 = null,
+};
+
+/// proposeCuration
+pub const ProposeCurationPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for proposeCuration.
+pub fn parseProposeCurationBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.CurationProposalRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.CurationProposalRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// getCurationProposal
+pub const GetCurationProposalPathParams = struct {
+    table_name: []const u8,
+    proposal_id: []const u8,
+};
+
+/// acceptCurationProposal
+pub const AcceptCurationProposalPathParams = struct {
+    table_name: []const u8,
+    proposal_id: []const u8,
+};
+
+/// Parse the JSON request body for acceptCurationProposal.
+pub fn parseAcceptCurationProposalBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.CurationProposalDecisionRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.CurationProposalDecisionRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// rejectCurationProposal
+pub const RejectCurationProposalPathParams = struct {
+    table_name: []const u8,
+    proposal_id: []const u8,
+};
+
+/// Parse the JSON request body for rejectCurationProposal.
+pub fn parseRejectCurationProposalBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.CurationProposalDecisionRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.CurationProposalDecisionRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Adopt stored write destinations with the current credential
 pub const ReauthorizeTableDestinationsPathParams = struct {
     /// Name of the table whose stored destinations should be adopted
@@ -923,7 +1270,7 @@ pub const GetDocumentArtifactManifestParams = struct {
     detail: ?[]const u8 = null,
 };
 
-/// Reprocess a derived asset
+/// Reprocess a derived artifact
 pub const ReprocessDocumentArtifactPathParams = struct {
     /// Name of the table
     table_name: []const u8,
@@ -932,6 +1279,67 @@ pub const ReprocessDocumentArtifactPathParams = struct {
     /// Name of the derived document artifact.
     artifact_name: []const u8,
 };
+
+/// list entity resolver state
+pub const ListEntityResolverStatePathParams = struct {
+    table_name: []const u8,
+    key: []const u8,
+};
+
+/// pinEntitiesDistinct
+pub const PinEntitiesDistinctPathParams = struct {
+    table_name: []const u8,
+    key: []const u8,
+};
+
+/// Parse the JSON request body for pinEntitiesDistinct.
+pub fn parsePinEntitiesDistinctBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.EntityDistinctRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.EntityDistinctRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// merge entity
+pub const MergeEntityPathParams = struct {
+    table_name: []const u8,
+    key: []const u8,
+};
+
+/// Parse the JSON request body for mergeEntity.
+pub fn parseMergeEntityBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.EntityMergeRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.EntityMergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// suppress entity
+pub const SuppressEntityPathParams = struct {
+    table_name: []const u8,
+    key: []const u8,
+};
+
+/// Parse the JSON request body for suppressEntity.
+pub fn parseSuppressEntityBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.EntitySuppressRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.EntitySuppressRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// unmerge entity
+pub const UnmergeEntityPathParams = struct {
+    table_name: []const u8,
+    key: []const u8,
+};
+
+/// Parse the JSON request body for unmergeEntity.
+pub fn parseUnmergeEntityBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverUnmergeRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverUnmergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// unsuppress entity
+pub const UnsuppressEntityPathParams = struct {
+    table_name: []const u8,
+    key: []const u8,
+};
+
+/// Parse the JSON request body for unsuppressEntity.
+pub fn parseUnsuppressEntityBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverUnmergeRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverUnmergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
 
 /// List all indexes for a table
 pub const ListIndexesPathParams = struct {
@@ -1145,6 +1553,141 @@ pub const RunTableRepairPathParams = struct {
 /// Parse the JSON request body for runTableRepair.
 pub fn parseRunTableRepairBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RepairRunRequest) {
     return std.json.parseFromSlice(types.RepairRunRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// list resolvers
+pub const ListResolversPathParams = struct {
+    table_name: []const u8,
+};
+
+/// get resolver
+pub const GetResolverPathParams = struct {
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// drop resolver identity
+pub const DropResolverIdentityPathParams = struct {
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// list resolver redirects
+pub const ListResolverRedirectsPathParams = struct {
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// merge resolver keys
+pub const MergeResolverKeysPathParams = struct {
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// Parse the JSON request body for mergeResolverKeys.
+pub fn parseMergeResolverKeysBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverMergeRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverMergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// unmerge resolver key
+pub const UnmergeResolverKeyPathParams = struct {
+    table_name: []const u8,
+    resolver_name: []const u8,
+    key: []const u8,
+};
+
+pub const UnmergeResolverKeyParams = struct {
+    pin_distinct: ?[]const u8 = null,
+};
+
+/// Parse the JSON request body for unmergeResolverKey.
+pub fn parseUnmergeResolverKeyBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverUnmergeRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverUnmergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// list resolver reviews
+pub const ListResolverReviewsPathParams = struct {
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+pub const ListResolverReviewsParams = struct {
+    cursor: ?[]const u8 = null,
+    limit: ?[]const u8 = null,
+};
+
+/// review resolver mention
+pub const ReviewResolverMentionPathParams = struct {
+    table_name: []const u8,
+    resolver_name: []const u8,
+    review_id: []const u8,
+};
+
+/// Parse the JSON request body for reviewResolverMention.
+pub fn parseReviewResolverMentionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverReviewDecision) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverReviewDecision, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// list resolver suppressions
+pub const ListResolverSuppressionsPathParams = struct {
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// suppress resolver keys
+pub const SuppressResolverKeysPathParams = struct {
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// Parse the JSON request body for suppressResolverKeys.
+pub fn parseSuppressResolverKeysBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverSuppressionRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverSuppressionRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// unsuppress resolver key
+pub const UnsuppressResolverKeyPathParams = struct {
+    table_name: []const u8,
+    resolver_name: []const u8,
+    key: []const u8,
+};
+
+/// Parse the JSON request body for unsuppressResolverKey.
+pub fn parseUnsuppressResolverKeyBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverUnmergeRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverUnmergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// set resolver namespace
+pub const SetResolverNamespacePathParams = struct {
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// Parse the JSON request body for setResolverNamespace.
+pub fn parseSetResolverNamespaceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverNamespaceRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverNamespaceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// render resolver key
+pub const RenderResolverKeyPathParams = struct {
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// Parse the JSON request body for renderResolverKey.
+pub fn parseRenderResolverKeyBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverRenderRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverRenderRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// resolve resolver query
+pub const ResolveResolverQueryPathParams = struct {
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// Parse the JSON request body for resolveResolverQuery.
+pub fn parseResolveResolverQueryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverResolveRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverResolveRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Restore a table from backup
@@ -1403,7 +1946,18 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retire", .operation_id = "retireNamespaceRelationalConstraints", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retry", .operation_id = "retryNamespaceRelationalConstraints", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/status", .operation_id = "getNamespaceRelationalConstraintStatus", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals", .operation_id = "namespaceListCurationProposals", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals", .operation_id = "namespaceProposeCuration", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}", .operation_id = "namespaceGetCurationProposal", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:accept", .operation_id = "namespaceAcceptCurationProposal", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:reject", .operation_id = "namespaceRejectCurationProposal", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/documents/{key}", .operation_id = "lookupNamespaceTableDocument", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}/redirects", .operation_id = "namespaceListEntityResolverState", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:distinct", .operation_id = "namespacePinEntitiesDistinct", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:merge", .operation_id = "namespaceMergeEntity", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:suppress", .operation_id = "namespaceSuppressEntity", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:unmerge", .operation_id = "namespaceUnmergeEntity", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:unsuppress", .operation_id = "namespaceUnsuppressEntity", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes", .operation_id = "listNamespaceTableIndexes", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "getNamespaceTableIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "createNamespaceTableIndex", .request_body = .buffered, .streaming_response = false },
@@ -1413,6 +1967,20 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/retry", .operation_id = "retryNamespaceIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query", .operation_id = "queryNamespaceTable", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rename", .operation_id = "renameNamespaceTable", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers", .operation_id = "namespaceListResolvers", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}", .operation_id = "namespaceGetResolver", .request_body = .none, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}", .operation_id = "namespaceDropResolverIdentity", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/redirects", .operation_id = "namespaceListResolverRedirects", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/redirects", .operation_id = "namespaceMergeResolverKeys", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/redirects/{key}", .operation_id = "namespaceUnmergeResolverKey", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/reviews", .operation_id = "namespaceListResolverReviews", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/reviews/{reviewId}", .operation_id = "namespaceReviewResolverMention", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/suppressions", .operation_id = "namespaceListResolverSuppressions", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/suppressions", .operation_id = "namespaceSuppressResolverKeys", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/suppressions/{key}", .operation_id = "namespaceUnsuppressResolverKey", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}:namespace", .operation_id = "namespaceSetResolverNamespace", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}:render", .operation_id = "namespaceRenderResolverKey", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}:resolve", .operation_id = "namespaceResolveResolverQuery", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/restore", .operation_id = "restoreNamespaceTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/mutate", .operation_id = "mutateNamespaceRelationalRows", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/query", .operation_id = "queryNamespaceRelationalRows", .request_body = .buffered, .streaming_response = true },
@@ -1466,12 +2034,23 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/constraints/retire", .operation_id = "retireRelationalConstraints", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/constraints/retry", .operation_id = "retryRelationalConstraints", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/constraints/status", .operation_id = "getRelationalConstraintStatus", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/curation/proposals", .operation_id = "listCurationProposals", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/curation/proposals", .operation_id = "proposeCuration", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/curation/proposals/{proposalId}", .operation_id = "getCurationProposal", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/curation/proposals/{proposalId}:accept", .operation_id = "acceptCurationProposal", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/curation/proposals/{proposalId}:reject", .operation_id = "rejectCurationProposal", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/destination-authorization", .operation_id = "reauthorizeTableDestinations", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/documents", .operation_id = "scanKeys", .request_body = .buffered, .streaming_response = true },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}", .operation_id = "lookupKey", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts", .operation_id = "listDocumentArtifactManifests", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}", .operation_id = "getDocumentArtifactManifest", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifact", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/entities/{key}/redirects", .operation_id = "listEntityResolverState", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/entities/{key}:distinct", .operation_id = "pinEntitiesDistinct", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/entities/{key}:merge", .operation_id = "mergeEntity", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/entities/{key}:suppress", .operation_id = "suppressEntity", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/entities/{key}:unmerge", .operation_id = "unmergeEntity", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/entities/{key}:unsuppress", .operation_id = "unsuppressEntity", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes", .operation_id = "listIndexes", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "getIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "createIndex", .request_body = .buffered, .streaming_response = false },
@@ -1494,6 +2073,20 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/repair/jobs/{jobId}/advance", .operation_id = "advanceTableRepairJob", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/repair/jobs/{jobId}/cancel", .operation_id = "cancelTableRepairJob", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/repair/run", .operation_id = "runTableRepair", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/resolvers", .operation_id = "listResolvers", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/resolvers/{resolverName}", .operation_id = "getResolver", .request_body = .none, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/tables/{tableName}/resolvers/{resolverName}", .operation_id = "dropResolverIdentity", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/resolvers/{resolverName}/redirects", .operation_id = "listResolverRedirects", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/resolvers/{resolverName}/redirects", .operation_id = "mergeResolverKeys", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/tables/{tableName}/resolvers/{resolverName}/redirects/{key}", .operation_id = "unmergeResolverKey", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/resolvers/{resolverName}/reviews", .operation_id = "listResolverReviews", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/resolvers/{resolverName}/reviews/{reviewId}", .operation_id = "reviewResolverMention", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/resolvers/{resolverName}/suppressions", .operation_id = "listResolverSuppressions", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/resolvers/{resolverName}/suppressions", .operation_id = "suppressResolverKeys", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/tables/{tableName}/resolvers/{resolverName}/suppressions/{key}", .operation_id = "unsuppressResolverKey", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/resolvers/{resolverName}:namespace", .operation_id = "setResolverNamespace", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/resolvers/{resolverName}:render", .operation_id = "renderResolverKey", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/resolvers/{resolverName}:resolve", .operation_id = "resolveResolverQuery", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/restore", .operation_id = "restoreTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/rows/mutate", .operation_id = "mutateRelationalRows", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/rows/query", .operation_id = "queryRelationalRows", .request_body = .buffered, .streaming_response = true },
@@ -1569,7 +2162,18 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "retireNamespaceRelationalConstraints")) @compileError("ServerRouter: Impl missing required method 'retireNamespaceRelationalConstraints'");
         if (!@hasDecl(Impl, "retryNamespaceRelationalConstraints")) @compileError("ServerRouter: Impl missing required method 'retryNamespaceRelationalConstraints'");
         if (!@hasDecl(Impl, "getNamespaceRelationalConstraintStatus")) @compileError("ServerRouter: Impl missing required method 'getNamespaceRelationalConstraintStatus'");
+        if (!@hasDecl(Impl, "namespaceListCurationProposals")) @compileError("ServerRouter: Impl missing required method 'namespaceListCurationProposals'");
+        if (!@hasDecl(Impl, "namespaceProposeCuration")) @compileError("ServerRouter: Impl missing required method 'namespaceProposeCuration'");
+        if (!@hasDecl(Impl, "namespaceGetCurationProposal")) @compileError("ServerRouter: Impl missing required method 'namespaceGetCurationProposal'");
+        if (!@hasDecl(Impl, "namespaceAcceptCurationProposal")) @compileError("ServerRouter: Impl missing required method 'namespaceAcceptCurationProposal'");
+        if (!@hasDecl(Impl, "namespaceRejectCurationProposal")) @compileError("ServerRouter: Impl missing required method 'namespaceRejectCurationProposal'");
         if (!@hasDecl(Impl, "lookupNamespaceTableDocument")) @compileError("ServerRouter: Impl missing required method 'lookupNamespaceTableDocument'");
+        if (!@hasDecl(Impl, "namespaceListEntityResolverState")) @compileError("ServerRouter: Impl missing required method 'namespaceListEntityResolverState'");
+        if (!@hasDecl(Impl, "namespacePinEntitiesDistinct")) @compileError("ServerRouter: Impl missing required method 'namespacePinEntitiesDistinct'");
+        if (!@hasDecl(Impl, "namespaceMergeEntity")) @compileError("ServerRouter: Impl missing required method 'namespaceMergeEntity'");
+        if (!@hasDecl(Impl, "namespaceSuppressEntity")) @compileError("ServerRouter: Impl missing required method 'namespaceSuppressEntity'");
+        if (!@hasDecl(Impl, "namespaceUnmergeEntity")) @compileError("ServerRouter: Impl missing required method 'namespaceUnmergeEntity'");
+        if (!@hasDecl(Impl, "namespaceUnsuppressEntity")) @compileError("ServerRouter: Impl missing required method 'namespaceUnsuppressEntity'");
         if (!@hasDecl(Impl, "listNamespaceTableIndexes")) @compileError("ServerRouter: Impl missing required method 'listNamespaceTableIndexes'");
         if (!@hasDecl(Impl, "getNamespaceTableIndex")) @compileError("ServerRouter: Impl missing required method 'getNamespaceTableIndex'");
         if (!@hasDecl(Impl, "createNamespaceTableIndex")) @compileError("ServerRouter: Impl missing required method 'createNamespaceTableIndex'");
@@ -1579,6 +2183,20 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "retryNamespaceIndex")) @compileError("ServerRouter: Impl missing required method 'retryNamespaceIndex'");
         if (!@hasDecl(Impl, "queryNamespaceTable")) @compileError("ServerRouter: Impl missing required method 'queryNamespaceTable'");
         if (!@hasDecl(Impl, "renameNamespaceTable")) @compileError("ServerRouter: Impl missing required method 'renameNamespaceTable'");
+        if (!@hasDecl(Impl, "namespaceListResolvers")) @compileError("ServerRouter: Impl missing required method 'namespaceListResolvers'");
+        if (!@hasDecl(Impl, "namespaceGetResolver")) @compileError("ServerRouter: Impl missing required method 'namespaceGetResolver'");
+        if (!@hasDecl(Impl, "namespaceDropResolverIdentity")) @compileError("ServerRouter: Impl missing required method 'namespaceDropResolverIdentity'");
+        if (!@hasDecl(Impl, "namespaceListResolverRedirects")) @compileError("ServerRouter: Impl missing required method 'namespaceListResolverRedirects'");
+        if (!@hasDecl(Impl, "namespaceMergeResolverKeys")) @compileError("ServerRouter: Impl missing required method 'namespaceMergeResolverKeys'");
+        if (!@hasDecl(Impl, "namespaceUnmergeResolverKey")) @compileError("ServerRouter: Impl missing required method 'namespaceUnmergeResolverKey'");
+        if (!@hasDecl(Impl, "namespaceListResolverReviews")) @compileError("ServerRouter: Impl missing required method 'namespaceListResolverReviews'");
+        if (!@hasDecl(Impl, "namespaceReviewResolverMention")) @compileError("ServerRouter: Impl missing required method 'namespaceReviewResolverMention'");
+        if (!@hasDecl(Impl, "namespaceListResolverSuppressions")) @compileError("ServerRouter: Impl missing required method 'namespaceListResolverSuppressions'");
+        if (!@hasDecl(Impl, "namespaceSuppressResolverKeys")) @compileError("ServerRouter: Impl missing required method 'namespaceSuppressResolverKeys'");
+        if (!@hasDecl(Impl, "namespaceUnsuppressResolverKey")) @compileError("ServerRouter: Impl missing required method 'namespaceUnsuppressResolverKey'");
+        if (!@hasDecl(Impl, "namespaceSetResolverNamespace")) @compileError("ServerRouter: Impl missing required method 'namespaceSetResolverNamespace'");
+        if (!@hasDecl(Impl, "namespaceRenderResolverKey")) @compileError("ServerRouter: Impl missing required method 'namespaceRenderResolverKey'");
+        if (!@hasDecl(Impl, "namespaceResolveResolverQuery")) @compileError("ServerRouter: Impl missing required method 'namespaceResolveResolverQuery'");
         if (!@hasDecl(Impl, "restoreNamespaceTable")) @compileError("ServerRouter: Impl missing required method 'restoreNamespaceTable'");
         if (!@hasDecl(Impl, "mutateNamespaceRelationalRows")) @compileError("ServerRouter: Impl missing required method 'mutateNamespaceRelationalRows'");
         if (!@hasDecl(Impl, "queryNamespaceRelationalRows")) @compileError("ServerRouter: Impl missing required method 'queryNamespaceRelationalRows'");
@@ -1632,12 +2250,23 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "retireRelationalConstraints")) @compileError("ServerRouter: Impl missing required method 'retireRelationalConstraints'");
         if (!@hasDecl(Impl, "retryRelationalConstraints")) @compileError("ServerRouter: Impl missing required method 'retryRelationalConstraints'");
         if (!@hasDecl(Impl, "getRelationalConstraintStatus")) @compileError("ServerRouter: Impl missing required method 'getRelationalConstraintStatus'");
+        if (!@hasDecl(Impl, "listCurationProposals")) @compileError("ServerRouter: Impl missing required method 'listCurationProposals'");
+        if (!@hasDecl(Impl, "proposeCuration")) @compileError("ServerRouter: Impl missing required method 'proposeCuration'");
+        if (!@hasDecl(Impl, "getCurationProposal")) @compileError("ServerRouter: Impl missing required method 'getCurationProposal'");
+        if (!@hasDecl(Impl, "acceptCurationProposal")) @compileError("ServerRouter: Impl missing required method 'acceptCurationProposal'");
+        if (!@hasDecl(Impl, "rejectCurationProposal")) @compileError("ServerRouter: Impl missing required method 'rejectCurationProposal'");
         if (!@hasDecl(Impl, "reauthorizeTableDestinations")) @compileError("ServerRouter: Impl missing required method 'reauthorizeTableDestinations'");
         if (!@hasDecl(Impl, "scanKeys")) @compileError("ServerRouter: Impl missing required method 'scanKeys'");
         if (!@hasDecl(Impl, "lookupKey")) @compileError("ServerRouter: Impl missing required method 'lookupKey'");
         if (!@hasDecl(Impl, "listDocumentArtifactManifests")) @compileError("ServerRouter: Impl missing required method 'listDocumentArtifactManifests'");
         if (!@hasDecl(Impl, "getDocumentArtifactManifest")) @compileError("ServerRouter: Impl missing required method 'getDocumentArtifactManifest'");
         if (!@hasDecl(Impl, "reprocessDocumentArtifact")) @compileError("ServerRouter: Impl missing required method 'reprocessDocumentArtifact'");
+        if (!@hasDecl(Impl, "listEntityResolverState")) @compileError("ServerRouter: Impl missing required method 'listEntityResolverState'");
+        if (!@hasDecl(Impl, "pinEntitiesDistinct")) @compileError("ServerRouter: Impl missing required method 'pinEntitiesDistinct'");
+        if (!@hasDecl(Impl, "mergeEntity")) @compileError("ServerRouter: Impl missing required method 'mergeEntity'");
+        if (!@hasDecl(Impl, "suppressEntity")) @compileError("ServerRouter: Impl missing required method 'suppressEntity'");
+        if (!@hasDecl(Impl, "unmergeEntity")) @compileError("ServerRouter: Impl missing required method 'unmergeEntity'");
+        if (!@hasDecl(Impl, "unsuppressEntity")) @compileError("ServerRouter: Impl missing required method 'unsuppressEntity'");
         if (!@hasDecl(Impl, "listIndexes")) @compileError("ServerRouter: Impl missing required method 'listIndexes'");
         if (!@hasDecl(Impl, "getIndex")) @compileError("ServerRouter: Impl missing required method 'getIndex'");
         if (!@hasDecl(Impl, "createIndex")) @compileError("ServerRouter: Impl missing required method 'createIndex'");
@@ -1660,6 +2289,20 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "advanceTableRepairJob")) @compileError("ServerRouter: Impl missing required method 'advanceTableRepairJob'");
         if (!@hasDecl(Impl, "cancelTableRepairJob")) @compileError("ServerRouter: Impl missing required method 'cancelTableRepairJob'");
         if (!@hasDecl(Impl, "runTableRepair")) @compileError("ServerRouter: Impl missing required method 'runTableRepair'");
+        if (!@hasDecl(Impl, "listResolvers")) @compileError("ServerRouter: Impl missing required method 'listResolvers'");
+        if (!@hasDecl(Impl, "getResolver")) @compileError("ServerRouter: Impl missing required method 'getResolver'");
+        if (!@hasDecl(Impl, "dropResolverIdentity")) @compileError("ServerRouter: Impl missing required method 'dropResolverIdentity'");
+        if (!@hasDecl(Impl, "listResolverRedirects")) @compileError("ServerRouter: Impl missing required method 'listResolverRedirects'");
+        if (!@hasDecl(Impl, "mergeResolverKeys")) @compileError("ServerRouter: Impl missing required method 'mergeResolverKeys'");
+        if (!@hasDecl(Impl, "unmergeResolverKey")) @compileError("ServerRouter: Impl missing required method 'unmergeResolverKey'");
+        if (!@hasDecl(Impl, "listResolverReviews")) @compileError("ServerRouter: Impl missing required method 'listResolverReviews'");
+        if (!@hasDecl(Impl, "reviewResolverMention")) @compileError("ServerRouter: Impl missing required method 'reviewResolverMention'");
+        if (!@hasDecl(Impl, "listResolverSuppressions")) @compileError("ServerRouter: Impl missing required method 'listResolverSuppressions'");
+        if (!@hasDecl(Impl, "suppressResolverKeys")) @compileError("ServerRouter: Impl missing required method 'suppressResolverKeys'");
+        if (!@hasDecl(Impl, "unsuppressResolverKey")) @compileError("ServerRouter: Impl missing required method 'unsuppressResolverKey'");
+        if (!@hasDecl(Impl, "setResolverNamespace")) @compileError("ServerRouter: Impl missing required method 'setResolverNamespace'");
+        if (!@hasDecl(Impl, "renderResolverKey")) @compileError("ServerRouter: Impl missing required method 'renderResolverKey'");
+        if (!@hasDecl(Impl, "resolveResolverQuery")) @compileError("ServerRouter: Impl missing required method 'resolveResolverQuery'");
         if (!@hasDecl(Impl, "restoreTable")) @compileError("ServerRouter: Impl missing required method 'restoreTable'");
         if (!@hasDecl(Impl, "mutateRelationalRows")) @compileError("ServerRouter: Impl missing required method 'mutateRelationalRows'");
         if (!@hasDecl(Impl, "queryRelationalRows")) @compileError("ServerRouter: Impl missing required method 'queryRelationalRows'");
@@ -1733,7 +2376,18 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/constraints/retire", httpx.Handler.bind(self.impl, retireNamespaceRelationalConstraints));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/constraints/retry", httpx.Handler.bind(self.impl, retryNamespaceRelationalConstraints));
             try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/constraints/status", httpx.Handler.bind(self.impl, getNamespaceRelationalConstraintStatus));
+            try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/curation/proposals", httpx.Handler.bind(self.impl, namespaceListCurationProposals));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/curation/proposals", httpx.Handler.bind(self.impl, namespaceProposeCuration));
+            try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/curation/proposals/:proposalId", httpx.Handler.bind(self.impl, namespaceGetCurationProposal));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/curation/proposals/:proposalId:accept", httpx.Handler.bind(self.impl, namespaceAcceptCurationProposal));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/curation/proposals/:proposalId:reject", httpx.Handler.bind(self.impl, namespaceRejectCurationProposal));
             try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/documents/:key", httpx.Handler.bind(self.impl, lookupNamespaceTableDocument));
+            try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/entities/:key/redirects", httpx.Handler.bind(self.impl, namespaceListEntityResolverState));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/entities/:key:distinct", httpx.Handler.bind(self.impl, namespacePinEntitiesDistinct));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/entities/:key:merge", httpx.Handler.bind(self.impl, namespaceMergeEntity));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/entities/:key:suppress", httpx.Handler.bind(self.impl, namespaceSuppressEntity));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/entities/:key:unmerge", httpx.Handler.bind(self.impl, namespaceUnmergeEntity));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/entities/:key:unsuppress", httpx.Handler.bind(self.impl, namespaceUnsuppressEntity));
             try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes", httpx.Handler.bind(self.impl, listNamespaceTableIndexes));
             try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, getNamespaceTableIndex));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, createNamespaceTableIndex));
@@ -1743,6 +2397,20 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName/retry", httpx.Handler.bind(self.impl, retryNamespaceIndex));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/query", httpx.Handler.bind(self.impl, queryNamespaceTable));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/rename", httpx.Handler.bind(self.impl, renameNamespaceTable));
+            try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/resolvers", httpx.Handler.bind(self.impl, namespaceListResolvers));
+            try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/resolvers/:resolverName", httpx.Handler.bind(self.impl, namespaceGetResolver));
+            try server.delete("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/resolvers/:resolverName", httpx.Handler.bind(self.impl, namespaceDropResolverIdentity));
+            try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/resolvers/:resolverName/redirects", httpx.Handler.bind(self.impl, namespaceListResolverRedirects));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/resolvers/:resolverName/redirects", httpx.Handler.bind(self.impl, namespaceMergeResolverKeys));
+            try server.delete("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/resolvers/:resolverName/redirects/:key", httpx.Handler.bind(self.impl, namespaceUnmergeResolverKey));
+            try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/resolvers/:resolverName/reviews", httpx.Handler.bind(self.impl, namespaceListResolverReviews));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/resolvers/:resolverName/reviews/:reviewId", httpx.Handler.bind(self.impl, namespaceReviewResolverMention));
+            try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/resolvers/:resolverName/suppressions", httpx.Handler.bind(self.impl, namespaceListResolverSuppressions));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/resolvers/:resolverName/suppressions", httpx.Handler.bind(self.impl, namespaceSuppressResolverKeys));
+            try server.delete("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/resolvers/:resolverName/suppressions/:key", httpx.Handler.bind(self.impl, namespaceUnsuppressResolverKey));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/resolvers/:resolverName:namespace", httpx.Handler.bind(self.impl, namespaceSetResolverNamespace));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/resolvers/:resolverName:render", httpx.Handler.bind(self.impl, namespaceRenderResolverKey));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/resolvers/:resolverName:resolve", httpx.Handler.bind(self.impl, namespaceResolveResolverQuery));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/restore", httpx.Handler.bind(self.impl, restoreNamespaceTable));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/rows/mutate", httpx.Handler.bind(self.impl, mutateNamespaceRelationalRows));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/rows/query", httpx.Handler.bind(self.impl, queryNamespaceRelationalRows));
@@ -1796,12 +2464,23 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/tables/:tableName/constraints/retire", httpx.Handler.bind(self.impl, retireRelationalConstraints));
             try server.post("/tables/:tableName/constraints/retry", httpx.Handler.bind(self.impl, retryRelationalConstraints));
             try server.get("/tables/:tableName/constraints/status", httpx.Handler.bind(self.impl, getRelationalConstraintStatus));
+            try server.get("/tables/:tableName/curation/proposals", httpx.Handler.bind(self.impl, listCurationProposals));
+            try server.post("/tables/:tableName/curation/proposals", httpx.Handler.bind(self.impl, proposeCuration));
+            try server.get("/tables/:tableName/curation/proposals/:proposalId", httpx.Handler.bind(self.impl, getCurationProposal));
+            try server.post("/tables/:tableName/curation/proposals/:proposalId:accept", httpx.Handler.bind(self.impl, acceptCurationProposal));
+            try server.post("/tables/:tableName/curation/proposals/:proposalId:reject", httpx.Handler.bind(self.impl, rejectCurationProposal));
             try server.post("/tables/:tableName/destination-authorization", httpx.Handler.bind(self.impl, reauthorizeTableDestinations));
             try server.post("/tables/:tableName/documents", httpx.Handler.bind(self.impl, scanKeys));
             try server.get("/tables/:tableName/documents/:key", httpx.Handler.bind(self.impl, lookupKey));
             try server.get("/tables/:tableName/documents/:key/artifacts", httpx.Handler.bind(self.impl, listDocumentArtifactManifests));
             try server.get("/tables/:tableName/documents/:key/artifacts/:artifactName", httpx.Handler.bind(self.impl, getDocumentArtifactManifest));
             try server.post("/tables/:tableName/documents/:key/artifacts/:artifactName/reprocess", httpx.Handler.bind(self.impl, reprocessDocumentArtifact));
+            try server.get("/tables/:tableName/entities/:key/redirects", httpx.Handler.bind(self.impl, listEntityResolverState));
+            try server.post("/tables/:tableName/entities/:key:distinct", httpx.Handler.bind(self.impl, pinEntitiesDistinct));
+            try server.post("/tables/:tableName/entities/:key:merge", httpx.Handler.bind(self.impl, mergeEntity));
+            try server.post("/tables/:tableName/entities/:key:suppress", httpx.Handler.bind(self.impl, suppressEntity));
+            try server.post("/tables/:tableName/entities/:key:unmerge", httpx.Handler.bind(self.impl, unmergeEntity));
+            try server.post("/tables/:tableName/entities/:key:unsuppress", httpx.Handler.bind(self.impl, unsuppressEntity));
             try server.get("/tables/:tableName/indexes", httpx.Handler.bind(self.impl, listIndexes));
             try server.get("/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, getIndex));
             try server.post("/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, createIndex));
@@ -1824,6 +2503,20 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/tables/:tableName/repair/jobs/:jobId/advance", httpx.Handler.bind(self.impl, advanceTableRepairJob));
             try server.post("/tables/:tableName/repair/jobs/:jobId/cancel", httpx.Handler.bind(self.impl, cancelTableRepairJob));
             try server.post("/tables/:tableName/repair/run", httpx.Handler.bind(self.impl, runTableRepair));
+            try server.get("/tables/:tableName/resolvers", httpx.Handler.bind(self.impl, listResolvers));
+            try server.get("/tables/:tableName/resolvers/:resolverName", httpx.Handler.bind(self.impl, getResolver));
+            try server.delete("/tables/:tableName/resolvers/:resolverName", httpx.Handler.bind(self.impl, dropResolverIdentity));
+            try server.get("/tables/:tableName/resolvers/:resolverName/redirects", httpx.Handler.bind(self.impl, listResolverRedirects));
+            try server.post("/tables/:tableName/resolvers/:resolverName/redirects", httpx.Handler.bind(self.impl, mergeResolverKeys));
+            try server.delete("/tables/:tableName/resolvers/:resolverName/redirects/:key", httpx.Handler.bind(self.impl, unmergeResolverKey));
+            try server.get("/tables/:tableName/resolvers/:resolverName/reviews", httpx.Handler.bind(self.impl, listResolverReviews));
+            try server.post("/tables/:tableName/resolvers/:resolverName/reviews/:reviewId", httpx.Handler.bind(self.impl, reviewResolverMention));
+            try server.get("/tables/:tableName/resolvers/:resolverName/suppressions", httpx.Handler.bind(self.impl, listResolverSuppressions));
+            try server.post("/tables/:tableName/resolvers/:resolverName/suppressions", httpx.Handler.bind(self.impl, suppressResolverKeys));
+            try server.delete("/tables/:tableName/resolvers/:resolverName/suppressions/:key", httpx.Handler.bind(self.impl, unsuppressResolverKey));
+            try server.post("/tables/:tableName/resolvers/:resolverName:namespace", httpx.Handler.bind(self.impl, setResolverNamespace));
+            try server.post("/tables/:tableName/resolvers/:resolverName:render", httpx.Handler.bind(self.impl, renderResolverKey));
+            try server.post("/tables/:tableName/resolvers/:resolverName:resolve", httpx.Handler.bind(self.impl, resolveResolverQuery));
             try server.post("/tables/:tableName/restore", httpx.Handler.bind(self.impl, restoreTable));
             try server.post("/tables/:tableName/rows/mutate", httpx.Handler.bind(self.impl, mutateRelationalRows));
             try server.post("/tables/:tableName/rows/query", httpx.Handler.bind(self.impl, queryRelationalRows));
@@ -2131,6 +2824,60 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.getNamespaceRelationalConstraintStatus(ctx, database_name, namespace_name, table_name);
         }
 
+        /// listCurationProposals
+        /// GET /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals
+        fn namespaceListCurationProposals(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const query_params = NamespaceListCurationProposalsParams{
+                .state = try ctx.queryDecoded("state"),
+                .action = try ctx.queryDecoded("action"),
+                .cursor = try ctx.queryDecoded("cursor"),
+                .limit = try ctx.queryDecoded("limit"),
+            };
+            return impl.namespaceListCurationProposals(ctx, database_name, namespace_name, table_name, query_params);
+        }
+
+        /// proposeCuration
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals
+        fn namespaceProposeCuration(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.namespaceProposeCuration(ctx, database_name, namespace_name, table_name);
+        }
+
+        /// getCurationProposal
+        /// GET /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}
+        fn namespaceGetCurationProposal(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const proposal_id = ctx.param("proposalId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: proposalId" });
+            return impl.namespaceGetCurationProposal(ctx, database_name, namespace_name, table_name, proposal_id);
+        }
+
+        /// acceptCurationProposal
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:accept
+        fn namespaceAcceptCurationProposal(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const proposal_id = ctx.param("proposalId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: proposalId" });
+            return impl.namespaceAcceptCurationProposal(ctx, database_name, namespace_name, table_name, proposal_id);
+        }
+
+        /// rejectCurationProposal
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:reject
+        fn namespaceRejectCurationProposal(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const proposal_id = ctx.param("proposalId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: proposalId" });
+            return impl.namespaceRejectCurationProposal(ctx, database_name, namespace_name, table_name, proposal_id);
+        }
+
         /// Retrieve a document by key from an explicit namespace table
         /// GET /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/documents/{key}
         fn lookupNamespaceTableDocument(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -2143,6 +2890,66 @@ pub fn ServerRouter(comptime Impl: type) type {
                 .consistency = try ctx.queryDecoded("consistency"),
             };
             return impl.lookupNamespaceTableDocument(ctx, database_name, namespace_name, table_name, key, query_params);
+        }
+
+        /// list entity resolver state
+        /// GET /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}/redirects
+        fn namespaceListEntityResolverState(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
+            return impl.namespaceListEntityResolverState(ctx, database_name, namespace_name, table_name, key);
+        }
+
+        /// pinEntitiesDistinct
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:distinct
+        fn namespacePinEntitiesDistinct(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
+            return impl.namespacePinEntitiesDistinct(ctx, database_name, namespace_name, table_name, key);
+        }
+
+        /// merge entity
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:merge
+        fn namespaceMergeEntity(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
+            return impl.namespaceMergeEntity(ctx, database_name, namespace_name, table_name, key);
+        }
+
+        /// suppress entity
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:suppress
+        fn namespaceSuppressEntity(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
+            return impl.namespaceSuppressEntity(ctx, database_name, namespace_name, table_name, key);
+        }
+
+        /// unmerge entity
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:unmerge
+        fn namespaceUnmergeEntity(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
+            return impl.namespaceUnmergeEntity(ctx, database_name, namespace_name, table_name, key);
+        }
+
+        /// unsuppress entity
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:unsuppress
+        fn namespaceUnsuppressEntity(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
+            return impl.namespaceUnsuppressEntity(ctx, database_name, namespace_name, table_name, key);
         }
 
         /// List indexes for an explicit namespace table
@@ -2232,6 +3039,155 @@ pub fn ServerRouter(comptime Impl: type) type {
             const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             return impl.renameNamespaceTable(ctx, database_name, namespace_name, table_name);
+        }
+
+        /// list resolvers
+        /// GET /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers
+        fn namespaceListResolvers(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.namespaceListResolvers(ctx, database_name, namespace_name, table_name);
+        }
+
+        /// get resolver
+        /// GET /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}
+        fn namespaceGetResolver(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const resolver_name = ctx.param("resolverName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: resolverName" });
+            return impl.namespaceGetResolver(ctx, database_name, namespace_name, table_name, resolver_name);
+        }
+
+        /// drop resolver identity
+        /// DELETE /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}
+        fn namespaceDropResolverIdentity(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const resolver_name = ctx.param("resolverName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: resolverName" });
+            return impl.namespaceDropResolverIdentity(ctx, database_name, namespace_name, table_name, resolver_name);
+        }
+
+        /// list resolver redirects
+        /// GET /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/redirects
+        fn namespaceListResolverRedirects(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const resolver_name = ctx.param("resolverName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: resolverName" });
+            return impl.namespaceListResolverRedirects(ctx, database_name, namespace_name, table_name, resolver_name);
+        }
+
+        /// merge resolver keys
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/redirects
+        fn namespaceMergeResolverKeys(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const resolver_name = ctx.param("resolverName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: resolverName" });
+            return impl.namespaceMergeResolverKeys(ctx, database_name, namespace_name, table_name, resolver_name);
+        }
+
+        /// unmerge resolver key
+        /// DELETE /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/redirects/{key}
+        fn namespaceUnmergeResolverKey(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const resolver_name = ctx.param("resolverName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: resolverName" });
+            const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
+            const query_params = NamespaceUnmergeResolverKeyParams{
+                .pin_distinct = try ctx.queryDecoded("pin_distinct"),
+            };
+            return impl.namespaceUnmergeResolverKey(ctx, database_name, namespace_name, table_name, resolver_name, key, query_params);
+        }
+
+        /// list resolver reviews
+        /// GET /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/reviews
+        fn namespaceListResolverReviews(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const resolver_name = ctx.param("resolverName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: resolverName" });
+            const query_params = NamespaceListResolverReviewsParams{
+                .cursor = try ctx.queryDecoded("cursor"),
+                .limit = try ctx.queryDecoded("limit"),
+            };
+            return impl.namespaceListResolverReviews(ctx, database_name, namespace_name, table_name, resolver_name, query_params);
+        }
+
+        /// review resolver mention
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/reviews/{reviewId}
+        fn namespaceReviewResolverMention(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const resolver_name = ctx.param("resolverName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: resolverName" });
+            const review_id = ctx.param("reviewId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: reviewId" });
+            return impl.namespaceReviewResolverMention(ctx, database_name, namespace_name, table_name, resolver_name, review_id);
+        }
+
+        /// list resolver suppressions
+        /// GET /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/suppressions
+        fn namespaceListResolverSuppressions(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const resolver_name = ctx.param("resolverName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: resolverName" });
+            return impl.namespaceListResolverSuppressions(ctx, database_name, namespace_name, table_name, resolver_name);
+        }
+
+        /// suppress resolver keys
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/suppressions
+        fn namespaceSuppressResolverKeys(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const resolver_name = ctx.param("resolverName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: resolverName" });
+            return impl.namespaceSuppressResolverKeys(ctx, database_name, namespace_name, table_name, resolver_name);
+        }
+
+        /// unsuppress resolver key
+        /// DELETE /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/suppressions/{key}
+        fn namespaceUnsuppressResolverKey(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const resolver_name = ctx.param("resolverName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: resolverName" });
+            const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
+            return impl.namespaceUnsuppressResolverKey(ctx, database_name, namespace_name, table_name, resolver_name, key);
+        }
+
+        /// set resolver namespace
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}:namespace
+        fn namespaceSetResolverNamespace(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const resolver_name = ctx.param("resolverName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: resolverName" });
+            return impl.namespaceSetResolverNamespace(ctx, database_name, namespace_name, table_name, resolver_name);
+        }
+
+        /// render resolver key
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}:render
+        fn namespaceRenderResolverKey(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const resolver_name = ctx.param("resolverName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: resolverName" });
+            return impl.namespaceRenderResolverKey(ctx, database_name, namespace_name, table_name, resolver_name);
+        }
+
+        /// resolve resolver query
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}:resolve
+        fn namespaceResolveResolverQuery(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const resolver_name = ctx.param("resolverName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: resolverName" });
+            return impl.namespaceResolveResolverQuery(ctx, database_name, namespace_name, table_name, resolver_name);
         }
 
         /// Restore an explicit namespace table from backup
@@ -2544,7 +3500,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.deleteArtifactEnrichment(ctx, table_name, artifact_name);
         }
 
-        /// Reprocess a derived asset across a table range
+        /// Reprocess a derived artifact across a table range
         /// POST /tables/{tableName}/artifacts/{artifactName}/reprocess
         fn reprocessDocumentArtifactRange(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
@@ -2629,6 +3585,50 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.getRelationalConstraintStatus(ctx, table_name);
         }
 
+        /// listCurationProposals
+        /// GET /tables/{tableName}/curation/proposals
+        fn listCurationProposals(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const query_params = ListCurationProposalsParams{
+                .state = try ctx.queryDecoded("state"),
+                .action = try ctx.queryDecoded("action"),
+                .cursor = try ctx.queryDecoded("cursor"),
+                .limit = try ctx.queryDecoded("limit"),
+            };
+            return impl.listCurationProposals(ctx, table_name, query_params);
+        }
+
+        /// proposeCuration
+        /// POST /tables/{tableName}/curation/proposals
+        fn proposeCuration(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.proposeCuration(ctx, table_name);
+        }
+
+        /// getCurationProposal
+        /// GET /tables/{tableName}/curation/proposals/{proposalId}
+        fn getCurationProposal(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const proposal_id = ctx.param("proposalId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: proposalId" });
+            return impl.getCurationProposal(ctx, table_name, proposal_id);
+        }
+
+        /// acceptCurationProposal
+        /// POST /tables/{tableName}/curation/proposals/{proposalId}:accept
+        fn acceptCurationProposal(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const proposal_id = ctx.param("proposalId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: proposalId" });
+            return impl.acceptCurationProposal(ctx, table_name, proposal_id);
+        }
+
+        /// rejectCurationProposal
+        /// POST /tables/{tableName}/curation/proposals/{proposalId}:reject
+        fn rejectCurationProposal(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const proposal_id = ctx.param("proposalId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: proposalId" });
+            return impl.rejectCurationProposal(ctx, table_name, proposal_id);
+        }
+
         /// Adopt stored write destinations with the current credential
         /// POST /tables/{tableName}/destination-authorization
         fn reauthorizeTableDestinations(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -2678,13 +3678,61 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.getDocumentArtifactManifest(ctx, table_name, key, artifact_name, query_params);
         }
 
-        /// Reprocess a derived asset
+        /// Reprocess a derived artifact
         /// POST /tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess
         fn reprocessDocumentArtifact(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
             const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
             return impl.reprocessDocumentArtifact(ctx, table_name, key, artifact_name);
+        }
+
+        /// list entity resolver state
+        /// GET /tables/{tableName}/entities/{key}/redirects
+        fn listEntityResolverState(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
+            return impl.listEntityResolverState(ctx, table_name, key);
+        }
+
+        /// pinEntitiesDistinct
+        /// POST /tables/{tableName}/entities/{key}:distinct
+        fn pinEntitiesDistinct(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
+            return impl.pinEntitiesDistinct(ctx, table_name, key);
+        }
+
+        /// merge entity
+        /// POST /tables/{tableName}/entities/{key}:merge
+        fn mergeEntity(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
+            return impl.mergeEntity(ctx, table_name, key);
+        }
+
+        /// suppress entity
+        /// POST /tables/{tableName}/entities/{key}:suppress
+        fn suppressEntity(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
+            return impl.suppressEntity(ctx, table_name, key);
+        }
+
+        /// unmerge entity
+        /// POST /tables/{tableName}/entities/{key}:unmerge
+        fn unmergeEntity(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
+            return impl.unmergeEntity(ctx, table_name, key);
+        }
+
+        /// unsuppress entity
+        /// POST /tables/{tableName}/entities/{key}:unsuppress
+        fn unsuppressEntity(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
+            return impl.unsuppressEntity(ctx, table_name, key);
         }
 
         /// List all indexes for a table
@@ -2854,6 +3902,127 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn runTableRepair(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             return impl.runTableRepair(ctx, table_name);
+        }
+
+        /// list resolvers
+        /// GET /tables/{tableName}/resolvers
+        fn listResolvers(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.listResolvers(ctx, table_name);
+        }
+
+        /// get resolver
+        /// GET /tables/{tableName}/resolvers/{resolverName}
+        fn getResolver(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const resolver_name = ctx.param("resolverName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: resolverName" });
+            return impl.getResolver(ctx, table_name, resolver_name);
+        }
+
+        /// drop resolver identity
+        /// DELETE /tables/{tableName}/resolvers/{resolverName}
+        fn dropResolverIdentity(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const resolver_name = ctx.param("resolverName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: resolverName" });
+            return impl.dropResolverIdentity(ctx, table_name, resolver_name);
+        }
+
+        /// list resolver redirects
+        /// GET /tables/{tableName}/resolvers/{resolverName}/redirects
+        fn listResolverRedirects(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const resolver_name = ctx.param("resolverName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: resolverName" });
+            return impl.listResolverRedirects(ctx, table_name, resolver_name);
+        }
+
+        /// merge resolver keys
+        /// POST /tables/{tableName}/resolvers/{resolverName}/redirects
+        fn mergeResolverKeys(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const resolver_name = ctx.param("resolverName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: resolverName" });
+            return impl.mergeResolverKeys(ctx, table_name, resolver_name);
+        }
+
+        /// unmerge resolver key
+        /// DELETE /tables/{tableName}/resolvers/{resolverName}/redirects/{key}
+        fn unmergeResolverKey(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const resolver_name = ctx.param("resolverName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: resolverName" });
+            const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
+            const query_params = UnmergeResolverKeyParams{
+                .pin_distinct = try ctx.queryDecoded("pin_distinct"),
+            };
+            return impl.unmergeResolverKey(ctx, table_name, resolver_name, key, query_params);
+        }
+
+        /// list resolver reviews
+        /// GET /tables/{tableName}/resolvers/{resolverName}/reviews
+        fn listResolverReviews(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const resolver_name = ctx.param("resolverName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: resolverName" });
+            const query_params = ListResolverReviewsParams{
+                .cursor = try ctx.queryDecoded("cursor"),
+                .limit = try ctx.queryDecoded("limit"),
+            };
+            return impl.listResolverReviews(ctx, table_name, resolver_name, query_params);
+        }
+
+        /// review resolver mention
+        /// POST /tables/{tableName}/resolvers/{resolverName}/reviews/{reviewId}
+        fn reviewResolverMention(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const resolver_name = ctx.param("resolverName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: resolverName" });
+            const review_id = ctx.param("reviewId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: reviewId" });
+            return impl.reviewResolverMention(ctx, table_name, resolver_name, review_id);
+        }
+
+        /// list resolver suppressions
+        /// GET /tables/{tableName}/resolvers/{resolverName}/suppressions
+        fn listResolverSuppressions(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const resolver_name = ctx.param("resolverName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: resolverName" });
+            return impl.listResolverSuppressions(ctx, table_name, resolver_name);
+        }
+
+        /// suppress resolver keys
+        /// POST /tables/{tableName}/resolvers/{resolverName}/suppressions
+        fn suppressResolverKeys(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const resolver_name = ctx.param("resolverName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: resolverName" });
+            return impl.suppressResolverKeys(ctx, table_name, resolver_name);
+        }
+
+        /// unsuppress resolver key
+        /// DELETE /tables/{tableName}/resolvers/{resolverName}/suppressions/{key}
+        fn unsuppressResolverKey(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const resolver_name = ctx.param("resolverName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: resolverName" });
+            const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
+            return impl.unsuppressResolverKey(ctx, table_name, resolver_name, key);
+        }
+
+        /// set resolver namespace
+        /// POST /tables/{tableName}/resolvers/{resolverName}:namespace
+        fn setResolverNamespace(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const resolver_name = ctx.param("resolverName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: resolverName" });
+            return impl.setResolverNamespace(ctx, table_name, resolver_name);
+        }
+
+        /// render resolver key
+        /// POST /tables/{tableName}/resolvers/{resolverName}:render
+        fn renderResolverKey(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const resolver_name = ctx.param("resolverName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: resolverName" });
+            return impl.renderResolverKey(ctx, table_name, resolver_name);
+        }
+
+        /// resolve resolver query
+        /// POST /tables/{tableName}/resolvers/{resolverName}:resolve
+        fn resolveResolverQuery(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const resolver_name = ctx.param("resolverName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: resolverName" });
+            return impl.resolveResolverQuery(ctx, table_name, resolver_name);
         }
 
         /// Restore a table from backup
@@ -3085,7 +4254,18 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn retireNamespaceRelationalConstraints(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn retryNamespaceRelationalConstraints(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn getNamespaceRelationalConstraintStatus(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn namespaceListCurationProposals(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, params: NamespaceListCurationProposalsParams) !httpx.Response
+//   fn namespaceProposeCuration(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn namespaceGetCurationProposal(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, proposal_id: []const u8) !httpx.Response
+//   fn namespaceAcceptCurationProposal(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, proposal_id: []const u8) !httpx.Response
+//   fn namespaceRejectCurationProposal(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, proposal_id: []const u8) !httpx.Response
 //   fn lookupNamespaceTableDocument(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, params: LookupNamespaceTableDocumentParams) !httpx.Response
+//   fn namespaceListEntityResolverState(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
+//   fn namespacePinEntitiesDistinct(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
+//   fn namespaceMergeEntity(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
+//   fn namespaceSuppressEntity(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
+//   fn namespaceUnmergeEntity(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
+//   fn namespaceUnsuppressEntity(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn listNamespaceTableIndexes(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn getNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn createNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
@@ -3095,6 +4275,20 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn retryNamespaceIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn queryNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn renameNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn namespaceListResolvers(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn namespaceGetResolver(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn namespaceDropResolverIdentity(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn namespaceListResolverRedirects(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn namespaceMergeResolverKeys(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn namespaceUnmergeResolverKey(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8, key: []const u8, params: NamespaceUnmergeResolverKeyParams) !httpx.Response
+//   fn namespaceListResolverReviews(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8, params: NamespaceListResolverReviewsParams) !httpx.Response
+//   fn namespaceReviewResolverMention(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8, review_id: []const u8) !httpx.Response
+//   fn namespaceListResolverSuppressions(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn namespaceSuppressResolverKeys(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn namespaceUnsuppressResolverKey(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8, key: []const u8) !httpx.Response
+//   fn namespaceSetResolverNamespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn namespaceRenderResolverKey(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn namespaceResolveResolverQuery(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !httpx.Response
 //   fn restoreNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn mutateNamespaceRelationalRows(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn queryNamespaceRelationalRows(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
@@ -3148,12 +4342,23 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn retireRelationalConstraints(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn retryRelationalConstraints(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getRelationalConstraintStatus(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn listCurationProposals(self: *Impl, ctx: *httpx.Context, table_name: []const u8, params: ListCurationProposalsParams) !httpx.Response
+//   fn proposeCuration(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn getCurationProposal(self: *Impl, ctx: *httpx.Context, table_name: []const u8, proposal_id: []const u8) !httpx.Response
+//   fn acceptCurationProposal(self: *Impl, ctx: *httpx.Context, table_name: []const u8, proposal_id: []const u8) !httpx.Response
+//   fn rejectCurationProposal(self: *Impl, ctx: *httpx.Context, table_name: []const u8, proposal_id: []const u8) !httpx.Response
 //   fn reauthorizeTableDestinations(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn scanKeys(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn lookupKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: LookupKeyParams) !httpx.Response
 //   fn listDocumentArtifactManifests(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: ListDocumentArtifactManifestsParams) !httpx.Response
 //   fn getDocumentArtifactManifest(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8, params: GetDocumentArtifactManifestParams) !httpx.Response
 //   fn reprocessDocumentArtifact(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response
+//   fn listEntityResolverState(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
+//   fn pinEntitiesDistinct(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
+//   fn mergeEntity(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
+//   fn suppressEntity(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
+//   fn unmergeEntity(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
+//   fn unsuppressEntity(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn listIndexes(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn createIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
@@ -3176,6 +4381,20 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn advanceTableRepairJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn cancelTableRepairJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn runTableRepair(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn listResolvers(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn getResolver(self: *Impl, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn dropResolverIdentity(self: *Impl, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn listResolverRedirects(self: *Impl, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn mergeResolverKeys(self: *Impl, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn unmergeResolverKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8, key: []const u8, params: UnmergeResolverKeyParams) !httpx.Response
+//   fn listResolverReviews(self: *Impl, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8, params: ListResolverReviewsParams) !httpx.Response
+//   fn reviewResolverMention(self: *Impl, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8, review_id: []const u8) !httpx.Response
+//   fn listResolverSuppressions(self: *Impl, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn suppressResolverKeys(self: *Impl, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn unsuppressResolverKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8, key: []const u8) !httpx.Response
+//   fn setResolverNamespace(self: *Impl, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn renderResolverKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn resolveResolverQuery(self: *Impl, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8) !httpx.Response
 //   fn restoreTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn mutateRelationalRows(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn queryRelationalRows(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response

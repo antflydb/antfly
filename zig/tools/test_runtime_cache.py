@@ -405,6 +405,47 @@ class RuntimeCacheTest(unittest.TestCase):
                         self.build(target, settings=settings, succeeds=False),
                     )
 
+    def test_compute_owner_ignores_storage_abi_changes(self):
+        contract = self.own("zig/pkg/antfly-embedded/src/storage/kernel_owner_abi.zig")
+        self.assert_compile(
+            self.build("runtime-unit-enrichment_compute"),
+            "enrichment_compute",
+            "success",
+        )
+        self.assert_compile(
+            self.build("runtime-unit-enrichment_compute"),
+            "enrichment_compute",
+            "cached",
+        )
+        contract.write_bytes(
+            contract.read_bytes() + b"\n// storage ABI cache regression\n"
+        )
+        self.assert_compile(
+            self.build("runtime-unit-enrichment_compute"),
+            "enrichment_compute",
+            "cached",
+        )
+        # Compute must remain buildable without declaring this storage-only
+        # contract, rather than merely avoiding semantic use of its types.
+        contract.unlink()
+        self.assert_compile(
+            self.build("runtime-unit-enrichment_compute"),
+            "enrichment_compute",
+            "cached",
+        )
+
+    def test_control_consumers_ignore_physical_db_implementation(self):
+        physical = self.own("zig/pkg/antfly-embedded/src/storage/db/db.zig")
+        self.build("cache-probe")
+        self.assert_archives(self.build("cache-probe"))
+        physical.write_bytes(physical.read_bytes() + b"\n// physical DB cache fence\n")
+        # Literal imports in shared helper tests are cache inputs too. Preserve
+        # the real module graph while replacing only expensive runtime bodies.
+        # Physical provider bodies are replaced in this fixture; none of the
+        # retained control module graphs may acquire their implementation input.
+        # The production compilation audit separately checks owner rebuilding.
+        self.assert_archives(self.build("cache-probe"))
+
     def test_runtime_owner_dependencies(self):
         owners = (
             ("zig/lib/mcp/src/root.zig", ("api_kernel",)),
@@ -544,32 +585,6 @@ class RuntimeCacheTest(unittest.TestCase):
                             self.build(target), rf"compile {artifact} debug \S+ cached"
                         )
 
-    def test_optional_onnx_dependencies(self):
-        source = self.own("zig/lib/audio/src/mod.zig")
-        source.write_bytes(
-            source.read_bytes()
-            + b'\npub const cache_test_profile = @import("builtin").mode;\n'
-        )
-        settings = ("-Donnx=true", f"-Donnx-root={self.root / 'missing-onnx'}")
-        for standalone in (False, True):
-            with self.subTest(standalone=standalone):
-                if standalone:
-                    self.use_standalone()
-                self.build("--help", settings=settings)
-                self.assertIn(
-                    "BENCH_PROFILE debug debug",
-                    self.build("cache-antfly-inference-audio-bench", settings=settings),
-                )
-                if not standalone:
-                    self.build("lib-hash-test", settings=settings)
-                target = "cache-inference" if standalone else "cache-probe"
-                self.build(target)
-                failure = self.build(target, settings=settings, succeeds=False)
-                self.assertIn("onnxruntime", failure)
-                self.assertNotIn("panic:", failure)
-                self.assertIn("Build Summary:", failure)
-                self.build(target)
-
     def test_native_artifact_profiles(self):
         for source in ("zig/lib/audio/src/mod.zig", "zig/lib/linalg/src/mod.zig"):
             path = self.own(source)
@@ -635,10 +650,6 @@ class RuntimeCacheTest(unittest.TestCase):
                     ("metal", ()),
                     ("cuda", ()),
                     (None, ("-Dpjrt=true",)),
-                    (
-                        None,
-                        ("-Donnx=true", f"-Donnx-root={self.root / 'missing-onnx'}"),
-                    ),
                 ):
                     check(
                         self.build(*targets, backend=backend, settings=settings),
@@ -715,10 +726,6 @@ class RuntimeCacheTest(unittest.TestCase):
                     ("metal", ()),
                     ("cuda", ()),
                     (None, ("-Dpjrt=true",)),
-                    (
-                        None,
-                        ("-Donnx=true", f"-Donnx-root={self.root / 'missing-onnx'}"),
-                    ),
                 ):
                     check(
                         self.build(
@@ -882,10 +889,6 @@ class RuntimeCacheTest(unittest.TestCase):
                     ("metal", ()),
                     ("cuda", ()),
                     (None, ("-Dpjrt=true",)),
-                    (
-                        None,
-                        ("-Donnx=true", f"-Donnx-root={self.root / 'missing-onnx'}"),
-                    ),
                 ):
                     check(
                         self.build(
@@ -1157,6 +1160,15 @@ class RuntimeCacheTest(unittest.TestCase):
         )
         failure = self.build("cache-finetune-registry", succeeds=False)
         self.assertIn("received undeclared import undeclared-test-import", failure)
+        common.write_text(
+            contents.replace(
+                '            module.addImport("antfly_runtime_abi", ctx.runtime_abi_mod);',
+                "",
+                1,
+            )
+        )
+        failure = self.build("cache-finetune-registry", succeeds=False)
+        self.assertIn("command lost its shared runtime ABI identity", failure)
 
     def test_finetune_shared_test_ownership(self):
         shutil.copyfile(
@@ -1207,11 +1219,65 @@ class RuntimeCacheTest(unittest.TestCase):
         contents = project.read_text()
         attachment = 'default_test_step.dependOn(&b.top_level_steps.get("test-finetune-unit").?.step);'
         self.assertIn(attachment, contents)
-        project.write_text(contents.replace(attachment, "_ = default_test_step;"))
+        # Keep this graph mutation compilable even when other suites also
+        # reference the default step. A discard becomes a Zig compile error
+        # once another owner uses it, hiding the intended ownership failure.
+        project.write_text(
+            contents.replace(
+                attachment, "std.mem.doNotOptimizeAway(default_test_step);"
+            )
+        )
         failure = self.build("cache-finetune-standalone", succeeds=False)
         self.assertIn(
             "standalone gate must reach shared finetuning owner once", failure
         )
+
+    def test_finetune_isolated_test_ownership(self):
+        shutil.copyfile(
+            ZIG_ROOT / "tools/fixtures/finetune_commands.zig",
+            self.root / "zig/build.zig",
+        )
+        tests = self.own("zig/pkg/inference/build/finetune/tests.zig")
+        contents = tests.read_text()
+        attachment = "aggregate.dependOn(isolated);"
+        self.assertIn(attachment, contents)
+        for replacement in (
+            "",
+            attachment + "\n            aggregate.dependOn(common.addTest(ctx, spec));",
+        ):
+            with self.subTest(root_attachment=replacement):
+                tests.write_text(contents.replace(attachment, replacement))
+                try:
+                    failure = self.build("cache-finetune-registry", succeeds=False)
+                    self.assertIn(
+                        "isolated finetune root must execute exactly once", failure
+                    )
+                finally:
+                    tests.write_text(contents)
+
+        self.use_standalone()
+        shutil.copyfile(
+            ZIG_ROOT / "tools/fixtures/finetune_standalone.zig",
+            self.build_directory / "build.zig",
+        )
+        self.build("cache-finetune-standalone")
+        attachment = "unit_step.dependOn(isolated);"
+        self.assertIn(attachment, contents)
+        for replacement, expected in (
+            ("", "standalone gate must reach isolated finetuning owner once"),
+            (
+                attachment
+                + '\n            unit_step.dependOn(&ctx.b.addRunArtifact(isolated.dependencies.items[0].cast(@import("std").Build.Step.Run).?.argv.items[0].artifact.artifact).step);',
+                "standalone gate repeats a finetuning executable",
+            ),
+        ):
+            with self.subTest(standalone_attachment=replacement):
+                tests.write_text(contents.replace(attachment, replacement))
+                try:
+                    failure = self.build("cache-finetune-standalone", succeeds=False)
+                    self.assertIn(expected, failure)
+                finally:
+                    tests.write_text(contents)
 
     def test_vopr_workflow_memory_admission(self):
         shutil.copyfile(
@@ -1285,7 +1351,7 @@ class RuntimeCacheTest(unittest.TestCase):
                         ("-Dskip-openapi=true",),
                     ]
                 else:
-                    settings_to_check += [("-Donnx=true",), ("-Dpjrt=true",)]
+                    settings_to_check += [("-Dpjrt=true",)]
                 for settings in settings_to_check:
                     output = self.build(
                         "cache-inference-wasm", settings=base + settings

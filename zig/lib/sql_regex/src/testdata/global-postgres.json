@@ -1,0 +1,352 @@
+{
+  "format": 1,
+  "collation": "C",
+  "entries": [
+    {
+      "id": "unicode-empty",
+      "pattern": "",
+      "input": "雪😀",
+      "flags": 3,
+      "start": 0,
+      "captures": 0,
+      "occurrences": [
+        [
+          {
+            "start": 0,
+            "end": 0,
+            "text": ""
+          }
+        ],
+        [
+          {
+            "start": 1,
+            "end": 1,
+            "text": ""
+          }
+        ],
+        [
+          {
+            "start": 2,
+            "end": 2,
+            "text": ""
+          }
+        ]
+      ]
+    },
+    {
+      "id": "nonempty-then-empty",
+      "pattern": ".*",
+      "input": "雪😀",
+      "flags": 3,
+      "start": 0,
+      "captures": 0,
+      "occurrences": [
+        [
+          {
+            "start": 0,
+            "end": 2,
+            "text": "雪😀"
+          }
+        ],
+        [
+          {
+            "start": 2,
+            "end": 2,
+            "text": ""
+          }
+        ]
+      ]
+    },
+    {
+      "id": "optional-captures",
+      "pattern": "(a)?(b*)",
+      "input": "a雪bb😀",
+      "flags": 3,
+      "start": 0,
+      "captures": 2,
+      "occurrences": [
+        [
+          {
+            "start": 0,
+            "end": 1,
+            "text": "a"
+          },
+          {
+            "start": 0,
+            "end": 1,
+            "text": "a"
+          },
+          {
+            "start": 1,
+            "end": 1,
+            "text": ""
+          }
+        ],
+        [
+          {
+            "start": 1,
+            "end": 1,
+            "text": ""
+          },
+          {
+            "start": -1,
+            "end": -1,
+            "text": null
+          },
+          {
+            "start": 1,
+            "end": 1,
+            "text": ""
+          }
+        ],
+        [
+          {
+            "start": 2,
+            "end": 4,
+            "text": "bb"
+          },
+          {
+            "start": -1,
+            "end": -1,
+            "text": null
+          },
+          {
+            "start": 2,
+            "end": 4,
+            "text": "bb"
+          }
+        ],
+        [
+          {
+            "start": 4,
+            "end": 4,
+            "text": ""
+          },
+          {
+            "start": -1,
+            "end": -1,
+            "text": null
+          },
+          {
+            "start": 4,
+            "end": 4,
+            "text": ""
+          }
+        ],
+        [
+          {
+            "start": 5,
+            "end": 5,
+            "text": ""
+          },
+          {
+            "start": -1,
+            "end": -1,
+            "text": null
+          },
+          {
+            "start": 5,
+            "end": 5,
+            "text": ""
+          }
+        ]
+      ]
+    },
+    {
+      "id": "shortest-quantifiers",
+      "pattern": "a+?",
+      "input": "aaa雪aa",
+      "flags": 3,
+      "start": 0,
+      "captures": 0,
+      "occurrences": [
+        [
+          {
+            "start": 0,
+            "end": 1,
+            "text": "a"
+          }
+        ],
+        [
+          {
+            "start": 1,
+            "end": 2,
+            "text": "a"
+          }
+        ],
+        [
+          {
+            "start": 2,
+            "end": 3,
+            "text": "a"
+          }
+        ],
+        [
+          {
+            "start": 4,
+            "end": 5,
+            "text": "a"
+          }
+        ],
+        [
+          {
+            "start": 5,
+            "end": 6,
+            "text": "a"
+          }
+        ]
+      ]
+    },
+    {
+      "id": "nonzero-start-lookbehind",
+      "pattern": "(?<=雪)😀|$",
+      "input": "雪😀雪😀",
+      "flags": 3,
+      "start": 2,
+      "captures": 0,
+      "occurrences": [
+        [
+          {
+            "start": 3,
+            "end": 4,
+            "text": "😀"
+          }
+        ],
+        [
+          {
+            "start": 4,
+            "end": 4,
+            "text": ""
+          }
+        ]
+      ]
+    },
+    {
+      "id": "nonzero-start-anchor",
+      "pattern": "^a|$",
+      "input": "aa",
+      "flags": 3,
+      "start": 1,
+      "captures": 0,
+      "occurrences": [
+        [
+          {
+            "start": 2,
+            "end": 2,
+            "text": ""
+          }
+        ]
+      ]
+    },
+    {
+      "id": "empty-subject",
+      "pattern": "(a*)",
+      "input": "",
+      "flags": 3,
+      "start": 0,
+      "captures": 1,
+      "occurrences": [
+        [
+          {
+            "start": 0,
+            "end": 0,
+            "text": ""
+          },
+          {
+            "start": 0,
+            "end": 0,
+            "text": ""
+          }
+        ]
+      ]
+    },
+    {
+      "id": "no-match",
+      "pattern": "z+",
+      "input": "雪😀aa",
+      "flags": 3,
+      "start": 0,
+      "captures": 0,
+      "occurrences": []
+    },
+    {
+      "id": "repeated-backreferences",
+      "pattern": "([a-z]+)-\\1",
+      "input": "cat-cat dog-dog",
+      "flags": 3,
+      "start": 0,
+      "captures": 1,
+      "occurrences": [
+        [
+          {
+            "start": 0,
+            "end": 7,
+            "text": "cat-cat"
+          },
+          {
+            "start": 0,
+            "end": 3,
+            "text": "cat"
+          }
+        ],
+        [
+          {
+            "start": 8,
+            "end": 15,
+            "text": "dog-dog"
+          },
+          {
+            "start": 8,
+            "end": 11,
+            "text": "dog"
+          }
+        ]
+      ]
+    },
+    {
+      "id": "newline-anchors",
+      "pattern": "^|$",
+      "input": "a\nb\n",
+      "flags": 195,
+      "start": 0,
+      "captures": 0,
+      "occurrences": [
+        [
+          {
+            "start": 0,
+            "end": 0,
+            "text": ""
+          }
+        ],
+        [
+          {
+            "start": 1,
+            "end": 1,
+            "text": ""
+          }
+        ],
+        [
+          {
+            "start": 2,
+            "end": 2,
+            "text": ""
+          }
+        ],
+        [
+          {
+            "start": 3,
+            "end": 3,
+            "text": ""
+          }
+        ],
+        [
+          {
+            "start": 4,
+            "end": 4,
+            "text": ""
+          }
+        ]
+      ]
+    }
+  ]
+}

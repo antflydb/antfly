@@ -128,9 +128,25 @@ def check_terminology() -> None:
         r"`[^`]*antfly inference[^`]*`|^\s*antfly inference\b", re.MULTILINE
     )
     for path in sorted(DOCS_DIR.rglob("*.md*")):
+        # Archived implementation logs preserve historical names and commands.
+        # Enforce current branding on live documentation, not quoted history.
+        if "history" in path.relative_to(DOCS_DIR).parts[:-1]:
+            continue
         source = cli_form.sub("", path.read_text(encoding="utf-8"))
+        fence = None
+        prose = []
+        for line in source.splitlines():
+            marker = re.match(r"^\s*(`{3,}|~{3,})", line)
+            if marker:
+                if fence is None:
+                    fence = marker[1]
+                elif marker[1][0] == fence[0] and len(marker[1]) >= len(fence):
+                    fence = None
+                prose.append("")
+            else:
+                prose.append("" if fence else re.sub(r"`+[^`\n]*`+", "", line))
         for phrase, reason in BANNED_PHRASES.items():
-            for line_number, line in enumerate(source.splitlines(), start=1):
+            for line_number, line in enumerate(prose, start=1):
                 if phrase in line:
                     fail(
                         f"{path.relative_to(REPO)}:{line_number}: {phrase!r}: {reason}"
@@ -145,6 +161,21 @@ def main() -> int:
     source = QUICKSTART.read_text(encoding="utf-8")
     go_example = GO_EXAMPLE.read_text(encoding="utf-8")
     quickstart_tape = QUICKSTART_TAPE.read_text(encoding="utf-8")
+
+    embedding_model = "google/embeddinggemma-2:bf16-safetensors-bundle-v1"
+    if source.count(f"antfly inference pull hf:{embedding_model}") != 1:
+        fail("install EmbeddingGemma2 once, before indexing; reuse it for image search")
+    demo_config = json.loads((REPO / "wikipedia-config.json").read_text())
+    for name, config in demo_config["indexes"].items():
+        if config["embedder"]["model"] != embedding_model:
+            fail(f"the {name} recording index must use the quickstart embedding model")
+        if config.get("dimension", 768) != 768:
+            fail(f"the {name} recording index must match EmbeddingGemma2's dimensions")
+    for label, example in (("quickstart", source), ("Go example", go_example)):
+        if embedding_model not in example:
+            fail(f"{label} must use EmbeddingGemma2")
+        if "clipclap" in example.lower() or "Qwen3-Embedding" in example:
+            fail(f"{label} retains a superseded embedding model")
 
     check_component_balance(source)
     blocks = fenced_blocks(source)

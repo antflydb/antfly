@@ -16,6 +16,37 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+/// The grouped planner replaces declared selectors with this synthetic input.
+pub const grouped_source_field = "_group_unit.text";
+
+/// Resolve the same upstream group for public, durable, and inspection catalogs.
+pub fn groupRoot(configs: anytype, name: []const u8) ?[]const u8 {
+    var current = name;
+    for (0..configs.len + 1) |_| {
+        const entry = for (configs) |cfg| {
+            if (std.mem.eql(u8, cfg.name, current)) break cfg;
+        } else return null;
+        const is_group = if (@hasField(@TypeOf(entry), "group_source_json")) entry.group_source_json.len > 0 else entry.kind == .group;
+        if (is_group) return entry.name;
+        current = entry.source_artifact_name;
+        if (current.len == 0) return null;
+    }
+    return null;
+}
+
+/// Borrowed runtime source-field selection. Public field names are literal
+/// object keys; only grouped execution supplies the synthetic group unit path.
+/// Template paths are interpreted separately by the template engine.
+pub fn sourceFieldValue(root: std.json.Value, field: []const u8, grouped: bool) std.json.Value {
+    if (root != .object) return .null;
+    if (grouped and std.mem.eql(u8, field, grouped_source_field)) {
+        const unit = root.object.get("_group_unit") orelse return .null;
+        if (unit != .object) return .null;
+        return unit.object.get("text") orelse .null;
+    }
+    return root.object.get(field) orelse .null;
+}
+
 /// Process-wide count of query-time embeds currently executing (a public
 /// query whose text is being embedded into a vector right now). The query
 /// layers increment it around the embed call itself — not the whole query —
@@ -183,6 +214,10 @@ pub const GeneratedEnrichmentRequest = struct {
     /// non-empty, the runtime samples the document's same-shard graph
     /// adjacency into the rendered producer input before dispatch.
     neighbor_context_json: []const u8 = "",
+    group_source_json: []const u8 = "",
+    group_artifact_name: []const u8 = "",
+    group_configuration: [32]u8 = @splat(0),
+    prior_context_json: []const u8 = "",
     /// Pinned dependency on committed graph adjacency or asset publication.
     requires_committed_graph: bool = false,
     execution_json: []const u8 = "",
@@ -196,6 +231,9 @@ pub const GeneratedEnrichmentRequest = struct {
     /// Replay sequence of the source document change. This is attached when a
     /// cached request plan is instantiated for a pending journal group.
     sequence: u64 = 0,
+    /// Document-owned reprocess generation, resolved once before execution.
+    /// Zero preserves legacy source-hash identities.
+    reprocess_generation: u64 = 0,
 };
 
 pub const GeneratedEnrichmentRef = struct {
@@ -223,6 +261,9 @@ pub fn freeGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReques
     if (request.chunker_json.len > 0) alloc.free(request.chunker_json);
     if (request.content_type.len > 0) alloc.free(request.content_type);
     if (request.producer_json.len > 0) alloc.free(request.producer_json);
+    if (request.group_source_json.len > 0) alloc.free(request.group_source_json);
+    if (request.group_artifact_name.len > 0) alloc.free(request.group_artifact_name);
+    if (request.prior_context_json.len > 0) alloc.free(request.prior_context_json);
     if (request.neighbor_context_json.len > 0) alloc.free(request.neighbor_context_json);
     if (request.execution_json.len > 0) alloc.free(request.execution_json);
     if (request.upstream_artifact_name.len > 0) alloc.free(request.upstream_artifact_name);
@@ -249,6 +290,12 @@ pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReque
     errdefer if (content_type.len > 0) alloc.free(content_type);
     const producer_json = if (request.producer_json.len > 0) try alloc.dupe(u8, request.producer_json) else "";
     errdefer if (producer_json.len > 0) alloc.free(producer_json);
+    const group_artifact_name = if (request.group_artifact_name.len > 0) try alloc.dupe(u8, request.group_artifact_name) else "";
+    errdefer if (group_artifact_name.len > 0) alloc.free(group_artifact_name);
+    const group_source_json = if (request.group_source_json.len > 0) try alloc.dupe(u8, request.group_source_json) else "";
+    errdefer if (group_source_json.len > 0) alloc.free(group_source_json);
+    const prior_context_json = if (request.prior_context_json.len > 0) try alloc.dupe(u8, request.prior_context_json) else "";
+    errdefer if (prior_context_json.len > 0) alloc.free(prior_context_json);
     const neighbor_context_json = if (request.neighbor_context_json.len > 0) try alloc.dupe(u8, request.neighbor_context_json) else "";
     errdefer if (neighbor_context_json.len > 0) alloc.free(neighbor_context_json);
     const execution_json = if (request.execution_json.len > 0) try alloc.dupe(u8, request.execution_json) else "";
@@ -285,11 +332,16 @@ pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReque
         .content_type = content_type,
         .producer_json = producer_json,
         .requires_committed_graph = request.requires_committed_graph,
+        .group_source_json = group_source_json,
+        .group_artifact_name = group_artifact_name,
+        .group_configuration = request.group_configuration,
+        .prior_context_json = prior_context_json,
         .neighbor_context_json = neighbor_context_json,
         .execution_json = execution_json,
         .upstream_artifact_name = upstream_artifact_name,
         .consumer_indexes = consumer_indexes,
         .sequence = request.sequence,
+        .reprocess_generation = request.reprocess_generation,
     };
 }
 
@@ -501,4 +553,12 @@ test "generated enrichment request clone releases every partial allocation" {
         }.run,
         .{source[0..]},
     );
+}
+
+/// A compiled group dependency selects its private unit namespace directly.
+/// This applies equally to live rows, deleted units and baseline censuses.
+pub fn appliesToDocument(request: GeneratedEnrichmentRequest, document: []const u8) bool {
+    const configuration = @import("../group_source_identity.zig").configurationOf(document);
+    if (configuration) |selected| return request.group_artifact_name.len > 0 and std.mem.eql(u8, &selected, &request.group_configuration);
+    return request.group_artifact_name.len == 0;
 }

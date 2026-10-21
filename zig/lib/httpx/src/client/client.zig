@@ -160,6 +160,9 @@ pub const RequestOptions = struct {
     /// to already-owned large envelopes whose lifetime spans redirects and
     /// retries. At most one body representation may be set.
     borrowed_body: ?[]const u8 = null,
+    /// Single-use upload, borrowed until requestToWriter returns. Response
+    /// reads and chunked upload run concurrently; redirects/retries are disabled.
+    body_stream: ?Request.BodyStream = null,
     /// Replayable borrowed body segments. The outer slice and all segment
     /// bytes must remain valid until the synchronous request returns. At most
     /// one body representation may be set.
@@ -1141,12 +1144,15 @@ pub const Client = struct {
 
         if (@intFromBool(reqOpts.body != null) +
             @intFromBool(reqOpts.borrowed_body != null) +
+            @intFromBool(reqOpts.body_stream != null) +
             @intFromBool(reqOpts.borrowed_body_segments != null) +
             @intFromBool(reqOpts.json != null) > 1)
             return error.ConflictingRequestBodies;
         if (reqOpts.body) |body| {
             try req.setBody(body);
         }
+
+        if (reqOpts.body_stream != null) return error.StreamingRequestRequiresWriter;
 
         if (reqOpts.borrowed_body) |body| {
             try req.setBorrowedBody(body);
@@ -1191,8 +1197,8 @@ pub const Client = struct {
             }
         }
 
-        const should_follow = reqOpts.follow_redirects orelse
-            self.config.redirect_policy.follow_redirects;
+        const should_follow = reqOpts.body_stream == null and (reqOpts.follow_redirects orelse
+            self.config.redirect_policy.follow_redirects);
         if (should_follow and response.isRedirect()) {
             if (depth >= self.config.redirect_policy.max_redirects) {
                 return error.TooManyRedirects;
@@ -1262,12 +1268,15 @@ pub const Client = struct {
 
         if (@intFromBool(reqOpts.body != null) +
             @intFromBool(reqOpts.borrowed_body != null) +
+            @intFromBool(reqOpts.body_stream != null) +
             @intFromBool(reqOpts.borrowed_body_segments != null) +
             @intFromBool(reqOpts.json != null) > 1)
             return error.ConflictingRequestBodies;
         if (reqOpts.body) |body| {
             try req.setBody(body);
         }
+
+        if (reqOpts.body_stream) |source| try req.setBodyStream(source);
 
         if (reqOpts.borrowed_body) |body| {
             try req.setBorrowedBody(body);
@@ -1314,8 +1323,8 @@ pub const Client = struct {
             }
         }
 
-        const should_follow = reqOpts.follow_redirects orelse
-            self.config.redirect_policy.follow_redirects;
+        const should_follow = reqOpts.body_stream == null and (reqOpts.follow_redirects orelse
+            self.config.redirect_policy.follow_redirects);
         if (should_follow and response.isRedirect()) {
             if (depth >= self.config.redirect_policy.max_redirects) {
                 return error.TooManyRedirects;
@@ -1826,6 +1835,14 @@ pub const Client = struct {
     }
 
     fn connectHostDirect(self: *Self, host: []const u8, port: u16) !Socket {
+        var socket = try self.connectHostAddress(host, port);
+        // HTTP headers and bodies may be separate writes. Nagle plus delayed
+        // ACK otherwise adds a timer per request on persistent H1 sockets.
+        // Match H2's existing low-latency policy, including direct/TLS paths.
+        socket.setNoDelay(true) catch {};
+        return socket;
+    }
+    fn connectHostAddress(self: *Self, host: []const u8, port: u16) !Socket {
         if (self.config.address_filter != null) {
             const address = try resolveAddressFiltered(self.io, host, port, self.config.address_filter);
             return try Socket.connect(address, self.io);
@@ -2087,7 +2104,7 @@ pub const Client = struct {
             break :blk self.config.timeouts.write_ms;
         };
 
-        if (shouldUseHttp2(self.config)) {
+        if (req.body_stream == null and shouldUseHttp2(self.config)) {
             var res = try self.executeRequestOnceUnobserved(req, timeout_override_ms, deadline_ms, interrupt);
             errdefer res.deinit();
             if (!res.isRedirect()) try notifyStreamingWriterResponse(writer, res);
@@ -2170,6 +2187,7 @@ pub const Client = struct {
         defer self.allocator.free(request_head);
         req.notifySend();
         try socket.sendAll(request_head);
+        if (req.body_stream != null) return self.executeDuplex(socket, socket, req, writer, progress_cb, progress_ctx);
         try req.writeBody(socket);
         const result = try self.readResponseToWriter(
             socket,
@@ -2216,6 +2234,10 @@ pub const Client = struct {
         const w = try session.getWriter();
         req.notifySend();
         try w.writeAll(request_head);
+        if (req.body_stream != null) {
+            try session.flush();
+            return self.executeDuplex(session, w, req, writer, progress_cb, progress_ctx);
+        }
         try req.writeBody(w);
         try session.flush();
         const result = try self.readResponseToWriter(
@@ -2229,6 +2251,49 @@ pub const Client = struct {
         if (keep_alive_out) |out| {
             out.* = result.reusable;
         }
+        return result.response;
+    }
+
+    /// The request source and response sink are borrowed until both tasks are
+    /// joined. Cancellation tears down blocked uploads on early peer responses.
+    fn executeDuplex(self: *Self, transport: anytype, output: anytype, req: *Request, writer: anytype, progress_cb: ?WriterProgressCallback, progress_ctx: ?*anyopaque) !Response {
+        const Upload = struct {
+            fn run(source: Request.BodyStream, target: @TypeOf(output), connection: @TypeOf(transport), failure: *?anyerror) Io.Cancelable!void {
+                send(source, target, connection) catch |err| {
+                    failure.* = err;
+                    if (comptime @TypeOf(connection) == *TlsSession) {
+                        if (connection.socket) |socket| socket.abortRequest();
+                    } else connection.abortRequest();
+                };
+            }
+            fn send(source: Request.BodyStream, target: @TypeOf(output), connection: @TypeOf(transport)) !void {
+                var chunk: [16384]u8 = undefined;
+                while (true) {
+                    const count = try source.read(source.context, &chunk);
+                    if (count > chunk.len) return error.InvalidRequestBody;
+                    if (count == 0) break;
+                    var header: [32]u8 = undefined;
+                    try target.writeAll(try std.fmt.bufPrint(&header, "{x}\r\n", .{count}));
+                    try target.writeAll(chunk[0..count]);
+                    try target.writeAll("\r\n");
+                    if (comptime @TypeOf(connection) == *TlsSession) try connection.flush();
+                }
+                try target.writeAll("0\r\n\r\n");
+                if (comptime @TypeOf(connection) == *TlsSession) try connection.flush();
+            }
+        };
+        var failure: ?anyerror = null;
+        var group: Io.Group = .init;
+        try group.concurrent(self.io, Upload.run, .{ req.body_stream.?, output, transport, &failure });
+        defer group.cancel(self.io);
+        const result = try self.readResponseToWriter(transport, req.method, self.responseSizeLimit(req), writer, progress_cb, progress_ctx);
+        // Cancel and join even when the peer terminates before upload EOF.
+        group.cancel(self.io);
+        if (failure) |err| if (err != error.Canceled and err != error.Cancelled) {
+            var response = result.response;
+            response.deinit();
+            return err;
+        };
         return result.response;
     }
 
@@ -2893,6 +2958,7 @@ pub const Client = struct {
     /// body reader. The caller reads DATA frames as they arrive without
     /// waiting for END_STREAM. Requires multiplexed mode (recv_running=true).
     pub fn requestStream(self: *Self, req: *Request) !H2StreamResponse {
+        if (req.body_stream != null) return error.StreamingRequestRequiresWriter;
         const host = req.uri.host orelse return error.InvalidUri;
         const is_tls = req.uri.isTls();
         const port = req.uri.effectivePort();
@@ -6254,12 +6320,14 @@ test "request redirects share a deadline for buffered streaming and cancellable 
     const TestServer = @import("../testing.zig").TestServer;
     const alloc = std.testing.allocator;
     const io = std.testing.io;
+    // Leave enough time to reach the final hop under concurrent build load.
+    // Resetting the budget at each redirect still exceeds the elapsed bound.
     for ([_]bool{ false, true }) |to_writer| {
         for ([_]bool{ false, true }) |coordinated| {
             var server = try TestServer.start(alloc, io, &.{
-                .{ .path = "/first", .respond = .{ .status = 307, .headers = &.{.{ .name = "Location", .value = "/second" }}, .delay_ns = 80 * std.time.ns_per_ms } },
-                .{ .path = "/second", .respond = .{ .status = 307, .headers = &.{.{ .name = "Location", .value = "/final" }}, .delay_ns = 80 * std.time.ns_per_ms } },
-                .{ .path = "/final", .respond = .{ .body = "ready", .delay_ns = 500 * std.time.ns_per_ms } },
+                .{ .path = "/first", .respond = .{ .status = 307, .headers = &.{.{ .name = "Location", .value = "/second" }}, .delay_ns = 400 * std.time.ns_per_ms } },
+                .{ .path = "/second", .respond = .{ .status = 307, .headers = &.{.{ .name = "Location", .value = "/final" }}, .delay_ns = 400 * std.time.ns_per_ms } },
+                .{ .path = "/final", .respond = .{ .body = "ready", .delay_ns = 3000 * std.time.ns_per_ms } },
             });
             defer server.deinit();
             const Task = struct {
@@ -6274,7 +6342,7 @@ test "request redirects share a deadline for buffered streaming and cancellable 
                 .keep_alive = false,
                 .cancel_in_flight_on_shutdown = coordinated,
                 .retry_policy = .{ .max_retries = 0 },
-                .timeouts = .{ .request_ms = 250 },
+                .timeouts = .{ .request_ms = 1500 },
             });
             defer client.deinit();
             const url = try std.fmt.allocPrint(alloc, "{s}/first", .{server.baseUrl()});
@@ -6283,14 +6351,14 @@ test "request redirects share a deadline for buffered streaming and cancellable 
             defer output.deinit(alloc);
             const start = common.milliTimestamp(io);
             // Exercise both default and per-request budgets.
-            const opts: RequestOptions = .{ .timeout_ms = if (coordinated) 250 else null };
+            const opts: RequestOptions = .{ .timeout_ms = if (coordinated) 1500 else null };
             if (to_writer) {
                 try std.testing.expectError(error.Timeout, client.getToWriter(url, opts, arrayListWriter(&output, alloc), null, null));
                 try std.testing.expectEqual(@as(usize, 0), output.items.len);
             } else {
                 try std.testing.expectError(error.Timeout, client.get(url, opts));
             }
-            try std.testing.expect(common.milliTimestamp(io) - start < 350);
+            try std.testing.expect(common.milliTimestamp(io) - start < 2000);
             try std.testing.expectEqualSlices(usize, &.{ 1, 1, 1 }, server.route_hits);
             try std.testing.expectEqual(@as(usize, 0), client.activeRequestCount());
         }
@@ -6478,4 +6546,225 @@ test "client body replay preserves method safety after truncation" {
             try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, server.route_hits);
         }
     }
+}
+
+test "HTTPS client uploads large immutable packs without truncation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const port = try reserveEphemeralPort(io);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "cert.pem", .data = test_tls_cert_pem });
+    try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = test_tls_key_pem });
+    const script =
+        \\import os, socket, ssl, sys
+        \\context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        \\context.load_cert_chain('cert.pem', 'key.pem')
+        \\listener = socket.socket()
+        \\listener.bind(('127.0.0.1', int(sys.argv[1])))
+        \\listener.listen()
+        \\versions = [ssl.TLSVersion.TLSv1_2]
+        \\if ssl.HAS_TLSv1_3:
+        \\    versions.append(ssl.TLSVersion.TLSv1_3)
+        \\with open('versions.tmp', 'w') as ready:
+        \\    ready.write(str(len(versions)))
+        \\os.replace('versions.tmp', 'versions.txt')
+        \\for version in versions:
+        \\    context.minimum_version = version
+        \\    context.maximum_version = version
+        \\    raw, _ = listener.accept()
+        \\    with context.wrap_socket(raw, server_side=True) as connection:
+        \\        connection.settimeout(30)
+        \\        for _ in range(4):
+        \\            data = b''
+        \\            while b'\r\n\r\n' not in data:
+        \\                chunk = connection.recv(4096)
+        \\                if not chunk:
+        \\                    raise RuntimeError('Truncated request headers')
+        \\                data += chunk
+        \\            headers, body = data.split(b'\r\n\r\n', 1)
+        \\            length = int(next(line.split(b':', 1)[1] for line in headers.split(b'\r\n') if line.lower().startswith(b'content-length:')))
+        \\            received = len(body)
+        \\            assert received <= length and body == b'*' * received
+        \\            while received < length:
+        \\                chunk = connection.recv(min(65536, length-received))
+        \\                if not chunk:
+        \\                    raise RuntimeError('Truncated request body')
+        \\                assert chunk == b'*' * len(chunk)
+        \\                received += len(chunk)
+        \\            connection.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok')
+        \\listener.close()
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = script });
+    var port_buf: [16]u8 = undefined;
+    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "python3", "server.py", port_arg },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    defer child.kill(io);
+    const url = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/", .{port});
+    defer allocator.free(url);
+    const ready_deadline = common.milliTimestamp(io) + 30_000;
+    const version_bytes = while (true) {
+        break tmp.dir.readFileAlloc(io, "versions.txt", allocator, .limited(8)) catch |err| switch (err) {
+            error.FileNotFound => {
+                if (common.milliTimestamp(io) >= ready_deadline) return error.TlsFixtureStartupTimeout;
+                try io.sleep(Io.Duration.fromMilliseconds(10), .awake);
+                continue;
+            },
+            else => return err,
+        };
+    };
+    defer allocator.free(version_bytes);
+    const version_count = try std.fmt.parseInt(usize, version_bytes, 10);
+    try std.testing.expect(version_count >= 1 and version_count <= 2);
+    for (0..version_count) |_| {
+        var client = Client.initWithConfig(allocator, io, .{
+            .keep_alive = true,
+            .verify_ssl = false,
+            .retry_policy = .{ .max_retries = 0 },
+            // This is a multi-MiB integrity campaign, including Debug crypto
+            // and allocator instrumentation. Short deadline/cancellation
+            // behavior is covered by the dedicated watchdog regressions.
+            .timeouts = .{ .request_ms = 30_000, .read_ms = 30_000, .write_ms = 30_000 },
+        });
+        defer client.deinit();
+        for ([_]usize{ 24 * 1024, 1024 * 1024, 8 * 1024 * 1024 }) |size| {
+            errdefer std.debug.print("TLS upload failed size={d}\n", .{size});
+            const body = try allocator.alloc(u8, size);
+            defer allocator.free(body);
+            @memset(body, '*');
+            var response = try client.post(url, .{ .body = body });
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            try std.testing.expectEqualStrings("ok", response.body orelse "");
+        }
+        // Fill the TLS plaintext buffer exactly. Ciphertext framing needs extra
+        // space, so one encryption pass cannot necessarily consume all of it.
+        const capacity = @import("../tls/client_compat.zig").min_buffer_len;
+        const body = try allocator.alloc(u8, capacity);
+        defer allocator.free(body);
+        @memset(body, '*');
+        var request = try Request.init(allocator, .POST, url);
+        defer request.deinit();
+        try request.setBorrowedBody(body);
+        const head = try serializeRequestHeadAlloc(allocator, &request);
+        defer allocator.free(head);
+        try request.setBorrowedBody(body[0 .. capacity - head.len]);
+        const exact_head = try serializeRequestHeadAlloc(allocator, &request);
+        defer allocator.free(exact_head);
+        try std.testing.expectEqual(capacity, exact_head.len + request.bodyLen());
+        var response = try client.executeRequest(&request, null, null, null);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        try std.testing.expectEqualStrings("ok", response.body orelse "");
+    }
+    std.debug.print("TLS buffer boundary verified protocol_versions={d}\n", .{version_count});
+}
+
+test "requestToWriter duplex upload observes response chunks before upload EOF and joins early rejection" {
+    const TestServer = @import("../testing.zig").TestServer;
+    const State = struct {
+        io: Io,
+        opening: Io.Event = .unset,
+        partial: Io.Event = .unset,
+        reads: usize = 0,
+        bytes: [64]u8 = undefined,
+        len: usize = 0,
+        fn read(raw: *anyopaque, dest: []u8) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.reads == 0) {
+                try self.opening.wait(self.io);
+                @memcpy(dest[0..4], "pcm!");
+                self.reads += 1;
+                return 4;
+            }
+            try self.partial.wait(self.io);
+            self.reads += 1;
+            return 0;
+        }
+        pub fn writeAll(self: *@This(), bytes: []const u8) !void {
+            if (bytes.len > self.bytes.len - self.len) return error.TestResponseTooLarge;
+            @memcpy(self.bytes[self.len..][0..bytes.len], bytes);
+            self.len += bytes.len;
+            if (std.mem.indexOf(u8, self.bytes[0..self.len], "opening") != null) self.opening.set(self.io);
+            if (std.mem.indexOf(u8, self.bytes[0..self.len], "partial") != null) self.partial.set(self.io);
+        }
+    };
+    const Peer = struct {
+        fn exact(socket: *Socket, expected: []const u8) !void {
+            for (expected) |byte| {
+                var actual: [1]u8 = undefined;
+                if (try socket.recv(&actual) != 1 or actual[0] != byte) return error.InvalidTestRequest;
+            }
+        }
+        fn run(server: *TestServer, reject: bool, failure: *?anyerror) Io.Cancelable!void {
+            serve(server, reject) catch |err| {
+                failure.* = err;
+            };
+        }
+        fn serve(server: *TestServer, reject: bool) !void {
+            const connection = try server.listener.accept();
+            var socket = connection.socket;
+            defer socket.close();
+            var head: [4096]u8 = undefined;
+            var len: usize = 0;
+            while (len < head.len) {
+                if (try socket.recv(head[len..][0..1]) != 1) return error.EndOfStream;
+                len += 1;
+                if (std.mem.endsWith(u8, head[0..len], "\r\n\r\n")) break;
+            }
+            if (std.mem.indexOf(u8, head[0..len], "chunked") == null) return error.InvalidTestRequest;
+            if (reject) {
+                try socket.writeAll("HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                return;
+            }
+            try socket.writeAll("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n7\r\nopening\r\n");
+            try exact(&socket, "4\r\npcm!\r\n");
+            try socket.writeAll("7\r\npartial\r\n");
+            try exact(&socket, "0\r\n\r\n");
+            try socket.writeAll("4\r\ndone\r\n0\r\n\r\n");
+        }
+    };
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |reject| {
+        var server = try TestServer.start(a, io, &.{});
+        defer server.deinit();
+        var failure: ?anyerror = null;
+        var group: Io.Group = .init;
+        try group.concurrent(io, Peer.run, .{ &server, reject, &failure });
+        defer group.cancel(io);
+        var state: State = .{ .io = io };
+        var client = Client.initWithConfig(a, io, .{ .keep_alive = false });
+        defer client.deinit();
+        var response = try client.requestToWriter(.POST, server.baseUrl(), .{ .body_stream = .{ .context = &state, .read = State.read }, .timeout_ms = 3000 }, &state, null, null);
+        defer response.deinit();
+        try group.await(io);
+        if (failure) |err| return err;
+        try std.testing.expectEqual(@as(u16, if (reject) 409 else 200), response.status.code);
+        if (!reject) {
+            try std.testing.expectEqualStrings("openingpartialdone", state.bytes[0..state.len]);
+            try std.testing.expectEqual(@as(usize, 2), state.reads);
+        }
+    }
+}
+
+test "H1 direct connections disable Nagle" {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const io = std.testing.io;
+    var listener = try @import("../net/socket.zig").TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var client = Client.init(std.testing.allocator, io);
+    defer client.deinit();
+    var socket = try client.connectHostDirect("127.0.0.1", listener.getLocalAddress().getPort());
+    defer socket.close();
+    var value: c_int = 0;
+    var size: std.posix.socklen_t = @sizeOf(c_int);
+    try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(std.posix.system.getsockopt(socket.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, @ptrCast(&value), &size)));
+    try std.testing.expect(value != 0);
 }

@@ -32,9 +32,11 @@ const decide_qualification = @import("../models/gliner_decide_qualification.zig"
 const safetensors_mod = @import("../models/safetensors.zig");
 const managed_receipt = @import("managed_receipt.zig");
 const c_file = @import("../util/c_file.zig");
+pub const pull_diagnostics = @import("pull_diagnostics.zig");
 pub const download = @import("download.zig");
 pub const qwen3vl_catalog = @import("qwen3vl_catalog.zig");
 pub const qwen3_embedding_catalog = @import("qwen3_embedding_catalog.zig");
+pub const embedding_gemma2_catalog = @import("embedding_gemma2_catalog.zig");
 pub const qwen3_reranker_catalog = @import("qwen3_reranker_catalog.zig");
 
 pub const ModelKind = enum {
@@ -70,6 +72,7 @@ test {
     _ = download;
     _ = qwen3vl_catalog;
     _ = qwen3_embedding_catalog;
+    _ = embedding_gemma2_catalog;
     _ = qwen3_reranker_catalog;
 }
 
@@ -519,8 +522,27 @@ pub const ModelRegistry = struct {
     }
 
     /// Pull a model from HuggingFace Hub, reporting progress to `progress_sink`
-    /// on the calling thread.
+    /// on the calling thread. Companion pulls recurse through this boundary,
+    /// so its error set must be explicit.
     pub fn pullWithProgress(
+        self: *ModelRegistry,
+        io: std.Io,
+        ref_str: []const u8,
+        hub_config: download.HubConfig,
+        tasks_csv: ?[]const u8,
+        capabilities_csv: ?[]const u8,
+        projector_selection: download.ProjectorSelection,
+        caller_sink: download.ProgressSink,
+    ) anyerror!void {
+        // Both CLIs and the linked engine use this path. Preserve the cause
+        // and report it here before a caller reduces it to a startup error.
+        return self.pullWithProgressImpl(io, ref_str, hub_config, tasks_csv, capabilities_csv, projector_selection, caller_sink) catch |err| {
+            pull_diagnostics.report(ref_str, err);
+            return err;
+        };
+    }
+
+    fn pullWithProgressImpl(
         self: *ModelRegistry,
         io: std.Io,
         ref_str: []const u8,
@@ -551,6 +573,41 @@ pub const ModelRegistry = struct {
             .lock = .exclusive,
         });
         defer download_lock.close(io);
+
+        // Immutable catalog pulls are idempotent. Do this before staging:
+        // even creating a hard link changes the live artifact's ctime and
+        // needlessly invalidates a loaded model's coherency signature.
+        if (tasks_csv == null and capabilities_csv == null) {
+            const cached = if (qwen3vl_catalog.findGenerationBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| blk: {
+                const descriptor = try qwen3vl_catalog.generationBundleManifestAlloc(self.allocator, bundle);
+                defer self.allocator.free(descriptor);
+                break :blk try download.installedPinnedBundleMatches(self.allocator, io, dest, .{
+                    .artifacts = &bundle.artifacts(),
+                    .generated = &.{.{ .path = download.bundle_descriptor_filename, .bytes = descriptor }},
+                }, hub_config, progress_sink);
+            } else if (qwen3vl_catalog.findGenerationSafetensorsBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle|
+                try download.installedPinnedBundleMatches(self.allocator, io, dest, .{
+                    .artifacts = &bundle.artifacts(),
+                    .generated = &.{.{ .path = download.bundle_descriptor_filename, .bytes = qwen3vl_catalog.generation_safetensors_bundle_manifest }},
+                }, hub_config, progress_sink)
+            else if (qwen3vl_catalog.isRerankerBundleRef(ref.owner, ref.name, ref.variant))
+                try download.installedPinnedBundleMatches(self.allocator, io, dest, .{
+                    .artifacts = &qwen3vl_catalog.rerankerArtifacts(),
+                    .generated = &.{.{ .path = download.bundle_descriptor_filename, .bytes = qwen3vl_catalog.reranker_bundle_manifest }},
+                }, hub_config, progress_sink)
+            else if (qwen3_embedding_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle|
+                try download.installedPinnedBundleMatches(self.allocator, io, dest, .{ .artifacts = bundle.artifacts() }, hub_config, progress_sink)
+            else if (embedding_gemma2_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle|
+                try download.installedPinnedBundleMatches(self.allocator, io, dest, .{ .artifacts = bundle.artifacts() }, hub_config, progress_sink)
+            else if (qwen3_reranker_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle|
+                try download.installedPinnedBundleMatches(self.allocator, io, dest, .{ .artifacts = bundle.artifacts() }, hub_config, progress_sink)
+            else
+                false;
+            if (cached) {
+                try download.finishVerifiedManagedInstall(self.allocator, io, dest);
+                return;
+            }
+        }
 
         var transaction = try download.ManagedModelTransaction.begin(self.allocator, io, dest);
         defer transaction.deinit(io);
@@ -602,6 +659,18 @@ pub const ModelRegistry = struct {
                 hub_config,
                 progress_sink,
             );
+        } else if (embedding_gemma2_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| {
+            try download.downloadPinnedEmbeddingGemma2Bundle(
+                self.allocator,
+                io,
+                ref.owner,
+                ref.name,
+                ref.variant,
+                bundle,
+                transaction.staging,
+                hub_config,
+                progress_sink,
+            );
         } else if (qwen3_reranker_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| {
             try download.downloadPinnedQwen3RerankerBundle(
                 self.allocator,
@@ -634,6 +703,7 @@ pub const ModelRegistry = struct {
             try download.writeManagedArtifactAndUpdatePlan(self.allocator, io, transaction.staging, "model_manifest.json", lightonocr3.manifest_json);
         }
         try self.writePulledModelManifest(io, transaction.staging, tasks_csv, capabilities_csv);
+        try download.validateManagedDownloadLimits(self.allocator, io, transaction.staging, hub_config);
         try download.completeManagedDownload(self.allocator, io, transaction.staging);
 
         // Gemma4 QAT gguf checkpoints ship a sibling MTP assistant repo that
@@ -1212,22 +1282,42 @@ test "boundary typed decisions require exact multi-Decide identity independent o
 /// The published Decide contract is granted only to the reviewed checkpoint
 /// bytes. Repository/path spelling is intentionally irrelevant: local copies
 /// of the same immutable artifact qualify, while changed weights fail closed.
-fn decideIdentityIsQualified(allocator: std.mem.Allocator, manifest: *const manifest_mod.ModelManifest) bool {
-    if (!std.mem.eql(u8, manifest.gliner_model_type, "gliner2") or manifest.gliner_architecture != .span or !manifest.gliner_span_declared) return false;
-    const weight_path = manifest.safetensors_path orelse return false;
-    var reader = safetensors_mod.MMapReader.openFileAbsolute(allocator, weight_path) catch return false;
-    defer reader.deinit();
-    var all_f32 = true;
-    var tensors = reader.header.tensors.iterator();
-    while (tensors.next()) |entry| if (entry.value_ptr.dtype != .f32) {
-        all_f32 = false;
-        break;
-    };
+fn decideIdentity(allocator: std.mem.Allocator, manifest: *const manifest_mod.ModelManifest) ?decide_qualification.Identity {
+    if (!std.mem.eql(u8, manifest.gliner_model_type, "gliner2") or manifest.gliner_architecture != .span or !manifest.gliner_span_declared) return null;
+    var weight: decide_qualification.Digest = undefined;
+    var companion: ?decide_qualification.Digest = null;
+    var inventory: decide_qualification.TensorInventory = undefined;
+    if (manifest.gguf_path) |encoder_path| {
+        const head_path = manifest.gliner_head_gguf_path orelse return null;
+        var encoder = c_file.MmapRegion.init(allocator, encoder_path) catch return null;
+        defer encoder.deinit();
+        var head = c_file.MmapRegion.init(allocator, head_path) catch return null;
+        defer head.deinit();
+        var encoder_file = gguf_format.parse(allocator, encoder.data) catch return null;
+        defer encoder_file.deinit(allocator);
+        var head_file = gguf_format.parse(allocator, head.data) catch return null;
+        defer head_file.deinit(allocator);
+        weight = decide_qualification.Digest.of(encoder.data);
+        companion = decide_qualification.Digest.of(head.data);
+        inventory = .{ .count = encoder_file.tensors.len + head_file.tensors.len, .all_f32 = false };
+    } else {
+        const weight_path = manifest.safetensors_path orelse return null;
+        var reader = safetensors_mod.MMapReader.openFileAbsolute(allocator, weight_path) catch return null;
+        defer reader.deinit();
+        var all_f32 = true;
+        var tensors = reader.header.tensors.iterator();
+        while (tensors.next()) |entry| if (entry.value_ptr.dtype != .f32) {
+            all_f32 = false;
+            break;
+        };
+        weight = decide_qualification.Digest.of(reader.file_bytes);
+        inventory = .{ .count = reader.header.tensors.count(), .all_f32 = all_f32 };
+    }
     const identity = decide_qualification.Identity{
         .encoder_family = switch (manifest.gliner_span_encoder_family) {
             .deberta => .deberta,
             .modern_bert => .modern_bert,
-            .unknown => return false,
+            .unknown => return null,
         },
         .geometry = .{
             .hidden_size = manifest.hidden_size,
@@ -1246,17 +1336,23 @@ fn decideIdentityIsQualified(allocator: std.mem.Allocator, manifest: *const mani
             .sep_struct = manifest.gliner_token_sep_struct,
             .sep_text = manifest.gliner_token_sep_text,
         },
-        .inventory = .{ .count = reader.header.tensors.count(), .all_f32 = all_f32 },
-        .weight = decide_qualification.Digest.of(reader.file_bytes),
+        .inventory = inventory,
+        .weight = weight,
+        .weight_companion = companion,
         .sidecars = .{
-            .config = manifest.gliner_span_config_digest orelse return false,
-            .encoder_config = manifest.gliner_span_encoder_digest orelse return false,
-            .tokenizer = manifest.gliner_span_tokenizer_digest orelse return false,
-            .tokenizer_config = manifest.gliner_span_tokenizer_config_digest orelse return false,
+            .config = manifest.gliner_span_config_digest orelse return null,
+            .encoder_config = manifest.gliner_span_encoder_digest orelse return null,
+            .tokenizer = manifest.gliner_span_tokenizer_digest orelse return null,
+            .tokenizer_config = manifest.gliner_span_tokenizer_config_digest orelse return null,
             .special_tokens_map = manifest.gliner_span_special_tokens_digest,
         },
     };
-    return decide_qualification.qualifiedVariant(identity) != null;
+    if (decide_qualification.qualifiedVariant(identity) == null) return null;
+    return identity;
+}
+
+fn decideIdentityIsQualified(allocator: std.mem.Allocator, manifest: *const manifest_mod.ModelManifest) bool {
+    return decideIdentity(allocator, manifest) != null;
 }
 
 fn isKnownDecideSource(source: managed_receipt.DownloadSource) bool {
@@ -1617,6 +1713,8 @@ fn appendInferredInputs(
     const has_visual = manifest.visual_model_path != null or
         manifest.visual_projection_path != null or
         gguf_projector_has_image or
+        // Native Moondream2 checkpoints carry the vision tower in model.safetensors.
+        std.mem.eql(u8, manifest.config_model_arch, "moondream1") or
         (manifest.gguf_projector_path != null and gguf_projector_kind == .unknown);
     const has_audio = manifest.audio_model_path != null or
         manifest.audio_projection_path != null or
@@ -1755,6 +1853,56 @@ fn synthesizePulledModelManifestJsonFromPlan(
 
 const PulledManifestSource = enum { published, staging_plan };
 
+fn qualifiedLimitsJsonAlloc(allocator: std.mem.Allocator, boundary_identity: ?@import("../models/gliner_boundary_bundle.zig").Identity, decide_identity: ?decide_qualification.Identity) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Profile = struct { backend: []const u8, features: []const []const u8, lengths: gliner_qualification.LengthContract };
+    var profiles: std.ArrayList(Profile) = .empty;
+    if (boundary_identity) |identity| for (gliner_qualification.publishedProfiles()) |entry| {
+        if (!std.meta.eql(identity, entry.identity)) continue;
+        var features: std.ArrayList([]const u8) = .empty;
+        var iterator = entry.features.iterator();
+        while (iterator.next()) |feature| try features.append(a, @tagName(feature));
+        try profiles.append(a, .{ .backend = @tagName(entry.backend), .features = features.items, .lengths = entry.lengths });
+    };
+    return try std.json.Stringify.valueAlloc(allocator, .{
+        .profiles = profiles.items,
+        .decide = if (decide_identity) |identity| try decide_qualification.requestLimits(identity) else null,
+        .span_extraction_status = if (decide_identity) |identity| if (decide_qualification.supportsSpanExtraction(identity)) @as(?[]const u8, "parity_only_no_nonempty_eval") else null else null,
+        .span_windows = if (decide_identity) |identity| if (decide_qualification.supportsSpanExtraction(identity)) @import("../models/gliner_span_window_limits.zig").qualified else null else null,
+        .runtime_revalidates_artifact = true,
+    }, .{});
+}
+
+test "qualified limits JSON shares serving geometry and window bounds" {
+    const a = std.testing.allocator;
+    const raw = try qualifiedLimitsJsonAlloc(a, gliner_qualification.fastino_gliner25_base_v1, decide_qualification.pinned_fp32_identity);
+    defer a.free(raw);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expect(root.get("runtime_revalidates_artifact").?.bool);
+    try std.testing.expect(root.get("profiles").?.array.items.len > 0);
+    const published = root.get("decide").?.object;
+    const enforced = (try decide_qualification.requestLimits(decide_qualification.pinned_fp32_identity)).?;
+    try std.testing.expectEqual(@as(i64, @intCast(enforced.sequence_tokens)), published.get("sequence_tokens").?.integer);
+    try std.testing.expectEqual(@as(i64, @intCast(enforced.prepared_sequences)), published.get("prepared_sequences").?.integer);
+    try std.testing.expectEqualStrings("parity_only_no_nonempty_eval", root.get("span_extraction_status").?.string);
+    const windows = root.get("span_windows").?.object;
+    const bounds = @import("../models/gliner_span_window_limits.zig").qualified;
+    try std.testing.expectEqual(@as(i64, @intCast(bounds.max_windows)), windows.get("max_windows").?.integer);
+    try std.testing.expectEqual(@as(i64, @intCast(bounds.max_request_tokens)), windows.get("max_request_tokens").?.integer);
+    try std.testing.expectEqual(@as(i64, @intCast(bounds.max_document_bytes)), windows.get("max_document_bytes").?.integer);
+    try std.testing.expectEqual(@as(i64, @intCast(bounds.max_document_words)), windows.get("max_document_words").?.integer);
+    const absent = try qualifiedLimitsJsonAlloc(a, null, null);
+    defer a.free(absent);
+    const none = try std.json.parseFromSlice(std.json.Value, a, absent, .{});
+    defer none.deinit();
+    try std.testing.expect(none.value.object.get("decide").? == .null);
+    try std.testing.expect(none.value.object.get("span_windows").? == .null);
+}
+
 fn synthesizePulledModelManifestJsonInternal(
     allocator: std.mem.Allocator,
     dest_dir: []const u8,
@@ -1772,8 +1920,10 @@ fn synthesizePulledModelManifestJsonInternal(
     // and compare it against the reviewed production table. This must never
     // run on the per-request listing path (loadListingFromDir), only here,
     // where the artifact was just staged to disk.
-    const qualified_boundary = boundaryIdentityIsQualified(allocator, &manifest);
-    const qualified_decide = decideIdentityIsQualified(allocator, &manifest);
+    const boundary_identity = boundaryIdentity(allocator, &manifest);
+    const qualified_boundary = if (boundary_identity) |identity| gliner_qualification.hasQualifiedIdentity(identity) else false;
+    const decide_identity = decideIdentity(allocator, &manifest);
+    const qualified_decide = decide_identity != null;
     const qualified_boundary_decide = boundaryDecisionIdentityIsQualified(allocator, &manifest);
     const decision_candidate = isGlinerDecisionCandidate(&manifest);
     const known_decide_source = source == .staging_plan and try isKnownDecideStagingSource(allocator, dest_dir);
@@ -1833,6 +1983,17 @@ fn synthesizePulledModelManifestJsonInternal(
         if (capabilities_csv) |csv| try appendCsvCapabilities(allocator, &capabilities, csv);
     }
     if (qualified_decide) {
+        // A raw or old synthesized manifest may still claim NER/relations.
+        // Never carry those claims forward from the zero-output 1B checkpoint.
+        if (decide_identity.?.encoder_family == .modern_bert) {
+            var i: usize = 0;
+            while (i < capabilities.items.len) {
+                const capability = capabilities.items[i];
+                if (std.mem.eql(u8, capability, "named_entity_recognition") or std.mem.eql(u8, capability, "relations") or std.mem.eql(u8, capability, "extraction")) {
+                    allocator.free(capabilities.orderedRemove(i));
+                } else i += 1;
+            }
+        }
         try appendQualifiedDecisionCapabilities(allocator, true, &capabilities);
         for (tasks.items) |task| if (!std.mem.eql(u8, task, "extract") and !std.mem.eql(u8, task, "decide")) return error.InvalidModelManifest;
         for (capabilities.items) |capability| if (!std.mem.eql(u8, capability, "classification") and !std.mem.eql(u8, capability, "typed_decisions")) return error.InvalidModelManifest;
@@ -1868,6 +2029,12 @@ fn synthesizePulledModelManifestJsonInternal(
     }
     if (qualified_decide)
         try body.appendSlice(allocator, ",\"gliner_classification_head\":\"label_marker_mlp\"");
+    if (qualified_boundary or qualified_decide) {
+        const limits = try qualifiedLimitsJsonAlloc(allocator, boundary_identity, decide_identity);
+        defer allocator.free(limits);
+        try body.appendSlice(allocator, ",\"qualified_limits\":");
+        try body.appendSlice(allocator, limits);
+    }
     if (sparse_3d_output_layout) |layout| {
         try body.appendSlice(allocator, ",\"sparse_3d_output_layout\":");
         try appendJsonString(&body, allocator, sparse3DOutputLayoutName(layout));
@@ -2794,4 +2961,67 @@ test "LightOnOCR3 pulled manifest preserves OCR identity when tasks are overridd
     try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"generator\"") != null);
     try std.testing.expectEqualStrings(lightonocr3.pinned_ref, resolveFriendlyRef("LightOnOCR3-0.8B").?);
     try std.testing.expectEqualStrings(lightonocr3.pinned_ref_4b, resolveFriendlyRef("LightOnOCR3-4B").?);
+}
+
+test "native Moondream2 manifests declare image input for reader and generator roles" {
+    const allocator = std.testing.allocator;
+    const manifest = manifest_mod.ModelManifest{ .allocator = allocator, .config_model_arch = "moondream1" };
+    for ([_]manifest_mod.ModelType{ .reader, .generator }) |role| {
+        var inputs = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (inputs.items) |item| allocator.free(item);
+            inputs.deinit(allocator);
+        }
+        try appendInferredInputs(allocator, &manifest, role, &inputs);
+        var has_image = false;
+        for (inputs.items) |item| has_image = has_image or std.mem.eql(u8, item, "image");
+        try std.testing.expect(has_image);
+    }
+}
+
+test "gliner boundary Transformers wrapper pull manifest qualifies the unchanged real weights" {
+    const source = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "encoder_config");
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(directory);
+    // Copy into the fixture so read-only caches, separate filesystems, and
+    // sandboxed test runs need only read access to the source model.
+    inline for (.{ "model.safetensors", "encoder_config/config.json", "tokenizer.json", "tokenizer_config.json" }) |name| {
+        const from = try std.fs.path.join(a, &.{ source, name });
+        defer a.free(from);
+        try Dir.cwd().copyFile(from, tmp.dir, name, io, .{ .permissions = std.Io.File.Permissions.default_file });
+    }
+    const config = try @import("../architectures/gliner/boundary_parity_test.zig").fixtureBytes(a, "models/base/config_transformers.json");
+    defer a.free(config);
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = config });
+    const manifest_json = try synthesizePulledModelManifestJson(a, directory, null, null);
+    defer a.free(manifest_json);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"tasks\":[\"extract\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"qualified_limits\"") != null);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = manifest_json });
+    var manifest = try manifest_mod.loadFromDir(a, directory);
+    defer manifest.deinit();
+    const identity = boundaryIdentity(a, &manifest) orelse return error.TestExpectedQualifiedIdentity;
+    try std.testing.expect(gliner_qualification.hasQualifiedIdentity(identity));
+    try std.testing.expectEqual(gliner_qualification.fastino_gliner25_base_v1_transformers.fingerprint(), identity.fingerprint());
+    // A valid but unreviewed config must not gain extraction advertisement.
+    const changed = try std.mem.replaceOwned(u8, a, config, "\"transformers_version\": \"5.8.0\"", "\"transformers_version\": \"5.8.1\"");
+    defer a.free(changed);
+    // The replacement also changes the inline encoder declaration, so keep
+    // its sidecar consistent while still producing an unreviewed identity.
+    const encoder_path = try std.fs.path.join(a, &.{ source, "encoder_config/config.json" });
+    defer a.free(encoder_path);
+    const original_encoder = try c_file.readFile(a, encoder_path);
+    defer a.free(original_encoder);
+    const changed_encoder = try std.mem.replaceOwned(u8, a, original_encoder, "5.8.0", "5.8.1");
+    defer a.free(changed_encoder);
+    try tmp.dir.writeFile(io, .{ .sub_path = "encoder_config/config.json", .data = changed_encoder });
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = changed });
+    const unreviewed = try synthesizePulledModelManifestJson(a, directory, null, null);
+    defer a.free(unreviewed);
+    try std.testing.expect(std.mem.indexOf(u8, unreviewed, "\"tasks\":[\"extract\"]") == null);
 }

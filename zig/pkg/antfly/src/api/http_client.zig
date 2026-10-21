@@ -505,7 +505,7 @@ pub const ApiHttpClient = struct {
         timeout_ms: ?u32,
         cancellation: ?*const http_common.RequestCancellation,
     ) !LookupResponse {
-        return self.fetchGroupLookupWithMode(base_uri, group_id, table_name, key, fields, read_consistency, timeout_ms, cancellation, false, false, "", "", "", "", null, null, false);
+        return self.fetchGroupLookupWithMode(base_uri, group_id, table_name, key, fields, read_consistency, timeout_ms, cancellation, false, false, "", "", "", "", "", null, null, false);
     }
 
     pub fn fetchGroupLookupWithMode(
@@ -524,6 +524,7 @@ pub const ApiHttpClient = struct {
         relational_activation_json: []const u8,
         relational_index_status_json: []const u8,
         relational_topology_json: []const u8,
+        group_source_query_json: []const u8,
         restore_staging_scope: ?[32]u8,
         restore_staging_plan_id: ?[16]u8,
         include_primary_digest: bool,
@@ -536,7 +537,7 @@ pub const ApiHttpClient = struct {
         // value even when they contain URI delimiters.
         const encoded_table_name = try percentEncodePathComponent(self.alloc, table_name);
         defer self.alloc.free(encoded_table_name);
-        const special = relational_integrity_catalog or relational_integrity_action or relational_integrity_jobs_json.len != 0 or relational_activation_json.len != 0 or relational_topology_json.len != 0 or relational_index_status_json.len != 0;
+        const special = group_source_query_json.len != 0 or relational_integrity_catalog or relational_integrity_action or relational_integrity_jobs_json.len != 0 or relational_activation_json.len != 0 or relational_topology_json.len != 0 or relational_index_status_json.len != 0;
         // Routing uses the actual logical key, including empty first-range
         // boundaries. Only the already-routed HTTP path needs a placeholder.
         const encoded_key = try percentEncodePathComponent(self.alloc, if (special and key.len == 0) "\x00relational_control" else key);
@@ -589,7 +590,11 @@ pub const ApiHttpClient = struct {
         defer if (index_status.len != 0) self.alloc.free(index_status);
         const index_path = if (index_status.len != 0) try std.fmt.allocPrint(self.alloc, "{s}&_relational_index_status={s}", .{ observation_path orelse path, index_status }) else null;
         defer if (index_path) |value| self.alloc.free(value);
-        const uri = try self.joinRoute(base_uri, index_path orelse observation_path orelse path);
+        const group_source = if (group_source_query_json.len != 0) try percentEncodePathComponent(self.alloc, group_source_query_json) else "";
+        defer if (group_source.len != 0) self.alloc.free(group_source);
+        const group_path = if (group_source.len != 0) try std.fmt.allocPrint(self.alloc, "{s}&_group_source={s}", .{ index_path orelse observation_path orelse path, group_source }) else null;
+        defer if (group_path) |value| self.alloc.free(value);
+        const uri = try self.joinRoute(base_uri, group_path orelse index_path orelse observation_path orelse path);
         defer self.alloc.free(uri);
 
         var resp = try self.executeRequest(.{
@@ -2041,6 +2046,50 @@ pub const ApiHttpClient = struct {
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
     }
 
+    pub fn fetchGroupGraphEdgesBatchWithControl(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !QueryResponse {
+        const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+            routes.Routes.tables_prefix,
+            table_name,
+            routes.Routes.graph_edges_batch_suffix,
+        });
+        defer self.alloc.free(suffix);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executeRequest(.{
+            .method = .POST,
+            .uri = uri,
+            .content_type = "application/json",
+            .body = body,
+            .timeout_ms = timeout_ms,
+            .cancellation = cancellation,
+        });
+        defer resp.deinit(self.alloc);
+        switch (resp.status) {
+            200 => {},
+            400 => return error.InvalidGraphEdgesWireRequest,
+            408 => return error.Timeout,
+            404 => return error.GraphEdgesBatchUnsupported,
+            409 => return remoteGroupConflictError(resp.body),
+            422 => return remoteGraphEdgesError(resp.body),
+            503 => return remoteStorageReadUnavailableError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
+        const result: QueryResponse = .{ .body = resp.body, .owner_allocator = resp.owner_allocator orelse self.alloc };
+        resp.body = &.{};
+        return result;
+    }
+
     pub fn fetchGroupGraphMetricMaintenance(
         self: *ApiHttpClient,
         base_uri: []const u8,
@@ -2087,6 +2136,71 @@ pub const ApiHttpClient = struct {
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
+            else => return error.UnexpectedHttpStatus,
+        }
+        return .{ .body = try self.alloc.dupe(u8, resp.body) };
+    }
+
+    pub fn fetchGroupResolverOperation(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !QueryResponse {
+        return self.fetchGroupResolverOperationWithCancellation(base_uri, group_id, table_name, body, null);
+    }
+
+    pub fn fetchGroupResolverOperationWithCancellation(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !QueryResponse {
+        return self.fetchGroupResolverOperationWithControl(base_uri, group_id, table_name, body, null, cancellation);
+    }
+
+    pub fn fetchGroupResolverOperationWithControl(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !QueryResponse {
+        const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+            routes.Routes.tables_prefix,
+            table_name,
+            routes.Routes.resolver_operation_suffix,
+        });
+        defer self.alloc.free(suffix);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executeRequest(.{
+            .method = .POST,
+            .uri = uri,
+            .content_type = "application/json",
+            .body = body,
+            .cancellation = cancellation,
+            .timeout_ms = timeout_ms,
+        });
+        defer resp.deinit(self.alloc);
+        switch (resp.status) {
+            200 => {},
+            400 => return error.InvalidResolverCurationRequest,
+            403 => return error.Forbidden,
+            404 => return error.UnknownGroup,
+            405 => return error.UnsupportedOperation,
+            409 => return error.ResolverCurationConflict,
+            408, 504 => return error.Timeout,
+            429 => return error.Busy,
             503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
@@ -3283,6 +3397,10 @@ pub const ApiHttpClient = struct {
     }
 
     pub fn fetchGroupOnlineMergeIo(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("online_merge_io.zig").contract.Request, timeout_ms: u32, cancellation: ?*const http_common.RequestCancellation) !QueryResponse {
+        const contract = @import("online_merge_io.zig").contract;
+        const budget_ms = try contract.serverBudgetMs(timeout_ms);
+        var budget_buffer: [16]u8 = undefined;
+        const budget = try std.fmt.bufPrint(&budget_buffer, "{d}", .{budget_ms});
         try request.validate();
         if (group_id != request.ownerGroup()) return error.OnlineSourceScopeChanged;
         const table = try percentEncodePathComponent(self.alloc, table_name);
@@ -3294,7 +3412,7 @@ pub const ApiHttpClient = struct {
         const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
         defer self.alloc.free(body);
         if (body.len > @import("online_merge_io.zig").contract.max_request_bytes) return error.InvalidMergePage;
-        var resp = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = timeout_ms, .cancellation = cancellation, .max_response_bytes = @import("online_merge_io.zig").contract.max_response_bytes });
+        var resp = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .headers = &.{.{ .name = contract.remaining_ms_header, .value = budget }}, .timeout_ms = timeout_ms, .cancellation = cancellation, .max_response_bytes = @import("online_merge_io.zig").contract.max_response_bytes });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
@@ -4060,6 +4178,7 @@ fn isDocIdentityNamespaceMismatchConflictMessage(body: []const u8) bool {
 }
 
 fn remoteGroupConflictError(body: []const u8) anyerror {
+    if (std.mem.eql(u8, body, "DocumentArtifactPublicationFailed")) return error.DocumentArtifactPublicationFailed;
     if (std.mem.eql(u8, body, "IndexGenerationMismatch")) return error.IndexGenerationMismatch;
     if (std.mem.eql(u8, body, "DecisionConflict") or std.mem.eql(u8, body, "decision conflict")) return error.DecisionConflict;
     if (transactions_api.isTopologyChangedConflictMessage(body)) return error.TopologyChanged;
@@ -4535,6 +4654,7 @@ fn consumerTests() type {
         test "api http client preserves stale hierarchy cursor conflicts" {
             try std.testing.expectEqual(error.HierarchyCursorStale, remoteGroupConflictError("HierarchyCursorStale"));
             try std.testing.expectEqual(error.HierarchyCursorStale, remoteGroupConflictError("hierarchy cursor stale"));
+            try std.testing.expectEqual(error.DocumentArtifactPublicationFailed, remoteGroupConflictError("DocumentArtifactPublicationFailed"));
         }
 
         test "api http client preserves remote storage read contention" {
@@ -5216,6 +5336,10 @@ fn consumerTests() type {
                         try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, header.value, "."));
                     }
                     try std.testing.expectEqual(@as(usize, if (self.expected_internal) 1 else 0), service_headers);
+                    if (std.mem.endsWith(u8, req.uri, routes.Routes.online_merge_io_suffix)) {
+                        try std.testing.expectEqual(@as(?u32, 1000), req.timeout_ms);
+                        try std.testing.expectEqualStrings("950", req.header(@import("online_merge_io.zig").contract.remaining_ms_header).?);
+                    }
                     return .{ .status = 200, .body = try alloc.dupe(u8, "{}") };
                 }
             };
@@ -6512,4 +6636,20 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "public graph metric borrowed wire edge batch endpoint capability" {
+    const Fake = struct {
+        calls: usize = 0,
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/groups/7/tables/docs/graph-edges-batch"));
+            return .{ .status = 404, .body = try a.dupe(u8, "unsupported") };
+        }
+    };
+    var fake = Fake{};
+    var client = ApiHttpClient.init(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+    try std.testing.expectError(error.GraphEdgesBatchUnsupported, client.fetchGroupGraphEdgesBatchWithControl("http://example.test", 7, "docs", "{}", null, null));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
 }

@@ -54,7 +54,32 @@ const std = @import("std");
 /// Version 27 persists reduction ownership for exact contribution retention.
 /// Version 28 maintains immutable ownership counts and publication root sets.
 /// Version 29 admits seekable native text corpora and their durable GC frontier.
-pub const current_version: u16 = 30;
+/// Version 31 decodes bounded relation source-adoption and reconciliation-job
+/// controls and independently prepared page advances. Serving/root activation and pending reservation sources remain
+/// separate capabilities, never implied by this decoder floor.
+/// Version 32 decodes independently verified live relation-root publication
+/// and adopts every native namespace writer in the same durable transaction.
+/// Version 33 decodes name-sensitive table replacements carrying an exact
+/// relation-owner, logical-binding and metadata-incarnation mutation fence.
+/// Version 34 owns resolver corrections on destination namespaces, maintains
+/// their durable dependency index and applies bounded replay pages.
+/// Version 35 rejects incompatible resolver projection at admission and apply,
+/// and fences every namespace mutation against its validated consumer cut.
+/// Version 36 decodes curation provenance, cascade dispositions and proposal
+/// queues. Even an empty newly serialized namespace has fields v35 rejects.
+/// Version 37 fences proposal-owned source corrections at primary apply and
+/// understands durable queue identities on embedded resolver receipts.
+pub const current_version: u16 = 37;
+pub const resolver_namespaces_version: u16 = 37;
+/// Conservative admission over canonical stored JSON, shared by catalog and
+/// direct table writers so neither entry path can bypass the decoder floor.
+pub fn usesResolverNamespaces(indexes_json: []const u8) bool {
+    return std.mem.indexOf(u8, indexes_json, "_resolver_namespaces") != null or std.mem.indexOf(u8, indexes_json, "namespace_owned") != null or std.mem.indexOf(u8, indexes_json, "resolvers") != null or std.mem.indexOf(u8, indexes_json, "_resolver_curation") != null or std.mem.indexOf(u8, indexes_json, "_curation_proposals") != null;
+}
+
+pub const relation_mutation_version: u16 = 33;
+pub const relation_publication_version: u16 = 32;
+pub const relation_reconciliation_version: u16 = 31;
 pub const object_table_engine_version: u16 = 30;
 pub const lake_index_catalog_version: u16 = 29;
 pub const durable_activation_version: u16 = 9;

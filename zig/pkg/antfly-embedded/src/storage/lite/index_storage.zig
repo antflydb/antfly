@@ -69,6 +69,7 @@ pub const Store = struct {
         .delete_file_absolute = deleteFileAbsolute,
         .delete_tree = deleteTree,
         .list_file_names_alloc = listFileNamesAlloc,
+        .list_directory_names_alloc = listDirectoryNamesAlloc,
         .sync_contents_absolute = syncContentsAbsolute,
         .sync_parent_absolute = syncParentAbsolute,
         .now_ns = nowNs,
@@ -108,7 +109,7 @@ fn createDirPath(ptr: *anyopaque, path: []const u8) !void {
 }
 
 fn lockStore(store: *docstore.Store) void {
-    platform_sync.lockYielding(&store.mutex);
+    store.mutex.lock();
 }
 
 fn pinSnapshot(store: *docstore.Store) !docstore.Txn {
@@ -304,14 +305,14 @@ const CatalogWrite = struct {
 
 fn writeFileReserved(self: *Store, path: []const u8, contents: []const u8) !void {
     var mutation = CatalogWrite{ .kind = .put, .path = path, .value = contents };
-    try self.docs.submitMutation(&mutation, CatalogWrite.apply);
+    try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, true);
 }
 
 fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
     var mutation = CatalogWrite{ .kind = .append, .path = path, .value = contents };
-    try self.docs.submitMutationWithDurability(&mutation, CatalogWrite.apply, sync);
+    try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, sync);
 }
 
 fn beginAtomicWrite(ptr: *anyopaque, allocator: Allocator, path: []const u8) !AtomicWriteSink {
@@ -326,14 +327,14 @@ fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !
     try validateIndexPath(self, old_path);
     try validateIndexPath(self, new_path);
     var mutation = CatalogWrite{ .kind = .rename, .path = old_path, .value = new_path };
-    try self.docs.submitMutation(&mutation, CatalogWrite.apply);
+    try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, true);
 }
 
 fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
     var mutation = CatalogWrite{ .kind = .delete, .path = path };
-    try self.docs.submitMutation(&mutation, CatalogWrite.apply);
+    try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, true);
 }
 
 fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
@@ -349,7 +350,7 @@ fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
         }
     };
     var request = Context{ .store = self, .path = directory };
-    try self.docs.submitMutation(&request, Context.apply);
+    try self.docs.submitIndexMutation(&request, Context.apply, true);
 }
 
 // Subtree deletion stays one atomic native transaction. Each private flush
@@ -415,6 +416,40 @@ fn deleteTreeLocked(self: *Store, path: []const u8) !void {
     try batch.flush();
 }
 
+fn listDirectoryNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) ![][]u8 {
+    const self: *Store = @ptrCast(@alignCast(ptr));
+    const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
+    try validateIndexPath(self, directory);
+    var snapshot = try pinSnapshot(self.docs);
+    defer snapshot.abort();
+    const file = try snapshot.readFile();
+    const prefix = if (std.mem.eql(u8, directory, "/"))
+        try allocator.dupe(u8, "/")
+    else
+        try std.fmt.allocPrint(allocator, "{s}/", .{directory});
+    defer allocator.free(prefix);
+    var cursor = try file.indexCatalogCursor(snapshot.checkpoint, prefix);
+    defer cursor.deinit();
+    var names = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (names.items) |name| allocator.free(name);
+        names.deinit(allocator);
+    }
+    while (try cursor.next()) |record| {
+        defer file.allocator.free(record.key);
+        const relative = record.key[prefix.len..];
+        const separator = std.mem.indexOfScalar(u8, relative, '/') orelse continue;
+        if (separator == 0) continue;
+        const name = relative[0..separator];
+        // The catalog cursor is ordered; every child directory is contiguous.
+        if (names.items.len != 0 and std.mem.eql(u8, names.items[names.items.len - 1], name)) continue;
+        const owned = try allocator.dupe(u8, name);
+        errdefer allocator.free(owned);
+        try names.append(allocator, owned);
+    }
+    return try names.toOwnedSlice(allocator);
+}
+
 fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) ![][]u8 {
     const self: *Store = @ptrCast(@alignCast(ptr));
     const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
@@ -457,7 +492,7 @@ fn syncContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
     var mutation = CatalogWrite{ .kind = .sync, .path = path };
-    try self.docs.submitMutation(&mutation, CatalogWrite.apply);
+    try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, true);
 }
 
 fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
@@ -704,7 +739,7 @@ const NativeAtomicWriteSink = struct {
         defer self.deinit();
         if (self.failure) |err| return err;
         if (self.file != null) try self.flush();
-        try self.storage.docs.submitMutation(self, publish);
+        try self.storage.docs.submitIndexMutation(self, publish, true);
     }
 
     fn finishSource(ptr: *anyopaque) !@import("../../segment_source.zig").Source {
@@ -712,7 +747,7 @@ const NativeAtomicWriteSink = struct {
         defer self.deinit();
         if (self.failure) |err| return err;
         if (self.file != null) try self.flush();
-        try self.storage.docs.submitMutation(self, publish);
+        try self.storage.docs.submitIndexMutation(self, publish, true);
         return self.storage.docs.openArtifactSource(self.path);
     }
 
@@ -726,7 +761,7 @@ const NativeAtomicWriteSink = struct {
         try self.flush();
         const mapped = try mapArtifact(file, self.persisted);
         errdefer std.posix.munmap(mapped);
-        try self.storage.docs.submitMutation(self, publish);
+        try self.storage.docs.submitIndexMutation(self, publish, true);
         const lease = self.artifact_lease.?;
         self.artifact_lease = null;
         return .{ .bytes = mapped, .context = lease, .release = docstore.ArtifactLease.release };
@@ -2088,7 +2123,9 @@ test "lite mapped artifact disk admission includes concurrent future claims" {
 test "lite mapped read only views report unavailable when directory cannot write" {
     if (!supports_mapped_artifacts) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    // chmod requires a real directory fd; Linux path-only (O_PATH) handles
+    // cannot be passed to fchmod.
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "mapped-readonly.aflite");
     defer a.free(path);
@@ -2533,7 +2570,7 @@ test "lite atomic publication returns owned immutable source without requiring m
     source_only_writer.finish_mapped = null;
     writer.vtable = &source_only_writer;
     active = false;
-    var source = try writer.vtable.finish_source.?(writer.ptr);
+    var source = try writer.finishSource();
     defer source.close();
     try storage.writeFileAbsolute("/published", "replacement");
     docs.close();

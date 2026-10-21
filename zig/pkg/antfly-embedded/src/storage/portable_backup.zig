@@ -417,6 +417,7 @@ fn portableBlobIndex(blobs: []const PortableBlob, digest: [std.crypto.hash.sha2.
 /// The caller provides an allocator for temporary buffers. The output is
 /// appended to `out`.
 pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !void {
+    if (comptime @import("engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("portableExport", .{ alloc, store, out });
     var allocating = std.Io.Writer.Allocating.fromArrayList(alloc, out);
     defer out.* = allocating.toArrayList();
     try exportPortableToWriter(alloc, store, &allocating.writer);
@@ -504,6 +505,7 @@ pub fn exportPortableToWriterWithOptions(
     sink_writer: *std.Io.Writer,
     options: ExportOptions,
 ) !void {
+    if (comptime @import("engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("portableExportToWriterWithOptions", .{ alloc, store, sink_writer, options });
     var certificate_builder: ?source_snapshot.Builder = null;
     if (options.source_generation_summary_output) |output| output.output.* = null;
     if (options.source_copy != null and (options.cohort != null or options.source_certificate == null)) return error.InvalidBackupRequest;
@@ -1212,11 +1214,15 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
     while (scan_entry) |kv| : (scan_entry = try nextPortableDataEntry(&cursor, try cursor.next(), out.stats)) {
         try out.cancellation.check();
         if (isPortableMetadataKey(kv.key)) continue;
-        if (source_copy != null and @import("db/online_graph_artifacts.zig").isKey(kv.key)) {
+        if (source_copy != null and (@import("db/online_graph_artifacts.zig").isKey(kv.key) or @import("db/group_source_transfer.zig").isKey(kv.key))) {
             const owner = (try internal_keys.decodeDocumentComponentAlloc(alloc, kv.key)) orelse return error.InvalidGraphTransfer;
             defer alloc.free(owner);
             if (source_range) |range| if (!range.contains(owner)) continue;
-            try @import("db/online_graph_artifacts.zig").validate(kv.key, kv.value);
+            if (@import("db/group_source_transfer.zig").isKey(kv.key)) {
+                var group_arena = std.heap.ArenaAllocator.init(alloc);
+                defer group_arena.deinit();
+                try @import("db/group_source_transfer.zig").validate(group_arena.allocator(), kv.key, kv.value);
+            } else try @import("db/online_graph_artifacts.zig").validate(kv.key, kv.value);
             const source_batch = @import("db/source_artifact_batch.zig");
             if (kv.key.len > source_batch.max_key_bytes or kv.value.len +| kv.key.len +| 12 > source_batch.max_bytes)
                 return error.ResourceLimitExceeded;
@@ -1751,7 +1757,7 @@ pub fn isPortableMetadataKey(key: []const u8) bool {
     // Destination facts must be rebuilt from imported physical records, never
     // copied from a source's potentially partial maintenance certificate.
     if (@import("artifact_footprint.zig").isKey(key)) return false;
-    return std.mem.eql(u8, key, cohort_proof_key) or std.mem.eql(u8, key, source_copy_proof_key) or
+    return @import("db/group_source_index.zig").isRevisionClockKey(key) or (key.len == 20 and std.mem.startsWith(u8, key, @import("db/group_source_state.zig").lease_clock_prefix)) or std.mem.eql(u8, key, @import("db/group_source_mutations.zig").table_identity_key) or std.mem.eql(u8, key, cohort_proof_key) or std.mem.eql(u8, key, source_copy_proof_key) or
         std.mem.startsWith(u8, key, source_generation_admission_prefix) or
         std.mem.eql(u8, key, source_integrity_key) or std.mem.eql(u8, key, source_integrity_catalog_key) or std.mem.eql(u8, key, source_integrity_activation_key) or
         std.mem.eql(u8, key, "\x00\x00__metadata__:schema") or
@@ -1763,7 +1769,12 @@ pub fn isPortableMetadataKey(key: []const u8) bool {
         std.mem.eql(u8, key, table_catalog.key) or
         std.mem.eql(u8, key, "\x00\x00__metadata__:indexes") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:enrichments") or
-        std.mem.eql(u8, key, "\x00\x00__metadata__:resolvers");
+        std.mem.eql(u8, key, "\x00\x00__metadata__:resolvers") or
+        std.mem.eql(u8, key, @import("antfly_resolver").curation.proposal_store_key) or
+        std.mem.eql(u8, key, resolver_catalog.minimum_reader_key) or
+        std.mem.eql(u8, key, resolver_catalog.merge_catalog_key) or
+        std.mem.eql(u8, key, @import("db/promotion_runtime.zig").source_identity_key) or
+        std.mem.startsWith(u8, key, resolver_catalog.drop_marker_prefix);
 }
 
 /// True only for durable keys that a validated portable import may create.
@@ -2258,12 +2269,16 @@ fn PortableArchiveReader(comptime RawReader: type) type {
         }
 
         pub fn readBlock(self: *Self, alloc: Allocator) !backup_codec.Block {
+            return self.readBlockLimited(alloc, backup_codec.max_block_payload_bytes);
+        }
+
+        pub fn readBlockLimited(self: *Self, alloc: Allocator, max_bytes: usize) !backup_codec.Block {
             if (self.header.format_version == backup_codec.legacy_format_version)
-                return try self.raw.readBlock(alloc);
+                return try self.raw.readBlockLimited(alloc, max_bytes);
             if (self.done) return error.EndOfStream;
 
             if (self.manifest_pending) {
-                const manifest_block = try self.raw.readBlock(alloc);
+                const manifest_block = try self.raw.readBlockLimited(alloc, max_bytes);
                 errdefer alloc.free(manifest_block.payload);
                 if (manifest_block.block_type != .bundle_manifest) return error.InvalidBackupManifest;
                 var manifest = try backup_bundle.parseManifest(alloc, manifest_block.payload);
@@ -2293,6 +2308,7 @@ fn PortableArchiveReader(comptime RawReader: type) type {
             const manifest = &(self.manifest orelse return error.InvalidBackupManifest).value;
             if (self.next_ordinal >= manifest.objects.len) return error.IncompleteBackupInventory;
             const descriptor = manifest.objects[self.next_ordinal];
+            if (descriptor.size_bytes > max_bytes) return error.BackupExpansionLimitExceeded;
             const blob_index = backup_bundle.blobIndex(manifest.blobs, descriptor.sha256) orelse
                 return error.IncompleteBackupInventory;
             try self.ensureIndex(alloc);
@@ -2607,7 +2623,7 @@ fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: st
                 };
                 const derived = try public_table_schema.deriveRuntimeTableSchema(alloc, validator.schema);
                 defer storage_schema.freeSchema(alloc, derived);
-                if (!try storage_schema.schemasEqual(alloc, epoch.layout.schema, derived)) return error.InvalidBackupRequest;
+                if (!try storage_schema.schemasEqualForPublicBinding(alloc, epoch.layout.schema, derived)) return error.InvalidBackupRequest;
             } else if (epoch.layout.schema.requires_public_schema or state.phase == .public_layouts) return error.InvalidBackupRequest;
             state.cursor = try owned.dupe(u8, kv.key);
             count += 1;
@@ -2719,7 +2735,7 @@ fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: st
             state.ordinal += 1;
         }
         if (state.ordinal == state.object_count) state.phase = .layouts;
-        try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(owned, store, proof.namespace(), 1, &writes, keys, &.{});
+        try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(owned, store, proof.namespace(), 1, &writes, keys, &.{}, null);
         try writes.append(owned, .{ .key = cohort_import_checkpoint_key, .value = try std.json.Stringify.valueAlloc(owned, state, .{}) });
         try cancellation.check();
         try validateAndImportDocumentEntries(alloc, store, selected, &archive, writes.items);
@@ -2865,6 +2881,193 @@ pub fn validatePortable(alloc: Allocator, data: []const u8) !void {
     try validatePortableImportBlocks(alloc, data, .{});
 }
 
+pub const FileInspectionOptions = struct {
+    metadata_first: bool = false,
+    max_input_bytes: u64 = 64 * 1024 * 1024 * 1024,
+    max_logical_bytes: u64 = 128 * 1024 * 1024 * 1024,
+    max_metadata_bytes: usize = std.math.maxInt(usize),
+    max_document_bytes: usize = std.math.maxInt(usize),
+    cancellation: @import("antfly_cancellation").CancellationToken = .none,
+};
+
+pub const FileInspection = struct {
+    format_version: u32,
+    size_bytes: u64,
+    logical_bytes: u64,
+    fingerprint: backup_codec.FileReader.Fingerprint,
+};
+
+/// Logical document decoding for read-only visitors. Uses the restore reader's
+/// bounded schema cache and spool, including historical relational row layouts.
+/// Only feed blocks authenticated by inspectPortableFileBlocks.
+pub const InspectionDocumentDecoder = struct {
+    archive: PortableArchiveValidation = .{ .format_version = 2, .min_afb_reader = backup_bundle.afb_reader_version },
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        self.archive.deinit(alloc);
+    }
+
+    pub fn metadataLimited(self: *@This(), alloc: Allocator, payload: []const u8, max_bytes: usize) !void {
+        const reader = try backup_codec.KeyValueBatchReader.init(payload);
+        try reader.checkEntryLimit(max_bytes);
+        try validateMetadataBatchPayload(alloc, payload, &self.archive);
+    }
+
+    /// Enforce the logical output budget before retaining document JSON.
+    pub fn documentJsonLimitedAlloc(self: *@This(), alloc: Allocator, entry: backup_codec.DocumentEntry, max_bytes: usize) ![]u8 {
+        if (entry.value_flags & backup_codec.doc_value_flag_relational_row != 0) {
+            const version = try relational_store.rowSchemaVersion(entry.value);
+            const layout = (try self.archive.layoutForVersion(version)) orelse return error.InvalidBackupRequest;
+            return relational_store.decodeValueForSchemaAndLayoutLimitedAlloc(alloc, entry.value, layout.schema.*, layout.physical, max_bytes);
+        }
+        if (entry.value_flags & backup_codec.doc_value_flag_compressed != 0)
+            return backup_codec.decompressZstdLimited(alloc, entry.value, max_bytes);
+        if (entry.value.len > max_bytes) return error.StreamTooLong;
+        return alloc.dupe(u8, entry.value);
+    }
+};
+
+/// Only asset/chunk payloads are materialized as documents. Vector and
+/// resolution artifacts keep their own format and block admission contracts.
+pub fn checkArtifactDocumentLimit(alloc: Allocator, payload: []const u8, max_bytes: usize) !void {
+    var reader = try backup_codec.KeyValueBatchReader.init(payload);
+    while (try reader.next()) |entry| {
+        if (entry.value.len <= max_bytes) continue;
+        var ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, entry.key)) orelse return error.InvalidBackupRequest;
+        defer ref.deinit(alloc);
+        if (ref.kind == .asset or ref.kind == .chunk) return error.StreamTooLong;
+    }
+}
+
+/// Read-only seam for preparation and dependency inspectors. First validate
+/// every logical record with the restore reader, then visit the authenticated
+/// blocks from the same descriptor. No DB, enrichment runtime, or network is
+/// opened. A callback must keep its output private until this function returns:
+/// a late checksum failure or source mutation invalidates the entire report.
+/// This validates the portable format, not destination/model/media eligibility.
+pub fn inspectPortableFileBlocks(
+    alloc: Allocator,
+    io: std.Io,
+    file: std.Io.File,
+    options: FileInspectionOptions,
+    context: anytype,
+    comptime visit: fn (@TypeOf(context), backup_codec.BlockType, []const u8) anyerror!void,
+) !FileInspection {
+    try options.cancellation.check();
+    if (!try file.tryLock(io, .shared)) return error.WriterLocked;
+    defer file.unlock(io);
+    const initial_stat = try file.stat(io);
+    if (initial_stat.kind != .file) return error.InvalidBackupRequest;
+    if (initial_stat.size > options.max_input_bytes) return error.BackupInputLimitExceeded;
+    var raw = backup_codec.FileReader.init(io, file, initial_stat.size);
+    raw.max_block_bytes = std.math.cast(usize, options.max_logical_bytes) orelse std.math.maxInt(usize);
+    var reader: InspectionReader = .{
+        .inner = try PortableArchiveReader(backup_codec.FileReader).init(&raw),
+        .options = options,
+    };
+    defer reader.inner.deinit(alloc);
+    try validatePortableImportReader(alloc, &reader, .{ .cancellation = options.cancellation });
+    const fingerprint = try reader.verifiedFingerprint();
+    try reader.reset(alloc);
+    if (options.metadata_first) {
+        _ = try reader.readHeader();
+        while (reader.hasRemaining()) {
+            const block = try reader.readBlock(alloc);
+            defer alloc.free(block.payload);
+            if (block.block_type == .metadata_batch) try visit(context, block.block_type, block.payload);
+        }
+        try reader.inner.verifyFingerprint(fingerprint);
+        try reader.reset(alloc);
+    }
+    const header = try reader.readHeader();
+    while (reader.hasRemaining()) {
+        const block = try reader.readBlock(alloc);
+        defer alloc.free(block.payload);
+        if (!options.metadata_first or block.block_type != .metadata_batch)
+            try visit(context, block.block_type, block.payload);
+    }
+    try reader.inner.verifyFingerprint(fingerprint);
+    const final_stat = try file.stat(io);
+    if (final_stat.size != initial_stat.size or
+        !std.meta.eql(final_stat.mtime, initial_stat.mtime) or
+        !std.meta.eql(final_stat.ctime, initial_stat.ctime)) return error.SourceFileChanged;
+    try options.cancellation.check();
+    return .{
+        .format_version = header.format_version,
+        .size_bytes = initial_stat.size,
+        .logical_bytes = reader.logical_bytes,
+        .fingerprint = fingerprint,
+    };
+}
+
+const InspectionReader = struct {
+    inner: PortableArchiveReader(backup_codec.FileReader),
+    options: FileInspectionOptions,
+    logical_bytes: u64 = 0,
+
+    fn readHeader(self: *@This()) !backup_codec.FileHeader {
+        return self.inner.readHeader();
+    }
+
+    fn readBlock(self: *@This(), alloc: Allocator) !backup_codec.Block {
+        try self.options.cancellation.check();
+        const remaining_bytes = std.math.cast(usize, self.options.max_logical_bytes -| self.logical_bytes) orelse std.math.maxInt(usize);
+        const block = try self.inner.readBlockLimited(alloc, remaining_bytes);
+        errdefer alloc.free(block.payload);
+        if (block.payload.len > self.options.max_logical_bytes -| self.logical_bytes)
+            return error.BackupExpansionLimitExceeded;
+        self.logical_bytes += block.payload.len;
+        if (block.block_type == .metadata_batch) {
+            const metadata = try backup_codec.KeyValueBatchReader.init(block.payload);
+            metadata.checkEntryLimit(self.options.max_metadata_bytes) catch |err| switch (err) {
+                error.StreamTooLong => return error.BackupExpansionLimitExceeded,
+                else => return err,
+            };
+        }
+        if (block.block_type == .artifact_batch or block.block_type == .chunk_batch) {
+            checkArtifactDocumentLimit(alloc, block.payload, self.options.max_document_bytes) catch |err| switch (err) {
+                error.StreamTooLong => return error.BackupExpansionLimitExceeded,
+                else => return err,
+            };
+        }
+        // A document may be compressed inside an already decoded block. Charge
+        // its expansion on every inspection pass, before invoking any visitor.
+        if (block.block_type == .document_batch) {
+            const entries = try backup_codec.decodeDocumentBatchBorrowed(alloc, block.payload);
+            defer alloc.free(entries);
+            for (entries) |entry| {
+                if (entry.value_flags & backup_codec.doc_value_flag_compressed == 0) {
+                    if (entry.value_flags & backup_codec.doc_value_flag_relational_row == 0 and entry.value.len > self.options.max_document_bytes)
+                        return error.BackupExpansionLimitExceeded;
+                    continue;
+                }
+                try self.options.cancellation.check();
+                const remaining = self.options.max_logical_bytes - self.logical_bytes;
+                const limit = @min(self.options.max_document_bytes, std.math.cast(usize, remaining +| entry.value.len) orelse std.math.maxInt(usize));
+                const expanded_size = backup_codec.zstdExpandedSizeLimited(alloc, entry.value, limit) catch |err| switch (err) {
+                    error.StreamTooLong => return error.BackupExpansionLimitExceeded,
+                    else => return err,
+                };
+                self.logical_bytes += expanded_size -| entry.value.len;
+            }
+        }
+        return block;
+    }
+
+    fn hasRemaining(self: *const @This()) bool {
+        return self.inner.hasRemaining();
+    }
+
+    fn reset(self: *@This(), alloc: Allocator) !void {
+        try self.inner.reset(alloc);
+        self.logical_bytes = 0;
+    }
+
+    fn verifiedFingerprint(self: *const @This()) !backup_codec.FileReader.Fingerprint {
+        return self.inner.verifiedFingerprint();
+    }
+};
+
 /// Validate the cross-catalog invariant required when an archive represents a
 /// complete database image. Generic portable imports intentionally remain
 /// usable for identity-free data migration; production restore entry points
@@ -2931,7 +3134,7 @@ fn validateCompleteDatabaseImageWithProofs(alloc: Allocator, store: *DocStore, c
                 else => return error.InvalidBackupRequest,
             };
             defer storage_schema.freeSchema(alloc, derived);
-            const schemas_match = storage_schema.schemasEqual(alloc, schema, derived) catch |err| switch (err) {
+            const schemas_match = storage_schema.schemasEqualForPublicBinding(alloc, schema, derived) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return error.InvalidBackupRequest,
             };
@@ -3140,14 +3343,16 @@ fn validateAndImportPortableStagingAfterHeader(
         .snapshot_alloc = alloc,
     };
     defer archive.deinit(alloc);
+    var probe = try primeReleasedPortableMetadata(alloc, reader, opts, &archive, store);
+    defer probe.deinit(alloc);
     var imported_identity = false;
     var block_index: usize = 0;
     var saw_bundle_manifest = false;
     var payload_bytes: u64 = 0;
     const restore_started_ns = platform_time.monotonicNs();
-    while (reader.hasRemaining()) {
+    while (probe.first != null or reader.hasRemaining()) {
         try opts.cancellation.check();
-        const block = try reader.readBlock(alloc);
+        const block = try probe.next(alloc, reader);
         defer alloc.free(block.payload);
         if (block_index == 0 and block.block_type != .bundle_manifest) return error.InvalidBackupManifest;
         if (block.block_type == .bundle_manifest) {
@@ -3158,7 +3363,7 @@ fn validateAndImportPortableStagingAfterHeader(
             archive.min_afb_reader = manifest.value.compatibility.min_afb_reader;
             saw_bundle_manifest = true;
         }
-        if (block.block_type == .metadata_batch and archive.saw_document_block)
+        if (!probe.metadata_primed and block.block_type == .metadata_batch and archive.saw_document_block)
             return error.InvalidBackupManifest;
         switch (block.block_type) {
             .document_batch => {
@@ -3174,7 +3379,7 @@ fn validateAndImportPortableStagingAfterHeader(
                 try importIdentityBatch(alloc, store, block.payload);
                 imported_identity = true;
             },
-            .metadata_batch => try validateAndImportMetadataBatchPayload(alloc, store, block.payload, &archive),
+            .metadata_batch => if (!probe.metadata_primed) try validateAndImportMetadataBatchPayload(alloc, store, block.payload, &archive),
             .chunk_batch => if (opts.import_derived_indexes) try importChunkBatch(alloc, store, block.payload),
             .artifact_batch => if (opts.import_derived_indexes) try importPublicArtifactBatch(alloc, store, block.payload, .asset),
             .resolution_batch => if (opts.import_derived_indexes) try importResolutionArtifactBatch(alloc, store, block.payload),
@@ -3244,6 +3449,7 @@ fn importPortablePrimaryBlocks(alloc: Allocator, store: *DocStore, reader: anyty
 
 fn finishPortableIdentityImport(alloc: Allocator, store: *DocStore, opts: ImportOptions, imported_identity: bool) !void {
     if (imported_identity) {
+        try doc_identity.upgradeImportedLiveDirectoryAlloc(alloc, store, opts.cancellation);
         try doc_identity.validateStoreAlloc(alloc, store);
         try validateImportedIdentityNamespace(store, opts);
     }
@@ -3284,10 +3490,12 @@ fn validatePortableImportReader(alloc: Allocator, reader: anytype, opts: ImportO
         .source_copy = opts.source_copy,
     };
     defer archive.deinit(alloc);
+    var probe = try primeReleasedPortableMetadata(alloc, reader, opts, &archive, null);
+    defer probe.deinit(alloc);
     var block_index: usize = 0;
     var saw_bundle_manifest = false;
-    while (reader.hasRemaining()) {
-        const block = try reader.readBlock(alloc);
+    while (probe.first != null or reader.hasRemaining()) {
+        const block = try probe.next(alloc, reader);
         defer alloc.free(block.payload);
         if (header.format_version == backup_codec.format_version and block_index == 0 and
             block.block_type != .bundle_manifest) return error.InvalidBackupManifest;
@@ -3299,16 +3507,77 @@ fn validatePortableImportReader(alloc: Allocator, reader: anytype, opts: ImportO
             archive.min_afb_reader = manifest.value.compatibility.min_afb_reader;
             saw_bundle_manifest = true;
         }
-        if (header.format_version == backup_codec.format_version and
+        if (!probe.metadata_primed and header.format_version == backup_codec.format_version and
             block.block_type == .metadata_batch and archive.saw_document_block)
             return error.InvalidBackupManifest;
-        try validatePortableImportBlockPayload(alloc, block.block_type, block.payload, opts, &archive);
+        if (!probe.metadata_primed or block.block_type != .metadata_batch)
+            try validatePortableImportBlockPayload(alloc, block.block_type, block.payload, opts, &archive);
         if (block.block_type == .document_batch) archive.saw_document_block = true;
         block_index += 1;
     }
     if (header.format_version == backup_codec.format_version and !saw_bundle_manifest)
         return error.InvalidBackupManifest;
     try archive.finish(alloc);
+}
+
+const PortableMetadataProbe = struct {
+    metadata_primed: bool = false,
+    first: ?backup_codec.Block = null,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        if (self.first) |block| alloc.free(block.payload);
+    }
+
+    fn next(self: *@This(), alloc: Allocator, reader: anytype) !backup_codec.Block {
+        if (self.first) |block| {
+            self.first = null;
+            return block;
+        }
+        return reader.readBlock(alloc);
+    }
+};
+
+// Released v0.2.1+ AFB2 writers place documents before their schema metadata.
+// Authenticate a bounded streaming metadata pass first, then reset the same
+// source and validate every row with its schema. Reader.reset also checks the
+// archive fingerprint across passes; newer reader levels retain strict ordering.
+fn primeReleasedPortableMetadata(
+    alloc: Allocator,
+    reader: anytype,
+    opts: ImportOptions,
+    archive: *PortableArchiveValidation,
+    store: ?*DocStore,
+) !PortableMetadataProbe {
+    if (archive.format_version != backup_codec.format_version) return .{};
+    if (!reader.hasRemaining()) return error.InvalidBackupManifest;
+    const first = try reader.readBlock(alloc);
+    var first_owned = true;
+    defer if (first_owned) alloc.free(first.payload);
+    if (first.block_type != .bundle_manifest) return error.InvalidBackupManifest;
+    var manifest = try backup_bundle.parseManifest(alloc, first.payload);
+    defer manifest.deinit();
+    if (manifest.value.representation != .portable) return error.BackupArtifactFormatMismatch;
+    if (manifest.value.compatibility.min_afb_reader != backup_bundle.base_afb_reader_version) {
+        // Current archives continue their authenticated pass with this block.
+        // Reset is only legal after the footer has completed the pass.
+        first_owned = false;
+        return .{ .first = first };
+    }
+    while (reader.hasRemaining()) {
+        try opts.cancellation.check();
+        const block = try reader.readBlock(alloc);
+        defer alloc.free(block.payload);
+        if (block.block_type == .bundle_manifest) return error.InvalidBackupManifest;
+        if (block.block_type == .metadata_batch) {
+            if (store) |staging| {
+                try validateAndImportMetadataBatchPayload(alloc, staging, block.payload, archive);
+            } else {
+                try validateMetadataBatchPayload(alloc, block.payload, archive);
+            }
+        }
+    }
+    try reader.reset(alloc);
+    return .{ .metadata_primed = true };
 }
 
 const ArchiveSchemaLayout = struct {
@@ -3371,6 +3640,11 @@ const PortableArchiveValidation = struct {
     saw_index_catalog: bool = false,
     saw_enrichment_catalog: bool = false,
     saw_resolver_catalog: bool = false,
+    minimum_reader_version: ?u32 = null,
+    saw_resolver_merges: bool = false,
+    saw_curation_proposals: bool = false,
+    resolver_configs: ?[]resolver_catalog.ResolverConfig = null,
+    resolver_merge_data: ?[]u8 = null,
 
     const DecodedEpoch = struct {
         version: u32,
@@ -3521,6 +3795,11 @@ const PortableArchiveValidation = struct {
     }
 
     pub fn deinit(self: *PortableArchiveValidation, alloc: Allocator) void {
+        if (self.resolver_configs) |configs| {
+            for (configs) |*cfg| cfg.deinit(alloc);
+            alloc.free(configs);
+        }
+        if (self.resolver_merge_data) |data| alloc.free(data);
         self.source_generation_admissions.deinit(alloc);
         if (self.source_integrity_catalog) |*catalog| catalog.deinit();
         if (self.index_projection) |*projection| projection.deinit(alloc);
@@ -3616,6 +3895,21 @@ const PortableArchiveValidation = struct {
     }
 
     fn finish(self: *PortableArchiveValidation, alloc: Allocator) !void {
+        if (self.saw_curation_proposals and (self.minimum_reader_version orelse 0) < resolver_catalog.scoped_curation_reader_version) return error.InvalidMetadataBatch;
+        const resolver_bytes = try resolver_catalog.serializeCatalog(alloc, self.resolver_configs orelse &.{});
+        defer alloc.free(resolver_bytes);
+        if (self.minimum_reader_version) |version| {
+            if (version < try resolver_catalog.catalogReaderVersion(alloc, resolver_bytes)) return error.InvalidMetadataBatch;
+        }
+        const configs = try resolver_catalog.deserializeCatalog(alloc, resolver_bytes);
+        defer {
+            for (configs) |*cfg| cfg.deinit(alloc);
+            alloc.free(configs);
+        }
+        resolver_catalog.applyMergeState(alloc, configs, self.resolver_merge_data orelse "[]") catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidMetadataBatch,
+        };
         if (self.cohort != null and !self.saw_cohort) return error.BackupIntegrityFailure;
         if (self.source_copy != null and !self.saw_source_copy) return error.BackupIntegrityFailure;
         if (self.source_integrity != null and (self.source_integrity_catalog == null or !self.source_integrity_activation)) return error.BackupIntegrityFailure;
@@ -3657,7 +3951,7 @@ const PortableArchiveValidation = struct {
                     else => return error.InvalidBackupRequest,
                 };
                 defer storage_schema.freeSchema(alloc, derived);
-                const schemas_match = storage_schema.schemasEqual(alloc, runtime_schema, derived) catch |err| switch (err) {
+                const schemas_match = storage_schema.schemasEqualForPublicBinding(alloc, runtime_schema, derived) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => return error.InvalidBackupRequest,
                 };
@@ -3677,7 +3971,7 @@ const PortableArchiveValidation = struct {
                 else => return error.InvalidBackupRequest,
             };
             defer storage_schema.freeSchema(alloc, derived);
-            const schemas_match = storage_schema.schemasEqual(alloc, layout.schema.*, derived) catch |err| switch (err) {
+            const schemas_match = storage_schema.schemasEqualForPublicBinding(alloc, layout.schema.*, derived) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return error.InvalidBackupRequest,
             };
@@ -4375,9 +4669,8 @@ fn validateIdentityBatchPayload(alloc: Allocator, payload: []const u8) !void {
 }
 
 fn validateMetadataBatchPayload(alloc: Allocator, payload: []const u8, archive: *PortableArchiveValidation) !void {
-    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
-    defer freeKeyValueEntries(alloc, entries);
-    return try validateMetadataEntries(alloc, entries, archive);
+    var reader = try backup_codec.KeyValueBatchReader.init(payload);
+    while (try reader.next()) |entry| try validateMetadataEntries(alloc, &.{entry}, archive);
 }
 
 fn validateMetadataEntries(
@@ -4387,7 +4680,14 @@ fn validateMetadataEntries(
 ) !void {
     for (entries) |entry| {
         if (!isPortableMetadataKey(entry.key)) return error.InvalidMetadataBatch;
-        if (std.mem.eql(u8, entry.key, source_copy_proof_key)) {
+        if (@import("db/group_source_index.zig").isRevisionClockKey(entry.key)) {
+            @import("db/group_source_index.zig").validateRevisionClock(entry.key, entry.value) catch return error.InvalidMetadataBatch;
+        } else if (entry.key.len == 20 and std.mem.startsWith(u8, entry.key, @import("db/group_source_state.zig").lease_clock_prefix)) {
+            if (entry.value.len < 37 or entry.value.len > 64 or !std.mem.eql(u8, entry.value[0..4], "GSC1") or !std.mem.eql(u8, entry.value[entry.value.len - 32 ..], &@import("db/group_source_queue.zig").checksum(entry.key, entry.value[4 .. entry.value.len - 32]))) return error.InvalidMetadataBatch;
+            _ = std.fmt.parseInt(u64, entry.value[4 .. entry.value.len - 32], 10) catch return error.InvalidMetadataBatch;
+        } else if (std.mem.eql(u8, entry.key, @import("db/group_source_mutations.zig").table_identity_key)) {
+            if (entry.value.len != 48 or std.mem.readInt(u128, entry.value[0..16], .big) == 0 or !std.mem.eql(u8, entry.value[16..], &@import("db/group_sources.zig").digest(entry.value[0..16]))) return error.InvalidMetadataBatch;
+        } else if (std.mem.eql(u8, entry.key, source_copy_proof_key)) {
             const expected = archive.source_copy orelse return error.SourceCopyRestoreUnsupported;
             if (archive.saw_source_copy or !std.mem.eql(u8, entry.value, &try expected.encode())) return error.BackupIntegrityFailure;
             archive.saw_source_copy = true;
@@ -4542,9 +4842,30 @@ fn validateMetadataEntries(
                 error.OutOfMemory => return err,
                 else => return error.InvalidMetadataBatch,
             };
-            for (configs) |*config| config.deinit(alloc);
-            alloc.free(configs);
+            archive.resolver_configs = configs;
             archive.saw_resolver_catalog = true;
+        } else if (std.mem.eql(u8, entry.key, @import("antfly_resolver").curation.proposal_store_key)) {
+            if (archive.saw_curation_proposals) return error.InvalidMetadataBatch;
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            _ = @import("antfly_resolver").curation.parseProposalManifest(arena.allocator(), entry.value) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidMetadataBatch,
+            };
+            archive.saw_curation_proposals = true;
+        } else if (std.mem.eql(u8, entry.key, resolver_catalog.minimum_reader_key)) {
+            if (archive.minimum_reader_version != null) return error.InvalidMetadataBatch;
+            const version = std.fmt.parseInt(u32, entry.value, 10) catch return error.InvalidMetadataBatch;
+            if (version == 0 or version > resolver_catalog.supported_reader_version) return error.InvalidMetadataBatch;
+            archive.minimum_reader_version = version;
+        } else if (std.mem.eql(u8, entry.key, resolver_catalog.merge_catalog_key)) {
+            if (archive.saw_resolver_merges) return error.InvalidMetadataBatch;
+            resolver_catalog.validateSerializedMergeState(alloc, entry.value) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidMetadataBatch,
+            };
+            archive.resolver_merge_data = try alloc.dupe(u8, entry.value);
+            archive.saw_resolver_merges = true;
         }
     }
 }
@@ -4574,9 +4895,8 @@ fn validatePortableArtifactEntry(alloc: Allocator, ref: db_types.ArtifactRef, va
 }
 
 fn validatePublicArtifactBatchPayload(alloc: Allocator, payload: []const u8, allowed_kind: db_types.ArtifactKind) !void {
-    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
-    defer freeKeyValueEntries(alloc, entries);
-    for (entries) |entry| {
+    var reader = try backup_codec.KeyValueBatchReader.init(payload);
+    while (try reader.next()) |entry| {
         var artifact_ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, entry.key)) orelse return error.InvalidBackupRequest;
         defer artifact_ref.deinit(alloc);
         try validatePortableArtifactEntry(alloc, artifact_ref, entry.value, allowed_kind);
@@ -4584,9 +4904,8 @@ fn validatePublicArtifactBatchPayload(alloc: Allocator, payload: []const u8, all
 }
 
 fn validateResolutionArtifactBatchPayload(alloc: Allocator, payload: []const u8) !void {
-    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
-    defer freeKeyValueEntries(alloc, entries);
-    for (entries) |entry| {
+    var reader = try backup_codec.KeyValueBatchReader.init(payload);
+    while (try reader.next()) |entry| {
         var artifact_ref = (try decodeResolutionPublicIdAlloc(alloc, entry.key)) orelse return error.InvalidBackupRequest;
         defer artifact_ref.deinit(alloc);
     }
@@ -6349,10 +6668,15 @@ test "import preflights logical block payloads before mutating destination" {
 
 test "import preflights durable catalogs before mutating destination" {
     const alloc = std.testing.allocator;
+    const required_catalog = try resolver_catalog.serializeCatalog(alloc, &.{.{ .name = "r", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{ uslug _entity.text }}", .merge_generation = 2, .merge_state_version = 1 }});
+    defer alloc.free(required_catalog);
     const cases = [_]struct { key: []const u8, value: []const u8 }{
         .{ .key = "\x00\x00__metadata__:indexes", .value = "not-an-index-catalog" },
         .{ .key = "\x00\x00__metadata__:enrichments", .value = "not-json" },
         .{ .key = "\x00\x00__metadata__:resolvers", .value = "not-json" },
+        .{ .key = resolver_catalog.merge_catalog_key, .value = "not-json" },
+        .{ .key = resolver_catalog.merge_catalog_key, .value = "[{\"name\":\"orphan\",\"aliases\":[{\"key\":\"a\",\"target\":\"b\"}]}]" },
+        .{ .key = "\x00\x00__metadata__:resolvers", .value = required_catalog },
     };
     for (cases) |case| {
         var tmp_src = std.testing.tmpDir(.{});
@@ -6452,11 +6776,14 @@ test "export and import preserves doc identity metadata" {
         &initial_identity,
         &.{ "doc:a", "doc:b" },
         &.{},
+        null,
     );
     try src.putBatch(initial_identity.items, &.{});
 
     var tombstone_identity = std.ArrayListUnmanaged(KVPair).empty;
     defer freeAllocatedKVPairs(alloc, &tombstone_identity);
+    var live_deletes_tombstone_identity = std.ArrayListUnmanaged([]u8).empty;
+    defer doc_identity.freeIdentityDeleteKeys(alloc, &live_deletes_tombstone_identity);
     try doc_identity.appendBatchIdentityMetadataAlloc(
         alloc,
         &src,
@@ -6466,8 +6793,9 @@ test "export and import preserves doc identity metadata" {
         &tombstone_identity,
         &.{},
         &.{"doc:b"},
+        &live_deletes_tombstone_identity,
     );
-    try src.putBatch(tombstone_identity.items, &.{});
+    try src.putBatch(tombstone_identity.items, live_deletes_tombstone_identity.items);
 
     var out: ArrayList(u8) = .empty;
     defer out.deinit(alloc);
@@ -6575,6 +6903,7 @@ test "import rejects doc identity metadata with invalid canonical ids" {
         &identity_writes,
         &.{doc_id},
         &.{},
+        null,
     );
     try src.putBatch(identity_writes.items, &.{});
 
@@ -6622,6 +6951,7 @@ test "import rejects doc identity namespace mismatch unless preserving existing 
         &identity_writes,
         &.{doc_id},
         &.{},
+        null,
     );
     try src.putBatch(identity_writes.items, &.{});
 
@@ -7065,7 +7395,7 @@ test "export skips derived data" {
     }
 }
 
-test "portable relationships preserve parallel identities and arbitrary endpoints" {
+test "portable backup relationships preserve parallel identities and arbitrary endpoints" {
     const alloc = std.testing.allocator;
     var tmp_src = std.testing.tmpDir(.{});
     defer tmp_src.cleanup();
@@ -7095,6 +7425,7 @@ test "portable relationships preserve parallel identities and arbitrary endpoint
         defer manifest.deinit();
         try std.testing.expectEqual(backup_bundle.relationship_reader_version, manifest.value.compatibility.min_afb_reader);
     }
+    try validatePortable(alloc, out.items);
 
     for ([_]bool{ false, true }) |staged| {
         var tmp_dst = std.testing.tmpDir(.{});
@@ -7114,7 +7445,7 @@ test "portable relationships preserve parallel identities and arbitrary endpoint
     }
 }
 
-test "portable graph retirements are primary and require reader version four" {
+test "portable backup graph retirements are primary and require reader version four" {
     const alloc = std.testing.allocator;
     const stamped = @import("graph_cleanup_contract.zig").retirementValue(42);
     for ([_][]const u8{ "1", &stamped }) |retirement| {
@@ -7145,6 +7476,7 @@ test "portable graph retirements are primary and require reader version four" {
             defer manifest.deinit();
             try std.testing.expectEqual(backup_bundle.retirement_reader_version, manifest.value.compatibility.min_afb_reader);
         }
+        try validatePortable(alloc, out.items);
         for ([_]bool{ false, true }) |staged| {
             for ([_]bool{ false, true }) |derived| {
                 var tmp_dst = std.testing.tmpDir(.{});
@@ -7170,4 +7502,88 @@ test "portable graph retirements are primary and require reader version four" {
             }
         }
     }
+}
+
+test "portable backup v02 released AFB2 validates imports and binds public schemas" {
+    const alloc = std.testing.allocator;
+    const bytes = @embedFile("testdata/v02-server/portable.afb");
+    try validatePortable(alloc, bytes);
+    for ([_]bool{ false, true }) |staged| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var store = try openTestStore(alloc, &tmp);
+        defer store.close();
+        try importPortableWithOptions(alloc, &store, bytes, .{ .unpublished_staging = staged });
+        try validateCompleteDatabaseImageAlloc(alloc, &store);
+        var identity = try store.beginProbeTxn();
+        defer identity.abort();
+        try doc_identity.requireLiveDirectoryTxn(&identity);
+        try std.testing.expect(try doc_identity.lookupOrdinalTxn(alloc, &identity, "a") != null);
+        const runtime = (try storage_schema.loadSchema(&store, alloc)).?;
+        defer storage_schema.freeSchema(alloc, runtime);
+        try std.testing.expectEqual(@as(u32, 12), runtime.decoded_format_version);
+        try std.testing.expectEqual(storage_schema.StorageMode.document, runtime.storage_mode);
+        const key = try internal_keys.documentKeyAlloc(alloc, "a");
+        defer alloc.free(key);
+        const row = try store.get(alloc, key);
+        defer alloc.free(row);
+        try std.testing.expect(std.mem.indexOf(u8, row, "zebrafish") != null);
+        try store.put("\x00\x00__metadata__:schema_json", "{\"version\":0,\"default_type\":\"conflicting\"}");
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, validateCompleteDatabaseImageAlloc(alloc, &store));
+    }
+}
+
+test "resolver import cross checks merge catalog before publication" {
+    const alloc = std.testing.allocator;
+    const cfg: resolver_catalog.ResolverConfig = .{ .name = "r", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{ uslug _entity.text }}", .merge_generation = 2, .merge_state_version = 1 };
+    const catalog = try resolver_catalog.serializeCatalog(alloc, &.{cfg});
+    defer alloc.free(catalog);
+    const cases = [_]?[]const u8{
+        null,
+        "[]",
+        "[{\"name\":\"unrelated\",\"aliases\":[{\"key\":\"a\",\"target\":\"b\"}]}]",
+        "[{\"name\":\"r\",\"aliases\":[{\"key\":\"a\",\"target\":\"b\"}]}]",
+    };
+    for (cases, 0..) |merges, i| {
+        var archive: PortableArchiveValidation = .{ .format_version = backup_codec.format_version };
+        defer archive.deinit(alloc);
+        try validateMetadataEntries(alloc, &.{.{ .key = "\x00\x00__metadata__:resolvers", .value = catalog }}, &archive);
+        if (merges) |data| try validateMetadataEntries(alloc, &.{.{ .key = resolver_catalog.merge_catalog_key, .value = data }}, &archive);
+        if (i == 3) try archive.finish(alloc) else try std.testing.expectError(error.InvalidMetadataBatch, archive.finish(alloc));
+    }
+    // A valid sidecar cannot introduce a resolver absent from the catalog.
+    var orphan: PortableArchiveValidation = .{ .format_version = backup_codec.format_version };
+    defer orphan.deinit(alloc);
+    try validateMetadataEntries(alloc, &.{.{ .key = resolver_catalog.merge_catalog_key, .value = cases[3].? }}, &orphan);
+    try std.testing.expectError(error.InvalidMetadataBatch, orphan.finish(alloc));
+}
+
+test "portable backup curation proposal metadata validates identity and reader floor" {
+    const alloc = std.testing.allocator;
+    const pure = @import("antfly_resolver").curation;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const plan = try pure.propose(a, .{ .receipt_scope = @splat('a') }, &.{}, .{ .action = .suppress, .key = "concept/noise", .actor = "screen" }, .{ .actor = "screen", .created_at_ms = 1 });
+    const bytes = try std.json.Stringify.valueAlloc(a, pure.ProposalManifest{ .queue = plan.state }, .{});
+    try std.testing.expect(isPortableMetadataKey(pure.proposal_store_key));
+    var archive: PortableArchiveValidation = .{ .format_version = backup_codec.format_version };
+    defer archive.deinit(alloc);
+    try validateMetadataEntries(alloc, &.{.{ .key = pure.proposal_store_key, .value = bytes }}, &archive);
+    try std.testing.expect(archive.saw_curation_proposals);
+    try std.testing.expectError(error.InvalidMetadataBatch, archive.finish(alloc));
+    try validateMetadataEntries(alloc, &.{.{ .key = resolver_catalog.minimum_reader_key, .value = "10" }}, &archive);
+    try std.testing.expectError(error.InvalidMetadataBatch, archive.finish(alloc));
+    archive.minimum_reader_version = resolver_catalog.scoped_curation_reader_version;
+    try archive.finish(alloc);
+    try std.testing.expectError(error.InvalidMetadataBatch, validateMetadataEntries(alloc, &.{.{ .key = pure.proposal_store_key, .value = bytes }}, &archive));
+    var invalid: PortableArchiveValidation = .{ .format_version = backup_codec.format_version };
+    defer invalid.deinit(alloc);
+    try std.testing.expectError(error.InvalidMetadataBatch, validateMetadataEntries(alloc, &.{.{ .key = pure.proposal_store_key, .value = "{\"pending_id\":\"orphan\"}" }}, &invalid));
+    const restored = try pure.parseProposalManifest(a, bytes);
+    try std.testing.expect(pure.sameReceiptScope(plan.state.receipt_scope, restored.queue.receipt_scope));
+    var unscoped = plan.state;
+    unscoped.receipt_scope = null;
+    const unscoped_bytes = try std.json.Stringify.valueAlloc(a, pure.ProposalManifest{ .queue = unscoped }, .{});
+    try std.testing.expectError(error.InvalidResolverCurationRequest, pure.parseProposalManifest(a, unscoped_bytes));
 }

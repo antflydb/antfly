@@ -11,7 +11,10 @@ from ..models.graph_resolver_config_source_artifact_kind import GraphResolverCon
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.graph_resolver_adjudication_config import GraphResolverAdjudicationConfig
+    from ..models.graph_resolver_config_aliases_item import GraphResolverConfigAliasesItem
     from ..models.graph_resolver_scorer_config import GraphResolverScorerConfig
+    from ..models.graph_resolver_suppression_config import GraphResolverSuppressionConfig
 
 
 T = TypeVar("T", bound="GraphResolverConfig")
@@ -29,12 +32,24 @@ class GraphResolverConfig:
         key_template (str):
         source_artifact_kind (GraphResolverConfigSourceArtifactKind | Unset):  Default:
             GraphResolverConfigSourceArtifactKind.ASSET.
+        promote (bool | Unset): Materialize canonical entity documents. False resolves graph keys without promotion.
+            Default: True.
+        aliases (list[GraphResolverConfigAliasesItem] | Unset): Explicit redirects between fully rendered keys in this
+            resolver's table; no entity documents required. Changes trigger corpus re-resolution.
         labels (list[str] | Unset): Mention labels this resolver consumes; empty consumes every label (catch-all).
             Labeled resolvers sharing a source artifact must claim disjoint label sets, and every catch-all on that artifact
             skips the labels claimed by labeled siblings, so extraction labels stay open-vocabulary while each mention
             routes to exactly one labeled resolver (label-routed tables, e.g. event mentions to an events table).
         type_must_match (bool | Unset):  Default: True.
         scorer (GraphResolverScorerConfig | Unset):
+        adjudicate (GraphResolverAdjudicationConfig | Unset): Adjudicate the best deterministic REVIEW candidate with a
+            typed decision. MATCH and NO_MATCH bypass the model. Evidence is authoritative resolution data, retained
+            independently of work caches and reused on recovery. Changes trigger versioned re-resolution. This resolves
+            mentions, not global key merges.
+        suppress (GraphResolverSuppressionConfig | Unset): Suppress mentions before candidate search, embedding,
+            adjudication and promotion. Suppressed mentions remain explainable in resolution artifacts and contribute no
+            canonical graph edges. Changes use the normal resolver generation and bounded backfill lifecycle. Redirects to
+            suppressed keys are rejected. Runtime suppressions are additive and outlive index versions.
         scorer_json (str | Unset):
         candidate_search (GraphResolverConfigCandidateSearch | Unset):
         candidate_ann_index (str | Unset):
@@ -47,8 +62,9 @@ class GraphResolverConfig:
         fusion_prior_weight (float | Unset):
         min_confidence (float | Unset): Mention admission floor: mentions whose extractor-asserted confidence is below
             this are never resolved — no canonical entity key, no mention edge, and relation endpoints referencing them are
-            withheld. The cheap post-extraction junk filter for score-carrying extractors; 0 (the default) admits
-            everything.
+            withheld. The cheap post-extraction junk filter for score-carrying extractors; omission defaults to 0 for
+            trained extractors. Resolvers consuming verdict-only generated extraction must set this field explicitly,
+            including when the chosen floor is zero.
         config_generation (int | Unset):
     """
 
@@ -58,9 +74,13 @@ class GraphResolverConfig:
     resolution_artifact: str
     key_template: str
     source_artifact_kind: GraphResolverConfigSourceArtifactKind | Unset = GraphResolverConfigSourceArtifactKind.ASSET
+    promote: bool | Unset = True
+    aliases: list[GraphResolverConfigAliasesItem] | Unset = UNSET
     labels: list[str] | Unset = UNSET
     type_must_match: bool | Unset = True
     scorer: GraphResolverScorerConfig | Unset = UNSET
+    adjudicate: GraphResolverAdjudicationConfig | Unset = UNSET
+    suppress: GraphResolverSuppressionConfig | Unset = UNSET
     scorer_json: str | Unset = UNSET
     candidate_search: GraphResolverConfigCandidateSearch | Unset = UNSET
     candidate_ann_index: str | Unset = UNSET
@@ -89,6 +109,15 @@ class GraphResolverConfig:
         if not isinstance(self.source_artifact_kind, Unset):
             source_artifact_kind = self.source_artifact_kind.value
 
+        promote = self.promote
+
+        aliases: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.aliases, Unset):
+            aliases = []
+            for aliases_item_data in self.aliases:
+                aliases_item = aliases_item_data.to_dict()
+                aliases.append(aliases_item)
+
         labels: list[str] | Unset = UNSET
         if not isinstance(self.labels, Unset):
             labels = self.labels
@@ -98,6 +127,14 @@ class GraphResolverConfig:
         scorer: dict[str, Any] | Unset = UNSET
         if not isinstance(self.scorer, Unset):
             scorer = self.scorer.to_dict()
+
+        adjudicate: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.adjudicate, Unset):
+            adjudicate = self.adjudicate.to_dict()
+
+        suppress: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.suppress, Unset):
+            suppress = self.suppress.to_dict()
 
         scorer_json = self.scorer_json
 
@@ -140,12 +177,20 @@ class GraphResolverConfig:
         )
         if source_artifact_kind is not UNSET:
             field_dict["source_artifact_kind"] = source_artifact_kind
+        if promote is not UNSET:
+            field_dict["promote"] = promote
+        if aliases is not UNSET:
+            field_dict["aliases"] = aliases
         if labels is not UNSET:
             field_dict["labels"] = labels
         if type_must_match is not UNSET:
             field_dict["type_must_match"] = type_must_match
         if scorer is not UNSET:
             field_dict["scorer"] = scorer
+        if adjudicate is not UNSET:
+            field_dict["adjudicate"] = adjudicate
+        if suppress is not UNSET:
+            field_dict["suppress"] = suppress
         if scorer_json is not UNSET:
             field_dict["scorer_json"] = scorer_json
         if candidate_search is not UNSET:
@@ -175,7 +220,10 @@ class GraphResolverConfig:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.graph_resolver_adjudication_config import GraphResolverAdjudicationConfig
+        from ..models.graph_resolver_config_aliases_item import GraphResolverConfigAliasesItem
         from ..models.graph_resolver_scorer_config import GraphResolverScorerConfig
+        from ..models.graph_resolver_suppression_config import GraphResolverSuppressionConfig
 
         d = dict(src_dict)
         name = d.pop("name")
@@ -195,6 +243,17 @@ class GraphResolverConfig:
         else:
             source_artifact_kind = GraphResolverConfigSourceArtifactKind(_source_artifact_kind)
 
+        promote = d.pop("promote", UNSET)
+
+        _aliases = d.pop("aliases", UNSET)
+        aliases: list[GraphResolverConfigAliasesItem] | Unset = UNSET
+        if _aliases is not UNSET:
+            aliases = []
+            for aliases_item_data in _aliases:
+                aliases_item = GraphResolverConfigAliasesItem.from_dict(aliases_item_data)
+
+                aliases.append(aliases_item)
+
         labels = cast(list[str], d.pop("labels", UNSET))
 
         type_must_match = d.pop("type_must_match", UNSET)
@@ -205,6 +264,20 @@ class GraphResolverConfig:
             scorer = UNSET
         else:
             scorer = GraphResolverScorerConfig.from_dict(_scorer)
+
+        _adjudicate = d.pop("adjudicate", UNSET)
+        adjudicate: GraphResolverAdjudicationConfig | Unset
+        if isinstance(_adjudicate, Unset):
+            adjudicate = UNSET
+        else:
+            adjudicate = GraphResolverAdjudicationConfig.from_dict(_adjudicate)
+
+        _suppress = d.pop("suppress", UNSET)
+        suppress: GraphResolverSuppressionConfig | Unset
+        if isinstance(_suppress, Unset):
+            suppress = UNSET
+        else:
+            suppress = GraphResolverSuppressionConfig.from_dict(_suppress)
 
         scorer_json = d.pop("scorer_json", UNSET)
 
@@ -247,9 +320,13 @@ class GraphResolverConfig:
             resolution_artifact=resolution_artifact,
             key_template=key_template,
             source_artifact_kind=source_artifact_kind,
+            promote=promote,
+            aliases=aliases,
             labels=labels,
             type_must_match=type_must_match,
             scorer=scorer,
+            adjudicate=adjudicate,
+            suppress=suppress,
             scorer_json=scorer_json,
             candidate_search=candidate_search,
             candidate_ann_index=candidate_ann_index,

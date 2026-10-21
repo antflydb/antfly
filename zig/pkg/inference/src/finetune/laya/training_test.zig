@@ -63,8 +63,9 @@ test "laya training forward objective and every parameter gradient match PyTorch
 // attention graph (roadmap step 2c) instead of the dense materialized-bias
 // one. The reference gradients were computed against upstream's dense
 // attention; this checks the fused op does not move the relative L2 error
-// materially away from the dense path's (LAYA.md, "Verification":
-// 0.4-0.6% worst per-layer relative L2 on the released-model fixture).
+// materially away from the dense path's (LAYA.md, "Long states":
+// about 4% worst relative L2 over `encoder.layers.*` on the released-model
+// fixture, for either path).
 test "laya training forward objective and every parameter gradient match PyTorch (fused segment attention)" {
     try exerciseGradientParity(std.testing.allocator, true);
 }
@@ -156,7 +157,8 @@ fn exerciseGradientParity(a: std.mem.Allocator, use_fused_attention: bool) !void
     backward_inputs[combined.len] = .{ .node_id = program.gradients.id_map[program.seed], .value = seed };
     var backward = try train.executeFramed(a, &program.gradients.graph, cb, backward_inputs);
     defer backward.deinit(cb);
-    if (trace) try compareTraces(scratch, root, &program, cb, backward.outputs[program.wrt.len..], "backward");
+    // Past the gradients and the forward logits.
+    if (trace) try compareTraces(scratch, root, &program, cb, backward.outputs[program.wrt.len + 1 ..], "backward");
     var worst: f32 = 0;
     var mismatches: usize = 0;
     var worst_relative: f64 = 0;

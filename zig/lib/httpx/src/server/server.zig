@@ -602,19 +602,21 @@ pub const Context = struct {
         }
 
         const content = try self.allocator.alloc(u8, @intCast(stat.size));
-        errdefer self.allocator.free(content);
+        var transferred = false;
+        defer if (!transferred) self.allocator.free(content);
         _ = f.readPositionalAll(self.io, content, 0) catch return self.status(500).text("Read Error");
 
         _ = try self.response.header(HeaderName.CONTENT_TYPE, common.mimeTypeFromPath(path));
-        self.response.body_data = content;
-        self.response.body_owned = true;
+        _ = self.response.bodyOwned(self.allocator, content);
+        transferred = true;
         return self.response.build();
     }
 
     /// Sends chunked transfer-encoded payload with optional trailers.
     pub fn chunked(self: *Self, data: []const u8, trailers: ?*const Headers) !Response {
         const encoded = try http.encodeChunkedBody(data, trailers, self.allocator);
-        errdefer self.allocator.free(encoded);
+        var transferred = false;
+        defer if (!transferred) self.allocator.free(encoded);
 
         _ = try self.response.header(HeaderName.TRANSFER_ENCODING, "chunked");
         if (trailers) |trailer_headers| {
@@ -623,8 +625,8 @@ pub const Context = struct {
             _ = try self.response.header(HeaderName.TRAILER, trailer_names);
         }
         // Transfer ownership to the builder to avoid a second allocation in build().
-        self.response.body_data = encoded;
-        self.response.body_owned = true;
+        _ = self.response.bodyOwned(self.allocator, encoded);
+        transferred = true;
         return self.response.build();
     }
 
@@ -1723,6 +1725,10 @@ pub const Server = struct {
         try self.router.addStreamingRaw(method, path, handler);
     }
 
+    pub fn routeStreamingRawWithData(self: *Self, method: types.Method, path: []const u8, handler: anytype, data: *anyopaque) !void {
+        try self.router.addStreamingRawWithData(method, path, handler, data);
+    }
+
     /// Registers a route with borrowed opaque data copied into Context.
     pub fn routeWithData(self: *Self, method: types.Method, path: []const u8, handler: anytype, data: *anyopaque) !void {
         try self.router.addWithData(method, path, handler, data);
@@ -2504,11 +2510,7 @@ pub const Server = struct {
             }
 
             if (suppress_body) {
-                if (response.body_owned) {
-                    if (response.body) |body| self.allocator.free(body);
-                    response.body_owned = false;
-                }
-                response.body = null;
+                response.releaseBody();
             }
 
             // Handlers may deliberately shed an overloaded request and ask the
@@ -3261,11 +3263,7 @@ pub const Server = struct {
         defer response.deinit();
 
         if (suppress_body) {
-            if (response.body_owned) {
-                if (response.body) |b| self.allocator.free(b);
-                response.body_owned = false;
-            }
-            response.body = null;
+            response.releaseBody();
         }
 
         // RFC 7231 §7.1.1.2: origin servers SHOULD include a Date header.

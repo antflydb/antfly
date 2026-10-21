@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import json
+import os
 import subprocess
 import sys
 from contextlib import closing
@@ -23,6 +24,7 @@ import pytest
 
 import antfly_embedded as af
 from antfly_embedded import dbapi
+from antfly_embedded._sql import SQLStateError
 
 CASES = Path(__file__).resolve().parents[4] / "zig/pkg/antfly-embedded/capi-conformance/sql/cases.json"
 
@@ -35,6 +37,15 @@ def canonical(rows):
 
 
 def test_sql_conformance(require_native, aflite_path):
+    fixture = json.loads((CASES.parent / "search-fixture.json").read_text())
+    with af.create(aflite_path, no_sync=True) as database:
+        database.create_table(fixture["table"], fixture["schema"])
+        database.create_table("history_items", fixture["history"])
+        with database.open_table(fixture["table"]) as table:
+            for index in fixture["indexes"]:
+                table.add_index(index)
+            table.batch_json(fixture["batch"])
+            table.run_until_idle()
     with closing(dbapi.connect(aflite_path, autocommit=True, no_sync=True)) as connection:
         cursor = connection.cursor()
         for case in json.loads(CASES.read_text()):
@@ -145,6 +156,36 @@ def test_multi_table_stable_snapshot(require_native, aflite_path, tmp_path):
             for name, value in (("one", 1), ("two", 2)):
                 with database.open_table(name) as table:
                     assert table.lookup("same") == {"value": value}
+
+
+@pytest.mark.parametrize("delete_action", ["", " ON DELETE CASCADE"])
+def test_issue_1141_fk_insert_subquery_delete_commit(require_native, aflite_path, delete_action):
+    # The native regression forces the refresh race without background timing.
+    # Keep the complete reported stress workload available without slowing every
+    # binding test lane or accumulating hundreds of MiB of maintenance output.
+    iterations = 400 if os.environ.get("ANTFLY_EMBEDDED_SQL_STRESS") == "1" else 32
+    with closing(dbapi.connect(aflite_path, autocommit=True)) as connection:
+        cursor = connection.cursor()
+        cursor.execute("CREATE TABLE parent (id TEXT PRIMARY KEY)")
+        cursor.execute(
+            f"CREATE TABLE child (id TEXT PRIMARY KEY, parent_id TEXT NOT NULL REFERENCES parent (id){delete_action})"
+        )
+        for i in range(iterations):
+            connection.autocommit = True
+            cursor.execute("INSERT INTO parent (id) VALUES ($1)", (f"p{i}",))
+            connection.autocommit = False
+            cursor.execute("INSERT INTO child (id, parent_id) VALUES ($1, $2)", (f"c{i}", f"p{i}"))
+            cursor.execute(
+                "DELETE FROM child WHERE id IN (SELECT id FROM child WHERE parent_id = $1 ORDER BY id DESC OFFSET 8)",
+                (f"p{i}",),
+            )
+            connection.commit()
+            # Bound unrelated text-index debt between committed transactions.
+            if (i + 1) % 16 == 0:
+                connection._database.run_until_idle()
+        connection.autocommit = True
+        cursor.execute("SELECT COUNT(*) FROM child")
+        assert cursor.fetchall() == [(iterations,)]
 
 
 def test_cross_table_foreign_keys_and_failed_transaction(require_native, aflite_path):
@@ -534,3 +575,149 @@ def test_commented_rollback_preserves_manual_transactions(require_native, aflite
         assert cursor.execute("SELECT n FROM numbers").fetchall() == [(3,)]
         connection.rollback()
         assert cursor.execute("SELECT n FROM numbers").fetchall() == []
+
+
+def test_issue_1057_not_null_identifies_public_column(require_native, aflite_path):
+    with af.create(aflite_path, no_sync=True) as database:
+        database.sql(
+            "CREATE TABLE p (id TEXT PRIMARY KEY, board TEXT NOT NULL, n BIGINT NOT NULL, body TEXT NOT NULL, note TEXT NOT NULL)"
+        )
+        for statement, parameters in [
+            ("INSERT INTO p (id, board, n, body) VALUES ('z','b1',3,'no note')", ()),
+            ("INSERT INTO p (id, board, n, body, note) VALUES ('z','b1',3,'no note',$1)", (None,)),
+            ("INSERT INTO p (id, board, n, body, note) VALUES ('z','b1',3,'no note',NULL)", ()),
+        ]:
+            with pytest.raises(SQLStateError) as raised:
+                database.sql(statement, parameters)
+            assert raised.value.sqlstate == "23502"
+            assert raised.value.diagnostic["column_name"] == "note"
+        assert database.sql("SELECT id FROM p")["rows"] == []
+
+
+@pytest.mark.parametrize("size_mib", [2, 3, 4, 6, 8, 12])
+def test_issue_1057_large_autocommit_statement(require_native, aflite_path, size_mib):
+    with af.create(aflite_path, no_sync=True) as database:
+        database.sql("CREATE TABLE large_payloads (id TEXT PRIMARY KEY, body TEXT NOT NULL)")
+        payload = "x" * (size_mib * 1024 * 1024)
+        database.sql("INSERT INTO large_payloads (id,body) VALUES ('bound',$1)", (payload,))
+        database.sql("INSERT INTO large_payloads (id,body) VALUES ('literal','" + payload + "')")
+        assert database.sql("SELECT id,octet_length(body) FROM large_payloads ORDER BY id")["rows"] == [
+            ["bound", str(len(payload))],
+            ["literal", str(len(payload))],
+        ]
+
+
+def test_issue_1057_large_transaction(require_native, aflite_path):
+    with af.create(aflite_path, no_sync=True) as database:
+        database.sql("CREATE TABLE txn_payloads (id TEXT PRIMARY KEY, body TEXT NOT NULL)")
+        session = database.sql_session()
+        try:
+            session.execute("BEGIN")
+            for index in range(4):
+                session.execute("INSERT INTO txn_payloads (id,body) VALUES ($1,$2)", (str(index), "x" * 1024 * 1024))
+            session.execute("COMMIT")
+            assert database.sql("SELECT count(*) FROM txn_payloads")["rows"] == [["4"]]
+        finally:
+            session.close()
+
+
+def test_issue_1057_oversized_request_has_sql_diagnostic(require_native, aflite_path):
+    with af.create(aflite_path, no_sync=True) as database:
+        with pytest.raises(SQLStateError) as raised:
+            database.sql("SELECT $1", ("x" * (64 * 1024 * 1024),))
+        assert raised.value.sqlstate == "54000"
+        assert "67108864" in raised.value.diagnostic["message"]
+        assert database.sql("SELECT 1")["rows"] == [["1"]]
+
+
+def test_issue_1057_not_null_preserves_default_and_empty_source(require_native, aflite_path):
+    with af.create(aflite_path, no_sync=True) as database:
+        database.sql("CREATE TABLE defaults_test (id TEXT PRIMARY KEY, note TEXT NOT NULL DEFAULT 'ready')")
+        database.sql("INSERT INTO defaults_test (id) VALUES ('ok')")
+        assert database.sql("SELECT note FROM defaults_test")["rows"] == [["ready"]]
+        database.sql("CREATE TABLE required_test (id TEXT PRIMARY KEY, note TEXT NOT NULL)")
+        database.sql("INSERT INTO required_test (id) SELECT 'skip' WHERE false")
+        assert database.sql("SELECT id FROM required_test")["rows"] == []
+
+
+def test_shared_storage_drop_respects_other_connection_streams(require_native, aflite_path):
+    with af.create(aflite_path, no_sync=True) as first, af.open(aflite_path, no_sync=True) as second:
+        first.sql("CREATE TABLE numbers (n BIGINT)")
+        first.sql("INSERT INTO numbers (_id,n) VALUES ('row',7)")
+        with closing(second.sql_cursor("SELECT n FROM numbers")) as cursor:
+            with pytest.raises(SQLStateError) as blocked:
+                first.sql("DROP TABLE numbers")
+            assert blocked.value.sqlstate == "53300"
+            assert cursor.fetch()["result"]["rows"] == [["7"]]
+        first.sql("DROP TABLE numbers")
+        second.sql("CREATE TABLE numbers (n BIGINT)")
+        assert second.sql("SELECT n FROM numbers")["rows"] == []
+
+
+def test_shared_storage_cursor_survives_other_connection_close(require_native, aflite_path):
+    first = af.create(aflite_path, no_sync=True)
+    try:
+        first.sql("CREATE TABLE numbers (n BIGINT)")
+        first.sql("INSERT INTO numbers (_id,n) VALUES ('row',7)")
+        with af.open(aflite_path, no_sync=True) as second:
+            with closing(second.sql_cursor("SELECT n FROM numbers")) as cursor:
+                first.close()
+                assert cursor.fetch()["result"]["rows"] == [["7"]]
+            second.sql("INSERT INTO numbers (_id,n) VALUES ('next',8)")
+            assert second.sql("SELECT n FROM numbers ORDER BY n")["rows"] == [["7"], ["8"]]
+    finally:
+        first.close()
+
+
+@pytest.mark.parametrize(
+    "kind,value",
+    [
+        ("TEXT", "prefix\x00suffix"),
+        ("JSONB", {"output": ["prefix\x00suffix"]}),
+        ("JSONB", {"prefix\x00suffix": "value"}),
+    ],
+)
+def test_sql_nul_diagnostic_and_atomicity(require_native, aflite_path, kind, value):
+    with af.create(aflite_path, no_sync=True) as database:
+        database.sql(f"CREATE TABLE items (id BIGINT PRIMARY KEY, item {kind})")
+        statement = "INSERT INTO items (id,item) VALUES ($1,$2) ON CONFLICT (id) DO UPDATE SET item=excluded.item"
+        with pytest.raises(SQLStateError) as raised:
+            database.sql(statement, [1, value])
+        assert raised.value.sqlstate == "22P05"
+        assert raised.value.diagnostic["parameter_index"] == 2
+        assert "parameter $2" in str(raised.value)
+        assert "NUL" in str(raised.value)
+        detail = json.loads(database._lib.antfly_last_error_detail())
+        assert detail["error"]["parameter_index"] == 2
+        assert "parameter $2" in detail["error"]["message"]
+        assert database.sql("SELECT id FROM items")["rows"] == []
+        database.sql(statement, [1, "clean" if kind == "TEXT" else {"output": "clean"}])
+        with pytest.raises(SQLStateError) as update:
+            database.sql("UPDATE items SET item=$1 WHERE id=1", [value])
+        assert update.value.sqlstate == "22P05"
+        assert update.value.diagnostic["parameter_index"] == 1
+        # Cursor preparation uses the same parameter validation and diagnostics.
+        with pytest.raises(SQLStateError) as cursor:
+            database.sql_cursor(f"SELECT $1::{kind}", [value])
+        assert cursor.value.sqlstate == "22P05"
+        assert cursor.value.diagnostic["parameter_index"] == 1
+
+
+@pytest.mark.parametrize("payload", ['{"v":"\\u0000"}', '{"\\u0000":"v"}'])
+@pytest.mark.parametrize("bound", [False, True])
+def test_sql_jsonb_cast_rejects_nul(require_native, aflite_path, payload, bound):
+    expression = "$1::text::jsonb" if bound else f"'{payload}'::jsonb"
+    parameters = [payload] if bound else []
+    with af.create(aflite_path, no_sync=True) as database:
+        database.sql("CREATE TABLE items (id BIGINT PRIMARY KEY, item JSONB)")
+        for statement in [f"SELECT {expression}", f"INSERT INTO items (id,item) VALUES (1,{expression})"]:
+            with pytest.raises(SQLStateError) as raised:
+                database.sql(statement, parameters)
+            assert raised.value.sqlstate == "22P05"
+            assert "NUL" in str(raised.value)
+        assert database.sql("SELECT id FROM items")["rows"] == []
+        database.sql("INSERT INTO items (id,item) VALUES (1,'{}'::jsonb)")
+        with pytest.raises(SQLStateError) as raised:
+            with closing(database.sql_cursor(f"SELECT {expression} FROM items", parameters)) as cursor:
+                cursor.fetch()
+        assert raised.value.sqlstate == "22P05"

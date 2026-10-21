@@ -90,6 +90,8 @@ pub const ReplayBatcher = union(enum) {
     }
 };
 
+// Replay maps already coalesce each document/artifact identity. Equal sort
+// keys cannot carry an earlier write, so stable merge sorting adds no ordering.
 const TextReplayAccumulator = struct {
     alloc: Allocator,
     target_kind: derived_types.DerivedTarget = .full_text,
@@ -189,8 +191,8 @@ const TextReplayAccumulator = struct {
         var doc_index: usize = 0;
         while (docs_it.next()) |entry| : (doc_index += 1) documents[doc_index] = entry.value_ptr.*;
 
-        if (delete_count > 1) std.mem.sort([]const u8, overwritten_doc_keys, {}, lessThanString);
-        if (doc_count > 1) std.mem.sort(derived_types.DerivedDocument, documents, {}, lessThanDocument);
+        if (delete_count > 1) std.mem.sortUnstable([]const u8, overwritten_doc_keys, {}, lessThanString);
+        if (doc_count > 1) std.mem.sortUnstable(derived_types.DerivedDocument, documents, {}, lessThanDocument);
 
         self.pre_deletes.deinit(self.alloc);
         self.pre_deletes = .empty;
@@ -419,9 +421,9 @@ const DenseReplayAccumulator = struct {
             self.alloc.free(entry.key_ptr.*);
         }
 
-        if (delete_count > 1) std.mem.sort([]const u8, overwritten_doc_keys, {}, lessThanString);
-        if (doc_count > 1) std.mem.sort(derived_types.DerivedDocument, documents, {}, lessThanDocument);
-        if (embedding_count > 1) std.mem.sort(derived_types.DerivedDenseEmbeddingWrite, dense_embeddings, {}, lessThanDenseEmbedding);
+        if (delete_count > 1) std.mem.sortUnstable([]const u8, overwritten_doc_keys, {}, lessThanString);
+        if (doc_count > 1) std.mem.sortUnstable(derived_types.DerivedDocument, documents, {}, lessThanDocument);
+        if (embedding_count > 1) std.mem.sortUnstable(derived_types.DerivedDenseEmbeddingWrite, dense_embeddings, {}, lessThanDenseEmbedding);
 
         self.pre_deletes.deinit(self.alloc);
         self.pre_deletes = .empty;
@@ -604,9 +606,9 @@ const SparseReplayAccumulator = struct {
             self.alloc.free(entry.key_ptr.*);
         }
 
-        if (delete_count > 1) std.mem.sort([]const u8, overwritten_doc_keys, {}, lessThanString);
-        if (doc_count > 1) std.mem.sort(derived_types.DerivedDocument, documents, {}, lessThanDocument);
-        if (embedding_count > 1) std.mem.sort(derived_types.DerivedSparseEmbeddingWrite, sparse_embeddings, {}, lessThanSparseEmbedding);
+        if (delete_count > 1) std.mem.sortUnstable([]const u8, overwritten_doc_keys, {}, lessThanString);
+        if (doc_count > 1) std.mem.sortUnstable(derived_types.DerivedDocument, documents, {}, lessThanDocument);
+        if (embedding_count > 1) std.mem.sortUnstable(derived_types.DerivedSparseEmbeddingWrite, sparse_embeddings, {}, lessThanSparseEmbedding);
 
         self.pre_deletes.deinit(self.alloc);
         self.pre_deletes = .empty;
@@ -629,6 +631,8 @@ const SparseReplayAccumulator = struct {
     }
 };
 
+// One index per accumulator; relationship keys are deduplicated before sort.
+// The remaining comparator fields cover their complete identity.
 const GraphReplayAccumulator = struct {
     alloc: Allocator,
     index_name: []const u8,
@@ -884,10 +888,10 @@ const GraphReplayAccumulator = struct {
             self.alloc.free(entry.key_ptr.*);
         }
 
-        if (delete_count > 1) std.mem.sort([]const u8, deleted_keys, {}, lessThanString);
-        if (clear_count > 1) std.mem.sort(derived_types.DerivedGraphDocClear, graph_doc_clears, {}, lessThanGraphClear);
-        if (write_count > 1) std.mem.sort(types.GraphEdgeWrite, graph_writes, {}, lessThanGraphWrite);
-        if (delete_edge_count > 1) std.mem.sort(types.GraphEdgeDelete, graph_deletes, {}, lessThanGraphDelete);
+        if (delete_count > 1) std.mem.sortUnstable([]const u8, deleted_keys, {}, lessThanString);
+        if (clear_count > 1) std.mem.sortUnstable(derived_types.DerivedGraphDocClear, graph_doc_clears, {}, lessThanGraphClear);
+        if (write_count > 1) std.mem.sortUnstable(types.GraphEdgeWrite, graph_writes, {}, lessThanGraphWrite);
+        if (delete_edge_count > 1) std.mem.sortUnstable(types.GraphEdgeDelete, graph_deletes, {}, lessThanGraphDelete);
 
         self.deleted_keys.deinit(self.alloc);
         self.deleted_keys = .empty;

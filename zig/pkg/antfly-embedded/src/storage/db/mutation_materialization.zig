@@ -386,10 +386,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn acquireTransactionSchemaView(self: anytype, alloc: Allocator, binding: ?transactions_mod.SchemaBinding) !?schema_registry_mod.SchemaView {
             if (binding) |pinned| return if (pinned.version) |version|
-                try self.core.acquireSchemaVersionWriteView(alloc, version)
+                try S.ownerField(self, "core").*.acquireSchemaVersionWriteView(alloc, version)
             else
                 null;
-            return self.core.acquireSchemaView();
+            return S.ownerField(self, "core").*.acquireSchemaView();
         }
 
         pub fn appendDenseArtifactCounterBootstrapWrite(
@@ -505,7 +505,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             while (final_it.next()) |entry| : (artifact_index += 1) {
                 artifact_keys[artifact_index] = entry.key_ptr.*;
             }
-            std.mem.sort([]const u8, artifact_keys, {}, struct {
+            std.mem.sortUnstable([]const u8, artifact_keys, {}, struct {
                 fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
                     return std.mem.order(u8, lhs, rhs) == .lt;
                 }
@@ -768,9 +768,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn artifactMaterializationsReady(self: anytype, txn: anytype, catalogs: @import("artifact_inventory.zig").Catalogs) !bool {
-            if (!try self.core.index_manager.matchesArtifactInventory(catalogs)) return false;
-            const prefix = try internal_keys.indexArtifactCleanupRootPrefixAlloc(self.alloc);
-            defer self.alloc.free(prefix);
+            if (!try S.ownerField(self, "core").*.index_manager.matchesArtifactInventory(catalogs)) return false;
+            const prefix = try internal_keys.indexArtifactCleanupRootPrefixAlloc(S.ownerField(self, "alloc").*);
+            defer S.ownerField(self, "alloc").*.free(prefix);
             var cursor = try txn.openCursor();
             defer cursor.close();
             const first = try cursor.seekAtOrAfter(prefix) orelse return true;
@@ -781,7 +781,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const Read = struct {
                 fn get(ptr: *anyopaque, alloc: Allocator, key: []const u8) !?[]u8 {
                     const owner: @TypeOf(self) = @ptrCast(@alignCast(ptr));
-                    return owner.core.getStoreValue(alloc, key);
+                    return S.ownerField(owner, "core").*.getStoreValue(alloc, key);
                 }
             };
             return .{ .ptr = self, .get = Read.get };
@@ -833,9 +833,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer if (replication_mutation) |*lease| lease.release();
             try self.enforceReplicationWriteGate();
             try self.lockApplyForPortableRuntime();
-            defer self.core.unlockApply();
+            defer S.ownerField(self, "core").*.unlockApply();
             const deletes = [_][]const u8{key};
-            try self.core.store.putBatch(&.{}, deletes[0..]);
+            try S.ownerField(self, "core").*.store.putBatch(&.{}, deletes[0..]);
         }
 
         pub fn denseArtifactCounterBootstrapKeyAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
@@ -851,8 +851,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn denseRepairWriteBackpressured(self: anytype) bool {
-            if (!self.async_context.index_repair_replay_pinned.load(.acquire)) return false;
-            const manager = self.core.index_manager.resource_manager orelse return false;
+            if (!S.ownerField(self, "async_context").*.index_repair_replay_pinned.load(.acquire)) return false;
+            const manager = S.ownerField(self, "core").*.index_manager.resource_manager orelse return false;
             return manager.denseRepairReplayPressureIsHard();
         }
 
@@ -867,14 +867,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn derivedCoverageAppliesToIndex(self: anytype, kind: types.IndexKind, index_name: []const u8) bool {
             return switch (kind) {
                 .graph => blk: {
-                    for (self.core.graphIndexes()) |entry| {
+                    for (S.ownerField(self, "core").*.graphIndexes()) |entry| {
                         if (std.mem.eql(u8, entry.config.name, index_name))
                             break :blk entry.artifact_sources.len > 0;
                     }
                     break :blk false;
                 },
                 .full_text => blk: {
-                    for (self.core.index_manager.text_indexes.items) |entry| {
+                    for (S.ownerField(self, "core").*.index_manager.text_indexes.items) |entry| {
                         if (std.mem.eql(u8, entry.config.name, index_name))
                             break :blk entry.chunk_name != null or entry.source_artifact_names.len > 0;
                     }
@@ -889,21 +889,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             dispatcher: DocumentArtifactChildRangeDispatcher,
             limit: usize,
         ) anyerror!DocumentArtifactChildRangeOutboxDrainResult {
-            if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+            if (openModeRequiresReadOnlyBackends(S.ownerField(self, "open_mode").*)) return error.ReadOnly;
             var replication_mutation = self.acquireReplicationMutationShared();
             defer if (replication_mutation) |*lease| lease.release();
             try self.enforceReplicationWriteGate();
 
-            const prefix = try internal_keys.documentChildRangeOutboxRootPrefixAlloc(self.alloc);
-            defer self.alloc.free(prefix);
+            const prefix = try internal_keys.documentChildRangeOutboxRootPrefixAlloc(S.ownerField(self, "alloc").*);
+            defer S.ownerField(self, "alloc").*.free(prefix);
 
             try self.lockApplyForPortableRuntime();
             var apply_mutex_held = true;
-            errdefer if (apply_mutex_held) self.core.unlockApply();
-            const scanned = try self.core.scanStorePrefix(self.alloc, prefix);
-            self.core.unlockApply();
+            errdefer if (apply_mutex_held) S.ownerField(self, "core").*.unlockApply();
+            const scanned = try S.ownerField(self, "core").*.scanStorePrefix(S.ownerField(self, "alloc").*, prefix);
+            S.ownerField(self, "core").*.unlockApply();
             apply_mutex_held = false;
-            defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
+            defer docstore_mod.DocStore.freeResults(S.ownerField(self, "alloc").*, scanned);
 
             const Removal = struct {
                 fn remove(ptr: *anyopaque, key: []const u8) !void {
@@ -911,7 +911,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     return owner.deleteDocumentArtifactChildRangeOutboxEntry(key);
                 }
             };
-            return document_child_range_outbox.drain(self.alloc, scanned, dispatcher, limit, self, Removal.remove);
+            return document_child_range_outbox.drain(S.ownerField(self, "alloc").*, scanned, dispatcher, limit, self, Removal.remove);
         }
 
         pub fn encodeDenseArtifactCounterBootstrap(value: DenseArtifactCounterBootstrap, out: *[dense_artifact_counter_bootstrap_encoded_len]u8) void {
@@ -934,7 +934,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn hasConfiguredResolvers(self: anytype) bool {
-            return self.core.index_manager.resolvers.items.len > 0;
+            return S.ownerField(self, "core").*.index_manager.resolvers.items.len > 0;
         }
 
         pub fn loadDenseArtifactCounterBootstrap(
@@ -1214,7 +1214,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 defer artifact_ref.deinit(alloc);
                 try appendUniqueOwnedKey(alloc, &artifact_names, artifact_ref.name);
             }
-            std.mem.sort([]u8, artifact_names.items, {}, struct {
+            std.mem.sortUnstable([]u8, artifact_names.items, {}, struct {
                 fn lessThan(_: void, lhs: []u8, rhs: []u8) bool {
                     return std.mem.order(u8, lhs, rhs) == .lt;
                 }
@@ -1529,7 +1529,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try appendOwnedKey(alloc, artifact_delete_keys, manifest_key);
             const state_key = try assetStateKeyAlloc(alloc, doc_key, artifact_name);
             errdefer alloc.free(state_key);
-            const existing_state = db.core.getStoreValue(alloc, state_key) catch |err| switch (err) {
+            const existing_state = S.ownerField(db, "core").*.getStoreValue(alloc, state_key) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
@@ -1700,7 +1700,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ) !void {
             const summary_key = try internal_keys.documentUnitNavigationSummaryKeyAlloc(alloc, doc_key, artifact_name);
             defer alloc.free(summary_key);
-            const existing_summary = try db.core.getStoreValue(alloc, summary_key);
+            const existing_summary = try S.ownerField(db, "core").*.getStoreValue(alloc, summary_key);
             defer if (existing_summary) |value| alloc.free(value);
             if (existing_summary) |summary| {
                 if (try hierarchy_navigation.indexMetadataMatches(alloc, state, summary, generation)) return;
@@ -1726,7 +1726,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     return error.InvalidDocumentExtractionState;
                 }
                 if (descriptor.fingerprint.len == 0) {
-                    const stored = try db.core.getStoreValue(alloc, descriptor.key) orelse
+                    const stored = try S.ownerField(db, "core").*.getStoreValue(alloc, descriptor.key) orelse
                         return error.InvalidDocumentExtractionState;
                     defer alloc.free(stored);
                     descriptor.fingerprint = try documentExtractionStoredUnitFingerprintAlloc(alloc, stored);
@@ -1896,7 +1896,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     sparse_pending.deinit(alloc);
                 }
                 try collectPendingDocumentUnitSparseChunkEmbeddings(alloc, db, &entry, &sparse_pending);
-                const runtime = db.enrichment_runtime;
+                const runtime = S.ownerField(db, "enrichment_runtime").*;
                 const dense_embedder = if (runtime) |rt| rt.config.dense_embedder else null;
                 const sparse_embedder = if (runtime) |rt| rt.config.sparse_embedder else null;
 
@@ -2236,11 +2236,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 group_positions: std.StringHashMapUnmanaged(usize) = .empty,
 
                 fn group(self: *@This(), owner: []const u8, index: *index_manager_mod.IndexManager.GraphIndex) !*Group {
-                    const key = try internal_keys.graphEdgeContenderCountKeyAlloc(self.alloc, owner, index.config.name);
-                    const pos = try self.group_positions.getOrPut(self.alloc, key);
+                    const key = try internal_keys.graphEdgeContenderCountKeyAlloc(S.ownerField(self, "alloc").*, owner, index.config.name);
+                    const pos = try self.group_positions.getOrPut(S.ownerField(self, "alloc").*, key);
                     if (!pos.found_existing) {
                         pos.value_ptr.* = self.groups.items.len;
-                        try self.groups.append(self.alloc, .{ .owner = try self.alloc.dupe(u8, owner), .index = index });
+                        try self.groups.append(S.ownerField(self, "alloc").*, .{ .owner = try S.ownerField(self, "alloc").*.dupe(u8, owner), .index = index });
                     }
                     return &self.groups.items[pos.value_ptr.*];
                 }
@@ -2278,22 +2278,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     } else false;
                     const g = try self.group(owner, index);
                     if (suppressed) {
-                        try appendGraphContenderChange(self.alloc, &g.changes, try self.alloc.dupe(u8, view.edge_key), try self.alloc.dupe(u8, view.state_key), view.source_priority, null);
-                        try g.extra_deletes.append(self.alloc, try self.alloc.dupe(u8, lifetime_key));
+                        try appendGraphContenderChange(S.ownerField(self, "alloc").*, &g.changes, try S.ownerField(self, "alloc").*.dupe(u8, view.edge_key), try S.ownerField(self, "alloc").*.dupe(u8, view.state_key), view.source_priority, null);
+                        try g.extra_deletes.append(S.ownerField(self, "alloc").*, try S.ownerField(self, "alloc").*.dupe(u8, lifetime_key));
                         return;
                     }
                     // A changed revision retires an obsolete imported tombstone too.
-                    if (tomb_raw != null) try g.extra_deletes.append(self.alloc, try self.alloc.dupe(u8, tomb_key));
-                    var payload = try self.alloc.dupe(u8, view.payload);
+                    if (tomb_raw != null) try g.extra_deletes.append(S.ownerField(self, "alloc").*, try S.ownerField(self, "alloc").*.dupe(u8, tomb_key));
+                    var payload = try S.ownerField(self, "alloc").*.dupe(u8, view.payload);
                     if (state) |row| if (internal_keys.isGraphEdgeTtlLifetimeKey(row.key)) {
                         if (row.value.len != 8) return error.InvalidGraphEdgeTtlLifetime;
                         const timestamp = std.mem.readInt(u64, row.value[0..8], .big);
                         if (timestamp == 0) return error.InvalidGraphEdgeTtlLifetime;
                         var edge = try enrichment_artifact_codec.decodeGraphEdgeAlloc(probe, payload);
                         defer edge.deinit(probe);
-                        payload = try enrichment_artifact_codec.encodeGraphEdgeWithTtlAlloc(self.alloc, null, index.config.coverage_generation, edge.weight, edge.created_at, edge.updated_at, timestamp, edge.metadata_json);
+                        payload = try enrichment_artifact_codec.encodeGraphEdgeWithTtlAlloc(S.ownerField(self, "alloc").*, null, index.config.coverage_generation, edge.weight, edge.created_at, edge.updated_at, timestamp, edge.metadata_json);
                     };
-                    try appendGraphContenderChange(self.alloc, &g.changes, try self.alloc.dupe(u8, view.edge_key), try self.alloc.dupe(u8, view.state_key), view.source_priority, payload);
+                    try appendGraphContenderChange(S.ownerField(self, "alloc").*, &g.changes, try S.ownerField(self, "alloc").*.dupe(u8, view.edge_key), try S.ownerField(self, "alloc").*.dupe(u8, view.state_key), view.source_priority, payload);
                 }
             };
             var positions = StoreWritePositions.empty;
@@ -2579,28 +2579,28 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
                 fn add(self: *@This(), edge_key: []const u8, payload: ?[]const u8) !void {
                     if (!internal_keys.isGraphEdgeArtifactKey(edge_key)) return;
-                    const parsed = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(self.alloc, edge_key)) orelse return error.InvalidGraphEdgeArtifact;
+                    const parsed = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(S.ownerField(self, "alloc").*, edge_key)) orelse return error.InvalidGraphEdgeArtifact;
                     defer {
-                        self.alloc.free(parsed.doc_key);
-                        self.alloc.free(parsed.index_name);
-                        self.alloc.free(parsed.edge_type);
-                        self.alloc.free(parsed.target_doc_key);
-                        self.alloc.free(parsed.edge_id);
-                        self.alloc.free(parsed.logical_source);
+                        S.ownerField(self, "alloc").*.free(parsed.doc_key);
+                        S.ownerField(self, "alloc").*.free(parsed.index_name);
+                        S.ownerField(self, "alloc").*.free(parsed.edge_type);
+                        S.ownerField(self, "alloc").*.free(parsed.target_doc_key);
+                        S.ownerField(self, "alloc").*.free(parsed.edge_id);
+                        S.ownerField(self, "alloc").*.free(parsed.logical_source);
                     }
                     const entry = self.index_manager.graphIndex(parsed.index_name) orelse return;
                     if (self.index_manager.graphArtifactSources(parsed.index_name).len == 0) return;
-                    const state_key = try internal_keys.graphDirectStateKeyAlloc(self.alloc, parsed.doc_key, parsed.index_name);
+                    const state_key = try internal_keys.graphDirectStateKeyAlloc(S.ownerField(self, "alloc").*, parsed.doc_key, parsed.index_name);
                     var state_key_owned = true;
-                    defer if (state_key_owned) self.alloc.free(state_key);
-                    const gop = try self.positions.getOrPut(self.alloc, state_key);
+                    defer if (state_key_owned) S.ownerField(self, "alloc").*.free(state_key);
+                    const gop = try self.positions.getOrPut(S.ownerField(self, "alloc").*, state_key);
                     if (!gop.found_existing) {
-                        const doc_key = try self.alloc.dupe(u8, parsed.doc_key);
-                        errdefer self.alloc.free(doc_key);
-                        const index_name = try self.alloc.dupe(u8, parsed.index_name);
-                        errdefer self.alloc.free(index_name);
+                        const doc_key = try S.ownerField(self, "alloc").*.dupe(u8, parsed.doc_key);
+                        errdefer S.ownerField(self, "alloc").*.free(doc_key);
+                        const index_name = try S.ownerField(self, "alloc").*.dupe(u8, parsed.index_name);
+                        errdefer S.ownerField(self, "alloc").*.free(index_name);
                         gop.value_ptr.* = self.groups.items.len;
-                        try self.groups.append(self.alloc, .{
+                        try self.groups.append(S.ownerField(self, "alloc").*, .{
                             .doc_key = doc_key,
                             .index_name = index_name,
                             .state_key = state_key,
@@ -2611,7 +2611,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         state_key_owned = false;
                     }
                     const group = &self.groups.items[gop.value_ptr.*];
-                    try appendGraphContenderChange(self.alloc, &group.changes, edge_key, group.state_key, @intCast(graph_mod.direct_source_priority), payload);
+                    try appendGraphContenderChange(S.ownerField(self, "alloc").*, &group.changes, edge_key, group.state_key, @intCast(graph_mod.direct_source_priority), payload);
                 }
             };
             var groups = std.ArrayListUnmanaged(Group).empty;
@@ -2761,13 +2761,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // across chunking, rendering, or model inference -- instead of reading
             // those arrays while a concurrent catalog publish could replace or free
             // them.
-            var pinned = try db.core.index_manager.acquireWritePlanSnapshot();
+            var pinned = try S.ownerField(db, "core").*.index_manager.acquireWritePlanSnapshot();
             defer pinned.release();
             const requirements = if (pinned.plan().completion_plan) |*value| value else return error.ArtifactCatalogDrift;
             _ = requirements.providerFor(request) catch return error.EnrichmentSourceChanged;
-            db.core.index_manager.catalog_mutex.lockShared();
-            defer db.core.index_manager.catalog_mutex.unlockShared();
-            const consumers = try db.core.index_manager.indexesDependingOnArtifact(alloc, requestArtifactName(request));
+            S.ownerField(db, "core").*.index_manager.catalog_mutex.lockShared();
+            defer S.ownerField(db, "core").*.index_manager.catalog_mutex.unlockShared();
+            const consumers = try S.ownerField(db, "core").*.index_manager.indexesDependingOnArtifact(alloc, requestArtifactName(request));
             defer {
                 for (consumers) |name| alloc.free(name);
                 alloc.free(consumers);
@@ -2789,7 +2789,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .outcome = outcome,
                 });
                 const readiness = @import("artifact_producer_readiness.zig");
-                const sources = try db.core.index_manager.artifactSourceNamesForIndexAlloc(alloc, index_name);
+                const sources = try S.ownerField(db, "core").*.index_manager.artifactSourceNamesForIndexAlloc(alloc, index_name);
                 defer {
                     for (sources) |source| alloc.free(source);
                     alloc.free(sources);
@@ -3184,7 +3184,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var cursor: ?[]u8 = null;
             defer if (cursor) |key| alloc.free(key);
             while (true) {
-                const existing = try db.core.store.scanPrefixKeysPage(alloc, prefix, cursor, 256);
+                const existing = try S.ownerField(db, "core").*.store.scanPrefixKeysPage(alloc, prefix, cursor, 256);
                 defer freeOwnedKeySlice(alloc, existing);
                 if (existing.len == 0) break;
                 for (existing) |entry| {
@@ -3362,10 +3362,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn applyDerivedBatchProfiled(self: anytype, batch: derived_types.DerivedBatch, profile: ?*BatchProfile) !void {
             var ctx = self.batchContext();
             try applyDerivedBatchContextProfiled(&ctx, batch, profile);
-            if (self.text_merge_runtime) |runtime| {
+            if (S.ownerField(self, "text_merge_runtime").*) |runtime| {
                 runtime.notify();
             }
-            if (self.sparse_compaction_runtime) |runtime| runtime.notify();
+            if (S.ownerField(self, "sparse_compaction_runtime").*) |runtime| runtime.notify();
         }
 
         pub fn applyDerivedBatchTargetsContextProfiled(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch, index_names: []const []const u8, profile: ?*BatchProfile) !void {
@@ -3411,10 +3411,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn applyDerivedBatchTargetsProfiled(self: anytype, batch: derived_types.DerivedBatch, index_names: []const []const u8, profile: ?*BatchProfile) !void {
             var ctx = self.batchContext();
             try applyDerivedBatchTargetsContextProfiled(&ctx, batch, index_names, profile);
-            if (self.text_merge_runtime) |runtime| {
+            if (S.ownerField(self, "text_merge_runtime").*) |runtime| {
                 runtime.notify();
             }
-            if (self.sparse_compaction_runtime) |runtime| runtime.notify();
+            if (S.ownerField(self, "sparse_compaction_runtime").*) |runtime| runtime.notify();
         }
 
         pub fn applyDerivedBatchToIndexContext(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) !void {
@@ -3701,6 +3701,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         entry.chunk_name != null
                     else
                         false;
+                    const external = ctx.index_manager.denseIndexUsesExternalCoverage(index_ref.name);
+                    // External vectors are caller-owned artifacts. Source overwrites
+                    // do not retire them: omission is a no-op, replacements upsert,
+                    // and explicit nulls enter replay_delete_keys via artifact deletes.
                     // Chunk-backed vectors have deterministic artifact identities and
                     // a complete stale-chunk delete lifecycle. Erasing every vector
                     // for an overwritten parent races asynchronous enrichment replay,
@@ -3708,16 +3712,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // with only a partial physical corpus. Non-chunked generated and
                     // inline vectors still require parent-wide replacement to retire
                     // provisional or previous identities.
-                    if (!chunk_backed) {
+                    if (!chunk_backed and !external) {
                         try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, batch.overwritten_doc_keys, batch_options);
                     }
                     if (!ctx.projection_only) {
-                        try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.deleted_keys);
-                        if (ctx.index_manager.denseIndexUsesManagedDirectField(index_ref.name) or
-                            ctx.index_manager.denseIndexUsesExternalCoverage(index_ref.name))
-                        {
+                        // Translate external artifact deletions to their parent
+                        // identities so explicit null also retires coverage.
+                        try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, if (external) replay_delete_keys else batch.deleted_keys);
+                        if (ctx.index_manager.denseIndexUsesManagedDirectField(index_ref.name)) {
                             try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys);
-                        } else {
+                        } else if (!external) {
                             // Producer-owned exact outcomes are committed atomically with
                             // the source update. Only a request retained for asynchronous
                             // replay makes the prior generated outcome pending.
@@ -3734,30 +3738,34 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     }
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.dense_delete_ns, dense_delete_start_ns);
 
-                    // Artifact-only replay has no documents to filter with this set.
-                    var dense_embedding_doc_keys = if (batch.documents.len == 0)
-                        std.StringHashMapUnmanaged(void).empty
-                    else
-                        try denseEmbeddingDocKeySet(ctx.alloc, dense_embeddings.writes);
-                    defer dense_embedding_doc_keys.deinit(ctx.alloc);
+                    // External indexes consume only embedding artifacts. Avoid
+                    // loading or parsing source documents on unrelated updates.
+                    if (!external) {
+                        // Artifact-only replay has no documents to filter with this set.
+                        var dense_embedding_doc_keys = if (batch.documents.len == 0)
+                            std.StringHashMapUnmanaged(void).empty
+                        else
+                            try denseEmbeddingDocKeySet(ctx.alloc, dense_embeddings.writes);
+                        defer dense_embedding_doc_keys.deinit(ctx.alloc);
 
-                    var index_writes = try collectDocumentWritesProfiled(
-                        ctx.alloc,
-                        ctx.store,
-                        ctx.index_manager,
-                        batch.documents,
-                        ctx.index_manager.byte_range,
-                        .{
-                            .skip_doc_keys = &dense_embedding_doc_keys,
-                            .relational_base_rows = ctx.relational_base_rows,
-                        },
-                        null,
-                    );
-                    defer index_writes.deinit();
-                    if (index_writes.missing_required != 0) return error.ReplayDocumentNotVisible;
-                    const dense_doc_index_start_ns = monotonicTimeNs();
-                    try ctx.index_manager.indexDenseBatchByNameWithOptions(ctx.store, index_ref.name, index_writes.items, batch_options);
-                    if (profile) |active_profile| recordProfileNs(profile, &active_profile.dense_doc_index_ns, dense_doc_index_start_ns);
+                        var index_writes = try collectDocumentWritesProfiled(
+                            ctx.alloc,
+                            ctx.store,
+                            ctx.index_manager,
+                            batch.documents,
+                            ctx.index_manager.byte_range,
+                            .{
+                                .skip_doc_keys = &dense_embedding_doc_keys,
+                                .relational_base_rows = ctx.relational_base_rows,
+                            },
+                            null,
+                        );
+                        defer index_writes.deinit();
+                        if (index_writes.missing_required != 0) return error.ReplayDocumentNotVisible;
+                        const dense_doc_index_start_ns = monotonicTimeNs();
+                        try ctx.index_manager.indexDenseBatchByNameWithOptions(ctx.store, index_ref.name, index_writes.items, batch_options);
+                        if (profile) |active_profile| recordProfileNs(profile, &active_profile.dense_doc_index_ns, dense_doc_index_start_ns);
+                    }
 
                     const dense_embedding_start_ns = monotonicTimeNs();
                     try ctx.index_manager.applyDenseEmbeddingWritesByNameWithOptions(ctx.store, index_ref.name, dense_embeddings.writes, batch_options);
@@ -3830,14 +3838,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     );
                     defer freeOwnedKeySlice(ctx.alloc, replay_delete_keys);
                     try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, replay_delete_keys, batch_options);
-                    try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.overwritten_doc_keys, batch_options);
+                    // As in dense replay, caller-owned vectors change only through
+                    // explicit artifact mutations, never an unrelated source edit.
+                    const external = ctx.index_manager.sparseIndexUsesExternalCoverage(index_ref.name);
+                    if (!external) try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.overwritten_doc_keys, batch_options);
                     if (!ctx.projection_only) {
-                        try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.deleted_keys);
-                        if (ctx.index_manager.sparseIndexUsesManagedDirectField(index_ref.name) or
-                            ctx.index_manager.sparseIndexUsesExternalCoverage(index_ref.name))
-                        {
+                        try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, if (external) replay_delete_keys else batch.deleted_keys);
+                        if (ctx.index_manager.sparseIndexUsesManagedDirectField(index_ref.name)) {
                             try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys);
-                        } else {
+                        } else if (!external) {
                             const pending_doc_keys = try pendingGeneratedCoverageDocKeysForIndexAlloc(
                                 ctx.alloc,
                                 ctx.index_manager,
@@ -3851,35 +3860,39 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     }
                     if (emit_sparse_write_profile) sparse_delete_ns = monotonicTimeNs() - sparse_delete_start_ns;
 
-                    var sparse_embedding_doc_keys = if (batch.documents.len == 0)
-                        std.StringHashMapUnmanaged(void).empty
-                    else
-                        try sparseEmbeddingDocKeySet(ctx.alloc, sparse_embeddings.writes);
-                    defer sparse_embedding_doc_keys.deinit(ctx.alloc);
+                    // External indexes consume only embedding artifacts. Avoid
+                    // loading or parsing source documents on unrelated updates.
+                    if (!external) {
+                        var sparse_embedding_doc_keys = if (batch.documents.len == 0)
+                            std.StringHashMapUnmanaged(void).empty
+                        else
+                            try sparseEmbeddingDocKeySet(ctx.alloc, sparse_embeddings.writes);
+                        defer sparse_embedding_doc_keys.deinit(ctx.alloc);
 
-                    const sparse_collect_doc_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
-                    const sparse_field_name = ctx.index_manager.sparseFieldNameByName(index_ref.name) orelse return error.IndexNotFound;
-                    var index_writes = try collectSparseFieldWritesProfiled(
-                        ctx.alloc,
-                        ctx.store,
-                        ctx.index_manager,
-                        batch.documents,
-                        ctx.index_manager.byte_range,
-                        sparse_field_name,
-                        .{
-                            .prefer_inline_when_store_tip_matches_sequence = batch.sequence,
-                            .prefer_available_inline_values = true,
-                            .skip_doc_keys = &sparse_embedding_doc_keys,
-                            .relational_base_rows = ctx.relational_base_rows,
-                        },
-                        if (emit_sparse_write_profile) &collect_doc_profile else null,
-                    );
-                    defer index_writes.deinit();
-                    if (emit_sparse_write_profile) sparse_collect_doc_ns = monotonicTimeNs() - sparse_collect_doc_start_ns;
-                    if (index_writes.missing_required != 0) return error.ReplayDocumentNotVisible;
-                    const sparse_doc_index_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
-                    try ctx.index_manager.indexSparsePreparedWritesByNameWithOptions(index_ref.name, index_writes.items, batch_options);
-                    if (emit_sparse_write_profile) sparse_doc_index_ns = monotonicTimeNs() - sparse_doc_index_start_ns;
+                        const sparse_collect_doc_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
+                        const sparse_field_name = ctx.index_manager.sparseFieldNameByName(index_ref.name) orelse return error.IndexNotFound;
+                        var index_writes = try collectSparseFieldWritesProfiled(
+                            ctx.alloc,
+                            ctx.store,
+                            ctx.index_manager,
+                            batch.documents,
+                            ctx.index_manager.byte_range,
+                            sparse_field_name,
+                            .{
+                                .prefer_inline_when_store_tip_matches_sequence = batch.sequence,
+                                .prefer_available_inline_values = true,
+                                .skip_doc_keys = &sparse_embedding_doc_keys,
+                                .relational_base_rows = ctx.relational_base_rows,
+                            },
+                            if (emit_sparse_write_profile) &collect_doc_profile else null,
+                        );
+                        defer index_writes.deinit();
+                        if (emit_sparse_write_profile) sparse_collect_doc_ns = monotonicTimeNs() - sparse_collect_doc_start_ns;
+                        if (index_writes.missing_required != 0) return error.ReplayDocumentNotVisible;
+                        const sparse_doc_index_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
+                        try ctx.index_manager.indexSparsePreparedWritesByNameWithOptions(index_ref.name, index_writes.items, batch_options);
+                        if (emit_sparse_write_profile) sparse_doc_index_ns = monotonicTimeNs() - sparse_doc_index_start_ns;
+                    }
 
                     const sparse_embedding_apply_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
                     try ctx.index_manager.applySparseEmbeddingWritesByNameWithOptions(ctx.store, index_ref.name, sparse_embeddings.writes, batch_options);
@@ -3956,6 +3969,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         const graph_writes = try collectGraphWrites(ctx.alloc, batch.graph_writes, index_ref.name);
                         defer if (graph_writes.len > 0) ctx.alloc.free(graph_writes);
                         try ctx.index_manager.applyGraphMutationsByName(index_ref.name, graph_writes, graph_deletes);
+                    }
+                    // A field replacement clears the document's serving edges.
+                    // Restore every committed contributor, including unchanged
+                    // extraction artifacts whose producer hash is still current.
+                    for (batch.graph_doc_clears) |clear| {
+                        if (!containsDeleteKey(clear.index_names, index_ref.name)) continue;
+                        const surviving = try collectGraphArtifactsForDocIndex(ctx.alloc, ctx.store, clear.key, index_ref.name);
+                        defer docstore_mod.DocStore.freeResults(ctx.alloc, surviving);
+                        const keys = try ctx.alloc.alloc([]const u8, surviving.len);
+                        defer ctx.alloc.free(keys);
+                        for (surviving, keys) |entry, *key| key.* = entry.key;
+                        try applyGraphArtifactMutationPages(ctx, index_ref.name, keys, &.{}, batch.sequence);
                     }
                     if (batch.changed_artifact_keys.len > 0 or materialized_artifact_keys.len > 0) {
                         try applyGraphArtifactMutationPages(
@@ -4221,7 +4246,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
         }
 
-        pub fn buildDerivedBatch(
+        pub noinline fn buildDerivedBatch(
             alloc: Allocator,
             req: types.BatchRequest,
             extracted: []const mapper.ExtractedWrite,
@@ -4450,15 +4475,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             db: anytype,
             artifact_name: []const u8,
         ) !DocumentExtractionCatalogView {
-            db.core.index_manager.catalog_mutex.lockShared();
-            defer db.core.index_manager.catalog_mutex.unlockShared();
+            S.ownerField(db, "core").*.index_manager.catalog_mutex.lockShared();
+            defer S.ownerField(db, "core").*.index_manager.catalog_mutex.unlockShared();
 
             var chunks = std.ArrayListUnmanaged(DocumentExtractionChunkView).empty;
             errdefer {
                 for (chunks.items) |*chunk| chunk.deinit(alloc);
                 chunks.deinit(alloc);
             }
-            for (db.core.index_manager.enrichments.items) |entry| {
+            for (S.ownerField(db, "core").*.index_manager.enrichments.items) |entry| {
                 if (entry.kind != .chunk) continue;
                 if (!std.mem.eql(u8, entry.source_artifact_name, artifact_name)) continue;
 
@@ -4471,7 +4496,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 chunk.chunk_overlap = entry.chunk_overlap;
                 const include_default_full_text = entry.full_text_index or
                     try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, entry.chunker_json);
-                chunk.text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, entry.name, include_default_full_text);
+                chunk.text_indexes = try S.ownerField(db, "core").*.index_manager.textIndexesForChunk(alloc, entry.name, include_default_full_text);
 
                 var dense = std.ArrayListUnmanaged(DocumentExtractionEmbeddingView).empty;
                 defer {
@@ -4500,16 +4525,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             dense: *std.ArrayListUnmanaged(DocumentExtractionEmbeddingView),
             sparse: *std.ArrayListUnmanaged(DocumentExtractionEmbeddingView),
         ) !void {
-            for (db.core.index_manager.enrichments.items) |entry| {
+            for (S.ownerField(db, "core").*.index_manager.enrichments.items) |entry| {
                 if (entry.kind != .embedding) continue;
                 if (!std.mem.eql(u8, entry.source_artifact_name, chunk_artifact_name)) continue;
                 // cloneFromEnrichment takes ownership only on success. End the
                 // consumer cleanup scope before the view becomes the sole owner.
                 var view = blk: {
                     const consumers = if (entry.expected_dims > 0)
-                        try db.core.index_manager.denseIndexesForEmbedding(alloc, entry.name, entry.expected_dims)
+                        try S.ownerField(db, "core").*.index_manager.denseIndexesForEmbedding(alloc, entry.name, entry.expected_dims)
                     else
-                        try db.core.index_manager.sparseIndexesForEmbedding(alloc, entry.name);
+                        try S.ownerField(db, "core").*.index_manager.sparseIndexesForEmbedding(alloc, entry.name);
                     errdefer {
                         for (consumers) |name| alloc.free(name);
                         alloc.free(consumers);
@@ -5051,23 +5076,25 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             delete_keys: *std.ArrayListUnmanaged([]const u8),
             owned_delete_keys: *std.ArrayListUnmanaged([]u8),
         ) ![][]u8 {
-            _ = extracted;
             const vector_effects = artifact_effects;
-            if (!self.core.hasArtifactCleanupMaybe() and vector_effects.len == 0) return try self.alloc.alloc([]u8, 0);
+            const explicit_deletes = for (extracted) |row| {
+                if (row.deleted_embedding_indexes.len > 0) break true;
+            } else false;
+            if (!explicit_deletes and !S.ownerField(self, "core").*.hasArtifactCleanupMaybe() and vector_effects.len == 0) return try S.ownerField(self, "alloc").*.alloc([]u8, 0);
 
             var deleted = std.ArrayListUnmanaged([]u8).empty;
-            errdefer deleted.deinit(self.alloc);
+            errdefer deleted.deinit(S.ownerField(self, "alloc").*);
             var seen_docs = std.StringHashMapUnmanaged(void).empty;
-            defer seen_docs.deinit(self.alloc);
+            defer seen_docs.deinit(S.ownerField(self, "alloc").*);
             var selected_artifacts = std.StringHashMapUnmanaged(void).empty;
-            defer selected_artifacts.deinit(self.alloc);
+            defer selected_artifacts.deinit(S.ownerField(self, "alloc").*);
 
             for (req.deletes) |key| {
-                const gop = try seen_docs.getOrPut(self.alloc, key);
+                const gop = try seen_docs.getOrPut(S.ownerField(self, "alloc").*, key);
                 if (gop.found_existing) continue;
                 try collectEnrichmentArtifactDeleteKeysForDocContext(
-                    self.alloc,
-                    self.core.store,
+                    S.ownerField(self, "alloc").*,
+                    S.ownerField(self, "core").*.store,
                     key,
                     delete_keys,
                     owned_delete_keys,
@@ -5079,20 +5106,41 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // insertion is not materialized yet. Do not count the same deletion twice
             // when this fragment also deletes its primary document.
             var seen_artifacts = std.StringHashMapUnmanaged(void).empty;
-            defer seen_artifacts.deinit(self.alloc);
-            for (deleted.items) |key| try seen_artifacts.put(self.alloc, key, {});
-            for (vector_effects) |effect| if (effect.value == null) {
-                const gop = try seen_artifacts.getOrPut(self.alloc, effect.key);
-                if (gop.found_existing) continue;
-                const owned_key = try self.alloc.dupe(u8, effect.key);
-                owned_delete_keys.append(self.alloc, owned_key) catch |err| {
-                    self.alloc.free(owned_key);
+            defer seen_artifacts.deinit(S.ownerField(self, "alloc").*);
+            for (deleted.items) |key| try seen_artifacts.put(S.ownerField(self, "alloc").*, key, {});
+            // A null directive retires exactly the named authored artifact. It
+            // uses the same durable tombstone/replay lane as document cleanup,
+            // without scanning or rewriting any sibling vector artifacts.
+            for (extracted, 0..) |row, i| for (row.deleted_embedding_indexes) |name| {
+                const alloc = S.ownerField(self, "alloc").*;
+                try owned_delete_keys.ensureUnusedCapacity(alloc, 1);
+                try delete_keys.ensureUnusedCapacity(alloc, 1);
+                try deleted.ensureUnusedCapacity(alloc, 1);
+                const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, req.writes[i].key, name);
+                const gop = seen_artifacts.getOrPut(alloc, key) catch |err| {
+                    alloc.free(key);
                     return err;
                 };
-                try delete_keys.append(self.alloc, owned_key);
-                try deleted.append(self.alloc, owned_key);
+                if (gop.found_existing) {
+                    alloc.free(key);
+                    continue;
+                }
+                owned_delete_keys.appendAssumeCapacity(key);
+                delete_keys.appendAssumeCapacity(key);
+                deleted.appendAssumeCapacity(key);
             };
-            return try deleted.toOwnedSlice(self.alloc);
+            for (vector_effects) |effect| if (effect.value == null) {
+                const gop = try seen_artifacts.getOrPut(S.ownerField(self, "alloc").*, effect.key);
+                if (gop.found_existing) continue;
+                const owned_key = try S.ownerField(self, "alloc").*.dupe(u8, effect.key);
+                owned_delete_keys.append(S.ownerField(self, "alloc").*, owned_key) catch |err| {
+                    S.ownerField(self, "alloc").*.free(owned_key);
+                    return err;
+                };
+                try delete_keys.append(S.ownerField(self, "alloc").*, owned_key);
+                try deleted.append(S.ownerField(self, "alloc").*, owned_key);
+            };
+            return try deleted.toOwnedSlice(S.ownerField(self, "alloc").*);
         }
 
         pub fn collectGraphArtifactsForDocIndex(
@@ -5549,7 +5597,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             chunk_view: *const DocumentExtractionChunkView,
             out: *std.ArrayListUnmanaged(PendingDocumentUnitDenseChunkEmbedding),
         ) !void {
-            const runtime = db.enrichment_runtime orelse return;
+            const runtime = S.ownerField(db, "enrichment_runtime").* orelse return;
             if (runtime.config.dense_embedder == null) return;
             for (chunk_view.dense_embeddings) |embed_entry| {
                 if (embed_entry.consumer_indexes.len == 0) continue;
@@ -5580,7 +5628,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             chunk_view: *const DocumentExtractionChunkView,
             out: *std.ArrayListUnmanaged(PendingDocumentUnitSparseChunkEmbedding),
         ) !void {
-            const runtime = db.enrichment_runtime orelse return;
+            const runtime = S.ownerField(db, "enrichment_runtime").* orelse return;
             if (runtime.config.sparse_embedder == null) return;
             for (chunk_view.sparse_embeddings) |embed_entry| {
                 if (embed_entry.consumer_indexes.len == 0) continue;
@@ -5757,7 +5805,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 for (artifact_delete_keys.items) |delete_key| {
                     if (std.mem.eql(u8, delete_key, upstream_key)) break :blk null;
                 }
-                break :blk try db.core.getStoreValue(alloc, upstream_key);
+                break :blk try S.ownerField(db, "core").*.getStoreValue(alloc, upstream_key);
             } else try extractAssetSourceValue(alloc, db, doc_value, request);
             if (source_text == null or source_text.?.len == 0) {
                 if (source_text) |s| alloc.free(s);
@@ -5803,7 +5851,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     selected_manifest = write.value;
                     break;
                 }
-                const retained_manifest = if (selected_manifest == null) try db.core.getStoreValue(alloc, key) else null;
+                const retained_manifest = if (selected_manifest == null) try S.ownerField(db, "core").*.getStoreValue(alloc, key) else null;
                 defer if (retained_manifest) |value| alloc.free(value);
                 if (selected_manifest orelse retained_manifest) |manifest| {
                     const failed = try documentExtractionManifestHasLastError(alloc, manifest) or
@@ -5830,10 +5878,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 null;
             defer if (state_value) |value| alloc.free(value);
             if (!force_reprocess and state_key != null and state_value != null) {
-                const existing_state = try db.core.getStoreValue(alloc, state_key.?);
+                const existing_state = try S.ownerField(db, "core").*.getStoreValue(alloc, state_key.?);
                 defer if (existing_state) |value| alloc.free(value);
                 if (existing_state != null and std.mem.eql(u8, existing_state.?, state_value.?)) {
-                    const existing_asset = try db.core.getStoreValue(alloc, key);
+                    const existing_asset = try S.ownerField(db, "core").*.getStoreValue(alloc, key);
                     defer if (existing_asset) |value| alloc.free(value);
                     if (existing_asset) |value| {
                         try artifact_writes.append(alloc, .{
@@ -5880,7 +5928,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             const value = if (producer_cfg.type == .copy) source_text.? else blk: {
-                const runtime = db.enrichment_runtime orelse return error.MissingAssetProducer;
+                const runtime = S.ownerField(db, "enrichment_runtime").* orelse return error.MissingAssetProducer;
                 const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
                 break :blk try producer.produce(alloc, .{
                     .producer_type = producer_cfg.type,
@@ -6057,8 +6105,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
             memo: ?*GeneratedEmbeddingMemo,
             shared_pending_writes: ?*const PendingArtifactWriteIndex,
+            reuse_unchanged: bool,
         ) !void {
-            return computeDenseRequestImpl(alloc, db, doc_value, request, artifact_writes, pending_deletes, dense_embeddings, cache, true, memo, shared_pending_writes, appendDerivedDenseEmbeddingForConsumers);
+            return computeDenseRequestImpl(alloc, db, doc_value, request, artifact_writes, pending_deletes, dense_embeddings, cache, reuse_unchanged, memo, shared_pending_writes, appendDerivedDenseEmbeddingForConsumers);
         }
 
         pub fn computeDenseRequestImpl(
@@ -6086,7 +6135,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     return;
                 }
             };
-            const runtime = db.enrichment_runtime orelse return error.MissingDenseEmbedder;
+            const runtime = S.ownerField(db, "enrichment_runtime").* orelse return error.MissingDenseEmbedder;
             const dense_embedder = runtime.config.dense_embedder orelse return error.MissingDenseEmbedder;
 
             const embedding_name = requestEmbeddingName(request);
@@ -6118,7 +6167,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const max_batch_bytes = generatedEmbedBatchBytes();
                 var batch_source_bytes: usize = 0;
                 for (sources, 0..) |source, i| {
-                    const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json);
+                    const source_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
                     const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
                     defer alloc.free(artifact_key);
                     if (skip_unchanged_artifacts) {
@@ -6179,7 +6228,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const source_text = if (request.source_template.len > 0)
                 renderSourceTemplateText(alloc, db, request.source_template, doc_value) catch |err| switch (err) {
-                    error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                    error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                     else => null,
                 }
             else
@@ -6232,7 +6281,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 embedding_name,
                 request.source_field,
                 null,
-                .{ .generated = enrichment_artifact_codec.hashEmbeddingSource(source_text.?, request.producer_json) },
+                .{ .generated = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source_text.?, request.producer_json, request.reprocess_generation) },
                 vector,
             );
             defer alloc.free(artifact_key);
@@ -6264,12 +6313,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const state_key = try assetStateKeyAlloc(alloc, request.doc_key, artifact_name);
             defer alloc.free(state_key);
-            const existing_state = db.core.getStoreValue(alloc, state_key) catch |err| switch (err) {
+            const existing_state = S.ownerField(db, "core").*.getStoreValue(alloc, state_key) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
             defer if (existing_state) |value| alloc.free(value);
-            const existing_manifest = db.core.getStoreValue(alloc, manifest_key) catch |err| switch (err) {
+            const existing_manifest = S.ownerField(db, "core").*.getStoreValue(alloc, manifest_key) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
@@ -6326,12 +6375,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
 
-            const extraction_resource_manager = if (db.enrichment_runtime) |runtime|
+            const extraction_resource_manager = if (S.ownerField(db, "enrichment_runtime").*) |runtime|
                 runtime.config.resource_manager orelse runtime.index_manager.resource_manager
             else
-                db.core.index_manager.resource_manager;
+                S.ownerField(db, "core").*.index_manager.resource_manager;
+            // Whole source documents are buffered here. Back the budget with the
+            // long-lived DB allocator so source bytes are charged only to the
+            // document extraction budget, not also to the request's fixed
+            // preparation budget (which rejected large sources).
+            const extraction_backing = if (@hasField(@TypeOf(db.*), "alloc")) S.ownerField(db, "alloc").* else alloc;
             var extraction_budgeted: ?resource_manager_mod.BudgetedAllocator = if (extraction_resource_manager) |manager|
-                resource_manager_mod.BudgetedAllocator.initReclaiming(manager, .document_extraction_working_set, alloc, 1)
+                resource_manager_mod.BudgetedAllocator.initReclaiming(manager, .document_extraction_working_set, extraction_backing, 1)
             else
                 null;
             defer if (extraction_budgeted) |*budgeted| budgeted.deinit();
@@ -6342,13 +6396,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 remoteRenderConfig(db, null),
                 source_url,
                 if (config.credentials.len > 0) config.credentials else null,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => if (extraction_budgeted != null and extraction_budgeted.?.denied()) return enrichment_runtime_mod.documentExtractionBudgetDenialError(&extraction_budgeted.?) else return err,
-                else => {
-                    if (!document_extraction_mod.remoteContentErrorIsPermanent(err)) return err;
-                    try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "remote content download failed", "remote_content_download", artifact_writes);
-                    return;
-                },
+            ) catch |raw_err| {
+                const err = if (raw_err == error.OutOfMemory and extraction_budgeted != null and extraction_budgeted.?.denied())
+                    enrichment_runtime_mod.documentExtractionBudgetDenialError(&extraction_budgeted.?)
+                else
+                    raw_err;
+                if (err != error.DocumentExtractionWorkingSetTooLarge and !document_extraction_mod.remoteContentErrorIsPermanent(err)) return err;
+                try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "remote content download failed", "remote_content_download", artifact_writes);
+                return;
             };
             const downloaded = switch (fetched) {
                 .ok => |content| content,
@@ -6382,22 +6437,28 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 extraction_config.pdf_decode_limits.max_decoded_stream_bytes = @min(extraction_config.pdf_decode_limits.max_decoded_stream_bytes, pdf_inspection_bytes);
             }
             var extraction_failure: runtime_failure_abi.FailureIdentity = .{};
-            var extraction = extractDocumentDownloadedAlloc(document_extraction_alloc, downloaded_mut, source_url, extraction_config, config_json, doc_value, &extraction_failure) catch |err| switch (err) {
-                error.OutOfMemory => if (pdf_inspection_reservation.limit_exceeded)
-                    return error.DocumentExtractionWorkingSetTooLarge
+            var extraction = extractDocumentDownloadedAlloc(document_extraction_alloc, downloaded_mut, source_url, extraction_config, config_json, doc_value, &extraction_failure) catch |raw_err| {
+                const err = if (raw_err != error.OutOfMemory)
+                    raw_err
+                else if (pdf_inspection_reservation.limit_exceeded)
+                    error.DocumentExtractionWorkingSetTooLarge
                 else if (extraction_budgeted != null and extraction_budgeted.?.denied())
-                    return enrichment_runtime_mod.documentExtractionBudgetDenialError(&extraction_budgeted.?)
+                    enrichment_runtime_mod.documentExtractionBudgetDenialError(&extraction_budgeted.?)
                 else
-                    return err,
-                else => {
-                    const exact_error_name = boundaryFailureErrorName(&extraction_failure, err);
-                    try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, exact_error_name, "document extraction failed", document_extraction_mod.failureStageFromErrorName(exact_error_name, "document_extraction"), artifact_writes);
-                    return;
-                },
+                    raw_err;
+                // Capacity contention must yield; a permanent decode ceiling
+                // must publish a failed attempt just like other extraction
+                // failures. Use the mutation allocator for the small manifest
+                // after the extraction allocator has exhausted its budget.
+                const exact_error_name = if (err != raw_err) @errorName(err) else boundaryFailureErrorName(&extraction_failure, err);
+                const decode_failure = document_extraction_mod.failureStageFromErrorName(exact_error_name, "").len != 0;
+                if (err == error.OutOfMemory or err == error.ResourceTemporarilyUnavailable or err == error.Canceled or err == error.Cancelled or err == error.DeadlineExceeded or err == error.Timeout or (!decode_failure and enrichment_runtime_mod.isRetryableEnrichmentError(err))) return err;
+                try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, exact_error_name, "document extraction failed", document_extraction_mod.failureStageFromErrorName(exact_error_name, "document_extraction"), artifact_writes);
+                return;
             };
             defer extraction.deinit(document_extraction_alloc);
-            if (db.enrichment_runtime) |runtime| {
-                try enrichment_runtime_mod.completeDocumentExtractionGeneratedTextForRequestWithMemory(
+            if (S.ownerField(db, "enrichment_runtime").*) |runtime| {
+                enrichment_runtime_mod.completeDocumentExtractionGeneratedTextForRequestWithMemory(
                     if (document_execution) |execution| &execution.runtime else runtime,
                     document_extraction_alloc,
                     request,
@@ -6409,7 +6470,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .{
                         .native_backing_alloc = alloc,
                     },
-                );
+                ) catch |raw_err| {
+                    const err = if (raw_err == error.OutOfMemory and pdf_inspection_reservation.limit_exceeded)
+                        error.DocumentExtractionWorkingSetTooLarge
+                    else if (raw_err == error.OutOfMemory and extraction_budgeted != null and extraction_budgeted.?.denied())
+                        enrichment_runtime_mod.documentExtractionBudgetDenialError(&extraction_budgeted.?)
+                    else
+                        raw_err;
+                    if (err != error.DocumentExtractionWorkingSetTooLarge) return err;
+                    try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "generated document text exceeded its working-set limit", "document_generated_text", artifact_writes);
+                    return;
+                };
             } else if (document_extraction_mod.ocrEnabledForRoute(config, extraction.route_type) or config.transcription_enabled) {
                 return error.MissingAssetProducer;
             }
@@ -6462,7 +6533,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer alloc.free(new_state);
             const navigation_summary_key = try internal_keys.documentUnitNavigationSummaryKeyAlloc(alloc, request.doc_key, artifact_name);
             defer alloc.free(navigation_summary_key);
-            const existing_navigation_summary = try db.core.getStoreValue(alloc, navigation_summary_key);
+            const existing_navigation_summary = try S.ownerField(db, "core").*.getStoreValue(alloc, navigation_summary_key);
             defer if (existing_navigation_summary) |value| alloc.free(value);
 
             var previous_state = DocumentExtractionPreviousState{};
@@ -6666,6 +6737,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             embedding_name: []const u8,
             consumer_indexes: []const []const u8,
             shared_pending_writes: ?*const PendingArtifactWriteIndex,
+            reuse_unchanged: bool,
         ) !void {
             const artifact_name = requestArtifactName(request);
             const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "chunk", artifact_name);
@@ -6695,11 +6767,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try pending_chunk_keys.put(alloc, write.key, {});
                 _ = try appendMaterializedChunkSourceToBatch(alloc, &sources, &batch_source_bytes, write.key, write.value, request.source_field);
                 if (sources.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
-                    try flushGeneratedSparseChunkSourceBatch(alloc, db, runtime, sparse_embedder, embedding_name, request.producer_json, artifact_writes, sparse_embeddings, &sources, consumer_indexes, pending_writes);
+                    try flushGeneratedSparseChunkSourceBatch(alloc, db, runtime, sparse_embedder, embedding_name, request.producer_json, request.reprocess_generation, artifact_writes, sparse_embeddings, &sources, consumer_indexes, pending_writes, reuse_unchanged);
                     batch_source_bytes = 0;
                 }
             }
-            try flushGeneratedSparseChunkSourceBatch(alloc, db, runtime, sparse_embedder, embedding_name, request.producer_json, artifact_writes, sparse_embeddings, &sources, consumer_indexes, pending_writes);
+            try flushGeneratedSparseChunkSourceBatch(alloc, db, runtime, sparse_embedder, embedding_name, request.producer_json, request.reprocess_generation, artifact_writes, sparse_embeddings, &sources, consumer_indexes, pending_writes, reuse_unchanged);
             batch_source_bytes = 0;
 
             const upper = try internal_keys.nextPrefixAlloc(alloc, prefix);
@@ -6709,7 +6781,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer alloc.free(lower);
             while (true) {
                 const next_lower = try scanMaterializedChunkSourceStoreBatch(alloc, db, prefix, upper_bound, lower, request.source_field, &pending_chunk_keys, pending_deletes, &sources, &batch_source_bytes, max_batch_items, max_batch_bytes);
-                try flushGeneratedSparseChunkSourceBatch(alloc, db, runtime, sparse_embedder, embedding_name, request.producer_json, artifact_writes, sparse_embeddings, &sources, consumer_indexes, pending_writes);
+                try flushGeneratedSparseChunkSourceBatch(alloc, db, runtime, sparse_embedder, embedding_name, request.producer_json, request.reprocess_generation, artifact_writes, sparse_embeddings, &sources, consumer_indexes, pending_writes, reuse_unchanged);
                 batch_source_bytes = 0;
                 if (next_lower) |owned_next| {
                     alloc.free(lower);
@@ -6731,6 +6803,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
             memo: ?*GeneratedEmbeddingMemo,
             shared_pending_writes: ?*const PendingArtifactWriteIndex,
+            reuse_unchanged: bool,
         ) !void {
             if (memo) |preservation| if (preservation.reuse_stored_artifacts) {
                 if (try preparePreservedEmbeddingSources(alloc, db, doc_value, request, artifact_writes.items, pending_deletes, cache, shared_pending_writes)) |sources| {
@@ -6743,7 +6816,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     return;
                 }
             };
-            const runtime = db.enrichment_runtime orelse return error.MissingSparseEmbedder;
+            const runtime = S.ownerField(db, "enrichment_runtime").* orelse return error.MissingSparseEmbedder;
             const sparse_embedder = runtime.config.sparse_embedder orelse return error.MissingSparseEmbedder;
 
             const embedding_name = requestEmbeddingName(request);
@@ -6752,7 +6825,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             if (requestUsesChunkSource(request)) {
                 if (requestUsesPinnedMaterializedChunkArtifact(request)) {
-                    try computeSparseMaterializedChunkRequest(alloc, db, runtime, request, artifact_writes, pending_deletes, sparse_embeddings, sparse_embedder, embedding_name, consumer_indexes, shared_pending_writes);
+                    try computeSparseMaterializedChunkRequest(alloc, db, runtime, request, artifact_writes, pending_deletes, sparse_embeddings, sparse_embedder, embedding_name, consumer_indexes, shared_pending_writes, reuse_unchanged);
                     return;
                 }
                 var chunks_created: usize = 0;
@@ -6775,36 +6848,36 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const max_batch_bytes = generatedEmbedBatchBytes();
                 var batch_source_bytes: usize = 0;
                 for (sources, 0..) |source, i| {
-                    const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json);
+                    const source_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
                     const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
                     defer alloc.free(artifact_key);
-                    if (try storedOrPendingEmbeddingSourceHash(db, pending_writes, artifact_key)) |existing_hash| {
+                    if (reuse_unchanged) if (try storedOrPendingEmbeddingSourceHash(db, pending_writes, artifact_key)) |existing_hash| {
                         if (existing_hash == source_hash) {
                             try appendDerivedSparseEmbeddingForConsumers(alloc, sparse_embeddings, source.key, artifact_key, &.{}, &.{}, consumer_indexes);
                             continue;
                         }
-                    }
+                    };
                     if (chunk_texts.items.len > 0 and
                         (chunk_texts.items.len >= max_batch_items or batch_source_bytes + source.text.len > max_batch_bytes))
                     {
-                        try flushGeneratedSparseChunkBatch(alloc, runtime, sparse_embedder, embedding_name, request.producer_json, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
+                        try flushGeneratedSparseChunkBatch(alloc, runtime, sparse_embedder, embedding_name, request.producer_json, request.reprocess_generation, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
                         batch_source_bytes = 0;
                     }
                     try chunk_texts.append(alloc, source.text);
                     try source_indexes.append(alloc, i);
                     batch_source_bytes += source.text.len;
                     if (chunk_texts.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
-                        try flushGeneratedSparseChunkBatch(alloc, runtime, sparse_embedder, embedding_name, request.producer_json, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
+                        try flushGeneratedSparseChunkBatch(alloc, runtime, sparse_embedder, embedding_name, request.producer_json, request.reprocess_generation, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
                         batch_source_bytes = 0;
                     }
                 }
-                try flushGeneratedSparseChunkBatch(alloc, runtime, sparse_embedder, embedding_name, request.producer_json, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
+                try flushGeneratedSparseChunkBatch(alloc, runtime, sparse_embedder, embedding_name, request.producer_json, request.reprocess_generation, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
                 return;
             }
 
             const source_text = if (request.source_template.len > 0)
                 renderSourceTemplateText(alloc, db, request.source_template, doc_value) catch |err| switch (err) {
-                    error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                    error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                     else => null,
                 }
             else
@@ -6846,7 +6919,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 artifact_writes,
                 request.doc_key,
                 embedding_name,
-                .{ .generated = enrichment_artifact_codec.hashEmbeddingSource(source_text.?, request.producer_json) },
+                .{ .generated = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source_text.?, request.producer_json, request.reprocess_generation) },
                 sparse.indices,
                 sparse.values,
             );
@@ -6986,6 +7059,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .new => "new",
                 .match => "match",
                 .review => "review",
+                .suppressed => "suppressed",
             };
         }
 
@@ -7942,7 +8016,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     defer _ = arena_state.reset(.retain_capacity);
                     const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(scratch, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id));
                     const chunk_key_index = documentExtractionKeyIndex(desired_chunk_keys, chunk_key) orelse return false;
-                    const stored = (db.core.getStoreValue(scratch, chunk_key) catch |err| switch (err) {
+                    const stored = (S.ownerField(db, "core").*.getStoreValue(scratch, chunk_key) catch |err| switch (err) {
                         error.NotFound => return false,
                         else => return err,
                     }) orelse return false;
@@ -7962,7 +8036,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             chunk_view: *const DocumentExtractionChunkView,
             chunk_key: []const u8,
         ) !bool {
-            const runtime = db.enrichment_runtime;
+            const runtime = S.ownerField(db, "enrichment_runtime").*;
             for (chunk_view.dense_embeddings) |entry| {
                 if (entry.consumer_indexes.len == 0 or runtime == null or runtime.?.config.dense_embedder == null) continue;
                 const artifact_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, entry.name);
@@ -8201,11 +8275,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ) !?[]u8 {
             if (request.source_template.len > 0) {
                 const rendered = renderSourceTemplateText(alloc, db, request.source_template, doc_value) catch |err| switch (err) {
-                    error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                    error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                     else => return null,
                 };
                 errdefer alloc.free(rendered);
-                try document_extraction_mod.validateInlineSourceSize(db.remote_content, rendered);
+                try document_extraction_mod.validateInlineSourceSize(S.ownerField(db, "remote_content").*, rendered);
                 return @constCast(rendered);
             }
 
@@ -8216,13 +8290,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return switch (source) {
                 .null => null,
                 .string => |value| blk: {
-                    try document_extraction_mod.validateInlineSourceSize(db.remote_content, value);
+                    try document_extraction_mod.validateInlineSourceSize(S.ownerField(db, "remote_content").*, value);
                     break :blk try alloc.dupe(u8, value);
                 },
                 else => blk: {
                     const rendered = try std.json.Stringify.valueAlloc(alloc, source, .{});
                     errdefer alloc.free(rendered);
-                    try document_extraction_mod.validateInlineSourceSize(db.remote_content, rendered);
+                    try document_extraction_mod.validateInlineSourceSize(S.ownerField(db, "remote_content").*, rendered);
                     break :blk rendered;
                 },
             };
@@ -8323,7 +8397,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // corruption: advance past the stale upsert and let the following
                     // delete record remove any indexed value. This also prevents TTL
                     // cleanup from wedging replay on an artifact it correctly removed.
-                    if (repair_reason == .missing_artifact and !try denseEmbeddingWriteSourceDocumentExists(ctx, write)) {
+                    // For external indexes the artifact itself is the source: an
+                    // explicit null removes it while leaving the document alive.
+                    if (repair_reason == .missing_artifact and
+                        ((if (ctx.index_manager.denseIndex(index_name)) |entry| entry.external else false) or
+                            !try denseEmbeddingWriteSourceDocumentExists(ctx, write)))
+                    {
                         try removed_indices.append(ctx.alloc, probe.write_index);
                         continue;
                     }
@@ -8331,7 +8410,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
             if (removed_indices.items.len == 0) return;
-            std.mem.sort(usize, removed_indices.items, {}, std.sort.asc(usize));
+            std.mem.sortUnstable(usize, removed_indices.items, {}, std.sort.asc(usize));
 
             const kept_len = owned.writes.len - removed_indices.items.len;
             const kept = try owned.alloc.alloc(mapper.DenseEmbeddingWrite, kept_len);
@@ -8369,7 +8448,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // ordering as dense cleanup. If a later delete already removed
                     // both the source and artifact, this stale upsert is superseded;
                     // the later delete record remains responsible for index removal.
-                    if (reason == .missing_artifact and !try replaySourceDocumentExists(ctx, write.doc_key)) {
+                    // External nulls remove only the authoritative artifact, so
+                    // source document existence cannot distinguish supersession.
+                    if (reason == .missing_artifact and
+                        ((if (ctx.index_manager.sparseIndex(index_name)) |entry| entry.external else false) or
+                            !try replaySourceDocumentExists(ctx, write.doc_key)))
+                    {
                         try removed_indices.append(ctx.alloc, write_idx);
                         continue;
                     }
@@ -8510,6 +8594,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
         ) !void {
             if (pending.chunk_texts.items.len == 0) return;
+            if (pending.reprocess_generation == null) pending.reprocess_generation = try enrichment_runtime_mod.embeddingReprocessGeneration(runtime, doc_key, pending.embedding_name, pending.producer_json);
             const synthetic_request: enrichment_types.GeneratedEnrichmentRequest = .{
                 .kind = .dense_embedding,
                 .index_name = "",
@@ -8517,6 +8602,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .source_field = pending.source_field,
                 .expected_dims = pending.expected_dims,
                 .producer_json = pending.producer_json,
+                .reprocess_generation = pending.reprocess_generation.?,
             };
             try flushGeneratedDenseChunkBatch(
                 alloc,
@@ -8544,12 +8630,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
         ) !void {
             if (pending.chunk_texts.items.len == 0) return;
+            if (pending.reprocess_generation == null) {
+                const doc_key = (try internal_keys.decodeDocumentComponentAlloc(alloc, pending.sources.items[0].key)) orelse return error.InvalidArtifactPayload;
+                defer alloc.free(doc_key);
+                pending.reprocess_generation = try enrichment_runtime_mod.embeddingReprocessGeneration(runtime, doc_key, pending.embedding_name, pending.producer_json);
+            }
             try flushGeneratedSparseChunkBatch(
                 alloc,
                 runtime,
                 sparse_embedder,
                 pending.embedding_name,
                 pending.producer_json,
+                pending.reprocess_generation.?,
                 artifact_writes,
                 sparse_embeddings,
                 pending.sources.items,
@@ -8571,7 +8663,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (items.items.len == 0) return;
             defer clearPrecomputeAssetProducerBatchItems(alloc, items);
 
-            const runtime = db.enrichment_runtime orelse return error.MissingAssetProducer;
+            const runtime = S.ownerField(db, "enrichment_runtime").* orelse return error.MissingAssetProducer;
             const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
             const requests = try alloc.alloc(asset_producer_mod.Request, items.items.len);
             defer alloc.free(requests);
@@ -8705,7 +8797,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const source_text = if (request.source_template.len > 0)
                 renderSourceTemplateText(alloc, db, request.source_template, doc_value) catch |err| switch (err) {
-                    error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                    error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                     else => null,
                 }
             else
@@ -8858,6 +8950,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             store: *docstore_mod.DocStore,
             index_manager: *index_manager_mod.IndexManager,
             doc_key: []const u8,
+            index_name: []const u8,
             source_artifact_name: []const u8,
         ) !?[]u8 {
             var arena = std.heap.ArenaAllocator.init(alloc);
@@ -8867,38 +8960,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var resolver_targets_artifact = false;
 
             for (index_manager.resolvers.items) |*cfg| {
-                if (!std.mem.eql(u8, cfg.source_artifact, source_artifact_name)) continue;
+                if (!cfg.visibleToGraph(index_name) or !std.mem.eql(u8, cfg.source_artifact, source_artifact_name)) continue;
                 resolver_targets_artifact = true;
                 const res_key = try internal_keys.resolutionArtifactKeyAlloc(a, doc_key, cfg.resolution_artifact);
                 const raw = store.get(a, res_key) catch |err| switch (err) {
                     error.NotFound => continue,
                     else => return err,
                 };
-                const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch continue;
-                if (parsed != .object) continue;
-                const entities = parsed.object.get("entities") orelse continue;
-                if (entities != .array) continue;
-                for (entities.array.items) |entity| {
-                    if (entity != .object) continue;
-                    // Same human-review gate as the mention-edge path
-                    // (resolutionDecisionCreatesCanonicalEdge): a review-band entry
-                    // carries a PROVISIONAL doc key, and admitting it here would make
-                    // relations traversable through that identity before a curator
-                    // approves it. Only canonical decisions become endpoints; the
-                    // relation stays absent (drop-before-resolution) and the
-                    // approval's re-resolution replay renders it.
-                    const decision = jsonStringField(entity, "decision") orelse continue;
-                    if (!std.mem.eql(u8, decision, "new") and !std.mem.eql(u8, decision, "match")) continue;
-                    const local_id = jsonStringField(entity, "local_id") orelse continue;
-                    const doc_ref = entity.object.get("doc_ref") orelse continue;
-                    if (doc_ref != .object) continue;
-                    const key = jsonStringField(doc_ref, "key") orelse continue;
-                    if (key.len == 0) continue;
-                    var ref: std.json.ObjectMap = .empty;
-                    try ref.put(a, "key", .{ .string = key });
-                    if (jsonStringField(doc_ref, "table")) |table| try ref.put(a, "table", .{ .string = table });
-                    try map.put(a, local_id, .{ .object = ref });
-                }
+                try @import("graph_endpoint_resolutions.zig").append(a, &map, raw);
             }
             // No resolver targets this artifact: return null so relation sources
             // keep their owning document (see appendRelationItem). A targeting
@@ -9335,10 +9404,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     return .irrelevant;
                 },
                 .dense_vector => {
+                    const external = index_manager.denseIndexUsesExternalCoverage(index_ref.name);
                     if (managedIndexDeleteKeysAffectProjection(index_manager, index_ref, batch.deleted_keys) or
-                        batch.overwritten_doc_keys.len > 0) return .relevant;
+                        (!external and batch.overwritten_doc_keys.len > 0)) return .relevant;
                     const uses_artifact_members = index_manager.denseIndexUsesArtifactMembers(index_ref.name);
-                    if (!uses_artifact_members) {
+                    if (!external and !uses_artifact_members) {
                         for (batch.documents) |doc| {
                             if (doc.action == .upsert) return .relevant;
                         }
@@ -9358,10 +9428,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     return .irrelevant;
                 },
                 .sparse_vector => {
+                    const external = index_manager.sparseIndexUsesExternalCoverage(index_ref.name);
                     if (managedIndexDeleteKeysAffectProjection(index_manager, index_ref, batch.deleted_keys) or
-                        batch.overwritten_doc_keys.len > 0) return .relevant;
+                        (!external and batch.overwritten_doc_keys.len > 0)) return .relevant;
                     const uses_artifact_members = index_manager.sparseIndexUsesArtifactMembers(index_ref.name);
-                    if (!uses_artifact_members) {
+                    if (!external and !uses_artifact_members) {
                         for (batch.documents) |doc| {
                             if (doc.action == .upsert) return .relevant;
                         }
@@ -9408,7 +9479,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             }
                             for (index_manager.graphArtifactSources(index_ref.name)) |source| {
                                 if (source.mention_edge_type.len == 0) continue;
-                                if (resolverConfigForResolution(index_manager, source.artifact_name, parsed.artifact_name) != null) return .relevant;
+                                if (resolverConfigForResolution(index_manager, index_ref.name, source.artifact_name, parsed.artifact_name) != null) return .relevant;
                             }
                             if (resolverConfigForResolutionArtifact(index_manager, parsed.artifact_name) != null) continue;
                             return .missing_dependency;
@@ -9526,15 +9597,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     return .irrelevant;
                 },
                 .dense_vector => {
+                    const external = index_manager.denseIndexUsesExternalCoverage(index_ref.name);
                     if (managedIndexDeleteKeysAffectProjection(index_manager, index_ref, record.deleted_doc_keys) or
-                        record.overwritten_doc_keys.len > 0) return .relevant;
+                        (!external and record.overwritten_doc_keys.len > 0)) return .relevant;
                     // Artifact-backed indexes consume generated artifact records, not
                     // the source document record that scheduled enrichment. Treating
                     // that source record as perpetually applicable prevents a clean
                     // target advance after an idempotent index recreate reuses already
                     // durable artifacts. The artifact target counter and active index
                     // cardinality below remain the completeness gate.
-                    if (record.changed_doc_keys.len > 0) {
+                    if (!external and record.changed_doc_keys.len > 0) {
                         const entry = index_manager.denseIndex(index_ref.name);
                         if (entry == null or !denseIndexIsArtifactBacked(entry.?)) return .relevant;
                     }
@@ -9542,9 +9614,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     return .irrelevant;
                 },
                 .sparse_vector => {
-                    if (record.changed_doc_keys.len > 0 or
+                    const external = index_manager.sparseIndexUsesExternalCoverage(index_ref.name);
+                    if ((!external and record.changed_doc_keys.len > 0) or
                         managedIndexDeleteKeysAffectProjection(index_manager, index_ref, record.deleted_doc_keys) or
-                        record.overwritten_doc_keys.len > 0) return .relevant;
+                        (!external and record.overwritten_doc_keys.len > 0)) return .relevant;
                     if (batchHasEmbeddingArtifactForManagedIndex(index_manager, index_ref, record.changed_artifact_keys)) return .relevant;
                     return .irrelevant;
                 },
@@ -9565,7 +9638,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             }
                             for (index_manager.graphArtifactSources(index_ref.name)) |source| {
                                 if (source.mention_edge_type.len == 0) continue;
-                                if (resolverConfigForResolution(index_manager, source.artifact_name, parsed.artifact_name) != null) return .relevant;
+                                if (resolverConfigForResolution(index_manager, index_ref.name, source.artifact_name, parsed.artifact_name) != null) return .relevant;
                             }
                             if (resolverConfigForResolutionArtifact(index_manager, parsed.artifact_name) != null) continue;
                             return .missing_dependency;
@@ -9623,7 +9696,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             var parsed_artifact = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .parse_numbers = false });
             defer parsed_artifact.deinit();
-            const endpoint_resolutions = try graphEndpointResolutionsJsonAlloc(alloc, store, index_manager, artifact_ref.document_id, source.artifact_name);
+            const endpoint_resolutions = try graphEndpointResolutionsJsonAlloc(alloc, store, index_manager, artifact_ref.document_id, index_name, source.artifact_name);
             defer if (endpoint_resolutions) |value| alloc.free(value);
             if (endpoint_resolutions) |res_raw| try injectGraphEndpointResolutions(&parsed_artifact, res_raw);
             const raw_doc = try storeDocumentValueForGraphSource(
@@ -9760,6 +9833,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var changed_set = std.StringHashMapUnmanaged(void).empty;
             defer changed_set.deinit(alloc);
 
+            var resolved_assets: std.StringHashMapUnmanaged(void) = .empty;
+            defer {
+                var keys = resolved_assets.keyIterator();
+                while (keys.next()) |key| alloc.free(key.*);
+                resolved_assets.deinit(alloc);
+            }
+            for (changed_artifact_keys) |key| {
+                if (!internal_keys.isResolutionArtifactKey(key)) continue;
+                if (try resolutionOwningAssetArtifactKeyAlloc(alloc, index_manager, index_name, key)) |asset| {
+                    const entry = resolved_assets.getOrPut(alloc, asset) catch |err| {
+                        alloc.free(asset);
+                        return err;
+                    };
+                    if (entry.found_existing) alloc.free(asset);
+                }
+            }
             for (changed_artifact_keys) |artifact_key| {
                 if (internal_keys.isResolutionArtifactKey(artifact_key)) {
                     for (sources) |source| {
@@ -9773,34 +9862,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         };
                     }
                     for (changed.items) |key| try changed_set.put(alloc, key, {});
-                    // Relation edges materialize when the extraction artifact is
-                    // written, which is before its resolution artifacts exist, so
-                    // their first render carries local-id endpoints. A landed
-                    // resolution re-renders the owning extraction artifact with
-                    // canonical endpoints (graphEndpointResolutionsJsonAlloc); the
-                    // existing replacement semantics retire the stale local-id
-                    // edges. Depth-one recursion: the synthesized key is an asset
-                    // artifact, never another resolution key.
-                    if (try resolutionOwningAssetArtifactKeyAlloc(alloc, index_manager, artifact_key)) |asset_key| {
-                        defer alloc.free(asset_key);
-                        const rerendered = try materializeGraphSourceArtifactsForIndex(alloc, store, index_manager, &.{asset_key}, index_name, options);
-                        defer alloc.free(rerendered);
-                        var idx: usize = 0;
-                        errdefer for (rerendered[idx..]) |key| alloc.free(key);
-                        while (idx < rerendered.len) {
-                            const key = rerendered[idx];
-                            if (changed_set.contains(key)) {
-                                alloc.free(key);
-                                idx += 1;
-                                continue;
-                            }
-                            try changed.append(alloc, key);
-                            idx += 1;
-                            try changed_set.put(alloc, key, {});
-                        }
-                    }
+                    // Canonical relation endpoints render once per asset after
+                    // the complete resolution batch below.
                     continue;
                 }
+                if (resolved_assets.contains(artifact_key)) continue;
                 var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, artifact_key)) orelse continue;
                 defer artifact_ref.deinit(alloc);
                 const source = blk: {
@@ -9834,7 +9900,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         if (options.repair_ctx) |ctx| ctx.relational_base_rows else false,
                     );
                     defer if (raw_doc) |doc_value| alloc.free(doc_value);
-                    const endpoint_resolutions = try graphEndpointResolutionsJsonAlloc(alloc, store, index_manager, artifact_ref.document_id, source.artifact_name);
+                    const endpoint_resolutions = try graphEndpointResolutionsJsonAlloc(alloc, store, index_manager, artifact_ref.document_id, index_name, source.artifact_name);
                     defer if (endpoint_resolutions) |res_raw| alloc.free(res_raw);
                     const graph_writes = graphWritesFromArtifactValueAlloc(
                         alloc,
@@ -9966,6 +10032,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 };
             }
 
+            // Resolve all mentions first, then render each affected extraction
+            // once using the complete canonical endpoint set.
+            var asset_keys: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer asset_keys.deinit(alloc);
+            var assets = resolved_assets.keyIterator();
+            while (assets.next()) |key| try asset_keys.append(alloc, key.*);
+            if (asset_keys.items.len != 0) {
+                const rerendered = try materializeGraphSourceArtifactsForIndex(alloc, store, index_manager, asset_keys.items, index_name, options);
+                defer freeOwnedKeySlice(alloc, rerendered);
+                for (rerendered) |key| try appendUniqueOwnedKeyIndexed(alloc, &changed, &changed_set, key);
+            }
             return try changed.toOwnedSlice(alloc);
         }
 
@@ -9997,7 +10074,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
 
-            const cfg = resolverConfigForResolution(index_manager, source.artifact_name, parsed_key.artifact_name) orelse {
+            const cfg = resolverConfigForResolution(index_manager, index_name, source.artifact_name, parsed_key.artifact_name) orelse {
                 // A multi-source graph pairs every changed resolution key with every
                 // mention-edge source. A resolution artifact owned by a different
                 // source's resolver (e.g. label-routed autoschema layouts with one
@@ -10050,6 +10127,32 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     cfg,
                 );
                 defer freeGraphWrites(alloc, mention_edge_writes);
+                if (source.mapping.source_template.len > 0) {
+                    const raw_doc = try storeDocumentValueForGraphSource(alloc, store, index_manager, parsed_key.doc_key, if (options.repair_ctx) |ctx| ctx.relational_base_rows else false);
+                    defer if (raw_doc) |value| alloc.free(value);
+                    var parsed_doc = if (raw_doc) |value| try std.json.parseFromSlice(std.json.Value, alloc, value, .{}) else null;
+                    defer if (parsed_doc) |*value| value.deinit();
+                    const doc_value: ?std.json.Value = if (parsed_doc) |value| value.value else null;
+                    const renderer = @import("graph_restore_materialization.zig").renderGraphArtifactTemplateAlloc;
+                    for (mention_edge_writes, 0..) |*write, item_index| {
+                        var item: std.json.ObjectMap = .empty;
+                        defer item.deinit(alloc);
+                        try item.put(alloc, "id", .{ .string = write.target });
+                        try item.put(alloc, "target", .{ .string = write.target });
+                        try item.put(alloc, "source", .{ .string = parsed_key.doc_key });
+                        const endpoint = try renderer(alloc, source.mapping.source_template, parsed_key.doc_key, doc_value, .{ .object = item }, item_index, source.artifact_name, "application/json", .null);
+                        errdefer alloc.free(endpoint);
+                        if (endpoint.len == 0) return error.InvalidGraphEdges;
+                        const edge_id = try renderer(alloc, source.mapping.edge_id_template, parsed_key.doc_key, doc_value, .{ .object = item }, item_index, source.artifact_name, "application/json", .null);
+                        errdefer alloc.free(edge_id);
+                        if (edge_id.len == 0) return error.InvalidGraphEdges;
+                        const owner = try alloc.dupe(u8, parsed_key.doc_key);
+                        alloc.free(write.source);
+                        write.source = endpoint;
+                        write.owner_document = owner;
+                        write.edge_id = edge_id;
+                    }
+                }
                 for (mention_edge_writes) |write| {
                     const key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, if (write.owner_document.len > 0) write.owner_document else if (write.owner.len > 0) write.owner else write.source, write.index_name, write.edge_type, write.target, write.source, write.edge_id);
                     var key_owned = true;
@@ -10188,50 +10291,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             mention_edge_type: []const u8,
             cfg: *const index_manager_mod.ResolverConfig,
         ) ![]types.GraphEdgeWrite {
-            var parsed_resolution = resolver_lib.parseResolution(alloc, resolution_raw) catch return try alloc.alloc(types.GraphEdgeWrite, 0);
-            defer parsed_resolution.deinit();
-            var parsed_extraction: ?resolver_lib.ParsedEntities = if (extraction_raw) |raw|
-                resolver_lib.parseExtractionEntities(alloc, raw) catch null
-            else
-                null;
-            defer if (parsed_extraction) |*parsed| parsed.deinit();
-
-            var aggregates = std.ArrayListUnmanaged(MentionEdgeAggregate).empty;
-            defer {
-                for (aggregates.items) |*aggregate| aggregate.deinit(alloc);
-                aggregates.deinit(alloc);
-            }
-            for (parsed_resolution.entities) |entity| {
-                if (!resolutionDecisionCreatesCanonicalEdge(entity.decision)) continue;
-                if (entity.doc_ref.key.len == 0) continue;
-                const mention_confidence = if (parsed_extraction) |parsed|
-                    extractionConfidenceForLocalId(parsed.entities, entity.local_id) orelse entity.confidence
-                else
-                    entity.confidence;
-                const mention_artifact_key = try resolutionMentionArtifactKeyAlloc(alloc, doc_key, cfg.source_artifact, cfg.resolution_artifact, entity.local_id);
-                var mention_key_owned = true;
-                errdefer if (mention_key_owned) alloc.free(mention_artifact_key);
-                const aggregate = try findOrAppendMentionEdgeAggregate(alloc, &aggregates, entity.doc_ref.key, entity.doc_ref.table);
-                try aggregate.appendMentionArtifactKey(alloc, mention_artifact_key);
-                mention_key_owned = false;
-                aggregate.mention_confidence = @max(aggregate.mention_confidence, mention_confidence);
-            }
-
-            var writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
-            errdefer freeGraphWrites(alloc, writes.items);
-            for (aggregates.items) |aggregate| {
-                const metadata = try mentionEdgeMetadataJsonAlloc(alloc, aggregate);
-                errdefer alloc.free(metadata);
-                try writes.append(alloc, .{
-                    .index_name = try alloc.dupe(u8, index_name),
-                    .source = try alloc.dupe(u8, doc_key),
-                    .target = try alloc.dupe(u8, aggregate.target),
-                    .edge_type = try alloc.dupe(u8, mention_edge_type),
-                    .weight = cfg.fusedMentionWeight(aggregate.mention_confidence),
-                    .metadata_json = metadata,
-                });
-            }
-            return try writes.toOwnedSlice(alloc);
+            return @import("graph_mention_projection.zig").writesAlloc(alloc, index_name, doc_key, resolution_raw, extraction_raw, mention_edge_type, cfg, true);
         }
 
         pub fn mentionEvidencePayloadAlloc(
@@ -10395,7 +10455,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
             if (manifest == null) {
-                owned_manifest = db.core.store.get(alloc, manifest_key) catch |err| switch (err) {
+                owned_manifest = S.ownerField(db, "core").*.store.get(alloc, manifest_key) catch |err| switch (err) {
                     error.NotFound => return null,
                     else => return err,
                 };
@@ -11298,7 +11358,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn relationalColumns(self: anytype) ?[]const schema_mod.RelationalColumn {
-            const schema = self.core.schema orelse return null;
+            const schema = S.ownerField(self, "core").*.schema orelse return null;
             if (schema.storage_mode != .relational) return null;
             return schema.relational_columns;
         }
@@ -11336,7 +11396,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ) !?[]template_mod.ContentPart {
             if (request.source_template.len == 0) return null;
             const parts = renderSourceTemplateParts(alloc, db, request.source_template, doc_value, max_media_parts) catch |err| switch (err) {
-                error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                 else => return null,
             };
             if (parts.len == 0) {
@@ -11442,7 +11502,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn resolutionDecisionCreatesCanonicalEdge(decision: resolver_lib.Decision) bool {
             return switch (decision) {
                 .new, .match => true,
-                .review => false,
+                .review, .suppressed => false,
             };
         }
 
@@ -11485,7 +11545,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             for (index_manager.resolvers.items) |cfg| {
-                if (!std.mem.eql(u8, cfg.source_artifact, source.artifact_name)) continue;
+                if (!cfg.visibleToGraph(index_name) or !std.mem.eql(u8, cfg.source_artifact, source.artifact_name)) continue;
 
                 const state_name = try mentionGraphStateNameAlloc(alloc, source.artifact_name, cfg.resolution_artifact);
                 defer alloc.free(state_name);
@@ -11505,22 +11565,25 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn resolutionOwningAssetArtifactKeyAlloc(
             alloc: Allocator,
             index_manager: *index_manager_mod.IndexManager,
+            index_name: []const u8,
             resolution_key: []const u8,
         ) !?[]u8 {
             const parsed_key = (try internal_keys.parseResolutionArtifactKeyAlloc(alloc, resolution_key)) orelse return null;
             defer alloc.free(parsed_key.doc_key);
             defer alloc.free(parsed_key.artifact_name);
             const cfg = resolverConfigForResolutionArtifact(index_manager, parsed_key.artifact_name) orelse return null;
+            if (!cfg.visibleToGraph(index_name)) return null;
             return try internal_keys.artifactNamedPrefixAlloc(alloc, parsed_key.doc_key, "asset", cfg.source_artifact);
         }
 
         pub fn resolverConfigForResolution(
             index_manager: *index_manager_mod.IndexManager,
+            index_name: []const u8,
             source_artifact: []const u8,
             resolution_artifact: []const u8,
         ) ?*const index_manager_mod.ResolverConfig {
             for (index_manager.resolvers.items) |*cfg| {
-                if (std.mem.eql(u8, cfg.source_artifact, source_artifact) and
+                if (cfg.visibleToGraph(index_name) and std.mem.eql(u8, cfg.source_artifact, source_artifact) and
                     std.mem.eql(u8, cfg.resolution_artifact, resolution_artifact))
                 {
                     return cfg;
@@ -11534,6 +11597,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             resolution_artifact: []const u8,
         ) ?*const index_manager_mod.ResolverConfig {
             for (index_manager.resolvers.items) |*cfg| {
+                if (std.mem.eql(u8, cfg.resolution_artifact, resolution_artifact)) return cfg;
+            }
+            for (index_manager.retired_resolvers.items) |*cfg| {
                 if (std.mem.eql(u8, cfg.resolution_artifact, resolution_artifact)) return cfg;
             }
             return null;
@@ -11735,7 +11801,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             const unit_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", artifact_name);
             defer alloc.free(unit_prefix);
-            const unit_rows = try db.core.store.scanPrefix(alloc, unit_prefix);
+            const unit_rows = try S.ownerField(db, "core").*.store.scanPrefix(alloc, unit_prefix);
             defer docstore_mod.DocStore.freeResults(alloc, unit_rows);
             for (unit_rows) |entry| {
                 if (std.mem.eql(u8, entry.key, unit_prefix)) continue;
@@ -11751,7 +11817,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             for (view.chunks) |entry| {
                 const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "chunk", entry.name);
                 defer alloc.free(chunk_prefix);
-                const chunk_rows = try db.core.store.scanPrefix(alloc, chunk_prefix);
+                const chunk_rows = try S.ownerField(db, "core").*.store.scanPrefix(alloc, chunk_prefix);
                 defer docstore_mod.DocStore.freeResults(alloc, chunk_rows);
                 for (chunk_rows) |row| {
                     if (!internal_keys.isChunkArtifactRecordKey(row.key)) continue;
@@ -11826,7 +11892,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .max_batch_items = max_batch_items,
                 .max_batch_bytes = max_batch_bytes,
             };
-            try db.core.store.scanWithContext(lower, upper_bound, .{}, &scan_ctx, ScanCtx.consume);
+            try S.ownerField(db, "core").*.store.scanWithContext(lower, upper_bound, .{}, &scan_ctx, ScanCtx.consume);
             if (scan_ctx.stopped_key) |key| {
                 defer alloc.free(key);
                 return try keyAfterAlloc(alloc, key);
@@ -12000,7 +12066,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             doc_key: []const u8,
             relational_base_rows: bool,
         ) !?[]u8 {
-            const internal_doc_key = if (relational_base_rows)
+            const internal_doc_key = if (relational_base_rows and !@import("group_source_identity.zig").isAnchor(doc_key))
                 try relational_store.keyAlloc(alloc, doc_key)
             else
                 try internal_keys.documentKeyAlloc(alloc, doc_key);
@@ -12024,7 +12090,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn storeKeyExists(alloc: Allocator, db: anytype, key: []const u8) !bool {
-            const value = db.core.getStoreValue(alloc, key) catch |err| switch (err) {
+            const value = S.ownerField(db, "core").*.getStoreValue(alloc, key) catch |err| switch (err) {
                 error.NotFound => return false,
                 else => return err,
             };
@@ -12052,7 +12118,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     return enrichment_artifact_codec.sourceHash(value) catch null;
                 }
             }
-            const metadata = db.core.store.getArtifactMetadata(artifact_key) catch |err| switch (err) {
+            const metadata = S.ownerField(db, "core").*.store.getArtifactMetadata(artifact_key) catch |err| switch (err) {
                 error.NotFound,
                 error.InvalidArtifactHeader,
                 error.InvalidArtifactMagic,
@@ -12221,10 +12287,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn validateDocumentExtractionInlineSources(db: anytype, doc_value: []const u8) !void {
             var has_document_extraction_asset = false;
-            for (db.core.index_manager.enrichments.items) |entry| {
+            for (S.ownerField(db, "core").*.index_manager.enrichments.items) |entry| {
                 if (entry.kind != .asset) continue;
-                var producer_cfg = asset_producer_mod.parseProducerConfig(db.alloc, entry.producer_json) catch continue;
-                defer producer_cfg.deinit(db.alloc);
+                var producer_cfg = asset_producer_mod.parseProducerConfig(S.ownerField(db, "alloc").*, entry.producer_json) catch continue;
+                defer producer_cfg.deinit(S.ownerField(db, "alloc").*);
                 if (producer_cfg.type == .document_extraction) {
                     has_document_extraction_asset = true;
                     break;
@@ -12232,7 +12298,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             if (!has_document_extraction_asset) return;
 
-            const parsed = try std.json.parseFromSlice(std.json.Value, db.alloc, doc_value, .{});
+            const parsed = try std.json.parseFromSlice(std.json.Value, S.ownerField(db, "alloc").*, doc_value, .{});
             defer parsed.deinit();
             return try validateDocumentExtractionInlineSourcesParsed(db, parsed.value, doc_value);
         }
@@ -12244,25 +12310,25 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ) !void {
             if (value != .object) return;
 
-            for (db.core.index_manager.enrichments.items) |entry| {
+            for (S.ownerField(db, "core").*.index_manager.enrichments.items) |entry| {
                 if (entry.kind != .asset) continue;
-                var producer_cfg = asset_producer_mod.parseProducerConfig(db.alloc, entry.producer_json) catch continue;
-                defer producer_cfg.deinit(db.alloc);
+                var producer_cfg = asset_producer_mod.parseProducerConfig(S.ownerField(db, "alloc").*, entry.producer_json) catch continue;
+                defer producer_cfg.deinit(S.ownerField(db, "alloc").*);
                 if (producer_cfg.type != .document_extraction) continue;
 
                 if (entry.source_template.len > 0) {
-                    const rendered = renderSourceTemplateText(db.alloc, db, entry.source_template, doc_value) catch |err| switch (err) {
-                        error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                    const rendered = renderSourceTemplateText(S.ownerField(db, "alloc").*, db, entry.source_template, doc_value) catch |err| switch (err) {
+                        error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                         else => continue,
                     };
-                    defer db.alloc.free(rendered);
-                    try document_extraction_mod.validateInlineSourceSize(db.remote_content, rendered);
+                    defer S.ownerField(db, "alloc").*.free(rendered);
+                    try document_extraction_mod.validateInlineSourceSize(S.ownerField(db, "remote_content").*, rendered);
                     continue;
                 }
 
                 const source = value.object.get(entry.source_field) orelse continue;
                 if (source != .string) continue;
-                try document_extraction_mod.validateInlineSourceSize(db.remote_content, source.string);
+                try document_extraction_mod.validateInlineSourceSize(S.ownerField(db, "remote_content").*, source.string);
             }
         }
 
@@ -12282,16 +12348,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
                 if (request.source_template.len > 0) {
                     const rendered = renderSourceTemplateText(alloc, db, request.source_template, (try document.logicalJson()).?) catch |err| switch (err) {
-                        error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                        error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                         else => continue,
                     };
                     defer alloc.free(rendered);
-                    try document_extraction_mod.validateInlineSourceSize(db.remote_content, rendered);
+                    try document_extraction_mod.validateInlineSourceSize(S.ownerField(db, "remote_content").*, rendered);
                     continue;
                 }
                 const source = value.object.get(request.source_field) orelse continue;
                 if (source != .string) continue;
-                try document_extraction_mod.validateInlineSourceSize(db.remote_content, source.string);
+                try document_extraction_mod.validateInlineSourceSize(S.ownerField(db, "remote_content").*, source.string);
             }
         }
 

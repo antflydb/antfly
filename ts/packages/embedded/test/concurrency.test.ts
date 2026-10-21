@@ -19,7 +19,7 @@ import { join } from "node:path";
 import { expect, it } from "vitest";
 import { threadingMode } from "../src/abi.js";
 import { createWithOptions, openWithOptions } from "../src/database.js";
-import { BusyError, InvalidArgumentError } from "../src/errors.js";
+import { InvalidArgumentError } from "../src/errors.js";
 import { THREADING_SERIALIZED } from "../src/types.js";
 import { describeWithLibrary } from "./helpers.js";
 
@@ -130,38 +130,23 @@ describeWithLibrary("concurrency", () => {
     await expect(db.stats()).rejects.toBeInstanceOf(InvalidArgumentError);
   });
 
-  it("busyTimeoutMs 0 fails immediately with BusyError", async () => {
-    const path = tempDbPath("busy-immediate");
+  it.each([
+    0, 150, 10_000,
+  ])("idle connections coexist with busyTimeoutMs %i", async (busyTimeoutMs) => {
+    const path = tempDbPath("independent-connections");
     const first = await createWithOptions(path, { noSync: true });
+    const second = await openWithOptions(path, { noSync: true, busyTimeoutMs });
     try {
-      await expect(openWithOptions(path, { noSync: true })).rejects.toBeInstanceOf(BusyError);
+      await first.batch([{ key: "doc:first", value: { body: "from first" } }], 1);
+      expect(await second.lookup("doc:first")).toMatchObject({ body: "from first" });
+      await second.batch([{ key: "doc:second", value: { body: "from second" } }], 2);
+      expect(await first.lookup("doc:second")).toMatchObject({ body: "from second" });
+      await first.close();
+      expect(await second.lookup("doc:first")).toMatchObject({ body: "from first" });
     } finally {
       await first.close();
+      await second.close();
     }
-  });
-
-  it("busyTimeoutMs 150 fails with BusyError only after waiting", async () => {
-    const path = tempDbPath("busy-150");
-    const first = await createWithOptions(path, { noSync: true });
-    try {
-      const start = Date.now();
-      await expect(
-        openWithOptions(path, { noSync: true, busyTimeoutMs: 150 })
-      ).rejects.toBeInstanceOf(BusyError);
-      expect(Date.now() - start).toBeGreaterThanOrEqual(140);
-    } finally {
-      await first.close();
-    }
-  });
-
-  it("a long busyTimeoutMs succeeds once the first writer closes", async () => {
-    const path = tempDbPath("busy-long");
-    const first = await createWithOptions(path, { noSync: true });
-    setTimeout(() => {
-      void first.close();
-    }, 100);
-    const second = await openWithOptions(path, { noSync: true, busyTimeoutMs: 10_000 });
-    await second.close();
   });
 
   it("concurrent async searches overlap instead of blocking the event loop", async () => {

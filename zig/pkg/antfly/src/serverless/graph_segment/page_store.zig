@@ -35,9 +35,14 @@ pub const PageStore = struct {
     remaining_read_bytes: *u64,
     remaining_write_bytes: *u64,
     read_cache: ?ReadCache = null,
+    /// Only build owners with a concurrency-safe artifact allocator opt in.
+    io: ?std.Io = null,
+    /// Background streaming builders bound each page, rather than archive size.
+    /// Query stores retain cumulative request budgets by default.
+    streaming: bool = false,
 
     pub fn store(self: *PageStore) tree.Store {
-        return .{ .domain = self.domain, .attempt = self.attempt, .ptr = self, .get = get, .put = put, .check = check };
+        return .{ .domain = self.domain, .attempt = self.attempt, .ptr = self, .get = get, .put = put, .put_many = if (self.io != null) putMany else null, .check = check };
     }
 
     pub fn namespaceDomain(namespace: []const u8) [32]u8 {
@@ -77,6 +82,7 @@ pub const PageStore = struct {
         if (!std.mem.eql(u8, &root.domain, &self.domain)) return error.GraphPageDomainMismatch;
         const bytes = root.encode();
         _ = try graph.Root.decode(&bytes);
+        if (self.streaming) self.remaining_write_bytes.* = tree.max_page_bytes;
         if (bytes.len > self.remaining_write_bytes.*) return error.GraphPageWriteBudgetExceeded;
         self.remaining_write_bytes.* -= bytes.len;
         var metadata = try self.artifacts.putScoped(.{ .domain = self.domain, .attempt = self.attempt }, &bytes, self.cancellation);
@@ -111,6 +117,7 @@ pub const PageStore = struct {
         const self: *PageStore = @ptrCast(@alignCast(ptr));
         try ref.validate();
         const id = try identity(self.domain, ref);
+        if (self.streaming) self.remaining_read_bytes.* = tree.max_page_bytes;
         if (self.read_cache) |cache| return cache.read(cache.ptr, alloc, self.artifacts, .{
             .kind = .graph_segment,
             .artifact_id = &id,
@@ -126,13 +133,73 @@ pub const PageStore = struct {
     fn put(ptr: *anyopaque, ref: tree.Ref, bytes: []const u8) !void {
         const self: *PageStore = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, &ref.attempt, &self.attempt)) return error.GraphPageAttemptMismatch;
+        try ref.validate();
+        if (self.streaming) self.remaining_write_bytes.* = tree.max_page_bytes;
         if (bytes.len > self.remaining_write_bytes.*) return error.GraphPageWriteBudgetExceeded;
         self.remaining_write_bytes.* -= bytes.len;
+        try self.upload(ref, bytes);
+    }
+
+    fn upload(self: *PageStore, ref: tree.Ref, bytes: []const u8) !void {
         var metadata = try self.artifacts.putScoped(.{ .domain = self.domain, .attempt = self.attempt }, bytes, self.cancellation);
         defer metadata.deinit(self.artifacts.allocator);
         const id = try identity(self.domain, ref);
         if (metadata.byte_len != ref.bytes or !std.mem.eql(u8, metadata.artifact_id, &id) or
             !std.mem.eql(u8, metadata.checksum, id[7..71])) return error.ArtifactIntegrityMismatch;
+    }
+
+    fn putMany(ptr: *anyopaque, writes: []const tree.Write) !void {
+        const self: *PageStore = @ptrCast(@alignCast(ptr));
+        if (writes.len > tree.max_write_batch) return error.GraphPageWriteBudgetExceeded;
+        var bytes: u64 = 0;
+        for (writes) |write| {
+            try write.ref.validate();
+            if (!std.mem.eql(u8, &write.ref.attempt, &self.attempt)) return error.GraphPageAttemptMismatch;
+            if (write.ref.bytes != write.bytes.len) return error.ArtifactIntegrityMismatch;
+            bytes = try std.math.add(u64, bytes, write.bytes.len);
+        }
+        // Streaming construction admits one bounded batch, not cumulative archive bytes.
+        // Every page and fan-in was validated above; query stores keep their cumulative budget.
+        if (self.streaming) self.remaining_write_bytes.* = @as(u64, tree.max_page_bytes) * writes.len;
+        // Charge before spawning. Workers never race on admission counters.
+        if (bytes > self.remaining_write_bytes.*) return error.GraphPageWriteBudgetExceeded;
+        self.remaining_write_bytes.* -= bytes;
+        try self.cancellation.check();
+        const width = if (self.artifacts.io_phase) |phase| phase.max_parallel else tree.max_write_batch;
+        var begin: usize = 0;
+        while (begin < writes.len) {
+            const end = @min(writes.len, begin + width);
+            var phase = try self.artifacts.beginIo(end - begin);
+            defer phase.abort();
+            var backend = self.artifacts.*;
+            backend.io_phase = null;
+            var worker = self.*;
+            worker.artifacts = &backend;
+            worker.uploadBatch(writes[begin..end]) catch |err| return phase.failed(err);
+            try phase.finish();
+            begin = end;
+        }
+    }
+    fn uploadBatch(self: *PageStore, writes: []const tree.Write) !void {
+        var failures: [tree.max_write_batch]?anyerror = @splat(null);
+        var group: std.Io.Group = .init;
+        const io = self.io.?;
+        const Worker = struct {
+            fn run(owner: *PageStore, write: tree.Write, failure: *?anyerror) void {
+                owner.upload(write.ref, write.bytes) catch |err| {
+                    failure.* = err;
+                };
+            }
+        };
+        for (writes, 0..) |write, index| group.async(io, Worker.run, .{ self, write, &failures[index] });
+        // Even cancellation must drain all children before borrowed pages and
+        // the publication owner are released.
+        group.await(io) catch |err| {
+            group.cancel(io);
+            return err;
+        };
+        for (failures[0..writes.len]) |failure| if (failure) |err| return err;
+        try self.cancellation.check();
     }
 };
 
@@ -204,6 +271,13 @@ const TestArtifacts = struct {
     memory: tree.testing.MemoryStore,
     deleted: usize = 0,
     fail_delete_after: ?usize = null,
+    mutex: std.atomic.Mutex = .unlocked,
+    fail_upload: bool = false,
+    cancel_upload: ?*std.atomic.Value(bool) = null,
+    completed_uploads: std.atomic.Value(usize) = .init(0),
+    active_uploads: std.atomic.Value(usize) = .init(0),
+    peak_uploads: std.atomic.Value(usize) = .init(0),
+    upload_io: ?std.Io = null,
 
     fn capability(self: *@This()) artifacts.ArtifactStore {
         return .{ .allocator = self.memory.alloc, .ptr = self, .vtable = &.{
@@ -239,7 +313,17 @@ const TestArtifacts = struct {
     }
 
     fn putScoped(ptr: *anyopaque, alloc: std.mem.Allocator, scope: artifacts.UploadScope, bytes: []const u8, cancellation: CancellationToken) !artifacts.ArtifactMetadata {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const active = self.active_uploads.fetchAdd(1, .acq_rel) + 1;
+        _ = self.peak_uploads.fetchMax(active, .acq_rel);
+        defer {
+            _ = self.active_uploads.fetchSub(1, .acq_rel);
+            _ = self.completed_uploads.fetchAdd(1, .acq_rel);
+        }
+        if (self.upload_io) |io| try std.Io.sleep(io, .fromMilliseconds(5), .awake);
+        if (self.cancel_upload) |signal| signal.store(true, .release);
         try cancellation.check();
+        if (self.fail_upload) return error.InjectedUploadFailure;
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
         const id = try scope.artifactId(&std.fmt.bytesToHex(&digest, .lower));
@@ -248,6 +332,8 @@ const TestArtifacts = struct {
 
     fn save(ptr: *anyopaque, alloc: std.mem.Allocator, id: []const u8, bytes: []const u8) !artifacts.ArtifactMetadata {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
         const store = self.memory.store();
         try store.put(store.ptr, .{ .digest = address(id), .bytes = @intCast(bytes.len), .height = 0, .records = 1 }, bytes);
         return metadata(alloc, id, bytes.len);
@@ -525,4 +611,130 @@ test "serverless paged public adjacency reader preserves query-local identities 
 
 test "serverless paged public adjacency reader cleans every allocation failure" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exercisePageReader, .{});
+}
+
+test "serverless graph page store bounded uploads drain failures and respect admission" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    var fixture: TestArtifacts = .{ .memory = .{ .alloc = alloc }, .upload_io = io_impl.io() };
+    defer fixture.memory.deinit();
+    var capability = fixture.capability();
+    var read_bytes: u64 = 0;
+    var write_bytes: u64 = 511;
+    var pages: PageStore = .{
+        .domain = PageStore.namespaceDomain("bounded-upload-test"),
+        .attempt = @splat(1),
+        .artifacts = &capability,
+        .remaining_read_bytes = &read_bytes,
+        .remaining_write_bytes = &write_bytes,
+        .io = io_impl.io(),
+    };
+    const bytes: [64]u8 = @splat(7);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&bytes, &digest, .{});
+    const writes: [tree.max_write_batch]tree.Write = @splat(.{
+        .ref = .{ .digest = digest, .attempt = @splat(1), .bytes = bytes.len, .height = 0, .records = 1 },
+        .bytes = &bytes,
+    });
+    const store = pages.store();
+    try std.testing.expectError(error.GraphPageWriteBudgetExceeded, store.put_many.?(store.ptr, &writes));
+    try std.testing.expectEqual(@as(usize, 0), fixture.completed_uploads.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 511), write_bytes);
+    write_bytes = 512;
+    try store.put_many.?(store.ptr, &writes);
+    try std.testing.expectEqual(@as(u64, 0), write_bytes);
+    try std.testing.expectEqual(@as(usize, 8), fixture.completed_uploads.load(.acquire));
+    try std.testing.expect(fixture.peak_uploads.load(.acquire) > 1);
+    try std.testing.expect(fixture.peak_uploads.load(.acquire) <= tree.max_write_batch);
+    fixture.fail_upload = true;
+    write_bytes = 512;
+    try std.testing.expectError(error.InjectedUploadFailure, store.put_many.?(store.ptr, &writes));
+    try std.testing.expectEqual(@as(usize, 16), fixture.completed_uploads.load(.acquire));
+    // A borrowed cancellation is checked before scheduling any uploads.
+    var signal: std.atomic.Value(bool) = .init(true);
+    pages.cancellation = CancellationToken.fromAtomic(&signal);
+    write_bytes = 512;
+    try std.testing.expectError(error.Canceled, store.put_many.?(store.ptr, &writes));
+    try std.testing.expectEqual(@as(usize, 16), fixture.completed_uploads.load(.acquire));
+    // Cancellation arriving inside an upload must also drain every child.
+    signal.store(false, .release);
+    fixture.fail_upload = false;
+    fixture.cancel_upload = &signal;
+    write_bytes = 512;
+    try std.testing.expectError(error.Canceled, store.put_many.?(store.ptr, &writes));
+    // Siblings may stop at ArtifactStore's cancellation preflight without
+    // entering the provider. Every provider that did enter has finished.
+    const completed = fixture.completed_uploads.load(.acquire);
+    try std.testing.expect(completed >= 17 and completed <= 24);
+    try std.testing.expectEqual(@as(usize, 0), fixture.active_uploads.load(.acquire));
+    // Streaming builders can publish successive bounded batches after a serial
+    // root write has exhausted the prior single-page allowance.
+    pages.cancellation = .none;
+    fixture.cancel_upload = null;
+    pages.streaming = true;
+    write_bytes = 0;
+    const before_stream = fixture.completed_uploads.load(.acquire);
+    try store.put_many.?(store.ptr, &writes);
+    write_bytes = 0;
+    try store.put_many.?(store.ptr, &writes);
+    try std.testing.expectEqual(before_stream + 16, fixture.completed_uploads.load(.acquire));
+    try std.testing.expectEqual(@as(u64, tree.max_page_bytes) * tree.max_write_batch - 512, write_bytes);
+    try std.testing.expectEqual(@as(usize, 0), fixture.active_uploads.load(.acquire));
+}
+
+test "serverless graph publication IO phases bound batch fanout and drain before resumption" {
+    const Phase = struct {
+        active: bool = false,
+        begins: usize = 0,
+        finishes: usize = 0,
+        aborted: usize = 0,
+        fn begin(raw: *anyopaque, slots: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(!self.active);
+            try std.testing.expect(slots > 0 and slots <= 2);
+            self.active = true;
+            self.begins += 1;
+        }
+        fn finish(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.active);
+            self.active = false;
+            self.finishes += 1;
+        }
+        fn abort(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.active);
+            self.active = false;
+            self.aborted += 1;
+        }
+    };
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    var fixture: TestArtifacts = .{ .memory = .{ .alloc = a }, .upload_io = io_impl.io() };
+    defer fixture.memory.deinit();
+    var phase: Phase = .{};
+    var backend = fixture.capability();
+    const io_capability: artifacts.IoPhase = .{ .ptr = &phase, .max_parallel = 2, .begin = Phase.begin, .finish = Phase.finish, .abort = Phase.abort };
+    backend.io_phase = &io_capability;
+    var read_bytes: u64 = 1024;
+    var write_bytes: u64 = 1024;
+    var pages: PageStore = .{ .domain = PageStore.namespaceDomain("io-phases"), .attempt = @splat(1), .artifacts = &backend, .remaining_read_bytes = &read_bytes, .remaining_write_bytes = &write_bytes, .io = io_impl.io(), .streaming = true };
+    const bytes: [64]u8 = @splat(3);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&bytes, &digest, .{});
+    const writes: [8]tree.Write = @splat(.{ .ref = .{ .digest = digest, .attempt = @splat(1), .bytes = bytes.len, .height = 0, .records = 1 }, .bytes = &bytes });
+    const store = pages.store();
+    try store.put_many.?(store.ptr, &writes);
+    try std.testing.expectEqual(@as(usize, 4), phase.begins);
+    try std.testing.expectEqual(phase.begins, phase.finishes);
+    try std.testing.expectEqual(@as(usize, 8), fixture.completed_uploads.load(.acquire));
+    try std.testing.expect(fixture.peak_uploads.load(.acquire) <= 2);
+    fixture.fail_upload = true;
+    try std.testing.expectError(error.InjectedUploadFailure, store.put_many.?(store.ptr, &writes));
+    try std.testing.expectEqual(@as(usize, 0), phase.aborted);
+    try std.testing.expectEqual(phase.begins, phase.finishes);
+    try std.testing.expectEqual(@as(usize, 0), fixture.active_uploads.load(.acquire));
+    try std.testing.expect(!phase.active);
 }

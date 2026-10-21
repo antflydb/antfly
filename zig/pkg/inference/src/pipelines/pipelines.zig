@@ -86,7 +86,6 @@ pub const qwen3vl_multimodal_reranker = @import("qwen3vl_multimodal_reranker.zig
 pub const document_preprocessing = documents.preprocessing;
 pub const document_classification = documents.classification;
 pub const document_token_classification = documents.token_classification;
-pub const OnnxDecoderOnlyVlmPipeline = @import("onnx_decoder_only_vlm.zig").Pipeline;
 pub const JsonGrammar = grammar.JsonGrammar;
 
 test {
@@ -105,6 +104,7 @@ test {
     _ = gliner_boundary_long_relations;
     _ = extraction_regex;
     _ = @import("gliner_boundary_unicode.zig");
+    _ = @import("token_logprobs.zig");
     _ = @import("embedding.zig");
     _ = @import("sparse_embedding.zig");
     _ = @import("chunking.zig");
@@ -141,5 +141,9 @@ test {
     _ = @import("document_classification.zig");
     _ = @import("document_token_classification.zig");
     _ = @import("adapters.zig");
-    _ = @import("onnx_decoder_only_vlm.zig");
+}
+
+test {
+    _ = @import("gemma4_image_broker.zig");
+    _ = @import("audio_preparation.zig");
 }

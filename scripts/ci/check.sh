@@ -120,6 +120,7 @@ check_sdk_impl() {
   check_typescript
 
   section "Checking the Go SDK"
+  "$policy_python" -m unittest discover -s "$repo_root/scripts" -p test_generate_go_sdk.py
   (
     cd "$repo_root/go/pkg/sdk"
     GOWORK=off go generate ./...
@@ -151,8 +152,9 @@ check_sdk_impl() {
 }
 
 # The embedded Lite bindings need a built libantfly to run their native
-# tests; `zig build lite-test` covers those. Here they get static checks and
-# the tests that run without the library (native tests skip cleanly).
+# tests. Here they get static checks and tests that run without the library.
+# CI separately requires real native SDK tests through test-embedded-sdk-native.sh,
+# reusing the E2E build installation instead of rebuilding Zig in each SDK job.
 check_lite_bindings() {
   section "Checking the Go Lite binding"
   (

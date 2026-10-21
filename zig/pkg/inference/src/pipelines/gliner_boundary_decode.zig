@@ -248,85 +248,10 @@ pub fn decodeQuery(allocator: std.mem.Allocator, spans: []const ScoredSpan, opti
     return resolveOverlaps(allocator, eligible[0..count], options.policy, options.limits);
 }
 
-pub const OffsetUnit = enum { utf8_bytes, unicode_codepoints, utf16_codeunits };
-pub const Offsets = struct { start: usize, end: usize };
-const OffsetEntry = struct { byte: usize, utf16: usize };
-
-/// One immutable index per document, reused across queries and chunk merges.
-pub const OffsetMap = struct {
-    allocator: std.mem.Allocator,
-    entries: []OffsetEntry,
-
-    pub fn init(allocator: std.mem.Allocator, text: []const u8, max_bytes: usize) !OffsetMap {
-        if (text.len > max_bytes) return error.ExtractionTextLimitExceeded;
-        const view = try std.unicode.Utf8View.init(text);
-        var iter = view.iterator();
-        var count: usize = 0;
-        while (iter.nextCodepoint() != null) count += 1;
-        const entries = try allocator.alloc(OffsetEntry, count + 1);
-        iter = view.iterator();
-        var utf16: usize = 0;
-        var i: usize = 0;
-        entries[0] = .{ .byte = 0, .utf16 = 0 };
-        while (iter.nextCodepoint()) |cp| {
-            utf16 += if (cp > 0xffff) @as(usize, 2) else 1;
-            i += 1;
-            entries[i] = .{ .byte = iter.i, .utf16 = utf16 };
-        }
-        return .{ .allocator = allocator, .entries = entries };
-    }
-
-    pub fn deinit(self: *OffsetMap) void {
-        self.allocator.free(self.entries);
-        self.* = undefined;
-    }
-
-    fn find(self: OffsetMap, byte: usize) !usize {
-        var lo: usize = 0;
-        var hi = self.entries.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (self.entries[mid].byte < byte) lo = mid + 1 else hi = mid;
-        }
-        if (lo == self.entries.len or self.entries[lo].byte != byte) return error.InvalidUtf8Boundary;
-        return lo;
-    }
-
-    pub fn convert(self: OffsetMap, bytes: Offsets, unit: OffsetUnit) !Offsets {
-        if (bytes.end < bytes.start) return error.InvalidBoundarySpan;
-        const start = try self.find(bytes.start);
-        const end = try self.find(bytes.end);
-        return switch (unit) {
-            .utf8_bytes => bytes,
-            .unicode_codepoints => .{ .start = start, .end = end },
-            .utf16_codeunits => .{ .start = self.entries[start].utf16, .end = self.entries[end].utf16 },
-        };
-    }
-
-    fn fromUnit(self: OffsetMap, offset: usize, unit: OffsetUnit) !usize {
-        if (unit == .utf8_bytes) return self.find(offset);
-        if (unit == .unicode_codepoints) {
-            if (offset >= self.entries.len) return error.InvalidCodepointBoundary;
-            return offset;
-        }
-        var lo: usize = 0;
-        var hi = self.entries.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (self.entries[mid].utf16 < offset) lo = mid + 1 else hi = mid;
-        }
-        // A surrogate-pair interior is not a source character boundary.
-        if (lo == self.entries.len or self.entries[lo].utf16 != offset) return error.InvalidUtf16Boundary;
-        return lo;
-    }
-
-    pub fn toBytes(self: OffsetMap, offsets: Offsets, unit: OffsetUnit) !Offsets {
-        if (offsets.end < offsets.start) return error.InvalidBoundarySpan;
-        const start = try self.fromUnit(offsets.start, unit);
-        const end = try self.fromUnit(offsets.end, unit);
-        return .{ .start = self.entries[start].byte, .end = self.entries[end].byte };
-    }
-};
+const shared_text = @import("antfly_extracting").text_processing;
+pub const OffsetUnit = shared_text.OffsetUnit;
+pub const Offsets = shared_text.Offsets;
+pub const OffsetMap = shared_text.OffsetMap;
 
 test "gliner boundary overlap flat solves global score and deterministic ties" {
     const a = std.testing.allocator;

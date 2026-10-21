@@ -9,6 +9,7 @@ from ..models.sql_column_type import SQLColumnType
 
 if TYPE_CHECKING:
     from ..models.sql_column import SQLColumn
+    from ..models.sql_parameter_descriptor import SQLParameterDescriptor
 
 
 T = TypeVar("T", bound="SQLPreparedResponse")
@@ -22,6 +23,9 @@ class SQLPreparedResponse:
         expires_at_ms (int):
         owner_node_id (str): Exact decimal API owner identifier, preserved by JavaScript clients.
         parameter_types (list[SQLColumnType]):
+        parameter_descriptors (list[SQLParameterDescriptor]): Precise positional contracts, aligned with
+            parameter_types. Array arguments use the lossless SQLArrayValue envelope or PostgreSQL array text; plain JSON
+            arrays are not SQL arrays.
         columns (list[SQLColumn]):
     """
 
@@ -29,6 +33,7 @@ class SQLPreparedResponse:
     expires_at_ms: int
     owner_node_id: str
     parameter_types: list[SQLColumnType]
+    parameter_descriptors: list[SQLParameterDescriptor]
     columns: list[SQLColumn]
 
     def to_dict(self) -> dict[str, Any]:
@@ -43,6 +48,11 @@ class SQLPreparedResponse:
             parameter_types_item = parameter_types_item_data.value
             parameter_types.append(parameter_types_item)
 
+        parameter_descriptors = []
+        for parameter_descriptors_item_data in self.parameter_descriptors:
+            parameter_descriptors_item = parameter_descriptors_item_data.to_dict()
+            parameter_descriptors.append(parameter_descriptors_item)
+
         columns = []
         for columns_item_data in self.columns:
             columns_item = columns_item_data.to_dict()
@@ -56,6 +66,7 @@ class SQLPreparedResponse:
                 "expires_at_ms": expires_at_ms,
                 "owner_node_id": owner_node_id,
                 "parameter_types": parameter_types,
+                "parameter_descriptors": parameter_descriptors,
                 "columns": columns,
             }
         )
@@ -65,6 +76,7 @@ class SQLPreparedResponse:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.sql_column import SQLColumn
+        from ..models.sql_parameter_descriptor import SQLParameterDescriptor
 
         d = dict(src_dict)
         prepared_id = d.pop("prepared_id")
@@ -80,6 +92,13 @@ class SQLPreparedResponse:
 
             parameter_types.append(parameter_types_item)
 
+        parameter_descriptors = []
+        _parameter_descriptors = d.pop("parameter_descriptors")
+        for parameter_descriptors_item_data in _parameter_descriptors:
+            parameter_descriptors_item = SQLParameterDescriptor.from_dict(parameter_descriptors_item_data)
+
+            parameter_descriptors.append(parameter_descriptors_item)
+
         columns = []
         _columns = d.pop("columns")
         for columns_item_data in _columns:
@@ -92,6 +111,7 @@ class SQLPreparedResponse:
             expires_at_ms=expires_at_ms,
             owner_node_id=owner_node_id,
             parameter_types=parameter_types,
+            parameter_descriptors=parameter_descriptors,
             columns=columns,
         )
 

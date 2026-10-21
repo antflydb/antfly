@@ -30,6 +30,7 @@ const graph_work_budget_diagnostic = @import("../graph/work_budget_diagnostic.zi
 const graph_distinct_budget_diagnostic = @import("../graph/distinct_budget_diagnostic.zig");
 const public_limits = @import("antfly_public_limits");
 const query_contract = @import("query_contract.zig");
+const graph_payload = @import("graph.zig");
 
 pub const QueryResponse = query_contract.QueryResponse;
 pub const QueryResponseMeta = query_contract.QueryResponseMeta;
@@ -43,6 +44,7 @@ pub const validateStoragePublicQueryRequest = query_contract.validateStoragePubl
 pub const parsePublicQueryRequest = query_contract.parsePublicQueryRequest;
 pub const parsePublicQueryRequestWithDeadline = query_contract.parsePublicQueryRequestWithDeadline;
 pub const isPublicQueryValidationError = query_contract.isPublicQueryValidationError;
+pub const highlightsJsonValue = query_contract.highlightsJsonValue;
 pub const publicFilterQueryErrorStatus = query_contract.publicFilterQueryErrorStatus;
 pub const encodePublicFilterQueryErrorBodyAlloc = query_contract.encodePublicFilterQueryErrorBodyAlloc;
 pub const parseAggregationRequestsJson = query_contract.parseAggregationRequestsJson;
@@ -109,15 +111,15 @@ pub fn mergeSearchResultsWithRuntimeSchema(
     limit: u32,
     runtime_schema: ?runtime_schema_mod.TableSchema,
 ) !db_mod.types.SearchResult {
-    if (req.hierarchy_children != null) {
-        return try mergeHierarchyChildrenSearchResults(alloc, req, results, offset, limit);
-    }
-
-    if (requestReturnsHierarchyUnitGroups(req)) {
-        return try mergeHierarchyUnitSearchResults(alloc, req, results, offset, limit, runtime_schema);
-    }
-
-    return try mergeGenericSearchResultsWithRuntimeSchema(alloc, req, results, offset, limit, runtime_schema);
+    var merged = if (req.hierarchy_children != null)
+        try mergeHierarchyChildrenSearchResults(alloc, req, results, offset, limit)
+    else if (requestReturnsHierarchyUnitGroups(req))
+        try mergeHierarchyUnitSearchResults(alloc, req, results, offset, limit, runtime_schema)
+    else
+        try mergeGenericSearchResultsWithRuntimeSchema(alloc, req, results, offset, limit, runtime_schema);
+    errdefer merged.deinit();
+    if (req.profile) merged.value_search_profile_json = try @import("../search/value_query.zig").mergeProfilesAlloc(alloc, results);
+    return merged;
 }
 
 fn mergeGenericSearchResultsWithRuntimeSchema(
@@ -926,6 +928,7 @@ fn queryIsScoreBearing(query: db_mod.types.Query) bool {
 
 fn textQueryIsScoreBearing(query: db_mod.types.TextQuery) bool {
     return switch (query) {
+        .value, .autocomplete => true,
         .phrase,
         .multi_phrase,
         .term,
@@ -1056,6 +1059,7 @@ const GraphAggregateResultBuilder = struct {
 const GraphSearchResultBuilder = struct {
     name: []u8,
     nodes: std.ArrayListUnmanaged(graph_query_mod.GraphResultNode) = .empty,
+    metric_owners: std.ArrayListUnmanaged(graph_query_mod.GraphMetricOwner) = .empty,
     node_identities: graph_node_identity.BorrowedMap(void) = .{},
     paths: std.ArrayListUnmanaged(db_mod.types.GraphPath) = .empty,
     matches: std.ArrayListUnmanaged(db_mod.types.GraphPatternMatch) = .empty,
@@ -1071,6 +1075,8 @@ const GraphSearchResultBuilder = struct {
         self.node_identities.deinit(alloc);
         for (self.nodes.items) |*node| node.deinit(alloc);
         self.nodes.deinit(alloc);
+        for (self.metric_owners.items) |*owner| owner.deinit(alloc);
+        self.metric_owners.deinit(alloc);
         for (self.paths.items) |path| graph_paths.freePath(alloc, path);
         self.paths.deinit(alloc);
         for (self.matches.items) |*match| match.deinit(alloc);
@@ -1169,11 +1175,19 @@ const GraphSearchResultBuilder = struct {
             if (metric_status.len > 0) alloc.free(metric_status);
         }
 
+        try retainGraphMergeBytes(budget, self.name, query, retainedBytesForSlice(graph_query_mod.GraphMetricOwner, self.metric_owners.items.len));
+        const metric_owners = try self.metric_owners.toOwnedSlice(alloc);
+        errdefer {
+            for (metric_owners) |*owner| owner.deinit(alloc);
+            alloc.free(metric_owners);
+        }
+
         const name = self.name;
         self.name = &.{};
         return .{
             .name = name,
             .nodes = nodes,
+            .metric_owners = metric_owners,
             .paths = paths,
             .matches = matches,
             .aggregates = aggregates,
@@ -1184,6 +1198,14 @@ const GraphSearchResultBuilder = struct {
         };
     }
 };
+
+fn graphMetricColumnsRetainedBytes(columns: *const graph_query_mod.GraphMetricColumns) usize {
+    var bytes: usize = @sizeOf(graph_query_mod.GraphMetricColumns);
+    retainedAdd(&bytes, columns.backingBytes());
+    retainedAdd(&bytes, retainedBytesForSlice([]u8, columns.names.len));
+    for (columns.names) |name| retainedAdd(&bytes, name.len);
+    return bytes;
+}
 
 fn ensureGraphIdentityIndexCapacity(
     alloc: std.mem.Allocator,
@@ -1394,7 +1416,7 @@ fn artifactRefRetainedBytes(artifact: db_mod.types.ArtifactRef) usize {
 }
 
 fn graphHitRetainedBytes(hit: db_mod.types.SearchHit) usize {
-    var total: usize = 0;
+    var total: usize = if (hit.document_authority != null) @sizeOf(db_mod.types.document_authority.Authority) else 0;
     retainedAdd(&total, hit.id.len);
     if (hit.source_table) |table| retainedAdd(&total, table.len);
     retainedAdd(&total, retainedBytesForSlice(std.meta.Child(@TypeOf(hit.index_scores)), hit.index_scores.len));
@@ -1452,6 +1474,14 @@ pub fn graphResultsRetainedUsage(
         );
         retainedAdd(&usage.state_bytes, retainedBytesForSlice([]u8, result.metric_value_names.len));
         for (result.metric_value_names) |name| retainedAdd(&usage.state_bytes, name.len);
+        retainedAdd(&usage.state_bytes, retainedBytesForSlice(graph_query_mod.GraphMetricOwner, result.metric_owners.len));
+        if (result.metric_columns) |columns| retainedAdd(&usage.state_bytes, graphMetricColumnsRetainedBytes(columns));
+        for (result.metric_owners) |owner| {
+            if (owner.columns) |columns| retainedAdd(&usage.state_bytes, graphMetricColumnsRetainedBytes(columns));
+            retainedAdd(&usage.state_bytes, retainedBytesForSlice(graph_query_mod.GraphMetricValue, owner.values.len));
+            retainedAdd(&usage.state_bytes, retainedBytesForSlice([]u8, owner.names.len));
+            for (owner.names) |name| retainedAdd(&usage.state_bytes, name.len);
+        }
         retainedAdd(
             &usage.state_bytes,
             retainedBytesForSlice(db_mod.types.GraphMetricStatus, result.metric_status.len),
@@ -2128,6 +2158,7 @@ fn freeGraphSearchMetricStatuses(
 }
 
 fn validateGraphResultNodePayload(node: graph_query_mod.GraphResultNode) !void {
+    if (!node.metricViewValid()) return error.UnsupportedQueryRequest;
     if (!std.math.isFinite(node.distance)) return error.UnsupportedQueryRequest;
     if (node.path) |path_nodes| {
         if (node.path_edges) |edges| {
@@ -2346,9 +2377,12 @@ fn validateGraphResultNodeMetricPayload(
     projected_metrics: []const graph_query_mod.GraphMetricRead,
     node: graph_query_mod.GraphResultNode,
 ) !void {
-    for (node.metrics, 0..) |metric, i| {
+    if (!node.metricViewValid()) return error.UnsupportedQueryRequest;
+    for (0..node.metricCount()) |i| {
+        const metric = node.metricAt(i);
         if (!graphQueryMetricProjected(projected_metrics, metric.name)) return error.UnsupportedQueryRequest;
-        for (node.metrics[0..i]) |previous| {
+        for (0..i) |previous_index| {
+            const previous = node.metricAt(previous_index);
             if (std.mem.eql(u8, previous.name, metric.name)) return error.UnsupportedQueryRequest;
         }
         if (metric.score) |score| {
@@ -2357,7 +2391,8 @@ fn validateGraphResultNodeMetricPayload(
     }
     for (projected_metrics) |projected| {
         var found = false;
-        for (node.metrics) |metric| {
+        for (0..node.metricCount()) |column| {
+            const metric = node.metricAt(column);
             if (!std.mem.eql(u8, metric.name, projected.name)) continue;
             found = true;
             break;
@@ -2414,7 +2449,8 @@ fn mergeGraphSearchMetricStatus(
         try mergeGraphMetricStatusInto(alloc, status, source);
         return;
     }
-    try statuses.append(alloc, try cloneGraphMetricStatus(alloc, source));
+    try statuses.ensureUnusedCapacity(alloc, 1);
+    statuses.appendAssumeCapacity(try cloneGraphMetricStatus(alloc, source));
 }
 
 fn mergeGraphSearchResults(
@@ -2473,15 +2509,86 @@ pub const GraphSearchResultsAccumulator = struct {
         self.* = undefined;
     }
 
-    pub fn appendOwned(
-        self: *GraphSearchResultsAccumulator,
-        source_alloc: std.mem.Allocator,
-        graph_results: *[]db_mod.types.GraphSearchResult,
-    ) !void {
+    const Adoption = struct {
+        const Checkpoint = struct {
+            builder: usize,
+            source: *db_mod.types.GraphSearchResult,
+            nodes: usize,
+            paths: usize,
+            matches: usize,
+            hits: usize,
+            metrics: usize,
+        };
+        alloc: std.mem.Allocator,
+        checkpoints: std.ArrayListUnmanaged(Checkpoint) = .empty,
+        credit: usize = 0,
+        fn checkpoint(self: *@This(), index: usize, builder: *const GraphSearchResultBuilder, source: *db_mod.types.GraphSearchResult) !void {
+            try self.checkpoints.append(self.alloc, .{ .builder = index, .source = source, .nodes = builder.nodes.items.len, .paths = builder.paths.items.len, .matches = builder.matches.items.len, .hits = builder.hits.items.len, .metrics = builder.metric_owners.items.len });
+        }
+        fn record(self: *@This(), bytes: usize) !void {
+            self.credit = try std.math.add(usize, self.credit, bytes);
+        }
+        fn finish(self: *@This(), accumulator: *GraphSearchResultsAccumulator, commit: bool) void {
+            // Query names are unique within a shard. Each contribution is
+            // a contiguous prefix, so rollback needs no per-row journal.
+            var end = self.checkpoints.items.len;
+            while (end != 0) {
+                end -= 1;
+                const mark = self.checkpoints.items[end];
+                const builder = &accumulator.builders.items[mark.builder];
+                const source = mark.source;
+                const nodes = builder.nodes.items[mark.nodes..];
+                const paths = builder.paths.items[mark.paths..];
+                const matches = builder.matches.items[mark.matches..];
+                const hits = builder.hits.items[mark.hits..];
+                const owners = builder.metric_owners.items[mark.metrics..];
+                if (commit) {
+                    for (source.nodes[0..nodes.len]) |*node| node.* = .{ .key = "", .depth = 0, .distance = 0 };
+                    for (source.paths[0..paths.len]) |*path| path.* = .{ .nodes = &.{}, .edges = &.{}, .total_weight = 0, .length = 0 };
+                    for (source.matches[0..matches.len]) |*match| match.* = .{ .bindings = &.{}, .path = &.{} };
+                    for (source.hits[0..hits.len]) |*hit| hit.* = .{ .id = @constCast("") };
+                    source.metric_columns = null;
+                    source.metric_values_slab = &.{};
+                    source.metric_value_names = &.{};
+                    for (source.metric_owners) |*owner| owner.* = .{};
+                } else {
+                    for (nodes) |*node| node.* = .{ .key = "", .depth = 0, .distance = 0 };
+                    for (paths) |*path| path.* = .{ .nodes = &.{}, .edges = &.{}, .total_weight = 0, .length = 0 };
+                    for (matches) |*match| match.* = .{ .bindings = &.{}, .path = &.{} };
+                    for (hits) |*hit| hit.* = .{ .id = @constCast("") };
+                    for (owners) |*owner| owner.* = .{};
+                }
+                // Query names are unique in one shard, so there is only one
+                // checkpoint per builder in an append. Lengths stay unchanged
+                // to preserve capacity ownership and the failure cleanup path.
+            }
+        }
+    };
+
+    /// Same-allocator inputs transfer payloads only after the entire append
+    /// succeeds. A move journal rolls back destination ownership on failure,
+    /// leaving the caller's input intact. Failed appends poison the accumulator.
+    pub fn appendOwned(self: *GraphSearchResultsAccumulator, source_alloc: std.mem.Allocator, graph_results: *[]db_mod.types.GraphSearchResult) !void {
         if (self.finished) return error.InvalidRemoteResponse;
-        const lease = try self.admission.reserve(graph_results.*);
+        var lease = try self.admission.reserve(graph_results.*);
         defer self.admission.release(lease);
-        try self.appendAdmitted(graph_results.*);
+        if (source_alloc.ptr == self.alloc.ptr and source_alloc.vtable == self.alloc.vtable) {
+            var move_budget = graph_work_budget.RetainedAllocator{ .backing = self.alloc, .budget = &self.admission.work_budget };
+            var adoption: Adoption = .{ .alloc = move_budget.allocator() };
+            defer adoption.checkpoints.deinit(adoption.alloc);
+            self.appendWithAdoption(graph_results.*, &adoption) catch |err| {
+                adoption.finish(self, false);
+                self.finished = true;
+                if (err == error.OutOfMemory and move_budget.denied) return error.GraphWorkBudgetExceeded;
+                return err;
+            };
+            adoption.finish(self, true);
+            std.debug.assert(adoption.credit <= lease.state_bytes);
+            lease.state_bytes -= adoption.credit;
+        } else self.appendAdmitted(graph_results.*) catch |err| {
+            self.finished = true;
+            return err;
+        };
         for (graph_results.*) |*graph_result| graph_result.deinit(source_alloc);
         if (graph_results.*.len > 0) source_alloc.free(graph_results.*);
         graph_results.* = &.{};
@@ -2491,13 +2598,16 @@ pub const GraphSearchResultsAccumulator = struct {
         self: *GraphSearchResultsAccumulator,
         graph_results: []const db_mod.types.GraphSearchResult,
     ) !void {
+        return self.appendWithAdoption(graph_results, null);
+    }
+    fn appendWithAdoption(self: *GraphSearchResultsAccumulator, graph_results: []const db_mod.types.GraphSearchResult, adoption: ?*Adoption) !void {
         if (self.finished) return error.InvalidRemoteResponse;
         try validateGraphQueriesForShard(self.queries, graph_results);
         self.shard_count = std.math.add(usize, self.shard_count, 1) catch
             return error.InvalidRemoteResponse;
         const merge_work_budget = &self.admission.work_budget;
         const distinct_budget = &self.admission.distinct_budget;
-        for (graph_results) |graph_result| {
+        for (graph_results, 0..) |graph_result, result_index| {
             try validateGraphAggregateShard(self.queries, graph_result);
             const merge_query = graphQueryByName(self.queries, graph_result.name) orelse
                 return error.InvalidRemoteResponse;
@@ -2529,6 +2639,7 @@ pub const GraphSearchResultsAccumulator = struct {
                 break :blk self.builders.items.len - 1;
             };
             var builder = &self.builders.items[idx];
+            if (adoption) |moves| try moves.checkpoint(idx, builder, @constCast(&graph_results[result_index]));
             builder.total_hits +|= graph_result.total_hits;
             builder.truncated = builder.truncated or graph_result.truncated;
 
@@ -2541,7 +2652,52 @@ pub const GraphSearchResultsAccumulator = struct {
             {
                 return error.QueryCandidateBudgetExceeded;
             }
-            for (graph_result.nodes) |node| {
+            var metrics: graph_query_mod.GraphMetricOwner = .{};
+            if (adoption) |moves| {
+                const source = @constCast(&graph_results[result_index]);
+                const owner_count = source.metric_owners.len + @as(usize, @intFromBool(source.metric_columns != null or source.metric_values_slab.len != 0 or source.metric_value_names.len != 0));
+                try ensureGraphMergeListCapacity(graph_query_mod.GraphMetricOwner, self.alloc, merge_work_budget, graph_result.name, merge_query, &builder.metric_owners, builder.metric_owners.items.len + owner_count);
+                if (owner_count > source.metric_owners.len) {
+                    var bytes: usize = if (source.metric_columns) |columns| graphMetricColumnsRetainedBytes(columns) else 0;
+                    retainedAdd(&bytes, retainedBytesForSlice(graph_query_mod.GraphMetricValue, source.metric_values_slab.len));
+                    retainedAdd(&bytes, retainedBytesForSlice([]u8, source.metric_value_names.len));
+                    for (source.metric_value_names) |name| retainedAdd(&bytes, name.len);
+                    try moves.record(bytes);
+                    builder.metric_owners.appendAssumeCapacity(.{ .columns = source.metric_columns, .values = source.metric_values_slab, .names = source.metric_value_names });
+                }
+                for (source.metric_owners) |*owner| {
+                    var bytes: usize = if (owner.columns) |columns| graphMetricColumnsRetainedBytes(columns) else 0;
+                    retainedAdd(&bytes, retainedBytesForSlice(graph_query_mod.GraphMetricValue, owner.values.len));
+                    retainedAdd(&bytes, retainedBytesForSlice([]u8, owner.names.len));
+                    for (owner.names) |name| retainedAdd(&bytes, name.len);
+                    try moves.record(bytes);
+                    builder.metric_owners.appendAssumeCapacity(owner.*);
+                }
+            } else {
+                var metric_bytes: usize = 0;
+                if (graph_payload.compactMetricLayout(graph_result.nodes)) {
+                    retainedAdd(&metric_bytes, @sizeOf(graph_query_mod.GraphMetricColumns));
+                    const first = graph_result.nodes[0];
+                    retainedAdd(&metric_bytes, retainedBytesForSlice(f64, first.metricCount() * graph_result.nodes.len));
+                    retainedAdd(&metric_bytes, retainedBytesForSlice([]u8, first.metricCount()));
+                    for (0..first.metricCount()) |column| retainedAdd(&metric_bytes, first.metricAt(column).name.len);
+                } else {
+                    for (graph_result.nodes) |node| for (0..node.metricCount()) |column| {
+                        const metric = node.metricAt(column);
+                        retainedAdd(&metric_bytes, @sizeOf(graph_query_mod.GraphMetricValue));
+                        retainedAdd(&metric_bytes, @sizeOf([]u8));
+                        retainedAdd(&metric_bytes, metric.name.len);
+                    };
+                }
+                try retainGraphMergeBytes(merge_work_budget, graph_result.name, merge_query, metric_bytes);
+                if (metric_bytes != 0) try ensureGraphMergeListCapacity(graph_query_mod.GraphMetricOwner, self.alloc, merge_work_budget, graph_result.name, merge_query, &builder.metric_owners, builder.metric_owners.items.len + 1);
+                // Clone once per contribution. Slab/name addresses remain stable
+                // as builder.nodes grows, and the source remains independent.
+                metrics = try graph_payload.cloneGraphMetricOwner(self.alloc, graph_result.nodes);
+                if (metric_bytes != 0) builder.metric_owners.appendAssumeCapacity(metrics);
+            }
+            var metric_offset: usize = 0;
+            for (graph_result.nodes, 0..) |node, row| {
                 try validateGraphResultNodePayload(node);
                 const identity = graph_node_identity.Ref{ .table = node.table, .key = node.key };
                 if (builder.node_identities.contains(identity)) return error.UnsupportedQueryRequest;
@@ -2564,13 +2720,28 @@ pub const GraphSearchResultsAccumulator = struct {
                     &builder.nodes,
                     builder.nodes.items.len + 1,
                 );
-                try retainGraphMergeBytes(
-                    merge_work_budget,
-                    graph_result.name,
-                    merge_query,
-                    graphResultNodeRetainedBytes(node),
-                );
-                const owned = try cloneGraphResultNode(self.alloc, node);
+                var owned: graph_query_mod.GraphResultNode = undefined;
+                if (adoption) |moves| {
+                    try moves.record(graphResultNodeRetainedBytes(node));
+                    owned = node;
+                } else {
+                    try retainGraphMergeBytes(
+                        merge_work_budget,
+                        graph_result.name,
+                        merge_query,
+                        graphResultNodeRetainedBytes(noMetricsNode(node)),
+                    );
+                    owned = try cloneGraphResultNode(self.alloc, noMetricsNode(node));
+                    if (metrics.columns) |columns| {
+                        owned.metrics_owned = false;
+                        owned.metric_columns = columns;
+                        owned.metric_row = @intCast(row);
+                    } else {
+                        owned.metrics = metrics.values[metric_offset..][0..node.metricCount()];
+                        owned.metrics_owned = false;
+                        metric_offset += node.metricCount();
+                    }
+                }
                 builder.nodes.appendAssumeCapacity(owned);
                 const stored = &builder.nodes.items[builder.nodes.items.len - 1];
                 builder.node_identities.putAssumeCapacityNoClobber(.{
@@ -2591,13 +2762,13 @@ pub const GraphSearchResultsAccumulator = struct {
                     &builder.paths,
                     builder.paths.items.len + 1,
                 );
-                try retainGraphMergeBytes(
-                    merge_work_budget,
-                    graph_result.name,
-                    merge_query,
-                    graphPathRetainedBytes(path),
-                );
-                const owned = try cloneGraphPath(self.alloc, path);
+                const owned: db_mod.types.GraphPath = if (adoption) |moves| moved: {
+                    try moves.record(graphPathRetainedBytes(path));
+                    break :moved path;
+                } else cloned: {
+                    try retainGraphMergeBytes(merge_work_budget, graph_result.name, merge_query, graphPathRetainedBytes(path));
+                    break :cloned try cloneGraphPath(self.alloc, path);
+                };
                 builder.paths.appendAssumeCapacity(owned);
             }
             for (graph_result.matches) |match| {
@@ -2620,13 +2791,13 @@ pub const GraphSearchResultsAccumulator = struct {
                     &builder.matches,
                     builder.matches.items.len + 1,
                 );
-                try retainGraphMergeBytes(
-                    merge_work_budget,
-                    graph_result.name,
-                    merge_query,
-                    graphPatternMatchRetainedBytes(match),
-                );
-                const owned = try cloneGraphPatternMatch(self.alloc, match);
+                const owned: db_mod.types.GraphPatternMatch = if (adoption) |moves| moved: {
+                    try moves.record(graphPatternMatchRetainedBytes(match));
+                    break :moved match;
+                } else cloned: {
+                    try retainGraphMergeBytes(merge_work_budget, graph_result.name, merge_query, graphPatternMatchRetainedBytes(match));
+                    break :cloned try cloneGraphPatternMatch(self.alloc, match);
+                };
                 builder.matches.appendAssumeCapacity(owned);
             }
             for (graph_result.aggregates) |aggregate| {
@@ -2708,13 +2879,13 @@ pub const GraphSearchResultsAccumulator = struct {
                     &builder.hits,
                     builder.hits.items.len + 1,
                 );
-                try retainGraphMergeBytes(
-                    merge_work_budget,
-                    graph_result.name,
-                    merge_query,
-                    graphHitRetainedBytes(hit),
-                );
-                const owned = try hit.clone(self.alloc);
+                const owned: db_mod.types.SearchHit = if (adoption) |moves| moved: {
+                    try moves.record(graphHitRetainedBytes(hit));
+                    break :moved hit;
+                } else cloned: {
+                    try retainGraphMergeBytes(merge_work_budget, graph_result.name, merge_query, graphHitRetainedBytes(hit));
+                    break :cloned try hit.clone(self.alloc);
+                };
                 builder.hits.appendAssumeCapacity(owned);
                 const stored = &builder.hits.items[builder.hits.items.len - 1];
                 builder.hit_identities.putAssumeCapacityNoClobber(.{
@@ -2883,82 +3054,8 @@ fn freeGraphNodeRefs(alloc: std.mem.Allocator, values: []const graph_node_identi
     if (values.len > 0) alloc.free(values);
 }
 
-fn cloneGraphSearchResult(
-    alloc: std.mem.Allocator,
-    source: db_mod.types.GraphSearchResult,
-) !db_mod.types.GraphSearchResult {
-    const GraphNode = std.meta.Child(@TypeOf(source.nodes));
-    const nodes = try alloc.alloc(GraphNode, source.nodes.len);
-    var initialized_nodes: usize = 0;
-    errdefer {
-        for (nodes[0..initialized_nodes]) |*node| node.deinit(alloc);
-        if (source.nodes.len > 0) alloc.free(nodes);
-    }
-    for (source.nodes, 0..) |node, i| {
-        nodes[i] = try cloneGraphResultNode(alloc, node);
-        initialized_nodes += 1;
-    }
-
-    const GraphPath = std.meta.Child(@TypeOf(source.paths));
-    const paths = try alloc.alloc(GraphPath, source.paths.len);
-    var initialized_paths: usize = 0;
-    errdefer {
-        for (paths[0..initialized_paths]) |path| graph_paths.freePath(alloc, path);
-        if (source.paths.len > 0) alloc.free(paths);
-    }
-    for (source.paths, 0..) |path, i| {
-        paths[i] = try cloneGraphPath(alloc, path);
-        initialized_paths += 1;
-    }
-
-    const hits = try alloc.alloc(db_mod.types.SearchHit, source.hits.len);
-    var initialized_hits: usize = 0;
-    errdefer {
-        for (hits[0..initialized_hits]) |*hit| hit.deinit(alloc);
-        if (source.hits.len > 0) alloc.free(hits);
-    }
-    for (source.hits, 0..) |hit, i| {
-        hits[i] = try hit.clone(alloc);
-        initialized_hits += 1;
-    }
-
-    const matches = try alloc.alloc(db_mod.types.GraphPatternMatch, source.matches.len);
-    var initialized_matches: usize = 0;
-    errdefer {
-        for (matches[0..initialized_matches]) |*match| match.deinit(alloc);
-        if (source.matches.len > 0) alloc.free(matches);
-    }
-    for (source.matches, 0..) |match, i| {
-        matches[i] = try cloneGraphPatternMatch(alloc, match);
-        initialized_matches += 1;
-    }
-
-    const aggregates = try alloc.alloc(db_mod.types.GraphAggregateResult, source.aggregates.len);
-    var initialized_aggregates: usize = 0;
-    errdefer {
-        for (aggregates[0..initialized_aggregates]) |*aggregate| aggregate.deinit(alloc);
-        if (source.aggregates.len > 0) alloc.free(aggregates);
-    }
-    for (source.aggregates, 0..) |aggregate, i| {
-        const name = try alloc.dupe(u8, aggregate.name);
-        const distinct_values = cloneGraphNodeRefs(alloc, aggregate.distinct_values) catch |err| {
-            alloc.free(name);
-            return err;
-        };
-        aggregates[i] = .{ .name = name, .value = aggregate.value, .exact = aggregate.exact, .distinct_values = distinct_values };
-        initialized_aggregates += 1;
-    }
-
-    return .{
-        .name = try alloc.dupe(u8, source.name),
-        .nodes = nodes,
-        .paths = paths,
-        .matches = matches,
-        .aggregates = aggregates,
-        .hits = hits,
-        .total_hits = source.total_hits,
-        .truncated = source.truncated,
-    };
+fn cloneGraphSearchResult(alloc: std.mem.Allocator, source: db_mod.types.GraphSearchResult) !db_mod.types.GraphSearchResult {
+    return graph_payload.cloneGraphSearchResult(alloc, source);
 }
 
 pub fn cloneGraphMetricStatus(
@@ -3110,6 +3207,13 @@ fn cloneGraphPatternMatch(
     };
 }
 
+fn noMetricsNode(node: graph_query_mod.GraphResultNode) graph_query_mod.GraphResultNode {
+    var payload = node;
+    payload.metrics = &.{};
+    payload.metric_columns = null;
+    return payload;
+}
+
 fn cloneGraphResultNode(
     alloc: std.mem.Allocator,
     source: graph_query_mod.GraphResultNode,
@@ -3133,19 +3237,7 @@ fn cloneGraphResultNode(
         null;
     errdefer if (provenance) |items| freeStringSlice(alloc, items);
 
-    const metrics = try alloc.alloc(graph_query_mod.GraphMetricValue, source.metrics.len);
-    var initialized_metrics: usize = 0;
-    errdefer {
-        for (metrics[0..initialized_metrics]) |*metric| metric.deinit(alloc);
-        if (source.metrics.len > 0) alloc.free(metrics);
-    }
-    for (source.metrics, 0..) |metric, i| {
-        metrics[i] = .{
-            .name = try alloc.dupe(u8, metric.name),
-            .score = metric.score,
-        };
-        initialized_metrics += 1;
-    }
+    const metrics = try source.cloneMetrics(alloc);
 
     return .{
         .key = key,
@@ -5448,6 +5540,116 @@ fn consumerTests() type {
                 diagnostic.dimension,
             );
             try std.testing.expectEqual(@as(usize, 1), diagnostic.maximum);
+        }
+
+        test "owned graph metric fan-in adopts backing and rolls back every allocation failure" {
+            const Runner = struct {
+                fn run(a: std.mem.Allocator, adopt: bool) !void {
+                    var input_counter = @import("../storage/lite/test_allocator.zig").BudgetAllocator{ .backing = std.testing.allocator };
+                    defer std.debug.assert(input_counter.live == 0);
+                    const input_alloc = if (adopt) a else input_counter.allocator();
+                    const queries = [_]db_mod.types.NamedGraphQuery{.{ .name = "g", .query = .{ .query_type = .neighbors, .index_name = "graph", .start_nodes = .{ .keys = &.{} }, .metrics = &.{.{ .name = "rank" }} } }};
+                    var metrics = [_]graph_query_mod.GraphMetricValue{.{ .name = "rank", .score = 3.5, .name_owned = false }};
+                    var nodes = [_]graph_query_mod.GraphResultNode{.{ .key = "a", .depth = 0, .distance = 0, .metrics = &metrics, .metrics_owned = false }};
+                    var statuses = [_]db_mod.types.GraphMetricStatus{.{ .name = @constCast("rank") }};
+                    var path_keys = [_][]const u8{"a"};
+                    var paths = [_]db_mod.types.GraphPath{.{ .nodes = &path_keys, .edges = &.{}, .total_weight = 0, .length = 0 }};
+                    var bindings = [_]db_mod.types.GraphPatternBinding{.{ .alias = @constCast("v"), .node = nodes[0] }};
+                    var matches = [_]db_mod.types.GraphPatternMatch{.{ .bindings = &bindings, .path = &.{} }};
+                    var hits = [_]db_mod.types.SearchHit{.{ .id = @constCast("a"), .stored_data = @constCast("{}") }};
+                    var result = try cloneGraphSearchResult(input_alloc, .{ .name = @constCast("g"), .nodes = &nodes, .paths = &paths, .matches = &matches, .hits = &hits, .total_hits = 1, .metric_status = &statuses });
+                    var result_owned = true;
+                    errdefer if (result_owned) result.deinit(input_alloc);
+                    var source = try input_alloc.alloc(db_mod.types.GraphSearchResult, 1);
+                    source[0] = result;
+                    result_owned = false;
+                    defer {
+                        for (source) |*item| item.deinit(input_alloc);
+                        if (source.len != 0) input_alloc.free(source);
+                    }
+                    const original_key = source[0].nodes[0].key.ptr;
+                    const original_columns = source[0].metric_columns;
+                    const original_path = source[0].paths[0].nodes[0].ptr;
+                    const original_match = source[0].matches[0].bindings[0].node.key.ptr;
+                    const original_hit = source[0].hits[0].id.ptr;
+                    var accumulator = try GraphSearchResultsAccumulator.init(a, &queries, .{});
+                    defer accumulator.deinit();
+                    accumulator.appendOwned(input_alloc, &source) catch |err| {
+                        try std.testing.expectEqual(original_key, source[0].nodes[0].key.ptr);
+                        try std.testing.expectEqual(original_columns, source[0].metric_columns);
+                        try std.testing.expectEqual(@as(?f64, 3.5), source[0].nodes[0].metricAt(0).score);
+                        try std.testing.expectEqual(original_path, source[0].paths[0].nodes[0].ptr);
+                        try std.testing.expectEqual(original_match, source[0].matches[0].bindings[0].node.key.ptr);
+                        try std.testing.expectEqual(original_hit, source[0].hits[0].id.ptr);
+                        return err;
+                    };
+                    try std.testing.expectEqual(@as(usize, 0), source.len);
+                    const output = try accumulator.toOwned();
+                    defer {
+                        for (output) |*item| item.deinit(a);
+                        a.free(output);
+                    }
+                    try std.testing.expectEqual(adopt, original_key == output[0].nodes[0].key.ptr);
+                    try std.testing.expectEqual(adopt, original_columns == output[0].nodes[0].metric_columns);
+                    try std.testing.expectEqual(adopt, original_path == output[0].paths[0].nodes[0].ptr);
+                    try std.testing.expectEqual(adopt, original_match == output[0].matches[0].bindings[0].node.key.ptr);
+                    try std.testing.expectEqual(adopt, original_hit == output[0].hits[0].id.ptr);
+                    try std.testing.expectEqual(@as(?f64, 3.5), output[0].nodes[0].metricAt(0).score);
+                }
+            };
+            for ([_]bool{ false, true }) |adopt| {
+                try Runner.run(std.testing.allocator, adopt);
+                try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{adopt});
+            }
+        }
+
+        test "owned graph metric fan-in allocation measurement" {
+            const a = std.testing.allocator;
+            const n = public_limits.max_graph_result_items;
+            var names = [_][]u8{ @constCast("rank"), @constCast("degree"), @constCast("hub"), @constCast("display") };
+            const scores = try a.alloc(f64, n * names.len);
+            defer a.free(scores);
+            @memset(scores, 1);
+            var columns = graph_query_mod.GraphMetricColumns{ .names = &names, .scores = scores, .rows = n };
+            const nodes = try a.alloc(graph_query_mod.GraphResultNode, n);
+            defer a.free(nodes);
+            const keys = try a.alloc([8]u8, n);
+            defer a.free(keys);
+            for (nodes, keys, 0..) |*node, *key, row| node.* = .{ .key = try std.fmt.bufPrint(key, "{d:0>8}", .{row}), .depth = 0, .distance = 0, .metric_columns = &columns, .metric_row = @intCast(row), .metrics_owned = false };
+            var statuses: [4]db_mod.types.GraphMetricStatus = undefined;
+            var projected: [4]graph_query_mod.GraphMetricRead = undefined;
+            for (names, &statuses, &projected) |name, *status, *metric| {
+                status.* = .{ .name = name };
+                metric.* = .{ .name = name };
+            }
+            const queries = [_]db_mod.types.NamedGraphQuery{.{ .name = "g", .query = .{ .query_type = .neighbors, .index_name = "graph", .start_nodes = .{ .keys = &.{} }, .metrics = &projected } }};
+            for (0..2) |mode| {
+                var counter = @import("../storage/lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+                const alloc = counter.allocator();
+                var source = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+                source[0] = try graph_payload.cloneGraphSearchResult(alloc, .{ .name = @constCast("g"), .nodes = nodes, .hits = &.{}, .total_hits = n, .metric_status = &statuses });
+                defer {
+                    for (source) |*result| result.deinit(alloc);
+                    if (source.len != 0) alloc.free(source);
+                }
+                const input_bytes = counter.live;
+                const input_allocations = counter.alloc_calls;
+                var accumulator = try GraphSearchResultsAccumulator.init(alloc, &queries, .{});
+                var accumulator_live = true;
+                defer if (accumulator_live) accumulator.deinit();
+                if (mode == 0) try accumulator.appendAdmitted(source) else try accumulator.appendOwned(alloc, &source);
+                const output = try accumulator.toOwned();
+                accumulator.deinit();
+                accumulator_live = false;
+                try std.testing.expectEqual(@as(?f64, 1), output[0].nodes[n - 1].metricAt(3).score);
+                std.debug.print("OWNED_FAN_IN mode={d} nodes={d} input_bytes={d} peak_bytes={d} allocations={d} retained_bytes={d}\n", .{ mode, n, input_bytes, counter.peak, counter.alloc_calls - input_allocations, counter.live });
+                for (output) |*result| result.deinit(alloc);
+                alloc.free(output);
+                for (source) |*result| result.deinit(alloc);
+                if (source.len != 0) alloc.free(source);
+                source = &.{};
+                try std.testing.expectEqual(@as(usize, 0), counter.live);
+            }
         }
 
         test "incremental graph merge enforces distinct identities across released shards" {
@@ -8640,8 +8842,8 @@ fn consumerTests() type {
             defer merged.deinit();
             try std.testing.expectEqual(@as(usize, 1), merged.graph_results.len);
             try std.testing.expectEqual(@as(usize, 1), merged.graph_results[0].nodes.len);
-            try std.testing.expectEqual(@as(usize, 1), merged.graph_results[0].nodes[0].metrics.len);
-            try std.testing.expect(merged.graph_results[0].nodes[0].metrics[0].score == null);
+            try std.testing.expectEqual(@as(usize, 1), merged.graph_results[0].nodes[0].metricCount());
+            try std.testing.expect(merged.graph_results[0].nodes[0].metricAt(0).score == null);
             try std.testing.expectEqual(@as(usize, 0), merged.graph_results[0].metric_status.len);
 
             const include_graph_queries = [_]db_mod.types.NamedGraphQuery{.{

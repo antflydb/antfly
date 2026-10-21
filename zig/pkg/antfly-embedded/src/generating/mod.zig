@@ -52,7 +52,7 @@ pub const GeneratorFactory = lib.GeneratorFactory;
 pub const default_max_tokens = lib.default_max_tokens;
 pub const parseConfigFromSlice = lib.parseConfigFromSlice;
 
-test "embedded canonical generation preserves tool definitions returned calls and cancellation" {
+test "provider registry gateway embedded canonical generation preserves tools usage and cancellation" {
     const Fake = struct {
         fn generate(_: *anyopaque, alloc: std.mem.Allocator, body: []const u8, context: ?RequestContext) ![]u8 {
             try std.testing.expect(context != null);
@@ -60,7 +60,7 @@ test "embedded canonical generation preserves tool definitions returned calls an
             try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":0") != null);
             return alloc.dupe(u8,
-                \\{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call-1","function":{"name":"search","arguments":"{\"query_index\":0}"}}]}}]}
+                \\{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call-1","function":{"name":"search","arguments":"{\"query_index\":0}"}}]}}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":5}}
             );
         }
     };
@@ -79,8 +79,98 @@ test "embedded canonical generation preserves tool definitions returned calls an
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
     try std.testing.expectEqualStrings("call-1", result.tool_calls[0].id);
+    try std.testing.expectEqual(@as(?u64, 5), result.usage.?.total_tokens);
 }
 pub const parseConfigFromValue = lib.parseConfigFromValue;
+
+test "provider registry gateway typed vendor chains preserve HTTP failure policy without public gateway" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Case = struct {
+        status: u16,
+        condition: ?ChainCondition = .on_error,
+        fallback: bool = false,
+        expected_error: ?anyerror = error.GenerateRequestFailed,
+        body: []const u8 = "{}",
+    };
+    const cases = [_]Case{
+        .{ .status = 502, .fallback = true },
+        .{ .status = 503, .fallback = true },
+        .{ .status = 503, .condition = .always, .fallback = true },
+        .{ .status = 503, .condition = null, .expected_error = error.ServiceUnavailable },
+        .{ .status = 503, .condition = .on_rate_limit, .expected_error = error.ServiceUnavailable },
+        .{ .status = 503, .condition = .on_timeout, .expected_error = error.ServiceUnavailable },
+        .{ .status = 429, .fallback = true },
+        .{ .status = 429, .condition = .on_rate_limit, .fallback = true },
+        .{ .status = 504, .condition = .on_timeout, .fallback = true },
+        .{ .status = 504, .expected_error = error.Timeout },
+        .{ .status = 504, .condition = .always, .expected_error = error.Timeout },
+        .{ .status = 400 },
+        .{ .status = 401 },
+        .{ .status = 403 },
+        .{ .status = 500 },
+        // Successful HTTP responses with unusable output are never retried.
+        .{ .status = 200, .body = "{\"choices\":[],\"candidates\":[]}" },
+        .{ .status = 200, .body = "{", .expected_error = null },
+    };
+    for ([_]Provider{ .openai, .openrouter, .ollama, .gemini, .vertex }) |provider| {
+        for (cases) |case| {
+            errdefer std.debug.print("typed chain provider={s} status={d} condition={any}\n", .{ @tagName(provider), case.status, case.condition });
+            const path = switch (provider) {
+                .gemini => "/primary/models/primary:generateContent",
+                .vertex => "/primary/projects/fixture/locations/us-central1/publishers/google/models/primary:generateContent",
+                else => "/primary/chat/completions",
+            };
+            var server = try httpx.TestServer.start(a, io, &.{
+                .{ .method = .POST, .path = path, .respond = .{ .status = case.status, .body = case.body } },
+                .{ .method = .POST, .path = "/backup/chat/completions", .respond = .{ .body = "{\"choices\":[{\"message\":{\"content\":\"backup\"}}]}" } },
+            });
+            defer server.deinit();
+            const primary = try std.fmt.allocPrint(a, "{s}/primary", .{server.baseUrl()});
+            defer a.free(primary);
+            const backup = try std.fmt.allocPrint(a, "{s}/backup", .{server.baseUrl()});
+            defer a.free(backup);
+            const Serve = struct {
+                fn run(peer: *httpx.TestServer, failure: *?anyerror) std.Io.Cancelable!void {
+                    // Always accept a possible backup so an erroneous fallback
+                    // fails assertions instead of blocking on a missing peer.
+                    for (0..2) |_| peer.handleOne() catch |err| {
+                        failure.* = err;
+                        return;
+                    };
+                }
+            };
+            var failure: ?anyerror = null;
+            var group: std.Io.Group = .init;
+            try group.concurrent(io, Serve.run, .{ &server, &failure });
+            defer group.cancel(io);
+            var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+            defer client.deinit();
+            const chain = [_]ChainLink{
+                .{ .generator = .{ .provider = provider, .model = "primary", .url = primary, .api_key = "fixture", .project_id = if (provider == .vertex) "fixture" else null }, .condition = case.condition },
+                .{ .generator = .{ .provider = .openai, .model = "backup", .url = backup, .api_key = "fixture" } },
+            };
+            // Exercise the same internal entry point used by agents and RAG,
+            // with no public gateway configuration or HTTP handlers installed.
+            if (executeChain(a, &client, &chain, &.{.{ .role = .user, .content = .{ .text = "hello" } }})) |value| {
+                var result = value;
+                defer result.deinit();
+                try std.testing.expect(case.fallback);
+                try std.testing.expectEqualStrings("backup", result.content);
+                try group.await(io);
+                if (failure) |err| return err;
+                try std.testing.expectEqual(@as(usize, 1), server.route_hits[1]);
+            } else |err| {
+                try std.testing.expect(!case.fallback);
+                if (case.expected_error) |expected| try std.testing.expectEqual(expected, err);
+                // Join before reading counters written by the server task.
+                group.cancel(io);
+                try std.testing.expectEqual(@as(usize, 0), server.route_hits[1]);
+            }
+            try std.testing.expectEqual(@as(usize, 1), server.route_hits[0]);
+        }
+    }
+}
 
 test "Apple generation backend bypasses HTTP quotas and honors request deadlines" {
     const alloc = std.testing.allocator;
@@ -211,6 +301,7 @@ const ChatGPTBackend = struct {
 };
 
 const BackendState = struct {
+    http: *httpx.Client,
     quota: ?provider_limits.Handle = null,
     limits: *provider_limits.Registry = &provider_limits.process_registry,
     alloc: std.mem.Allocator,
@@ -218,6 +309,7 @@ const BackendState = struct {
     cfg: GeneratorConfig,
     api_key: ?common_secrets.SecretValue = null,
     auth_header_cache: common_secrets.BearerAuthHeaderCache = .{},
+    owned_base_url: ?[]u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     max_response_bytes: ?usize = null,
     execution: execution_context.Context = .{},
@@ -252,9 +344,18 @@ const BackendState = struct {
         _ = try provider_limits.Policy.fromConfig(cfg.rate_limit);
         state.alloc = alloc;
         state.io = http.io;
+        state.http = http;
         state.cfg = cfg;
+        state.owned_base_url = if (cfg.provider == .antfly and cfg.url.len == 0 and embedded_antfly_provider == null)
+            if (execution.resolveAntflyEndpoint(null, false)) |endpoint|
+                try @import("../common/inference_gateway.zig").apiBaseAlloc(alloc, endpoint)
+            else
+                null
+        else
+            null;
+        errdefer if (state.owned_base_url) |endpoint| alloc.free(endpoint);
         state.api_key = switch (cfg.provider) {
-            .antfly => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key orelse inference_api_key, "ANTFLY_INFERENCE_API_KEY"),
+            .antfly => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key orelse (if (cfg.url.len == 0) inference_api_key else null), "ANTFLY_INFERENCE_API_KEY"),
             .openai => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, "OPENAI_API_KEY"),
             .openrouter => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, "OPENROUTER_API_KEY"),
             .gemini => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, "GEMINI_API_KEY"),
@@ -301,7 +402,7 @@ const BackendState = struct {
             .antfly => if (cfg.url.len == 0 and embedded_antfly_provider != null)
                 .{ .embedded_antfly = embedded_antfly_provider.? }
             else blk: {
-                var provider = antfly_provider.Provider.init(alloc, http, if (cfg.url.len > 0) cfg.url else "http://127.0.0.1:8082");
+                var provider = antfly_provider.Provider.init(alloc, http, if (cfg.url.len > 0) cfg.url else state.owned_base_url orelse "http://127.0.0.1:8082");
                 errdefer provider.deinit();
                 try provider.setSourceTable(execution.routing.source_table);
                 if (cfg.capability_token) |token| try provider.setCapabilityToken(token);
@@ -326,8 +427,21 @@ const BackendState = struct {
             .vtable = &.{
                 .generate = generate,
                 .deinit = deinit,
+                .chat = chat,
             },
         };
+    }
+
+    fn chat(ptr: *anyopaque, alloc: std.mem.Allocator, request: lib.ChatRequest) !lib.ChatResponse {
+        const self: *BackendState = @ptrCast(@alignCast(ptr));
+        var response = try chatResponseWithState(alloc, self, request);
+        defer response.deinit();
+        var result = lib.ChatResponse{ .allocator = alloc, .status = response.status.code, .body = try alloc.dupe(u8, response.body orelse "") };
+        errdefer result.deinit();
+        if (response.contentType()) |value| result.content_type = try alloc.dupe(u8, value);
+        if (response.header("retry-after")) |value| result.retry_after = try alloc.dupe(u8, value);
+        if (response.header("x-request-id")) |value| result.request_id = try alloc.dupe(u8, value);
+        return result;
     }
 
     pub fn deinit(ptr: *anyopaque) void {
@@ -341,6 +455,7 @@ const BackendState = struct {
         }
         if (self.quota) |*quota| quota.release();
         self.auth_header_cache.deinit(self.alloc);
+        if (self.owned_base_url) |endpoint| self.alloc.free(endpoint);
         if (self.api_key) |*api_key| api_key.deinit(self.alloc);
         self.alloc.destroy(self);
     }
@@ -427,6 +542,8 @@ const BackendState = struct {
                     }
                 }
                 provider.setToolOptions(self.cfg.tools_json, self.cfg.tool_choice_json);
+                provider.response_format_json = self.cfg.response_format_json;
+                provider.logprobs = self.cfg.logprobs;
                 provider.setMaxTokens(self.cfg.max_tokens);
                 if (self.cfg.provider == .openai) provider.setCompletionOptions(self.cfg.max_completion_tokens, if (self.cfg.reasoning_effort) |effort| @tagName(effort) else null);
                 provider.setMaxResponseBytes(self.max_response_bytes);
@@ -441,6 +558,8 @@ const BackendState = struct {
                     }
                 }
                 provider.setToolOptions(self.cfg.tools_json, self.cfg.tool_choice_json);
+                provider.response_format_json = self.cfg.response_format_json;
+                provider.logprobs = self.cfg.logprobs;
                 provider.setMaxTokens(self.cfg.max_tokens);
                 const response_limit = if (self.execution.max_response_bytes) |execution_limit|
                     if (self.max_response_bytes) |family_limit| @min(execution_limit, family_limit) else execution_limit
@@ -476,8 +595,11 @@ const BackendState = struct {
                 const has_tool_history = for (messages) |message| {
                     if (message.tool_calls != null or message.tool_call_id != null or message.role == .tool) break true;
                 } else false;
-                if (local.generate_json != null and (self.cfg.tools_json != null or self.cfg.tool_choice_json != null or has_tool_history)) {
+                if (local.generate_json != null and (self.cfg.tools_json != null or self.cfg.tool_choice_json != null or self.cfg.response_format_json != null or has_tool_history)) {
                     const body = try inference.types.chatRequestJsonWithOptionsAlloc(alloc, model, messages, .termite_native, .{
+                        .response_format_json = self.cfg.response_format_json,
+                        .logprobs = self.cfg.logprobs,
+                        .top_logprobs = 64,
                         .tools_json = self.cfg.tools_json,
                         .tool_choice_json = self.cfg.tool_choice_json,
                         .max_tokens = self.cfg.max_tokens,
@@ -488,14 +610,14 @@ const BackendState = struct {
                         .presence_penalty = self.cfg.presence_penalty,
                         // Agent tool turns spend the bounded output budget on
                         // calls and answers, not optional private reasoning.
-                        .enable_thinking = if (self.cfg.tools_json != null or has_tool_history) false else null,
+                        .enable_thinking = if (self.cfg.tools_json != null or self.cfg.response_format_json != null or has_tool_history) false else null,
                     });
                     defer alloc.free(body);
                     const response = try local.generateJson(alloc, body, self.request_context);
                     defer alloc.free(response);
                     break :blk try antfly_provider.Provider.parseGenerationResponse(alloc, response, self.cfg.tools_json, self.cfg.tool_choice_json);
                 }
-                if (self.cfg.tools_json != null or self.cfg.tool_choice_json != null) return error.UnsupportedGeneratorProvider;
+                if (self.cfg.tools_json != null or self.cfg.tool_choice_json != null or self.cfg.response_format_json != null) return error.UnsupportedGeneratorProvider;
                 const options = try inference.GenerationOptions.fromMaxTokens(self.cfg.max_tokens);
                 const linked_context = self.request_context orelse self.execution.requestContext(
                     self.execution.io orelse self.io orelse std.Io.Threaded.global_single_threaded.io(),
@@ -567,9 +689,14 @@ const BackendState = struct {
             for (calls) |*call| call.deinit(alloc);
             if (calls.len > 0) alloc.free(calls);
         }
+        const proof = if (result.token_logprobs_json) |evidence| try alloc.dupe(u8, evidence) else null;
+        errdefer if (proof) |value| alloc.free(value);
         return .{
             .content = content,
+            .usage = result.usage,
             .tool_calls = calls,
+            .tool_calls_synthesized = result.tool_calls_synthesized,
+            .token_logprobs_json = proof,
             .google_parts_json = if (result.google_parts_json) |parts| try alloc.dupe(u8, parts) else null,
             .allocator = alloc,
         };
@@ -633,7 +760,7 @@ test "generating optional env auth is skipped when unset" {
 
 test "generating explicit missing secret auth remains strict" {
     const alloc = std.testing.allocator;
-    var api_key = try common_secrets.SecretValue.initConfig(alloc, "secret://missing.generator_key") orelse return error.TestUnexpectedResult;
+    var api_key = try common_secrets.SecretValue.initConfig(alloc, "${secret:missing.generator_key}") orelse return error.TestUnexpectedResult;
     defer api_key.deinit(alloc);
 
     var state = BackendState{
@@ -655,8 +782,7 @@ pub fn executeChain(
     chain: []const ChainLink,
     messages: []const ChatMessage,
 ) !GenerateResult {
-    var factory_impl = BackendFactory.init(alloc, http);
-    return try lib.executeChainWithIo(alloc, http.io, chain, factory_impl.factory(), messages);
+    return executeChainWithOptions(alloc, http, chain, .{}, messages);
 }
 
 pub fn executeChainWithAntflyProvider(
@@ -666,8 +792,7 @@ pub fn executeChainWithAntflyProvider(
     embedded_antfly_provider: ?managed_embedder.AntflyProvider,
     messages: []const ChatMessage,
 ) !GenerateResult {
-    var factory_impl = BackendFactory.initWithAntflyProvider(alloc, http, embedded_antfly_provider);
-    return try lib.executeChainWithIo(alloc, http.io, chain, factory_impl.factory(), messages);
+    return executeChainWithOptions(alloc, http, chain, .{ .antfly_provider = embedded_antfly_provider }, messages);
 }
 
 pub fn executeChainWithOptions(
@@ -678,8 +803,19 @@ pub fn executeChainWithOptions(
     messages: []const ChatMessage,
 ) !GenerateResult {
     for (chain) |link| if (link.generator.provider == .chatgpt and (chain.len != 1 or link.retry != null)) return error.ChatGPTBillingFallbackForbidden;
-    var factory_impl = BackendFactory.initWithOptions(alloc, http, options);
-    return try lib.executeChainWithIo(alloc, http.io, chain, factory_impl.factory(), messages);
+    var effective = options;
+    if (effective.request_context == null) effective.request_context = effective.execution.requestContext(http.io);
+    if (effective.request_context.?.deadline_ns == null) effective.request_context.?.deadline_ns = platform_time.monotonicNs() + 120 * std.time.ns_per_s;
+    var factory_impl = BackendFactory.initWithOptions(alloc, http, effective);
+    const Control = struct {
+        options: BackendFactory.Options,
+        fn check(raw: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (self.options.request_context) |context| try context.check() else try self.options.execution.check(platform_time.monotonicNs());
+        }
+    };
+    const control = Control{ .options = effective };
+    return try lib.executeChainWithControl(alloc, http.io, chain, factory_impl.factory(), messages, .{ .context = &control, .check_fn = Control.check });
 }
 
 test "generating backend enforces shared policies and token budgets before dispatch" {
@@ -1514,4 +1650,78 @@ test "generating backend defaults OpenAI and OpenRouter credentials from the sto
         try group.await(io);
         if (failure) |err| return err;
     }
+}
+
+/// Rich Chat Completions transport for adapters that can preserve the wire
+/// contract. Uses the same state, credential identity and quotas as SQL. The
+/// sink receives actual upstream chunks, never a completed-result simulation.
+fn chatResponseWithState(alloc: std.mem.Allocator, state: *BackendState, request: lib.ChatRequest) !httpx.Response {
+    const cfg = state.cfg;
+    const http = state.http;
+    if (state.request_context) |context| try context.check();
+    try validateGenerationMessagesTokenBudget(cfg, request.messages);
+    const base = switch (state.provider) {
+        .openai => |provider| provider.base_url,
+        .remote_antfly => |provider| provider.base_url,
+        else => return error.UnsupportedInferenceFeature,
+    };
+    const operation = if (cfg.provider == .antfly and request.operation == .generate) "generate" else "chat/completions";
+    const url = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ std.mem.trimEnd(u8, base, "/"), operation });
+    defer alloc.free(url);
+    const authorization = if (state.api_key) |*key| try optionalBearerAuthHeaderOwned(state, alloc, key) else null;
+    defer if (authorization) |value| alloc.free(value);
+    var headers: [3][2][]const u8 = undefined;
+    var header_count: usize = 0;
+    if (authorization) |value| {
+        headers[header_count] = .{ "Authorization", value };
+        header_count += 1;
+    }
+    const timeout_ms = if (state.request_context) |context| try context.remainingTimeoutMs() else @as(?u64, 120_000);
+    const timeout_header = try std.fmt.allocPrint(alloc, "{d}", .{timeout_ms orelse 120_000});
+    defer alloc.free(timeout_header);
+    if (cfg.provider == .antfly) {
+        headers[header_count] = .{ "X-Antfly-Inference-Attempts-Remaining", "1" };
+        header_count += 1;
+        headers[header_count] = .{ "X-Antfly-Inference-Timeout-Ms", timeout_header };
+        header_count += 1;
+    }
+    const request_options = httpx.RequestOptions{
+        .json = request.body_json,
+        .headers = headers[0..header_count],
+        .timeout_ms = timeout_ms,
+        .cancellation = if (state.request_context) |context| if (context.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null else null,
+        .attempt_observer = state.quota.?.limiter().observer(try generationOutputBudget(cfg, 1)),
+        .max_retries = 0,
+        .follow_redirects = false,
+        .cookies_enabled = false,
+    };
+    if (request.stream) |sink| {
+        const Writer = struct {
+            sink: lib.ChatStream,
+            pub fn startResponse(self: *@This(), response: httpx.Response) !void {
+                try self.sink.start(self.sink.context, response.status.code, response.contentType() orelse "application/json", response.header("retry-after"), response.header("x-request-id"));
+            }
+            pub fn writeAll(self: *@This(), bytes: []const u8) !void {
+                try self.sink.write(self.sink.context, bytes);
+            }
+        };
+        var writer = Writer{ .sink = sink };
+        var response = try http.requestToWriter(.POST, url, request_options, &writer, null, null);
+        errdefer response.deinit();
+        try sink.close(sink.context);
+        return response;
+    }
+    return http.post(url, request_options);
+}
+
+test "generating remote-only default endpoint is shared with named gateway execution" {
+    const a = std.testing.allocator;
+    var client = httpx.Client.initWithConfig(a, std.testing.io, .{});
+    defer client.deinit();
+    var factory = BackendFactory.initWithOptions(a, &client, .{ .execution = .{ .default_endpoint = "http://runtime.internal:8080" } });
+    var generator = try factory.factory().create(a, .{ .provider = .antfly, .model = "configured", .url = "" });
+    defer generator.deinit();
+    const state: *BackendState = @ptrCast(@alignCast(generator.ptr));
+    try std.testing.expectEqualStrings("http://runtime.internal:8080/ai/v1", state.provider.remote_antfly.base_url);
+    try std.testing.expectEqualStrings("http://runtime.internal:8080/ai/v1", state.quotaIdentity("configured").endpoint.endpoint);
 }

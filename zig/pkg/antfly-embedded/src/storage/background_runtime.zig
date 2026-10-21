@@ -480,6 +480,25 @@ pub const Config = struct {
     filesystem_io: ?Io = null,
 };
 
+const IoReceiver = @import("antfly_runtime_abi").io_abi.Receiver;
+const IoBorrow = @import("antfly_runtime_abi").io_abi.Borrow;
+fn receiveIo(io_value: ?Io) !?IoReceiver {
+    const value = io_value orelse return null;
+    return try IoBorrow.init(&value).receive();
+}
+const BorrowedIoReceivers = struct {
+    general: IoReceiver,
+    request_forward: ?IoReceiver,
+    raft_inbound: ?IoReceiver,
+    raft_outbound: ?IoReceiver,
+    api: ?IoReceiver,
+    inference: ?IoReceiver,
+    control: ?IoReceiver,
+    fn init(value: BorrowedIo) !BorrowedIoReceivers {
+        return .{ .general = (try receiveIo(value.general)).?, .request_forward = try receiveIo(value.request_forward), .raft_inbound = try receiveIo(value.raft_inbound), .raft_outbound = try receiveIo(value.raft_outbound), .api = try receiveIo(value.api), .inference = try receiveIo(value.inference), .control = try receiveIo(value.control) };
+    }
+};
+
 pub const BorrowedIo = struct {
     general: Io,
     request_forward: ?Io = null,
@@ -574,15 +593,23 @@ const LaneLeaseGate = struct {
 /// to keep the executor layer independent of the DB module; DB.open is the sole
 /// caller and passes a `*db.OpenOptions`.
 pub const DbOpenConfigurator = struct {
+    const NativeCallbacks = struct { configure_fn: @FieldType(DbOpenConfigurator, "configure_fn") };
+    const NativeBoundary = @import("named_callback.zig").Boundary(NativeCallbacks);
+    callback_dispatch: @import("named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+
     ptr: *anyopaque,
     configure_fn: *const fn (ptr: *anyopaque, path: []const u8, options: *anyopaque) anyerror!void,
 
     pub fn configure(self: @This(), path: []const u8, options: anytype) !void {
-        try self.configure_fn(self.ptr, path, @ptrCast(options));
+        try NativeBoundary.call("configure_fn", self.callback_dispatch, self.configure_fn, .{ self.ptr, path, @as(*anyopaque, @ptrCast(options)) });
     }
 };
 
 pub const DurableJobLane = struct {
+    const NativeCallbacks = struct { submit: @FieldType(DurableJobLane.VTable, "submit"), pause_owner: @FieldType(DurableJobLane.VTable, "pause_owner"), resume_owner: @FieldType(DurableJobLane.VTable, "resume_owner"), reopen_owner: @FieldType(DurableJobLane.VTable, "reopen_owner"), poll: @FieldType(DurableJobLane.VTable, "poll") };
+    const NativeBoundary = @import("named_callback.zig").Boundary(NativeCallbacks);
+    callback_dispatch: @import("named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+
     ptr: *anyopaque,
     vtable: *const VTable,
 
@@ -605,7 +632,7 @@ pub const DurableJobLane = struct {
     /// On success, the lane owns `job` and will call `job.deinit`.
     /// On error, ownership remains with the caller.
     pub fn submit(self: DurableJobLane, job: Job) !void {
-        return try self.vtable.submit(self.ptr, job);
+        return try NativeBoundary.call("submit", self.callback_dispatch, self.vtable.submit, .{ self.ptr, job });
     }
 
     pub fn drainOwner(self: DurableJobLane, owner_id: u64) void {
@@ -620,21 +647,21 @@ pub const DurableJobLane = struct {
     /// already committed to the lane. Drain may be used after pause to reach a
     /// stable quiescent owner state.
     pub fn pauseOwner(self: DurableJobLane, owner_id: u64) !void {
-        try self.vtable.pause_owner(self.ptr, owner_id);
+        try NativeBoundary.call("pause_owner", self.callback_dispatch, self.vtable.pause_owner, .{ self.ptr, owner_id });
     }
 
     pub fn resumeOwner(self: DurableJobLane, owner_id: u64) !void {
-        try self.vtable.resume_owner(self.ptr, owner_id);
+        try NativeBoundary.call("resume_owner", self.callback_dispatch, self.vtable.resume_owner, .{ self.ptr, owner_id });
     }
 
     /// Re-registers the same logical owner only after close has drained and
     /// retired its prior generation.
     pub fn reopenOwner(self: DurableJobLane, owner_id: u64) !void {
-        try self.vtable.reopen_owner(self.ptr, owner_id);
+        try NativeBoundary.call("reopen_owner", self.callback_dispatch, self.vtable.reopen_owner, .{ self.ptr, owner_id });
     }
 
     pub fn poll(self: DurableJobLane, max_jobs: usize) !usize {
-        return try self.vtable.poll(self.ptr, max_jobs);
+        return try NativeBoundary.call("poll", self.callback_dispatch, self.vtable.poll, .{ self.ptr, max_jobs });
     }
 
     /// Whether the lane still admits successor work. Durable jobs use this to
@@ -654,6 +681,10 @@ pub const DurableJobLane = struct {
 };
 
 pub const Job = struct {
+    const NativeCallbacks = struct { run: @FieldType(Job, "run") };
+    const NativeBoundary = @import("named_callback.zig").Boundary(NativeCallbacks);
+    callback_dispatch: @import("named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+
     owner_id: u64,
     class: Class,
     ptr: *anyopaque,
@@ -665,6 +696,10 @@ pub const Job = struct {
         maintenance,
         cleanup,
     };
+
+    pub fn execute(self: Job) !void {
+        return NativeBoundary.call("run", self.callback_dispatch, self.run, .{self.ptr});
+    }
 };
 
 /// Allocation-free, owner-scoped maintenance callback. Probes are intended for
@@ -969,6 +1004,8 @@ pub const BackendRuntime = struct {
     borrowed_storage: ?storage_io.IoStorage = null,
     lsm_owner_clone_registry: LsmOwnerCloneRegistry,
     borrowed_filesystem_io: ?Io = null,
+    borrowed_filesystem_receiver: ?@import("antfly_runtime_abi").io_abi.Receiver = null,
+    borrowed_receivers: ?BorrowedIoReceivers = null,
     /// One immutable network-only view is shared by purpose-bound outbound
     /// transports. General filesystem, storage, scheduling, and randomness
     /// users retain Threaded's native vtable; a partially decorated `Io` must
@@ -1042,6 +1079,8 @@ pub const BackendRuntime = struct {
             .native_storage_pool = native_storage_pool,
             .lsm_owner_clone_registry = LsmOwnerCloneRegistry.init(alloc),
             .borrowed_filesystem_io = config.filesystem_io,
+            .borrowed_filesystem_receiver = try receiveIo(config.filesystem_io),
+            .borrowed_receivers = if (config.borrowed_io) |value| try BorrowedIoReceivers.init(value) else null,
             .durable_jobs = undefined,
             .borrowed_io = config.borrowed_io,
             .borrowed_storage = if (config.borrowed_io) |borrowed| storage_io.IoStorage.init(borrowed.general) else null,
@@ -1165,7 +1204,7 @@ pub const BackendRuntime = struct {
     }
 
     pub fn io(self: *BackendRuntime) ?Io {
-        if (self.borrowed_io) |borrowed| return borrowed.general;
+        if (self.borrowed_receivers) |*borrowed| return borrowed.general.io();
         if (comptime builtin.os.tag == .freestanding) return null;
         return if (self.io_impl) |io_impl| io_impl.io() else null;
     }
@@ -1219,9 +1258,9 @@ pub const BackendRuntime = struct {
     /// I/O authority for synchronous storage work. Unlike `io`, this may be
     /// caller-owned and does not imply that background scheduling is enabled.
     pub fn filesystemIo(self: *BackendRuntime) ?Io {
-        if (self.borrowed_io) |borrowed| return self.borrowed_filesystem_io orelse borrowed.general;
-        if (comptime builtin.os.tag == .freestanding) return self.borrowed_filesystem_io;
-        return if (self.io_impl) |io_impl| io_impl.io() else self.borrowed_filesystem_io;
+        if (self.borrowed_receivers) |*borrowed| return if (self.borrowed_filesystem_receiver) |*filesystem| filesystem.io() else borrowed.general.io();
+        if (comptime builtin.os.tag == .freestanding) return if (self.borrowed_filesystem_receiver) |*filesystem| filesystem.io() else null;
+        return if (self.io_impl) |io_impl| io_impl.io() else if (self.borrowed_filesystem_receiver) |*filesystem| filesystem.io() else null;
     }
 
     pub fn nativeStoragePool(self: *BackendRuntime) *storage_io.NativeStoragePool {
@@ -1309,7 +1348,7 @@ pub const BackendRuntime = struct {
     }
 
     pub fn raftInboundIo(self: *BackendRuntime) ?Io {
-        if (self.borrowed_io) |borrowed| return borrowed.raft_inbound orelse borrowed.general;
+        if (self.borrowed_receivers) |*borrowed| return if (borrowed.raft_inbound) |*receiver| receiver.io() else borrowed.general.io();
         if (comptime builtin.os.tag == .freestanding) return null;
         return if (self.raftInboundIoImpl()) |io_impl| io_impl.io() else null;
     }
@@ -1322,7 +1361,7 @@ pub const BackendRuntime = struct {
     }
 
     pub fn raftOutboundIo(self: *BackendRuntime) ?Io {
-        if (self.borrowed_io) |borrowed| return borrowed.raft_outbound orelse borrowed.general;
+        if (self.borrowed_receivers) |*borrowed| return if (borrowed.raft_outbound) |*receiver| receiver.io() else borrowed.general.io();
         if (comptime builtin.os.tag == .freestanding) return null;
         return if (self.raftOutboundIoImpl()) |io_impl| self.threadedNetworkIo(io_impl) else null;
     }
@@ -1353,8 +1392,8 @@ pub const BackendRuntime = struct {
         _ = self.request_forward_lane_gate.tryAcquireBounded(capacity) orelse
             return error.RequestForwardCapacityUnavailable;
         errdefer self.request_forward_lane_gate.release(self.io());
-        const forward_io = if (self.borrowed_io) |borrowed|
-            borrowed.request_forward orelse borrowed.general
+        const forward_io = if (self.borrowed_receivers) |*borrowed|
+            if (borrowed.request_forward) |*receiver| receiver.io() else borrowed.general.io()
         else if (comptime builtin.os.tag == .freestanding)
             return error.BackendRuntimeUnavailable
         else if (self.backend == .manual)
@@ -1412,7 +1451,7 @@ pub const BackendRuntime = struct {
     /// Components own and await the tasks they submit; BackendRuntime only owns
     /// the executor lane and must outlive every borrower.
     pub fn apiIo(self: *BackendRuntime) ?Io {
-        if (self.borrowed_io) |borrowed| return borrowed.api orelse borrowed.general;
+        if (self.borrowed_receivers) |*borrowed| return if (borrowed.api) |*receiver| receiver.io() else borrowed.general.io();
         const io_impl = self.apiIoImpl() orelse return null;
         return io_impl.io();
     }
@@ -1422,7 +1461,7 @@ pub const BackendRuntime = struct {
     /// the native Threaded contract, while HTTP transports require bounded,
     /// cancellation-safe connect completion.
     pub fn apiNetworkIo(self: *BackendRuntime) ?Io {
-        if (self.borrowed_io) |borrowed| return borrowed.api orelse borrowed.general;
+        if (self.borrowed_receivers) |*borrowed| return if (borrowed.api) |*receiver| receiver.io() else borrowed.general.io();
         const io_impl = self.apiIoImpl() orelse return null;
         return self.threadedNetworkIo(io_impl);
     }
@@ -1433,7 +1472,7 @@ pub const BackendRuntime = struct {
     /// the transport reader's `ReadFailed` classification instead of the OS
     /// path error.
     pub fn apiFilesystemIo(self: *BackendRuntime) ?Io {
-        if (self.borrowed_io) |borrowed| return borrowed.api orelse borrowed.general;
+        if (self.borrowed_receivers) |*borrowed| return if (borrowed.api) |*receiver| receiver.io() else borrowed.general.io();
         const io_impl = self.apiIoImpl() orelse return null;
         return io_impl.io();
     }
@@ -1487,7 +1526,7 @@ pub const BackendRuntime = struct {
     /// fan-out. A lifetime lease is required because the linked inference
     /// archive retains a copy of the interface until its node is destroyed.
     pub fn inferenceIo(self: *BackendRuntime) ?Io {
-        if (self.borrowed_io) |borrowed| return borrowed.inference orelse borrowed.general;
+        if (self.borrowed_receivers) |*borrowed| return if (borrowed.inference) |*receiver| receiver.io() else borrowed.general.io();
         if (comptime builtin.os.tag == .freestanding) return null;
         const io_impl = if (self.backend == .manual)
             self.io_impl orelse return null
@@ -1647,7 +1686,7 @@ pub const BackendRuntime = struct {
     /// coordination. It is intentionally isolated from public API work so
     /// overload cannot consume the runtime's last observable control path.
     pub fn controlIo(self: *BackendRuntime) ?Io {
-        if (self.borrowed_io) |borrowed| return borrowed.control orelse borrowed.general;
+        if (self.borrowed_receivers) |*borrowed| return if (borrowed.control) |*receiver| receiver.io() else borrowed.general.io();
         if (comptime builtin.os.tag == .freestanding) return null;
         const io_impl = if (self.backend == .manual)
             self.io_impl orelse return null
@@ -1745,9 +1784,9 @@ pub const BackendRuntime = struct {
             } else break;
         }
         errdefer _ = self.reserved_workers.fetchSub(options.capacity, .acq_rel);
-        if (self.borrowed_io) |borrowed| {
+        if (self.borrowed_io != null) {
             updateAtomicMax(&self.peak_reserved_workers, reserved + options.capacity);
-            return .{ .runtime = self, .borrowed_io = borrowed.general, .capacity = options.capacity };
+            return .{ .runtime = self, .borrowed_io = self.io().?, .capacity = options.capacity };
         }
         const io_impl = try self.alloc.create(IoImpl);
         io_impl.* = Io.Threaded.init(self.alloc, .{
@@ -1915,7 +1954,7 @@ const InlineDurableJobLane = struct {
         const owners: *OwnerRegistry = @ptrCast(@alignCast(ptr));
         try owners.beginJob(job.owner_id);
         defer owners.finishJob(job.owner_id);
-        try job.run(job.ptr);
+        try job.execute();
         job.deinit(job.ptr);
     }
 
@@ -1961,7 +2000,8 @@ const inline_vtable = DurableJobLane.VTable{
     .executes_inline = true,
 };
 
-const ThreadedDurableJobLane = if (is_hostless) struct {
+const ThreadedDurableJobLane = if (is_hostless) UnsupportedDurableJobLane else NativeDurableJobLane;
+const UnsupportedDurableJobLane = struct {
     fn init(_: Allocator, _: *IoImpl, _: *OwnerRegistry) ThreadedDurableJobLane {
         return .{};
     }
@@ -2004,7 +2044,8 @@ const ThreadedDurableJobLane = if (is_hostless) struct {
     fn isAccepting(_: *anyopaque) bool {
         return false;
     }
-} else struct {
+};
+const NativeDurableJobLane = struct {
     const Entry = struct {
         lane: *ThreadedDurableJobLane,
         job: Job,
@@ -2124,7 +2165,7 @@ const ThreadedDurableJobLane = if (is_hostless) struct {
     }
 
     fn runEntry(entry: *Entry) void {
-        entry.job.run(entry.job.ptr) catch |err| {
+        entry.job.execute() catch |err| {
             std.log.warn("background durable job failed owner={} class={s} err={s}", .{
                 entry.job.owner_id,
                 @tagName(entry.job.class),

@@ -798,8 +798,10 @@ pub const HfTokenizer = struct {
         .encodeIntoParallel = @ptrCast(&encodeIntoParallel),
         .encodeIntoParallelStable = @ptrCast(&encodeIntoParallelStable),
         .encodeForModel = @ptrCast(&encodeForModel),
+        .encodeForModelUnpadded = @ptrCast(&encodeForModelUnpadded),
         .encodeGeneration = @ptrCast(&encodeGeneration),
         .decode = @ptrCast(&decode),
+        .tokenPiece = @ptrCast(&tokenPieceForVTable),
         .specialTokens = @ptrCast(&getSpecialTokens),
         .allSpecialTokenIds = @ptrCast(&getAllSpecialTokenIds),
         .vocabSize = @ptrCast(&getVocabSize),
@@ -7281,16 +7283,24 @@ pub const HfTokenizer = struct {
     }
 
     fn encodeForModel(ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize) anyerror!@import("tokenizer.zig").EncodeResult {
+        return encodeForModelWithPadding(ptr, allocator, text, max_length, true);
+    }
+
+    fn encodeForModelUnpadded(ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize) anyerror!@import("tokenizer.zig").EncodeResult {
+        return encodeForModelWithPadding(ptr, allocator, text, max_length, false);
+    }
+
+    fn encodeForModelWithPadding(ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize, padded: bool) anyerror!@import("tokenizer.zig").EncodeResult {
         const self: *HfTokenizer = @ptrCast(@alignCast(ptr));
         if (self.model_type == .word_piece and self.pre_tokenizer_type == .bert) {
             var raw = try self.encodeWordPieceWithOffsets(allocator, text);
             defer raw.deinit(allocator);
-            return HfTokenizer.wrapModelEncodingWithOffsets(self, allocator, raw.ids.items, raw.offsets.items, max_length);
+            return HfTokenizer.wrapModelEncodingWithOffsets(self, allocator, raw.ids.items, raw.offsets.items, max_length, padded);
         }
         if (self.model_type == .unigram and self.pre_tokenizer_type == .metaspace and self.metaspace_split and self.unigram_normalizer.len == 0) {
             var raw = try self.encodeUnigramWithOffsets(allocator, text);
             defer raw.deinit(allocator);
-            return HfTokenizer.wrapModelEncodingWithOffsets(self, allocator, raw.ids.items, raw.offsets.items, max_length);
+            return HfTokenizer.wrapModelEncodingWithOffsets(self, allocator, raw.ids.items, raw.offsets.items, max_length, padded);
         }
         {
             const raw_ids = try self.encode(allocator, text);
@@ -7302,9 +7312,10 @@ pub const HfTokenizer = struct {
             const wrap_len = plan.prepend.len + plan.append.len;
             const max_tokens = if (max_length > wrap_len) max_length - wrap_len else 0;
             const token_count = @min(raw_ids.len, max_tokens);
-            const ids = try allocator.alloc(i32, max_length);
+            const allocation_length = if (padded) max_length else @min(max_length, wrap_len + token_count + 1);
+            const ids = try allocator.alloc(i32, allocation_length);
             errdefer allocator.free(ids);
-            const mask = try allocator.alloc(i32, max_length);
+            const mask = try allocator.alloc(i32, allocation_length);
 
             var pos: usize = 0;
             for (plan.prepend) |tid| {
@@ -7324,7 +7335,7 @@ pub const HfTokenizer = struct {
                 mask[pos] = 1;
                 pos += 1;
             }
-            for (pos..max_length) |i| {
+            for (pos..allocation_length) |i| {
                 ids[i] = special.pad_id;
                 mask[i] = 0;
             }
@@ -7575,6 +7586,7 @@ pub const HfTokenizer = struct {
         raw_ids: []const i32,
         raw_offsets: []const [2]u32,
         max_length: usize,
+        padded: bool,
     ) !@import("tokenizer.zig").EncodeResult {
         const special = self.getSpecialTokens();
         const legacy_wrap = [2]i32{ special.cls_id, special.sep_id };
@@ -7582,11 +7594,12 @@ pub const HfTokenizer = struct {
         const wrap_len = plan.prepend.len + plan.append.len;
         const max_tokens = if (max_length > wrap_len) max_length - wrap_len else 0;
         const token_count = @min(raw_ids.len, max_tokens);
-        const ids = try allocator.alloc(i32, max_length);
+        const allocation_length = if (padded) max_length else @min(max_length, wrap_len + token_count + 1);
+        const ids = try allocator.alloc(i32, allocation_length);
         errdefer allocator.free(ids);
-        const mask = try allocator.alloc(i32, max_length);
+        const mask = try allocator.alloc(i32, allocation_length);
         errdefer allocator.free(mask);
-        const offsets = try allocator.alloc([2]u32, max_length);
+        const offsets = try allocator.alloc([2]u32, allocation_length);
 
         var pos: usize = 0;
         for (plan.prepend) |tid| {
@@ -7609,7 +7622,7 @@ pub const HfTokenizer = struct {
             offsets[pos] = .{ 0, 0 };
             pos += 1;
         }
-        for (pos..max_length) |i| {
+        for (pos..allocation_length) |i| {
             ids[i] = special.pad_id;
             mask[i] = 0;
             offsets[i] = .{ 0, 0 };
@@ -7626,6 +7639,49 @@ pub const HfTokenizer = struct {
     // =====================================================================
     // Decoding
     // =====================================================================
+
+    fn byteFallbackValue(self: *const HfTokenizer, token: []const u8) ?u8 {
+        if (!self.byte_fallback or token.len != 6 or !std.mem.startsWith(u8, token, "<0x") or token[5] != '>') return null;
+        return std.fmt.parseInt(u8, token[3..5], 16) catch null;
+    }
+    fn tokenPieceForVTable(self: *HfTokenizer, allocator: std.mem.Allocator, id: i32) ?Tokenizer.TokenPiece {
+        const bytes = self.tokenBytes(allocator, id) catch return null;
+        const fallback = if (self.id_to_token.get(id)) |token| self.byteFallbackValue(token) != null else false;
+        return .{ .bytes = bytes, .is_byte_fallback = fallback };
+    }
+
+    fn tokenBytes(self: *HfTokenizer, allocator: std.mem.Allocator, id: i32) ![]u8 {
+        const token = self.id_to_token.get(id) orelse return allocator.dupe(u8, "");
+        if (self.added_tokens.contains(token)) return allocator.dupe(u8, "");
+        if (self.byteFallbackValue(token)) |byte| return allocator.dupe(u8, &.{byte});
+        var result = std.ArrayListUnmanaged(u8).empty;
+        errdefer result.deinit(allocator);
+        switch (self.model_type) {
+            .word_piece => {
+                if (std.mem.startsWith(u8, token, self.continuing_prefix)) {
+                    try result.appendSlice(allocator, token[self.continuing_prefix.len..]);
+                } else {
+                    try result.append(allocator, ' ');
+                    try result.appendSlice(allocator, token);
+                }
+            },
+            .bpe => {
+                if (self.pre_tokenizer_type == .byte_level or self.pre_tokenizer_type == .byte_level_split) {
+                    try appendByteDecoded(&result, allocator, token);
+                } else try result.appendSlice(allocator, token);
+            },
+            .unigram => try result.appendSlice(allocator, token),
+        }
+        if (self.model_type == .unigram or
+            (self.model_type == .bpe and self.pre_tokenizer_type == .metaspace) or
+            (self.model_type == .bpe and self.replace_space_with != null))
+        {
+            const bytes = try replaceMetaspaceWithPrefix(allocator, result.items, self.metaspace_replacement, false);
+            result.deinit(allocator);
+            return bytes;
+        }
+        return result.toOwnedSlice(allocator);
+    }
 
     fn decode(self: *HfTokenizer, allocator: std.mem.Allocator, token_ids: []const i32) ![]u8 {
         var result = std.ArrayListUnmanaged(u8).empty;
@@ -9080,9 +9136,12 @@ fn appendByteDecoded(result: *std.ArrayListUnmanaged(u8), allocator: std.mem.All
 }
 
 fn replaceMetaspace(allocator: std.mem.Allocator, text: []const u8, replacement: []const u8) ![]u8 {
+    return replaceMetaspaceWithPrefix(allocator, text, replacement, true);
+}
+fn replaceMetaspaceWithPrefix(allocator: std.mem.Allocator, text: []const u8, replacement: []const u8, strip_leading: bool) ![]u8 {
     var result = std.ArrayListUnmanaged(u8).empty;
     var i: usize = 0;
-    var at_start = true;
+    var at_start = strip_leading;
     while (i < text.len) {
         if (i + replacement.len <= text.len and std.mem.eql(u8, text[i .. i + replacement.len], replacement)) {
             if (!at_start) {
@@ -11394,6 +11453,44 @@ test "clip byte-level bpe honors split pretokenizer array merges and end suffix"
     try std.testing.expectEqualSlices(i32, &.{ 1, 1, 1, 1, 0, 0 }, encoded.attention_mask);
 }
 
+test "NFC byte-level BPE preserves added tokens and canonical composition exclusions" {
+    const a = std.testing.allocator;
+    const tok = try HfTokenizer.loadFromBytes(a,
+        \\{"model":{"type":"BPE","vocab":{"à":1,"¤":2,"¡":3,"¼":4,"Ã":5,"©":6,"Ġ":7,"<é>":20},"merges":[]},
+        \\ "normalizer":{"type":"NFC"},
+        \\ "pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"use_regex":true},
+        \\ "added_tokens":[{"id":20,"content":"<é>","special":true,"normalized":false}]}
+    );
+    defer tok.deinitSelf();
+    const text = "e\u{0301}<e\u{0301}>\u{095c}";
+    // é is C3 A9; U+095C normalizes to U+0921 U+093C (E0 A4 A1 E0 A4 BC).
+    const expected = [_]i32{ 5, 6, 20, 1, 2, 3, 1, 2, 4 };
+    const raw = try tok.encode(a, text);
+    defer a.free(raw);
+    try std.testing.expectEqualSlices(i32, &expected, raw);
+    var ids = std.ArrayListUnmanaged(i32).empty;
+    defer ids.deinit(a);
+    try tok.encodeInto(a, text, &ids);
+    try std.testing.expectEqualSlices(i32, &expected, ids.items);
+    var model = try tok.tokenizer().encodeForModel(a, text, expected.len);
+    defer model.deinit();
+    try std.testing.expectEqualSlices(i32, &expected, model.ids);
+    var generation = try tok.tokenizer().encodeForGenerationConfigured(a, text, expected.len, false);
+    defer generation.deinit();
+    try std.testing.expectEqualSlices(i32, &expected, generation.ids);
+
+    // Force parallel eligibility by size. Normalization must still happen
+    // before byte-level regex segmentation, including combining sequences.
+    const count = HfTokenizer.parallel_bpe_min_bytes / 4 + 1;
+    const large = try a.alloc(u8, count * 4);
+    defer a.free(large);
+    for (0..count) |i| @memcpy(large[i * 4 ..][0..4], "e\u{0301} ");
+    ids.clearRetainingCapacity();
+    try tok.tokenizer().encodeIntoParallel(std.testing.io, a, large, &ids, 4);
+    try std.testing.expectEqual(count * 3, ids.items.len);
+    for (0..count) |i| try std.testing.expectEqualSlices(i32, &.{ 5, 6, 7 }, ids.items[i * 3 ..][0..3]);
+}
+
 test "sequence normalizer applies lowercase before byte-level bpe" {
     const allocator = std.testing.allocator;
 
@@ -12151,6 +12248,17 @@ test "TemplateProcessing appends exactly one trailing eos and no leading token" 
         if (mask > 0 and id == 9) eos_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), eos_count);
+    // The unpadded path must preserve wrapping and truncation while avoiding
+    // full-context allocations for short embedding inputs.
+    for ([_]usize{ 1, 2, 3, 8, 32768 }) |maximum| {
+        var padded = try tok.tokenizer().encodeForModel(allocator, "abc", maximum);
+        defer padded.deinit();
+        var unpadded = try tok.tokenizer().encodeForModelUnpadded(allocator, "abc", maximum);
+        defer unpadded.deinit();
+        try std.testing.expect(unpadded.ids.len <= 3);
+        try std.testing.expectEqualSlices(i32, padded.ids[0..unpadded.ids.len], unpadded.ids);
+        try std.testing.expectEqualSlices(i32, padded.attention_mask[0..unpadded.ids.len], unpadded.attention_mask);
+    }
 }
 
 test "TemplateProcessing eos survives max-length truncation" {
@@ -12328,4 +12436,25 @@ fn z17RepeatString(comptime bytes: []const u8, comptime count: usize) *const [by
         break :blk repeated;
     };
     return &result;
+}
+
+test "raw token bytes retain metaspace and split byte fallback without sequence cleanup" {
+    const a = std.testing.allocator;
+    const tok = try HfTokenizer.loadFromBytes(a,
+        \\{"model":{"type":"Unigram","unk_id":0,"byte_fallback":true,"vocab":[["<unk>",0],["x",-1],["▁1",-1],["1",-1],["▁",-1],["<0xC3>",-1],["<0xA9>",-1]]},"pre_tokenizer":{"type":"Metaspace","replacement":"▁","prepend_scheme":"always","split":true}}
+    );
+    defer tok.deinitSelf();
+    const tokenizer = tok.tokenizer();
+    const standalone = try tokenizer.decode(a, &.{2});
+    defer a.free(standalone);
+    try std.testing.expectEqualStrings("1", standalone);
+    const continuation = try tokenizer.tokenBytes(a, 2);
+    defer a.free(continuation);
+    try std.testing.expectEqualStrings(" 1", continuation);
+    const space = try tokenizer.tokenBytes(a, 4);
+    defer a.free(space);
+    try std.testing.expectEqualStrings(" ", space);
+    const byte = try tokenizer.tokenBytes(a, 5);
+    defer a.free(byte);
+    try std.testing.expectEqualSlices(u8, &.{0xc3}, byte);
 }

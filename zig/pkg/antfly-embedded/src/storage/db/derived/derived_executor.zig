@@ -97,6 +97,16 @@ pub const Executor = struct {
         return try self.vtable.fail_if_unhealthy(self.ptr);
     }
 
+    /// Primary durability does not require a healthy secondary-index worker.
+    /// Journal/backlog admission still bounds debt; index visibility requests
+    /// fail closed before committing if their derived runtime is unhealthy.
+    pub fn checkSyncLevelHealth(self: *Executor, level: types.SyncLevel) !void {
+        switch (level) {
+            .full_text, .full_index => try self.failIfUnhealthy(),
+            .propose, .write, .enrichments => {},
+        }
+    }
+
     pub fn addWorker(self: *Executor, name: []const u8, kind: index_manager_mod.ManagedIndexRef, applied_sequence: u64) !void {
         return try self.vtable.add_worker(self.ptr, name, kind, applied_sequence);
     }

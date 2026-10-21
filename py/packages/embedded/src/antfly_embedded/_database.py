@@ -324,9 +324,14 @@ class Database:
 
     # -- backup / import ----------------------------------------------------
 
-    def backup(self) -> bytes:
-        """Return a portable Antfly backup archive (.afb) of this database,
-        which restores or imports into either storage kind."""
+    def backup(self, *, tables: list[str] | None = None) -> bytes:
+        """Return a portable archive for either storage kind.
+
+        ``tables`` explicitly scopes named tables; default is always included.
+        Full backups fail if any table is unavailable, without omitting data.
+        """
+        if tables is not None:
+            return self._with_input_output(self._lib.antfly_db_backup_json, encode_json_input({"tables": tables}))
         return self._read_buffer(self._lib.antfly_db_backup)
 
     def import_backup(self, backup: bytes) -> None:
@@ -422,16 +427,202 @@ class Database:
     def list_indexes(self, *, raw: bool = False) -> Any:
         return self._json_read(self._lib.antfly_db_list_indexes_json, raw=raw)
 
+    def render_resolver_key(self, resolver: str, mention: JSONInput, *, raw: bool = False) -> Any:
+        """Render a durable resolver template and follow its explicit key aliases.
+
+        Returns minted_key, key, table and config_generation. No writes or ANN search.
+        """
+        handle = self._acquire()
+        try:
+            name, keep_name = _ffi.make_slice(encode_text(resolver))
+            data, keep_data = _ffi.make_slice(encode_json_input(mention))
+            out = _ffi.AntflyBuffer()
+            errors.raise_for_code(
+                self._lib.antfly_db_render_resolver_key_json(ctypes.c_void_p(handle), name, data, ctypes.byref(out))
+            )
+            return decode_json_response(_ffi.take_buffer(out), raw)
+        finally:
+            self._release()
+
+    def resolve_query(self, resolver: str, request: JSONInput, *, raw: bool = False) -> Any:
+        """Extract {"text": "..."}, or resolve {"extraction": {"entities": [...]}}.
+
+        Uses the durable extractor and resolver, including alias/ANN matching.
+        Returns extraction and resolution (canonical doc_refs and decisions),
+        without publishing documents, resolution artifacts or graph edges.
+        """
+        handle = self._acquire()
+        try:
+            name, keep_name = _ffi.make_slice(encode_text(resolver))
+            data, keep_data = _ffi.make_slice(encode_json_input(request))
+            out = _ffi.AntflyBuffer()
+            errors.raise_for_code(
+                self._lib.antfly_db_resolve_query_json(ctypes.c_void_p(handle), name, data, ctypes.byref(out))
+            )
+            return decode_json_response(_ffi.take_buffer(out), raw)
+        finally:
+            self._release()
+
+    def merge_resolver_keys(
+        self, resolver: str, key: str, target: str, *, replace: bool = False, pin_distinct: bool = False
+    ) -> None:
+        """Persist a key redirect; run_until_idle re-keys existing resolution edges."""
+        handle = self._acquire()
+        try:
+            name, keep_name = _ffi.make_slice(encode_text(resolver))
+            data, keep_data = _ffi.make_slice(
+                encode_json_input({"key": key, "target": target, "replace": replace, "pin_distinct": pin_distinct})
+            )
+            errors.raise_for_code(self._lib.antfly_db_merge_resolver_keys_json(ctypes.c_void_p(handle), name, data))
+        finally:
+            self._release()
+
+    def unmerge_resolver_key(self, resolver: str, request: JSONInput, *, raw: bool = False) -> Any:
+        """Execute durable resolver curation; the response reports accepted replay."""
+        handle = self._acquire()
+        try:
+            arg0, keep0 = _ffi.make_slice(encode_text(resolver))
+            arg1, keep1 = _ffi.make_slice(encode_json_input(request))
+            out = _ffi.AntflyBuffer()
+            errors.raise_for_code(
+                self._lib.antfly_db_unmerge_resolver_key_json(ctypes.c_void_p(handle), arg0, arg1, ctypes.byref(out))
+            )
+            return decode_json_response(_ffi.take_buffer(out), raw)
+        finally:
+            self._release()
+
+    def suppress_resolver_keys(self, resolver: str, request: JSONInput, *, raw: bool = False) -> Any:
+        """Execute durable resolver curation; the response reports accepted replay."""
+        handle = self._acquire()
+        try:
+            arg0, keep0 = _ffi.make_slice(encode_text(resolver))
+            arg1, keep1 = _ffi.make_slice(encode_json_input(request))
+            out = _ffi.AntflyBuffer()
+            errors.raise_for_code(
+                self._lib.antfly_db_suppress_resolver_keys_json(ctypes.c_void_p(handle), arg0, arg1, ctypes.byref(out))
+            )
+            return decode_json_response(_ffi.take_buffer(out), raw)
+        finally:
+            self._release()
+
+    def unsuppress_resolver_key(self, resolver: str, request: JSONInput, *, raw: bool = False) -> Any:
+        """Execute durable resolver curation; the response reports accepted replay."""
+        handle = self._acquire()
+        try:
+            arg0, keep0 = _ffi.make_slice(encode_text(resolver))
+            arg1, keep1 = _ffi.make_slice(encode_json_input(request))
+            out = _ffi.AntflyBuffer()
+            errors.raise_for_code(
+                self._lib.antfly_db_unsuppress_resolver_key_json(ctypes.c_void_p(handle), arg0, arg1, ctypes.byref(out))
+            )
+            return decode_json_response(_ffi.take_buffer(out), raw)
+        finally:
+            self._release()
+
+    def resolver_curation(self, resolver: str = "", *, raw: bool = False) -> Any:
+        """Execute durable resolver curation; the response reports accepted replay."""
+        handle = self._acquire()
+        try:
+            arg0, keep0 = _ffi.make_slice(encode_text(resolver))
+            out = _ffi.AntflyBuffer()
+            errors.raise_for_code(
+                self._lib.antfly_db_resolver_curation_json(ctypes.c_void_p(handle), arg0, ctypes.byref(out))
+            )
+            return decode_json_response(_ffi.take_buffer(out), raw)
+        finally:
+            self._release()
+
+    def resolver_reviews(self, request: JSONInput, *, raw: bool = False) -> Any:
+        """Execute durable resolver curation; the response reports accepted replay."""
+        handle = self._acquire()
+        try:
+            arg0, keep0 = _ffi.make_slice(encode_json_input(request))
+            out = _ffi.AntflyBuffer()
+            errors.raise_for_code(
+                self._lib.antfly_db_resolver_reviews_json(ctypes.c_void_p(handle), arg0, ctypes.byref(out))
+            )
+            return decode_json_response(_ffi.take_buffer(out), raw)
+        finally:
+            self._release()
+
+    def curate_entity(self, table: str, key: str, request: JSONInput, *, raw: bool = False) -> Any:
+        """Execute durable resolver curation; the response reports accepted replay."""
+        handle = self._acquire()
+        try:
+            arg0, keep0 = _ffi.make_slice(encode_text(table))
+            arg1, keep1 = _ffi.make_slice(encode_text(key))
+            arg2, keep2 = _ffi.make_slice(encode_json_input(request))
+            out = _ffi.AntflyBuffer()
+            errors.raise_for_code(
+                self._lib.antfly_db_curate_entity_json(ctypes.c_void_p(handle), arg0, arg1, arg2, ctypes.byref(out))
+            )
+            return decode_json_response(_ffi.take_buffer(out), raw)
+        finally:
+            self._release()
+
+    def list_resolver_identities(self, *, raw: bool = False) -> Any:
+        """List active/retired table-local identities and their durable merges."""
+        return self._json_read(self._lib.antfly_db_list_resolver_identities_json, raw=raw)
+
+    def drop_resolver_identity(self, resolver: str) -> bool:
+        """Discard a retired identity/merges; preserve artifacts and canonical rows.
+
+        Delete source documents to remove their artifacts, and explicitly delete
+        canonical rows after checking other users. BusyError is retryable.
+        """
+        handle = self._acquire()
+        try:
+            name, keep_name = _ffi.make_slice(encode_text(resolver))
+            deleted = ctypes.c_bool(False)
+            errors.raise_for_code(
+                self._lib.antfly_db_drop_resolver_identity(ctypes.c_void_p(handle), name, ctypes.byref(deleted))
+            )
+            return bool(deleted.value)
+        finally:
+            self._release()
+
+    def set_resolver_namespace(self, resolver: str, request: JSONInput) -> None:
+        """Reset/migrate identity rules; drain afterward. BusyError is retryable."""
+        handle = self._acquire()
+        try:
+            name, keep_name = _ffi.make_slice(encode_text(resolver))
+            data, keep_data = _ffi.make_slice(encode_json_input(request))
+            errors.raise_for_code(self._lib.antfly_db_set_resolver_namespace_json(ctypes.c_void_p(handle), name, data))
+        finally:
+            self._release()
+
     def add_index(self, config: JSONInput) -> None:
+        """Add or replace an index; retry the identical request on BusyError.
+
+        A graph's ``replaces`` registers a resumable background shadow; the old
+        index serves until activation. It also works when the old index is absent.
+        Optional ``wait: {timeout_ms: N}`` waits for activation. A wait timeout
+        leaves the accepted shadow running; inspect ``pending_work_stats()``.
+        Waits release native admission between quanta; cancellation raises
+        CancelledError. ReplacementFailedError, ReplacementPendingError and
+        ReplacementConfigurationMismatchError classify replacement preconditions.
+        """
         self._with_input(self._lib.antfly_db_add_index_json, encode_json_input(config))
 
     def delete_index(self, name: str) -> bool:
-        """Delete an index by name, returning whether it existed."""
+        """Delete an index, returning whether it existed; BusyError is retryable."""
         handle = self._acquire()
         try:
             sl, _keep = _ffi.make_slice(encode_text(name))
             deleted = ctypes.c_bool(False)
             code = self._lib.antfly_db_delete_index(ctypes.c_void_p(handle), sl, ctypes.byref(deleted))
+            errors.raise_for_code(code)
+            return bool(deleted.value)
+        finally:
+            self._release()
+
+    def cancel_replacement(self, name: str) -> bool:
+        """Cancel a running or failed replacement by its new name; idempotent."""
+        handle = self._acquire()
+        try:
+            sl, _keep = _ffi.make_slice(encode_text(name))
+            deleted = ctypes.c_bool(False)
+            code = self._lib.antfly_db_cancel_replacement(ctypes.c_void_p(handle), sl, ctypes.byref(deleted))
             errors.raise_for_code(code)
             return bool(deleted.value)
         finally:

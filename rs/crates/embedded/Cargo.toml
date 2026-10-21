@@ -21,6 +21,7 @@ log = { version = "0.4", optional = true }
 
 [dev-dependencies]
 serde_json = "1.0"
+tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [features]
 default = ["serde"]
@@ -60,4 +61,9 @@ path = "tests/pure.rs"
 [[test]]
 name = "sqlx"
 path = "tests/sqlx.rs"
+required-features = ["libantfly", "sqlx"]
+
+[[test]]
+name = "sql_scaling"
+path = "tests/sql_scaling.rs"
 required-features = ["libantfly", "sqlx"]

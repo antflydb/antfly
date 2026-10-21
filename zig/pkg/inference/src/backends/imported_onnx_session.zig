@@ -148,7 +148,7 @@ const BackendContext = union(enum) {
 
     fn init(allocator: std.mem.Allocator, requested: BackendType, io: ?std.Io) !BackendContext {
         return switch (requested) {
-            .native, .onnx => blk: {
+            .native => blk: {
                 if (comptime !build_options.enable_native) return error.NativeNotEnabled;
                 const compute = try allocator.create(NativeCompute);
                 errdefer allocator.destroy(compute);
@@ -1620,7 +1620,7 @@ fn validateRuntimeShapeBackend(graph: *const Graph, backend_type: BackendType) !
 
     // Native and Metal execute imported Slice and its consumers using runtime
     // dimensions. Other graph backends still require static downstream shapes.
-    if (backend_type == .native or backend_type == .onnx or backend_type == .metal) return;
+    if (backend_type == .native or backend_type == .metal) return;
 
     for (graph.nodes.items, 0..) |node, node_id| {
         const attrs = switch (node.op) {
@@ -1649,7 +1649,6 @@ test "runtime-bound ONNX slices admit native and Metal imported graph backends" 
     });
 
     try validateRuntimeShapeBackend(&graph, .native);
-    try validateRuntimeShapeBackend(&graph, .onnx);
     try validateRuntimeShapeBackend(&graph, .metal);
     try std.testing.expectError(error.UnsupportedDynamicOnnxGraphBackend, validateRuntimeShapeBackend(&graph, .wasm));
 }
@@ -1666,7 +1665,6 @@ test "imported ConvTranspose selects only the native graph backend" {
     });
 
     try validateRuntimeShapeBackend(&graph, .native);
-    try std.testing.expectError(error.UnsupportedOnnxGraphBackendOperation, validateRuntimeShapeBackend(&graph, .onnx));
     try std.testing.expectError(error.UnsupportedOnnxGraphBackendOperation, validateRuntimeShapeBackend(&graph, .metal));
     try std.testing.expectError(error.UnsupportedOnnxGraphBackendOperation, validateRuntimeShapeBackend(&graph, .cuda));
     try std.testing.expectError(error.UnsupportedOnnxGraphBackendOperation, validateRuntimeShapeBackend(&graph, .wasm));
@@ -2824,11 +2822,23 @@ fn defaultClipclapModelPath(allocator: std.mem.Allocator, file_name: []const u8)
 }
 
 test "imported onnx session executes clipclap text model natively with padded mask" {
+    try expectClipclapTextExecution(.native, null);
+}
+
+test "imported onnx session executes clipclap text model on metal across graph runtimes" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    for ([_]graph_runtime_mod.Strategy{ .interpreter, .partitioned, .compiled_preferred }) |strategy| {
+        try expectClipclapTextExecution(.metal, strategy);
+    }
+}
+
+fn expectClipclapTextExecution(requested_backend: BackendType, strategy: ?graph_runtime_mod.Strategy) !void {
     const allocator = std.testing.allocator;
     const path = try defaultClipclapTextModelPath(allocator);
     defer allocator.free(path);
 
-    var session = createSession(allocator, path, .native) catch |err| switch (err) {
+    var session = createSessionWithOptions(allocator, path, requested_backend, .{ .graph_runtime_strategy = strategy }) catch |err| switch (err) {
         error.FileNotFound => return error.SkipZigTest,
         else => return err,
     };
@@ -2838,10 +2848,20 @@ test "imported onnx session executes clipclap text model natively with padded ma
     var input_ids_data: [seq_len]i64 = undefined;
     var attention_mask_data: [seq_len]i64 = undefined;
     @memset(input_ids_data[0..], 1);
+    // Pool from a nonzero EOS position, as real CLIP-tokenized text does.
+    input_ids_data[0] = 49406;
+    input_ids_data[8] = 49407;
     @memset(attention_mask_data[0..], 0);
     @memset(attention_mask_data[0..9], 1);
 
-    var input_ids = try Tensor.initInt64(allocator, "input_ids", &.{ 1, seq_len }, &input_ids_data);
+    var compact_ids: [seq_len]i32 = undefined;
+    for (input_ids_data, &compact_ids) |id, *compact| compact.* = @intCast(id);
+    // The embedding pipeline uploads compact i32 token IDs. Exercise its
+    // identity cast and cross-partition lifetime, alongside native i64 input.
+    var input_ids = if (requested_backend == .metal)
+        try Tensor.initInt32(allocator, "input_ids", &.{ 1, seq_len }, &compact_ids)
+    else
+        try Tensor.initInt64(allocator, "input_ids", &.{ 1, seq_len }, &input_ids_data);
     defer input_ids.deinit();
     var attention_mask = try Tensor.initInt64(allocator, "attention_mask", &.{ 1, seq_len }, &attention_mask_data);
     defer attention_mask.deinit();

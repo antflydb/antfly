@@ -80,3 +80,55 @@ export fn runtime_io_abi_test_inject(enabled: bool) callconv(.c) void {
 
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
+
+// Real retained storage is constructed here and consumed in another archive.
+const retained_storage = @import("antfly_local_sources").storage_db_native_query_remote_storage;
+const retained_io = @import("antfly_local_sources").storage_lsm_backend_storage_io;
+var retained_marker: u8 = 0;
+fn retainedChunk(_: *anyopaque, a: std.mem.Allocator, chunk: retained_storage.Chunk, token: @import("antfly_cancellation").CancellationToken) ![]u8 {
+    try token.check();
+    return a.dupe(u8, chunk.artifact_id);
+}
+export fn runtime_io_abi_test_retained_source(output: *retained_io.Storage.Lease) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+    const reader = retained_storage.Reader.create(std.heap.c_allocator, std.Options.debug_io, "/retained", &.{.{
+        .path = "runs/1.sst",
+        .size = 8,
+        .chunks = &.{.{ .artifact_id = "abcdefgh", .byte_len = 8, .checksum = "verified-by-provider" }},
+    }}, .{ .ptr = &retained_marker, .read = retainedChunk }, .{ .parent = .none, .deadline_ns = std.math.maxInt(u64) }) catch |err|
+        return @import("antfly_runtime_abi").error_abi.statusFromError(err);
+    output.* = reader.lease();
+    return .ok;
+}
+
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
+var checkpoint_error: u8 = 0;
+fn checkpointFailure(_: *const anyopaque) !void {
+    return switch (checkpoint_error) {
+        0 => error.DeadlineExceeded,
+        1 => error.SessionLeaseLost,
+        2 => error.ConnectionRefused,
+        else => error.Canceled,
+    };
+}
+export fn runtime_io_abi_test_checkpoint(output: *CancellationToken, failure: u8) callconv(.c) void {
+    checkpoint_error = failure;
+    output.* = .{ .ptr = &checkpoint_error, .check_fn = checkpointFailure };
+}
+export fn runtime_io_abi_test_consume_checkpoint(token: *const CancellationToken) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+    token.check() catch |err| return @import("antfly_runtime_abi").error_abi.statusFromError(err);
+    return .ok;
+}
+
+const InferenceControl = @import("inference_checkpoint_control").InferenceExecutionControl;
+fn inferenceCheckpoint(_: ?*anyopaque) !void {
+    if (checkpoint_error == 4) return;
+    try checkpointFailure(&checkpoint_error);
+}
+export fn runtime_io_abi_test_inference_control(output: *InferenceControl, failure: u8) callconv(.c) void {
+    checkpoint_error = failure;
+    output.* = .{ .check_fn = inferenceCheckpoint };
+}
+export fn runtime_io_abi_test_consume_inference_control(control: *const InferenceControl) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+    control.check() catch |err| return @import("antfly_runtime_abi").error_abi.statusFromError(err);
+    return .ok;
+}

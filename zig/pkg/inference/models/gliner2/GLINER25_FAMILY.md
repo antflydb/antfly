@@ -14,7 +14,7 @@ an encoder, head, tokenizer, or converter.
 | --- | --- | --- |
 | multi-v1 | native, Metal | measured single-window entity, classification, structure, and relation profiles |
 | multi-Decide | native, Metal | the multilingual boundary profiles, plus typed Decide |
-| Decide-1B | native, Metal | typed classification/Decide; one item and one prepared sequence, at most 198 tokens |
+| Decide-1B | native, Metal | typed classification/Decide; one item, at most 64 prepared sequences of at most 1024 tokens each, independently measured for FP32 and Q8; FP32 also has diagnostic span execution, with extraction capabilities withheld |
 
 The multilingual checkpoints have the same 334-tensor schema and the same
 16 MB Unigram tokenizer, but different learned weights. They share boundary
@@ -94,15 +94,44 @@ one preflight, three warmups, and twenty samples per request. It excludes
 request parsing, admission/lock acquisition, and HTTP handling, and therefore
 cannot qualify the HTTP route or replace its request heap.
 
-## Metal performance follow-up (2026-10-06)
+## Performance
 
-Local FP32 Apple M4 measurements use the exact artifacts above and a two-thread
-CPU math budget. Multilingual Metal times below include the in-process HTTP
-handler; Python includes schema construction, preprocessing, model execution,
-and decoding, with synchronized MPS and CPU fallback disabled. The 1B Metal
-rows use the direct pipeline boundary described above. Each row contains
-twenty warm samples after three warmups; these are descriptive serial
-latencies, not concurrent throughput or service SLOs.
+> **Relocated:** the dated 2026-10-06 Metal performance and 2026-10-07 Decide-1B production-allocator follow-ups (AB/BA measurements, exploratory Python comparison, receipts, and pass counts) → [history](../../../../../docs/design/inference/history/gliner2/gliner25-family-metal-followups-2026-10.md).
+
+Both Metal encoder optimizations below are on by default, keep the scalar
+FP32 numerical contract and cancellation boundaries, and have a diagnostic
+rollback:
+
+- **Packed boundary QKV** reduces the three attention projections to one
+  matrix multiplication plus a split/bias epilogue (about 5–6% lower
+  extraction latency in same-binary AB/BA runs). It adds 81 MiB of immutable
+  resident storage for the 12-layer, 768-wide base/multilingual geometry,
+  included in model admission. `TERMITE_METAL_DISABLE_GLINER_BOUNDARY_PACKED_QKV`
+  disables execution but retains the storage, so it compares execution cost
+  rather than the previous memory envelope.
+- **Fused resident FFN** combines bias/exact GELU and
+  bias/residual/centered-LayerNorm epilogues while reusing the admitted
+  product workspace (a further 4–6% median reduction on Decide requests).
+  Missing fused pipelines fall back before acquiring weights or changing
+  scope state. `TERMITE_METAL_DISABLE_GLINER_BOUNDARY_FUSED_FFN` disables it.
+
+Decide-1B serving uses a typed Decide span route that avoids the extraction
+JSON round trip; tokenizer listing projects marker metadata without
+allocating the vocabulary; native and Metal compute implement the packed
+exact-GeGLU hook; native M-RoPE shares each token's phases across heads; and
+Accelerate attention specializes single contiguous segments up to 198 tokens
+with 64-wide heads, retaining the general fallback. The standalone
+`inference-bench-server decide-bench` command measures the loaded pipeline,
+encoder/head, direct Node call, and in-process HTTP handler separately with
+the production allocator; campaign instructions and acceptance boundaries are
+in the [development tools README](../../scripts/gliner25/README.md#decide-1b-production-allocator-comparison).
+
+Reference serial latency on an Apple M4 (FP32, exact pinned artifacts, two CPU
+threads, twenty warm samples after three warmups). Multilingual rows include
+the in-process HTTP handler; Decide-1B rows use the direct pipeline boundary
+described above. Python MPS includes schema construction, preprocessing,
+model execution, and decoding. These are descriptive serial latencies, not
+concurrent throughput or service SLOs:
 
 | Request | Prepared tokens | Metal median ms | Python MPS median ms |
 | --- | ---: | ---: | ---: |
@@ -112,76 +141,20 @@ latencies, not concurrent throughput or service SLOs.
 | Decide-1B described choice, direct pipeline | 87 | 122.04 | 128.88 |
 | Decide-1B choice/score/NoUL, direct pipeline | 158 | 177.42 | 200.11 |
 
-Packed boundary QKV reduces three projections to one matrix multiplication
-and a split/bias epilogue. Same-binary AB/BA measurements showed about 5–6%
-lower extraction latency. Its additional immutable resident storage is
-81 MiB for the 12-layer, 768-wide base/multilingual geometry and is included
-in model admission. The diagnostic disable flag retains this storage, so it
-compares execution cost rather than the previous memory envelope.
+The two Decide-1B direct-pipeline p95 values were 123.68 and 178.83 ms. Host
+GPU scheduling outliers in the multilingual runs preclude a service-tail claim.
 
-The strict FP32 resident FFN combines bias/exact GELU and bias/residual/centered
-LayerNorm epilogues while reusing the admitted product workspace. Same-binary
-AB/BA Decide measurements showed a further 4–6% median reduction in both
-orders. Paired synthetic FFN frames at 97–218 rows showed approximately 3–7%
-lower time with exact outputs; the 61-row result was inconclusive. Missing
-fused pipelines fall back before acquiring weights or changing scope state.
-Both optimizations retain their scalar numerical contract and cancellation
-boundaries.
+### Open work
 
-Host GPU scheduling caused large swings in some short extraction runs; all
-samples remain in the receipts. The 1B encoder counters attribute most time
-to GPU execution, with fourteen production frame submissions. No wider
-cancellation cadence or attention prototype was promoted. Standard English
-base/Decide measurements use different requests and timing boundaries and
-are historical context rather than a matched family comparison. Local
-receipts are under `.benchmark-results/gliner25-metal-opt-2026-10-06/`.
-The final multilingual matrix passed 21 tests without skips, and the physical
-fused-FFN suite passed four tests without leaks. The final canonical 1B direct
-pipeline job also passed without skips or leaks, with source identity unchanged
-during the run. Its two p95 values were 123.68 and 178.83 ms; scheduling outliers
-in the longer multilingual AB/BA runs still preclude a service-tail claim.
+- Decide-1B full-model CPU and Metal performance on final source is
+  unmeasured. The last exploratory HTTP-handler comparison predates the final
+  CPU attention and M-RoPE changes, still regressed against Python MPS on
+  shorter requests, and failed the paired-block and 5% p95-ratio acceptance
+  checks; no overall win over Python is established.
+- Decide-1B HTTP service qualification on current source needs a host with
+  enough physical headroom for the 512 MiB request heap.
 
-## Decide-1B production-allocator follow-up (2026-10-07)
-
-The standalone `inference-bench-server decide-bench` command measures the
-loaded pipeline, encoder/head, direct Node call, and in-process HTTP handler
-separately with the production allocator. The typed Decide span route avoids
-the extraction JSON round trip, tokenizer listing projects marker metadata
-without allocating the vocabulary, and native/Metal compute implement the
-existing packed exact-GeGLU hook. Native M-RoPE also shares each token's phases
-across heads; Accelerate attention specializes single contiguous segments up
-to 198 tokens with 64-wide heads and retains the general fallback.
-
-The latest completed exploratory Metal block below includes the typed route,
-tokenizer projection, and packed GeGLU. It predates the final CPU attention and
-M-RoPE changes and subsequent review fixes. These numbers are not final-source
-qualification. Both processes use the pinned FP32 checkpoint, two CPU threads,
-three warmups, and twenty measured samples per case on an Apple M4. Python is
-3.12.3 with torch 2.9.1 and transformers 5.17.0. Antfly includes complete HTTP
-handler dispatch, admission, and serialization; Python measures the loaded
-pipeline. Neither includes socket transport.
-
-| Request | Tokens | Antfly Metal median ms | Python MPS median ms |
-| --- | ---: | ---: | ---: |
-| Binary short holdout | 40 | 105.99 | 69.72 |
-| Four-label holdout | 79 | 134.50 | 125.18 |
-| Described choice | 87 | 136.87 | 130.23 |
-| Score/NoUL holdout | 93 | 141.06 | 131.23 |
-| Choice/score/NoUL | 158 | 199.70 | 206.82 |
-| Longer mixed holdout | 174 | 210.67 | 221.16 |
-
-All six cases passed the run's output and ownership checks. Performance
-acceptance failed: only one of six required paired blocks ran, shorter cases
-still regress, several p95 ratios exceed the 5% ceiling, and whole-process host
-swap grew by 0.62 MiB. This does not establish an overall win over Python.
-The final production build was cancelled before fresh full-model CPU/Metal
-runs. The final CPU optimizations have focused numerical and allocation-failure
-coverage, but their full-model performance remains unmeasured.
-
-Campaign instructions and acceptance boundaries are in the
-[development tools README](../../scripts/gliner25/README.md#decide-1b-production-allocator-comparison).
-The local exploratory receipt is
-`.benchmark-results/gliner25-win-2026-10-07/metal-packed-exploration/comparison.json`.
+## Decide-1B architecture and serving contract
 
 The 1B checkpoint has 199 tensors and a 4,755,208,228-byte FP32 weights file.
 Its typed classifier uses `[L]` marker states and an H→2H→1 MLP. The encoder
@@ -206,15 +179,26 @@ current CUDA attention kernel has a 512-token limit, which is enforced in
 planning and execution. A config accepting 7999 positions does not establish
 measured maximum-length performance or device qualification.
 
-The supported ModernBERT span path is typed classification. Its entity and
-relation heads differ from the older DeBERTa CountLSTM implementation; those
-tasks are rejected until their own head implementation and parity checks
-exist. Pulling an unqualified decision artifact installs its bytes while
-withholding executable tasks and capabilities.
+The ModernBERT span path serves typed classification/Decide. The exact pinned
+FP32 artifact also implements diagnostic entity/relation execution through its
+own marker span representations, GRU count slots, and span scoring heads; see
+[GLINER25.md](GLINER25.md#embedded-knowledge-graph-extraction-and-bounded-windows).
+Neither precision advertises entity/relation extraction: the retained upstream
+probes return empty results even at low thresholds. Numerical head parity
+alone does not establish useful graph extraction. See the
+[extraction investigation](../../scripts/gliner25/SPAN_1B_INVESTIGATION.md).
+Pulling an unqualified decision artifact withholds executable tasks and
+capabilities.
 
 The public 1B decision contract is separate from the encoder's saved position
-budget. It permits native or Metal, one request item, one prepared sequence,
-and at most 198 prepared tokens. The planner rejects larger requests without
+budget. For the exact pinned FP32 artifact it permits native or Metal, one
+request item, at most 64 prepared sequences, and at most 1024 prepared tokens
+per sequence. The separately pinned Q8 encoder/head bundle has independent
+Native and physical Metal pipeline and HTTP measurements at the same bounds;
+it does not borrow the FP32 proof. These limits
+are `requestLimits` in `src/models/gliner_decide_qualification.zig`, enforced
+by `requireRequestIdentity` and applied to the span planner in
+`src/server/server.zig`. The planner rejects larger requests without
 truncating them. The live session must match the full weight digest, tensor
 inventory, geometry, marker IDs, and every sidecar digest. Its tokenizer is
 sealed only after the exact consumed bytes have been verified. Registry
@@ -421,3 +405,102 @@ execution, maximum-length memory bounds, and throughput require separate
 evidence for each artifact/backend combination. See [GLINER25.md](GLINER25.md)
 for the boundary qualification policy and [GLINER25_DECIDE.md](GLINER25_DECIDE.md)
 for the existing DeBERTa Decide route.
+
+## Published split bundles and pull defaults (2026-10-17)
+
+Canonical repositories follow Fastino's checkpoint capitalization and omit a
+format suffix, matching `antflydb/gliner2-base-v1`'s multi-format repository
+layout:
+
+| Repository | Immutable layout revision | Current typed Decide contract |
+| --- | --- | --- |
+| [`antflydb/GLiNER2.5-Decide-1B`](https://huggingface.co/antflydb/GLiNER2.5-Decide-1B) | `ef47cca0f42f554e146cd9ab3ce870741c98daa5` | Native/Metal, one item, 64 sequences, 1024 complete prompt tokens per sequence |
+| [`antflydb/GLiNER2.5-Decide`](https://huggingface.co/antflydb/GLiNER2.5-Decide) | `358ae4b1263cedb79faf9e8b7984c3b4e5586874` | Not qualified; the DeBERTa Q8 exporter strips `decide` |
+
+The previous `gliner2.5-decide-1B-gguf` and `gliner2.5-decide-gguf` URLs redirect
+to these repositories. Both contain `gliner2-encoder.Q8_0.gguf`,
+`gliner2-head.Q8_0.gguf`, `antfly_inference_bundle.json`, and
+`antfly_inference_variants.json`. `Q8_0` in the pair's filenames identifies the
+bundle variant: auxiliary heads remain FP32. Renaming files changed none of
+the weight, tokenizer, or encoder configuration bytes. Historical captures and
+receipts retain their original paths; their `gliner_head.gguf` digest identifies
+the renamed head. The migration script is
+[`migrate_hub_bundles.py`](../../scripts/gliner25/migrate_hub_bundles.py).
+
+Pull selects a split bundle's encoder and head from its descriptor at the
+resolved immutable Hub commit. This supports the historical mixed-suffix
+layout as well as canonical paired filenames, rejects missing or unsafe
+references, and never substitutes an unrelated GGUF for a missing component.
+An explicitly requested quantization selects the declared encoder when it
+matches, or another complete canonical GLiNER pair for that quantization. A
+partial pair never falls back to an unrelated GGUF. Managed manifests resolve
+the published variant when the Hub default pair was not downloaded.
+
+The 1B layout migration was published at `98ce73668cea4b940299396920671ec0a8abc57f`.
+The current revision adds the [immutable capacity receipts](https://huggingface.co/antflydb/GLiNER2.5-Decide-1B/blob/ef47cca0f42f554e146cd9ab3ce870741c98daa5/qualification/2026-10-17-capacity/manifest.json)
+and requires runtime commit `10e6c371d5` or later for the larger classification
+limits. Both GGUF weight hashes remain identical to the migration revision.
+
+Unversioned pulls of reviewed Fastino GLiNER2.5 checkpoints use the immutable
+revisions in `src/registry/gliner_catalog.zig`, including base-v1, multi-v1,
+multi-Decide, Decide, and Decide-1B. An explicit `:auto@main`, branch, tag or
+commit overrides that default and still undergoes loaded-artifact checks.
+This keeps an upstream configuration change from silently replacing the
+qualified artifact. Repository names and redirects do not grant capabilities.
+
+The SQL decision provider already emits one `state` per request in
+`antfly-embedded/src/functions/runtime.zig` (`Job.invoke`). Its `batch_size`
+controls concurrent independent requests, rather than combining several states
+into a model request. It need not be set to one for the 1B item limit; use one
+when serial admission is desirable on a memory-constrained host.
+
+Issue #1083 remains open for useful entity/relation extraction from a trained
+artifact. Q8 context expansion is independently measured; the pinned upstream
+weights still return empty extraction.
+The existing DeBERTa GLiNER trainer and the Laya trainer do not qualify a
+Decide-1B adapter. A future trainer must bind the exact encoder/head geometry,
+replay labeled decision and extraction holdouts, materialize a versioned bundle,
+and qualify that new artifact before publishing its capabilities. Neither the
+Hub rename nor existing FP32 evidence changes those requirements.
+
+### Q8 context probes
+
+The retained [Q8 probe receipt](../../testdata/gliner25/decide_1b_q8_context_probe.json)
+records 17 cases on Native and physical Metal: all 14 original frozen
+classification inputs plus independent upstream 55-, 65-, and 1024-token
+single-window captures. Each case ran one preflight and three measured
+invocations, with two CPU threads. Maximum raw-logit drift across the complete
+sweep was 0.02295 Native and 0.02270 Metal, below the predefined 0.05 probe
+tolerance. The 1024-token case alone differed by 0.001661 Native and 0.001581
+Metal. These timings describe a shared host, not a latency qualification.
+
+Those original probes are superseded for classification capacity by the
+[capacity campaign](../../testdata/gliner25/family/decide_1b/q8_capacity/README.md): 31 complete
+in-budget prompts on Native and physical Metal, independent upstream token
+IDs/logits/distributions, natural-language 665–748-token contexts, exact
+1024-token acceptance, and real HTTP execution of 64 windows. The public Q8
+classification ceiling is now one item and 64 prepared sequences of at most
+1024 tokens each. Larger requests are rejected without truncation. This does
+not qualify entity/relation extraction or prove application-level decision
+quality; the campaign retains gold-model misses separately from parity.
+
+Reproduce the capture with `benchmark-cases.json` and `validation.json` from
+the immutable bundle revision recorded in the receipt:
+
+```sh
+python3 zig/pkg/inference/scripts/gliner25/prepare_decide_quant_capture.py \
+  --cases /path/to/bundle/benchmark-cases.json \
+  --validation /path/to/bundle/validation.json --reference fp32 \
+  --window-reference zig/pkg/inference/src/extractors/testdata/knowledge_graph/decide_1b_windows.json \
+  --output /path/to/context-cases.json
+```
+
+Build `inference-bench-gliner-decide-quant-build` with Zig 0.17,
+`-Doptimize=fast -Dmetal=true -Dcuda=false`. Run the resulting
+`antfly-inference-gliner-decide-quant-bench` with `--model-dir` pointing to the
+complete canonical Q8 bundle, `--capture /path/to/context-cases.json`,
+`--backend native` or `metal`, `--warmups 0 --reps 3 --tolerance 0.05`, and
+`ANTFLY_INFERENCE_CPU_THREADS=2 VECLIB_MAXIMUM_THREADS=2`. Capture JSON stdout
+and diagnostic stderr separately. The capture preparer verifies the complete
+window-reference digest and excludes multi-window aggregate logits from raw
+per-sequence comparisons.

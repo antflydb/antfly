@@ -121,9 +121,45 @@ pub const PinnedTextSource = struct {
     owner: ?*anyopaque = null,
     release_owner: ?*const fn (*anyopaque) void = null,
     selected_field: ?[]const u8 = null,
+    /// Authenticated source fields present in every stored sidecar document.
+    /// Empty means no coverage proof; native document IDs alone are not one.
+    stored_projection_fields: []const []const u8 = &.{},
     /// Immutable provider metadata retained by release_owner's lease.
     provider_metadata: ?*const anyopaque = null,
+    logical_tie_rank: ?@import("../../../search/scorer.zig").TieRank = null,
+    shared_owner: ?*Shared = null,
+    const Shared = struct {
+        allocator: Allocator,
+        source: PinnedTextSource,
+        references: std.atomic.Value(usize) = .init(1),
+        fn release(self: *@This()) void {
+            if (self.references.fetchSub(1, .acq_rel) != 1) return;
+            self.source.deinit();
+            self.allocator.destroy(self);
+        }
+    };
+    /// Consume this pin into shared query ownership. Ranking and deferred
+    /// delivery keep the same native document-number space and authority;
+    /// only the final owner quiesces the source and releases provider metadata.
+    pub fn share(self: PinnedTextSource, allocator: Allocator) !PinnedTextSource {
+        if (self.shared_owner != null) return self;
+        const owner = try allocator.create(Shared);
+        owner.* = .{ .allocator = allocator, .source = self };
+        var result = self;
+        result.shared_owner = owner;
+        return result;
+    }
+    pub fn clone(self: PinnedTextSource) !PinnedTextSource {
+        const owner = self.shared_owner orelse return error.InvalidArgument;
+        _ = owner.references.fetchAdd(1, .monotonic);
+        return self;
+    }
     pub fn deinit(self: *PinnedTextSource) void {
+        if (self.shared_owner) |owner| {
+            owner.release();
+            self.* = undefined;
+            return;
+        }
         self.snapshot.quiesceReadContext();
         self.snapshot.release();
         if (self.release_owner) |release| release(self.owner.?);
@@ -157,7 +193,18 @@ pub const OrderedTextCandidates = struct {
     close: *const fn (*anyopaque) void,
 };
 
+pub const LogicalSourceRow = @import("../../logical_source.zig").Row;
+pub const LogicalSourceReader = struct {
+    ctx: *anyopaque,
+    load: *const fn (*anyopaque, Allocator, []const []const u8, []const []const u8) anyerror![]LogicalSourceRow,
+    close: *const fn (*anyopaque) void,
+};
+pub const LogicalSourceOpener = *const fn (?*anyopaque, Allocator) anyerror!?LogicalSourceReader;
+
 pub const SearchTextQueryExecutor = struct {
+    open_logical_sources: ?LogicalSourceOpener = null,
+    load_many_stored_values: ?*const fn (?*anyopaque, Allocator, []const []const u8) anyerror![]?[]u8 = null,
+
     open_ordered_candidates: ?*const fn (?*anyopaque, Allocator, types.SearchRequest, *const index_mod.IndexSnapshot) anyerror!?OrderedTextCandidates = null,
     /// Provider attests that its pinned snapshot already enforces primary row
     /// visibility. Fully native counts can skip per-hit postprocessing.
@@ -169,6 +216,9 @@ pub const SearchTextQueryExecutor = struct {
     exact_doc_id_filters: bool = false,
     /// Project immutable producer identities before filtering, sorting, and paging.
     project_key: ?*const fn (?*anyopaque, Allocator, []const u8) anyerror![]u8 = null,
+    /// An authenticated provider ordinal map can project identity without
+    /// fetching a stored-key page. Null preserves ordinary key hydration.
+    project_doc_num: ?*const fn (?*anyopaque, Allocator, *const index_mod.IndexSnapshot, u32) anyerror!?[]u8 = null,
     native_key: ?*const fn (?*anyopaque, Allocator, []const u8) anyerror![]u8 = null,
     acquire_text_source: ?*const fn (?*anyopaque, ?[]const u8) anyerror!?PinnedTextSource = null,
     /// Primary rows can disappear independently of a derived posting. Keep
@@ -527,6 +577,9 @@ pub const MatchAllCandidateStreamStats = struct {
 };
 
 pub const MatchAllExecutor = struct {
+    /// The caller proved this is a primary-row population with no residual
+    /// predicates or transforms requiring exhaustive candidate collection.
+    bounded_unordered_page: bool = false,
     ctx: ?*anyopaque,
     collect_candidates: *const fn (
         ctx: ?*anyopaque,
@@ -601,6 +654,7 @@ pub const MatchAllExecutor = struct {
 pub const MatchAllCandidateCollector = struct {
     ctx: ?*anyopaque,
     /// Snapshot-pinned row providers stream public identities directly.
+    scan_ids_ctx: ?*anyopaque = null,
     scan_ids: ?*const fn (?*anyopaque, Allocator, MatchAllCandidateCollectOptions, ?*anyopaque, *const fn (?*anyopaque, []const u8) anyerror!docstore_mod.DocStore.ScanAction) anyerror!void = null,
     scan_store_range: *const fn (
         ctx: ?*anyopaque,
@@ -629,8 +683,71 @@ pub const MatchAllCandidateCollector = struct {
     ) anyerror!?doc_set.DocOrdinal = null,
 };
 
+pub const ComposedComponent = struct {
+    request: types.SearchRequest,
+    query: union(enum) { text: types.TextQuery, default_text, dense: types.DenseKnnQuery, sparse: types.SparseKnnQuery },
+};
+pub const ComposedComponentBatch = struct {
+    alloc: Allocator,
+    results: []?types.SearchResult,
+    execution_ns: []u64 = &.{},
+    position: usize = 0,
+    pub fn deinit(self: *@This()) void {
+        for (self.results) |*result| if (result.*) |*owned| owned.deinit();
+        self.alloc.free(self.results);
+        self.alloc.free(self.execution_ns);
+    }
+    pub fn lastExecutionNs(self: *const @This()) ?u64 {
+        return if (self.position != 0 and self.execution_ns.len == self.results.len) self.execution_ns[self.position - 1] else null;
+    }
+    fn take(self: *@This()) !types.SearchResult {
+        if (self.position >= self.results.len) return error.InvalidQueryRequest;
+        const result = self.results[self.position] orelse return error.InvalidQueryRequest;
+        self.results[self.position] = null;
+        self.position += 1;
+        return result;
+    }
+};
+fn composedComponents(a: Allocator, req: types.SearchRequest) ![]ComposedComponent {
+    var components: std.ArrayList(ComposedComponent) = .empty;
+    errdefer components.deinit(a);
+    if (req.full_text_queries.len == 0) {
+        if (req.full_text) |text| try components.append(a, .{ .request = req, .query = .{ .text = text } }) else if (!isDefaultMatchAll(req.query) and isTextQuery(req.query)) try components.append(a, .{ .request = req, .query = .default_text });
+    } else {
+        for (req.full_text_queries) |named| {
+            var child = req;
+            child.index_name = named.index_name;
+            try components.append(a, .{ .request = child, .query = .{ .text = named.query } });
+        }
+    }
+    var vectors = req;
+    vectors.full_text = null;
+    if (vectors.dense_queries.len == 0 and vectors.dense != null) {
+        try components.append(a, .{ .request = vectors, .query = .{ .dense = vectors.dense.? } });
+    } else {
+        for (vectors.dense_queries) |named| {
+            var child = vectors;
+            child.index_name = named.index_name;
+            try components.append(a, .{ .request = child, .query = .{ .dense = named.query } });
+        }
+    }
+    if (vectors.sparse_queries.len == 0 and vectors.sparse != null) {
+        try components.append(a, .{ .request = vectors, .query = .{ .sparse = vectors.sparse.? } });
+    } else {
+        for (vectors.sparse_queries) |named| {
+            var child = vectors;
+            child.index_name = named.index_name;
+            try components.append(a, .{ .request = child, .query = .{ .sparse = named.query } });
+        }
+    }
+    return components.toOwnedSlice(a);
+}
+
 pub const ComposedSearchExecutor = struct {
     ctx: ?*anyopaque,
+    /// Optional independent component executions. Results must retain input
+    /// order; fusion, graph dependencies and transforms remain on the caller.
+    search_components: ?*const fn (?*anyopaque, Allocator, []const ComposedComponent) anyerror!ComposedComponentBatch = null,
     resolve_structured_doc_filter: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -891,6 +1008,7 @@ pub fn searchComposed(
         }
         owned_resolved_sets.deinit(alloc);
     }
+    try owned_results.ensureTotalCapacity(alloc, composedTextSourceCount(req) + composedEmbeddingSourceCount(req));
     var shared_filter: ?doc_set.ResolvedDocFilter = if (executor.resolve_structured_doc_filter) |resolve|
         try resolve(executor.ctx, alloc, req)
     else
@@ -902,7 +1020,17 @@ pub fn searchComposed(
         null;
     defer if (shared_text_filter) |*filter| filter.deinit(alloc);
 
+    // Component bodies are not inputs to score fusion. The fusion executor
+    // hydrates its final winners under the same pinned read authority. Keep
+    // eager payloads where named graph inputs, highlights or hierarchy output
+    // require those component-local bodies.
+    const defer_component_bodies = req.include_stored and
+        composedTextSourceCount(req) + composedEmbeddingSourceCount(req) > 1 and
+        req.graph_queries.len == 0 and req.highlight == null and !req.hasHitEvaluation() and
+        req.return_mode == .parent and !req.hierarchy_include_source and !req.hierarchy_include_unit and
+        !req.hierarchy_grouped_matches and req.aggregations_json.len == 0;
     var shared_req = req;
+    if (defer_component_bodies) shared_req.include_stored = false;
     if (shared_filter) |*filter| {
         shared_req.resolved_doc_filter = filter;
         shared_req.resolved_doc_filter_owned = false;
@@ -918,11 +1046,24 @@ pub fn searchComposed(
         shared_req.profile = true;
     }
 
+    var component_batch: ?ComposedComponentBatch = null;
+    defer if (component_batch) |*batch| batch.deinit();
+    if (executor.search_components) |run| {
+        // The optional single-dense profile sink is caller-owned mutable state.
+        // Its existing serial executor remains authoritative when enabled.
+        if (executor.search_dense_profiled == null or executor.dense_profile_sink == null) {
+            const components = try composedComponents(alloc, shared_req);
+            defer alloc.free(components);
+            if (components.len > 1) component_batch = try run(executor.ctx, alloc, components);
+        }
+    }
+
     if (shared_req.full_text_queries.len == 0) {
         if (shared_req.full_text) |text| {
             const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-            const text_result = try executor.search_text_query(executor.ctx, alloc, shared_req, text);
-            if (bench_query_profile) text_ns += platform_time.monotonicNs() - phase_start_ns;
+            const text_result = if (component_batch) |*batch| try batch.take() else try executor.search_text_query(executor.ctx, alloc, shared_req, text);
+            owned_results.appendAssumeCapacity(text_result);
+            if (bench_query_profile) text_ns += if (component_batch) |*batch| batch.lastExecutionNs() orelse (platform_time.monotonicNs() - phase_start_ns) else platform_time.monotonicNs() - phase_start_ns;
             composed_candidate_count += text_result.hits.len;
             if (requestHasSortPageOptions(shared_req)) {
                 try validateComposedExactSortComponent(shared_req, text_result);
@@ -936,11 +1077,11 @@ pub fn searchComposed(
                 .total_hits_relation = text_result.total_hits_relation,
                 .resolved_doc_set = resolved_doc_set,
             });
-            try owned_results.append(alloc, text_result);
         } else if (!isDefaultMatchAll(shared_req.query) and isTextQuery(shared_req.query)) {
             const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-            const text_result = try executor.search_text(executor.ctx, alloc, shared_req);
-            if (bench_query_profile) text_ns += platform_time.monotonicNs() - phase_start_ns;
+            const text_result = if (component_batch) |*batch| try batch.take() else try executor.search_text(executor.ctx, alloc, shared_req);
+            owned_results.appendAssumeCapacity(text_result);
+            if (bench_query_profile) text_ns += if (component_batch) |*batch| batch.lastExecutionNs() orelse (platform_time.monotonicNs() - phase_start_ns) else platform_time.monotonicNs() - phase_start_ns;
             composed_candidate_count += text_result.hits.len;
             if (requestHasSortPageOptions(shared_req)) {
                 try validateComposedExactSortComponent(shared_req, text_result);
@@ -954,15 +1095,15 @@ pub fn searchComposed(
                 .total_hits_relation = text_result.total_hits_relation,
                 .resolved_doc_set = resolved_doc_set,
             });
-            try owned_results.append(alloc, text_result);
         }
     } else {
         for (shared_req.full_text_queries) |full_text_query| {
             var text_req = shared_req;
             text_req.index_name = full_text_query.index_name;
             const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-            const text_result = try executor.search_text_query(executor.ctx, alloc, text_req, full_text_query.query);
-            if (bench_query_profile) text_ns += platform_time.monotonicNs() - phase_start_ns;
+            const text_result = if (component_batch) |*batch| try batch.take() else try executor.search_text_query(executor.ctx, alloc, text_req, full_text_query.query);
+            owned_results.appendAssumeCapacity(text_result);
+            if (bench_query_profile) text_ns += if (component_batch) |*batch| batch.lastExecutionNs() orelse (platform_time.monotonicNs() - phase_start_ns) else platform_time.monotonicNs() - phase_start_ns;
             composed_candidate_count += text_result.hits.len;
             if (requestHasSortPageOptions(shared_req)) {
                 try validateComposedExactSortComponent(shared_req, text_result);
@@ -976,7 +1117,6 @@ pub fn searchComposed(
                 .total_hits_relation = text_result.total_hits_relation,
                 .resolved_doc_set = resolved_doc_set,
             });
-            try owned_results.append(alloc, text_result);
         }
     }
 
@@ -992,14 +1132,15 @@ pub fn searchComposed(
 
     if (vector_req.dense_queries.len == 0 and vector_req.dense != null) {
         const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-        const dense_result = try searchComposedDenseComponent(
+        const dense_result = if (component_batch) |*batch| try batch.take() else try searchComposedDenseComponent(
             alloc,
             vector_req,
             vector_req.dense.?,
             executor,
             profile_dense_component,
         );
-        if (bench_query_profile) dense_ns += platform_time.monotonicNs() - phase_start_ns;
+        owned_results.appendAssumeCapacity(dense_result);
+        if (bench_query_profile) dense_ns += if (component_batch) |*batch| batch.lastExecutionNs() orelse (platform_time.monotonicNs() - phase_start_ns) else platform_time.monotonicNs() - phase_start_ns;
         composed_candidate_count += dense_result.hits.len;
         const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, shared_req, executor, &owned_resolved_sets, dense_result.hits);
         try named_sets.append(alloc, .{
@@ -1009,20 +1150,20 @@ pub fn searchComposed(
             .total_hits_relation = dense_result.total_hits_relation,
             .resolved_doc_set = resolved_doc_set,
         });
-        try owned_results.append(alloc, dense_result);
     } else {
         for (vector_req.dense_queries) |dense_query| {
             var dense_req = vector_req;
             dense_req.index_name = dense_query.index_name;
             const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-            const dense_result = try searchComposedDenseComponent(
+            const dense_result = if (component_batch) |*batch| try batch.take() else try searchComposedDenseComponent(
                 alloc,
                 dense_req,
                 dense_query.query,
                 executor,
                 profile_dense_component,
             );
-            if (bench_query_profile) dense_ns += platform_time.monotonicNs() - phase_start_ns;
+            owned_results.appendAssumeCapacity(dense_result);
+            if (bench_query_profile) dense_ns += if (component_batch) |*batch| batch.lastExecutionNs() orelse (platform_time.monotonicNs() - phase_start_ns) else platform_time.monotonicNs() - phase_start_ns;
             composed_candidate_count += dense_result.hits.len;
             const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, shared_req, executor, &owned_resolved_sets, dense_result.hits);
             try named_sets.append(alloc, .{
@@ -1032,14 +1173,14 @@ pub fn searchComposed(
                 .total_hits_relation = dense_result.total_hits_relation,
                 .resolved_doc_set = resolved_doc_set,
             });
-            try owned_results.append(alloc, dense_result);
         }
     }
 
     if (vector_req.sparse_queries.len == 0 and vector_req.sparse != null) {
         const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-        const sparse_result = try executor.search_sparse(executor.ctx, alloc, vector_req, vector_req.sparse.?);
-        if (bench_query_profile) sparse_ns += platform_time.monotonicNs() - phase_start_ns;
+        const sparse_result = if (component_batch) |*batch| try batch.take() else try executor.search_sparse(executor.ctx, alloc, vector_req, vector_req.sparse.?);
+        owned_results.appendAssumeCapacity(sparse_result);
+        if (bench_query_profile) sparse_ns += if (component_batch) |*batch| batch.lastExecutionNs() orelse (platform_time.monotonicNs() - phase_start_ns) else platform_time.monotonicNs() - phase_start_ns;
         composed_candidate_count += sparse_result.hits.len;
         const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, shared_req, executor, &owned_resolved_sets, sparse_result.hits);
         try named_sets.append(alloc, .{
@@ -1049,14 +1190,14 @@ pub fn searchComposed(
             .total_hits_relation = sparse_result.total_hits_relation,
             .resolved_doc_set = resolved_doc_set,
         });
-        try owned_results.append(alloc, sparse_result);
     } else {
         for (vector_req.sparse_queries) |sparse_query| {
             var sparse_req = vector_req;
             sparse_req.index_name = sparse_query.index_name;
             const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-            const sparse_result = try executor.search_sparse(executor.ctx, alloc, sparse_req, sparse_query.query);
-            if (bench_query_profile) sparse_ns += platform_time.monotonicNs() - phase_start_ns;
+            const sparse_result = if (component_batch) |*batch| try batch.take() else try executor.search_sparse(executor.ctx, alloc, sparse_req, sparse_query.query);
+            owned_results.appendAssumeCapacity(sparse_result);
+            if (bench_query_profile) sparse_ns += if (component_batch) |*batch| batch.lastExecutionNs() orelse (platform_time.monotonicNs() - phase_start_ns) else platform_time.monotonicNs() - phase_start_ns;
             composed_candidate_count += sparse_result.hits.len;
             const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, shared_req, executor, &owned_resolved_sets, sparse_result.hits);
             try named_sets.append(alloc, .{
@@ -1066,7 +1207,6 @@ pub fn searchComposed(
                 .total_hits_relation = sparse_result.total_hits_relation,
                 .resolved_doc_set = resolved_doc_set,
             });
-            try owned_results.append(alloc, sparse_result);
         }
     }
 
@@ -1074,7 +1214,8 @@ pub fn searchComposed(
     // Reranking and pruning are coordinator transforms. Keep their bounded
     // retrieval window through local fusion instead of truncating it to the
     // final page, and defer pruning until provider scores exist when present.
-    const fusion_req = composedFusionRequest(shared_req);
+    var fusion_req = composedFusionRequest(shared_req);
+    if (defer_component_bodies) fusion_req.include_stored = true;
     var base = if (named_sets.items.len == 0)
         try emptySearchResult(alloc)
     else if (named_sets.items.len == 1)
@@ -1244,6 +1385,7 @@ fn appendEmbeddingsResultAlias(
     owned_results: *std.ArrayListUnmanaged(types.SearchResult),
     owned_resolved_sets: *std.ArrayListUnmanaged(*doc_set.ResolvedDocSet),
 ) !void {
+    if (req.graph_queries.len == 0) return;
     if (findComposedNamedSet(named_sets.items, "$embeddings_results") != null) return;
 
     var embedding_sets = std.ArrayListUnmanaged(graph_exec.NamedResultSet).empty;
@@ -1714,6 +1856,10 @@ const NativeDocIdConstraints = struct {
 };
 
 pub const StructuredFilterResolverExecutor = struct {
+    open_logical_sources: ?LogicalSourceOpener = null,
+    load_many_stored_values: ?*const fn (?*anyopaque, Allocator, []const []const u8) anyerror![]?[]u8 = null,
+
+    load_stored: ?*const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8 = null,
     /// The provider maps public document IDs exactly into its native identity space.
     exact_doc_id_filters: bool = false,
     ctx: ?*anyopaque,
@@ -2322,7 +2468,7 @@ fn collectFullTextResolvedDocSetAlloc(
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
-    const search_query = try textQueryToSearchQuery(arena_alloc, text_query, text_entry.text_analysis, text_entry.runtime_schema);
+    const search_query: search_mod.SearchQuery = .{ .match_all = {} };
 
     return try collectSearchQueryResolvedDocSetAlloc(
         alloc,
@@ -2331,6 +2477,8 @@ fn collectFullTextResolvedDocSetAlloc(
         text_entry,
         search_query,
         true,
+        .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns },
+        .{ .query = text_query, .request = req },
     );
 }
 
@@ -2932,7 +3080,7 @@ fn logExactSortBudgetRejection(
     );
 }
 
-fn checkSearchRequestDeadline(req: types.SearchRequest) !void {
+pub fn checkSearchRequestDeadline(req: types.SearchRequest) !void {
     if (req.cancellation) |cancellation| {
         if (cancellation.isCancelled()) return error.Cancelled;
     }
@@ -5454,6 +5602,31 @@ fn searchHitAllowedByCursor(req: types.SearchRequest, plan: SortExecutionPlan, h
     return false;
 }
 
+/// Shared typed ordering for bounded coordinators. Validate once at admission;
+/// heap comparisons then use the same numeric, timestamp, null and ID contract
+/// as local collection and distributed cursor merging.
+pub const SearchHitOrder = struct {
+    effective: EffectiveSortRequest,
+    plan: SortExecutionPlan,
+    pub fn init(a: Allocator, req: types.SearchRequest, runtime: ?runtime_schema_mod.TableSchema) !SearchHitOrder {
+        var effective = try effectiveSortRequestAlloc(a, req);
+        errdefer effective.deinit(a);
+        try validateSortPageOptions(effective.req);
+        if (effective.req.order_by.len == 0) return error.InvalidQueryRequest;
+        return .{ .effective = effective, .plan = .{ .kind = .distributed_k_way_merge, .runtime_schema = runtime } };
+    }
+    pub fn deinit(self: *SearchHitOrder, a: Allocator) void {
+        self.effective.deinit(a);
+    }
+    pub fn validate(self: SearchHitOrder, hit: types.SearchHit) !void {
+        _ = try compareSearchHitSortValues(self.effective.req, self.plan, hit, hit);
+        if (!try searchHitAllowedByCursor(self.effective.req, self.plan, hit)) return error.InvalidQueryRequest;
+    }
+    pub fn compare(self: SearchHitOrder, left: types.SearchHit, right: types.SearchHit) std.math.Order {
+        return compareSearchHitSortValues(self.effective.req, self.plan, left, right) catch unreachable;
+    }
+};
+
 const DistributedSortedShard = struct {
     hits: []const types.SearchHit = &.{},
     total_hits: ?u32 = null,
@@ -6826,7 +6999,10 @@ fn nativeSortValueFromTextDocValuesAlloc(
     field: []const u8,
 ) !?SortValue {
     const resolved = snapshot.resolveDocId(native_text_doc_id) orelse return null;
-    const segment = &snapshot.segments[resolved.seg_idx];
+    var segment_lease = try snapshot.leaseSegment(resolved.seg_idx);
+    defer segment_lease.deinit();
+    const segment = segment_lease.entry;
+    try reads.retainSegment(segment_lease);
     const reader = (try reads.get(&segment.reader, field)) orelse {
         logNativeDocValueLoadFailure(field, "missing_doc_values_section");
         return error.UnsupportedExactSort;
@@ -7561,7 +7737,7 @@ fn sortAndPageMatchAllCandidateStreamAlloc(
     };
 }
 
-const MatchAllIdSeekContext = struct {
+const MatchAllPageContext = struct {
     alloc: Allocator,
     req: types.SearchRequest,
     skip_count: usize,
@@ -7575,12 +7751,13 @@ const MatchAllIdSeekContext = struct {
     }
 };
 
-fn consumeMatchAllIdSeekCandidate(ctx: ?*anyopaque, candidate: MatchAllCandidate) !void {
-    const seek_ctx: *MatchAllIdSeekContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+fn consumeMatchAllPageCandidate(ctx: ?*anyopaque, candidate: MatchAllCandidate) !void {
+    const seek_ctx: *MatchAllPageContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
     const alloc = seek_ctx.alloc;
 
     var owned_candidate = candidate;
-    errdefer owned_candidate.deinit(alloc);
+    // The stream retains ownership on callback failure. On success this
+    // consumer either releases the candidate or transfers it into its page.
 
     seek_ctx.accepted_count += 1;
     if (seek_ctx.accepted_count <= seek_ctx.skip_count) {
@@ -7592,10 +7769,13 @@ fn consumeMatchAllIdSeekCandidate(ctx: ?*anyopaque, candidate: MatchAllCandidate
         return;
     }
 
-    const sort_values = try alloc.alloc(std.json.Value, 1);
-    errdefer alloc.free(sort_values);
-    sort_values[0] = .{ .string = try alloc.dupe(u8, owned_candidate.id) };
-    errdefer types.deinitJsonValue(alloc, &sort_values[0]);
+    const sort_values: []std.json.Value = if (seek_ctx.req.order_by.len > 0)
+        try alloc.alloc(std.json.Value, 1)
+    else
+        &.{};
+    errdefer if (sort_values.len > 0) alloc.free(sort_values);
+    if (sort_values.len > 0) sort_values[0] = .{ .string = try alloc.dupe(u8, owned_candidate.id) };
+    errdefer if (sort_values.len > 0) types.deinitJsonValue(alloc, &sort_values[0]);
 
     try seek_ctx.hits.append(alloc, .{
         .id = owned_candidate.id,
@@ -7684,7 +7864,7 @@ fn sortAndPageMatchAllIdSeekAlloc(
     observeSortCandidateSource(if (collect_sort_profile) &profile else null, "primary_key");
     observeNativeFilterConstraints(if (collect_sort_profile) &profile else null, constraints);
     if (collect_sort_profile) profile.window_capacity = stop_after;
-    var seek_ctx = MatchAllIdSeekContext{
+    var seek_ctx = MatchAllPageContext{
         .alloc = alloc,
         .req = effective_req,
         .skip_count = skip_count,
@@ -7699,7 +7879,7 @@ fn sortAndPageMatchAllIdSeekAlloc(
         .primary_key_reverse = reverse,
         .stop_after_accepted = stop_after,
         .scan_batch_size = @max(@min(stop_after, default_match_all_primary_key_scan_batch_size), 1),
-    }, &seek_ctx, consumeMatchAllIdSeekCandidate);
+    }, &seek_ctx, consumeMatchAllPageCandidate);
 
     const hits = try seek_ctx.hits.toOwnedSlice(alloc);
     if (reverse and hits.len > 1) std.mem.reverse(types.SearchHit, hits);
@@ -7806,7 +7986,10 @@ fn buildSortedSegmentDocMembershipAlloc(
 
     var doc_base: u32 = 0;
     var candidate_count: usize = 0;
-    for (snapshot.segments, 0..) |*segment, i| {
+    for (snapshot.segments, 0..) |_, i| {
+        var segment_lease = try snapshot.leaseSegment(i);
+        defer segment_lease.deinit();
+        const segment = segment_lease.entry;
         defer doc_base += segment.reader.doc_count;
         bitmaps[i] = try filter.executeWithOffset(alloc, segment, doc_base);
         candidate_count += bitmaps[i].cardinality();
@@ -7869,7 +8052,9 @@ fn decorateSortedSegmentDocAlloc(
     load_stored: *const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
     profile: ?*SortCollectorProfile,
 ) !DecoratedSortHit {
-    const segment = &snapshot.segments[segment_index];
+    var segment_lease = try snapshot.leaseSegment(segment_index);
+    defer segment_lease.deinit();
+    const segment = segment_lease.entry;
     const ordinal = try segment.reader.docOrdinal(local_doc_id);
     const global_doc_id = doc_base + local_doc_id;
     const raw_hit = types.SearchHit{
@@ -7974,7 +8159,9 @@ fn sortedSegmentSeekStartDocAlloc(
     load_stored: *const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
     reverse: bool,
 ) !i64 {
-    const segment = &snapshot.segments[iterator.segment_index];
+    var segment_lease = try snapshot.leaseSegment(iterator.segment_index);
+    defer segment_lease.deinit();
+    const segment = segment_lease.entry;
     const doc_count = segment.reader.doc_count;
     if (doc_count == 0) return -1;
     const cursor = activeSortCursor(req);
@@ -8068,7 +8255,9 @@ fn nextSortedSegmentHeadAlloc(
     var identity_scratch = segment_mod.SegmentReadScratch.init(alloc, 64 * 1024);
     defer identity_scratch.deinit();
     const iterator = &iterators[iterator_index];
-    const segment = &snapshot.segments[iterator.segment_index];
+    var segment_lease = try snapshot.leaseSegment(iterator.segment_index);
+    defer segment_lease.deinit();
+    const segment = segment_lease.entry;
     while (!sortedSegmentIteratorDone(snapshot, iterator.*, reverse)) {
         const local_doc_id: u32 = @intCast(iterator.next_doc);
         sortedSegmentIteratorAdvance(iterator, reverse);
@@ -8157,8 +8346,11 @@ fn countSortedSegmentVisibleCandidatesWithoutSortValuesAlloc(
     defer constraint_membership.deinit(alloc);
 
     var count: usize = 0;
-    for (snapshot.segments, 0..) |*segment, segment_index| {
-        if (segment.liveDocCount() == 0) continue;
+    for (snapshot.segments, 0..) |*physical, segment_index| {
+        if (physical.liveDocCount() == 0) continue;
+        var segment_lease = try snapshot.leaseSegment(segment_index);
+        defer segment_lease.deinit();
+        const segment = segment_lease.entry;
         for (0..segment.reader.doc_count) |local_doc_id_usize| {
             const local_doc_id: u32 = @intCast(local_doc_id_usize);
             scanned_count +|= 1;
@@ -8223,7 +8415,9 @@ fn countSortedSegmentVisibleCandidatesFromSeekAlloc(
 
     var count: usize = 0;
     for (iterators) |*iterator| {
-        const segment = &snapshot.segments[iterator.segment_index];
+        var segment_lease = try snapshot.leaseSegment(iterator.segment_index);
+        defer segment_lease.deinit();
+        const segment = segment_lease.entry;
         while (!sortedSegmentIteratorDone(snapshot, iterator.*, reverse)) {
             const local_doc_id: u32 = @intCast(iterator.next_doc);
             sortedSegmentIteratorAdvance(iterator, reverse);
@@ -8710,6 +8904,8 @@ fn collectStructuredFilterResolvedDocSetAlloc(
         text_entry,
         search_query,
         false,
+        .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns },
+        null,
     );
 }
 
@@ -8718,8 +8914,10 @@ fn collectSearchQueryResolvedDocSetAlloc(
     arena_alloc: Allocator,
     executor: StructuredFilterResolverExecutor,
     text_entry: *index_manager_mod.IndexManager.TextIndex,
-    search_query: search_mod.SearchQuery,
+    unresolved_query: search_mod.SearchQuery,
     allow_analyzed_terms: bool,
+    control: query_mod.ExecutionControl,
+    logical: ?struct { query: types.TextQuery, request: types.SearchRequest },
 ) !?doc_set.ResolvedDocSet {
     var identity_scratch = segment_mod.SegmentReadScratch.init(alloc, 64 * 1024);
     defer identity_scratch.deinit();
@@ -8733,6 +8931,10 @@ fn collectSearchQueryResolvedDocSetAlloc(
     const snapshot_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     const snapshot = text_entry.persistent.acquireSnapshot();
     defer snapshot.release();
+    var values = ValueExecution{ .a = alloc, .snapshot = snapshot, .req = if (logical) |l| l.request else .{}, .load_ctx = executor.ctx, .load = executor.load_stored, .load_many = executor.load_many_stored_values, .open_projected = executor.open_logical_sources };
+    defer values.deinit();
+    const search_query = if (logical) |l| try textQueryToSearchQueryWithValues(arena_alloc, l.query, text_entry.text_analysis, text_entry.runtime_schema, &values) else unresolved_query;
+
     if (bench_profile) snapshot_ns = platform_time.monotonicNs() - snapshot_start_ns;
     const capability_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     if (!(try searchQueryCanUseSnapshot(
@@ -8748,7 +8950,7 @@ fn collectSearchQueryResolvedDocSetAlloc(
     const filter = search_mod.searchQueryToFilterArena(arena_alloc, search_query) catch return null;
     if (bench_profile) filter_compile_ns = platform_time.monotonicNs() - filter_compile_start_ns;
     const execute_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-    const doc_nums = try snapshot.executeFilter(alloc, filter);
+    const doc_nums = try snapshot.executeFilter(alloc, filter.withControl(control));
     if (bench_profile) execute_ns = platform_time.monotonicNs() - execute_start_ns;
     defer alloc.free(doc_nums);
     if (doc_nums.len == 0) {
@@ -8823,7 +9025,7 @@ fn collectStructuredFilterTextDocNumsAlloc(
     ))) return null;
 
     const filter = search_mod.searchQueryToFilterArena(arena_alloc, search_query) catch return null;
-    const doc_nums = try snapshot.executeFilter(alloc, filter);
+    const doc_nums = try snapshot.executeFilter(alloc, filter.withControl(.{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns }));
     if (doc_nums.len == 0) {
         alloc.free(doc_nums);
         return .none;
@@ -8920,6 +9122,7 @@ fn collectStructuredFilterDocIdsAlloc(
     const k: u32 = @intCast(@min(snapshot.liveDocCount(), @as(u64, std.math.maxInt(u32))));
     var result = try search_mod.execute(alloc, snapshot, .{
         .query = search_query,
+        .control = .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns, .pattern_programs = req.text_pattern_programs },
         .k = k,
         .offset = 0,
         .include_stored = false,
@@ -9048,7 +9251,7 @@ fn queryFieldUsesKeywordAnalyzer(
     return analyzer.tokenizer == .keyword and analyzer.filters.len == 0 and analyzer.char_filters.len == 0;
 }
 
-fn resolveFilterTextIndexEntry(
+pub fn resolveFilterTextIndexEntry(
     executor: StructuredFilterResolverExecutor,
     primary_text_index_name: ?[]const u8,
     index_name: ?[]const u8,
@@ -9332,11 +9535,7 @@ fn patternFilterValueToSearchQuery(
     if (value.object.get("bool")) |bool_query| return try patternBoolFilterToSearchQuery(alloc, bool_query, text_analysis, runtime_schema);
 
     if (value.object.get("term")) |term| {
-        const field_value = try singleFieldString(term, "term");
-        return .{ .term = .{
-            .field = try exactTermFilterFieldAlloc(alloc, field_value.field, text_analysis, runtime_schema),
-            .term = field_value.value,
-        } };
+        return try scalarTermFilterToSearchQuery(alloc, term, text_analysis, runtime_schema);
     }
     if (value.object.get("terms")) |terms| {
         const field_terms = try singleFieldTerms(alloc, terms);
@@ -9423,7 +9622,7 @@ fn patternFilterValueToSearchQuery(
             .auto_fuzzy = field_fuzzy.auto_fuzzy,
         } };
     }
-    if (value.object.get("range")) |range_query| return try parseStandardRangeQuery(range_query, runtime_schema);
+    if (value.object.get("range")) |range_query| return try parseStandardRangeQuery(alloc, range_query, runtime_schema);
     if (value.object.get("numeric_range")) |range_query| return .{ .numeric_range = try parseNumericRangeQuery(range_query) };
     if (value.object.get("date_range")) |range_query| return .{ .date_range = try parseDateRangeQuery(range_query) };
     if (value.object.get("bool_field")) |bool_query| return .{ .bool_field = try parseBoolFieldQuery(bool_query) };
@@ -9780,6 +9979,62 @@ const FieldFuzzy = struct {
     auto_fuzzy: bool = false,
 };
 
+/// Native indexes use dotted source paths. Only translate pointers whose
+/// components have the same meaning; literal dots and array positions need
+/// stored evaluation rather than an approximate index predicate.
+fn nativeFilterFieldAlloc(alloc: Allocator, field: []const u8) ![]const u8 {
+    if (!std.mem.startsWith(u8, field, "/")) {
+        if (field.len == 0) return error.InvalidArgument;
+        return field;
+    }
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var parts = std.mem.splitScalar(u8, field[1..], '/');
+    while (parts.next()) |part| {
+        const decoded = try graph_exec.decodePatternJsonPointerSegmentAlloc(alloc, part);
+        defer if (std.mem.indexOfScalar(u8, part, '~') != null) alloc.free(decoded);
+        if (decoded.len == 0 or std.mem.indexOfScalar(u8, decoded, '.') != null) return error.InvalidArgument;
+        if (std.fmt.parseInt(u64, decoded, 10)) |_| return error.InvalidArgument else |_| {}
+        if (out.items.len != 0) try out.append(alloc, '.');
+        try out.appendSlice(alloc, decoded);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn scalarTermFilterToSearchQuery(
+    alloc: Allocator,
+    term: std.json.Value,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) !search_mod.SearchQuery {
+    if (term != .object) return error.InvalidArgument;
+    if (term.object.get("field") != null and term.object.get("path") != null) return error.InvalidArgument;
+    if (term.object.get("term") != null and term.object.get("value") != null) return error.InvalidArgument;
+    const raw_field, const value = blk: {
+        if (term.object.get("field") orelse term.object.get("path")) |field| {
+            break :blk .{ jsonString(field) orelse return error.InvalidArgument, term.object.get("term") orelse term.object.get("value") orelse return error.InvalidArgument };
+        }
+        if (term.object.count() != 1) return error.InvalidArgument;
+        var it = term.object.iterator();
+        const entry = it.next().?;
+        break :blk .{ entry.key_ptr.*, entry.value_ptr.* };
+    };
+    const field = try nativeFilterFieldAlloc(alloc, raw_field);
+    if (value == .string) return .{ .term = .{
+        .field = try exactTermFilterFieldAlloc(alloc, field, text_analysis, runtime_schema),
+        .term = value.string,
+    } };
+    const mapping = runtime_schema_mod.resolveDeclaredFieldType(runtime_schema orelse return error.InvalidArgument, field) orelse return error.InvalidArgument;
+    if (mapping.field_type == .numeric and (value == .integer or value == .float or value == .number_string)) {
+        const number = try jsonOptionalF64Strict(value);
+        // f64 indexes cannot distinguish neighboring large integer keys.
+        if (!std.math.isFinite(number.?) or @abs(number.?) >= 9007199254740992.0) return error.InvalidArgument;
+        return .{ .numeric_range = .{ .field = field, .min = number, .max = number, .inclusive_min = true, .inclusive_max = true } };
+    }
+    if (mapping.field_type == .boolean and value == .bool) return .{ .bool_field = .{ .field = field, .value = value.bool } };
+    return error.InvalidArgument;
+}
+
 fn singleFieldString(value: std.json.Value, value_key: []const u8) !FieldString {
     if (value != .object) return error.InvalidArgument;
     if (value.object.get("field") orelse value.object.get("path")) |field_value| {
@@ -9970,6 +10225,42 @@ test "pattern date range filter lowers public date and timestamp bounds" {
     try std.testing.expect(ns_query == .date_range);
     try std.testing.expectEqual(@as(u64, 1767398400000000000), ns_query.date_range.start_ns.?);
     try std.testing.expectEqual(@as(u64, 1767571200000000000), ns_query.date_range.end_ns.?);
+}
+
+test "pattern native pointer scalar filters preserve exact numeric and escaped path semantics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const schema: runtime_schema_mod.TableSchema = .{ .declared_fields = &.{
+        .{ .field = "hn_id", .mapping = .{ .field_type = .numeric } },
+        .{ .field = "created_at", .mapping = .{ .field_type = .numeric } },
+        .{ .field = "published", .mapping = .{ .field_type = .boolean } },
+    } };
+    const term = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"term":{"path":"/hn_id","value":142577}}
+    , .{});
+    const query = try patternFilterValueToSearchQuery(alloc, term.value, .{}, schema);
+    try std.testing.expectEqualStrings("hn_id", query.numeric_range.field);
+    try std.testing.expectEqual(@as(?f64, 142577), query.numeric_range.min);
+    try std.testing.expectEqual(query.numeric_range.min, query.numeric_range.max);
+    try std.testing.expect(query.numeric_range.inclusive_min and query.numeric_range.inclusive_max);
+    const range = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"range":{"path":"/created_at","gte":1700000000}}
+    , .{});
+    const range_query = try patternFilterValueToSearchQuery(alloc, range.value, .{}, schema);
+    try std.testing.expectEqualStrings("created_at", range_query.numeric_range.field);
+    const boolean = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"term":{"path":"/published","value":true}}
+    , .{});
+    try std.testing.expect((try patternFilterValueToSearchQuery(alloc, boolean.value, .{}, schema)).bool_field.value);
+    const unsafe = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"term":{"path":"/hn_id","value":9007199254740993}}
+    , .{});
+    try std.testing.expectError(error.InvalidArgument, patternFilterValueToSearchQuery(alloc, unsafe.value, .{}, schema));
+    try std.testing.expectEqualStrings("a/b~c.child", try nativeFilterFieldAlloc(alloc, "/a~1b~0c/child"));
+    for ([_][]const u8{ "", "/", "/a.b", "/items/0", "/a~2b" }) |path| {
+        try std.testing.expectError(error.InvalidArgument, nativeFilterFieldAlloc(alloc, path));
+    }
 }
 
 test "pattern typed structured filters accept explicit path alias" {
@@ -10410,20 +10701,21 @@ const JsonRangeBound = struct {
 };
 
 fn parseStandardRangeQuery(
+    alloc: Allocator,
     value: std.json.Value,
     runtime_schema: ?runtime_schema_mod.TableSchema,
 ) !search_mod.SearchQuery {
     if (value != .object) return error.InvalidArgument;
     if (value.object.get("field") orelse value.object.get("path")) |field_value| {
         const field = jsonString(field_value) orelse return error.InvalidArgument;
-        return try parseStandardRangeObject(field, value.object, runtime_schema);
+        return try parseStandardRangeObject(try nativeFilterFieldAlloc(alloc, field), value.object, runtime_schema);
     }
 
     if (value.object.count() != 1) return error.InvalidArgument;
     var it = value.object.iterator();
     const entry = it.next() orelse return error.InvalidArgument;
     if (entry.value_ptr.* != .object) return error.InvalidArgument;
-    return try parseStandardRangeObject(entry.key_ptr.*, entry.value_ptr.object, runtime_schema);
+    return try parseStandardRangeObject(try nativeFilterFieldAlloc(alloc, entry.key_ptr.*), entry.value_ptr.object, runtime_schema);
 }
 
 fn parseStandardRangeObject(
@@ -11692,7 +11984,12 @@ pub fn searchTextQuery(
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
-    var base_search_query = try textQueryToSearchQuery(arena_alloc, text_query, text_source.text_analysis, text_source.runtime_schema);
+    // The trusted lake coordinator prepared this exact text query once under
+    // the pinned index configuration. Borrow its analyzer and syntax identities
+    // across windows; subsequent predicate/key transformations remain local.
+    var value_execution = ValueExecution{ .a = alloc, .snapshot = text_source.snapshot, .req = effective_req, .load_ctx = executor.ctx, .load = executor.load_stored, .load_many = executor.load_many_stored_values, .open_projected = executor.open_logical_sources };
+    defer value_execution.deinit();
+    var base_search_query = if (effective_req.text_navigation_plan) |prepared| prepared.query else try textQueryToSearchQueryWithValues(arena_alloc, text_query, text_source.text_analysis, text_source.runtime_schema, &value_execution);
     if (executor.native_key) |native_key| base_search_query = try projectTextQueryKeys(arena_alloc, executor.ctx, native_key, base_search_query);
     // Full-text projection publishes replacement snapshots independently of
     // query execution. Pin this generation for the entire request: a borrowed
@@ -11750,6 +12047,7 @@ pub fn searchTextQuery(
         constraint_req.exclusion_query_json = "";
     }
     var native_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, constraint_req, .{
+        .load_stored = executor.load_stored,
         .ctx = executor.ctx,
         .text_index_entry = executor.text_index_entry,
         .exact_doc_id_filters = executor.exact_doc_id_filters,
@@ -11848,7 +12146,7 @@ pub fn searchTextQuery(
         effective_req.graph_queries.len == 0 and effective_req.aggregations_json.len == 0 and executor.is_expired_key == null)
     {
         try checkSearchRequestDeadline(effective_req);
-        const total = try search_mod.countMatches(alloc, snapshot, search_query);
+        const total = try search_mod.countMatchesPreparedWithControl(alloc, snapshot, search_query, effective_req.text_navigation_plan, .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns, .pattern_programs = effective_req.text_pattern_programs });
         try checkSearchRequestDeadline(effective_req);
         return .{ .alloc = alloc, .hits = &.{}, .total_hits = total, .total_hits_relation = .exact, .graph_results = &.{} };
     }
@@ -11873,12 +12171,12 @@ pub fn searchTextQuery(
         effective_req.full_text_queries.len == 0)
     {
         const sorted_membership_query = try textSearchQueryWithNativeDocIdsAlloc(arena_alloc, base_search_query, native_constraints, true);
-        const membership_filter = search_mod.searchQueryToFilterArena(arena_alloc, sorted_membership_query) catch |err| switch (err) {
+        const membership_filter = search_mod.searchQueryToFilterWithPreparation(arena_alloc, sorted_membership_query, effective_req.text_navigation_plan) catch |err| switch (err) {
             error.InvalidArgument => null,
             else => return err,
         };
         if (membership_filter) |filter| {
-            var membership = try buildSortedSegmentDocMembershipAlloc(alloc, snapshot, filter);
+            var membership = try buildSortedSegmentDocMembershipAlloc(alloc, snapshot, filter.withControl(.{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns }));
             defer membership.deinit(alloc);
 
             const cost_decision = sortedSegmentSelectiveCandidateDocValuesDecision(effective_req, membership.candidate_count, snapshot);
@@ -11967,7 +12265,7 @@ pub fn searchTextQuery(
                 alloc,
                 effective_req,
                 snapshot,
-                filter,
+                filter.withControl(.{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns }),
                 executor,
                 field_sort_plan,
             );
@@ -11978,7 +12276,7 @@ pub fn searchTextQuery(
                 const selected = try arena_alloc.alloc(u32, out.hits.len);
                 for (out.hits, selected) |hit, *doc| doc.* = hit.native_text_doc_id orelse return error.InvalidData;
                 std.mem.sort(u32, selected, {}, std.sort.asc(u32));
-                var scored = try search_mod.execute(alloc, snapshot, .{ .query = search_query, .k = @intCast(selected.len), .include_stored = false, .filter_doc_nums = selected, .filter_doc_nums_positive = true, .distributed_text_stats = effective_req.distributed_text_stats });
+                var scored = try search_mod.execute(alloc, snapshot, .{ .query = search_query, .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns, .pattern_programs = effective_req.text_pattern_programs, .pattern_cache = effective_req.text_pattern_membership }, .k = @intCast(selected.len), .include_stored = false, .filter_doc_nums = selected, .filter_doc_nums_positive = true, .distributed_text_stats = effective_req.distributed_text_stats });
                 defer scored.deinit();
                 var scores: std.AutoHashMapUnmanaged(u32, f32) = .empty;
                 defer scores.deinit(alloc);
@@ -12063,14 +12361,18 @@ pub fn searchTextQuery(
 
         const execute_start_ns = if (collect_score_timing) platform_time.monotonicNs() else 0;
         var result = if (effective_req.count_only)
-            try search_mod.executeCountCandidates(alloc, snapshot, search_query)
+            try search_mod.executeCountCandidatesWithControl(alloc, snapshot, search_query, .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns })
         else
             try search_mod.execute(alloc, snapshot, .{
                 .query = search_query,
+                .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns, .pattern_programs = effective_req.text_pattern_programs, .pattern_cache = effective_req.text_pattern_membership },
                 .k = if (collect_window_candidates) candidate_limit else paging.limit,
                 .offset = if (collect_window_candidates) 0 else paging.offset,
                 .include_stored = load_stored_in_search_engine,
                 .distributed_text_stats = effective_req.distributed_text_stats,
+                .minimum_competitive_score = effective_req.minimum_competitive_score,
+                .text_navigation_plan = effective_req.text_navigation_plan,
+                .tie_rank = effective_req.native_text_tie_rank orelse text_source.logical_tie_rank,
                 .filter_doc_nums = native_constraints.filter_doc_nums,
                 .filter_doc_nums_positive = native_constraints.positive_filter,
                 .exclude_doc_nums = native_constraints.exclude_doc_nums,
@@ -12101,6 +12403,16 @@ pub fn searchTextQuery(
         for (result.hits, 0..) |hit, i| {
             if (i % 1024 == 0) try checkSearchRequestDeadline(effective_req);
             const doc_ordinal = try snapshot.docOrdinal(hit.doc_id);
+            if (!chunk_backed) if (executor.project_doc_num) |project_doc_num| if (try project_doc_num(executor.ctx, alloc, snapshot, hit.doc_id)) |key| {
+                var materialized = types.SearchHit{ .id = key, .doc_ordinal = doc_ordinal, .native_text_doc_id = hit.doc_id, .score = hit.score };
+                var assigned = false;
+                errdefer if (!assigned) materialized.deinit(alloc);
+                materialized.index_scores = try types.cloneIndexScores(alloc, hit.index_scores);
+                hits[i] = materialized;
+                assigned = true;
+                initialized += 1;
+                continue;
+            };
             const id = hit.id orelse {
                 identity_scratch.reset();
                 const stored = .{ .id = (try snapshot.storedIdScoped(identity_scratch.allocator(), hit.doc_id)) orelse return error.StoredDocMissing };
@@ -12240,7 +12552,7 @@ pub fn searchTextQuery(
                 try sortAndPageSearchResultInPlace(&out, effective_req, executor.ctx, executor.load_stored, field_sort_plan, null);
             }
         } else if ((late_visibility_paginate or group_chunk_parents or executor.filter_candidate_presence) and !effective_req.count_only) {
-            try paginateSearchResultInPlace(&out, effective_req.offset, effective_req.limit);
+            try paginateSearchResultInPlace(&out, paging.offset, paging.limit);
         }
         // This is population-exhaustion evidence, independently of corpus
         // totals (which include matches before a cursor). Preserve it through
@@ -12477,7 +12789,10 @@ fn textDocNumsForDocIdsAlloc(
     errdefer out.deinit(alloc);
     var doc_offset: u32 = 0;
     var scanned_count: u64 = 0;
-    for (snapshot.segments) |*seg| {
+    for (snapshot.segments, 0..) |_, segment_index| {
+        var segment_lease = try snapshot.leaseSegment(segment_index);
+        defer segment_lease.deinit();
+        const seg = segment_lease.entry;
         {
             seg.shared.lockDeletionShared();
             defer seg.shared.unlockDeletionShared();
@@ -12739,7 +13054,10 @@ fn collectFilteredExplicitTextStats(
     var selected_doc_keys = std.ArrayListUnmanaged([]const u8).empty;
     defer freeDocIdArrayList(alloc, &selected_doc_keys);
     var doc_offset: u32 = 0;
-    for (snapshot.segments) |*seg| {
+    for (snapshot.segments, 0..) |_, segment_index| {
+        var segment_lease = try snapshot.leaseSegment(segment_index);
+        defer segment_lease.deinit();
+        const seg = segment_lease.entry;
         {
             seg.shared.lockDeletionShared();
             defer seg.shared.unlockDeletionShared();
@@ -12790,7 +13108,10 @@ fn collectFilteredExplicitTextStats(
         // Index-only adapters have no primary document store. Retain an exact
         // fallback by summing native term frequencies for allowed documents.
         doc_offset = 0;
-        for (snapshot.segments) |*seg| {
+        for (snapshot.segments, 0..) |_, segment_index| {
+            var segment_lease = try snapshot.leaseSegment(segment_index);
+            defer segment_lease.deinit();
+            const seg = segment_lease.entry;
             var allowed_local_docs = roaring.RoaringBitmap.init(alloc);
             defer allowed_local_docs.deinit();
             {
@@ -15624,7 +15945,7 @@ pub fn searchSparse(
             .exclude_doc_ids = native_constraints.exclude_doc_ids,
             .filter_doc_nums = native_constraints.filter_doc_nums,
             .exclude_doc_nums = native_constraints.exclude_doc_nums,
-            .key_predicate = if (req.native_key_predicate) |predicate| .{ .ptr = predicate.ptr, .allows = predicate.allows, .select_ordinals = predicate.select_ordinals, .select_constraints = predicate.select_constraints } else null,
+            .key_predicate = if (req.native_key_predicate) |predicate| .{ .ptr = predicate.ptr, .allows = predicate.allows, .select_ordinals = predicate.select_ordinals, .select_constraints = predicate.select_constraints, .constraint_revision = predicate.constraint_revision, .select_range = predicate.select_range } else null,
             .cancellation = req.cancellation,
         });
         defer sparse_mod.SparseIndex.freeResults(alloc, raw_hits);
@@ -16276,8 +16597,14 @@ fn snapshotTypedDocValuesCoverageDetailsForMappingWithValidation(
     validation: ?index_mod.CoverageValidation,
 ) !TypedDocValuesCoverage {
     var expected_value_type: ?typed_dv.ValueType = null;
-    for (snapshot.segments) |*segment| {
-        if (segment.liveDocCount() == 0) continue;
+    for (snapshot.segments, 0..) |*physical, segment_index| {
+        if (physical.liveDocCount() == 0) continue;
+        var segment_lease = snapshot.leaseSegment(segment_index) catch |err| switch (err) {
+            error.Canceled => return error.Cancelled,
+            else => return err,
+        };
+        defer segment_lease.deinit();
+        const segment = segment_lease.entry;
         const cached = (segment.typedDocValuesCoverageWithValidation(field, validation) catch |err| switch (err) {
             // Search requests use the historical double-l spelling at this
             // layer; keep that public contract while the shared token remains
@@ -16313,8 +16640,11 @@ fn snapshotGeoPointDocValuesCoverage(
     snapshot: *const index_mod.IndexSnapshot,
     field: []const u8,
 ) !TypedDocValuesCoverageStatus {
-    for (snapshot.segments) |*segment| {
-        if (segment.liveDocCount() == 0) continue;
+    for (snapshot.segments, 0..) |*physical, segment_index| {
+        if (physical.liveDocCount() == 0) continue;
+        var segment_lease = try snapshot.leaseSegment(segment_index);
+        defer segment_lease.deinit();
+        const segment = segment_lease.entry;
         const cached = (try segment.typedDocValuesCoverage(field)) orelse return .missing_doc_values_section;
         const value_type = cached.value_type orelse return cached.status;
         if (value_type != .geo_point) return .doc_values_kind_mismatch;
@@ -16324,6 +16654,7 @@ fn snapshotGeoPointDocValuesCoverage(
 }
 
 fn sortFieldMapping(schema: runtime_schema_mod.TableSchema, field: []const u8) ?runtime_schema_mod.FieldMapping {
+    if (runtime_schema_mod.resolveLogicalDocValues(schema, field)) |resolved| return resolved.mapping;
     return runtime_schema_mod.resolveDeclaredFieldType(schema, field);
 }
 
@@ -16612,8 +16943,11 @@ fn snapshotSegmentsHaveIndexSortAlloc(
 ) !bool {
     if (schema.index_sort.len == 0) return false;
     var covered_live_segments = false;
-    for (snapshot.segments) |*segment| {
-        if (segment.liveDocCount() == 0) continue;
+    for (snapshot.segments, 0..) |*physical, segment_index| {
+        if (physical.liveDocCount() == 0) continue;
+        var segment_lease = try snapshot.leaseSegment(segment_index);
+        defer segment_lease.deinit();
+        const segment = segment_lease.entry;
         covered_live_segments = true;
         if (!try segmentIndexSortMatchesSchemaAlloc(alloc, &segment.reader, schema)) return false;
     }
@@ -16694,8 +17028,11 @@ fn snapshotSegmentsHaveIndexSortBoundsAlloc(
 ) !bool {
     if (schema.index_sort.len == 0) return false;
     var covered_live_segments = false;
-    for (snapshot.segments) |*segment| {
-        if (segment.liveDocCount() == 0) continue;
+    for (snapshot.segments, 0..) |*physical, segment_index| {
+        if (physical.liveDocCount() == 0) continue;
+        var segment_lease = try snapshot.leaseSegment(segment_index);
+        defer segment_lease.deinit();
+        const segment = segment_lease.entry;
         covered_live_segments = true;
         const bounds = segment.reader.indexSortBoundsAlloc(alloc) catch |err| {
             if (err == error.OutOfMemory) return err;
@@ -16856,7 +17193,10 @@ fn buildAllOrdinalTextDocIdMapAlloc(
 
     var doc_offset: u32 = 0;
     var saw_live_doc = false;
-    for (snapshot.segments) |*segment| {
+    for (snapshot.segments, 0..) |_, segment_index| {
+        var segment_lease = try snapshot.leaseSegment(segment_index);
+        defer segment_lease.deinit();
+        const segment = segment_lease.entry;
         {
             segment.shared.lockDeletionShared();
             defer segment.shared.unlockDeletionShared();
@@ -16891,7 +17231,10 @@ fn matchAllDocOrdinalsForDocIdsAlloc(
     var out = std.ArrayListUnmanaged(u32).empty;
     errdefer out.deinit(alloc);
     var scanned_count: u64 = 0;
-    for (snapshot.segments) |*segment| {
+    for (snapshot.segments, 0..) |_, segment_index| {
+        var segment_lease = try snapshot.leaseSegment(segment_index);
+        defer segment_lease.deinit();
+        const segment = segment_lease.entry;
         {
             segment.shared.lockDeletionShared();
             defer segment.shared.unlockDeletionShared();
@@ -17523,6 +17866,53 @@ pub fn searchMatchAll(
         native_constraints.exclusion_query_json_resolved,
     );
 
+    if (executor.bounded_unordered_page and exec_req.order_by.len == 0 and
+        !requestHasSortPageOptions(exec_req) and !unresolved_stored_filters and
+        executor.collect_candidates_stream != null)
+    {
+        const start_ns = if (postprocess_req.profile) platform_time.monotonicNs() else 0;
+        // This is the final page of a proven single primary population.
+        // Fusion windows do not widen its public pagination or zero-limit count.
+        const paging = ComponentPaging{ .offset = postprocess_req.offset, .limit = postprocess_req.limit };
+        const count_only = postprocess_req.count_only or paging.limit == 0;
+        var page = MatchAllPageContext{
+            .alloc = alloc,
+            .req = postprocess_req,
+            .skip_count = paging.offset,
+            .limit = if (count_only) 0 else paging.limit,
+        };
+        defer page.deinitHits();
+        const stop_after: usize = @as(usize, paging.offset) +| @as(usize, paging.limit);
+        const stats = try executor.collect_candidates_stream.?(executor.ctx, alloc, postprocess_req, .{
+            .constraints = &native_constraints,
+            .stop_after_accepted = if (count_only) null else stop_after,
+            .scan_batch_size = if (count_only) default_match_all_primary_key_scan_batch_size else @max(@min(stop_after, default_match_all_primary_key_scan_batch_size), 1),
+        }, &page, consumeMatchAllPageCandidate);
+        try checkSearchRequestDeadline(postprocess_req);
+        const selected_count = page.hits.items.len;
+        var out = types.SearchResult{
+            .alloc = alloc,
+            .hits = try page.hits.toOwnedSlice(alloc),
+            .total_hits = boundedU32(stats.accepted_count),
+            .total_hits_relation = if (stats.stopped_early or stats.accepted_count > std.math.maxInt(u32)) .gte else .exact,
+            .sort_profile = if (postprocess_req.profile) sortResultProfile(postprocess_req, .{ .kind = .score_top_k }, false, .{
+                .candidate_source = "primary_key",
+                .candidate_count = stats.accepted_count,
+                .selected_count = selected_count,
+                .window_capacity = if (count_only) 0 else stop_after,
+                .window_len = selected_count,
+                .total_ns = platform_time.monotonicNs() - start_ns,
+            }) else null,
+            .graph_results = &.{},
+        };
+        errdefer out.deinit();
+        if (postprocess_req.include_stored) {
+            _ = try loadMissingProjectedMatchAllHitDocuments(alloc, postprocess_req, executor, out.hits);
+            try dropMissingStoredSearchHits(alloc, &out, "match_all");
+        }
+        return out;
+    }
+
     if (exec_req.order_by.len > 0 and
         (planned_sort.kind == .sorted_segment_seek or planned_sort.kind == .native_doc_values_top_n) and
         (native_constraints.filter_doc_ids.len > 0 or native_constraints.exclude_doc_ids.len > 0))
@@ -18052,7 +18442,7 @@ fn collectMatchAllCandidateStateWithOptions(
                 return .@"continue";
             }
         };
-        try scan(collector.ctx, alloc, options, &state, Visitor.visit);
+        try scan(collector.scan_ids_ctx orelse collector.ctx, alloc, options, &state, Visitor.visit);
     } else if (collector.scan_store_range_with_context) |scan| {
         var current_lower = try alloc.dupe(u8, lower);
         defer alloc.free(current_lower);
@@ -18263,10 +18653,15 @@ const MatchAllCandidateCollectState = struct {
 
         errdefer candidate.deinit(self.alloc);
         if (self.consumer) |consumer| {
-            const seen_key = try self.alloc.dupe(u8, candidate.id);
-            errdefer self.alloc.free(seen_key);
-            try self.seen.put(self.alloc, seen_key, {});
-            try self.seen_key_storage.append(self.alloc, seen_key);
+            {
+                const seen_key = try self.alloc.dupe(u8, candidate.id);
+                errdefer self.alloc.free(seen_key);
+                try self.seen.put(self.alloc, seen_key, {});
+                try self.seen_key_storage.append(self.alloc, seen_key);
+            }
+            // Storage owns the dedup key before the consumer can fail. Its
+            // outer cleanup frees it; the candidate remains owned here until
+            // the consumer succeeds.
 
             try consumer(self.consumer_ctx, candidate);
             candidate.id = @constCast(&[_]u8{});
@@ -18280,13 +18675,1084 @@ const MatchAllCandidateCollectState = struct {
     }
 };
 
+const value_query = @import("../../../search/value_query.zig");
+
+/// Request-owned verification: compact membership is memoized so rescoring,
+/// cursor collection and counting do not reload the same original values.
+const ValueExecution = struct {
+    const LiteralGroup = struct {
+        set: value_query.LiteralSet,
+        slots: [64]u6,
+        count: usize,
+    };
+    const Cohort = struct { known: roaring.RoaringBitmap, members: u64 = 0, literal_group: ?usize = null };
+    a: Allocator,
+    snapshot: *const index_mod.IndexSnapshot,
+    req: types.SearchRequest,
+    load_ctx: ?*anyopaque,
+    load: ?*const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
+    producers: std.ArrayListUnmanaged(*ValueProducer) = .empty,
+    local_work: value_query.Work = .{},
+    load_many: ?*const fn (?*anyopaque, Allocator, []const []const u8) anyerror![]?[]u8 = null,
+    open_projected: ?LogicalSourceOpener = null,
+    projected_reader: ?LogicalSourceReader = null,
+    projected_unavailable: bool = false,
+    projection: ?@import("../../../search/value_source.zig").Plan = null,
+    projection_attempted: bool = false,
+    stored_read_policy: @import("../../../search/value_source.zig").StoredReadPolicy = .{},
+    source_tuner: SourceReadTuner = .{},
+    tuning_key: ?u64 = null,
+    tuning_started: bool = false,
+    source_epoch: usize = 0,
+    original_average_bytes: u64 = 0,
+    literal_groups: std.ArrayListUnmanaged(LiteralGroup) = .empty,
+    cohorts: std.ArrayListUnmanaged(Cohort) = .empty,
+    active_cohort: ?usize = null,
+    literals_checked: bool = false,
+    fn beginTuning(self: *@This(), projected: bool) void {
+        if (self.tuning_started and !projected) return;
+        self.publishTuning();
+        self.tuning_started = true;
+        self.tuning_key = null;
+        const scope = self.req.value_search_scope orelse return;
+        // Hints contain timing/size classes only, never source or membership.
+        // A provider change or a projected reader gets independent feedback.
+        var hash = std.hash.Wyhash.init(if (projected) 1 else 0);
+        hash.update(&scope.source_identity);
+        if (self.req.index_name) |index| hash.update(index);
+        const provider = if (projected) if (self.open_projected) |open| @intFromPtr(open) else 0 else if (self.load_many) |load| @intFromPtr(load) else if (self.load) |load| @intFromPtr(load) else 0;
+        hash.update(std.mem.asBytes(&provider));
+        const key = hash.final();
+        self.tuning_key = key;
+        if (source_read_hints.get(key, @import("../native_query_cut.zig").nowMs())) |hint| {
+            const max_rows = self.source_tuner.max_rows;
+            self.source_tuner = hint;
+            self.source_tuner.max_rows = max_rows;
+        }
+    }
+    fn publishTuning(self: *@This()) void {
+        if (self.tuning_key) |key| source_read_hints.put(key, self.source_tuner, @import("../native_query_cut.zig").nowMs());
+    }
+    fn observeOriginal(self: *@This(), rows: usize, bytes: u64) void {
+        if (rows == 0) return;
+        const mean = bytes / rows;
+        self.original_average_bytes = if (self.original_average_bytes == 0) mean else (self.original_average_bytes *| 3 +| mean) / 4;
+    }
+    fn shouldProject(self: *const @This()) bool {
+        if (self.projected_reader != null) return true;
+        return self.open_projected != null and !self.projected_unavailable and self.original_average_bytes >= @import("../../document_projection.zig").minimum_bytes and self.stored_read_policy.mayBenefit();
+    }
+    fn projectedSources(self: *@This(), a: Allocator, ids: []const []const u8) !?[]LogicalSourceRow {
+        var fields: [64][]const u8 = undefined;
+        const selected = self.paths(&fields);
+        if (selected.len == 0 and self.projected_reader == null) {
+            self.projected_unavailable = true;
+            return null;
+        }
+        const probe = selected.len != 0 and self.stored_read_policy.admit(ids.len);
+        if (!probe and self.projected_reader == null) return null;
+        if (self.projected_reader == null) {
+            self.projected_reader = try self.open_projected.?(self.load_ctx, @import("../../../sql/memory_budget.zig").reclaimingAllocator(self.a));
+            if (self.projected_reader == null) {
+                self.projected_unavailable = true;
+                return null;
+            }
+            // Different source representations have different read costs.
+            // Restart learning without charging one-time snapshot setup to a
+            // steady-state arm, retaining any allocator-imposed row ceiling.
+            self.publishTuning();
+            self.tuning_key = null;
+            self.source_tuner = .{ .max_rows = self.source_tuner.max_rows, .bootstrapped = true };
+            self.beginTuning(true);
+            self.source_epoch += 1;
+        }
+        const reader = self.projected_reader.?;
+        // Once pinned, fallback must retain this reader's exact snapshot.
+        // Empty paths request complete bodies without authority inspection.
+        const rows = try reader.load(reader.ctx, a, ids, if (probe) selected else &.{});
+        if (probe) {
+            var projected: usize = 0;
+            for (rows) |row| if (row.projected) {
+                projected += 1;
+            };
+            self.stored_read_policy.observeProbe(rows.len, projected);
+        }
+        return rows;
+    }
+    // Immutable logical predicate paths, never synthesized physical names.
+    // Empty/root-wide predicates require complete original bytes.
+    fn paths(self: *@This(), output: *[64][]const u8) []const []const u8 {
+        if (self.producers.items.len > output.len) return &.{};
+        var n: usize = 0;
+        for (self.producers.items) |producer| {
+            const field = producer.matcher.spec.field;
+            if (field.len == 0) return &.{};
+            const root = field;
+            const duplicate = for (output[0..n]) |prior| {
+                if (std.mem.eql(u8, prior, root)) break true;
+            } else false;
+            if (!duplicate) {
+                output[n] = root;
+                n += 1;
+            }
+        }
+        return output[0..n];
+    }
+    fn deinit(self: *@This()) void {
+        self.publishTuning();
+        if (self.projected_reader) |reader| reader.close(reader.ctx);
+        self.clearGroups();
+        for (self.producers.items) |producer| {
+            producer.matcher.deinit();
+            producer.visited.deinit();
+            producer.matched.deinit();
+            self.a.destroy(producer);
+        }
+        self.producers.deinit(self.a);
+        for (self.cohorts.items) |*cohort| cohort.known.deinit();
+        self.cohorts.deinit(self.a);
+        self.local_work.deinit(self.a);
+    }
+    fn clearGroups(self: *@This()) void {
+        if (self.projection) |*plan| plan.deinit();
+        self.projection = null;
+        self.projection_attempted = false;
+        self.stored_read_policy = .{};
+        for (self.literal_groups.items) |*group| group.set.deinit();
+        self.literal_groups.deinit(self.a);
+        self.literal_groups = .empty;
+        for (self.cohorts.items) |*cohort| {
+            cohort.known.deinit();
+            cohort.known = roaring.RoaringBitmap.init(self.a);
+            cohort.literal_group = null;
+        }
+        self.literals_checked = false;
+    }
+    fn sourceValue(self: *@This(), a: Allocator, bytes: []const u8, stored_projection: bool) !std.json.Value {
+        const work = self.req.value_search_work orelse &self.local_work;
+        const start = if (self.req.profile) platform_time.monotonicNs() else 0;
+        defer if (self.req.profile) {
+            _ = work.source_parse_ns.fetchAdd(platform_time.monotonicNs() - start, .monotonic);
+        };
+        // Small objects keep the standard parser's low setup cost. Large
+        // sources build only relevant path structure, validating everything.
+        if (bytes.len >= 1024 and self.producers.items.len <= 64) {
+            if (!self.projection_attempted) {
+                self.projection_attempted = true;
+                var fields: [64][]const u8 = undefined;
+                for (self.producers.items, 0..) |producer, i| fields[i] = producer.matcher.spec.field;
+                self.projection = @import("../../../search/value_source.zig").Plan.init(self.a, fields[0..self.producers.items.len]) catch null;
+            }
+        }
+        const parsed = try @import("../../../search/value_source.zig").parse(a, bytes, if (self.projection) |*plan| plan else null);
+        if (!stored_projection and bytes.len >= @import("../../document_projection.zig").minimum_bytes) {
+            if (parsed.projected) {
+                self.stored_read_policy.observeSource(bytes.len, self.projection.?.selected_string_bytes);
+            } else {
+                self.stored_read_policy.forgetCoverage();
+            }
+        }
+        if (self.req.profile and (parsed.projected or stored_projection)) _ = work.projected_sources.fetchAdd(1, .monotonic);
+        return parsed.value;
+    }
+
+    fn streamsPredicates(self: *@This(), producer: *ValueProducer) bool {
+        if (self.producers.items.len > 64) return false;
+        const cohort = producer.cohort orelse return false;
+        return @popCount(self.cohorts.items[cohort].members) >= 2;
+    }
+    fn newCohort(self: *@This()) !usize {
+        const id = self.cohorts.items.len;
+        try self.cohorts.append(self.a, .{ .known = roaring.RoaringBitmap.init(self.a) });
+        return id;
+    }
+    fn prepareLiterals(self: *@This()) void {
+        if (self.literals_checked) return;
+        self.literals_checked = true;
+        if (self.producers.items.len > 64) return;
+        var grouped: u64 = 0;
+        for (self.producers.items, 0..) |first, i| {
+            if (grouped & (@as(u64, 1) << @intCast(i)) != 0) continue;
+            const spec = first.matcher.spec;
+            if (spec.kind != .contains or !spec.case_sensitive or first.exact_keyword or !self.streamsPredicates(first)) continue;
+            var needles: [64][]const u8 = undefined;
+            var slots: [64]u6 = undefined;
+            var n: usize = 0;
+            for (self.producers.items, 0..) |other, j| {
+                const candidate = other.matcher.spec;
+                if (candidate.kind != .contains or !candidate.case_sensitive or other.exact_keyword or other.cohort != first.cohort or !std.mem.eql(u8, candidate.field, spec.field)) continue;
+                needles[n] = candidate.text;
+                slots[n] = @intCast(j);
+                grouped |= @as(u64, 1) << @intCast(j);
+                n += 1;
+            }
+            if (n < 3) continue;
+            var set = value_query.LiteralSet.init(@import("../../../sql/memory_budget.zig").reclaimingAllocator(self.a), needles[0..n]) catch continue;
+            self.literal_groups.append(self.a, .{ .set = set, .slots = slots, .count = n }) catch {
+                set.deinit();
+                continue;
+            };
+            const cohort = &self.cohorts.items[first.cohort.?];
+            if (@popCount(cohort.members) == n) cohort.literal_group = self.literal_groups.items.len - 1;
+        }
+    }
+    fn evaluateLeaf(self: *@This(), slot: usize, doc: std.json.Value, done: *u64, positives: *u64) !void {
+        const bit = @as(u64, 1) << @intCast(slot);
+        if (done.* & bit != 0) return;
+        const producer = self.producers.items[slot];
+        for (self.literal_groups.items) |*group| {
+            var member = false;
+            for (group.slots[0..group.count]) |index| if (index == slot) {
+                member = true;
+                break;
+            };
+            if (!member) continue;
+            if (group.set.document(doc, producer.matcher.spec.field)) |bits| {
+                for (group.slots[0..group.count], 0..) |index, j| {
+                    const target = @as(u64, 1) << index;
+                    done.* |= target;
+                    if (bits & (@as(u64, 1) << @intCast(j)) != 0) positives.* |= target;
+                }
+                return;
+            } else |_| {
+                // Eager group traversal may exceed a limit after a required
+                // leaf could have returned early. Preserve individual behavior.
+                break;
+            }
+        }
+        const yes = try producer.matcher.document(doc);
+        done.* |= bit;
+        if (yes) positives.* |= bit;
+    }
+    fn matchSource(self: *@This(), producer: *ValueProducer, global: u32, doc: std.json.Value) !bool {
+        if (!self.streamsPredicates(producer)) return producer.matcher.document(doc);
+        const cohort = &self.cohorts.items[producer.cohort.?];
+        // A wholly literal cohort retains the original single-automaton path:
+        // no generic per-leaf dispatch, coverage probes or sibling polling.
+        if (cohort.literal_group) |index| {
+            const group = &self.literal_groups.items[index];
+            if (group.set.document(doc, producer.matcher.spec.field)) |bits| {
+                try cohort.known.add(global);
+                var remaining = bits;
+                while (remaining != 0) {
+                    const slot = group.slots[@intCast(@ctz(remaining))];
+                    try self.producers.items[slot].matched.add(global);
+                    remaining &= remaining - 1;
+                }
+                return producer.matched.contains(global);
+            } else |_| {
+                // Preserve the required leaf's early-return behavior on a
+                // source traversal limit, using individual matchers below.
+            }
+        }
+        const required = cohort.members;
+        var done: u64 = 0;
+        var positives: u64 = 0;
+        for (self.producers.items, 0..) |leaf, i| {
+            const bit = @as(u64, 1) << @intCast(i);
+            if (required & bit == 0) continue;
+            if (leaf.visited.contains(global)) {
+                done |= bit;
+                if (leaf.matched.contains(global)) positives |= bit;
+            }
+        }
+        try self.evaluateLeaf(producer.slot, doc, &done, &positives);
+        for (self.producers.items, 0..) |leaf, i| {
+            const bit = @as(u64, 1) << @intCast(i);
+            if (required & bit == 0 or done & bit != 0) continue;
+            // Preserve indexed selectivity: a sibling with its own candidate
+            // constraint runs through that iterator rather than expanding work
+            // to this leaf's broader source domain.
+            if (leaf != producer and leaf.candidate != null) continue;
+            try (@import("../../../search/query.zig").ExecutionControl{ .cancellation = self.req.cancellation, .deadline_ns = self.req.execution_deadline_ns }).check();
+            // Optional siblings use the same bounded work policy. Failures are
+            // never negative facts: defer them until that leaf is demanded by
+            // its own candidate iterator, without failing the requested leaf.
+            self.evaluateLeaf(i, doc, &done, &positives) catch continue;
+        }
+        const complete = done & required == required;
+        if (complete) try cohort.known.add(global);
+        for (self.producers.items, 0..) |leaf, i| {
+            const bit = @as(u64, 1) << @intCast(i);
+            if (done & bit == 0) continue;
+            if (!complete) try leaf.visited.add(global);
+            if (positives & bit != 0) try leaf.matched.add(global);
+        }
+        return positives & (@as(u64, 1) << @intCast(producer.slot)) != 0;
+    }
+    fn prepare(self: *@This(), arena: Allocator, spec: value_query.Spec, analysis: introducer_mod.TextAnalysisConfig, schema: ?runtime_schema_mod.TableSchema) !search_mod.SearchQuery {
+        const producer = try self.a.create(ValueProducer);
+        errdefer self.a.destroy(producer);
+        producer.* = .{ .owner = self, .visited = roaring.RoaringBitmap.init(self.a), .matched = roaring.RoaringBitmap.init(self.a) };
+        errdefer producer.visited.deinit();
+        errdefer producer.matched.deinit();
+        try producer.matcher.init(self.a, spec);
+        errdefer producer.matcher.deinit();
+        producer.matcher.work = self.req.value_search_work orelse &self.local_work;
+        producer.matcher.policy = self.req.value_search_execution;
+        var candidate: ?search_mod.SearchQuery = null;
+        if (spec.case_sensitive and spec.text.len != 0) {
+            if (spec.kind == .equals) {
+                if (try valueRepresentation(arena, schema, analysis, spec.field, "keyword")) |field| {
+                    candidate = .{ .term = .{ .field = field, .term = spec.text } };
+                    producer.exact_keyword = logicalKeywordProvesEquality(schema.?, spec.field, field);
+                }
+            } else {
+                const literal = if (spec.kind == .contains) spec.text else producer.matcher.pattern.?.prefilter;
+                if (longestAsciiFragment(literal)) |fragment| {
+                    if (try valueRepresentation(arena, schema, analysis, spec.field, "substring")) |field| {
+                        const folded = try arena.dupe(u8, fragment);
+                        for (folded) |*byte| byte.* = std.ascii.toLower(byte.*);
+                        candidate = .{ .prefix = .{ .field = field, .prefix = folded } };
+                    }
+                }
+            }
+        }
+        if (candidate) |query| {
+            producer.candidate = try search_mod.searchQueryToFilterArena(arena, query);
+        } else if (!self.req.value_search_execution.allow_scan) return error.ValueSearchRequiresScan;
+        if (self.req.profile) {
+            const physical: ?[]const u8 = if (candidate) |q| switch (q) {
+                .term => |t| t.field,
+                .prefix => |t| t.field,
+                else => null,
+            } else null;
+            const work = self.req.value_search_work orelse &self.local_work;
+            try work.record(self.a, spec, physical, self.req.index_name, if (candidate == null) "no_safe_indexed_constraint" else null, if (producer.exact_keyword) "lossless_keyword" else "original_value");
+        }
+        if (self.load == null) return error.UnsupportedQueryRequest;
+        // Preparation normally finishes before execution. If a caller extends
+        // an already evaluated plan, preserve prior coverage before regrouping.
+        for (self.producers.items) |leaf| if (leaf.cohort) |cohort| try leaf.visited.orWith(&self.cohorts.items[cohort].known);
+        producer.slot = self.producers.items.len;
+        producer.cohort = self.active_cohort;
+        try self.producers.append(self.a, producer);
+        if (producer.cohort) |cohort| if (producer.slot < 64 and !producer.exact_keyword) {
+            self.cohorts.items[cohort].members |= @as(u64, 1) << @intCast(producer.slot);
+        };
+        (self.req.value_search_work orelse &self.local_work).registerLeaf();
+        self.clearGroups();
+        return .{ .doc_num = .{ .ids = &.{}, .producer = .{ .ptr = producer, .produce = ValueProducer.produce, .borrow = ValueProducer.borrow }, .boost = spec.boost } };
+    }
+};
+
+/// Bounded read-ahead over candidates this leaf actually owes. Returned bytes
+/// never outlive the window and are consumed in original iterator order.
+/// Query-local bounded exploration of provider cost, independent of parser or
+/// output work. Every sample is a required read: no duplicate benchmark I/O.
+/// Byte limits and allocator admission remain authoritative over learned sizes.
+const SourceReadTuner = struct {
+    const sizes = [_]usize{ 16, 1, 2, 4, 8, 32, 64 };
+    const exploration_order = [_]usize{ 0, 5, 6, 4, 3, 2, 1 };
+    observations: [sizes.len]usize = @splat(0),
+    exploration_cursor: usize = 0,
+    ns: [sizes.len]u64 = @splat(0),
+    rows: [sizes.len]usize = @splat(0),
+    choice: usize = 0,
+    exploring: bool = true,
+    calls: usize = 0,
+    probe: usize = 0,
+    max_rows: usize = 64,
+    average_bytes: u64 = 0,
+    bootstrapped: bool = false,
+    const bootstrap_rows = 2;
+    fn allowedRows(self: *const @This()) usize {
+        const byte_rows = @max(1, (256 * 1024) / @max(1, self.average_bytes));
+        var allowed: usize = 1;
+        // Round the payload-derived row cap up to a size class. A few source
+        // bytes must not halve a useful 64-row batch, and medium documents
+        // must retain 2/4/8-row choices. Estimated payload stays below twice
+        // the target; the allocation budget remains the hard safety limit.
+        for ([_]usize{ 2, 4, 8, 16, 32, 64 }) |size| if (size / 2 < byte_rows and size <= self.max_rows) {
+            allowed = size;
+        };
+        return allowed;
+    }
+    fn desired(self: *const @This()) usize {
+        return @min(if (self.bootstrapped) sizes[self.choice] else bootstrap_rows, self.allowedRows());
+    }
+    fn best(self: *const @This()) usize {
+        var result: usize = 0;
+        var cost: u64 = std.math.maxInt(u64);
+        for (self.rows, 0..) |rows, i| {
+            if (rows == 0 or sizes[i] > self.allowedRows()) continue;
+            const candidate = self.ns[i] / rows;
+            if (candidate < cost) {
+                cost = candidate;
+                result = i;
+            }
+        }
+        return result;
+    }
+    fn observePayload(self: *@This(), rows: usize, bytes: u64) void {
+        if (rows == 0) return;
+        const average = @max(1, bytes / rows);
+        self.average_bytes = if (self.average_bytes == 0) average else (self.average_bytes *| 3 +| average) / 4;
+    }
+    fn observe(self: *@This(), mode: enum { scalar, batch }, rows: usize, bytes: u64, elapsed_ns: u64) void {
+        if (rows == 0) return;
+        const requested = self.desired();
+        const bootstrap = !self.bootstrapped;
+        self.bootstrapped = true;
+        self.observePayload(rows, bytes);
+        // A truncated batch is not a sample of a full arm. Scalar fallbacks
+        // always train scalar, independently of the requested window size.
+        if (mode == .batch and rows != requested) return;
+        // The required cold bootstrap estimates bytes, never steady-state cost.
+        if (bootstrap) return;
+        const effective = for (sizes, 0..) |size, i| {
+            if (size == (if (mode == .scalar) @as(usize, 1) else rows)) break i;
+        } else unreachable;
+        // Decay completed epochs to adapt without retaining unbounded history.
+        if (self.rows[effective] >= 1024) {
+            self.rows[effective] /= 2;
+            self.ns[effective] /= 2;
+        }
+        self.rows[effective] += rows;
+        self.ns[effective] +|= elapsed_ns;
+        self.observations[effective] += 1;
+        // Falling back must not complete exploration of an untested arm.
+        if (sizes[effective] != requested) return;
+        self.calls += 1;
+        // Each batch is already required verification work. Explore coarse
+        // windows first and take three scalar samples rather than sixteen
+        // tiny reads per arm. Skip capped or already sampled classes.
+        if (self.exploring and self.observations[effective] >= (if (effective == 1) @as(usize, 3) else 1)) {
+            while (true) {
+                self.exploration_cursor += 1;
+                if (self.exploration_cursor == exploration_order.len) {
+                    self.exploring = false;
+                    self.choice = self.best();
+                    self.calls = 0;
+                    break;
+                }
+                const next = exploration_order[self.exploration_cursor];
+                if (sizes[next] <= self.allowedRows() and self.observations[next] == 0) {
+                    self.choice = next;
+                    break;
+                }
+            }
+        } else if (!self.exploring) {
+            if (self.calls >= 64) {
+                self.probe = (self.probe + 1) % sizes.len;
+                self.choice = self.probe;
+                self.calls = 0;
+            } else self.choice = self.best();
+        }
+    }
+};
+
+/// Fixed-size, memory-only provider hints. A hit seeds cost selection; all byte
+/// caps, refusal fallback and periodic probes still apply. New executions do not
+/// inherit elapsed time or work counters. Source representation switches use a
+/// different key. No allocator or provider call runs under this lock.
+const SourceReadHints = struct {
+    const Entry = struct { key: u64, expires_ms: u64, tuner: SourceReadTuner };
+    entries: [64]?Entry = @splat(null),
+    next: usize = 0,
+    mutex: std.atomic.Mutex = .unlocked,
+    fn get(self: *@This(), key: u64, now: u64) ?SourceReadTuner {
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.entries) |entry| if (entry) |value| {
+            if (value.key == key and value.expires_ms > now) {
+                var tuner = value.tuner;
+                // Keep one mean-cost observation per sampled arm. A new query
+                // adapts quickly instead of inheriting a whole prior epoch.
+                for (&tuner.rows, &tuner.ns) |*rows, *ns| if (rows.* != 0) {
+                    ns.* /= rows.*;
+                    rows.* = 1;
+                };
+                tuner.calls = 0;
+                tuner.bootstrapped = false;
+                tuner.average_bytes = 0;
+                tuner.max_rows = 64;
+                return tuner;
+            }
+        };
+        return null;
+    }
+    fn put(self: *@This(), key: u64, tuner: SourceReadTuner, now: u64) void {
+        if (tuner.exploring) return;
+        const best = tuner.best();
+        if (tuner.observations[best] < 3 or tuner.rows[best] < 64) return;
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        var index = self.next;
+        for (self.entries, 0..) |entry, i| if (entry) |value| {
+            if (value.key == key) {
+                index = i;
+                break;
+            }
+        };
+        var saved = tuner;
+        saved.choice = best;
+        self.entries[index] = .{ .key = key, .expires_ms = now +| 60000, .tuner = saved };
+        self.next = (index + 1) % self.entries.len;
+    }
+};
+var source_read_hints: SourceReadHints = .{};
+
+test "logical value provider hints amortize calibration and preserve caps expiry and isolation" {
+    var cache: SourceReadHints = .{};
+    var trained: SourceReadTuner = .{};
+    for (0..256) |_| {
+        const rows = trained.desired();
+        trained.observe(if (rows == 1) .scalar else .batch, rows, rows * 1024, 1000 + rows * 10);
+    }
+    cache.put(7, trained, 100);
+    var warm = cache.get(7, 101).?;
+    try std.testing.expect(!warm.exploring);
+    try std.testing.expectEqual(@as(usize, 2), warm.desired());
+    warm.observe(.batch, 2, 2048, 1000000);
+    try std.testing.expectEqual(@as(usize, 64), warm.desired());
+    warm.max_rows = 4;
+    try std.testing.expectEqual(@as(usize, 4), warm.desired());
+    try std.testing.expect(cache.get(8, 101) == null);
+    try std.testing.expect(cache.get(7, 60100) == null);
+    var cold: SourceReadTuner = .{};
+    cold.observe(.batch, 2, 2048, 1000);
+    cache.put(8, cold, 101);
+    try std.testing.expect(cache.get(8, 102) == null);
+}
+
+test "logical value source bootstrap bounds initial originals without changing steady state" {
+    var tuner: SourceReadTuner = .{};
+    try std.testing.expectEqual(@as(usize, 2), tuner.desired());
+    tuner.observe(.batch, 2, 2 * 64 * 1024, 1000);
+    try std.testing.expect(tuner.bootstrapped);
+    try std.testing.expectEqual(@as(usize, 4), tuner.desired());
+    try std.testing.expectEqual(@as(usize, 0), tuner.choice);
+    try std.testing.expectEqual(@as(usize, 0), tuner.rows[2]);
+    var scalar: SourceReadTuner = .{ .max_rows = 1 };
+    try std.testing.expectEqual(@as(usize, 1), scalar.desired());
+    scalar.observe(.scalar, 1, 1024, 1000);
+    try std.testing.expect(scalar.bootstrapped);
+    try std.testing.expectEqual(@as(usize, 1), scalar.desired());
+}
+
+test "logical value representation changes seed payload bounds without timing setup" {
+    var tuner: SourceReadTuner = .{ .bootstrapped = true };
+    tuner.observePayload(2, 2 * 1024 * 1024);
+    try std.testing.expectEqual(@as(usize, 1), tuner.desired());
+    for (tuner.rows) |rows| try std.testing.expectEqual(@as(usize, 0), rows);
+    for (tuner.ns) |ns| try std.testing.expectEqual(@as(u64, 0), ns);
+    try std.testing.expectEqual(@as(u64, 1024 * 1024), tuner.average_bytes);
+    tuner.observePayload(0, 0);
+    try std.testing.expectEqual(@as(u64, 1024 * 1024), tuner.average_bytes);
+}
+
+test "logical value source tuner learns scalar or batch cost and respects byte bounds" {
+    for ([_]bool{ false, true }) |batch_wins| {
+        var tuner: SourceReadTuner = .{};
+        for (0..256) |_| {
+            const rows = tuner.desired();
+            const elapsed: u64 = if (batch_wins) 1000 + rows * 10 else if (rows == 1) 10 else rows * 100;
+            tuner.observe(if (rows == 1) .scalar else .batch, rows, rows * 4096, elapsed);
+        }
+        try std.testing.expectEqual(if (batch_wins) @as(usize, 64) else @as(usize, 1), SourceReadTuner.sizes[tuner.best()]);
+        tuner.average_bytes = 1024 * 1024;
+        try std.testing.expectEqual(@as(usize, 1), tuner.desired());
+        const old_scalar_rows = tuner.rows[1];
+        tuner.observe(.scalar, 1, 32 * 1024, 1000);
+        try std.testing.expect(tuner.rows[1] > old_scalar_rows);
+        try std.testing.expectEqual(@as(usize, 1), SourceReadTuner.sizes[tuner.best()]);
+        tuner.average_bytes = 1;
+        tuner.max_rows = 16;
+        try std.testing.expect(tuner.desired() <= 16);
+    }
+    var medium: SourceReadTuner = .{};
+    for (0..512) |_| {
+        const rows = medium.desired();
+        medium.observe(if (rows == 1) .scalar else .batch, rows, rows * 18 * 1024, 1000 + rows * 10);
+    }
+    try std.testing.expectEqual(@as(usize, 16), SourceReadTuner.sizes[medium.best()]);
+    medium.average_bytes = 96 * 1024;
+    try std.testing.expectEqual(@as(usize, 2), medium.allowedRows());
+    medium.average_bytes = 4126;
+    try std.testing.expectEqual(@as(usize, 64), medium.allowedRows());
+}
+
+test "logical value tuner distinguishes scalar fallback and truncated batches" {
+    var tuner: SourceReadTuner = .{ .bootstrapped = true };
+    tuner.observe(.scalar, 1, 128, 1000);
+    try std.testing.expectEqual(@as(usize, 1), tuner.rows[1]);
+    try std.testing.expectEqual(@as(usize, 0), tuner.rows[0]);
+    try std.testing.expectEqual(@as(usize, 16), tuner.desired());
+    tuner.observe(.batch, 3, 384, 2000);
+    try std.testing.expectEqual(@as(usize, 0), tuner.rows[0]);
+    tuner.observe(.batch, 16, 2048, 2000);
+    try std.testing.expectEqual(@as(usize, 16), tuner.rows[0]);
+    try std.testing.expectEqual(@as(usize, 32), tuner.desired());
+}
+
+test "logical value source exploration has bounded calls and skips capped arms" {
+    for ([_]usize{ 1, 2, 4, 8, 16, 32, 64 }) |cap| {
+        var tuner: SourceReadTuner = .{ .max_rows = cap };
+        var calls: usize = 0;
+        while (tuner.exploring and calls < 16) : (calls += 1) {
+            const rows = tuner.desired();
+            try std.testing.expect(rows <= cap);
+            tuner.observe(if (rows == 1) .scalar else .batch, rows, rows * 128, 1000 + rows * 10);
+        }
+        try std.testing.expect(!tuner.exploring);
+        try std.testing.expect(calls <= 10);
+        try std.testing.expectEqual(cap, SourceReadTuner.sizes[tuner.best()]);
+    }
+}
+
+const ValueSourceWindow = struct {
+    const limit = 8 * 1024 * 1024;
+    const capacity = 64;
+    budget: @import("../../../sql/memory_budget.zig"),
+    arena: std.heap.ArenaAllocator = undefined,
+    ids: [capacity]u32 = undefined,
+    keys: [capacity][]const u8 = undefined,
+    values: []LogicalSourceRow = &.{},
+    count: usize = 0,
+    enabled: bool = true,
+    admitted: bool = false,
+    rows: usize = 16,
+    adaptive: bool = true,
+    fn reset(self: *@This(), free: bool) void {
+        _ = self.arena.reset(if (free) .free_all else .{ .retain_with_limit = 512 * 1024 });
+        self.count = 0;
+        self.values = &.{};
+    }
+    fn get(self: *@This(), local: u32) ?struct { bytes: ?[]u8, key: []const u8, original_bytes: u64, projected: bool } {
+        var lo: usize = 0;
+        var hi = self.values.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.ids[mid] < local) lo = mid + 1 else hi = mid;
+        }
+        if (lo == self.values.len or self.ids[lo] != local) return null;
+        return .{ .bytes = self.values[lo].bytes, .key = self.keys[lo], .original_bytes = self.values[lo].original_bytes, .projected = self.values[lo].projected };
+    }
+    fn fill(self: *@This(), producer: *ValueProducer, initial_key: []const u8, started_ns: u64, local: u32, count: u32, offset: u32, iterator: anytype, sequential: u32, deleted: ?*const roaring.RoaringBitmap, known: *const roaring.RoaringBitmap, coverage: ?*const roaring.RoaringBitmap, control: query_mod.ExecutionControl) anyerror!void {
+        self.fillOnce(producer, initial_key, started_ns, local, count, offset, iterator, sequential, deleted, known, coverage, control) catch |err| {
+            if (err != error.OutOfMemory) return err;
+            const attempted = if (self.count == 0) self.rows else @min(self.rows, self.count);
+            self.reset(true);
+            self.rows = attempted / 2;
+            producer.owner.source_tuner.max_rows = @max(1, self.rows);
+            if (producer.owner.req.profile) {
+                const work = producer.owner.req.value_search_work orelse &producer.owner.local_work;
+                _ = work.batch_refusals.fetchAdd(1, .monotonic);
+            }
+            if (self.rows < 2) self.enabled = false else try self.fill(producer, initial_key, started_ns, local, count, offset, iterator, sequential, deleted, known, coverage, control);
+        };
+    }
+    fn load(self: *@This(), owner: *ValueExecution) ![]LogicalSourceRow {
+        const a = self.arena.allocator();
+        if (owner.shouldProject()) if (try owner.projectedSources(a, self.keys[0..self.count])) |rows| return rows;
+        const raw = try owner.load_many.?(owner.load_ctx, a, self.keys[0..self.count]);
+        const rows = try a.alloc(LogicalSourceRow, raw.len);
+        for (raw, rows) |bytes, *row| row.* = .{ .bytes = bytes, .original_bytes = if (bytes) |value| value.len else 0 };
+        return rows;
+    }
+    fn fillOnce(self: *@This(), producer: *ValueProducer, initial_key: []const u8, started_ns: u64, local: u32, count: u32, offset: u32, iterator: anytype, sequential: u32, deleted: ?*const roaring.RoaringBitmap, known: *const roaring.RoaringBitmap, coverage: ?*const roaring.RoaringBitmap, control: query_mod.ExecutionControl) anyerror!void {
+        const owner = producer.owner;
+        if (owner.load_many == null) {
+            self.enabled = false;
+            return;
+        }
+        if (!self.enabled) return;
+        if (!self.admitted) {
+            if (getenv("ANTFLY_BENCH_VALUE_SOURCE_SCALAR")) |value| if (std.mem.eql(u8, value, "1")) {
+                self.enabled = false;
+                return;
+            };
+            if (getenv("ANTFLY_BENCH_VALUE_SOURCE_ROWS")) |value| {
+                self.rows = @max(2, @min(capacity, std.fmt.parseInt(usize, value, 10) catch capacity));
+                self.adaptive = false;
+            }
+            const room = @import("../../../sql/memory_budget.zig").reusableHeadroom(self.budget.backing);
+            if (room == null or room.? < 16384) {
+                self.enabled = false;
+                if (owner.req.profile) {
+                    const work = owner.req.value_search_work orelse &owner.local_work;
+                    _ = work.batch_refusals.fetchAdd(1, .monotonic);
+                }
+                return;
+            }
+            // Leave most known headroom available to mandatory matcher/output
+            // allocations; successful windows reuse their backing capacity.
+            self.budget.limit = @min(limit, room.? / 4);
+            self.admitted = true;
+        }
+        const epoch = owner.source_epoch;
+        if (self.adaptive) self.rows = owner.source_tuner.desired();
+        self.reset(false);
+        if (self.rows < 2) return;
+        const work = owner.req.value_search_work orelse &owner.local_work;
+        defer if (owner.req.profile) {
+            _ = work.batch_peak_bytes.fetchMax(self.budget.peak, .monotonic);
+        };
+        const remaining = owner.req.value_search_execution.max_documents -| work.documents.load(.monotonic);
+        if (remaining < 2) return;
+        const maximum = @min(self.rows, remaining);
+        var probe = iterator;
+        var next_seq = sequential;
+        var next: ?u32 = local;
+        while (next) |id| {
+            if (self.count == maximum) break;
+            if (id >= count) return error.InvalidArgument;
+            try control.check();
+            const global = offset + id;
+            if (!(if (deleted) |d| d.contains(id) else false) and !known.contains(id) and !producer.visited.contains(global) and !(if (coverage) |c| c.contains(global) else false)) {
+                const key = if (id == local) try self.arena.allocator().dupe(u8, initial_key) else (try owner.snapshot.storedIdScoped(self.arena.allocator(), global)) orelse return error.StoredDocMissing;
+                if (work.sources.get(owner.load_ctx, key) == null) {
+                    self.ids[self.count] = id;
+                    self.keys[self.count] = key;
+                    self.count += 1;
+                }
+            }
+            next = if (probe) |*it| it.next() else blk: {
+                if (deleted) |d| next_seq = @intCast(roaring.RoaringBitmap.candidateLowerBound(next_seq, count, &.{}, &.{d}));
+                if (next_seq >= count) break :blk null;
+                const id_next = next_seq;
+                next_seq += 1;
+                break :blk id_next;
+            };
+        }
+        if (self.count < 2) return;
+        // Reserve the shared document allowance before speculative I/O, so
+        // concurrent components cannot each read the same remaining budget.
+        try value_query.Work.charge(&work.documents, self.count, owner.req.value_search_execution.max_documents);
+        self.values = self.load(owner) catch |err| {
+            _ = work.documents.fetchSub(self.count, .monotonic);
+            return err;
+        };
+        if (self.values.len != self.count) return error.InvalidArgument;
+        var source_bytes: u64 = 0;
+        var payload_bytes: u64 = 0;
+        for (self.values) |row| {
+            source_bytes = std.math.add(u64, source_bytes, row.original_bytes) catch return error.ValueSearchLimitExceeded;
+            if (row.bytes) |bytes| payload_bytes +|= bytes.len;
+            if (owner.req.profile and row.projected) _ = work.stored_field_sources.fetchAdd(1, .monotonic);
+        }
+        try value_query.Work.charge(&work.bytes, source_bytes, owner.req.value_search_execution.max_bytes);
+        owner.observeOriginal(self.count, source_bytes);
+        if (self.adaptive) {
+            if (owner.source_epoch == epoch) {
+                owner.source_tuner.observe(.batch, self.count, payload_bytes, platform_time.monotonicNs() - started_ns);
+            } else {
+                // New representations still supply a required payload sample;
+                // exclude only snapshot setup from steady-state timing arms.
+                owner.source_tuner.observePayload(self.count, payload_bytes);
+            }
+        }
+        if (owner.req.profile) {
+            _ = work.source_batches.fetchAdd(1, .monotonic);
+        }
+        try control.check();
+    }
+};
+
+const ValueProducer = struct {
+    owner: *ValueExecution,
+    matcher: value_query.Matcher = undefined,
+    candidate: ?@import("../../../search/query.zig").Filter = null,
+    visited: roaring.RoaringBitmap,
+    matched: roaring.RoaringBitmap,
+    exact_keyword: bool = false,
+    slot: usize = 0,
+    cohort: ?usize = null,
+    fn borrow(raw: *anyopaque, offset: u32, count: u32) anyerror!?roaring.BorrowedBitmap {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const owner = self.owner;
+        try (@import("../../../search/query.zig").ExecutionControl{ .cancellation = owner.req.cancellation, .deadline_ns = owner.req.execution_deadline_ns }).check();
+        const scope = owner.req.value_search_scope orelse return null;
+        const resolved = owner.snapshot.resolveDocId(offset) orelse return null;
+        const segment = &owner.snapshot.segments[resolved.seg_idx];
+        if (resolved.local_id != 0 or segment.reader.doc_count != count) return null;
+        const membership = value_query.membership;
+        const key = membership.key(scope, owner.req.index_name, segment.id, count, self.matcher.spec);
+        var pin = membership.retained.borrow(key, @import("../native_query_cut.zig").nowMs()) orelse return null;
+        if (!pin.facts().complete) {
+            pin.deinit();
+            return null;
+        }
+        return pin.intoBorrowed();
+    }
+    fn produce(raw: *anyopaque, a: Allocator, offset: u32, count: u32, incoming: ?*const roaring.RoaringBitmap) anyerror!roaring.RoaringBitmap {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const owner = self.owner;
+        owner.prepareLiterals();
+        // Plan/coverage ownership is stable for this producer invocation.
+        const stream_membership = owner.streamsPredicates(self);
+        const coverage = if (stream_membership) &owner.cohorts.items[self.cohort.?].known else null;
+        const control = @import("../../../search/query.zig").ExecutionControl{ .cancellation = owner.req.cancellation, .deadline_ns = owner.req.execution_deadline_ns, .pattern_programs = owner.req.text_pattern_programs, .pattern_cache = owner.req.text_pattern_membership };
+        try control.check();
+        var result = roaring.RoaringBitmap.init(a);
+        errdefer result.deinit();
+        if (count == 0) return result;
+        const resolved = owner.snapshot.resolveDocId(offset) orelse return error.InvalidArgument;
+        var lease = try owner.snapshot.leaseSegment(resolved.seg_idx);
+        defer lease.deinit();
+        // Lossless keyword membership uses only the literal term. Ordinary term
+        // filters may expand synonyms, which cannot establish raw equality.
+        if (self.exact_keyword) {
+            const term = self.candidate.?.term;
+            var exact = try literalKeywordMembership(a, lease.entry, term.field, term.term);
+            errdefer exact.deinit();
+            if (incoming) |other| exact.andWith(other);
+            try control.check();
+            result.deinit();
+            return exact;
+        }
+        const scope = owner.req.value_search_scope;
+        const membership = value_query.membership;
+        const now = if (scope != null) @import("../native_query_cut.zig").nowMs() else 0;
+        const cache_key = if (scope) |cut| membership.key(cut, owner.req.index_name, lease.entry.id, count, self.matcher.spec) else null;
+        var cached = if (cache_key) |key| membership.retained.borrow(key, now) else null;
+        defer if (cached) |*pin| pin.deinit();
+        if (cached != null and cached.?.facts().complete) {
+            // A complete immutable predicate already includes the proof of
+            // absence outside its conservative candidate postings. It needs
+            // neither another term expansion nor a scan of cached IDs.
+            const held = &cached.?.facts().matched;
+            const reused = if (incoming) |other| try held.intersectionClone(a, other) else try held.cloneExact(a);
+            result.deinit();
+            result = reused;
+            try control.check();
+            return result;
+        }
+        var facts = if (cached) |pin| pin.facts().clone(a) catch membership.Facts.init(a) else membership.Facts.init(a);
+        defer facts.deinit();
+        // Partial builders own mutable copies; completed hits above copy once.
+        if (cached) |*pin| {
+            pin.deinit();
+            cached = null;
+        }
+        var changed = false;
+        // Snapshot deletion state once without holding its read lease across
+        // source I/O. Superseded physical slots must not consume scan budgets.
+        var deleted = try lease.entry.cloneDeleted(@import("../../../sql/memory_budget.zig").reclaimingAllocator(a));
+        defer if (deleted) |*bitmap| bitmap.deinit();
+        var indexed = if (self.candidate) |filter| try filter.withControl(control).executeWithOffset(a, lease.entry, offset) else null;
+        defer if (indexed) |*bitmap| bitmap.deinit();
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        owner.beginTuning(false);
+        var source_window: ValueSourceWindow = .{ .rows = owner.source_tuner.desired(), .budget = .{ .backing = @import("../../../sql/memory_budget.zig").reclaimingAllocator(a), .limit = ValueSourceWindow.limit } };
+        source_window.arena = .init(source_window.budget.allocator());
+        defer source_window.arena.deinit();
+        if (indexed) |*bitmap| if (incoming) |other| bitmap.andWith(other);
+        if (indexed) |*bitmap| if (deleted) |*tombstones| bitmap.andNotWith(tombstones);
+        const selected: ?*const roaring.RoaringBitmap = if (indexed) |*bitmap| bitmap else incoming;
+        var pending: ?roaring.RoaringBitmap = null;
+        defer if (pending) |*bitmap| bitmap.deinit();
+        if (facts.known.cardinality() != 0) {
+            // Reuse whole bitmap runs rather than probing every cached document
+            // on every page. Only genuinely unverified candidates reach the loop.
+            const reused = try facts.matched.clone(a);
+            result.deinit();
+            result = reused;
+            if (selected) |bitmap| {
+                result.andWith(bitmap);
+                pending = try bitmap.clone(a);
+                pending.?.andNotWith(&facts.known);
+            }
+        }
+        var iterator = if (pending) |*bitmap| bitmap.iterator() else if (selected) |bitmap| bitmap.iterator() else null;
+        var sequential: u32 = 0;
+        while (true) {
+            try control.check();
+            const local = if (iterator) |*it| it.next() orelse break else blk: {
+                if (deleted) |*tombstones| {
+                    sequential = @intCast(roaring.RoaringBitmap.candidateLowerBound(sequential, count, &.{}, &.{tombstones}));
+                }
+                if (sequential >= count) break;
+                const next = sequential;
+                sequential += 1;
+                break :blk next;
+            };
+            if (local >= count) return error.InvalidArgument;
+            if (deleted) |*tombstones| if (tombstones.contains(local)) continue;
+            const global = offset + local;
+            if (self.visited.contains(global) or (if (coverage) |known| known.contains(global) else false)) {
+                const yes = self.matched.contains(global);
+                if (yes) try result.add(local);
+                // Fusion can establish this leaf while another leaf is being
+                // evaluated. Publish only facts known for this exact predicate.
+                if (cache_key != null and !facts.known.contains(local)) {
+                    try facts.known.add(local);
+                    if (yes) try facts.matched.add(local);
+                    changed = true;
+                }
+                continue;
+            }
+            if (facts.known.contains(local)) {
+                if (facts.matched.contains(local)) try result.add(local);
+                continue;
+            }
+            const work = owner.req.value_search_work orelse &owner.local_work;
+            _ = scratch.reset(.retain_capacity);
+            var buffered = source_window.get(local);
+            // A buffered row performs no provider I/O and supplies no tuner
+            // sample. Avoid a clock syscall on every row of a filled window.
+            const scalar_start = if (buffered == null) platform_time.monotonicNs() else 0;
+            const id = if (buffered) |row| row.key else (try owner.snapshot.storedIdScoped(scratch.allocator(), global)) orelse return error.StoredDocMissing;
+            var matched = false;
+            if (work.sources.get(owner.load_ctx, id)) |doc| {
+                matched = try owner.matchSource(self, global, doc);
+            } else {
+                const already_buffered = buffered != null;
+                if (buffered == null) {
+                    try source_window.fill(self, id, scalar_start, local, count, offset, iterator, sequential, if (deleted) |*d| d else null, &facts.known, coverage, control);
+                    buffered = source_window.get(local);
+                }
+                // Both scalar and batch loaders share the admitted provider.
+                var projected_source = if (buffered) |row| row.projected else false;
+                var original_bytes: u64 = 0;
+                const stored = if (buffered) |row| row.bytes else scalar: {
+                    try value_query.Work.charge(&work.documents, 1, owner.req.value_search_execution.max_documents);
+                    const epoch = owner.source_epoch;
+                    const loaded = loaded: {
+                        if (owner.shouldProject()) if (try owner.projectedSources(scratch.allocator(), &.{id})) |rows| {
+                            if (rows.len != 1) return error.InvalidArgument;
+                            projected_source = rows[0].projected;
+                            original_bytes = rows[0].original_bytes;
+                            break :loaded rows[0].bytes;
+                        };
+
+                        const bytes = try owner.load.?(owner.load_ctx, scratch.allocator(), id);
+                        original_bytes = if (bytes) |value| value.len else 0;
+                        break :loaded bytes;
+                    };
+                    const elapsed = platform_time.monotonicNs() - scalar_start;
+                    owner.observeOriginal(1, original_bytes);
+                    if (owner.req.profile and projected_source) _ = work.stored_field_sources.fetchAdd(1, .monotonic);
+                    if (source_window.enabled and source_window.adaptive) {
+                        const payload = if (loaded) |bytes| bytes.len else 0;
+                        if (owner.source_epoch == epoch) owner.source_tuner.observe(.scalar, 1, payload, elapsed) else owner.source_tuner.observePayload(1, payload);
+                    }
+                    if (owner.req.profile) {
+                        _ = work.source_scalar_reads.fetchAdd(1, .monotonic);
+                    }
+                    break :scalar loaded;
+                };
+                if (owner.req.profile and !already_buffered) _ = work.source_read_ns.fetchAdd(platform_time.monotonicNs() - scalar_start, .monotonic);
+                if (stored) |bytes| {
+                    if (buffered == null) try value_query.Work.charge(&work.bytes, original_bytes, owner.req.value_search_execution.max_bytes);
+                    const shared = if (!stream_membership and !projected_source) remembered: {
+                        const start = if (owner.req.profile) platform_time.monotonicNs() else 0;
+                        defer if (owner.req.profile) {
+                            _ = work.source_parse_ns.fetchAdd(platform_time.monotonicNs() - start, .monotonic);
+                        };
+                        break :remembered try work.sources.remember(owner.a, owner.load_ctx, id, bytes);
+                    } else null;
+                    if (shared) |doc| {
+                        matched = try owner.matchSource(self, global, doc);
+                    } else {
+                        const value = try owner.sourceValue(scratch.allocator(), bytes, projected_source);
+                        matched = try owner.matchSource(self, global, value);
+                    }
+                }
+            }
+            if (cache_key != null) {
+                try facts.known.add(local);
+                if (matched) try facts.matched.add(local);
+                changed = true;
+            }
+            if (!(if (coverage) |known| known.contains(global) else false)) try self.visited.add(global);
+            if (matched) {
+                try self.matched.add(global);
+                try result.add(local);
+            }
+        }
+        try control.check();
+        if (cache_key != null and incoming == null) {
+            // Full candidate evaluation plus the conservative index proof
+            // establishes the predicate for every document in this segment.
+            facts.complete = true;
+            facts.known.deinit();
+            facts.known = roaring.RoaringBitmap.init(a);
+            changed = true;
+        }
+        if (changed) membership.retained.put(cache_key.?, scope.?.expires_ms, @import("../native_query_cut.zig").nowMs(), facts);
+        return result;
+    }
+};
+
+fn literalKeywordMembership(a: Allocator, segment: *const index_mod.SegmentEntry, field: []const u8, text: []const u8) !roaring.RoaringBitmap {
+    var result = roaring.RoaringBitmap.init(a);
+    errdefer result.deinit();
+    var reader = (try segment.reader.invertedIndexScoped(a, field)) orelse return result;
+    defer reader.deinit();
+    if (try reader.lookup(text)) |lookup| switch (lookup) {
+        .one_hit => |hit| try result.add(hit.doc_num),
+        .postings => |postings| {
+            const bitmap = try postings.docBitmap(a);
+            result.deinit();
+            result = bitmap;
+        },
+    };
+    return result;
+}
+
+fn logicalKeywordProvesEquality(schema: runtime_schema_mod.TableSchema, source: []const u8, emitted: []const u8) bool {
+    // Explicit full-text source extraction indexes only strings and preserves
+    // array-element boundaries. Unknown/legacy mapping shapes still verify.
+    if (schema.full_text_documents.len == 0) return false;
+    for (schema.full_text_documents) |doc| for (doc.fields) |field| {
+        if (std.mem.eql(u8, field.emitted_name, emitted) and
+            (!std.mem.eql(u8, field.path, source) or !std.mem.eql(u8, field.analyzer, "keyword"))) return false;
+    };
+    return true;
+}
+
+fn longestAsciiFragment(text: []const u8) ?[]const u8 {
+    var best: []const u8 = "";
+    var start: usize = 0;
+    for (text, 0..) |byte, i| {
+        if (!std.ascii.isAlphanumeric(byte)) {
+            start = i + 1;
+            continue;
+        }
+        const run = text[start .. i + 1];
+        if (run.len > best.len) best = run;
+    }
+    if (best.len < 3) return null;
+    return best[0..@min(best.len, 32)];
+}
+
+/// Resolve by source mapping and analyzer, never by a guessed suffix. Every
+/// document schema must agree; otherwise use the explicitly permitted scan.
+fn valueRepresentation(a: Allocator, optional_schema: ?runtime_schema_mod.TableSchema, analysis: introducer_mod.TextAnalysisConfig, source: []const u8, analyzer: []const u8) !?[]const u8 {
+    const schema = optional_schema orelse return null;
+    const field = runtime_schema_mod.resolveLogicalTextRepresentation(schema, source, analyzer) orelse return null;
+    if (!fieldUsesAnalyzer(analysis, schema, field, analyzer)) return null;
+    return try a.dupe(u8, field);
+}
+
 pub fn textQueryToSearchQuery(
     alloc: Allocator,
     text_query: types.TextQuery,
     text_analysis: introducer_mod.TextAnalysisConfig,
     runtime_schema: ?runtime_schema_mod.TableSchema,
 ) anyerror!search_mod.SearchQuery {
+    return textQueryToSearchQueryWithValues(alloc, text_query, text_analysis, runtime_schema, null);
+}
+
+fn textQueryToSearchQueryWithValues(
+    alloc: Allocator,
+    text_query: types.TextQuery,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+    values: ?*ValueExecution,
+) anyerror!search_mod.SearchQuery {
     return switch (text_query) {
+        .value => |spec| if (values) |execution| try execution.prepare(alloc, spec, text_analysis, runtime_schema) else return error.UnsupportedQueryRequest,
+        .autocomplete => |query| blk: {
+            const schema = runtime_schema orelse return error.UnsupportedQueryRequest;
+            const root = runtime_schema_mod.resolveLogicalAutocompleteRoot(schema, query.field) orelse return error.UnsupportedQueryRequest;
+            const fields = try alloc.alloc(types.TextMultiMatchField, 1);
+            fields[0] = .{ .field = root, .boost = 1 };
+            break :blk try multiMatchBoolPrefixToSearchQuery(alloc, .{ .query = query.text, .fields = fields, .boost = query.boost }, text_analysis, runtime_schema);
+        },
         .match_none => .{ .match_none = {} },
         .match_all => .{ .match_all = {} },
         .phrase => |phrase| .{ .term_phrase = .{
@@ -18429,9 +19895,9 @@ pub fn textQueryToSearchQuery(
             .boost = regexp.boost,
         } },
         .bool_query => |bool_query| .{ .bool_query = .{
-            .must = try textQuerySliceToSearchQuerySlice(alloc, bool_query.must, text_analysis, runtime_schema),
-            .should = try textQuerySliceToSearchQuerySlice(alloc, bool_query.should, text_analysis, runtime_schema),
-            .must_not = try textQuerySliceToSearchQuerySlice(alloc, bool_query.must_not, text_analysis, runtime_schema),
+            .must = try textQuerySliceToSearchQuerySlice(alloc, bool_query.must, text_analysis, runtime_schema, values, false),
+            .should = try textQuerySliceToSearchQuerySlice(alloc, bool_query.should, text_analysis, runtime_schema, values, true),
+            .must_not = try textQuerySliceToSearchQuerySlice(alloc, bool_query.must_not, text_analysis, runtime_schema, values, false),
             .min_should = bool_query.min_should,
             .pure_should_optional = bool_query.pure_should_optional,
             .boost = bool_query.boost,
@@ -18444,12 +19910,50 @@ fn textQuerySliceToSearchQuerySlice(
     items: []const types.TextQuery,
     text_analysis: introducer_mod.TextAnalysisConfig,
     runtime_schema: ?runtime_schema_mod.TableSchema,
+    values: ?*ValueExecution,
+    share_regex: bool,
 ) anyerror![]search_mod.SearchQuery {
     if (items.len == 0) return &.{};
-    var out = try alloc.alloc(search_mod.SearchQuery, items.len);
+    var groups: [64]?usize = @splat(null);
+    const previous = if (values) |execution| execution.active_cohort else null;
+    defer if (values) |execution| {
+        execution.active_cohort = previous;
+    };
+    if (values) |execution| if (items.len <= groups.len) {
+        var all_values = share_regex and items.len >= 2;
+        for (items) |item| {
+            if (item != .value) {
+                all_values = false;
+                break;
+            }
+        }
+        if (all_values) {
+            const cohort = try execution.newCohort();
+            @memset(groups[0..items.len], cohort);
+        } else {
+            // Preserve the existing cheap same-field literal fusion even in
+            // conjunctions. Expensive regex siblings keep their own domain.
+            for (items, 0..) |item, i| {
+                if (groups[i] != null or item != .value) continue;
+                const spec = item.value;
+                if (spec.kind != .contains or !spec.case_sensitive) continue;
+                var n: usize = 0;
+                for (items) |other| if (other == .value and other.value.kind == .contains and other.value.case_sensitive and std.mem.eql(u8, other.value.field, spec.field)) {
+                    n += 1;
+                };
+                if (n < 3) continue;
+                const cohort = try execution.newCohort();
+                for (items, 0..) |other, j| if (other == .value and other.value.kind == .contains and other.value.case_sensitive and std.mem.eql(u8, other.value.field, spec.field)) {
+                    groups[j] = cohort;
+                };
+            }
+        }
+    };
+    const out = try alloc.alloc(search_mod.SearchQuery, items.len);
     errdefer alloc.free(out);
     for (items, 0..) |item, i| {
-        out[i] = try textQueryToSearchQuery(alloc, item, text_analysis, runtime_schema);
+        if (values) |execution| execution.active_cohort = if (i < groups.len) groups[i] else null;
+        out[i] = try textQueryToSearchQueryWithValues(alloc, item, text_analysis, runtime_schema, values);
     }
     return out;
 }
@@ -19016,40 +20520,61 @@ pub fn attachHighlightsWithIndexQueries(
     hits: []types.SearchHit,
     sources: ?[]const ?[]u8,
 ) !void {
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var entries = std.ArrayListUnmanaged(HighlightMatcherEntry).empty;
-    for (indexed_queries, 0..) |indexed, index| {
-        const lowered = try textQueryToSearchQuery(arena, indexed.query, indexed.text_analysis, indexed.runtime_schema);
-        const start = entries.items.len;
-        try collectHighlightMatchers(arena, lowered, indexed, &entries);
-        for (entries.items[start..]) |*entry| entry.query_index = index;
-    }
-    if (entries.items.len == 0) return;
-
-    const fragment_size = @max(options.fragment_size, 1);
-    const max_fragments = @max(options.max_fragments, 1);
-
-    // Parsed documents live only as long as their own hit so peak memory is
-    // one document, not the whole page.
-    var hit_arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer hit_arena_state.deinit();
-
-    for (hits, 0..) |*hit, hit_index| {
-        if (hit.highlights.len > 0) continue;
-        _ = hit_arena_state.reset(.retain_capacity);
-        const hit_arena = hit_arena_state.allocator();
-        const parsed = parsed: {
-            if (sources) |items| if (items[hit_index]) |source|
-                break :parsed std.json.parseFromSliceLeaky(std.json.Value, hit_arena, source, .{}) catch continue;
+    var prepared = try PreparedHighlights.init(alloc, options, indexed_queries);
+    defer prepared.deinit();
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    for (hits, 0..) |*hit, index| {
+        if (hit.highlights.len != 0) continue;
+        _ = scratch.reset(.retain_capacity);
+        const a = scratch.allocator();
+        const value = parsed: {
+            if (sources) |items| if (items[index]) |source|
+                break :parsed std.json.parseFromSliceLeaky(std.json.Value, a, source, .{}) catch continue;
             if (hit.source_value) |value| break :parsed value;
-            if (hit.column_source) |source| break :parsed try source.value(&hit_arena_state);
-            const stored = hit.stored_data orelse continue;
-            break :parsed std.json.parseFromSliceLeaky(std.json.Value, hit_arena, stored, .{}) catch continue;
+            if (hit.column_source) |source| break :parsed try source.value(&scratch);
+            break :parsed std.json.parseFromSliceLeaky(std.json.Value, a, hit.stored_data orelse continue, .{}) catch continue;
         };
+        try prepared.attachValue(alloc, a, hit, value);
+    }
+}
 
+/// Query-owned matchers, shared by batched and streaming source consumers.
+/// Index analysis/schema are borrowed until deinit; output owns every fragment.
+pub const PreparedHighlights = struct {
+    arena: *std.heap.ArenaAllocator,
+    entries: []const HighlightMatcherEntry,
+    indexed_queries: []const HighlightQuery,
+    options: types.HighlightRequest,
+    pub fn init(alloc: Allocator, options: types.HighlightRequest, indexed_queries: []const HighlightQuery) !PreparedHighlights {
+        const owner = try alloc.create(std.heap.ArenaAllocator);
+        owner.* = .init(alloc);
+        errdefer {
+            owner.deinit();
+            alloc.destroy(owner);
+        }
+        const arena = owner.allocator();
+        var entries = std.ArrayListUnmanaged(HighlightMatcherEntry).empty;
+        for (indexed_queries, 0..) |indexed, index| {
+            const lowered = try textQueryToSearchQuery(arena, indexed.query, indexed.text_analysis, indexed.runtime_schema);
+            const start = entries.items.len;
+            try collectHighlightMatchers(arena, lowered, indexed, &entries);
+            for (entries.items[start..]) |*entry| entry.query_index = index;
+        }
+        return .{ .arena = owner, .entries = entries.items, .indexed_queries = indexed_queries, .options = options };
+    }
+    pub fn deinit(self: *PreparedHighlights) void {
+        const a = self.arena.child_allocator;
+        self.arena.deinit();
+        a.destroy(self.arena);
+    }
+    /// Parsed source and scratch are borrowed only for this call.
+    pub fn attachValue(self: *const PreparedHighlights, alloc: Allocator, hit_arena: Allocator, hit: *types.SearchHit, parsed: std.json.Value) !void {
+        if (self.entries.len == 0 or hit.highlights.len != 0) return;
+        const indexed_queries = self.indexed_queries;
+        const options = self.options;
+        const fragment_size = @max(options.fragment_size, 1);
+        const max_fragments = @max(options.max_fragments, 1);
         const text_fields = try hit_arena.alloc([]const mapper_mod.HighlightTextField, indexed_queries.len);
         var fields = std.ArrayListUnmanaged([]const u8).empty;
         if (options.fields.len > 0) try fields.appendSlice(hit_arena, options.fields);
@@ -19057,7 +20582,7 @@ pub fn attachHighlightsWithIndexQueries(
             text_fields[query_index] = try mapper_mod.highlightTextFieldsFromValueWithSelectedField(hit_arena, parsed, indexed.text_analysis, indexed.runtime_schema, indexed.selected_field);
             if (options.fields.len > 0) continue;
             for (text_fields[query_index]) |contribution| {
-                const referenced = for (entries.items) |entry| {
+                const referenced = for (self.entries) |entry| {
                     if (entry.query_index == query_index and std.mem.eql(u8, entry.indexed_field, contribution.indexed_field)) break true;
                 } else false;
                 if (!referenced) continue;
@@ -19095,7 +20620,7 @@ pub fn attachHighlightsWithIndexQueries(
             }
             for (indexed_queries, 0..) |indexed, query_index| {
                 var processed = std.ArrayListUnmanaged([]const u8).empty;
-                for (entries.items) |entry| {
+                for (self.entries) |entry| {
                     if (entry.query_index != query_index) continue;
                     const matches_field = for (text_fields[query_index]) |contribution| {
                         if (std.mem.eql(u8, contribution.indexed_field, entry.indexed_field) and
@@ -19113,7 +20638,7 @@ pub fn attachHighlightsWithIndexQueries(
                     try processed.append(hit_arena, entry.indexed_field);
 
                     var matchers = std.ArrayListUnmanaged(highlight_mod.Matcher).empty;
-                    for (entries.items) |candidate| {
+                    for (self.entries) |candidate| {
                         if (candidate.query_index == query_index and
                             std.mem.eql(u8, candidate.indexed_field, entry.indexed_field))
                         {
@@ -19153,11 +20678,11 @@ pub fn attachHighlightsWithIndexQueries(
         }
         if (highlighted.items.len == 0) {
             highlighted.deinit(alloc);
-            continue;
+            return;
         }
         hit.highlights = try highlighted.toOwnedSlice(alloc);
     }
-}
+};
 
 test "attachHighlights marks analyzed, prefix, and substring matches on stored source" {
     const alloc = std.testing.allocator;
@@ -19655,7 +21180,24 @@ test "fuzzy phrase clauses highlight matched surface terms" {
 /// two-byte suffixes would match nearly every document. Paths that cannot
 /// lower to containment lookups fall back to plain word tokens.
 fn queryTextAnalyzer(analyzer: *const analysis_mod.Analyzer) *const analysis_mod.Analyzer {
-    return if (analyzer == &analysis_mod.substring_analyzer) &analysis_mod.substring_query_analyzer else analyzer;
+    return if (analyzer == &analysis_mod.substring_analyzer)
+        &analysis_mod.substring_query_analyzer
+    else if (analyzer == &analysis_mod.search_as_you_type_index_prefix_analyzer or analyzer == &analysis_mod.search_as_you_type_analyzer)
+        &analysis_mod.simple_analyzer
+    else
+        analyzer;
+}
+
+test "logical query autocomplete aliases preserve whole query tokens" {
+    const a = std.testing.allocator;
+    // Both the complete-token root and bounded prefix accelerator must use
+    // whole query tokens rather than applying index expansion to queries.
+    for ([_]*const analysis_mod.Analyzer{ &analysis_mod.search_as_you_type_analyzer, &analysis_mod.search_as_you_type_index_prefix_analyzer }) |analyzer| {
+        const tokens = try queryTextAnalyzer(analyzer).analyze(a, "Distributed");
+        defer analysis_mod.Analyzer.freeTokens(a, tokens);
+        try std.testing.expectEqual(@as(usize, 1), tokens.len);
+        try std.testing.expectEqualStrings("distributed", tokens[0].term);
+    }
 }
 
 fn fieldUsesSubstringAnalyzer(
@@ -20671,6 +22213,45 @@ fn testStreamMatchAllCandidatesCallback(
     }
     _ = req;
     return .{ .accepted_count = accepted, .stopped_early = false };
+}
+
+// Exercise production candidate ownership and deduplication with a small
+// deterministic identity source; the ordinary mock stream skips that layer.
+fn testStreamPrimaryMatchAllCandidatesCallback(
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+    req: types.SearchRequest,
+    options: MatchAllCandidateCollectOptions,
+    consumer_ctx: ?*anyopaque,
+    consumer: MatchAllCandidateConsumer,
+) anyerror!MatchAllCandidateStreamStats {
+    const Harness = struct {
+        fn scan(raw: ?*anyopaque, _: Allocator, _: MatchAllCandidateCollectOptions, target: ?*anyopaque, visitor: *const fn (?*anyopaque, []const u8) anyerror!docstore_mod.DocStore.ScanAction) !void {
+            const source: *const TestMatchAllCtx = @ptrCast(@alignCast(raw.?));
+            for (source.ids) |id| if (try visitor(target, id) == .stop) return;
+        }
+        fn range(_: ?*anyopaque, _: Allocator, _: []const u8, _: []const u8) ![]docstore_mod.OwnedKVPair {
+            return error.UnexpectedTestCall;
+        }
+        fn expired(_: ?*anyopaque, _: Allocator, _: []const u8) !bool {
+            return false;
+        }
+        fn ordinal(raw: ?*anyopaque, _: Allocator, id: []const u8, _: ?u64) !?doc_set.DocOrdinal {
+            const source: *const TestMatchAllCtx = @ptrCast(@alignCast(raw.?));
+            for (source.ids, 0..) |key, i| if (std.mem.eql(u8, id, key)) return if (i < source.ordinals.len) source.ordinals[i] else null;
+            return null;
+        }
+    };
+    const stats = try streamMatchAllCandidatesWithOptions(alloc, req, .{
+        .ctx = ctx,
+        .scan_ids = Harness.scan,
+        .scan_store_range = Harness.range,
+        .is_expired_key = Harness.expired,
+        .lookup_doc_ordinal = Harness.ordinal,
+    }, options, consumer_ctx, consumer);
+    const source: *const TestMatchAllCtx = @ptrCast(@alignCast(ctx.?));
+    if (source.stream_accepted_count) |count| count.* += stats.accepted_count;
+    return stats;
 }
 
 fn testMatchAllLoadProjectedCallback(
@@ -29542,6 +31123,48 @@ test "match_all native stream sort zero limit counts without decoration" {
     try std.testing.expectEqual(@as(u64, 0), profile.stored_json_load_count);
 }
 
+test "bounded primary match_all stops after the page and owns allocation failures (#1095)" {
+    const Exercise = struct {
+        fn run(alloc: Allocator) !void {
+            for ([_]bool{ false, true }) |count_only| {
+                var accepted: usize = 0;
+                var collected: usize = 0;
+                const ctx = TestMatchAllCtx{
+                    .ids = &.{ "doc:a", "doc:b", "doc:c" },
+                    .ordinals = &.{ 1, 2, 3 },
+                    .stream_accepted_count = &accepted,
+                    .collect_count = &collected,
+                };
+                var executor = testMatchAllExecutor(&ctx);
+                executor.bounded_unordered_page = true;
+                executor.collect_candidates_stream = testStreamPrimaryMatchAllCandidatesCallback;
+                var result = try searchMatchAll(alloc, .{
+                    .limit = 1,
+                    .offset = 1,
+                    .include_stored = false,
+                    .count_only = count_only,
+                    .profile = true,
+                }, executor);
+                defer result.deinit();
+                try std.testing.expectEqual(@as(usize, 0), collected);
+                try std.testing.expectEqual(@as(usize, if (count_only) 3 else 2), accepted);
+                try std.testing.expectEqual(@as(u32, if (count_only) 3 else 2), result.total_hits);
+                try std.testing.expectEqual(if (count_only) types.TotalHitsRelation.exact else .gte, result.total_hits_relation);
+                try std.testing.expectEqual(@as(usize, if (count_only) 0 else 1), result.hits.len);
+                const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqualStrings("primary_key", profile.candidate_source);
+                try std.testing.expectEqual(@as(u64, if (count_only) 0 else 1), profile.selected_count);
+                if (!count_only) {
+                    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+                    try std.testing.expectEqual(@as(usize, 0), result.hits[0].sort_values.len);
+                }
+            }
+        }
+    };
+    try Exercise.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{});
+}
+
 test "match_all supports id-only sort without native doc values" {
     const alloc = std.testing.allocator;
     var collect_count: usize = 0;
@@ -32404,4 +34027,755 @@ test "external lake signed native datetime cursors retain their concrete domain"
         try std.testing.expectEqual(@as(i128, -1), key.datetime_ns);
         try std.testing.expectEqual(std.math.Order.lt, compareSortValues(key, .{ .datetime_ns = 0 }));
     }
+}
+
+test "external lake ordinal identity projection avoids stored key I/O and preserves score ties" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const mapper = @import("../document_mapper.zig");
+    const docs = try ca.alloc(mapper.MapperDoc, 4000);
+    var random = std.Random.DefaultPrng.init(73);
+    for (docs, 0..) |*doc, i| {
+        var payload: [128]u8 = undefined;
+        random.random().bytes(&payload);
+        doc.* = .{ .key = try std.fmt.allocPrint(ca, "native-{d}", .{i}), .value = try std.fmt.allocPrint(ca, "{{\"body\":\"alpha {s}\"}}", .{std.fmt.bytesToHex(&payload, .lower)}) };
+    }
+    const bytes = (try mapper.buildTextSegmentFromDocuments(a, docs, .{}, null)).?;
+    defer a.free(bytes);
+    const Harness = struct {
+        bytes: []const u8,
+        writer: *index_mod.IndexWriter,
+        identity_reads: usize = 0,
+        hints: [16]struct { offset: u64, length: u64 } = undefined,
+        hint_count: usize = 0,
+        fn prefetch(raw: *anyopaque, offset: u64, length: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.hint_count < self.hints.len) self.hints[self.hint_count] = .{ .offset = offset, .length = length };
+            self.hint_count += 1;
+        }
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (offset == 0 and out.len > 21) self.identity_reads += 1;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+        fn acquire(raw: ?*anyopaque, _: ?[]const u8) !?PinnedTextSource {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return .{ .snapshot = self.writer.acquireSnapshot(), .name = "text", .text_analysis = .{}, .runtime_schema = null };
+        }
+        fn entry(_: ?*anyopaque, _: ?[]const u8) !?*index_manager_mod.IndexManager.TextIndex {
+            return null;
+        }
+        fn chunk(_: ?*anyopaque, _: Allocator, _: ?[]const u8) !bool {
+            return false;
+        }
+        fn matchAll(_: ?*anyopaque, _: Allocator, _: types.SearchRequest) !types.SearchResult {
+            return error.TestUnexpectedResult;
+        }
+        fn stored(_: ?*anyopaque, _: Allocator, _: []const u8) !?[]u8 {
+            return error.TestUnexpectedResult;
+        }
+        fn project(_: ?*anyopaque, out: Allocator, _: types.SearchRequest, _: []const u8, data: []const u8) ![]u8 {
+            return out.dupe(u8, data);
+        }
+        fn post(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, result: types.SearchResult, _: bool) !types.SearchResult {
+            return result;
+        }
+        fn ordinal(_: ?*anyopaque, out: Allocator, _: *const index_mod.IndexSnapshot, doc: u32) !?[]u8 {
+            return try key(out, doc);
+        }
+        fn key(out: Allocator, doc: u32) ![]u8 {
+            return std.fmt.allocPrint(out, "public-{d:0>4}", .{3999 - doc});
+        }
+        fn identity(_: ?*anyopaque, out: Allocator, id: []const u8) ![]u8 {
+            return key(out, try std.fmt.parseInt(u32, id[7..], 10));
+        }
+    };
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    var harness: Harness = .{ .bytes = bytes, .writer = &writer };
+    try writer.addSegmentWithIdData(1, .fromNative(.{ .ranges = .{ .ptr = &harness, .length = bytes.len, .read_into = Harness.read, .close = Harness.close, .prefetch = Harness.prefetch } }));
+    harness.hint_count = 0;
+    try writer.snapshot().prefetchStoredDoc(3999);
+    try std.testing.expectEqual(@as(usize, 2), harness.hint_count);
+    const identity = harness.hints[0];
+    try std.testing.expectEqualStrings("native-3999", bytes[@intCast(identity.offset)..][0..@intCast(identity.length)]);
+    try std.testing.expect(harness.hints[1].length > 0);
+    try std.testing.expect(harness.hints[1].offset + harness.hints[1].length <= bytes.len);
+    harness.identity_reads = 0;
+    const req: types.SearchRequest = .{ .include_stored = false, .limit = 3, .order_by = &.{ .{ .field = "_score", .desc = true }, .{ .field = "_id" } } };
+    var executor: SearchTextQueryExecutor = .{ .ctx = &harness, .acquire_text_source = Harness.acquire, .text_index_entry = Harness.entry, .text_index_is_chunk_backed = Harness.chunk, .search_match_all = Harness.matchAll, .project_stored_search = Harness.project, .load_stored = Harness.stored, .postprocess = Harness.post, .project_key = Harness.identity, .project_doc_num = Harness.ordinal };
+    var mapped = try searchTextQuery(a, req, .{ .term = .{ .field = "body", .term = "alpha" } }, executor);
+    defer mapped.deinit();
+    try std.testing.expectEqual(@as(usize, 0), harness.identity_reads);
+    try std.testing.expectEqualStrings("public-0000", mapped.hits[0].id);
+    try std.testing.expectEqual(@as(?u32, 3999), mapped.hits[0].native_text_doc_id);
+    executor.project_doc_num = null;
+    var legacy = try searchTextQuery(a, req, .{ .term = .{ .field = "body", .term = "alpha" } }, executor);
+    defer legacy.deinit();
+    try std.testing.expect(harness.identity_reads > 0);
+    try std.testing.expectEqual(mapped.total_hits, legacy.total_hits);
+    for (mapped.hits, legacy.hits) |lhs, rhs| {
+        try std.testing.expectEqualStrings(lhs.id, rhs.id);
+        try std.testing.expectEqual(lhs.score, rhs.score);
+    }
+    var next = req;
+    next.search_after = mapped.hits[mapped.hits.len - 1].sort_values;
+    executor.project_doc_num = Harness.ordinal;
+    var resumed = try searchTextQuery(a, next, .{ .term = .{ .field = "body", .term = "alpha" } }, executor);
+    defer resumed.deinit();
+    try std.testing.expectEqualStrings("public-0003", resumed.hits[0].id);
+}
+
+test "primary match_all stream retains ownership on consumer error (#1095)" {
+    var source = TestMatchAllCtx{ .ids = &.{"doc:a"}, .ordinals = &.{1} };
+    const Consumer = struct {
+        fn fail(_: ?*anyopaque, _: MatchAllCandidate) !void {
+            return error.ConsumerFailure;
+        }
+    };
+    try std.testing.expectError(error.ConsumerFailure, testStreamPrimaryMatchAllCandidatesCallback(&source, std.testing.allocator, .{}, .{}, null, Consumer.fail));
+}
+
+test "external lake ranked delivery shares exact snapshot authority until its final owner closes" {
+    const a = std.testing.allocator;
+    const bytes = (try mapper_mod.buildTextSegmentFromDocuments(a, &.{.{ .key = "row", .value = "{\"body\":\"quasar\"}" }}, .{}, null)).?;
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegmentWithId(1, bytes);
+    const Context = struct {
+        allowed: bool = true,
+        releases: usize = 0,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.allowed) return error.Forbidden;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.releases += 1;
+        }
+    };
+    var context: Context = .{};
+    const snapshot = try writer.acquireSnapshotWithReadCapability(.{ .ptr = &context, .check = Context.check, .io = std.testing.io });
+    var ranking: PinnedTextSource = .{ .snapshot = snapshot, .name = "body", .text_analysis = .{}, .runtime_schema = null, .owner = &context, .release_owner = Context.release };
+    ranking = try ranking.share(a);
+    var delivery = try ranking.clone();
+    const inspect = snapshot.retain();
+    defer inspect.release();
+    ranking.deinit();
+    try std.testing.expectEqual(@as(usize, 0), context.releases);
+    {
+        var lease = try delivery.snapshot.leaseSegment(0);
+        defer lease.deinit();
+        try std.testing.expectEqual(@as(u32, 1), lease.entry.reader.doc_count);
+    }
+    context.allowed = false;
+    try std.testing.expectError(error.Forbidden, delivery.snapshot.leaseSegment(0));
+    context.allowed = true;
+    delivery.deinit();
+    try std.testing.expectEqual(@as(usize, 1), context.releases);
+    try std.testing.expectError(error.Canceled, inspect.leaseSegment(0));
+}
+
+test "public graph metric borrowed wire composed search hydrates only fused winners in one batch" {
+    const a = std.testing.allocator;
+    const Harness = struct {
+        component_bodies: usize = 0,
+        loaded: usize = 0,
+        batches: usize = 0,
+        fusions: usize = 0,
+        fn result(raw: ?*anyopaque, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const hits = try alloc.alloc(types.SearchHit, 3);
+            var ready: usize = 0;
+            errdefer {
+                for (hits[0..ready]) |*hit| hit.deinit(alloc);
+                alloc.free(hits);
+            }
+            for ([_][]const u8{ "a", "b", "c" }, hits, 0..) |id, *hit, i| {
+                hit.* = .{ .id = try alloc.dupe(u8, id), .score = @floatFromInt(3 - i) };
+                ready += 1;
+                if (req.include_stored) {
+                    hit.stored_data = try alloc.dupe(u8, "{\"body\":\"component\"}");
+                    self.component_bodies += 1;
+                }
+            }
+            return .{ .alloc = alloc, .hits = hits, .total_hits = 3 };
+        }
+        fn text(raw: ?*anyopaque, alloc: Allocator, req: types.SearchRequest, _: types.TextQuery) anyerror!types.SearchResult {
+            return result(raw, alloc, req);
+        }
+        fn textLegacy(raw: ?*anyopaque, alloc: Allocator, req: types.SearchRequest) anyerror!types.SearchResult {
+            return result(raw, alloc, req);
+        }
+        fn dense(raw: ?*anyopaque, alloc: Allocator, req: types.SearchRequest, _: types.DenseKnnQuery) anyerror!types.SearchResult {
+            return result(raw, alloc, req);
+        }
+        fn sparse(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: types.SparseKnnQuery) anyerror!types.SearchResult {
+            return error.TestUnexpectedResult;
+        }
+        fn clone(_: ?*anyopaque, alloc: Allocator, set: graph_exec.NamedResultSet, include_stored: bool) anyerror!types.SearchResult {
+            return graph_exec.cloneNamedSetAsResult(alloc, set, include_stored);
+        }
+        fn single(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: []const u8) anyerror!?[]u8 {
+            return error.TestUnexpectedResult;
+        }
+        fn many(raw: ?*anyopaque, alloc: Allocator, req: types.SearchRequest, keys: []const []const u8) anyerror![]?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(req.include_stored);
+            self.batches += 1;
+            const documents = try alloc.alloc(?[]u8, keys.len);
+            @memset(documents, null);
+            errdefer {
+                for (documents) |document| if (document) |bytes| alloc.free(bytes);
+                alloc.free(documents);
+            }
+            for (documents) |*document| {
+                document.* = try alloc.dupe(u8, "{\"body\":\"winner\"}");
+                self.loaded += 1;
+            }
+            return documents;
+        }
+        fn fuse(raw: ?*anyopaque, alloc: Allocator, req: types.SearchRequest, sets: []const graph_exec.NamedResultSet) anyerror!types.SearchResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.fusions += 1;
+            return graph_exec.fuseNamedSets(alloc, req, sets, .{ .ctx = raw, .load_projected_document = single, .load_projected_documents = many });
+        }
+        fn graph(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: *types.SearchResult, _: []const graph_exec.NamedResultSet) anyerror!void {
+            return error.TestUnexpectedResult;
+        }
+        fn run(alloc: Allocator) !void {
+            var fixture: @This() = .{};
+            var output = try searchComposed(alloc, .{ .full_text = .{ .match = .{ .field = "body", .text = "alpha" } }, .dense = .{ .vector = &.{ 1, 2 }, .k = 3 }, .include_stored = true, .limit = 2 }, .{
+                .ctx = &fixture,
+                .search_text_query = text,
+                .search_text = textLegacy,
+                .search_dense = dense,
+                .search_sparse = sparse,
+                .clone_named_set = clone,
+                .fuse_named_sets = fuse,
+                .attach_graph_results = graph,
+            });
+            defer output.deinit();
+            try std.testing.expectEqual(@as(usize, 2), output.hits.len);
+            try std.testing.expectEqualStrings("a", output.hits[0].id);
+            try std.testing.expectEqualStrings("b", output.hits[1].id);
+            try std.testing.expectEqual(@as(usize, 0), fixture.component_bodies);
+            try std.testing.expectEqual(@as(usize, 2), fixture.loaded);
+            try std.testing.expectEqual(@as(usize, 1), fixture.batches);
+            try std.testing.expectEqual(@as(usize, 1), fixture.fusions);
+            for (output.hits) |hit| try std.testing.expectEqualStrings("{\"body\":\"winner\"}", hit.stored_data.?);
+        }
+    };
+    try Harness.run(a);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Harness.run, .{});
+    std.debug.print("COMPOSED_HYDRATION components=2 candidates=6 component_bodies=0 winner_bodies=2 hydration_batches=1\n", .{});
+}
+
+test "external lake metadata navigation prepared highlights own lazy regex allocators and borrow parsed sources" {
+    const a = std.testing.allocator;
+    const indexed = [_]HighlightQuery{.{ .query = .{ .regexp = .{ .field = "body", .pattern = "qu[a-z]+" } }, .text_analysis = .{}, .runtime_schema = null }};
+    var prepared = try PreparedHighlights.init(a, .{ .fields = &.{"body"} }, &indexed);
+    defer prepared.deinit();
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    var hits = [_]types.SearchHit{ .{ .id = try a.dupe(u8, "one") }, .{ .id = try a.dupe(u8, "two") } };
+    defer for (&hits) |*hit| hit.deinit(a);
+    for (&hits) |*hit| {
+        _ = scratch.reset(.retain_capacity);
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), "{\"body\":\"quasar quartz\"}", .{});
+        try prepared.attachValue(a, scratch.allocator(), hit, value);
+        try std.testing.expectEqual(@as(usize, 1), hit.highlights.len);
+    }
+    _ = scratch.reset(.free_all);
+    try std.testing.expectEqualDeep(hits[0].highlights, hits[1].highlights);
+}
+
+test "external lake metadata navigation composed batches preserve component semantics and fusion order" {
+    const a = std.testing.allocator;
+    const Harness = struct {
+        fn text(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: types.TextQuery) !types.SearchResult {
+            return error.UnexpectedSerialComponent;
+        }
+        fn defaultText(_: ?*anyopaque, _: Allocator, _: types.SearchRequest) !types.SearchResult {
+            return error.UnexpectedSerialComponent;
+        }
+        fn dense(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: types.DenseKnnQuery) !types.SearchResult {
+            return error.UnexpectedSerialComponent;
+        }
+        fn sparse(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: types.SparseKnnQuery) !types.SearchResult {
+            return error.UnexpectedSerialComponent;
+        }
+        fn clone(_: ?*anyopaque, alloc: Allocator, set: graph_exec.NamedResultSet, stored: bool) !types.SearchResult {
+            return graph_exec.cloneNamedSetAsResult(alloc, set, stored);
+        }
+        fn fuse(_: ?*anyopaque, alloc: Allocator, _: types.SearchRequest, sets: []const graph_exec.NamedResultSet) !types.SearchResult {
+            try std.testing.expectEqual(@as(usize, 2), sets.len);
+            try std.testing.expectEqualStrings("$full_text_results", sets[0].name);
+            try std.testing.expectEqualStrings("$embeddings_results", sets[1].name);
+            try std.testing.expectEqualStrings("component-0", sets[0].hits[0].id);
+            try std.testing.expectEqualStrings("component-1", sets[1].hits[0].id);
+            return graph_exec.cloneNamedSetAsResult(alloc, sets[0], false);
+        }
+        fn graph(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: *types.SearchResult, _: []const graph_exec.NamedResultSet) !void {
+            return error.UnexpectedGraphAttachment;
+        }
+        fn batch(_: ?*anyopaque, alloc: Allocator, components: []const ComposedComponent) !ComposedComponentBatch {
+            try std.testing.expectEqual(@as(usize, 2), components.len);
+            try std.testing.expect(components[0].query == .text and components[1].query == .dense);
+            try std.testing.expect(components[0].request.full_text != null and components[1].request.full_text == null);
+            for (components) |component| try std.testing.expectEqualStrings("filter", component.request.filter_query_json);
+            var out: ComposedComponentBatch = .{ .alloc = alloc, .results = try alloc.alloc(?types.SearchResult, 2) };
+            @memset(out.results, null);
+            errdefer out.deinit();
+            for (out.results, 0..) |*result, i| {
+                const hits = try alloc.alloc(types.SearchHit, 1);
+                errdefer alloc.free(hits);
+                hits[0] = .{ .id = try std.fmt.allocPrint(alloc, "component-{d}", .{i}), .score = 1 };
+                result.* = .{ .alloc = alloc, .hits = hits, .total_hits = 1 };
+            }
+            return out;
+        }
+    };
+    var result = try searchComposed(a, .{ .full_text = .{ .term = .{ .field = "body", .term = "common" } }, .dense = .{ .vector = &.{ 1, 0 }, .k = 2 }, .filter_query_json = "filter", .include_stored = false }, .{ .ctx = null, .search_components = Harness.batch, .search_text_query = Harness.text, .search_text = Harness.defaultText, .search_dense = Harness.dense, .search_sparse = Harness.sparse, .clone_named_set = Harness.clone, .fuse_named_sets = Harness.fuse, .attach_graph_results = Harness.graph });
+    defer result.deinit();
+    try std.testing.expectEqualStrings("component-0", result.hits[0].id);
+}
+
+test "external lake metadata navigation component timing belongs to completed execution" {
+    const a = std.testing.allocator;
+    var batch: ComposedComponentBatch = .{ .alloc = a, .results = try a.alloc(?types.SearchResult, 2) };
+    @memset(batch.results, null);
+    defer batch.deinit();
+    batch.execution_ns = try a.dupe(u64, &.{ 50 * std.time.ns_per_ms, 75 * std.time.ns_per_ms });
+    for (batch.results) |*result| result.* = .{ .alloc = a, .hits = &.{}, .total_hits = 0 };
+    try std.testing.expect(batch.lastExecutionNs() == null);
+    var first = try batch.take();
+    defer first.deinit();
+    try std.testing.expectEqual(@as(?u64, 50 * std.time.ns_per_ms), batch.lastExecutionNs());
+    var second = try batch.take();
+    defer second.deinit();
+    try std.testing.expectEqual(@as(?u64, 75 * std.time.ns_per_ms), batch.lastExecutionNs());
+}
+
+test "logical value producers verify before counts negation and pagination and memoize source loads" {
+    const a = std.testing.allocator;
+    const schema: runtime_schema_mod.TableSchema = .{ .full_text_documents = &.{.{ .name = "_default", .fields = &.{
+        .{ .path = "content", .emitted_name = "content._substring", .analyzer = "substring" },
+        .{ .path = "content", .emitted_name = "content._keyword", .analyzer = "keyword" },
+    } }} };
+    const documents = [_]mapper_mod.MapperDoc{
+        .{ .key = "a", .value = "{\"content\":\"connection refused\"}" },
+        .{ .key = "b", .value = "{\"content\":\"Connection-refused\"}" },
+        .{ .key = "c", .value = "{\"content\":\"connection-refused\"}" },
+        .{ .key = "d", .value = "{\"content\":\"no match\"}" },
+    };
+    const bytes = (try mapper_mod.buildTextSegmentFromDocuments(a, &documents, .{}, schema)).?;
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const Loader = struct {
+        calls: usize = 0,
+        fn load(raw: ?*anyopaque, alloc: Allocator, id: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            for (documents) |doc| if (std.mem.eql(u8, doc.key, id)) return try alloc.dupe(u8, doc.value);
+            return null;
+        }
+    };
+    var loader = Loader{};
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var execution = ValueExecution{ .a = a, .snapshot = writer.snapshot(), .req = .{}, .load_ctx = &loader, .load = Loader.load };
+    defer execution.deinit();
+    const query = try textQueryToSearchQueryWithValues(arena.allocator(), .{ .value = .{ .kind = .contains, .field = "content", .text = "connection-refused" } }, .{}, schema, &execution);
+    try std.testing.expectEqual(@as(u32, 1), try search_mod.countMatches(a, writer.snapshot(), query));
+    try std.testing.expectEqual(@as(usize, 3), loader.calls);
+    try std.testing.expectEqual(@as(u32, 1), try search_mod.countMatches(a, writer.snapshot(), query));
+    try std.testing.expectEqual(@as(usize, 3), loader.calls);
+    const negative: search_mod.SearchQuery = .{ .bool_query = .{ .must = &.{.{ .match_all = {} }}, .must_not = &.{query} } };
+    try std.testing.expectEqual(@as(u32, 3), try search_mod.countMatches(a, writer.snapshot(), negative));
+    var page = try search_mod.execute(a, writer.snapshot(), .{ .query = query, .k = 1, .include_stored = false });
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.hits.len);
+    try std.testing.expectEqual(@as(u32, 2), page.hits[0].doc_id);
+    const equals = try textQueryToSearchQueryWithValues(arena.allocator(), .{ .value = .{ .kind = .equals, .field = "content", .text = "connection-refused" } }, .{}, schema, &execution);
+    try std.testing.expectEqual(@as(u32, 1), try search_mod.countMatches(a, writer.snapshot(), equals));
+    try std.testing.expectEqual(@as(usize, 3), loader.calls);
+    try std.testing.expectError(error.ValueSearchRequiresScan, textQueryToSearchQueryWithValues(arena.allocator(), .{ .value = .{ .kind = .contains, .field = "content", .text = "-" } }, .{}, schema, &execution));
+    execution.req.value_search_execution = .{ .allow_scan = true, .max_documents = 1 };
+    const scan = try textQueryToSearchQueryWithValues(arena.allocator(), .{ .value = .{ .kind = .contains, .field = "content", .text = "-" } }, .{}, schema, &execution);
+    try std.testing.expectError(error.ValueSearchLimitExceeded, search_mod.countMatches(a, writer.snapshot(), scan));
+}
+
+test "logical value fusion preserves per-leaf scores and constrained retained facts" {
+    const a = std.testing.allocator;
+    const documents = [_]mapper_mod.MapperDoc{
+        .{ .key = "a", .value = "{\"content\":\"ushers\"}" },
+        .{ .key = "b", .value = "{\"content\":\"he\"}" },
+        .{ .key = "c", .value = "{\"content\":\"absent\"}" },
+        .{ .key = "d", .value = "{\"content\":[\"s\",\"he\"]}" },
+        .{ .key = "e", .value = "{\"content\":42}" },
+    };
+    const bytes = (try mapper_mod.buildTextSegmentFromDocuments(a, &documents, .{}, null)).?;
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    try std.testing.expect(try writer.deleteById("c"));
+    const Loader = struct {
+        calls: usize = 0,
+        fn load(raw: ?*anyopaque, alloc: Allocator, id: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            for (documents) |doc| if (std.mem.eql(u8, doc.key, id)) return try alloc.dupe(u8, doc.value);
+            return null;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var loader: Loader = .{};
+    var execution: ValueExecution = .{ .a = a, .snapshot = writer.snapshot(), .req = .{ .value_search_execution = .{ .allow_scan = true, .max_documents = 4 } }, .load_ctx = &loader, .load = Loader.load };
+    defer execution.deinit();
+    const source: types.TextQuery = .{ .bool_query = .{ .should = &.{
+        .{ .value = .{ .kind = .contains, .field = "content", .text = "she", .boost = 10 } },
+        .{ .value = .{ .kind = .contains, .field = "content", .text = "he", .boost = 2 } },
+        .{ .value = .{ .kind = .contains, .field = "content", .text = "hers", .boost = 1 } },
+        .{ .value = .{ .kind = .matches, .field = "content", .text = "h.*e", .boost = 1 } },
+        .{ .value = .{ .kind = .equals, .field = "content", .text = "HE", .case_sensitive = false, .boost = 1 } },
+        .{ .value = .{ .kind = .contains, .field = "absent", .text = "ignored", .boost = 1 } },
+    } } };
+    const query = try textQueryToSearchQueryWithValues(arena.allocator(), source, .{}, null, &execution);
+    try std.testing.expectEqual(@as(u32, 3), try search_mod.countMatches(a, writer.snapshot(), query));
+    try std.testing.expectEqual(@as(usize, 4), loader.calls);
+    var page = try search_mod.execute(a, writer.snapshot(), .{ .query = query, .k = 5, .include_stored = false });
+    defer page.deinit();
+    try std.testing.expectEqual(@as(u32, 0), page.hits[0].doc_id);
+    try std.testing.expect(page.hits[0].score > page.hits[1].score);
+    try std.testing.expectEqual(@as(usize, 4), loader.calls);
+
+    try std.testing.expectEqual(@as(usize, 0), execution.local_work.sources.budget.live);
+
+    loader.calls = 0;
+    var literals_only: ValueExecution = .{ .a = a, .snapshot = writer.snapshot(), .req = .{ .value_search_execution = .{ .allow_scan = true, .max_documents = 4 } }, .load_ctx = &loader, .load = Loader.load };
+    defer literals_only.deinit();
+    const literal_query = try textQueryToSearchQueryWithValues(arena.allocator(), .{ .bool_query = .{ .should = source.bool_query.should[0..3] } }, .{}, null, &literals_only);
+    try std.testing.expectEqual(@as(u32, 3), try search_mod.countMatches(a, writer.snapshot(), literal_query));
+    try std.testing.expectEqual(@as(usize, 4), loader.calls);
+
+    // A speculative sibling that exceeds its work budget is unknown, not a
+    // cached negative or an error for the demanded literal. Its own request
+    // must still report the original error.
+    var limited: ValueExecution = .{ .a = a, .snapshot = writer.snapshot(), .req = .{ .value_search_execution = .{ .allow_scan = true, .max_regex_work = 1 } }, .load_ctx = &loader, .load = Loader.load };
+    defer limited.deinit();
+    const limited_query = try textQueryToSearchQueryWithValues(arena.allocator(), .{ .bool_query = .{ .should = &.{
+        .{ .value = .{ .kind = .contains, .field = "content", .text = "he" } },
+        .{ .value = .{ .kind = .matches, .field = "content", .text = "h.*e" } },
+    } } }, .{}, null, &limited);
+    const demanded = limited_query.bool_query.should[0];
+    const deferred = limited_query.bool_query.should[1];
+    try std.testing.expectEqual(@as(u32, 3), try search_mod.countMatches(a, writer.snapshot(), demanded));
+    try std.testing.expectError(error.ValueSearchLimitExceeded, search_mod.countMatches(a, writer.snapshot(), deferred));
+
+    var selective: ValueExecution = .{ .a = a, .snapshot = writer.snapshot(), .req = .{ .value_search_execution = .{ .allow_scan = true } }, .load_ctx = &loader, .load = Loader.load };
+    defer selective.deinit();
+    const conjunction: types.TextQuery = .{ .bool_query = .{ .must = &.{
+        .{ .value = .{ .kind = .contains, .field = "content", .text = "never-present" } },
+        .{ .value = .{ .kind = .matches, .field = "content", .text = "h.*e" } },
+    } } };
+    const selective_query = try textQueryToSearchQueryWithValues(arena.allocator(), conjunction, .{}, null, &selective);
+    try std.testing.expectEqual(@as(u32, 0), try search_mod.countMatches(a, writer.snapshot(), selective_query));
+    try std.testing.expectEqual(@as(u64, 0), selective.local_work.regex_work.load(.monotonic));
+
+    // A cached subset, including a verified nonmatch, cannot stand for an
+    // entire segment when a subsequent request has a broader candidate set.
+    const now = @import("../native_query_cut.zig").nowMs();
+    const scope = value_query.membership.Scope.init("fusion-partial-test", "cut", @as(u64, 77), now + 60000);
+    const request: types.SearchRequest = .{ .value_search_execution = .{ .allow_scan = true }, .value_search_scope = scope };
+    var partial: ValueExecution = .{ .a = a, .snapshot = writer.snapshot(), .req = request, .load_ctx = &loader, .load = Loader.load };
+    defer partial.deinit();
+    const leaf: types.TextQuery = .{ .value = .{ .kind = .contains, .field = "content", .text = "he" } };
+    const partial_query = try textQueryToSearchQueryWithValues(arena.allocator(), leaf, .{}, null, &partial);
+    var incoming = roaring.RoaringBitmap.init(a);
+    defer incoming.deinit();
+    try incoming.add(0);
+    try incoming.add(2);
+    const producer = partial_query.doc_num.producer.?;
+    var first = try producer.produce(producer.ptr, a, 0, 5, &incoming);
+    defer first.deinit();
+    try std.testing.expectEqual(@as(usize, 1), first.cardinality());
+    loader.calls = 0;
+    var resumed: ValueExecution = .{ .a = a, .snapshot = writer.snapshot(), .req = request, .load_ctx = &loader, .load = Loader.load };
+    defer resumed.deinit();
+    const resumed_query = try textQueryToSearchQueryWithValues(arena.allocator(), leaf, .{}, null, &resumed);
+    try std.testing.expectEqual(@as(u32, 3), try search_mod.countMatches(a, writer.snapshot(), resumed_query));
+    try std.testing.expectEqual(@as(usize, 3), loader.calls);
+    loader.calls = 0;
+    var complete: ValueExecution = .{ .a = a, .snapshot = writer.snapshot(), .req = request, .load_ctx = &loader, .load = Loader.load };
+    defer complete.deinit();
+    const complete_query = try textQueryToSearchQueryWithValues(arena.allocator(), leaf, .{}, null, &complete);
+    try std.testing.expectEqual(@as(u32, 3), try search_mod.countMatches(a, writer.snapshot(), complete_query));
+    try std.testing.expectEqual(@as(usize, 0), loader.calls);
+    // A warmed count borrows immutable membership even with deletions. No
+    // allocator or original-source work is needed for the bitmap fast path.
+    var empty: [0]u8 = .{};
+    var no_alloc = std.heap.FixedBufferAllocator.init(&empty);
+    const borrowed_filter: @import("../../../search/query.zig").Filter = .{ .doc_num = .{ .doc_nums = &.{}, .producer = complete_query.doc_num.producer } };
+    try std.testing.expectEqual(@as(usize, 3), try writer.snapshot().countFilter(no_alloc.allocator(), borrowed_filter));
+    try std.testing.expectEqual(@as(usize, 0), loader.calls);
+    try std.testing.expectEqual(@as(u64, 0), complete.local_work.documents.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), complete.local_work.bytes.load(.monotonic));
+}
+
+test "logical value lossless keyword equality bypasses synonym expansion" {
+    const a = std.testing.allocator;
+    const inverted = @import("../../../section/inverted.zig");
+    var inv = inverted.InvertedIndexBuilder.init(a, .{});
+    defer inv.deinit();
+    try inv.addDocument(0, &.{.{ .term = "fast", .freq = 1, .norm = 1 }});
+    try inv.addDocument(1, &.{.{ .term = "quick", .freq = 1, .norm = 1 }});
+    const postings = try inv.build();
+    defer a.free(postings);
+    var synonyms = @import("../../../section/synonyms.zig").SynonymWriter.init(a);
+    defer synonyms.deinit();
+    try synonyms.addGroup(&.{ "fast", "quick" }, &.{ 0, 1 });
+    const aliases = try synonyms.build();
+    defer a.free(aliases);
+    var builder = segment_mod.SegmentWriter.init(a);
+    defer builder.deinit();
+    const field = try builder.addField("value.keyword");
+    try builder.addSection(field, .inverted_text, postings);
+    try builder.addSection(field, .synonym, aliases);
+    try builder.addStoredDoc("a", "{}");
+    try builder.addStoredDoc("b", "{}");
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const schema: runtime_schema_mod.TableSchema = .{ .full_text_documents = &.{.{ .name = "doc", .fields = &.{.{ .path = "value", .emitted_name = "value.keyword", .analyzer = "keyword" }} }} };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var execution: ValueExecution = .{ .a = a, .snapshot = writer.snapshot(), .req = .{}, .load_ctx = null, .load = testUnexpectedLoadStoredCallback };
+    defer execution.deinit();
+    const query = try textQueryToSearchQueryWithValues(arena.allocator(), .{ .value = .{ .kind = .equals, .field = "value", .text = "fast" } }, .{}, schema, &execution);
+    try std.testing.expectEqual(@as(u32, 1), try search_mod.countMatches(a, writer.snapshot(), query));
+    const ordinary: search_mod.SearchQuery = .{ .term = .{ .field = "value.keyword", .term = "fast" } };
+    try std.testing.expectEqual(@as(u32, 2), try search_mod.countMatches(a, writer.snapshot(), ordinary));
+}
+test "logical value batched reads preserve candidates budgets and scalar fallback" {
+    const a = std.testing.allocator;
+    const documents = [_]mapper_mod.MapperDoc{
+        .{ .key = "a", .value = "{\"content\":\"needle\"}" },
+        .{ .key = "b", .value = "{\"content\":\"other\"}" },
+        .{ .key = "c", .value = "{\"content\":\"needle\"}" },
+        .{ .key = "d", .value = "{\"content\":\"needle\"}" },
+    };
+    const bytes = (try mapper_mod.buildTextSegmentFromDocuments(a, &documents, .{}, null)).?;
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    try std.testing.expect(try writer.deleteById("c"));
+    const Loader = struct {
+        scalar: usize = 0,
+        batches: usize = 0,
+        refuse: bool = false,
+        fn source(alloc: Allocator, id: []const u8) !?[]u8 {
+            // A deleted row must never enter even a speculative read window.
+            if (std.mem.eql(u8, id, "c")) return error.TestUnexpectedResult;
+            for (documents) |doc| if (std.mem.eql(u8, id, doc.key)) return try alloc.dupe(u8, doc.value);
+            return null;
+        }
+        fn load(raw: ?*anyopaque, alloc: Allocator, id: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.scalar += 1;
+            return source(alloc, id);
+        }
+        fn open(raw: ?*anyopaque, _: Allocator) anyerror!?LogicalSourceReader {
+            return .{ .ctx = raw.?, .load = projected, .close = close };
+        }
+        fn close(_: *anyopaque) void {}
+        fn projected(raw: *anyopaque, alloc: Allocator, ids: []const []const u8, roots: []const []const u8) anyerror![]LogicalSourceRow {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.batches += 1;
+            try std.testing.expectEqual(@as(usize, 1), roots.len);
+            try std.testing.expectEqualStrings("content", roots[0]);
+            const rows = try alloc.alloc(LogicalSourceRow, ids.len);
+            for (ids, rows) |id, *row| row.* = .{ .bytes = try source(alloc, id), .original_bytes = 32 * 1024, .projected = true };
+            return rows;
+        }
+        fn many(raw: ?*anyopaque, alloc: Allocator, ids: []const []const u8) anyerror![]?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.batches += 1;
+            if (self.refuse) return error.OutOfMemory;
+            const output = try alloc.alloc(?[]u8, ids.len);
+            for (ids, output) |id, *slot| slot.* = try source(alloc, id);
+            return output;
+        }
+    };
+    for ([_]bool{ false, true }) |refuse| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var loader: Loader = .{ .refuse = refuse };
+        var execution: ValueExecution = .{ .a = a, .snapshot = writer.snapshot(), .req = .{ .profile = true, .value_search_execution = .{ .allow_scan = true, .max_documents = 3 } }, .load_ctx = &loader, .load = Loader.load, .load_many = Loader.many };
+        defer execution.deinit();
+        const query = try textQueryToSearchQueryWithValues(arena.allocator(), .{ .value = .{ .kind = .contains, .field = "content", .text = "needle" } }, .{}, null, &execution);
+        try std.testing.expectEqual(@as(u32, 2), try search_mod.countMatches(a, writer.snapshot(), query));
+        try std.testing.expectEqual(@as(u64, 3), execution.local_work.documents.load(.monotonic));
+        // Two bootstrap rows leave one required scalar tail read.
+        try std.testing.expectEqual(if (refuse) @as(usize, 3) else @as(usize, 1), loader.scalar);
+        try std.testing.expectEqual(@as(usize, 1), loader.batches);
+        // Reusing the producer must not issue any additional read window.
+        try std.testing.expectEqual(@as(u32, 2), try search_mod.countMatches(a, writer.snapshot(), query));
+        try std.testing.expectEqual(@as(usize, 1), loader.batches);
+    }
+    for ([_]bool{ false, true }) |limited| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var loader: Loader = .{};
+        var execution: ValueExecution = .{ .a = a, .snapshot = writer.snapshot(), .req = .{ .profile = true, .value_search_execution = .{ .allow_scan = true, .max_documents = 3, .max_bytes = if (limited) 1024 else 3 * 32 * 1024 } }, .load_ctx = &loader, .load = Loader.load, .load_many = Loader.many, .open_projected = Loader.open, .original_average_bytes = 32 * 1024 };
+        defer execution.deinit();
+        const query = try textQueryToSearchQueryWithValues(arena.allocator(), .{ .value = .{ .kind = .contains, .field = "content", .text = "needle" } }, .{}, null, &execution);
+        if (limited) {
+            try std.testing.expectError(error.ValueSearchLimitExceeded, search_mod.countMatches(a, writer.snapshot(), query));
+        } else {
+            try std.testing.expectEqual(@as(u32, 2), try search_mod.countMatches(a, writer.snapshot(), query));
+            try std.testing.expectEqual(@as(u64, 3 * 32 * 1024), execution.local_work.bytes.load(.monotonic));
+            try std.testing.expectEqual(@as(u64, 3), execution.local_work.stored_field_sources.load(.monotonic));
+            // A projected document must never impersonate a complete source.
+            try std.testing.expectEqual(@as(usize, 0), execution.local_work.sources.budget.live);
+        }
+    }
+}
+
+test "logical value unproductive projection retains its pinned reader during backoff" {
+    const a = std.testing.allocator;
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    const Loader = struct {
+        opens: usize = 0,
+        metadata: usize = 0,
+        complete: usize = 0,
+        closes: usize = 0,
+        live_value: []const u8 = "before",
+        captured: []const u8 = "",
+        fn open(raw: ?*anyopaque, _: Allocator) anyerror!?LogicalSourceReader {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.opens += 1;
+            self.captured = self.live_value;
+            return .{ .ctx = self, .load = read, .close = close };
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closes += 1;
+        }
+        fn read(raw: *anyopaque, alloc: Allocator, ids: []const []const u8, paths: []const []const u8) anyerror![]LogicalSourceRow {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (paths.len == 0) self.complete += 1 else self.metadata += 1;
+            const rows = try alloc.alloc(LogicalSourceRow, ids.len);
+            for (rows) |*row| row.* = .{ .bytes = try alloc.dupe(u8, self.captured), .original_bytes = 32768 };
+            return rows;
+        }
+    };
+    var loader: Loader = .{};
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var execution: ValueExecution = .{ .a = a, .snapshot = writer.snapshot(), .req = .{ .value_search_execution = .{ .allow_scan = true } }, .load_ctx = &loader, .load = testUnexpectedLoadStoredCallback, .open_projected = Loader.open, .original_average_bytes = 32768 };
+    var closed = false;
+    defer if (!closed) execution.deinit();
+    _ = try textQueryToSearchQueryWithValues(arena.allocator(), .{ .value = .{ .kind = .contains, .field = "content", .text = "needle" } }, .{}, null, &execution);
+    const first = (try execution.projectedSources(arena.allocator(), &.{"a"})).?;
+    try std.testing.expectEqualStrings("before", first[0].bytes.?);
+    loader.live_value = "after";
+    const second = (try execution.projectedSources(arena.allocator(), &.{"b"})).?;
+    try std.testing.expectEqualStrings("before", second[0].bytes.?);
+    execution.stored_read_policy.observeSource(32768, 32700);
+    try std.testing.expect(execution.shouldProject());
+    const third = (try execution.projectedSources(arena.allocator(), &.{"c"})).?;
+    try std.testing.expectEqualStrings("before", third[0].bytes.?);
+    execution.original_average_bytes = 1;
+    try std.testing.expect(execution.shouldProject());
+    const fourth = (try execution.projectedSources(arena.allocator(), &.{"d"})).?;
+    try std.testing.expectEqualStrings("before", fourth[0].bytes.?);
+    _ = try textQueryToSearchQueryWithValues(arena.allocator(), .{ .value = .{ .kind = .contains, .field = "", .text = "needle" } }, .{}, null, &execution);
+    const fifth = (try execution.projectedSources(arena.allocator(), &.{"e"})).?;
+    try std.testing.expectEqualStrings("before", fifth[0].bytes.?);
+    try std.testing.expectEqual(@as(usize, 1), loader.opens);
+    try std.testing.expectEqual(@as(usize, 1), loader.metadata);
+    try std.testing.expectEqual(@as(usize, 4), loader.complete);
+    execution.deinit();
+    closed = true;
+    try std.testing.expectEqual(@as(usize, 1), loader.closes);
+}
+
+// Keep private fact tests reachable under a focused value-search filter.
+test {
+    _ = value_query.membership;
+    _ = @import("../../logical_source.zig");
+}
+
+test "logical value bootstrap reads only two originals before pinning projections" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    const padding = try temp.alloc(u8, 32 * 1024);
+    @memset(padding, 'x');
+    const body = try std.fmt.allocPrint(temp, "{{\"content\":\"needle\",\"unused\":\"{s}\"}}", .{padding});
+    var docs: [32]mapper_mod.MapperDoc = undefined;
+    for (&docs, 0..) |*doc, i| doc.* = .{ .key = try std.fmt.allocPrint(temp, "doc-{d:0>3}", .{i}), .value = body };
+    const segment = (try mapper_mod.buildTextSegmentFromDocuments(a, &docs, .{}, null)).?;
+    defer a.free(segment);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(segment);
+    const Loader = struct {
+        body: []const u8,
+        full: usize = 0,
+        projected: usize = 0,
+        opens: usize = 0,
+        first_batch: usize = 0,
+        fn load(raw: ?*anyopaque, alloc: Allocator, _: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.full += 1;
+            return try alloc.dupe(u8, self.body);
+        }
+        fn many(raw: ?*anyopaque, alloc: Allocator, ids: []const []const u8) anyerror![]?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.first_batch == 0) self.first_batch = ids.len;
+            const result = try alloc.alloc(?[]u8, ids.len);
+            for (ids, result) |id, *row| row.* = try load(raw, alloc, id);
+            return result;
+        }
+        fn open(raw: ?*anyopaque, _: Allocator) anyerror!?LogicalSourceReader {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.opens += 1;
+            return .{ .ctx = raw.?, .load = ranges, .close = close };
+        }
+        fn close(_: *anyopaque) void {}
+        fn ranges(raw: *anyopaque, alloc: Allocator, ids: []const []const u8, paths: []const []const u8) anyerror![]LogicalSourceRow {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 1), paths.len);
+            try std.testing.expectEqualStrings("content", paths[0]);
+            const rows = try alloc.alloc(LogicalSourceRow, ids.len);
+            for (rows) |*row| row.* = .{ .bytes = try alloc.dupe(u8, "{\"content\":\"needle\"}"), .original_bytes = self.body.len, .projected = true };
+            self.projected += rows.len;
+            return rows;
+        }
+    };
+    var loader: Loader = .{ .body = body };
+    var execution: ValueExecution = .{ .a = a, .snapshot = writer.snapshot(), .req = .{ .value_search_execution = .{ .allow_scan = true, .max_documents = docs.len, .max_bytes = docs.len * body.len } }, .load_ctx = &loader, .load = Loader.load, .load_many = Loader.many, .open_projected = Loader.open };
+    defer execution.deinit();
+    const query = try textQueryToSearchQueryWithValues(temp, .{ .value = .{ .kind = .contains, .field = "content", .text = "needle" } }, .{}, null, &execution);
+    try std.testing.expectEqual(@as(u32, docs.len), try search_mod.countMatches(a, writer.snapshot(), query));
+    try std.testing.expectEqual(@as(usize, 2), loader.first_batch);
+    try std.testing.expectEqual(@as(usize, 2), loader.full);
+    try std.testing.expectEqual(@as(usize, docs.len - 2), loader.projected);
+    try std.testing.expectEqual(@as(usize, 1), loader.opens);
+    try std.testing.expectEqual(@as(u64, docs.len * body.len), execution.local_work.bytes.load(.monotonic));
 }

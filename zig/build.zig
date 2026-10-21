@@ -62,6 +62,10 @@ const makeRootBuildOptions = antfly_storage_build.makeRootBuildOptions;
 const selectTestFilters = antfly_tests_build.selectTestFilters;
 
 pub fn build(b: *std.Build) void {
+    if (b.option(bool, "grep-only", "Compose only the standalone native grep CLI") orelse false) {
+        @import("pkg/antfly-grep/build.zig").add(b, b.standardTargetOptions(.{}), b.standardOptimizeOption(.{}));
+        return;
+    }
     if (b.option(bool, "embedded-only", "Compose only the Apache embedded products") orelse false) {
         return @import("embedded.build.zig").buildDependency(b, @This());
     }
@@ -87,6 +91,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     const conformance_fixtures = shared.conformance_fixtures;
     const target = shared.target;
     const optimize = shared.optimize;
+    @import("antfly_media").support.addTests(b, b.path("lib/media"), target, optimize);
+    @import("antfly_video").support.addTests(b, b.path("lib/video"), target, optimize);
     const vopr_mod = shared.vopr_mod;
     const strip = shared.strip;
     const lmdb_backend = shared.lmdb_backend;
@@ -96,7 +102,6 @@ pub fn create(b: *std.Build) ?Artifacts {
     const sanitize_thread = shared.sanitize_thread;
     const runtime_artifact_role = shared.runtime_artifact_role;
     const antfly_bin_name = shared.antfly_bin_name;
-    const inference_enable_onnx = shared.inference_enable_onnx;
     const inference_enable_metal = shared.inference_enable_metal;
     const inference_enable_cuda = shared.inference_enable_cuda;
     const build_info = shared.build_info;
@@ -126,6 +131,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const usermgr_mod = shared.usermgr_mod;
     const fst_mod = shared.fst_mod;
     const regex_mod = shared.regex_mod;
+    @import("pkg/antfly-grep/build.zig").addConfigured(b, target, optimize, shared.antfly_version, strip);
     const jsonschema_mod = shared.jsonschema_mod;
     const toon_mod = shared.toon_mod;
     const mcp_mod = shared.mcp_mod;
@@ -159,8 +165,13 @@ pub fn create(b: *std.Build) ?Artifacts {
     const apple_reader_enabled = b.option(bool, "apple-providers", "Enable native Apple OCR, generation, and transcription (macOS 27 SDK and Swift required)") orelse false;
     if (apple_reader_enabled and (target.result.os.tag != .macos or !link_libc))
         @panic("-Dapple-providers=true requires macOS and libc");
+    // Vision OCR is Objective-C and supports cross compilation with the
+    // release SDK. Generation/transcription additionally need the Swift sidecar.
+    const apple_ocr_enabled = b.option(bool, "apple-ocr", "Enable Apple Vision OCR (macOS and libc required)") orelse apple_reader_enabled;
+    if (apple_ocr_enabled and (target.result.os.tag != .macos or !link_libc))
+        @panic("-Dapple-ocr=true requires macOS and libc");
     const apple_reader_options = b.addOptions();
-    apple_reader_options.addOption(bool, "enabled", apple_reader_enabled);
+    apple_reader_options.addOption(bool, "enabled", apple_ocr_enabled);
     const apple_options_module = apple_reader_options.createModule();
     readers_mod.addImport("apple_reader_options", apple_options_module);
     readers_mod.addImport("antfly_inference_work", antfly_imports.inference_work);
@@ -170,7 +181,9 @@ pub fn create(b: *std.Build) ?Artifacts {
         .target = target,
         .optimize = optimize,
     });
-    apple_native_mod.addImport("apple_native_options", apple_options_module);
+    const apple_native_options = b.addOptions();
+    apple_native_options.addOption(bool, "enabled", apple_reader_enabled);
+    apple_native_mod.addImport("apple_native_options", if (apple_ocr_enabled == apple_reader_enabled) apple_options_module else apple_native_options.createModule());
     apple_native_mod.addImport("antfly_platform", platform_mod);
     apple_native_mod.addImport("httpx", httpx_mod);
     generating_mod.addImport("antfly_apple_native", apple_native_mod);
@@ -202,7 +215,7 @@ pub fn create(b: *std.Build) ?Artifacts {
             .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
         });
     }
-    if (apple_reader_enabled) {
+    if (apple_ocr_enabled) {
         addMacosSdkPaths(b, readers_mod, target);
         readers_mod.linkFramework("Foundation", .{});
         readers_mod.linkFramework("CoreGraphics", .{});
@@ -248,7 +261,6 @@ pub fn create(b: *std.Build) ?Artifacts {
     const antfly_embedded_api_pkg_mod = embedded.antfly_embedded_api_pkg_mod;
     const antfly_client_pkg_mod = embedded.antfly_client_pkg_mod;
     const capi_mod = embedded.capi_mod;
-    const libantfly_link_mod = embedded.libantfly_link_mod;
     const install_libantfly = embedded.install_libantfly;
     if (install_apple_bridge) |install| install_libantfly.dependOn(&install.step);
     const install_capi_header = embedded.install_capi_header;
@@ -269,6 +281,37 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_lib_regex_tests = b.addRunArtifact(lib_regex_tests);
     const lib_regex_test_step = b.step("lib-regex-test", "Run standalone lib/regex tests");
     lib_regex_test_step.dependOn(&run_lib_regex_tests.step);
+    const capture_regex_tests = b.addTest(.{ .root_module = regex_mod.import_table.get("antfly_capture_regex").? });
+    const run_capture_regex_tests = b.addRunArtifact(capture_regex_tests);
+    lib_regex_test_step.dependOn(&run_capture_regex_tests.step);
+
+    const sql_regex_tests = b.addTest(.{ .root_module = @import("lib/sql_regex/build.zig").createModule(b, target, optimize, b.path("lib/sql_regex")) });
+    const run_sql_regex_tests = b.addRunArtifact(sql_regex_tests);
+    b.step("sql-regex-test", "Run native PostgreSQL-compatible regex ownership and span contracts").dependOn(&run_sql_regex_tests.step);
+    b.step("sql-regex-check", "Compile PostgreSQL ARE backend contracts for the selected target").dependOn(&sql_regex_tests.step);
+
+    const numeric_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly-embedded/src/numeric_test_root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = selectTestFilters(b, &.{}),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_numeric_tests = @import("build_support/antfly/test_support.zig").addFilteredTestRunArtifact(b, numeric_tests);
+    b.step("sql-numeric-test", "Run isolated exact NUMERIC arithmetic row and key contracts").dependOn(&run_numeric_tests.step);
+
+    const exact_float_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly-embedded/src/common/json_float_decimal.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_exact_float_tests = b.addRunArtifact(exact_float_tests);
+    b.step("sql-exact-float-test", "Verify exact binary64 decimal expansion across finite exponents and benchmark its codec")
+        .dependOn(&run_exact_float_tests.step);
 
     const lib_scraping_tests = b.addTest(.{
         .root_module = scraping_mod,
@@ -348,14 +391,14 @@ pub fn create(b: *std.Build) ?Artifacts {
         .root_module = matcher_mod,
     });
     const run_lib_matcher_tests = b.addRunArtifact(lib_matcher_tests);
-    const lib_matcher_test_step = b.step("lib-matcher-test", "Run standalone lib/matcher tests");
+    const lib_matcher_test_step = b.step("lib-matcher-test", "Run standalone pkg/antfly-embedded/matcher tests");
     lib_matcher_test_step.dependOn(&run_lib_matcher_tests.step);
 
     const lib_resolver_tests = b.addTest(.{
         .root_module = resolver_mod,
     });
     const run_lib_resolver_tests = b.addRunArtifact(lib_resolver_tests);
-    const lib_resolver_test_step = b.step("lib-resolver-test", "Run standalone lib/resolver tests");
+    const lib_resolver_test_step = b.step("lib-resolver-test", "Run standalone pkg/antfly-embedded/resolver tests");
     lib_resolver_test_step.dependOn(&run_lib_resolver_tests.step);
 
     const lib_toon_conformance = b.addExecutable(.{
@@ -424,6 +467,22 @@ pub fn create(b: *std.Build) ?Artifacts {
         },
     });
     const run_httpx_transport_regression_tests = b.addRunArtifact(httpx_transport_regression_tests);
+
+    const group_source_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/db/group_sources.zig"), .target = target, .optimize = optimize }) });
+    group_source_tests.root_module.addImport("antfly-json", json_mod);
+    const run_group_source_tests = b.addRunArtifact(group_source_tests);
+    b.step("group-sources-test", "Run durable grouped-source membership and fencing tests").dependOn(&run_group_source_tests.step);
+    const structured_test_module = b.createModule(.{ .root_source_file = b.path("lib/structured/root.zig"), .target = target, .optimize = optimize });
+    var structured_imports = b.modules.get("antfly_structured").?.import_table.iterator();
+    while (structured_imports.next()) |entry| structured_test_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    const structured_tests = b.addTest(.{ .root_module = structured_test_module });
+    const run_structured_tests = b.addRunArtifact(structured_tests);
+    b.step("lib-structured-test", "Run constrained output, evidence and generated extraction tests").dependOn(&run_structured_tests.step);
+    const decisions_test_module = b.createModule(.{ .root_source_file = b.path("lib/decisions/root.zig"), .target = target, .optimize = optimize });
+    decisions_test_module.addImport("antfly_structured", b.modules.get("antfly_structured").?);
+    const decisions_tests = b.addTest(.{ .root_module = decisions_test_module });
+    const run_decisions_tests = b.addRunArtifact(decisions_tests);
+    b.step("lib-decisions-test", "Run shared decision wire and generated contract tests").dependOn(&run_decisions_tests.step);
 
     const lib_generating_tests = b.addTest(.{
         .root_module = generating_mod,
@@ -533,12 +592,18 @@ pub fn create(b: *std.Build) ?Artifacts {
     });
     const run_lib_image_tests = image_tests.run_lib_image_tests;
     const run_png_tests = image_tests.run_png_tests;
+    const run_jpeg_tests = image_tests.run_jpeg_tests;
+    const run_webp_tests = image_tests.run_webp_tests;
     const run_jpeg2000_decode_tests = image_tests.run_jpeg2000_decode_tests;
+    b.step("lib-image-webp-test", "Run direct WebP decoder tests").dependOn(&run_webp_tests.step);
+    b.step("lib-image-jpeg-test", "Run direct JPEG decoder tests").dependOn(&run_jpeg_tests.step);
     b.step("lib-image-png-test", "Run PNG codec and checksum compatibility tests").dependOn(&run_png_tests.step);
     b.step("lib-image-jpeg2000-test", "Run direct JPEG 2000 decoder tests").dependOn(&run_jpeg2000_decode_tests.step);
     const image_test_step = b.step("lib-image-test", "Run shared image tests");
     image_test_step.dependOn(&run_lib_image_tests.step);
     image_test_step.dependOn(&run_png_tests.step);
+    image_test_step.dependOn(&run_jpeg_tests.step);
+    image_test_step.dependOn(&run_webp_tests.step);
     image_test_step.dependOn(&run_jpeg2000_decode_tests.step);
 
     const pdf_tests = pdf_build.addTests(b, .{
@@ -573,6 +638,20 @@ pub fn create(b: *std.Build) ?Artifacts {
         .spng_paths = lib_image_spng_paths,
     });
     b.step("lib-image-bench", "Build and install lib-image-bench").dependOn(&b.addInstallArtifact(image_benchmark, .{}).step);
+    const webp_bench_mod = b.createModule(.{
+        .root_source_file = b.path("lib/image/src/webp_bench.zig"),
+        .target = target,
+        .optimize = .fast,
+        .link_libc = true,
+    });
+    const webp_codec_mod = b.createModule(.{
+        .root_source_file = b.path("lib/image/src/webp.zig"),
+        .target = target,
+        .optimize = .fast,
+    });
+    webp_bench_mod.addImport("antfly_webp", webp_codec_mod);
+    const webp_bench = b.addExecutable(.{ .name = "lib-image-webp-bench", .root_module = webp_bench_mod });
+    b.step("lib-image-webp-bench", "Build the bounded WebP decode batch benchmark").dependOn(&b.addInstallArtifact(webp_bench, .{}).step);
 
     const pdf_bench_optimize = b.option(std.lang.Optimize, "pdf-optimize", "Optimization for the isolated PDF executable") orelse .fast;
     const pdf_bench_hash = if (pdf_bench_optimize == .fast) hash_bench_mod else if (pdf_bench_optimize == optimize) hash_mod else b.createModule(.{
@@ -674,6 +753,54 @@ pub fn create(b: *std.Build) ?Artifacts {
         .run_raft_library_tests = run_raft_library_tests,
     });
     const antfly_test_mod = owner_tests.antfly_test_mod;
+    const model_chunk_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "model aware media", "model chunk artifact" },
+    });
+    const model_chunk_step = b.step("antfly-media-chunking-test", "Qualify typed chunk provider ownership, artifact recipes and incomplete coverage");
+    model_chunk_step.dependOn(&b.addRunArtifact(model_chunk_tests).step);
+    const chunk_capability_tests = b.addTest(.{
+        .root_module = antfly_test_mod.import_table.get("antfly_inference_remote_capabilities").?,
+        .filters = &.{"model aware media remote capability"},
+    });
+    model_chunk_step.dependOn(&b.addRunArtifact(chunk_capability_tests).step);
+    const chunk_error_tests = b.addTest(.{
+        .root_module = antfly_test_mod.import_table.get("storage_engine_errors").?,
+    });
+    const chunk_error_run = b.addRunArtifact(chunk_error_tests);
+    model_chunk_step.dependOn(&chunk_error_run.step);
+    const error_identity_step = b.step("runtime-error-identities-test", "Validate native error names and model-aware chunk failure transport");
+    error_identity_step.dependOn(&chunk_error_run.step);
+    const error_provider = b.addLibrary(.{ .name = "chunk-error-test-provider", .root_module = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/runtime_chunk_error_roundtrip_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    }) });
+    const error_consumer = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/runtime_chunk_error_roundtrip_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    });
+    error_consumer.addImport("storage_engine_errors", antfly_test_mod.import_table.get("storage_engine_errors").?);
+    error_consumer.addImport("antfly_test_error_logs", antfly_test_mod.import_table.get("antfly_test_error_logs").?);
+    error_consumer.linkLibrary(error_provider);
+    const error_roundtrip = b.addRunArtifact(b.addTest(.{
+        .root_module = error_consumer,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    }));
+    error_identity_step.dependOn(&error_roundtrip.step);
+    model_chunk_step.dependOn(&error_roundtrip.step);
+    const error_status_run = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/runtime_error_abi.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    }) }));
+    error_identity_step.dependOn(&error_status_run.step);
+    model_chunk_step.dependOn(&error_status_run.step);
+
     const run_antfly_embedded_pkg_tests = owner_tests.run_antfly_embedded_pkg_tests;
     const run_lite_native_tests = owner_tests.run_lite_native_tests;
     const run_lite_cmd_tests = owner_tests.run_lite_cmd_tests;
@@ -682,6 +809,9 @@ pub fn create(b: *std.Build) ?Artifacts {
     const unit_test_step = owner_tests.unit_test_step;
     unit_test_step.dependOn(&b.addRunArtifact(openapi_docs_test).step);
     unit_test_step.dependOn(&run_sql_tests.step);
+    unit_test_step.dependOn(&run_exact_float_tests.step);
+    unit_test_step.dependOn(&run_capture_regex_tests.step);
+    unit_test_step.dependOn(&run_sql_regex_tests.step);
     unit_test_step.dependOn(&run_pgwire_tests.step);
     unit_test_step.dependOn(&pdf_integration.run.step);
     // HTTP client lifecycle tests belong to lib-test; keep their focused target.
@@ -694,6 +824,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const conformance_test_step = b.step("conformance-test", "Fetch and run conformance suites");
     const soak_test_step = b.step("soak-test", "Run long-running soak test aggregates");
     const lib_test_step = b.step("lib-test", "Run default standalone library tests");
+    lib_test_step.dependOn(&b.top_level_steps.get("grep-test").?.step);
     dependOnAll(conformance_test_step, &.{ lib_toon_conformance_step, lib_image_conformance_run_step });
     lib_test_step.dependOn(&run_yacc_tests.step);
     lib_test_step.dependOn(&yacc_steps.run_parser_tests.step);
@@ -701,9 +832,13 @@ pub fn create(b: *std.Build) ?Artifacts {
     lib_test_step.dependOn(&run_raft_library_tests.step);
     lib_test_step.dependOn(&run_lib_jsonschema_tests.step);
     lib_test_step.dependOn(&run_lib_generating_tests.step);
+    lib_test_step.dependOn(&run_structured_tests.step);
+    lib_test_step.dependOn(&run_group_source_tests.step);
+    lib_test_step.dependOn(&run_decisions_tests.step);
     lib_test_step.dependOn(&run_lib_embeddings_tests.step);
     lib_test_step.dependOn(&run_lib_vectorindex_tests.step);
     lib_test_step.dependOn(&run_lib_hash_tests.step);
+    lib_test_step.dependOn(&run_lib_resolver_tests.step);
     lib_test_step.dependOn(&run_vector_cancellation_tests.step);
     lib_test_step.dependOn(&run_lib_chunking_tests.step);
     lib_test_step.dependOn(&run_lib_google_tests.step);
@@ -717,6 +852,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     lib_test_step.dependOn(&run_png_tests.step);
     lib_test_step.dependOn(&run_jpeg2000_decode_tests.step);
     lib_test_step.dependOn(&run_lib_pdf_tests.step);
+    lib_test_step.dependOn(&b.top_level_steps.get("test-media").?.step);
+    lib_test_step.dependOn(&b.top_level_steps.get("test-video").?.step);
     lib_test_step.dependOn(&run_lib_scraping_tests.step);
     lib_test_step.dependOn(&run_hf_tokenizer_tests.step);
     lib_test_step.dependOn(platform_test_step);
@@ -822,7 +959,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .strip = strip,
         .link_libc = link_libc,
         .sanitize_thread = sanitize_thread,
-        .cpu_inference = !inference_enable_cuda and !inference_enable_metal and !inference_enable_onnx,
+        .cpu_inference = !inference_enable_cuda and !inference_enable_metal,
         .runtime_artifact_role = runtime_artifact_role,
         .structlog_mod = structlog_mod,
         .platform_mod = platform_mod,
@@ -830,12 +967,19 @@ pub fn create(b: *std.Build) ?Artifacts {
         .production_antfly_imports = production_antfly_imports,
         .antfly_client_pkg_mod = antfly_client_pkg_mod,
         .capi_mod = capi_mod,
-        .libantfly_link_mod = libantfly_link_mod,
+        .native_storage = embedded.native_storage,
+        .native_enrichment = embedded.native_enrichment,
+        .native_inference = embedded.native_inference,
     });
     b.step("linked-inference-abi-integration-test", "Run the production-linked inference function-table and binary-payload ABI probe").dependOn(&runtime.run_linked_inference_abi_integration.step);
     owner_tests.standalone_runtime_test_step.dependOn(&runtime.run_linked_inference_abi_integration.step);
     const antfly_main = runtime.antfly_main;
     const runtime_library_artifacts = runtime.runtime_library_artifacts;
+    // This fixture intentionally tests the inline host implementation. Compile
+    // its function-table export in the same image, so the shared storage owner
+    // resolves to that host instead of introducing a second codec/TLS owner.
+    owner_tests.lib_standalone_runtime_tests.root_module.addImport("antfly_inference_native_exports", embedded.native_inference.root_module);
+    if (production_antfly_imports.shared_inference_core) @import("build_support/embedded/source_owner.zig").registerLocalProvider(owner_tests.lib_standalone_runtime_tests.root_module, embedded.native_inference);
     const consumer_test_metadata = @import("lib/build_info/build_support.zig").create(b, .{
         .root = b.path("lib/build_info"),
         .target = target,
@@ -982,10 +1126,12 @@ pub fn create(b: *std.Build) ?Artifacts {
     production_antfly_imports.configureEmbedded(b, lite_main_mod, link_libc);
     lite_main_mod.addImport("antfly-client", antfly_client_pkg_mod);
     lite_main_mod.addImport("antfly_inference_host", production_antfly_imports.inference_host);
+    lite_main_mod.addImport("antfly_inference_engine", production_antfly_imports.inference_engine);
     build_info.link(lite_main_mod);
     const lite_main = b.addExecutable(.{
         .name = "antfly-lite",
         .root_module = lite_main_mod,
+        .use_llvm = @import("build_support/embedded/shared_library.zig").llvmBackend(target.result),
     });
     lite_main_mod.linkLibrary(embedded.native_inference);
     lite_main_mod.linkLibrary(embedded.native_enrichment);
@@ -1012,6 +1158,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     production_antfly_imports.configureEmbedded(b, lite_main_tests.root_module, link_libc);
     lite_main_tests.root_module.addImport("antfly-client", antfly_client_pkg_mod);
     lite_main_tests.root_module.addImport("antfly_inference_host", production_antfly_imports.inference_host);
+    lite_main_tests.root_module.addImport("antfly_inference_engine", production_antfly_imports.inference_engine);
     // Unit tests use the stable test version; only final products link release metadata.
     lite_main_tests.root_module.addImport("build_info", build_info.module);
     const run_lite_main_tests = addFilteredTestRunArtifact(b, lite_main_tests);
@@ -1135,8 +1282,9 @@ pub fn create(b: *std.Build) ?Artifacts {
     const unit_gate = b.step("unit-test", "Run and audit all four unit ownership gates");
     for ([_][]const u8{ "lib-test", "antfly-unit-test", "inference-test", "inference-finetune-test", "unit-test-inventory" }) |name|
         unit_gate.dependOn(&b.top_level_steps.get(name).?.step);
-    @import("build_support/antfly/test_cache_lifetime.zig").add(b, unit_gate);
     if (strip) @import("pkg/antfly/build/runtime.zig").stripBuildGraph(b);
+    @import("pkg/antfly/build/linked_tests.zig").finalizeNativeLinks(b);
+    @import("build_support/antfly/test_cache_lifetime.zig").add(b, unit_gate);
     return .{ .runtime = runtime, .inference = inference_graph, .wasm = wasm.artifact, .inference_steps = inference_steps };
 }
 

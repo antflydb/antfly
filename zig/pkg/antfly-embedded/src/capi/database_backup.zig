@@ -25,7 +25,7 @@ const store_mod = @import("../storage/docstore.zig");
 const lite_restore = @import("../storage/lite/portable_restore.zig");
 const magic = "ANTFLYDBAFB\x00\x01";
 const max_tables = 4096;
-const catalog_key = "\x00antfly/embedded/tables/v1";
+const catalog_key = @import("../storage/lite/embedded_catalog.zig").key;
 
 fn imageKey(key: []const u8) bool {
     // Keep the engine's portable primary boundary. Source index checkpoints,
@@ -46,9 +46,22 @@ fn integer(out: *std.ArrayList(u8), alloc: std.mem.Allocator, comptime T: type, 
 }
 
 pub fn exportDatabase(handle: *h.Handle, out: *std.ArrayList(u8)) !void {
+    return exportTables(handle, out, null);
+}
+
+pub fn exportTables(handle: *h.Handle, out: *std.ArrayList(u8), selected: ?[]const []const u8) !void {
     try tables.requireDatabase(handle);
-    try tables.load(handle);
-    const count = handle.embedded_tables.count() + 1;
+    try tables.loadCatalog(handle);
+    var requested: std.StringHashMapUnmanaged(void) = .empty;
+    defer requested.deinit(handle.alloc);
+    if (selected) |names| {
+        for (names) |name| {
+            if (std.mem.eql(u8, name, "default")) continue;
+            if ((try requested.getOrPut(handle.alloc, name)).found_existing) return error.InvalidArgument;
+            _ = try tables.get(handle, name);
+        }
+    } else try tables.load(handle);
+    const count = if (selected != null) requested.count() + 1 else handle.embedded_tables.count() + 1;
     if (count > max_tables) return error.SqlProgramLimitExceeded;
     const owners = try handle.alloc.alloc(*h.db_mod.DB, count);
     defer handle.alloc.free(owners);
@@ -57,11 +70,17 @@ pub fn exportDatabase(handle: *h.Handle, out: *std.ArrayList(u8)) !void {
     owners[0] = &handle.db;
     names[0] = "default";
     var iterator = handle.embedded_tables.valueIterator();
-    for (owners[1..], names[1..]) |*owner, *name| {
-        const table = iterator.next().?.*;
-        owner.* = &table.db;
-        name.* = table.name;
+    var used: usize = 1;
+    while (iterator.next()) |entry| {
+        const table = entry.*;
+        if (selected != null and !requested.contains(table.name)) continue;
+        owners[used] = &table.db;
+        names[used] = table.name;
+        used += 1;
     }
+    // Portable exports include serving catalogs, never an unpublished shadow.
+    // Finish accepted replacements before freezing the logical image.
+    for (owners) |owner| if (owner.hasPendingGraphReplacements()) try owner.runUntilIdle();
     // Reserve all native capture leases before exporting any table. API
     // serialization excludes embedded commits; these leases also exclude
     // background mutations. Native intents are excluded from the image.
@@ -86,6 +105,8 @@ pub fn exportDatabase(handle: *h.Handle, out: *std.ArrayList(u8)) !void {
     try integer(out, handle.alloc, u32, @intCast(count));
     try integer(out, handle.alloc, u64, handle.embedded_next_table_id);
     for (owners, names) |db, name| {
+        const jobs = try db.graphReplacementStatusAlloc(handle.alloc);
+        defer jobs.deinit();
         var policy = try db.local_execution.row_policy_gate.enterRaw();
         defer policy.release();
         try integer(out, handle.alloc, u32, @intCast(name.len));
@@ -100,6 +121,15 @@ pub fn exportDatabase(handle: *h.Handle, out: *std.ArrayList(u8)) !void {
         var entry = try cursor.seekAtOrAfter("");
         while (entry) |kv| : (entry = try cursor.next()) {
             if (!imageKey(kv.key)) continue;
+            const keys = @import("../storage/internal_keys.zig");
+            const unpublished = for (jobs.value) |job| {
+                if (keys.matchesGraphEdgeIndexName(kv.key, job.name) or
+                    keys.matchesGraphRetirementIndexName(kv.key, job.name) or
+                    keys.matchesGraphAssetStateIndexName(kv.key, job.name) or
+                    keys.matchesGraphEdgeContenderIndexName(kv.key, job.name) or
+                    keys.matchesGraphGlobalEdgeContenderIndexName(kv.key, job.name)) break true;
+            } else false;
+            if (unpublished) continue;
             try integer(out, handle.alloc, u32, @intCast(kv.key.len));
             try integer(out, handle.alloc, u64, @intCast(kv.value.len));
             try out.appendSlice(handle.alloc, kv.key);

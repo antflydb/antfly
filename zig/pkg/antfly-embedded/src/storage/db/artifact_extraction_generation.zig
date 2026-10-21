@@ -49,6 +49,13 @@ pub fn headKeyAlloc(alloc: std.mem.Allocator, document: []const u8, producer: []
 /// authoritative absence. Only a missing head permits physical-row fallback.
 /// Returned bytes borrow the pinned transaction; the input owns its head guard.
 pub fn captureInput(alloc: std.mem.Allocator, txn: anytype, logical: []const u8) !generations.Input {
+    // Only assets participate in named extraction generations. Resolution,
+    // summary, vector and control records retain their physical read contract;
+    // the shared reader below also selects chunk generations where applicable.
+    // Sending these families through the public ArtifactRef decoder rejects
+    // valid internal records (notably a resolver's own output precondition).
+    if (!keys.isAssetArtifactKey(logical) and !keys.isDocumentUnitArtifactRecordKey(logical))
+        return generations.captureInput(alloc, txn, logical);
     const ids = @import("artifact_ids.zig");
     var ref = (try ids.decodeArtifactRefAlloc(alloc, logical)) orelse return generations.captureInput(alloc, txn, logical);
     defer ref.deinit(alloc);
@@ -533,7 +540,7 @@ test "ordered artifact inventory named extraction directory resumes lookup enume
             defer page.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Check.append, .{ &plan, old, @as([]const Entry, entries[1..]) });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.append, .{ &plan, old, @as([]const Entry, entries[1..]) });
     try std.testing.expectError(error.InvalidBatchRequest, PreparedAppend.init(alloc, &plan, old, &.{ entries[1], entries[1] }));
     {
         var duplicate = try PreparedAppend.init(alloc, &plan, old, entries[0..1]);
@@ -577,7 +584,7 @@ test "ordered artifact inventory named extraction directory resumes lookup enume
             try std.testing.expectEqual(@as(usize, 1), selected_keys.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, InventoryAllocationCheck.run, .{&pinned});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, InventoryAllocationCheck.run, .{&pinned});
     const CaptureCheck = struct {
         fn run(a: std.mem.Allocator, txn: *@import("../docstore.zig").DocStore.Txn, key: []const u8) !void {
             var input = try captureInput(a, txn, key);
@@ -587,7 +594,7 @@ test "ordered artifact inventory named extraction directory resumes lookup enume
             try std.testing.expectEqualStrings(input.head_value.?, input.proofValue().?);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, CaptureCheck.run, .{ &pinned, unit_key });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, CaptureCheck.run, .{ &pinned, unit_key });
     {
         var selected_root = try captureInput(alloc, &pinned, root_key);
         defer selected_root.deinit();
@@ -602,7 +609,7 @@ test "ordered artifact inventory named extraction directory resumes lookup enume
             try std.testing.expectEqualStrings(input.head_key.?, input.proofKey(key));
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, RootCaptureCheck.run, .{ &pinned, root_key });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, RootCaptureCheck.run, .{ &pinned, root_key });
     const ids = @import("artifact_ids.zig");
     var identity = (try ids.decodeArtifactRefAlloc(alloc, unit_key)).?;
     defer identity.deinit(alloc);
@@ -704,7 +711,7 @@ test "ordered artifact inventory named extraction directory resumes lookup enume
                 defer page.deinit();
             }
         };
-        if (state.retired_through == 0) try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &probe, &plan, authority, state });
+        if (state.retired_through == 0) try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &probe, &plan, authority, state });
         var gc = try PreparedRetirement.init(alloc, &probe, &plan, authority, state, 1);
         defer gc.deinit();
         _ = try gc.stage(&plan, &probe);

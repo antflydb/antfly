@@ -851,23 +851,28 @@ pub fn prepareExpandedPromptEmbeddings(
     defer cb.free(embedding_weight);
     const base = try cb.embeddingLookup(embedding_weight, ids.items, ids.items.len, config.hidden_size);
     defer cb.free(base);
-    const host = try cb.toFloat32(base, allocator);
-    defer allocator.free(host);
-    const scale = config.tokenEmbeddingScale();
-    if (!std.math.approxEqAbs(f32, scale, 1.0, 1e-6)) {
-        for (host) |*value| value.* *= scale;
-    }
     const hidden_size: usize = @intCast(config.hidden_size);
     if (projected.embeddings.len != visual_tokens * hidden_size) return error.ImageTokenLengthMismatch;
-    var source_row: usize = 0;
-    for (plan.visual_token_mask, 0..) |is_visual, row| {
-        if (!is_visual) continue;
-        @memcpy(host[row * hidden_size ..][0..hidden_size], projected.embeddings[source_row * hidden_size ..][0..hidden_size]);
-        source_row += 1;
-    }
-    if (source_row != visual_tokens) return error.ImageTokenLengthMismatch;
-    const shape = [_]i32{ @intCast(ids.items.len), @intCast(hidden_size) };
-    const input_embeddings = try cb.fromFloat32Shape(host, &shape);
+    const input_embeddings = if (cb.vtable.concatRows2D != null and cb.vtable.takeRows != null and cb.vtable.multiplyScalar != null)
+        try assembleVisualPromptTensor(cb, allocator, base, projected.embeddings, plan.visual_token_mask, hidden_size, config.tokenEmbeddingScale())
+    else blk: {
+        const host = try cb.toFloat32(base, allocator);
+        defer allocator.free(host);
+        const scale = config.tokenEmbeddingScale();
+        if (!std.math.approxEqAbs(f32, scale, 1.0, 1e-6)) {
+            for (host) |*value| value.* *= scale;
+        }
+        if (projected.embeddings.len != visual_tokens * hidden_size) return error.ImageTokenLengthMismatch;
+        var source_row: usize = 0;
+        for (plan.visual_token_mask, 0..) |is_visual, row| {
+            if (!is_visual) continue;
+            @memcpy(host[row * hidden_size ..][0..hidden_size], projected.embeddings[source_row * hidden_size ..][0..hidden_size]);
+            source_row += 1;
+        }
+        if (source_row != visual_tokens) return error.ImageTokenLengthMismatch;
+        const shape = [_]i32{ @intCast(ids.items.len), @intCast(hidden_size) };
+        break :blk try cb.fromFloat32Shape(host, &shape);
+    };
     errdefer cb.free(input_embeddings);
     const visual_feature_stride = std.math.mul(usize, visual_tokens, hidden_size) catch return error.RequestTooLarge;
     const expected_deepstack = std.math.mul(usize, visual_feature_stride, projected.deepstack_layer_count) catch return error.RequestTooLarge;
@@ -1071,32 +1076,25 @@ fn encodeSingleImage(
         });
     };
     defer cb.free(embedded);
-    failed_stage = "patch_download";
-    const embedded_host = (cb.toFloat32(embedded, allocator) catch |zig017_err| {
-        zig017_return_error = zig017_err;
-        return zig017_err;
-    });
-    defer allocator.free(embedded_host);
     failed_stage = "position_embedding";
-    (addInterpolatedPositions(weights, embedded_host, cfg, geometry) catch |zig017_err| {
-        zig017_return_error = zig017_err;
-        return zig017_err;
-    });
+    var hidden = addInterpolatedPositionsTensor(cb, allocator, weights, embedded, cfg, geometry) catch |err| {
+        zig017_return_error = err;
+        return err;
+    };
+    defer cb.free(hidden);
     var completed_preprocess_evidence = preprocess_evidence;
     if (completed_preprocess_evidence) |*evidence| {
-        evidence.positioned_embedding_f32le_sha256 = sha256F32LeHex(embedded_host);
+        const positioned_host = cb.toFloat32(hidden, allocator) catch |err| {
+            zig017_return_error = err;
+            return err;
+        };
+        defer allocator.free(positioned_host);
+        evidence.positioned_embedding_f32le_sha256 = sha256F32LeHex(positioned_host);
     }
-    const hidden_shape = [_]i32{ @intCast(geometry.patchCount()), @intCast(cfg.vision_hidden) };
-    failed_stage = "positioned_upload";
-    var hidden = (cb.fromFloat32Shape(embedded_host, &hidden_shape) catch |zig017_err| {
-        zig017_return_error = zig017_err;
-        return zig017_err;
-    });
     // Keep exactly one owner for the current vision tensor. Every successful
     // stage replaces that owner only after freeing its predecessor, so all
     // later failures (including cancellation and backend allocation errors)
     // release the live tensor exactly once.
-    defer cb.free(hidden);
     if (cfg.is_qwen35 and cb.kind() == .metal) {
         if (try cb.ensureDeviceResident(hidden)) |resident| {
             cb.free(hidden);
@@ -1700,6 +1698,35 @@ fn visionPositions(allocator: std.mem.Allocator, geometry: Geometry, merge: usiz
     return positions;
 }
 
+fn assembleVisualPromptTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, base: CT, visual: []const f32, mask: []const bool, dim: usize, scale: f32) !CT {
+    if (dim == 0 or visual.len % dim != 0) return error.InvalidTensorShape;
+    const scaled = try cb.multiplyScalar(base, scale) orelse return error.UnsupportedResidentQwenVision;
+    defer cb.free(scaled);
+    const images = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(visual, &.{ @intCast(visual.len / dim), @intCast(dim) }));
+    defer cb.free(images);
+    const source = try cb.concatRows2D(allocator, scaled, images, mask.len, visual.len / dim, dim);
+    defer cb.free(source);
+    const ids = try allocator.alloc(u32, mask.len);
+    defer allocator.free(ids);
+    var visual_row: usize = 0;
+    for (mask, 0..) |is_visual, row| {
+        ids[row] = @intCast(if (is_visual) mask.len + visual_row else row);
+        if (is_visual) visual_row += 1;
+    }
+    if (visual_row != visual.len / dim) return error.ImageTokenLengthMismatch;
+    return try cb.takeRows(source, ids, mask.len, dim) orelse error.UnsupportedResidentQwenVision;
+}
+
+fn addInterpolatedPositionsTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, weights: *WeightCache, input: CT, cfg: Config, geometry: Geometry) !CT {
+    const positions = try allocator.alloc(f32, geometry.patchCount() * cfg.vision_hidden);
+    defer allocator.free(positions);
+    @memset(positions, 0);
+    try addInterpolatedPositions(weights, positions, cfg, geometry);
+    const offsets = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(positions, &.{ @intCast(geometry.patchCount()), @intCast(cfg.vision_hidden) }));
+    defer cb.free(offsets);
+    return cb.add(input, offsets);
+}
+
 fn addInterpolatedPositions(
     weights: *WeightCache,
     hidden: []f32,
@@ -2220,4 +2247,55 @@ test "LightOnOCR3 resident vision uses learned positions without DeepStack" {
     const name = try residentWeightNameAlloc(std.testing.allocator, cfg, "v.position_embd.weight");
     defer std.testing.allocator.free(name);
     try std.testing.expectEqualStrings("model.visual.pos_embed.weight", name);
+}
+
+fn checkQwen3Residency(cb: ComputeBackend, reference: ComputeBackend) !void {
+    const allocator = std.testing.allocator;
+    const fixture = @import("../ops/media_residency_test.zig");
+    const cfg = Config{ .text_hidden = 4, .vision_hidden = 4, .intermediate = 8, .block_count = 1, .head_count = 1, .image_size = 4, .patch_size = 1, .spatial_merge = 2, .layer_norm_eps = 1e-5, .image_mean = .{ 0, 0, 0 }, .image_std = .{ 1, 1, 1 } };
+    const geometry = Geometry{ .width = 6, .height = 4, .grid_x = 6, .grid_y = 4, .merged_x = 3, .merged_y = 2 };
+    var weights = WeightCache.initGguf(allocator, &cb, undefined);
+    defer weights.deinit();
+    weights.position_f32 = try allocator.alloc(f32, 16 * 4);
+    for (weights.position_f32.?, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) * 0.01;
+    var data: [24 * 4]f32 = undefined;
+    for (&data, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 23)) * 0.03;
+    const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&data, &.{ 24, 4 }));
+    defer cb.free(input);
+    var expected = data;
+    try addInterpolatedPositions(&weights, &expected, cfg, geometry);
+    const before = fixture.Transfers.snapshot(cb);
+    const positioned = try addInterpolatedPositionsTensor(&cb, allocator, &weights, input, cfg, geometry);
+    defer cb.free(positioned);
+    try before.expectUnchanged(cb);
+    const actual = try cb.toFloat32(positioned, allocator);
+    defer allocator.free(actual);
+    for (expected, actual) |e, a| try std.testing.expectApproxEqAbs(e, a, 1e-6);
+    const base_data = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    const base = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&base_data, &.{ 4, 4 }));
+    defer cb.free(base);
+    const visual = [_]f32{ 100, 101, 102, 103, 200, 201, 202, 203 };
+    const before_prompt = fixture.Transfers.snapshot(cb);
+    const prompt = try assembleVisualPromptTensor(&cb, allocator, base, &visual, &.{ false, true, true, false }, 4, 2);
+    defer cb.free(prompt);
+    try before_prompt.expectUnchanged(cb);
+    const prompt_data = try cb.toFloat32(prompt, allocator);
+    defer allocator.free(prompt_data);
+    _ = reference;
+    try std.testing.expectEqualSlices(f32, &.{ 2, 4, 6, 8, 100, 101, 102, 103, 200, 201, 202, 203, 26, 28, 30, 32 }, prompt_data);
+}
+
+test "media residency Qwen3 VL positions and prompt native parity" {
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.onNative(fixture.noWeights, checkQwen3Residency);
+}
+
+test "media residency Qwen3 VL positions and prompt Metal parity" {
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.onMetal(fixture.noWeights, checkQwen3Residency);
+}
+
+test "media residency Qwen3 VL positions and prompt CUDA parity" {
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.onCuda(fixture.noWeights, checkQwen3Residency);
 }

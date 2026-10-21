@@ -55,20 +55,55 @@ lake cursors overlap up to four version-pinned projected range reads in a
 32 MiB lookahead batch through the existing I/O runtime. Cancellation reaches
 provider tokens; workers join before source metadata is released.
 
+SQL residual predicates can evaluate supported PLAIN/dictionary Parquet pages
+without allocating complete value vectors. Primitive page kernels dispatch by
+operator/type, compare dense numeric runs with SIMD, and memoize referenced
+dictionary values. NULLs, deletes and scalar coercion errors retain their existing
+semantics; unsupported layouts use the established decoder. Projected values are
+materialized only for surviving rows. Non-nullable pages use implicit positions.
+
 Blocking sorts, mergeable grouped aggregates (including DISTINCT), and hash-join
 build rows can spill through statement-owned temporary storage. Bounded merge
-runs support sorting and per-key state reduction; joins use a bounded bucket
-directory and persistent match markers for outer joins. The shared statement
+runs support sorting and per-key state reduction. SQL joins partition both
+relations into typed sequential blocks, recursively splitting oversized build
+partitions. Inseparable/skewed partitions replay build blocks once per probe
+block, with disk-backed accepted-match flags for right/full joins. Residual ON
+predicates mark matches only after acceptance. The shared statement
 spill quota defaults to 1 GiB and 64 open files. Private files are immediately
 unlinked and close on success/error/cancellation. Small inputs keep the existing
 in-memory paths. The exact datum codec preserves integers and SQL/JSON nulls.
 
-Native SQL and public typed lake scans decode decimal columns as lossless,
-fixed-scale strings through precision 38. INT32/INT64 and binary/fixed binary
-(up to 16 bytes), nullable pages and cached dictionaries share exact integer
-formatting. The older row-scanner numeric contract remains an explicit decoding
-mode. Timestamp predicates normalize wire strings and numeric operands to exact
+Native page scans retain decimal columns as signed i128 coefficient vectors
+with column precision/scale through precision 38. Declared SQL NUMERIC reads
+convert coefficients directly into exact numeric state without formatting or
+parsing text. Raw string columns and public result boundaries retain lossless,
+fixed-scale strings. INT32/INT64 and binary/fixed binary (up to 16 bytes), nullable
+pages and cached dictionaries share this contract. The older row-scanner numeric
+contract remains an explicit decoding mode. Timestamp predicates normalize wire
+strings and numeric operands to exact
 signed epoch nanoseconds; canonical SQL projections preserve pre-1970 values.
+
+Exact decimal comparisons, hashes and mergeable aggregate updates borrow stack
+NUMERIC views instead of allocating a numeric value for every lane. Common
+comparison literals lower once to the column's coefficient scale; fractional,
+large and special literals retain exact comparison. SUM/AVG use wide state and
+can exceed i128. String declarations and explicit NUMERIC modifiers retain their
+existing coercion boundary.
+
+Dictionary predicates retain validated Parquet RLE/bit-packed ID runs when that
+uses less memory than an expanded ID vector. Repeated runs can reject a dense
+mask interval at once; packed IDs use bounded byte reads. Projected survivor
+cohorts keep the existing dictionary interfaces.
+
+After capturing a statement snapshot, eligible inner joins with three to eight
+inputs can use filter-aware estimates to choose a cheaper connected join order.
+Build-side selection preserves a negotiated native exact-index probe when only
+one side offers it; scan row estimates do not account for covering-index seeks.
+Planning uses bounded memory and only already-owned pruning/candidate evidence;
+it does not fetch Parquet footers to improve estimates. Logical column order is
+preserved across projection, aggregation and parallel spill workers. Unsupported
+or effectful shapes keep their original plan. Estimates remain advisory and use
+heuristics when precise cardinality statistics are unavailable.
 
 Table creation can infer and persist columns/fingerprints from every Parquet
 footer or the selected Iceberg schema. Inference preserves requiredness and
@@ -102,7 +137,10 @@ so decoder reads reuse the versioned cache entries.
 The active page set retains the 32 MiB input/decoded budgets; oversized individual
 pages/dictionaries still fail. Iceberg file pruning uses spec/source field IDs
 and inclusive identity, bucket, truncate and temporal projections. Unknown
-transforms or values remain residual.
+transforms or values remain residual. Typed floating bounds respect REAL
+normalization and PostgreSQL NaN ordering; Bloom probes require identical physical
+equality bytes. Optional OffsetIndex decode-cache admission exhaustion falls back
+to sequential page scanning within the original statement budget.
 
 Window partition rows, peer/group directories and frame trees now share the
 statement spill quota, with small tracked caches. Separate cell records store
@@ -122,7 +160,12 @@ input. Floating-point, DISTINCT and pattern reductions retain ordered execution.
 Shared scheduling bounds all workers and releases
 speculative warming admission on completion. Sequential sort/join/group spills
 use typed, checksummed column blocks where multiple rows fit, compact records
-for wide rows, and optional Snappy compression.
+for wide rows, and optional Snappy compression. Spilled join residuals evaluate
+bounded pinned candidate cohorts through physical/decimal column views, updating
+outer matches before advancing probes. Exact decimal column comparisons retain
+per-lane scales and NULLs. Census-backed native producers borrow immutable source
+state and mutate sparse overlays; dense/sparse v3 file-state directories path-copy
+changed files and retain document chunks through both GC walkers (protocol 54).
 
 Borrowed operator batches preserve physical scan vectors and selection masks
 through simple filters, projections and join admission. Probe payloads are
@@ -1126,3 +1169,348 @@ required. Storage/topology loss, recipe/incarnation changes, expiry and unavaila
 cuts fail explicitly instead of selecting newer data. See
 [Composed query sources](../docs/plans/composed-query-sources.md) for the complete
 contract and operational tradeoffs.
+
+### Compact Parquet data encodings
+
+The native reader supports plain and dictionary pages plus DELTA_BINARY_PACKED,
+DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY and BYTE_STREAM_SPLIT. Both nullable V1
+and V2 pages use the same selected-row semantics. Delta navigation keeps compact
+predecessor checkpoints; split streams gather selected lanes; prefix strings are
+reconstructed when demanded. Complete materializers fill final typed vectors directly. NULL-only delta pages
+and unused terminal miniblock widths are supported.
+The encoding is detected from Parquet metadata and requires no attachment option.
+
+
+Small compatible index refreshes use authenticated source deltas for algebraic
+reduction trees and ordered file-slot dictionaries (reader protocol 56). Unchanged
+branches and file slots survive without rebuilding complete per-index catalogs.
+Older/incomplete seeds reconcile conservatively; dense ordered refreshes retain
+bounded compaction. This changes refresh efficiency without adding SQL options.
+
+Native index publication shares one bounded, delete-aware file replay among
+admitted aggregate, ordered, text and vector builders. Matching file requests
+reuse the typed decode; each builder keeps its own durable checkpoint. Saturated
+scheduling and constrained memory select smaller admitted cohorts before serial
+fallback. Opaque allocator chains retain ordinary bounded construction. Optional
+next-file read-ahead uses a second private source view; both replay buffers share
+the same total memory/disk allowance. Oversized files stream ordinarily. Full delta integer pages stream directly
+into result vectors with one physical block of scratch; selective reads retain
+random-access navigation.
+
+
+Ordered refreshes persist free slots across publications and reuse authenticated
+current-cut checkpoints, including independently completed changed files. Reader
+protocol 56 protects the added free-slot page references during GC. Equality-delete
+keys stay private to replay capture. Count-only Parquet indexes use qualified
+footer counts, and full delta string columns own one expanded buffer per physical
+page instead of allocating each string independently. These changes require no
+attachment or query options.
+
+
+Reader protocol 57 adds recursive native aggregate directories. High-cardinality
+group buckets subdivide into bounded hash directories so small updates preserve
+sibling artifacts. Readers retain exact aggregate semantics and older flat formats;
+GC follows each recursive reference. Admitted publication cohorts share a live
+immutable source batch with backpressure, using a projection limited to their
+families. Streaming avoids a whole-file replay spool; serial/repeated passes retain
+bounded spill replay. Logical checkpoint commitments survive upload-attempt page
+rewrites, and zero-row updates preserve pending-file progress.
+
+Reader protocol 58 schedules bounded configuration cohorts within and across native
+index families. Admitted two-batch production overlaps decoding with indexing;
+smaller budgets and oversized batches keep borrowed backpressure. Dictionaries,
+exact decimal values and physical row identities survive the ownership boundary.
+Aggregate metadata v5 binds logical roots to a shared immediate-child cohort
+proof, so fused queries avoid a recursive startup metadata walk. Readers validate
+child identities and recipe slots as consumed; GC retains shared descriptors and
+legacy formats remain readable. No new attachment or query options are required.
+
+Native aggregate publication carries checksum-bound child state proofs directly
+from new publishers and authenticated inherited directories. Build hints are not
+serialized; certified parent directories avoid child-root rereads, and a bounded
+build-local memo avoids repeated validation of legacy and alias references. Aggregate query
+readers share bounded decoded leases for descriptors and column blocks, while
+checking each logical root and current reader authority. Admitted configuration
+cohorts also pin one next-file batch on a private cursor, overlapping reads with
+current indexing/uploads. Extra input/decode memory and shared I/O admission are
+required; denied or unused speculation drains safely and ordinary streaming
+remains available. These refinements retain reader protocol 58 and metadata v5.
+
+Publication separates file rendezvous from CPU execution. Up to 64 independently
+budgeted configuration consumers share each file across bounded CPU waves (eight
+simultaneous CPU lanes by default); waiting for files/batches releases CPU slots
+and workspace so the producer can parallelize Parquet column decoding. A separate
+node-wide parked-task limit bounds consumer descriptors and reserves at most
+2 GiB of combined reducer/input/replay allowance by default. Statement admission
+independently bounds retained reducers and input buffers. Memory/task pressure still selects
+smaller groups and ordinary fallback; configurations beyond an admitted group may
+need another source pass. Native Parquet frames retain immutable page/dictionary
+owners and copy only view metadata when admitted; constrained frames and mutable
+projections keep copied/borrowed fallback.
+
+Aggregate serving caches only selected physical state columns and expands each
+checkpoint dictionary entry once. Readers with different logical recipes share
+the verified encoded block and independently reuse selected typed columns. Each
+column has a 16 MiB expansion allowance, and selected columns share a 32 MiB
+reader-page allowance. An entry exceeding its own allowance
+leaves a small cache hint and uses encoded state on subsequent reads. Transient
+allocator/loading pressure remains retryable. Scope, physical recipe/slot,
+logical-directory and current reader checks still apply. These optimizations
+retain metadata v5 and reader protocol 58 and require no new public options.
+
+
+Publication admits required retained state against shared capacity before sizing
+optional buffers or read-ahead. Shared pressure reduces optional work before
+splitting configurations into additional source passes. Exact NUMERIC group keys
+and SUM/AVG/MIN/MAX use per-file incremental contribution trees; widened sums and
+counts merge before finalization, preserving scale equivalence and special values.
+Binary floating reductions and DISTINCT retain conservative rebuild eligibility.
+
+Finished grouped partials route directly through bounded columnar radix streams
+in one shared extent file, without a sort or another reducer import. Consumed
+parent streams retire before recursive processing, and small resident groups
+publish without spill I/O. Output pages coalesce at most 256 rows. Ordered indexes
+gather 64 keys at a time and pass covering scalar/JSON columns to native batch
+sorting, retaining payload ownership before advancing source pages. The durable
+metadata and attachment/query UX remain unchanged.
+
+
+Protocol 59 adds immutable packed aggregate leaves (metadata 6), combining a
+bounded native column block and all logical roots into one object. Readers
+validate the complete pack and each selected recipe/slot; GC retains the pack
+as one object. Existing flat and partitioned formats remain readable. Aggregate
+builds share bounded verified/decoded metadata caches, including physical pack
+controls, and copy retained directory descriptors without JSON round trips.
+
+Cold publications exceeding resident cohort admission advance private bounded-window
+checkpoints across configurations, retaining projected replays within the shared
+disk quota instead of rereading the archive for each cohort. Native vector/sparse generations, ordered
+and text checkpoints, and exact aggregate contributions reopen completed work.
+Only final roots become serving/recovery publications. Warm delta publications
+and non-incremental aggregate recipes retain their existing paths. Oversized
+individual files preserve ordinary streaming fallback and existing disk/memory
+limits. Attachment, SQL and search UX are unchanged.
+
+Protocol 60 admits exact logical aggregate aliases of one immutable metadata-v6
+pack. Small resident grouped results remain flat (one object for the
+32-group/four-slot fixture); larger results and merges promote to radix routing
+as needed. Reader name/recipe checks and complete object authentication remain
+active, and legacy flat/partitioned encodings remain readable.
+
+Cold file-major builds now advance paged append frontiers for native file state,
+text inventories, ordered dictionaries and counted aggregate contribution trees.
+They transfer the finished contribution directory once at the final publication
+boundary, without repeated full-prefix file catalogs or JSON ownership copying.
+Native logical generation size and cumulative newly published output have
+separate limits, so unchanged chunk references do not exhaust output work.
+Replay capture forwards prepared native scalar/dictionary vectors directly to
+the physical spill codec while preserving established conversion/fallback paths.
+
+
+Cold file-major checkpoints now cover up to four files, with one native builder
+session per configuration/window. At most two windows share the existing replay
+memory/disk allowance; admitted read-ahead overlaps capture with consumption.
+Quota pressure shortens a window, and an unretainable file keeps serial streaming
+fallback. Only complete final roots enter serving/recovery publication.
+
+Wide aggregate groups fall back from flat packs to byte-bounded immutable blocks
+without requiring a grouping spill. Complete authenticated aggregate cohorts can
+stream final groups directly to SQL result execution, avoiding a second hash
+reducer and spill pass. Full slot coverage and absence of an aggregate FILTER are required; grouping-key
+predicates can use the selective finalized stream below. Group/page/response limits, current authority and
+reader lifetime checks remain active. Exact NUMERIC finalization leaves shared
+cached states immutable. Attachment and query syntax are unchanged.
+
+
+Protocol 61 adds dense/sparse metadata version 4 with authenticated persistent
+native generation maps (generation version 2). File descriptors reference ordinal
+chunk trees; immutable prefixes survive checkpoints by reference, while partial
+tails and appended chunks path-copy bounded pages. Legacy inline generations and
+metadata versions 2/3 remain readable. Logical generation size and newly written
+payload/page work remain independently bounded. File descriptor enumeration keeps
+the existing 8,192-file limit. Readers cache authenticated navigation pages, and
+both audit and resumable GC follow map pages and payloads under reader protection.
+
+Mixed cold publications retain eligible shared-scan builders while incompatible
+aggregate units use their ordinary fallback. Final publication remains atomic.
+Complete aggregate cohorts filter grouping keys before state finalization and
+prune to one radix path for exactly typed full-key equality, including NULL.
+Mixed-domain comparisons keep residual filtering. One bounded input page survives
+small result pulls, so source page limits are independent of result framing.
+Unordered explicit LIMIT/OFFSET stops consumption after HAVING accepts enough rows.
+Aggregate FILTERs, filtered global aggregates, ordered evaluation and independent
+cohorts preserve their existing fallback behavior.
+
+Protocol 62 adds authenticated aggregate key fences. Blocks and radix children
+carry conservative 64-byte lower/exclusive-upper prefixes of the existing native
+scalar tuple encoding, including exact NUMERIC keys. Truncation widens a fence;
+it never excludes a matching group. Legacy roots without fences retain the
+ordinary partial/read path and their original cohort commitments.
+
+Finalized aggregate admission treats the complete materialization cardinality as
+an upper bound, rather than charging every stored group before selection. The
+statement still limits actual visited groups, provider pages, delivered groups
+and response bytes. Exactly typed equality prefixes and the next range component
+can prune children and blocks; SQL evaluates the complete residual predicate.
+
+Compatible grouping-key ORDER BY prefixes use bounded best-first result pages.
+The reader prioritizes authenticated fences, admits possible winners into the
+shared native TopK, and stops opening branches when their fences cannot improve
+the page. Wider retained candidates use the statement-owned spill manager.
+Continuation uses the complete native grouping key in either direction.
+SQL may stop after OFFSET/LIMIT and HAVING have accepted enough rows. Uniform
+ascending/descending key order and matching NULL placement are proven explicitly;
+aggregate-value ordering, mixed directions, incompatible NULL placement and old
+unfenced roots keep ordinary SQL evaluation. Broad ranges and long common key
+prefixes may still require scanning many blocks: fences are pruning metadata,
+not an exact ordered predicate index. The internal frontier charges the real
+payload work to the statement's scan limits.
+
+Native generation readers own a bounded navigation cache independently of the
+payload cache. Operation-owned tree access carries cancellation and read quotas;
+only immutable verified page bytes and descriptors survive a call. A 4 MiB,
+128-entry page cache shares identical cold misses and admits up to four loaders
+within 8 MiB of active memory. Independent misses overlap without holding the
+descriptor mutex across I/O. Every hit and flight waiter checks its own current
+authority; a canceled producer does not cancel healthy readers. Synchronous
+callers without an I/O executor can issue an independently admitted read rather
+than wait on a flight. File and chunk descriptors are fenced by directory identity and namespace;
+adjacent chunks use one tree cursor, and warm payload reads require no additional
+artifact navigation reads. Producers reuse the same navigation within checkpoint
+publication. Attempt-local descriptor origins authenticate retained file names
+without reopening the previous directory during finalization. Structural subtree
+retention removes omitted files and path-copies explicit descriptor edits; exact
+file/chunk counts update with explicit mutations and are checked against the pinned checkpoint. Origin hints are never
+serialized. Audit and resumable GC continue to trace the resulting immutable maps.
+
+Native virtual file/directory listings use a bounded prefix cursor and support
+the storage port's recursive byte accounting. Writable overlays merge local and
+virtual children and honor subtree tombstones, including unmaterialized base
+directories. Navigation allocations participate in native runtime memory quotas;
+pooled readers drop request authority while retaining only immutable data.
+
+
+Protocol 63 adds exact normalized-key serving trees to native aggregate leaves.
+Hash/radix reductions still own incremental state; unchanged leaves retain their
+ordered indexes. Small packs embed one navigation leaf, and larger indexes own
+scoped pages traced by normal and resumable GC. Forward/reverse cursors merge
+complete keys across leaves and persist between result pages. Typed ranges seek
+within those indexes. Preflight charges navigation and retained immutable leases;
+legacy leaves and declined admission use one ordinary SQL external sort.
+Scan quotas count visited index records without repeating a page-sized TopK scan.
+
+Aggregate blocks use recipe-specific native transition columns rather than an
+AGS checkpoint string for each group. Counts, exact i128 integer sums, floating
+transition bits, typed extrema and NUMERIC coefficient buffers share the existing
+column/spill codec. Lazy state readers preserve bounded selected-slot decoding;
+legacy, DISTINCT and pattern states retain their existing representation.
+
+Cold file-major construction keeps builders open over adaptive sessions of up to
+64 files. Actual retained memory/spill occupancy grows or shrinks the window while
+the two capture lanes retain their original shared quotas. Descriptor residency
+also participates in admission. Session boundaries, rather than every fixed four
+files, determine private checkpoint/reopen frequency.
+
+
+Finalized aggregate delivery accounts scan pages by logical provider batches,
+independent of decision/result fragmentation. Primitive native transitions finish
+directly into aggregate vectors. Compatible final-group streams bypass TopK and
+deliver result batches after HAVING/OFFSET/LIMIT. An explicit LIMIT with no residual
+predicate or HAVING also bounds ordered-index preflight: a best-first queue opens
+only leaves whose authenticated conservative fences can precede the next exact
+key, and admits the selected coordinates before any output. Truncated or missing
+fences widen work; memory denial retains the external-sort fallback.
+
+Sparse and dense incremental native checkpoints compare exact local before/after
+file cuts, publish explicit added/replaced/deleted descriptors, and path-copy only
+changed file and chunk maps. Retained immutable runs need no individual remote
+descriptor lookup. Pinned LSM run sizes preserve logical generation accounting;
+posting cuts retain exact committed WAL extents. Old reader pins keep bytes alive
+without retaining obsolete files in the new serving generation. The native
+manifest's bounded full run-set serialization remains local work.
+
+
+### Persistent ordered group state (protocol 65)
+
+Native grouped file reductions publish version 8 serving roots over one
+ordered copy-on-write page tree. Complete normalized grouping keys route directly
+to recipe-bound native transition records. Historical version 7 one-row columnar
+records remain readable, and mixed reductions upgrade through a full streaming
+merge once. The index binds the record layout and the publication requires
+reader protocol 65. Forward/reverse LIMIT and typed key ranges
+seek that tree; long common prefixes do not require opening every hash leaf.
+The same tree serves COUNT, integer SUM, exact NUMERIC, and typed extrema.
+Logical slots share one authenticated control object, binding names, the entire
+state recipe, and the state-tree identity. Its decoded lease is shared across
+slots. Compatible slots fuse only when their complete state-tree identities agree.
+
+A changed file still replaces its owned contribution. At each affected file
+reduction ancestor, authenticated child-tree differences identify changed group
+keys. Equal page content skips unchanged subtrees. Each affected group is merged
+from its two current children, then path-copied into the previous parent tree.
+This preserves exact arithmetic and recomputes MIN/MAX winners after removal,
+without inverse transitions or chains of old serving generations.
+Value updates retain unrelated underfull tail pages. Occupancy repair runs for
+splits, membership changes, or newly shrunken pages, and merges toward the normal
+page target rather than growing small tails into objects near the hard cap. Routing intervals are zipped across changed fences, splits, merges and tree
+height changes, so retained child references still skip without payload reads; large edit sets fall back to a full streaming
+merge before publishing any new root. File-contribution ownership remains the
+existing counted graph, while ordinary and resumable GC trace state-tree pages.
+
+Cold publication drains resident or spilled reducers into compact key/state
+records with bounded native sorting, then builds ordered pages in one pass.
+Records too large for a page retain the established radix/block publisher; the
+existing sorted partials feed that fallback without rereading Parquet. This is optional
+physical-format admission, not a new SQL key, state, or scan limit. Historical
+roots remain readable and are upgraded when an admitted reduction is rebuilt.
+
+Serving gathers bounded physical records into owned batches and exposes lazy
+transition readers directly to finalization kernels. A single next-batch task
+uses the shared I/O scheduler while SQL finalizes the current batch; at most two
+4 MiB record batches are resident, with scheduler headroom accounting for arena
+overhead. Cancellation and early close join that task before releasing request
+authority. All batch allocations retain the request's memory accounting.
+Explicit proven prefixes also allow the SQL adapter to consume provider batches
+without repeatedly verifying one group per output fragment.
+
+
+Fixed state offsets are compiled once per reader/reduction from the authenticated
+recipe. COUNT, integer SUM, primitive extrema, boolean and floating transitions
+occupy native fixed fields. Only key presentation, variable extrema and exact
+NUMERIC coefficient buffers need an offset directory. Scalar/NUMERIC payloads
+reuse the existing native scalar codec; this adds no public columnar interchange
+format. Selecting one counter allocates no column descriptors or reducers for
+other slots. The decoder admits a bounded batch by actual record/key bytes and
+key descriptor cost, while legacy records retain their wider descriptor bound.
+
+Native-to-native reductions merge COUNT, integer SUM, booleans and typed extrema
+directly from their fixed fields. Integer transitions keep the checked i128
+intermediate, and floating, generic scalar and exact NUMERIC reducers use the
+shared merge semantics in one reclaimable per-slot workspace. Fixed cohorts need
+one output allocation, independent of slot count. NUMERIC finalization reclaims
+its temporary coefficients before the next result while retaining the owned
+exact result and accounting for both under the request budget.
+
+Changed group keys use two monotone cursors across the current children. A
+missing key preserves the cursor's successor, and batch values own their bytes
+before either cursor advances. Copy-on-write batches stop at 1,024 edits or
+512 KiB of keys and values (plus one indivisible record). Bulk-built pages retain
+their bulk size class on edits, with balanced bulk splits; ordinary pages retain
+their existing packing target. Small occupancy repair does not grow toward the
+hard page cap or rewrite unrelated short tails.
+
+
+An unordered source prefix is explicitly authorized by SQL when ORDER BY is
+absent. Proven LIMIT/OFFSET consumption bounds cap record gathering, decoding and
+prefetch even without ordering. Unsupported sort expressions, residual predicates
+and HAVING do not acquire this authority. Logical scan quotas remain independent
+of physical batch fragmentation.
+
+Cold text diagnostics expose directory admission, inventory admission, immutable
+reader opening/validation, term planning, frontier navigation, posting/ranking
+windows and final result cursor work as bounded Prometheus phase counters. These
+scopes are inclusive and can overlap under prefetch; do not add them together.
+The HN native comparison runner uses identical source checksums and separate
+empty-cache/readiness cases rather than attributing aggregate improvements to
+BM25. See `examples/hackernews/native_search_comparison.py` and the qualification
+instructions in the ingestion/publication plan.

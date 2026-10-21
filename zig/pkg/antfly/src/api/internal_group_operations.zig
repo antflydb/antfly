@@ -56,6 +56,7 @@ pub const Error = operation.ApiError || @import("relational_integrity_errors.zig
     IndexGenerationMismatch,
     GenerationTransitionActive,
     HierarchyCursorStale,
+    DocumentArtifactPublicationFailed,
     DocIdentityNamespaceMismatch,
     StorageReadTemporarilyUnavailable,
     ReadIndexTimeout,
@@ -200,7 +201,7 @@ fn validateHandoffReceiptLookup(input: LookupInput, request: operation.RequestCo
         input.key.len != 0 or input.consistency != .read_index or
         input.options.generation_handoff_install_read_index_certified or
         input.options.include_primary_digest or input.options.relational_integrity_catalog or input.options.relational_integrity_action or
-        input.options.relational_integrity_jobs_json.len != 0 or input.options.relational_index_status_json.len != 0 or
+        input.options.relational_integrity_jobs_json.len != 0 or input.options.group_source_query_json.len != 0 or input.options.relational_index_status_json.len != 0 or
         input.options.relational_activation_json.len != 0 or input.options.fields.len != 0)
         return error.InvalidArgument;
 }
@@ -304,6 +305,7 @@ pub const Operations = struct {
             error.IndexGenerationMismatch => error.IndexGenerationMismatch,
             error.GenerationTransitionActive => error.GenerationTransitionActive,
             error.DocIdentityNamespaceMismatch => error.DocIdentityNamespaceMismatch,
+            error.DocumentArtifactPublicationFailed => error.DocumentArtifactPublicationFailed,
             // Reads share the same leadership admission as point lookup. Do
             // not turn a leader election/routing race into an opaque 500 at
             // the internal scan boundary.
@@ -1076,7 +1078,7 @@ pub const Operations = struct {
             if (probe.value.transition_id != null) {
                 if (input.key.len != 0 or input.consistency != .read_index or input.options.restore_staging_scope != null or
                     input.options.include_primary_digest or input.options.relational_integrity_catalog or input.options.relational_integrity_action or
-                    input.options.relational_integrity_jobs_json.len != 0 or input.options.relational_index_status_json.len != 0 or input.options.relational_activation_json.len != 0 or input.options.fields.len != 0) return error.InvalidArgument;
+                    input.options.relational_integrity_jobs_json.len != 0 or input.options.group_source_query_json.len != 0 or input.options.relational_index_status_json.len != 0 or input.options.relational_activation_json.len != 0 or input.options.fields.len != 0) return error.InvalidArgument;
                 var scoped = std.json.parseFromSlice(@import("../raft/shard_ops.zig").TopologyReadRequest, alloc, input.options.relational_topology_json, .{}) catch return error.InvalidArgument;
                 defer scoped.deinit();
                 const ops = self.shard_ops orelse return error.NotFound;
@@ -1280,7 +1282,14 @@ pub const Operations = struct {
     pub fn graphEdges(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_graph.GraphEdgesRequest) Error!distributed_graph.GraphEdgesResponse {
         try request.ensureActive();
         const reads = try self.routedReads(alloc, request, group_id);
-        return (reads.graphEdgesGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| {
+        const control = request.platformDeadline() catch |err| {
+            if (mapCommonReadError(err)) |mapped| return mapped;
+            return error.Internal;
+        };
+        var controlled = input;
+        controlled.cancellation = request.cancellation;
+        controlled.execution_deadline_ns = control.deadline_ns;
+        return (reads.graphEdgesGroupLocal(alloc, group_id, table_name, controlled, .read_index) catch |err| {
             if (mapCommonReadError(err)) |mapped| return mapped;
             return switch (err) {
                 error.InvalidQueryRequest, error.IndexNotFound => error.InvalidArgument,
@@ -2146,7 +2155,10 @@ fn consumerTests() type {
                     try std.testing.expectEqualStrings("documents", table_name);
                     try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
                     try std.testing.expectEqual(@as(?u64, 12345), req.identity_read_generation);
-                    if (req.hierarchy_children != null) return error.HierarchyCursorStale;
+                    if (req.hierarchy_children) |navigation| {
+                        if (std.mem.eql(u8, navigation.parent_id, "doc:failed")) return error.DocumentArtifactPublicationFailed;
+                        return error.HierarchyCursorStale;
+                    }
                     return error.UnsupportedQueryRequest;
                 }
 
@@ -2179,6 +2191,16 @@ fn consumerTests() type {
                 .{
                     .identity_read_generation = 12345,
                     .hierarchy_children = .{ .parent_id = "doc:a" },
+                },
+            ));
+            try std.testing.expectError(error.DocumentArtifactPublicationFailed, operations.query(
+                std.testing.allocator,
+                .{},
+                17,
+                "documents",
+                .{
+                    .identity_read_generation = 12345,
+                    .hierarchy_children = .{ .parent_id = "doc:failed" },
                 },
             ));
 

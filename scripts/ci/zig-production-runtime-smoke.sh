@@ -36,7 +36,16 @@ cleanup_server() {
 }
 
 cleanup() {
+  local smoke_exit=$?
   cleanup_server
+  if [[ "$smoke_exit" != 0 ]]; then
+    local log
+    for log in "$smoke_root"/*.log; do
+      [[ -f "$log" ]] || continue
+      echo "production runtime log: ${log##*/}" >&2
+      cat "$log" >&2
+    done
+  fi
   rm -rf -- "$smoke_root"
 }
 trap cleanup EXIT INT TERM
@@ -143,6 +152,12 @@ run_profile() {
   local tables_url="${catalog_url}/namespaces/public/tables"
   assert_http_status "$profile-catalog-database" 201 POST "$catalog_url" '{}'
   assert_http_status "$profile-catalog-table" 201 POST "$tables_url/events" '{}'
+  # A caller-owned Lite backend and the compiled physical engine have distinct
+  # Zig error domains. Cover absent reads, batch writes and durable reopen.
+  assert_http_status "$profile-document-missing" 404 GET "$tables_url/events/documents/smoke"
+  assert_http_status "$profile-document-write" 201 POST "$tables_url/events/batch" \
+    '{"inserts":{"smoke":{"value":7}},"sync_level":"write"}'
+  assert_http_status "$profile-document-before" 200 GET "$tables_url/events/documents/smoke"
   assert_http_status "$profile-catalog-before" 200 GET "$tables_url"
   cleanup_server
   "$binary" standalone \
@@ -153,6 +168,13 @@ run_profile() {
   server_pid="$!"
   wait_ready "$profile-reopen" "$port" "$log"
   assert_http_status "$profile-catalog-after" 200 GET "$tables_url"
+  assert_http_status "$profile-document-after" 200 GET "$tables_url/events/documents/smoke"
+  python3 -c '
+import json, sys
+before, after = (json.load(open(path)) for path in sys.argv[1:])
+assert before == after == {"value": 7}, (before, after)
+' "$smoke_root/$profile-document-before-response.txt" "$smoke_root/$profile-document-after-response.txt"
+
   python3 -c '
 import json, sys
 before, after = (json.load(open(path)) for path in sys.argv[1:])
@@ -169,3 +191,68 @@ run_profile lite \
   --storage-engine lite \
   --storage-path "$smoke_root/antfly.aflite" \
   --fsync false
+
+# Exercise the compiled owner boundary: monolithic unit tests do not call
+# adoptEmbeddedLiteRootFromKernelIfNeeded. The adopted table and its range must
+# be journaled, survive restart, and travel with a checkpoint to a new data dir.
+run_lite_adoption() {
+  local source="$smoke_root/embedded.aflite"
+  local copy="$smoke_root/embedded-copy.aflite"
+  local port log phase path
+  printf '%s\n' '{"inserts":{"portable":{"body":"snapshot portability","edited_locally":true}},"sync_level":"full_index"}' >"$smoke_root/embedded-write.json"
+  printf '%s\n' '{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"body":{"type":"string"}},"required":["body"]}}}}' >"$smoke_root/embedded-schema.json"
+  "$binary" lite init "$source" >"$smoke_root/embedded-init.log" 2>&1
+  "$binary" lite schema set "$source" --file "$smoke_root/embedded-schema.json" >"$smoke_root/embedded-schema.log" 2>&1
+  "$binary" lite batch "$source" --file "$smoke_root/embedded-write.json" >"$smoke_root/embedded-write.log" 2>&1
+  for phase in adopt reopen copy; do
+    port="$(free_port)"
+    log="$smoke_root/embedded-${phase}.log"
+    path="$source"
+    [[ "$phase" != copy ]] || path="$copy"
+    "$binary" standalone --host 127.0.0.1 --port "$port" --health false \
+      --storage-engine lite --storage-path "$path" \
+      --data-dir "$smoke_root/embedded-data-${phase}" >"$log" 2>&1 &
+    server_pid="$!"
+    wait_ready "embedded-${phase}" "$port" "$log"
+    assert_http_status "embedded-${phase}-tables" 200 GET "http://127.0.0.1:${port}/db/v1/tables"
+    assert_http_status "embedded-${phase}-document" 200 GET "http://127.0.0.1:${port}/db/v1/tables/default/documents/portable"
+    assert_http_status "embedded-${phase}-table" 200 GET "http://127.0.0.1:${port}/db/v1/tables/default"
+    assert_http_status "embedded-${phase}-query" 200 POST "http://127.0.0.1:${port}/db/v1/tables/default/query" \
+      '{"full_text_search":{"match":"portability","field":"body"},"limit":10}'
+    python3 - "$smoke_root/embedded-schema.json" "$smoke_root/embedded-${phase}-table-response.txt" "$smoke_root/embedded-${phase}-query-response.txt" <<'PY'
+import json, sys
+schema, table, result = (json.load(open(path)) for path in sys.argv[1:])
+assert table["schema"] == schema, table
+assert [row["_id"] for row in result["responses"][0]["hits"]["hits"]] == ["portable"], result
+PY
+    python3 - "$smoke_root/embedded-${phase}-tables-response.txt" "$smoke_root/embedded-${phase}-document-response.txt" <<'PY'
+import json, sys
+tables, document = (json.load(open(path)) for path in sys.argv[1:])
+assert len(tables) == 1 and tables[0]["name"] == "default", tables
+assert document == {"body": "snapshot portability", "edited_locally": True}, document
+PY
+    if [[ "$phase" == reopen ]]; then
+      "$binary" lite snapshot "$source" --out "$copy" >"$smoke_root/embedded-snapshot.log" 2>&1
+    fi
+    cleanup_server
+    if "$binary" lite schema set "$path" --file "$smoke_root/embedded-schema.json" >"$smoke_root/embedded-${phase}-offline-schema.log" 2>&1; then
+      echo "adopted Lite file accepted an offline catalog mutation" >&2
+      return 1
+    fi
+    if ! grep -q 'StandaloneLiteCatalogRequiresApi' "$smoke_root/embedded-${phase}-offline-schema.log"; then
+      cat "$smoke_root/embedded-${phase}-offline-schema.log" >&2
+      return 1
+    fi
+    "$binary" lite batch "$path" --file "$smoke_root/embedded-write.json" >"$smoke_root/embedded-${phase}-offline-write.log" 2>&1
+    ANTFLY_URL='://invalid-server-url' "$binary" backup inspect --input "$path" >"$smoke_root/embedded-${phase}-inspection.json"
+    python3 - "$smoke_root/embedded-${phase}-inspection.json" <<'PYREPORT'
+import json, sys
+report = json.load(open(sys.argv[1]))
+assert report["completeness"]["scan_complete"], report
+assert report["compatibility"]["verdict"] == "unknown", report
+PYREPORT
+  done
+  echo "production Lite embedded adoption, catalog ownership, offline inspection, reopen and snapshot smoke passed"
+}
+
+run_lite_adoption

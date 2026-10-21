@@ -15,8 +15,10 @@
 
 //! Allocation-free checksums with std-compatible wire semantics.
 pub const Crc32 = @import("crc32.zig").Crc32;
+pub const Crc32Bzip2 = @import("crc32.zig").Crc32Bzip2;
 pub const Crc32c = @import("crc32.zig").Crc32c;
 pub const Crc64Nvme = @import("crc64.zig").Crc64Nvme;
+pub const Crc64Xz = @import("crc64.zig").Crc64Xz;
 pub const RuntimeSha256 = @import("sha256.zig").RuntimeSha256;
 pub const Sha256 = @import("sha256.zig").Sha256;
 pub const Adler32 = @import("adler32.zig").Adler32;

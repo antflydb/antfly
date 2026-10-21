@@ -19,6 +19,7 @@ const selectTestFilters = @import("../../../build_support/antfly/test_support.zi
 const compileFiltersWithAnchors = @import("../../../build_support/antfly/test_support.zig").compileFiltersWithAnchors;
 const addFilteredTestRunArtifactWithRuntimeFilters = @import("../../../build_support/antfly/test_support.zig").addFilteredTestRunArtifactWithRuntimeFilters;
 const addFilteredTestRunArtifact = @import("../../../build_support/antfly/test_support.zig").addFilteredTestRunArtifact;
+const addCuratedTestRunArtifact = @import("../../../build_support/antfly/test_support.zig").addCuratedTestRunArtifact;
 
 pub const AddTestsOptions = struct {
     api_http_runtime_test_mod: *std.Build.Module,
@@ -70,6 +71,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "empty activation page validates source catalog without probing external parents",
         "SQL API cross-table MERGE retains both source and target range proofs",
         "api http server authenticates bounded online merge owner routes",
+        "online merge ingress bounds owner work using the transport clock",
         "online merge private standalone rewrite port pins authority and never fabricates Raft coordinates",
         "online merge private port fences owners cancellation and deadlines before dispatch",
         "online merge private port preserves source recovery errors through foreign runtime dispatch",
@@ -312,8 +314,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, public_api_parity_runtime_filters),
         // The macOS debug root includes the complete public transport,
         // generated-contract, and native-index surface. Debug test
-        // compilation currently peaks at 15.09 GB; reserve the measured
-        // envelope so the scheduler does not reject a successful compile.
+        // compilation has a measured native floor in testCompileMaxRss;
+        // retain this authored fallback for unmeasured host profiles.
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 15 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
@@ -371,6 +373,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api http server requires auth for ARD tenant catalog when auth is enabled",
         "api http server serves ARD OpenAPI, skill, resource, and registry endpoints",
         "api http server filters extension mcp tools by trusted principal table permissions",
+        "api http server serves document lookup through mcp tool",
         "ARD search filters scoped catalog entries",
         "ARD search requires text while explore accepts filter-only requests",
         "ARD search supports publisher and metadata filters",
@@ -402,8 +405,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         &lib_api_auth_default_filters,
     );
     const lib_api_auth_tests = b.addTest(.{
-        // macOS Debug measured 11.43 GB for the linked auth surface.
-        .max_rss = if (target.result.os.tag == .macos) 12 * 1024 * 1024 * 1024 else 0,
+        .name = "api-auth-tests",
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("api-auth-tests", b.graph.host.result, target.result, optimize, if (target.result.os.tag == .macos) 12 * 1024 * 1024 * 1024 else 0),
         .root_module = antfly_test_mod,
         .filters = lib_api_auth_runtime_filters,
         .test_runner = .{
@@ -419,6 +422,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     run_lib_api_auth_tests.step.dependOn(&openapi_root_check.step);
     const lib_api_auth_test_step = b.step("antfly-api-auth-test", "Run focused API auth/usermgr HTTP tests");
     lib_api_auth_test_step.dependOn(&run_lib_api_auth_tests.step);
+
+    // The real MCP transport/database security regression does not need the
+    // monolithic library discovery root or its full-suite memory reservation.
+    const mcp_auth_filters = &.{"api http server serves document lookup through mcp tool"};
+    const mcp_auth_tests = b.addTest(.{
+        .name = "api-mcp-auth-tests",
+        .root_module = options.api_http_runtime_test_mod,
+        .filters = mcp_auth_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    b.step("antfly-api-mcp-auth-test", "Run real MCP trusted-principal authorization regressions")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, mcp_auth_tests, mcp_auth_filters).step);
 
     const authorization_sink_filters = [_][]const u8{
         "api http server document scan requires table read permission",
@@ -669,6 +687,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "api session maintenance recovers crash window after durable 2pc commit",
             "api session maintenance skips live commit execution and acknowledgement",
             "session maintenance activation follows current range leadership without follower RPCs",
+            "api http server serves status using control metadata without diagnostic transfers",
             "transaction commit execution yields through caller io and preserves ownership on cancellation",
             "transaction session registry adopts durable session ownership",
             "transaction session registry only adopts durable sessions after lease expiry",
@@ -689,8 +708,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_api_session_maintenance_test_step.dependOn(&run_lib_api_session_maintenance_tests.step);
 
     const lib_api_docid_tests = b.addTest(.{
-        // macOS Debug measured 10.1 GiB for this broad identity/restore root.
-        .max_rss = if (target.result.os.tag == .macos) 12 * 1024 * 1024 * 1024 else 0,
+        .name = "api-docid-tests",
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("api-docid-tests", b.graph.host.result, target.result, optimize, if (target.result.os.tag == .macos) 12 * 1024 * 1024 * 1024 else 0),
         .root_module = antfly_test_mod,
         .filters = &.{
             "api table reads reject stale doc identity before multigroup fanout",
@@ -867,6 +886,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "segment doc ordinal sidecar roundtrip and merge preserve live order",
             "segment index sort metadata roundtrip",
             "segment merge drops index sort metadata until physical sort is preserved",
+            "segment sorted merge normalizes legacy mixed numeric index sort domains",
             "segment sorted merge preserves index sort and remaps doc addressed sections",
             "segment sorted merge rejects non-finite f64 index sort values",
             "match_all sorted segment seek merges sorted segments and applies cursors",
@@ -1287,6 +1307,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
     });
     const run_lib_api_docid_tests = addFilteredTestRunArtifact(b, lib_api_docid_tests);
+    b.step("antfly-api-docid-test", "Run public API document identity and restore contracts").dependOn(&run_lib_api_docid_tests.step);
     const lib_api_graph_snapshot_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, &.{
@@ -1415,8 +1436,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, api_derived_coverage_test_mod, true, true);
     api_derived_coverage_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lib_api_derived_coverage_tests = b.addTest(.{
+        .name = "api-derived-coverage-tests",
         .root_module = api_derived_coverage_test_mod,
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024,
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("api-derived-coverage-tests", b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024),
         .filters = &.{
             "live repair admission supersedes cached vector serviceability",
             // Own the complete status contract suite; table-write integration
@@ -1625,7 +1647,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "api-table-write-implementation-tests",
         .root_module = write_implementation_module,
         .filters = &.{"api.table_reads.implementationTests."},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 8) * 1024 * 1024 * 1024,
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("api-table-write-implementation-tests", b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 12 else 8) * 1024 * 1024 * 1024),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const run_api_table_writes_docid_tests = @import("linked_tests.zig").runPair(b, api_table_writes_docid_tests, write_implementation_tests);
@@ -1671,6 +1693,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-relational-rows-test", "Run generated relational row and schema boundary contracts").dependOn(&addFilteredTestRunArtifact(b, api_relational_row_contract_tests).step);
+    b.step("antfly-schema-expression-test", "Run durable expression semantics and bounded preparation contracts")
+        .dependOn(&addCuratedTestRunArtifact(b, api_relational_row_contract_tests, &.{"relational declarations"}).step);
     const restore_lookup_authority_tests = b.addTest(.{
         .root_module = api_public_table_http_docid_test_mod,
         .filters = &.{ "private restore lookup plan identity", "compiled lookup wire preserves binary scope", "ancestors-only hierarchy survives the internal wire re-encode without a stray group_by" },
@@ -1826,6 +1850,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "managed startup catch-up preserves restore repair debt while index load is terminal",
             "managed startup catch-up defers while shared bulk ingest state is active",
             "clean generated startup inspection does not retain a resident writer",
+            "managed startup catch-up retains resolver-only recovery after reopen",
+            "managed startup catch-up retains cursor-only resolver recovery on workerless reopen",
             "managed startup catch-up allocation failure preserves bounded retry",
             "managed startup catch-up quarantines repeated zero progress with bounded backoff",
             "standby HA replay reconciles managed indexes without opening the public write gate",
@@ -2083,7 +2109,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, hosted_fk_placement_tests).step);
     const sql_rewrite_receipt_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
-        .filters = &.{ "SQL rewrite response retains admitted and uncertain restore handles", "SQL DDL receipt status distinguishes unknown admission", "SQL UUID prepared CREATE TABLE commits and replays catalog topology only on execute", "relational UUID preparation canonicalizes before durable row and index extraction", "relational UUID ingress shares canonical typed bytes and semantic hash", "initial foreign-key create distinguishes unknown admission from accepted work", "primary key schema lowering rejects deferred timing and empty keys", "relational primary keys cannot defer enforcement", "restore immutable rewrite failures are terminal but transport pressure is retryable", "httpx restore owner accepts bounded rewrite source chunks above legacy control limit" },
+        .filters = &.{ "SQL DDL readiness retries transient observations without replaying the declaration", "SQL rewrite response retains admitted and uncertain restore handles", "SQL DDL receipt status distinguishes unknown admission", "SQL UUID prepared CREATE TABLE commits and replays catalog topology only on execute", "relational UUID preparation canonicalizes before durable row and index extraction", "relational UUID ingress shares canonical typed bytes and semantic hash", "initial foreign-key create distinguishes unknown admission from accepted work", "primary key schema lowering rejects deferred timing and empty keys", "relational primary keys cannot defer enforcement", "restore immutable rewrite failures are terminal but transport pressure is retryable", "httpx restore owner accepts bounded rewrite source chunks above legacy control limit" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-sql-rewrite-receipt-test", "Run SQL rewrite receipt and unknown-admission response regression")
@@ -2189,6 +2215,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // Recovery selections belong to the native Zig test inventory.
     const hosted_initial_fk_recovery_tests = b.addTest(.{
         .name = "antfly-hosted-initial-fk-recovery",
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("antfly-hosted-initial-fk-recovery", b.graph.host.result, target.result, optimize, 0),
         .root_module = hosted_initial_fk_test_mod,
         .filters = &.{ "mounted initial", "hosted initial FK real services and facade retain all required capabilities", "FK plan table and range descriptors survive snapshot release", "initial FK plan waits for all external parent schema migrations" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
@@ -2231,6 +2258,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, hosted_graph_truncate_tests).step);
     const hosted_truncate_fk_recovery_tests = b.addTest(.{
         .name = "antfly-hosted-truncate-fk-recovery",
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("antfly-hosted-truncate-fk-recovery", b.graph.host.result, target.result, optimize, 0),
         .root_module = hosted_fk_drop_test_mod,
         .filters = &.{ "mounted hosted external-parent FK DROP publishes after parent ACK", "mounted hosted external-parent FK TRUNCATE", "mounted hosted graph TRUNCATE", "owner catalog busy without index debt keeps provisioning retry until full reconciliation" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
@@ -2271,7 +2299,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, hosted_self_fk_diagnostic_tests).step);
     const hosted_cte_runtime_tests = b.addTest(.{
         .root_module = hosted_self_fk_test_mod,
-        .filters = &.{ "mounted hosted prepared CTE mutations and recursive read retain owner fences", "hosted CTE MERGE retries only proven precommit read unavailability", "SQL pgwire MERGE completion reports committed affected rows" },
+        .filters = &.{ "mounted hosted prepared CTE mutations and recursive read retain owner fences", "hosted CTE MERGE retries only proven precommit read unavailability", "SQL pgwire MERGE completion reports committed affected rows", "SQL unknown mutation keeps native reconciliation receipt without allocation", "public table batch handler maps write unavailable errors" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-hosted-cte-runtime-test", "Run linked hosted prepared CTE and recursive owner-snapshot regression")
@@ -2299,6 +2327,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, hosted_self_fk_leader_transfer_tests).step);
     const hosted_self_fk_recovery_tests = b.addTest(.{
         .name = "antfly-hosted-self-fk-recovery",
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("antfly-hosted-self-fk-recovery", b.graph.host.result, target.result, optimize, 0),
         .root_module = hosted_self_fk_test_mod,
         // Exact positive proofs: never include the old guard-on assertions.
         .filters = &.{ "mounted hosted self-FK ADD DROP restart", "mounted hosted self-FK publication resumes after lost owner and metadata replies", "mounted hosted self-FK resumes after metadata and owner cold restart at parent ACK", "mounted hosted self-FK survives three-voter owner leadership transfer at ADD and DROP ACK" },

@@ -1,0 +1,823 @@
+{
+  "format": 3,
+  "reference": "PostgreSQL exact SQL",
+  "profile": {
+    "format": 1,
+    "description": "Explicit native index-owner activation with unchanged original SQL, parameters and seed rows; complete three-table postimages.",
+    "schema": {
+      "version": 1,
+      "storage_mode": "relational",
+      "default_type": "row",
+      "document_schemas": {
+        "row": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "keyword"
+              },
+              "status": {
+                "type": "keyword"
+              },
+              "quantity": {
+                "type": "integer"
+              },
+              "email": {
+                "type": "keyword"
+              },
+              "tenant_id": {
+                "type": "keyword"
+              },
+              "amount": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "keyword"
+              },
+              "organization_id": {
+                "type": "keyword"
+              },
+              "priority": {
+                "type": "integer"
+              },
+              "expires_at": {
+                "type": "integer"
+              },
+              "enabled": {
+                "type": "boolean"
+              },
+              "metadata": {
+                "type": "json"
+              },
+              "tags": {
+                "type": "json"
+              },
+              "request_id": {
+                "type": "keyword"
+              },
+              "updated_at_ns": {
+                "type": "integer"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    "primary_key": [
+      "id"
+    ],
+    "rows": [
+      {
+        "key": "a",
+        "value": {
+          "id": "u1",
+          "status": "active",
+          "quantity": 2,
+          "email": "a@example.test",
+          "tenant_id": "t1",
+          "amount": 5,
+          "name": "Ada",
+          "organization_id": "o1",
+          "priority": 8,
+          "expires_at": 100,
+          "enabled": true,
+          "metadata": {
+            "source": "api",
+            "billing": {
+              "plan": "basic"
+            },
+            "flags": [
+              "seed"
+            ]
+          },
+          "tags": [
+            "hot"
+          ],
+          "request_id": "old",
+          "updated_at_ns": 10
+        }
+      },
+      {
+        "key": "b",
+        "value": {
+          "id": "u2",
+          "status": "closed",
+          "quantity": 7,
+          "email": "b@example.test",
+          "tenant_id": "t2",
+          "amount": 9,
+          "name": "Grace",
+          "organization_id": "o2",
+          "priority": 3,
+          "expires_at": 1100,
+          "enabled": false,
+          "metadata": {
+            "source": "internal",
+            "billing": {
+              "plan": "basic"
+            },
+            "flags": [
+              "seed"
+            ]
+          },
+          "tags": [],
+          "request_id": "other",
+          "updated_at_ns": 20
+        }
+      },
+      {
+        "key": "c",
+        "value": {
+          "id": "u_ready_seed",
+          "status": "ready",
+          "quantity": 3,
+          "email": "u3@example.test",
+          "tenant_id": "t1",
+          "amount": 17,
+          "name": "Ada",
+          "organization_id": "u1",
+          "priority": 8,
+          "expires_at": 100,
+          "enabled": true,
+          "metadata": {
+            "source": "api",
+            "billing": {
+              "plan": "basic"
+            },
+            "flags": [
+              "seed"
+            ]
+          },
+          "tags": [
+            "hot"
+          ],
+          "request_id": "old",
+          "updated_at_ns": 10
+        }
+      },
+      {
+        "key": "d",
+        "value": {
+          "id": "u_queued_seed",
+          "status": "queued",
+          "quantity": 4,
+          "email": "u4@example.test",
+          "tenant_id": "t1",
+          "amount": 23,
+          "name": "Ada",
+          "organization_id": "u2",
+          "priority": 8,
+          "expires_at": 100,
+          "enabled": true,
+          "metadata": {
+            "source": "api",
+            "billing": {
+              "plan": "basic"
+            },
+            "flags": [
+              "seed"
+            ]
+          },
+          "tags": [
+            "hot"
+          ],
+          "request_id": "old",
+          "updated_at_ns": 10
+        }
+      }
+    ],
+    "additional_tables": [
+      {
+        "name": "archived_records",
+        "schema": {
+          "version": 1,
+          "storage_mode": "relational",
+          "default_type": "row",
+          "document_schemas": {
+            "row": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "keyword"
+                  },
+                  "organization_id": {
+                    "type": "keyword"
+                  },
+                  "status": {
+                    "type": "keyword"
+                  },
+                  "archive_id": {
+                    "type": "keyword"
+                  },
+                  "archive_status": {
+                    "type": "keyword"
+                  },
+                  "archive_amount": {
+                    "type": "integer"
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "primary_key": [
+          "id"
+        ],
+        "rows": [
+          {
+            "key": "archive-a",
+            "value": {
+              "id": "u1",
+              "organization_id": "u1",
+              "status": "ready",
+              "archive_id": "archive_1",
+              "archive_status": "ready",
+              "archive_amount": 11
+            }
+          },
+          {
+            "key": "archive-b",
+            "value": {
+              "id": "u2",
+              "organization_id": "u2",
+              "status": "stale",
+              "archive_id": "archive_2",
+              "archive_status": "ready",
+              "archive_amount": 19
+            }
+          }
+        ]
+      },
+      {
+        "name": "source_records",
+        "schema": {
+          "version": 1,
+          "storage_mode": "relational",
+          "default_type": "row",
+          "document_schemas": {
+            "row": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "keyword"
+                  },
+                  "status": {
+                    "type": "keyword"
+                  },
+                  "quantity": {
+                    "type": "integer"
+                  },
+                  "email": {
+                    "type": "keyword"
+                  },
+                  "tenant_id": {
+                    "type": "keyword"
+                  },
+                  "amount": {
+                    "type": "integer"
+                  },
+                  "name": {
+                    "type": "keyword"
+                  },
+                  "organization_id": {
+                    "type": "keyword"
+                  },
+                  "priority": {
+                    "type": "integer"
+                  },
+                  "expires_at": {
+                    "type": "integer"
+                  },
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "metadata": {
+                    "type": "json"
+                  },
+                  "tags": {
+                    "type": "json"
+                  },
+                  "request_id": {
+                    "type": "keyword"
+                  },
+                  "updated_at_ns": {
+                    "type": "integer"
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "primary_key": [
+          "id"
+        ],
+        "rows": [
+          {
+            "key": "source-0",
+            "value": {
+              "id": "u1",
+              "status": "ready",
+              "quantity": 3,
+              "email": "a@example.test",
+              "tenant_id": "t1",
+              "amount": 5,
+              "name": "Ada",
+              "organization_id": "o1",
+              "priority": 8,
+              "expires_at": 100,
+              "enabled": true,
+              "metadata": {
+                "source": "api",
+                "billing": {
+                  "plan": "basic"
+                },
+                "flags": [
+                  "seed"
+                ]
+              },
+              "tags": [
+                "hot"
+              ],
+              "request_id": "old",
+              "updated_at_ns": 10
+            }
+          },
+          {
+            "key": "source-1",
+            "value": {
+              "id": "u2",
+              "status": "pending",
+              "quantity": 4,
+              "email": "b@example.test",
+              "tenant_id": "t2",
+              "amount": 9,
+              "name": "Grace",
+              "organization_id": "o2",
+              "priority": 3,
+              "expires_at": 1100,
+              "enabled": false,
+              "metadata": {
+                "source": "internal",
+                "billing": {
+                  "plan": "basic"
+                },
+                "flags": [
+                  "seed"
+                ]
+              },
+              "tags": [],
+              "request_id": "other",
+              "updated_at_ns": 20
+            }
+          }
+        ]
+      }
+    ],
+    "index_owner_profile": "tenant-lower-email",
+    "index_owner_ddl": "CREATE UNIQUE INDEX usage_records_tenant_lower_email_key ON usage_records (tenant_id, lower(email))",
+    "admission_probes": [
+      {
+        "sql": "INSERT INTO usage_records(id,tenant_id,email,status) VALUES ('index_probe','t1','a@example.test','active')",
+        "sqlstate": "23505"
+      },
+      {
+        "sql": "INSERT INTO usage_records(id) VALUES ('index_probe') ON CONFLICT ON CONSTRAINT usage_records_tenant_lower_email_key DO NOTHING",
+        "sqlstate": "42704"
+      },
+      {
+        "sql": "INSERT INTO usage_records(id,email) VALUES ('index_probe','a@example.test') ON CONFLICT(email) DO NOTHING",
+        "sqlstate": "42P10"
+      }
+    ]
+  },
+  "entries": [
+    {
+      "command_tag": "INSERT",
+      "affected": 1,
+      "columns": [
+        "id",
+        "name"
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "rows": [
+        [
+          "u1",
+          "new"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "id": "sql-1460",
+      "final_tables": {
+        "usage_records": {
+          "columns": [
+            "id",
+            "status",
+            "quantity",
+            "email",
+            "tenant_id",
+            "amount",
+            "name",
+            "organization_id",
+            "priority",
+            "expires_at",
+            "enabled",
+            "metadata",
+            "tags",
+            "request_id",
+            "updated_at_ns"
+          ],
+          "column_oids": [
+            25,
+            25,
+            20,
+            25,
+            25,
+            20,
+            25,
+            25,
+            20,
+            20,
+            16,
+            3802,
+            3802,
+            25,
+            20
+          ],
+          "rows": [
+            [
+              "u1",
+              "active",
+              2,
+              "a@example.test",
+              "t1",
+              5,
+              "new",
+              "o1",
+              8,
+              100,
+              true,
+              {
+                "flags": [
+                  "seed"
+                ],
+                "source": "api",
+                "billing": {
+                  "plan": "basic"
+                }
+              },
+              [
+                "hot"
+              ],
+              "old",
+              10
+            ],
+            [
+              "u2",
+              "closed",
+              7,
+              "b@example.test",
+              "t2",
+              9,
+              "Grace",
+              "o2",
+              3,
+              1100,
+              false,
+              {
+                "flags": [
+                  "seed"
+                ],
+                "source": "internal",
+                "billing": {
+                  "plan": "basic"
+                }
+              },
+              [],
+              "other",
+              20
+            ],
+            [
+              "u_queued_seed",
+              "queued",
+              4,
+              "u4@example.test",
+              "t1",
+              23,
+              "Ada",
+              "u2",
+              8,
+              100,
+              true,
+              {
+                "flags": [
+                  "seed"
+                ],
+                "source": "api",
+                "billing": {
+                  "plan": "basic"
+                }
+              },
+              [
+                "hot"
+              ],
+              "old",
+              10
+            ],
+            [
+              "u_ready_seed",
+              "ready",
+              3,
+              "u3@example.test",
+              "t1",
+              17,
+              "Ada",
+              "u1",
+              8,
+              100,
+              true,
+              {
+                "flags": [
+                  "seed"
+                ],
+                "source": "api",
+                "billing": {
+                  "plan": "basic"
+                }
+              },
+              [
+                "hot"
+              ],
+              "old",
+              10
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false
+            ],
+            [
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false
+            ],
+            [
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false
+            ],
+            [
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false
+            ]
+          ]
+        },
+        "archived_records": {
+          "columns": [
+            "id",
+            "organization_id",
+            "status",
+            "archive_id",
+            "archive_status",
+            "archive_amount"
+          ],
+          "column_oids": [
+            25,
+            25,
+            25,
+            25,
+            25,
+            20
+          ],
+          "rows": [
+            [
+              "u1",
+              "u1",
+              "ready",
+              "archive_1",
+              "ready",
+              11
+            ],
+            [
+              "u2",
+              "u2",
+              "stale",
+              "archive_2",
+              "ready",
+              19
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false,
+              false,
+              false,
+              false,
+              false
+            ],
+            [
+              false,
+              false,
+              false,
+              false,
+              false,
+              false
+            ]
+          ]
+        },
+        "source_records": {
+          "columns": [
+            "id",
+            "status",
+            "quantity",
+            "email",
+            "tenant_id",
+            "amount",
+            "name",
+            "organization_id",
+            "priority",
+            "expires_at",
+            "enabled",
+            "metadata",
+            "tags",
+            "request_id",
+            "updated_at_ns"
+          ],
+          "column_oids": [
+            25,
+            25,
+            20,
+            25,
+            25,
+            20,
+            25,
+            25,
+            20,
+            20,
+            16,
+            3802,
+            3802,
+            25,
+            20
+          ],
+          "rows": [
+            [
+              "u1",
+              "ready",
+              3,
+              "a@example.test",
+              "t1",
+              5,
+              "Ada",
+              "o1",
+              8,
+              100,
+              true,
+              {
+                "flags": [
+                  "seed"
+                ],
+                "source": "api",
+                "billing": {
+                  "plan": "basic"
+                }
+              },
+              [
+                "hot"
+              ],
+              "old",
+              10
+            ],
+            [
+              "u2",
+              "pending",
+              4,
+              "b@example.test",
+              "t2",
+              9,
+              "Grace",
+              "o2",
+              3,
+              1100,
+              false,
+              {
+                "flags": [
+                  "seed"
+                ],
+                "source": "internal",
+                "billing": {
+                  "plan": "basic"
+                }
+              },
+              [],
+              "other",
+              20
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false
+            ],
+            [
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false
+            ]
+          ]
+        }
+      }
+    }
+  ],
+  "excluded": [],
+  "server_version": 180006
+}

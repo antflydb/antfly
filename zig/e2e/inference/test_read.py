@@ -106,17 +106,6 @@ def _find_surya_reader_model(api) -> str | None:
     return _find_reader_model(api, "surya")
 
 
-def _api_backend_enabled(api, name: str) -> bool | None:
-    ready = api.readyz()
-    backends = ready.get("backends")
-    if not isinstance(backends, dict):
-        return None
-    enabled = backends.get(name)
-    if not isinstance(enabled, bool):
-        return None
-    return enabled
-
-
 def _env_csv(name: str) -> list[str]:
     raw = os.environ.get(name, "")
     return [item.strip() for item in raw.split(",") if item.strip()]
@@ -238,7 +227,9 @@ def _read_or_skip_backend_unavailable(
 @pytest.mark.multimodal
 def test_read_image(api):
     """Reading an image should return some text output."""
-    resp = api.read(images=[TINY_PNG_URI])
+    # This checks response shape, not long-form OCR. Keep native decode work
+    # bounded independently of the server's production output ceiling.
+    resp = api.read(images=[TINY_PNG_URI], max_tokens=8)
     assert_openai_list_response(resp, expected_len=1)
     results = resp["data"]
     assert len(results) == 1
@@ -248,7 +239,7 @@ def test_read_image(api):
 @pytest.mark.multimodal
 def test_read_with_prompt(api):
     """Reading with a prompt should return text."""
-    resp = api.read(images=[TINY_PNG_URI], prompt="Describe this image")
+    resp = api.read(images=[TINY_PNG_URI], prompt="Describe this image", max_tokens=32)
     results = resp["data"]
     assert len(results) == 1
     _assert_read_result_shape(results[0])
@@ -412,9 +403,6 @@ def test_read_multistage_model_round_trips_richer_shape(api):
             "No multistage OCR reader model is available; set ANTFLY_INFERENCE_MULTISTAGE_READER_MODEL or install a Paddle/Surya reader"
         )
 
-    if _api_backend_enabled(api, "onnx_runtime") is False:
-        pytest.skip("Multi-stage OCR e2e requires a antfly binary built with onnx=true")
-
     test_image = make_text_png_uri(
         [
             "INVOICE 42",
@@ -450,9 +438,6 @@ def test_read_surya_model_round_trips_regions(api):
     model = _find_surya_reader_model(api)
     if not model:
         pytest.skip("No Surya reader model is available")
-
-    if _api_backend_enabled(api, "onnx_runtime") is False:
-        pytest.skip("Surya e2e requires a antfly binary built with onnx=true")
 
     fixture = load_go_sample_page_fixture()
     if fixture is not None:
@@ -547,9 +532,6 @@ def test_read_moondream_model_exposes_optional_fields(api):
     if not model:
         pytest.skip("No Moondream reader model is available")
 
-    if _api_backend_enabled(api, "onnx_runtime") is False:
-        pytest.skip("Moondream e2e requires a antfly binary built with onnx=true")
-
     image = make_text_png_uri(["HELLO"], scale=10)
 
     resp = _read_or_skip_backend_unavailable(
@@ -586,9 +568,6 @@ def test_read_pix2struct_model_answers_prompt(api):
     model = configured_model or _find_reader_model(api, "pix2struct")
     if not model:
         pytest.skip("No Pix2Struct reader model is available")
-
-    if _api_backend_enabled(api, "onnx_runtime") is False:
-        pytest.skip("Pix2Struct e2e requires a antfly binary built with onnx=true")
 
     fixture = load_go_sample_page_fixture()
     if fixture is not None:

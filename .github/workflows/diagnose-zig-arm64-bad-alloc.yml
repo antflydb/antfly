@@ -1,4 +1,4 @@
-name: Diagnose Darwin ARM64 release packaging
+name: Qualify Darwin release archives
 
 # Select ci:darwin-release, then approve the PR with /ci run <sha>.
 on:
@@ -39,7 +39,7 @@ jobs:
       comment_id: ${{ inputs.comment_id }}
       suite: darwin
 
-  darwin-release:
+  archives:
     if: >-
       ${{ !cancelled() &&
       success() &&
@@ -47,130 +47,7 @@ jobs:
       (inputs.pr_number == '' ||
       github.run_attempt == 1) }}
     needs: admission
-    name: Darwin ARM64 fast archive
-    runs-on: arc-antfly-publish
-    timeout-minutes: 180
-    steps:
-      - name: Checkout requested revision
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ inputs.head_sha || github.sha }}
-          persist-credentials: false
-          submodules: true
-
-      - name: Load pinned toolchain policy
-        id: toolchain
-        uses: ./.github/actions/load-toolchain-policy
-
-      - name: Verify x86_64 host
-        run: test "$(uname -m)" = x86_64
-
-      - name: Verify runtime boundaries and bounded runner
-        run: |
-          python3 zig/tools/analyze_zig_import_graph.py --check-runtime-boundary --check-codegen-boundary --check-api-kernel-boundary --json
-          python3 -m unittest zig/tools/test_analyze_zig_import_graph.py
-          python3 -m unittest zig/tools/test_patch_zig_0_16_build_runner_maxrss.py
-          python3 -m unittest zig/tools/test_run_bounded_zig_build.py
-
-      - name: Install Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates time file
-
-      - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
-        with:
-          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
-
-      - name: Install glibc-linked Zig
-        env:
-          ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
-          ZIG_NIX_ATTRIBUTE: ${{ steps.toolchain.outputs.zig_nix_attribute }}
-        run: |
-          zig_path="$(nix-build '<nixpkgs>' -A "$ZIG_NIX_ATTRIBUTE" --no-out-link)"
-          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
-          compiler_description="$(file "$zig_path/bin/zig")"
-          echo "$compiler_description"
-          grep -q 'dynamically linked' <<<"$compiler_description"
-          echo "$zig_path/bin" >> "$GITHUB_PATH"
-
-      - name: Install pinned macOS cross-compilation SDK
-        env:
-          MACOS_SDK_VERSION: ${{ steps.toolchain.outputs.macos_cross_sdk_version }}
-          MACOS_SDK_SHA256: ${{ steps.toolchain.outputs.macos_cross_sdk_sha256 }}
-        run: |
-          sdk_archive="$RUNNER_TEMP/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz"
-          sdk_stage="$RUNNER_TEMP/macos-sdk"
-          curl --fail --location --retry 3 \
-            "https://github.com/joseluisq/macosx-sdks/releases/download/${MACOS_SDK_VERSION}/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz" \
-            -o "$sdk_archive"
-          echo "$MACOS_SDK_SHA256  $sdk_archive" | sha256sum --check --strict
-          mkdir -p "$sdk_stage"
-          tar -xJf "$sdk_archive" -C "$sdk_stage"
-
-          sdk_path="$sdk_stage/MacOSX${MACOS_SDK_VERSION}.sdk"
-          test -d "$sdk_path/System/Library/Frameworks/Metal.framework"
-          test -d "$sdk_path/System/Library/Frameworks/MetalPerformanceShaders.framework"
-          test -d "$sdk_path/System/Library/Frameworks/Accelerate.framework"
-          echo "SDK_PATH=$sdk_path" >> "$GITHUB_ENV"
-
-      - name: Build production Darwin ARM64 archive
-        run: |
-          mkdir -p dist/release-archives
-          /usr/bin/time -v -o "$RUNNER_TEMP/darwin-arm64-release.time" \
-            scripts/packaging/build_zig_release_archive.sh \
-            --version 0.0.0-diagnostic \
-            --target aarch64-macos \
-            --optimize fast \
-            --archive-name antfly_diagnostic_Darwin_arm64.tar.gz \
-            --out-dir dist/release-archives \
-            --metal true \
-            --system-blas true
-
-      - name: Verify Darwin ARM64 archive
-        run: |
-          archive=dist/release-archives/antfly_diagnostic_Darwin_arm64.tar.gz
-          extract_root="$RUNNER_TEMP/darwin-arm64-archive"
-          mkdir -p "$extract_root"
-          tar -xzf "$archive" -C "$extract_root"
-
-          binary="$extract_root/antfly"
-          library="$extract_root/lib/libantfly.dylib"
-          test -x "$binary"
-          test -f "$library"
-          test -f "$extract_root/include/antfly.h"
-          file "$binary" | tee "$RUNNER_TEMP/darwin-arm64.binary-file"
-          file "$library" | tee "$RUNNER_TEMP/darwin-arm64.capi-file"
-          grep -Eq 'Mach-O 64-bit (arm64|arm64e)' "$RUNNER_TEMP/darwin-arm64.binary-file"
-          grep -Eq 'Mach-O 64-bit (arm64|arm64e)' "$RUNNER_TEMP/darwin-arm64.capi-file"
-          stat -c 'binary_size_bytes=%s' "$binary" | tee "$RUNNER_TEMP/darwin-arm64.binary-size"
-          stat -c 'capi_size_bytes=%s' "$library" | tee "$RUNNER_TEMP/darwin-arm64.capi-size"
-          library_size=$(stat -c '%s' "$library")
-          # Raised from 20MiB on 2026-09-17: libantfly now embeds the
-          # standalone inference runtime by default (see COMPILATION.md's
-          # "C API composition" section), which is a deliberate product
-          # decision, not a regression. 60MiB leaves headroom over the
-          # measured ~48MiB stripped fast size.
-          if [ "$library_size" -ge 62914560 ]; then
-            echo "libantfly.dylib exceeded the 60MiB retained-code budget: $library_size bytes" >&2
-            exit 1
-          fi
-
-      - name: Report compiler memory
-        if: ${{ always() }}
-        run: cat "$RUNNER_TEMP/darwin-arm64-release.time" || true
-
-      - name: Upload diagnostic result
-        if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: zig-darwin-arm64-release-fast
-          path: |
-            dist/release-archives/antfly_diagnostic_Darwin_arm64.tar.gz
-            ${{ runner.temp }}/antfly-zig-release-aarch64-macos
-            ${{ runner.temp }}/darwin-arm64-release.time
-            ${{ runner.temp }}/darwin-arm64.binary-file
-            ${{ runner.temp }}/darwin-arm64.binary-size
-            ${{ runner.temp }}/darwin-arm64.capi-file
-            ${{ runner.temp }}/darwin-arm64.capi-size
-          if-no-files-found: warn
+    uses: ./.github/workflows/qualify-release-archives.yml
+    with:
+      source_commit: ${{ inputs.head_sha || github.sha }}
+      archive_os: Darwin

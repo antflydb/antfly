@@ -20,3 +20,6 @@ pkg/inference/web/node_modules/
 pkg/inference/scripts/dequant_cli
 pkg/inference/.debug/
 pkg/inference/onnxruntime/
+
+# Local qualification build caches and model benchmark outputs
+.benchmark-results/

@@ -18,7 +18,7 @@ tags: [inference, embeddings, reranking, models]
 - Why is my index stuck with pending enrichments?
 </Questions>
 
-Antfly Inference is the model runtime inside Antfly. It runs embedding, chunking, reranking, extraction, decision, transcription, reading, and generation models (text generation from text, image, and audio prompts) on the same machine as the database, with no external API and nothing leaving the host. It executes model artifacts through the native backend (CPU, Metal on macOS, CUDA in CUDA builds), plus ONNX Runtime and `ortgenai` in builds compiled with ONNX support. The decision it puts in front of you is which model to pull for each job; the [Local Model Compatibility](/docs/guides/supported-models) page holds the verified list, and this page covers how the runtime finds, stores, and serves them.
+Antfly Inference is the model runtime inside Antfly. It runs embedding, chunking, reranking, extraction, decision, transcription, reading, and generation models (text generation from text, image, and audio prompts) on the same machine as the database, with no external API and nothing leaving the host. It executes GGUF, safetensors, and ONNX artifacts on its own native backend (CPU, Metal on macOS, CUDA in CUDA builds); ONNX graphs are parsed and run on Antfly's kernels, with no external ONNX runtime. The decision it puts in front of you is which model to pull for each job; the [Local Model Compatibility](/docs/guides/supported-models) page holds the verified list, and this page covers how the runtime finds, stores, and serves them.
 
 Pull a model, then embed a sentence through the running engine:
 
@@ -36,7 +36,7 @@ The response is a 512-dimension vector in the OpenAI embeddings shape (`{"object
 
 In standalone mode the runtime is served on the API port under `/ai/v1`, beside `/db/v1`. Run as its own process with `antfly inference run`, it listens on `127.0.0.1:8090` by default, and a database points at it with the `inference.api_url` config key. External providers (Ollama, OpenAI, Bedrock) plug into the same embedder, reranker, and generator interfaces, so an index config names a provider and a model and never cares which process answers.
 
-In a CPU-only build, standalone runs models inside the database process. A build that includes a GPU or driver-backed backend (Metal, which is on by default on macOS, or CUDA, ONNX Runtime, or PJRT) starts a supervised child worker (`antfly inference _worker`) at startup and sends all embedded inference to it, CPU models included. A driver call cannot be interrupted safely, so a wedged or crashed worker is killed and respawned without taking the database down.
+In a CPU-only build, standalone runs models inside the database process. A build that includes a GPU or driver-backed backend (Metal, which is on by default on macOS, or CUDA or PJRT) starts a supervised child worker (`antfly inference _worker`) at startup and sends all embedded inference to it, CPU models included. A driver call cannot be interrupted safely, so a wedged or crashed worker is killed and respawned without taking the database down.
 
 Setting `inference.api_url` disables embedded inference. It is not a fallback. Standalone then keeps no embedded provider, loads no preloads, and serves no `/ai/v1` routes on its own port, and every `provider: antfly` call goes to that URL. `antfly inference run` refuses a non-loopback `--host` unless you also pass `--allow-insecure-public-bind`, because the listener has no built-in auth or TLS.
 
@@ -161,6 +161,38 @@ antfly inference pull hf:BAAI/bge-small-en-v1.5:i8 --tasks embed
 ```
 
 With no variant the pull is `auto`. Keep one variant per model directory: a second variant pulled beside the first leaves both in place, and different parts of a model can then resolve to different variants. If a model misbehaves after a second pull, delete the directory and pull once.
+
+## Local Gemma4 Video Prompts
+
+Linux CUDA builds accept one local H.264 MP4 clip with a Gemma4 GGUF model and
+its matching vision projector:
+
+```bash
+antfly inference generate /models/gemma4 'Describe this video.' \
+  --video clip.mp4 --backend cuda --max-tokens 128 --disable-thinking
+```
+
+The GPU must support compute capability 7.5 or newer, and the NVIDIA driver must
+expose `libnvcuvid.so.1` and support H.264 NVDEC decoding.
+In NVIDIA containers, expose the driver's `video` capability alongside `compute`
+and `utility`. The runtime uses checked-in CUDA kernels; video decoding does not
+require FFmpeg, a CUDA compiler, or NVRTC at runtime.
+
+Clips must be progressive 8-bit 4:2:0 SDR, at most 256 MiB and 60 seconds, with
+coded dimensions no larger than 4096 on either axis and no more than 18,000
+samples. The GPU's own decoder minimum and maximum dimensions also apply.
+Frames are selected in presentation order at one frame per second, with up to
+70 visual tokens per selected frame. MP4 edit-list end times are respected.
+Decoded surfaces, resized patches, projected features, and the prompt embedding
+handoff stay on the GPU. Compressed packets, timestamps, and model weights still
+use host memory; weights upload once per request.
+
+This route supports the local CLI and native generation library. The HTTP API
+does not accept video yet. Audio tracks in the clip are ignored. Rotation,
+non-square pixels, HDR, interlacing, other codecs, mixed image/audio attachments,
+raw prompts, and speculative decoding are unsupported. Unsupported clips fail
+explicitly. NVDEC owns additional driver memory outside Antfly's tensor-budget
+counters; leave GPU headroom for decoder surfaces when setting memory limits.
 
 ## Model Storage
 

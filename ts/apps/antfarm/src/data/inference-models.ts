@@ -9,13 +9,16 @@ export type ModelType =
   | "rewriter"
   | "generator"
   | "reader"
-  | "transcriber";
+  | "transcriber"
+  | "decider"
+  | "synthesizer"
+  | "predictor";
 
 export type ExtractorCapability = "labels" | "zeroshot" | "relations" | "answers";
 
 export type QuantizationType = "f32" | "f16" | "i8" | "i8-st" | "i4" | "i4-cuda";
 
-export type Backend = "native" | "onnx" | "metal" | "cuda" | "xla" | "wasm";
+export type Backend = "native" | "metal" | "cuda" | "xla" | "wasm";
 
 // Hardware capabilities that models can run on
 export type HardwareCapability = "nvidia-gpu" | "apple-silicon" | "google-tpu" | "cpu";
@@ -58,7 +61,6 @@ export const HARDWARE_INFO: Record<HardwareCapability, HardwareInfo> = {
 // Map backends to supported hardware capabilities
 export const BACKEND_TO_HARDWARE: Record<Backend, HardwareCapability[]> = {
   native: ["cpu"],
-  onnx: ["nvidia-gpu", "apple-silicon", "cpu"],
   metal: ["apple-silicon"],
   cuda: ["nvidia-gpu"],
   xla: ["google-tpu", "nvidia-gpu", "cpu"],
@@ -82,6 +84,9 @@ export function getHardwareCapabilities(backends?: Backend[]): HardwareCapabilit
   }
 
   // Return in a logical order: GPU first, then Apple, then TPU, then CPU
+  if (capabilities.size === 0) {
+    return ["cpu"];
+  }
   const order: HardwareCapability[] = ["nvidia-gpu", "apple-silicon", "google-tpu", "cpu"];
   return order.filter((cap) => capabilities.has(cap));
 }
@@ -159,6 +164,8 @@ export interface InferenceModel {
   architecture?: string;
   size?: string;
   inRegistry: boolean;
+  availability?: string;
+  freshness?: string;
 }
 
 export interface ModelTypeInfo {
@@ -263,6 +270,27 @@ export interface ModelTypeDetail {
 }
 
 export const MODEL_TYPE_DETAILS: Record<ModelType, ModelTypeDetail> = {
+  decider: {
+    type: "decider",
+    tagline: "Evaluate typed decisions",
+    description: "Evaluate predicates and selections with explicit probability or score semantics.",
+    useCases: [],
+    pipelineNote: "Uses the configured inference gateway target.",
+  },
+  synthesizer: {
+    type: "synthesizer",
+    tagline: "Convert text into speech",
+    description: "Synthesize audio with a named voice and provider.",
+    useCases: [],
+    pipelineNote: "Uses the configured inference gateway target.",
+  },
+  predictor: {
+    type: "predictor",
+    tagline: "Run feature-based predictions",
+    description: "Predict using the model feature schema.",
+    useCases: [],
+    pipelineNote: "Uses the configured inference gateway target.",
+  },
   embedder: {
     type: "embedder",
     tagline: "Convert text into dense vector representations",

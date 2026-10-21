@@ -56,6 +56,14 @@ pub const SpecialTokens = struct {
 pub const Tokenizer = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// Optional immutable tokenization generation for lifetime-bound caches.
+    /// Change this before mutation/address reuse; mutable adapters leave it null.
+    cache_identity: ?u64 = null,
+
+    pub const TokenPiece = struct {
+        bytes: []u8,
+        is_byte_fallback: bool = false,
+    };
 
     pub const VTable = struct {
         /// Encode text into token IDs (without special tokens or padding).
@@ -75,10 +83,17 @@ pub const Tokenizer = struct {
         encodeIntoParallelStable: ?*const fn (ptr: *anyopaque, io: std.Io, allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayListUnmanaged(i32), max_tasks: usize, stable_input_id: u64) anyerror!void = null,
         /// Encode text with model wrapping such as [CLS]/[SEP], optionally including offsets.
         encodeForModel: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize) anyerror!EncodeResult,
+        /// Optional dynamic-length encoding with the same model wrap. Keeps
+        /// one inactive slot when possible for a caller-supplied trailing EOS.
+        encodeForModelUnpadded: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize) anyerror!EncodeResult = null,
         /// Encode text for causal generation, optionally with BOS-aware start-of-sequence semantics.
         encodeGeneration: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize, add_bos_token: bool) anyerror!EncodeResult,
         /// Decode token IDs back to text.
         decode: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, ids: []const i32) anyerror![]u8,
+        /// Owned additive continuation bytes, without sequence-level cleanup.
+        /// Stateful decoders must provide this for grammar/evidence decoding.
+        /// Null reports allocation failure without a foreign Zig error ID.
+        tokenPiece: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, id: i32) ?TokenPiece = null,
         /// Get special token IDs.
         specialTokens: *const fn (ptr: *anyopaque) SpecialTokens,
         /// Return every tokenizer-declared special token ID. Implementations
@@ -160,6 +175,14 @@ pub const Tokenizer = struct {
         return self.vtable.decode(self.ptr, allocator, ids);
     }
 
+    pub fn tokenPiece(self: Tokenizer, allocator: std.mem.Allocator, id: i32) !TokenPiece {
+        if (self.vtable.tokenPiece) |decode_piece| return decode_piece(self.ptr, allocator, id) orelse error.OutOfMemory;
+        return .{ .bytes = try self.decode(allocator, &.{id}) };
+    }
+    pub fn tokenBytes(self: Tokenizer, allocator: std.mem.Allocator, id: i32) ![]u8 {
+        return (try self.tokenPiece(allocator, id)).bytes;
+    }
+
     pub fn specialTokens(self: Tokenizer) SpecialTokens {
         return self.vtable.specialTokens(self.ptr);
     }
@@ -196,6 +219,12 @@ pub const Tokenizer = struct {
     /// Returns token IDs and attention mask.
     pub fn encodeForModel(self: Tokenizer, allocator: std.mem.Allocator, text: []const u8, max_length: usize) !EncodeResult {
         return self.vtable.encodeForModel(self.ptr, allocator, text, max_length);
+    }
+
+    pub fn encodeForModelUnpadded(self: Tokenizer, allocator: std.mem.Allocator, text: []const u8, max_length: usize) !EncodeResult {
+        if (self.vtable.encodeForModelUnpadded) |encode_unpadded|
+            return encode_unpadded(self.ptr, allocator, text, max_length);
+        return self.encodeForModel(allocator, text, max_length);
     }
 
     /// Encode text for causal generation without implicitly appending an EOS/SEP token.

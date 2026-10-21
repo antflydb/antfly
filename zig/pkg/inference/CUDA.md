@@ -7,7 +7,7 @@ inference's portability model:
 
 - A normal Antfly inference build does not require the CUDA toolkit.
 - A normal Antfly inference container does not ship CUDA runtime libraries, cuBLAS,
-  cuDNN, TensorRT, ONNX Runtime, or XLA.
+  cuDNN, TensorRT, or XLA.
 - The native CUDA path uses only the NVIDIA driver ABI at runtime:
   `libcuda.so.1`, loaded dynamically.
 - XLA/PJRT remains an optional compiled-graph path for dense/static graph
@@ -177,7 +177,13 @@ with cubins for the current validation targets and a `compute_75` PTX fallback:
 - `sm_90` cubin for H100.
 - `sm_100`, `sm_110`, and `sm_120` cubins for Blackwell-generation targets.
 
-Keep the `compute_75` PTX path even when fatbins are used by default.
+Decision: release builds ship the multi-arch fatbin, not portable PTX alone.
+`-Dcuda-artifacts=fatbin` is the `build.zig` default; the Linux GNU release
+archives (`scripts/packaging/build_zig_release_archive.sh`) build with
+`-Dcuda=true` and no artifact override, and the CI/E2E build script defaults
+`ANTFLY_CI_ZIG_CUDA_ARTIFACTS` to `fatbin`. Portable PTX alone is an explicit opt-in
+(`-Dcuda-artifacts=portable`); CUDA 13.2 PTX does not load on the tested R580
+drivers. Keep the `compute_75` PTX path even when fatbins are used by default.
 Architecture-specific cubins must never be the only checked-in artifact.
 
 ## Kernel Artifact Policy
@@ -323,6 +329,262 @@ Runtime overrides:
 - `TERMITE_CUDA_DEQUANTIZE_QUANT_WEIGHTS=1`: force upload-time dequantization
   for quantized weights.
 
+## GLiNER2.5 Multi and Decide-1B
+
+The inference runtime has separate CUDA profiles for the multilingual boundary
+models and the Ettin/ModernBERT decision encoder. The nested encoder config
+selects the architecture; a span wrapper no longer implies DeBERTa. The new
+profiles do not change GLiNER training or the existing Metal dispatch policy.
+
+| Checkpoint | Implemented CUDA path | Context policy |
+|---|---|---|
+| `fastino/gliner2.5-multi-v1` | Boundary extraction and classification heads | Explicit boundary windows |
+| `fastino/GLiNER2.5-multi-Decide` | Boundary classification and typed decisions | Explicit classification windows |
+| `fastino/GLiNER2.5-Decide-1B` | Label-marker MLP over Ettin/ModernBERT | Native 7,999 encoder tokens, including schema |
+
+Distinct decision rows are grouped by encoded length, padded with independent
+attention/marker masks, and scattered back to request/task order. Default
+physical batches are bounded to 64 rows and 16,384 padded tokens. CUDA boundary
+requests and classification windows also batch through the managed executor;
+boundary requests queue before reserving device scratch, so waiting requests do
+not each reserve the same session workspace, and a queued client disconnect
+drains with no device reservation or kernel launches. The Ettin attention
+primitive handles both sliding and full attention without materializing a
+quadratic score tensor, including fully masked rows. Boundary inference has a
+separate tiled FP32 attention kernel; training keeps its versioned replay
+implementation. The ModernBERT profile fuses QKV splitting and full-head
+split-half RoPE. The BPE tokenizer applies the tokenizer's declared NFC
+normalization (including composition exclusions) before pre-tokenization,
+protecting added tokens.
+
+### Qualification status
+
+These model families remain **pending release qualification**. No release
+capability rows or registry model pins are granted by the diagnostic tools,
+and the opt-in HTTP and managed-window tests use a test-only boundary
+qualification override. Exact upstream revisions, file hashes, source hashes,
+FP32 oracle captures, and capacity fixtures live in
+`testdata/gliner25/family/manifest.json`; retained reports, compressed samples,
+and passing/rejected candidate summaries are under
+`testdata/gliner25/family/evidence/` (`evidence/summary.json`).
+
+Gates every candidate must pass before release capabilities are published:
+
+- Paired performance: at least 30 AB/BA pairs and 200 tail samples per case or
+  capacity cell, compared against the fastest quality-valid Fastino
+  attention/dtype profile (`reference_dtype` and `reference_weight_dtype` are
+  reported separately). Both the aggregate geometric speedup and every
+  per-cell 10% regression guard must pass; an aggregate pass does not override
+  a failing cell. Harnesses always emit `qualification: false`.
+- Public holdout: 200 deterministically selected
+  [MASSIVE test examples](https://huggingface.co/datasets/AmazonScience/massive)
+  per language (English, French, German, Spanish, Arabic, Hindi, Japanese,
+  Chinese; selection pinned under `testdata/gliner25/family/holdout/`). Each
+  language must independently reach 99.5% agreement with Fastino FP32; token
+  drift or host fallback fails the campaign. `--task entities` and
+  `--task structured` (pinned `holdout/structured_schema.json`) extend the
+  comparison to entities, attributes, relations, and records; a head with no
+  reference predictions fails. JointIE and other record modes still need their
+  own holdouts.
+- The approved `--source-span-policy original_text` compatibility comparison
+  excludes only Fastino predictions whose spans include its single synthetic
+  terminal period beyond the original text; it never clips spans or changes
+  native decoding, and does not grant qualification.
+  `recheck_family_holdout.py` re-evaluates a pinned strict capture without
+  rerunning inference.
+- Serving concurrency, long-window performance, cancellation/OOM recovery.
+
+Current results (NVIDIA L4): Decide-1B FP16 passes all ten capacity cells
+against Fastino SDPA FP16 (1.123× geometric speedup) and matches all 1,600
+holdout documents; both it and Fastino FP32 score 643/1,600 (40.19%) against
+MASSIVE gold intents. Multi passes all ten extraction fixtures and every per-cell
+guard (5.44× geometric speedup vs Fastino FP32 eager); Multi FP32 matches all
+1,600 classification documents and passes the entity and structured holdouts
+under the source-span policy. Multi-Decide FP16 reaches 1.53× geometric
+speedup but fails three capacity cells (512/B8, 2048/B1, 2048/B8) and matches
+1,599/1,600 holdout documents. Multi FP16 failed the per-language holdout gate.
+Multi-Decide FP32 passes the HTTP concurrency 1/4/16 test with every lease
+released. A cuBLASLt bias-epilogue candidate changed holdout selections and was
+removed from dispatch; FP32 bias addition stays separate from FP16 matmul.
+
+> **Relocated:** The campaign-by-campaign measurement narrative, per-language
+> match counts, and the Q8 mirror long-context tables →
+> [history/gliner2/cuda-family-qualification.md](../../../docs/design/inference/history/gliner2/cuda-family-qualification.md).
+
+### Precision policy
+
+`/decisions` accepts optional `long_document` with `mode`, `window_words`,
+`overlap_words`, and `max_windows`. Omission keeps over-limit rejection.
+Window mode is limited to qualified boundary decision models; Decide-1B keeps
+its native context policy. Preload configuration accepts `cuda_precision`:
+
+```json
+{"kind":"extractor","name":"fastino/GLiNER2.5-Decide-1B","backend":"cuda","cuda_precision":"fp32"}
+```
+
+`auto` currently resolves to FP32. Managed loads reject explicit `fp16`/`bf16`
+with `UnqualifiedGlinerCudaPrecision` until release evidence is available.
+Precision is part of both resident and in-flight model identity.
+
+Diagnostic constructors may measure reduced-precision candidates. For
+Decide-1B only encoder matrix weights are reduced; embeddings, norms,
+classifier weights, and logits remain FP32, and attention uses masked FP16
+tensor-core tiles with FP32 online softmax/output accumulation. The boundary
+diagnostic worker accepts `--precision fp16` (reduces encoder projections and
+attention; projection mirrors are model-owned and reject non-finite or
+overflowing values) and `--attention-only 1` (or `--attention-only` on the
+Python harness) to retain FP32 projections. Relative-position tiles use the
+exact processor bucket map and the original exponential calculation.
+`ANTFLY_GLINER25_FAMILY_CUDA_PRECISION=fp16` selects the candidate precision in
+the opt-in tests; its per-manager override exists only in test builds.
+
+### Decide-1B Q8_0 bundle
+
+The split Q8_0 Decide-1B bundle from
+[Metal PR #1033](https://github.com/antflydb/antfly/pull/1033) has an offline
+CUDA route. Use the immutable
+[Hugging Face revision](https://huggingface.co/antflydb/gliner2.5-decide-1B-gguf/tree/5c61a1a39ad4c6865d0e0ff98a7ac507e8c35cef).
+Both GGUF files, all sidecars, the 199-tensor inventory, and exact encoder
+geometry are authenticated before CUDA upload; shadowed tensor names and other
+packed formats are rejected. The 113 encoder matrices (including token
+embeddings) retain Q8 storage; norms, classifier, and auxiliary heads stay F32.
+Q8 tensor-core projections use FP16 operands and F32 accumulation/output.
+Explicit diagnostic `fp16`/`bf16` upload precision is rejected for packed-only
+source weights.
+
+- `ANTFLY_CUDA_QMATMUL_VARIANT=legacy`: direct Q8/F32 arithmetic without the
+  tensor-core weight packs. Missing optional tensor-core symbols also retain
+  the direct-Q8 path.
+- `ANTFLY_CUDA_GLINER_1B_Q8_F16_MIRRORS=1`: opt-in cached FP16 mirrors for the
+  112 typed encoder projections (replacing, not adding to, the Q8 tensor-core
+  pack). From 512 through 7,999 tokens, complete mirror profiles use tiled FP16
+  tensor-core attention with F32 online softmax; global layers use wider query
+  tiles from 2,048 tokens. Host decoding uses a 16 KiB F32 tile and at most
+  26.25 MiB FP16 staging per projection. Disabling the candidate or lacking its
+  kernels retains Q8 execution.
+- `ANTFLY_CUDA_GLINER_1B_Q8_F16_ATTENTION=0`: keep the mirrors but use the
+  previous F32 attention route.
+
+Reference (L4, batch 1, prepared-core median): the tiled-attention mirror route
+reaches Python FP16 parity at 512 tokens (1.00×) and is 5.7% slower at 2,048
+tokens; it passes all 14 published cases and the 512/2,048 capacity cases at
+the 0.002 logit tolerance, but only five of eight longer multilingual holdouts
+stay within that bound, so it does not qualify FP16 numerics or CUDA serving.
+The exact Q8 bundle does not acquire CUDA `/decisions` qualification from the
+Metal PR or this offline benchmark.
+
+Reproduce the offline comparison without adding model files or large fixtures
+to Git (run from `zig/pkg/inference`):
+
+```sh
+MODEL=/tmp/gliner-decide-q8
+hf download antflydb/gliner2.5-decide-1B-gguf \
+  antfly_inference_bundle.json config.json encoder_config/config.json \
+  tokenizer.json tokenizer_config.json gliner2-encoder.Q8_0.gguf gliner_head.gguf \
+  benchmark-cases.json validation.json \
+  --revision 5c61a1a39ad4c6865d0e0ff98a7ac507e8c35cef --local-dir "$MODEL"
+python scripts/gliner25/prepare_decide_quant_capture.py \
+  --cases "$MODEL/benchmark-cases.json" --validation "$MODEL/validation.json" \
+  --output /tmp/gliner-decide-q8-cases.json
+zig build bench-gliner-decide-quant-build test-gliner-decide-quant \
+  -Dcuda=true -Dmetal=false -Doptimize=fast -j1
+zig build test -Dtest-filter='GLiNER Decide CUDA' \
+  -Dcuda=true -Dmetal=false -Doptimize=fast -j1
+ANTFLY_CUDA_DISPATCH_STATS=1 \
+  zig-out/bin/antfly-inference-gliner-decide-quant-bench \
+  --model-dir "$MODEL" --capture /tmp/gliner-decide-q8-cases.json \
+  --backend cuda --warmups 3 --reps 10 --tolerance 0.002
+```
+
+The capture builder binds published input IDs to the independently decoded Q8
+oracle rather than the original FP32 checkpoint. The benchmark verifies exact
+token IDs, finite logits, and absolute errors on every run, and reports both the
+full loaded pipeline and the prepared encoder/classifier/readback clock. For
+paired measurements use the persistent worker controller, which keeps all
+routes and the decoded-Q8 PyTorch FP16 SDPA model resident and runs them in
+balanced permutations (the output directory must be new):
+
+```sh
+python scripts/gliner25/benchmark_decide_quant.py \
+  --model-dir "$MODEL" --capture /tmp/gliner-decide-q8-cases.json \
+  --native zig-out/bin/antfly-inference-gliner-decide-quant-bench \
+  --pairs 30 --tails 200 --warmups 3 --output /tmp/gliner-decide-q8-paired
+```
+
+### Reproduction
+
+Build optimized workers from `zig/pkg/inference`:
+
+```sh
+zig build bench-gliner25-decide-build bench-gliner25-cuda-build \
+  -Dcuda=true -Dmetal=false -Doptimize=fast
+ANTFLY_LAYA_BACKEND=cuda zig build test -Dcuda=true -Dmetal=false \
+  -Dtest-filter='GLiNER CUDA long attention'
+python -m unittest discover -s scripts/gliner25 -p test_family_contract.py
+```
+
+Use the pinned Fastino environment specified by the manifest, with `psutil`
+installed. When testing the raw 1B artifact provide explicit
+classification-head metadata (`model_manifest.json` with `type: extractor`,
+`tasks: [extract, decide]`, `capabilities: [classification, typed_decisions]`,
+`inputs: [text]`, and `gliner_classification_head: label_marker_mlp`); raw
+Multi-Decide directories need the same task/capability metadata without the
+`gliner_classification_head` field. These local declarations select routing;
+they do not grant release qualification.
+
+```sh
+python scripts/gliner25/check_family_decisions.py \
+  --native zig-out/bin/antfly-inference-gliner25-decide-bench \
+  --model-dir /models/decide-1b \
+  --cases testdata/gliner25/family/decide_1b/capacity_cases.json \
+  --oracle testdata/gliner25/family/decide_1b/capacity_oracle_fp32.jsonl \
+  --output /tmp/decide-1b-parity.json
+python scripts/gliner25/benchmark_family.py \
+  --native zig-out/bin/antfly-inference-gliner25-decide-bench \
+  --python /path/to/reference/bin/python --model-dir /models/decide-1b \
+  --model decide_1b --attention sdpa --output /tmp/decide-1b-paired
+python scripts/gliner25/family_oracle.py \
+  --model multi_decide --model-dir /models/multi-decide --dtype fp32 \
+  --cases testdata/gliner25/family/multi_decide/capacity_requests.json \
+  > /tmp/multi-decide-capacity-oracle.jsonl
+```
+
+For Multi-Decide select `--model multi_decide` and
+`zig-out/bin/antfly-inference-gliner25-cuda-bench` as the native worker;
+`--model multi` checks the full boundary fixture suite. For Multi-Decide
+capacity campaigns pass `--cases`, `--native-cases`, and `--oracle` with its
+`capacity_requests.json`, `capacity_cases.json`, and
+`capacity_oracle_fp32.jsonl` fixtures. Use `--reference-weight-dtype fp16` with
+`--reference-dtype fp16` to measure reduced resident Fastino weights (the
+default keeps FP32 resident weights). `--stop-on-regression` stops a campaign
+after the first measured performance failure without discarding samples; a
+completed campaign also exits unsuccessfully when any guard fails.
+`score_family_classification.py` scores pinned captures against MASSIVE gold
+intent labels without rerunning inference.
+
+```sh
+python scripts/gliner25/check_family_holdout.py \
+  --native zig-out/bin/antfly-inference-gliner25-cuda-bench \
+  --python /path/to/reference/bin/python --model multi_decide \
+  --model-dir /models/multi-decide --precision fp16 \
+  --output /tmp/multi-decide-public-parity
+python scripts/gliner25/check_family_reference_holdout.py \
+  --python /path/to/reference/bin/python --model multi_decide \
+  --model-dir /models/multi-decide --dtype fp16 --weight-dtype fp16 \
+  --attention flashdeberta \
+  --oracle-report testdata/gliner25/family/evidence/l4_multi_decide_fp16_compact_public_classification/report.json \
+  --output /tmp/fastino-multi-decide-public-parity
+ANTFLY_GLINER25_FAMILY_MODEL_DIR=/models/multi-decide \
+  zig build test -Dcuda=true -Dmetal=false \
+  -Dtest-filter='GLiNER family CUDA typed decisions'
+```
+
+The opt-in HTTP test sends loopback requests at concurrency 1/4/16, compares
+them with serial results, and checks admission cleanup. The model-backed
+managed window test covers 2/8/32 windows per document, window batch sizes one
+and four, pre-cancelled and interrupted calls, and identical retry responses;
+paired window performance is still required.
+
 ## Gemma4 And TurboQuant KV Status
 
 Gemma4 CUDA defaults remain `f32` KV for production correctness. The optional
@@ -383,7 +645,7 @@ binary directory will fail with `NoTokenizerFound`.
 
 ```sh
 ./antfly-inference generate \
-  /home/timkaye/tim/antfly/.models/unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf \
+  /abs/path/to/antfly/.models/unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf \
   "Give a one sentence summary of Korean history." \
   --backend cuda \
   --max-tokens 128 \
@@ -536,6 +798,8 @@ CUDA session creation now uses explicit capability profiles:
 | `clipclap` | CLIP, CLAP, ClipCLAP embedding paths | dense linears, bias/activation fusions, embedding lookup, layer/RMS norm, concat, conv2d, SDPA |
 | `deberta_reranker` | DeBERTa cross-encoder rerankers | `clipclap` primitives plus take-rows, DeBERTa attention, split-last-dim |
 | `gliner2` | GLiNER2 recognition | `deberta_reranker` primitives plus GLiNER word embeddings and label GRU combine |
+| `gliner25_boundary` | GLiNER2.5 Multi and Multi-Decide | Boundary encoder, extraction and classification device primitives |
+| `gliner25_modern_bert` | GLiNER2.5 Decide-1B | ModernBERT primitives plus masked long-context encoder attention |
 
 `antfly inference cuda-info --smoke` prints the loaded artifact's profile
 capability booleans before running kernel smokes. Production validation should
@@ -863,8 +1127,6 @@ CUDA meets its minimal-usefulness bar:
   CUDA artifacts in manifests.
 - Which GGUF model defines first acceptance: small deterministic fixture, a
   common 7B Q4_K model, or both?
-- Should release builds ship only portable PTX at first, or PTX plus L4/T4
-  cubins once CI can generate them?
 - How aggressive should per-op fallback be before the cost of CPU/GPU
   transfers makes whole-layer fallback preferable?
 - Should CUDA direct sessions load before or after Metal in `auto` when

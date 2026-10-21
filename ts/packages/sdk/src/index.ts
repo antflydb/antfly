@@ -98,13 +98,22 @@ export {
 export type {
   Chunk,
   ChunkConfig,
+  ChunkEmbeddingContext,
+  ChunkEmbeddingObject,
+  ChunkEmbeddingRequest,
+  ChunkEmbeddingResponse,
+  ChunkEmbeddingStreamEvent,
+  ChunkEmbeddingTarget,
   ChunkRequest,
   ChunkResponse,
+  ChunkSourceReference,
   ClassificationResult,
   Config as InferenceRuntimeConfig,
   ContentPart,
   ContentSecurityConfig,
   Credentials,
+  DecideRequest,
+  DecideResponse,
   EmbedInput,
   EmbedRequest,
   EmbedResponse,
@@ -116,6 +125,8 @@ export type {
   ExtractResponse,
   ExtractV2Request,
   GenerateChunk,
+  GeneratedDecideRequest,
+  GeneratedExtractRequest,
   GenerateRequest,
   GenerateResponse,
   ImageURL,
@@ -124,6 +135,7 @@ export type {
   InferenceConfig,
   InferenceError,
   Level,
+  MediaChunkPolicy,
   ModelsResponse,
   RequestOptions,
   RerankDocument,
@@ -378,6 +390,8 @@ export type {
   QueryResult,
   QueryScoreDetails,
   QueryStrategy,
+  ReadReceipt,
+  ReadRequirements,
   RelationalColumnExpression,
   RelationalConstraintConflictReason,
   RelationalConstraintRangeStatus,
@@ -404,6 +418,7 @@ export type {
   RelationalRowQueryRequest,
   RelationalScalarExpression,
   RelationalUniqueConstraint,
+  RelationalUniqueConstraintOrigin,
   RerankerConfig,
   RerankerProfile,
   // Research Agent types
@@ -455,12 +470,19 @@ export type {
   SignificanceAlgorithm,
   SortProfile,
   SparseEmbedding,
+  SQLArrayColumnSchema,
+  SQLArrayDimension,
+  SQLArrayElementType,
+  SQLArrayValue,
+  SQLBuiltinType,
   SQLColumn,
   SQLColumnType,
   SQLConnectionOpenRequest,
   SQLConnectionResponse,
   SQLDiagnostic,
   SQLMutationOutcome,
+  SQLNumericModifier,
+  SQLParameterDescriptor,
   SQLPreparedExecutionRequest,
   SQLPreparedResponse,
   SQLPrepareRequest,
@@ -498,12 +520,18 @@ export {
   queryHitsTotalValue,
   queryResultHitsTotal,
   queryResultTotalHits,
+  readAfterWrite,
 } from "./types.js";
 
 // Default export for convenience
 import { Client } from "./sdk.js";
 export default Client;
 
+export type {
+  InferenceGatewayCatalog,
+  InferenceGatewayModel,
+  InferenceGatewayOperation,
+} from "./client.js";
 export { ChatGPTConnectionError } from "./client.js";
 export * from "./models.js";
 export type {

@@ -2,6 +2,7 @@
 # - ts/antfly/sdk/v* tags publish @antfly/sdk
 # - ts/antfly/components/v* tags publish @antfly/components
 # - ts/antfly/design-system/v* tags publish @antfly/design-system
+# - ts/antfly/web/v* tags publish @antfly/web
 #
 # Uses npm Trusted Publishing (OIDC) - no secrets required.
 # Configure trusted publishers at: https://www.npmjs.com/package/@antfly/sdk/access
@@ -16,6 +17,7 @@ on:
       - 'ts/antfly/sdk/v*'
       - 'ts/antfly/components/v*'
       - 'ts/antfly/design-system/v*'
+      - 'ts/antfly/web/v*'
 
 permissions:
   contents: read
@@ -37,7 +39,7 @@ jobs:
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: ts/package.json
           registry-url: https://registry.npmjs.org/
@@ -86,3 +88,8 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/ts/antfly/design-system/v')
         working-directory: ts
         run: pnpm --filter @antfly/design-system publish --access public --no-git-checks --provenance
+
+      - name: Publish Browser Inference Client
+        if: startsWith(github.ref, 'refs/tags/ts/antfly/web/v')
+        working-directory: ts
+        run: pnpm --filter @antfly/web publish --access public --no-git-checks --provenance

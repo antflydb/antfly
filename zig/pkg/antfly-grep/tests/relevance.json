@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "documents": {
+    "retry.go": "package retry\nfunc fetch(max int) error {\n    for attempt := 0; ; attempt++ {\n        if attempt >= max { return ErrExhausted }\n        if err := request(); err == nil { return nil }\n    }\n}\n",
+    "validate.py": "def validate_limit(limit):\n    if limit < 0:\n        raise ValueError(\"limit must be nonnegative\")\n    return limit\n",
+    "cache.rs": "fn store(path: &Path, content: &[u8]) -> Result<()> {\n    let temporary = path.with_extension(\"tmp\");\n    std::fs::write(&temporary, content)?;\n    std::fs::rename(temporary, path)?;\n    Ok(())\n}\n",
+    "auth.py": "def read_source(principal, allowed, source):\n    if principal not in allowed:\n        raise PermissionError(\"not authorized\")\n    return evaluate(source)\n",
+    "noise.go": "package sample\n// The retry, validation, cache and permissions documentation.\nfunc constant() int { return 42 }\n"
+  },
+  "questions": [
+    {
+      "id": "retry-bound",
+      "query": "Where is the retry attempt budget enforced?",
+      "relevant": {
+        "retry.go": [
+          3,
+          4
+        ]
+      }
+    },
+    {
+      "id": "invalid-input",
+      "query": "Where are negative limits rejected?",
+      "relevant": {
+        "validate.py": [
+          2,
+          3
+        ]
+      }
+    },
+    {
+      "id": "atomic-cache",
+      "query": "Where is a temporary cache file atomically published?",
+      "relevant": {
+        "cache.rs": [
+          2,
+          3,
+          4
+        ]
+      }
+    },
+    {
+      "id": "permission-gate",
+      "query": "Where is permission checked before source evaluation?",
+      "relevant": {
+        "auth.py": [
+          2,
+          3
+        ]
+      }
+    },
+    {
+      "id": "no-relevant-source",
+      "query": "Where are TLS certificates rotated?",
+      "relevant": {}
+    }
+  ]
+}

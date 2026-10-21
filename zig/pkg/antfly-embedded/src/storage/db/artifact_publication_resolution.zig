@@ -34,7 +34,7 @@ fn capture(alloc: std.mem.Allocator, txn: anytype, config: catalog.ResolverConfi
     const owned = arena.allocator();
     const ordered = (try inventory.load(owned, txn)) orelse return error.ArtifactCatalogDrift;
     const binding = ordered.value.command.binding;
-    if (binding.effect_protocol != 15 or binding.epoch != authority.epoch or
+    if (binding.effect_protocol < 15 or binding.epoch != authority.epoch or
         !std.mem.eql(u8, &binding.digest, &authority.catalog_digest) or
         !std.mem.eql(u8, &ordered.value.command.namespace, &authority.namespace)) return error.ArtifactCatalogDrift;
     const local = try inventory.catalogs(txn);
@@ -91,13 +91,16 @@ pub fn process(
     {
         var read = try store.beginReadTxnWithBlockCacheAdmission(.transient);
         defer read.abort();
-        if (try publication.authority(&read) == null) return false;
+        if (try publication.authority(&read) == null) {
+            return false;
+        }
     }
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const scratch = arena.allocator();
     var sources: std.ArrayList([]const u8) = .empty;
     for (changed_keys) |key| {
+        try runtime.appendDescriptionSources(scratch, resolvers, key, &sources);
         const source_key = if (try runtime.parseSourceArtifactKeyAlloc(scratch, key) != null) key else blk: {
             const source = (try runtime.sourceExtractionKeyForResolutionKeyAlloc(scratch, resolvers, key)) orelse continue;
             // Retirement deletes do not re-drive and resurrect their output.
@@ -142,7 +145,8 @@ pub fn process(
                 }
             }
             const output_key = try keys.resolutionArtifactKeyAlloc(work, parsed.resolution_scope_key, config.resolution_artifact);
-            var recorder: RecordingStore(@TypeOf(store.*)) = .{ .store = store, .fallback = fallback, .token = &token, .output_key = output_key, .upstream_key = key };
+            const control_key = try runtime.reviewOverrideArtifactKeyAlloc(work, parsed.resolution_scope_key, config.source_artifact, config.resolution_artifact);
+            var recorder: RecordingStore(@TypeOf(store.*)) = .{ .store = store, .fallback = fallback, .token = &token, .output_key = output_key, .upstream_key = key, .control_key = control_key };
             const value: ?[]const u8 = if (!token.source.exists) blk: {
                 // A genuine primary tombstone authorizes cleanup only. Never
                 // run inference on an orphaned extraction or resurrect output.
@@ -188,6 +192,7 @@ pub fn RecordingStore(comptime Store: type) type {
         token: *Token,
         output_key: []const u8,
         upstream_key: []const u8,
+        control_key: []const u8,
         const Self = @This();
 
         pub fn artifactStore(self: *Self) resolver_lib.ArtifactStore {
@@ -200,6 +205,17 @@ pub fn RecordingStore(comptime Store: type) type {
                 return self.fallback.get(alloc, key);
             var txn = try self.store.beginReadTxnWithBlockCacheAdmission(.transient);
             defer txn.abort();
+            if (std.mem.eql(u8, key, self.control_key)) {
+                // Curator decisions are primary control state. Guard their
+                // presence and bytes in the resolver's causal read set; they
+                // have no derived producer whose receipt could authorize them.
+                const raw = txn.get(key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                try self.token.observe(key, raw, try publication.artifactRevision(&txn, self.token.namespace, key));
+                return if (raw) |value| try alloc.dupe(u8, value) else null;
+            }
             var input = try @import("artifact_extraction_generation.zig").captureInput(alloc, &txn, key);
             defer input.deinit();
             const raw = input.value;
@@ -269,7 +285,10 @@ pub fn prepareResolution(alloc: std.mem.Allocator, command: publication.Command,
         if (mutation.value) |raw| {
             var result = resolver_lib.parseResolution(owned, raw) catch return error.InvalidBatchRequest;
             defer result.deinit();
-            if (result.config_generation != command.producer_generation) return error.InvalidBatchRequest;
+            // The producer identity tracks the definition generation. Curation
+            // advances the effective resolution generation without changing that
+            // identity; the catalog digest fences both in this transaction.
+            if (result.config_generation != config.effectiveGeneration()) return error.InvalidBatchRequest;
             for (result.entities) |entity| if (!std.mem.eql(u8, entity.doc_ref.table, config.table)) return error.InvalidBatchRequest;
         }
         changed[i] = try owned.dupe(u8, mutation.key);
@@ -282,8 +301,14 @@ pub fn prepareResolution(alloc: std.mem.Allocator, command: publication.Command,
 pub fn stageHandoff(alloc: std.mem.Allocator, txn: anytype, command: publication.Command) !void {
     if (command.producer_kind != .resolver) return error.InvalidBatchRequest;
     const handoff = @import("resolution_handoff.zig");
+    const active = (try publication.authority(txn)) orelse return error.ArtifactCatalogDrift;
     for (command.mutations) |mutation| {
         if (mutation.family != .resolution) return error.InvalidBatchRequest;
+        // Resolution changes invalidate graph consumers even when the primary
+        // document is unchanged. Persist the producer revisit with the handoff;
+        // accepted asset/provider output is reused during that bounded retry.
+        const source = command.sources[mutation.source_index];
+        _ = try @import("artifact_producer_obligations.zig").mark(alloc, txn, active, source.document_key, source.input_position);
         const marker = try handoff.keyAlloc(alloc, mutation.key);
         defer alloc.free(marker);
         if (mutation.value) |raw| {
@@ -422,7 +447,7 @@ test "ordered artifact inventory resolver inherits causal sources with stable so
             try result.validate(a);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, AllocationFailure.run, .{ proof, input_key, output_key });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationFailure.run, .{ proof, input_key, output_key });
 }
 
 test "ordered resolver preparation binds output to exact source and configured generation" {
@@ -456,8 +481,58 @@ test "ordered resolver preparation binds output to exact source and configured g
     mutation.value = "{\"config_generation\":6,\"entities\":[]}";
     command.publication_digest = command.digest();
     try std.testing.expectError(error.InvalidBatchRequest, prepareResolution(alloc, command, .{ .resolvers = encoded }));
+    // A merge/suppression changes the effective output generation while
+    // preserving the producer definition's generation and receipt identity.
+    var curated_config = config;
+    curated_config.resolution_generation = 9;
+    curated_config.merge_generation = 8;
+    const curated = try catalog.serializeCatalog(alloc, &.{curated_config});
+    defer alloc.free(curated);
+    mutation.value = "{\"config_generation\":9,\"entities\":[]}";
+    command.publication_digest = command.digest();
+    var curated_prepared = try prepareResolution(alloc, command, .{ .resolvers = curated });
+    defer curated_prepared.deinit();
+    mutation.value = "{\"config_generation\":7,\"entities\":[]}";
+    command.publication_digest = command.digest();
+    try std.testing.expectError(error.InvalidBatchRequest, prepareResolution(alloc, command, .{ .resolvers = curated }));
     mutation.value = null;
     command.producer_generation = 8;
     command.publication_digest = command.digest();
     try std.testing.expectError(error.EnrichmentSourceChanged, prepareResolution(alloc, command, .{ .resolvers = encoded }));
+}
+
+test "resolver curation ordered publication guards primary review state without producer receipts" {
+    const DB = @import("selected_root.zig").db.DB;
+    const a = std.testing.allocator;
+    var tmp = try @import("../../common/test_directory.zig").TestDirectory.init("resolver-control-read");
+    defer tmp.cleanup();
+    var db = try DB.open(a, tmp.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    var namespace: [24]u8 = undefined;
+    @import("doc_identity.zig").encodeNamespace(&namespace, db.core.identity_namespace);
+    const Scope = struct {
+        fn init(alloc: std.mem.Allocator, ns: [24]u8) Token {
+            return .{ .arena = std.heap.ArenaAllocator.init(alloc), .namespace = ns, .epoch = 1, .catalog_digest = @splat(2), .producer_kind = .resolver, .producer_name = "concepts", .producer_generation = 1, .artifact_name = "resolved", .source = .{ .document_key = "doc", .content_digest = @splat(3), .timestamp = 1, .input_position = null } };
+        }
+    };
+    const control = try runtime.reviewOverrideArtifactKeyAlloc(a, "doc", "kg", "resolved");
+    defer a.free(control);
+    var fallback: runtime.DbArtifactStore(@TypeOf(db.core.store.runtime_store)) = .{ .store = &db.core.store.runtime_store };
+    var before = Scope.init(a, namespace);
+    defer before.deinit();
+    var recorder: RecordingStore(@TypeOf(db.core.store.*)) = .{ .store = db.core.store, .fallback = fallback.artifactStore(), .token = &before, .output_key = "unused", .upstream_key = "unused", .control_key = control };
+    try std.testing.expect(try recorder.artifactStore().get(a, control) == null);
+    try std.testing.expectEqual(@as(usize, 1), before.reads.items.len);
+    try std.testing.expect(before.reads.items[0].content_digest == null);
+    const value = "{\"a\":{\"decision\":\"suppressed\",\"table\":\"entities\",\"key\":\"\"}}";
+    try db.core.store.put(control, value);
+    try std.testing.expectError(error.EnrichmentSourceChanged, recorder.artifactStore().get(a, control));
+    var after = Scope.init(a, namespace);
+    defer after.deinit();
+    recorder.token = &after;
+    const observed = (try recorder.artifactStore().get(a, control)).?;
+    defer a.free(observed);
+    try std.testing.expectEqualStrings(value, observed);
+    try std.testing.expectEqual(@as(usize, 1), after.reads.items.len);
+    try std.testing.expect(after.reads.items[0].content_digest != null);
 }

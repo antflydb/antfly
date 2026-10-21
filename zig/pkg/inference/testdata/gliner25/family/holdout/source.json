@@ -1,0 +1,40 @@
+{
+  "dataset": "AmazonScience/massive",
+  "revision": "1a5b2b362bcb4a6f5694396ee1ab577f91583ce2",
+  "split": "test",
+  "license": "cc-by-4.0",
+  "files": {
+    "en-US/massive-test.parquet": {
+      "size_bytes": 191261,
+      "sha256": "c418da9a5f3a7425b5cf44941bcea032a31040dbda2da85e0dd9323785c7731e"
+    },
+    "fr-FR/massive-test.parquet": {
+      "size_bytes": 228331,
+      "sha256": "aacd57aa2bcf6e1d037a350a41b70cb756bbf51199d2023f40a3ebb9d38a1981"
+    },
+    "de-DE/massive-test.parquet": {
+      "size_bytes": 225568,
+      "sha256": "3f15d6dcac758a56b4528a06b002252846208ebb8101f6159bc16ed836c55982"
+    },
+    "es-ES/massive-test.parquet": {
+      "size_bytes": 222136,
+      "sha256": "ca94eebc836e61e8bc530966c6565bb2c2b9d6184cc910c767c7fa6a9563de19"
+    },
+    "ar-SA/massive-test.parquet": {
+      "size_bytes": 235458,
+      "sha256": "fabc7afec26a29ec31c2deb016d47f9a4e38c33fa63c4b92b9f069e2b9f1054c"
+    },
+    "hi-IN/massive-test.parquet": {
+      "size_bytes": 299100,
+      "sha256": "f09ebfb9519169e5920785a1d6225d5d352c7de4a002235af99765147d219875"
+    },
+    "ja-JP/massive-test.parquet": {
+      "size_bytes": 225859,
+      "sha256": "017d55af0c9d90faa93363798976570e0f58c3c1f90bbdc4be45da43c1310d01"
+    },
+    "zh-CN/massive-test.parquet": {
+      "size_bytes": 201108,
+      "sha256": "7eca92a47e6bffeec3fc7de751948b82904680353a42eef7e8c6fdbe89adb2db"
+    }
+  }
+}

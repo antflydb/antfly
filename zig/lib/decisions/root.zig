@@ -16,6 +16,7 @@
 //! Public named-array decision contract. The model adapters retain their
 //! private typed-classification representation behind this boundary.
 const std = @import("std");
+pub const generated = @import("generated.zig");
 pub const legacy = @import("trained.zig");
 pub const scoring = @import("embedding.zig");
 const V = std.json.Value;
@@ -173,7 +174,7 @@ pub fn internalQuestions(a: A, questions: V) !V {
     try root.put(a, "model", str("contract-validation"));
     try root.put(a, "input", str("validation"));
     try root.put(a, "questions", questions);
-    const parsed = try parse(a, try std.json.Stringify.valueAlloc(a, V{ .object = root }, .{}));
+    const parsed = try parseValue(a, V{ .object = root });
     var out = std.json.ObjectMap{};
     for (parsed.inner.questions, parsed.policies, questions.array.items) |question, policy, raw| {
         var q = std.json.ObjectMap{};
@@ -294,19 +295,47 @@ pub fn publicResponse(a: A, response: V) !V {
 pub fn parse(a: A, bytes: []const u8) !Request {
     if (bytes.len > 16 * 1024 * 1024) return error.DecideRequestLimitExceeded;
     const value = std.json.parseFromSliceLeaky(V, a, bytes, .{ .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidDecideRequest;
+    return parseValue(a, value);
+}
+/// Shared parsed-envelope entrypoint avoids reparsing when a route selects
+/// trained or generated execution from the same authenticated request.
+pub fn parseValue(a: A, value: V) !Request {
     const root = try object(value);
-    try keys(root, &.{ "model", "model_identity", "input", "inputs", "questions", "embedding_options" });
+    try keys(root, &.{ "model", "model_identity", "input", "inputs", "questions", "embedding_options", "long_document", "context_version", "contexts" });
     const model = try text(root.get("model") orelse return error.InvalidDecideRequest);
     const batched = root.contains("inputs");
     if (batched == root.contains("input")) return error.InvalidDecideRequest;
+    const contexts: []const V = if (root.get("context_version")) |version| blk: {
+        if (version != .integer or version.integer != 1 or !batched) return error.InvalidDecideRequest;
+        const sources = root.get("contexts") orelse return error.InvalidDecideRequest;
+        if (sources != .array or sources.array.items.len > 128) return error.DecideRequestLimitExceeded;
+        for (sources.array.items) |source| {
+            const source_text = try text(source);
+            if (source_text.len > 1024 * 1024) return error.DecideRequestLimitExceeded;
+        }
+        break :blk sources.array.items;
+    } else blk: {
+        if (root.contains("contexts")) return error.InvalidDecideRequest;
+        break :blk &.{};
+    };
+    var expanded_bytes: usize = 0;
     const items = if (batched) blk: {
         const raw = root.get("inputs").?;
         if (raw != .array or raw.array.items.len == 0 or raw.array.items.len > 128) return error.DecideRequestLimitExceeded;
         const out = try a.alloc(Item, raw.array.items.len);
         for (raw.array.items, out) |entry, *item| {
             const fields = try object(entry);
-            try keys(fields, &.{ "id", "input" });
+            try keys(fields, &.{ "id", "input", "context_index" });
             item.* = .{ .input = try text(fields.get("input") orelse return error.InvalidDecideRequest), .id = if (fields.get("id")) |id| try text(id) else null };
+            if (fields.get("context_index")) |index| {
+                if (!root.contains("context_version") or index != .integer or index.integer < 0 or index.integer >= contexts.len) return error.InvalidDecideRequest;
+                const source = contexts[@intCast(index.integer)].string;
+                const size = source.len + 1 + item.input.len;
+                if (size > 1024 * 1024 or size > 16 * 1024 * 1024 - expanded_bytes) return error.DecideRequestLimitExceeded;
+                item.input = try std.fmt.allocPrint(a, "{s}\n{s}", .{ source, item.input });
+            }
+            if (item.input.len > 16 * 1024 * 1024 - expanded_bytes) return error.DecideRequestLimitExceeded;
+            expanded_bytes += item.input.len;
         }
         break :blk out;
     } else try a.dupe(Item, &.{.{ .input = try text(root.get("input").?) }});
@@ -393,6 +422,7 @@ pub fn parse(a: A, bytes: []const u8) !Request {
     var inner = std.json.ObjectMap{};
     try inner.put(a, "model", str(model));
     if (root.get("model_identity")) |id| try inner.put(a, "model_identity", id);
+    if (root.get("long_document")) |windows| try inner.put(a, "long_document", windows);
     try inner.put(a, "state", str(items[0].input));
     try inner.put(a, "questions", .{ .object = lowered });
     const serialized = try std.json.Stringify.valueAlloc(a, V{ .object = inner }, .{});
@@ -523,6 +553,33 @@ test "decisions typed span presenter preserves public score labels predicate and
     }
 }
 
+test "decisions public boundary windowing preserves batches and rejects invalid geometry" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const prefix = "{\"model\":\"multi-decide\",\"inputs\":[{\"id\":\"first\",\"input\":\"one\"},{\"input\":\"two\"}],\"questions\":[{\"name\":\"act\",\"type\":\"predicate\",\"instructions\":\"Act?\"}],\"long_document\":";
+    const request = try parse(a, prefix ++ "{\"mode\":\"window\",\"window_words\":64,\"overlap_words\":8,\"max_windows\":4}}");
+    const envelope = try extractionValue(a, request, .boundary);
+    const inputs = envelope.value.object.get("inputs").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), inputs.len);
+    try std.testing.expectEqualStrings("first", inputs[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("two", inputs[1].object.get("content").?.string);
+    const windows = envelope.value.object.get("options").?.object.get("long_document").?;
+    try std.testing.expectEqualDeep(request.inner.long_document, try @import("windowing.zig").parse(windows));
+    try std.testing.expectEqualDeep(request.inner.long_document, request.forItem(1).long_document);
+    try std.testing.expectError(error.UnsupportedDecisionWindowing, extractionValue(a, request, .laya));
+    for ([_][]const u8{
+        "null",
+        "{\"mode\":\"window\",\"window_words\":32,\"overlap_words\":32}",
+        "{\"mode\":\"window\",\"max_windows\":129}",
+        "{\"mode\":\"reject\",\"window_words\":64}",
+        "{\"mode\":\"window\",\"record_identity\":\"occurrence\"}",
+    }) |invalid| {
+        const json = try std.fmt.allocPrint(a, "{s}{s}}}", .{ prefix, invalid });
+        try std.testing.expectError(error.InvalidDecideRequest, parse(a, json));
+    }
+}
+
 test "decisions public contract isolates per-question acceptance and preserves batches" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -586,4 +643,46 @@ test "decisions public rejects duplicate questions and extraction decision alias
         "{\"inputs\":[{\"schema\":{\"classifications\":[{\"similarity_thresholds\":0.4}]}}]}",
     }) |json| try std.testing.expectError(error.UnsupportedExtractionFeature, validateExtractionBoundary(try std.json.parseFromSliceLeaky(V, a, json, .{})));
     try validateExtractionBoundary(try std.json.parseFromSliceLeaky(V, a, "{\"schema\":{\"entities\":[\"person\"],\"classifications\":[{\"mode\":\"multi\",\"labels\":[\"a\",\"b\"]}]}}", .{}));
+}
+
+test "shared contexts preserve effective input and reject invalid references" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const suffix = ",\"questions\":[{\"name\":\"q\",\"type\":\"predicate\",\"instructions\":\"?\"}]}";
+    const request = try parse(a, "{\"model\":\"m\",\"context_version\":1,\"contexts\":[\"source\"],\"inputs\":[{\"id\":\"a\",\"input\":\"target\",\"context_index\":0},{\"input\":\"other\"}]" ++ suffix);
+    try std.testing.expectEqualStrings("source\ntarget", request.items[0].input);
+    try std.testing.expectEqualStrings("other", request.items[1].input);
+    try std.testing.expectEqualStrings("source\ntarget", request.forItem(0).state);
+    const extraction = try extractionValue(a, request, .boundary);
+    const expanded = extraction.value.object.get("inputs").?.array.items;
+    try std.testing.expectEqualStrings("source\ntarget", expanded[0].object.get("content").?.string);
+    try std.testing.expectEqualStrings("a", expanded[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("other", expanded[1].object.get("content").?.string);
+    inline for (.{
+        "{\"model\":\"m\",\"context_version\":2,\"contexts\":[],\"inputs\":[{\"input\":\"x\"}]",
+        "{\"model\":\"m\",\"contexts\":[],\"inputs\":[{\"input\":\"x\"}]",
+        "{\"model\":\"m\",\"context_version\":1,\"contexts\":[\"s\"],\"inputs\":[{\"input\":\"x\",\"context_index\":1}]",
+        "{\"model\":\"m\",\"inputs\":[{\"input\":\"x\",\"context_index\":0}]",
+    }) |prefix| try std.testing.expectError(error.InvalidDecideRequest, parse(a, prefix ++ suffix));
+}
+
+test "shared context expansion enforces per-input and aggregate byte limits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const source = try a.alloc(u8, 640 * 1024);
+    @memset(source, 'x');
+    const Input = struct { input: []const u8 = "target", context_index: usize = 0 };
+    const inputs: [26]Input = @splat(.{});
+    const body = try std.json.Stringify.valueAlloc(a, .{ .model = "m", .context_version = 1, .contexts = .{source}, .inputs = inputs, .questions = .{.{ .name = "q", .type = "predicate", .instructions = "?" }} }, .{});
+    try std.testing.expectError(error.DecideRequestLimitExceeded, parse(a, body));
+    const long_input = try a.alloc(u8, 512 * 1024);
+    @memset(long_input, 'y');
+    const oversized = try std.json.Stringify.valueAlloc(a, .{ .model = "m", .context_version = 1, .contexts = .{source}, .inputs = .{Input{ .input = long_input }}, .questions = .{.{ .name = "q", .type = "predicate", .instructions = "?" }} }, .{});
+    try std.testing.expectError(error.DecideRequestLimitExceeded, parse(a, oversized));
+}
+
+test {
+    _ = generated;
 }

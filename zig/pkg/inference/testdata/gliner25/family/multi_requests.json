@@ -1,0 +1,270 @@
+{
+  "format_version": 1,
+  "cases": [
+    {
+      "id": "mixed_tasks",
+      "kind": "extract",
+      "schema": {
+        "entities": [
+          "person",
+          "organization"
+        ],
+        "classifications": [
+          {
+            "task": "sentiment",
+            "labels": [
+              "positive",
+              "negative"
+            ]
+          }
+        ],
+        "relations": [
+          "works_for"
+        ]
+      },
+      "texts": [
+        "John works at Apple. Alice works at Google."
+      ]
+    },
+    {
+      "id": "unicode_offsets",
+      "kind": "extract",
+      "schema": {
+        "entities": {
+          "person": "A named person",
+          "location": "A named place"
+        }
+      },
+      "texts": [
+        "İpek works at Apple in 東京. 🙂 Alice visits café é."
+      ]
+    },
+    {
+      "id": "entity_attributes",
+      "kind": "extract",
+      "schema": {
+        "entities": [
+          "product"
+        ],
+        "entity_attributes": {
+          "sentiment": {
+            "labels": [
+              "positive",
+              "negative",
+              "neutral"
+            ],
+            "applies_to": [
+              "product"
+            ],
+            "qualify_labels": true
+          },
+          "condition": {
+            "labels": [
+              "working",
+              "broken"
+            ],
+            "multi_label": true,
+            "threshold": 0.5,
+            "qualify_labels": true
+          }
+        }
+      },
+      "texts": [
+        "The iPhone camera is good. The battery is bad."
+      ]
+    },
+    {
+      "id": "legacy_structure",
+      "kind": "extract",
+      "schema": {
+        "structures": {
+          "employment": {
+            "fields": [
+              {
+                "name": "person",
+                "dtype": "str"
+              },
+              {
+                "name": "organization",
+                "dtype": "list"
+              }
+            ]
+          }
+        }
+      },
+      "texts": [
+        "John works at Apple. Alice works at Google."
+      ]
+    },
+    {
+      "id": "record_natural",
+      "kind": "extract",
+      "schema": {
+        "structures": {
+          "employment": {
+            "mode": "natural",
+            "anchor": "person",
+            "occurrence_policy": "latent_all",
+            "fields": [
+              {
+                "name": "person",
+                "dtype": "str",
+                "cardinality": "required_one"
+              },
+              {
+                "name": "organization",
+                "dtype": "str",
+                "exclusive": true
+              }
+            ]
+          }
+        }
+      },
+      "texts": [
+        "John works at Apple. Alice works at Google."
+      ]
+    },
+    {
+      "id": "record_latent",
+      "kind": "extract",
+      "schema": {
+        "structures": {
+          "employment": {
+            "mode": "latent",
+            "fields": [
+              {
+                "name": "person",
+                "dtype": "str"
+              },
+              {
+                "name": "organization",
+                "dtype": "str"
+              }
+            ]
+          }
+        }
+      },
+      "texts": [
+        "John works at Apple. Alice works at Google."
+      ]
+    },
+    {
+      "id": "record_anchorless",
+      "kind": "extract",
+      "schema": {
+        "structures": {
+          "employment": {
+            "mode": "anchorless",
+            "fields": [
+              {
+                "name": "person",
+                "dtype": "str"
+              },
+              {
+                "name": "organization",
+                "dtype": "str"
+              }
+            ]
+          }
+        }
+      },
+      "texts": [
+        "John works at Apple. Alice works at Google."
+      ]
+    },
+    {
+      "id": "enum_field",
+      "kind": "extract",
+      "schema": {
+        "structures": {
+          "review": {
+            "fields": [
+              {
+                "name": "product",
+                "dtype": "str"
+              },
+              {
+                "name": "sentiment",
+                "dtype": "str",
+                "choices": [
+                  "positive",
+                  "negative"
+                ]
+              }
+            ]
+          }
+        }
+      },
+      "texts": [
+        "The iPhone camera is good."
+      ]
+    },
+    {
+      "id": "constrained_classification",
+      "kind": "classification",
+      "schema": {
+        "version": 3,
+        "tasks": {
+          "intent": {
+            "labels": [
+              "read",
+              "delete"
+            ],
+            "min_labels": 1,
+            "max_labels": 1
+          },
+          "effects": {
+            "labels": [
+              "read_only",
+              "delete"
+            ],
+            "min_labels": 1,
+            "max_labels": 1
+          }
+        },
+        "constraints": [
+          {
+            "type": "Implies",
+            "cond": {
+              "type": "LabelRef",
+              "task": "intent",
+              "label": "delete"
+            },
+            "then": {
+              "type": "LabelRef",
+              "task": "effects",
+              "label": "delete"
+            }
+          }
+        ]
+      },
+      "texts": [
+        "Delete the temporary file."
+      ]
+    },
+    {
+      "id": "joint_ie",
+      "kind": "joint_ie",
+      "schema": {
+        "entities": [
+          "person",
+          "organization"
+        ],
+        "relations": {
+          "works_for": {
+            "head": [
+              "person"
+            ],
+            "tail": [
+              "organization"
+            ],
+            "max_per_head": 1
+          }
+        }
+      },
+      "texts": [
+        "John works at Apple. Alice works at Google."
+      ]
+    }
+  ]
+}

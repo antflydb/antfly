@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
+from ..models.inference_decide_request_context_version import InferenceDecideRequestContextVersion
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.choice_decision_question import ChoiceDecisionQuestion
     from ..models.decision_input import DecisionInput
     from ..models.embedding_decision_options import EmbeddingDecisionOptions
+    from ..models.inference_decide_long_document import InferenceDecideLongDocument
     from ..models.multi_choice_decision_question import MultiChoiceDecisionQuestion
     from ..models.predicate_decision_question import PredicateDecisionQuestion
     from ..models.score_decision_question import ScoreDecisionQuestion
@@ -29,9 +31,15 @@ class InferenceDecideRequest:
             model (str):
             questions (list[ChoiceDecisionQuestion | MultiChoiceDecisionQuestion | PredicateDecisionQuestion |
                 ScoreDecisionQuestion]):
+            context_version (InferenceDecideRequestContextVersion | Unset): Explicit shared-context transport version.
+                Requires batched inputs and contexts; unknown versions are rejected.
+            contexts (list[str] | Unset): Shared immutable context strings referenced by context_index. Requires
+                context_version 1. Total expanded input bytes are limited to 16 MiB.
             model_identity (str | Unset): Pin the exact EmbeddingGemma 2 assets and embedding recipe.
             input_ (str | Unset):
             inputs (list[DecisionInput] | Unset):
+            long_document (InferenceDecideLongDocument | Unset): Explicit windowing for qualified boundary decision models.
+                Span and embedding decision models reject window mode. Omission preserves rejection of over-limit text.
             embedding_options (EmbeddingDecisionOptions | Unset): Request-wide embedding geometry defaults. Acceptance
                 thresholds and calibration belong to individual questions.
     """
@@ -40,9 +48,12 @@ class InferenceDecideRequest:
     questions: list[
         ChoiceDecisionQuestion | MultiChoiceDecisionQuestion | PredicateDecisionQuestion | ScoreDecisionQuestion
     ]
+    context_version: InferenceDecideRequestContextVersion | Unset = UNSET
+    contexts: list[str] | Unset = UNSET
     model_identity: str | Unset = UNSET
     input_: str | Unset = UNSET
     inputs: list[DecisionInput] | Unset = UNSET
+    long_document: InferenceDecideLongDocument | Unset = UNSET
     embedding_options: EmbeddingDecisionOptions | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
@@ -66,6 +77,14 @@ class InferenceDecideRequest:
 
             questions.append(questions_item)
 
+        context_version: int | Unset = UNSET
+        if not isinstance(self.context_version, Unset):
+            context_version = self.context_version.value
+
+        contexts: list[str] | Unset = UNSET
+        if not isinstance(self.contexts, Unset):
+            contexts = self.contexts
+
         model_identity = self.model_identity
 
         input_ = self.input_
@@ -76,6 +95,10 @@ class InferenceDecideRequest:
             for inputs_item_data in self.inputs:
                 inputs_item = inputs_item_data.to_dict()
                 inputs.append(inputs_item)
+
+        long_document: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.long_document, Unset):
+            long_document = self.long_document.to_dict()
 
         embedding_options: dict[str, Any] | Unset = UNSET
         if not isinstance(self.embedding_options, Unset):
@@ -89,12 +112,18 @@ class InferenceDecideRequest:
                 "questions": questions,
             }
         )
+        if context_version is not UNSET:
+            field_dict["context_version"] = context_version
+        if contexts is not UNSET:
+            field_dict["contexts"] = contexts
         if model_identity is not UNSET:
             field_dict["model_identity"] = model_identity
         if input_ is not UNSET:
             field_dict["input"] = input_
         if inputs is not UNSET:
             field_dict["inputs"] = inputs
+        if long_document is not UNSET:
+            field_dict["long_document"] = long_document
         if embedding_options is not UNSET:
             field_dict["embedding_options"] = embedding_options
 
@@ -105,6 +134,7 @@ class InferenceDecideRequest:
         from ..models.choice_decision_question import ChoiceDecisionQuestion
         from ..models.decision_input import DecisionInput
         from ..models.embedding_decision_options import EmbeddingDecisionOptions
+        from ..models.inference_decide_long_document import InferenceDecideLongDocument
         from ..models.multi_choice_decision_question import MultiChoiceDecisionQuestion
         from ..models.predicate_decision_question import PredicateDecisionQuestion
         from ..models.score_decision_question import ScoreDecisionQuestion
@@ -155,6 +185,15 @@ class InferenceDecideRequest:
 
             questions.append(questions_item)
 
+        _context_version = d.pop("context_version", UNSET)
+        context_version: InferenceDecideRequestContextVersion | Unset
+        if isinstance(_context_version, Unset):
+            context_version = UNSET
+        else:
+            context_version = InferenceDecideRequestContextVersion(_context_version)
+
+        contexts = cast(list[str], d.pop("contexts", UNSET))
+
         model_identity = d.pop("model_identity", UNSET)
 
         input_ = d.pop("input", UNSET)
@@ -168,6 +207,13 @@ class InferenceDecideRequest:
 
                 inputs.append(inputs_item)
 
+        _long_document = d.pop("long_document", UNSET)
+        long_document: InferenceDecideLongDocument | Unset
+        if isinstance(_long_document, Unset):
+            long_document = UNSET
+        else:
+            long_document = InferenceDecideLongDocument.from_dict(_long_document)
+
         _embedding_options = d.pop("embedding_options", UNSET)
         embedding_options: EmbeddingDecisionOptions | Unset
         if isinstance(_embedding_options, Unset):
@@ -178,9 +224,12 @@ class InferenceDecideRequest:
         inference_decide_request = cls(
             model=model,
             questions=questions,
+            context_version=context_version,
+            contexts=contexts,
             model_identity=model_identity,
             input_=input_,
             inputs=inputs,
+            long_document=long_document,
             embedding_options=embedding_options,
         )
 

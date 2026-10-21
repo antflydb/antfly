@@ -61,8 +61,8 @@ pub const EmbeddedInferenceProviderLifetime = struct {
     handle: *anyopaque,
     // Owns the resource-budget capability `createEmbeddedInferenceNode`
     // configures on `handle`; released by `destroyEmbeddedInferenceNode`
-    // after the node itself is torn down. Null only if configuration failed
-    // (`create()` still succeeded and the node is otherwise usable).
+    // after the node itself is torn down. Production construction either
+    // configures this owner successfully or fails the open.
     resource_owner: ?*LiteInferenceResourceOwner = null,
     // Admission and borrower count share one modification order. A separate
     // accepting flag and counter would leave a check/increment window where
@@ -138,12 +138,8 @@ pub const EmbeddedInferenceProviderLifetime = struct {
 ///
 /// `io` must outlive the returned node; destroy it with
 /// `destroyEmbeddedInferenceNode` before releasing `io`.
-/// Result of `createEmbeddedInferenceNode`: the opaque node handle plus the
-/// resource-budget owner `configureLiteInferenceResourceBudget` installed on
-/// it (null only if that configuration step itself failed; the node is still
-/// usable, but every provider call will fail with the same
-/// `ResourceOwnerNotConfigured`-class error a caller reached before this
-/// existed).
+/// Construction returns a node with its resource-budget owner configured, or
+/// fails and destroys the partial node. No unusable runtime escapes an open.
 /// Explicit resource-budget overrides for `createEmbeddedInferenceNode`, 0
 /// meaning automatic/host-detected sizing. These mirror the CLI's
 /// `--inference-host-budget-mb`/`--inference-backend-budget-mb`/
@@ -191,9 +187,6 @@ const default_scratch_budget_mb: u32 = 16384;
 pub const EmbeddedInferenceNode = struct {
     handle: *anyopaque,
     resource_owner: ?*LiteInferenceResourceOwner,
-    /// Why `resource_owner` is null: the runtime started but cannot serve
-    /// calls, for example because its worker process failed to start.
-    configure_error: ?anyerror = null,
     // The process-memory envelope this node actually resolved -- either the
     // caller's explicit `process_memory_budget_mb` override or, when that is
     // 0 (the default), the same host/cgroup-detected policy
@@ -317,10 +310,10 @@ pub fn createEmbeddedInferenceNode(
         .has_max_loaded_models = 1,
         .content_security_json = .{},
         .s3_credentials_json = .{},
-        // libantfly runs inside the caller's program, which it cannot kill
-        // and restart like a worker, so every backend runs in-process; see
-        // execution_control.allowUninterruptibleInProcess.
-        .runtime_config_json = inference_bridge.String.init("{\"process_isolation\":false}"),
+        // Embedded callers own their process and accept cooperative cancellation
+        // around native calls. This policy is local to this runtime.
+        .execution_host = .embedded,
+        .runtime_config_json = inference_bridge.String.init("{}"),
         .executor = .init(&borrowed_io),
         .out_handle = &out_handle,
     };
@@ -354,19 +347,11 @@ pub fn createEmbeddedInferenceNode(
     // a multi-tenant server, so unconditional admission is the correct
     // policy, matching "antfly inference run"'s own local/host-owned default
     // when no external resource policy is configured.
-    var configure_error: ?anyerror = null;
-    const resource_owner = configureLiteInferenceResourceBudget(handle) catch |err| blk: {
-        std.log.warn(
-            "lite embedded inference resource budget configuration failed, provider calls will fail: {s}",
-            .{@errorName(err)},
-        );
-        configure_error = err;
-        break :blk null;
-    };
+    errdefer destroyEmbeddedInferenceNode(handle, null);
+    const resource_owner = try configureLiteInferenceResourceBudget(handle);
     return .{
         .handle = handle,
         .resource_owner = resource_owner,
-        .configure_error = configure_error,
         .process_memory_limit_bytes = process_memory_resolution.limit_bytes,
         .process_memory_limit_source = process_memory_resolution.effective_source,
         .host_budget_mb = effective_host_budget_mb,
@@ -497,17 +482,9 @@ fn observeLiteInferenceTokenizerCache(context: *anyopaque, observer_id: usize, p
 fn configureLiteInferenceResourceBudget(handle: *anyopaque) !*LiteInferenceResourceOwner {
     const owner = try std.heap.c_allocator.create(LiteInferenceResourceOwner);
     owner.* = .{};
-    // `Client.configure` (pkg/inference/src/host/worker.zig) calls
-    // `retain_context` -- and sets its own `self.budget` field to point at
-    // `owner` -- *before* it can fail (for example the `ensureWorker`
-    // failure this catches at the call site below): a failure after that
-    // point still leaves the client holding a retained reference it will
-    // release exactly once, whenever it deinits. Unconditionally destroying
-    // `owner` here on any error would be a use-after-free/double-free the
-    // instant that later release runs. `releaseBaseReference` is the
-    // correct unwind either way: it only frees `owner` once every retained
-    // reference -- ours here, and the client's if it got far enough to take
-    // one -- has been released.
+    // Configuration may retain this context before a later step fails. Drop
+    // only our base reference on error; node destruction releases any retained
+    // reference after its borrowers have drained.
     errdefer owner.releaseBaseReference();
     var budget = inference_bridge.ResourceBudget{
         .abi_version = inference_bridge.abi_version,
@@ -534,6 +511,15 @@ fn configureLiteInferenceResourceBudget(handle: *anyopaque) !*LiteInferenceResou
         if (!status.isOk()) return inference_bridge.errorFromStatus(status);
     }
     return owner;
+}
+
+pub fn embeddedMemoryAdmissionStats(handle: *anyopaque) !inference_bridge.MemoryAdmissionStats {
+    if (comptime inline_inference_codegen) return inference_host.impl.linkedInferenceMemoryAdmissionStats(handle);
+    var out: inference_bridge.MemoryAdmissionStats = .{};
+    const table = try linkedInferenceApi(inference_bridge.Capability.memory_admission);
+    const status = (table.memory_admission_stats orelse return error.UnsupportedOperation)(handle, &out);
+    if (!status.isOk()) return inference_bridge.errorFromStatus(status);
+    return out;
 }
 
 pub fn inferenceBoundaryProvider(lifetime: *EmbeddedInferenceProviderLifetime) inference.managed_embedder.AntflyProvider {
@@ -784,11 +770,23 @@ pub fn optionalOwnedInferenceConnectionBytes(
 }
 
 pub fn invokeLocalInferenceConnectionFallible(context: *const inference_connection_abi.InvokeContext) !void {
-    return invokeLocalInferenceRoute(context, .post);
+    return invokeLocalInferenceRoute(context, context.method);
 }
 
 /// Dispatches `<method> /ai/v1/<operation>` to the runtime's HTTP handlers
 /// in memory. POST sends `context.body` as JSON; GET sends no body.
+fn inferenceRouteMatches(pattern: []const u8, path: []const u8) bool {
+    var expected = std.mem.splitScalar(u8, pattern, '/');
+    var actual = std.mem.splitScalar(u8, path, '/');
+    while (expected.next()) |segment| {
+        const value = actual.next() orelse return false;
+        if (std.mem.startsWith(u8, segment, ":") or std.mem.startsWith(u8, segment, "{")) {
+            if (value.len == 0) return false;
+        } else if (!std.mem.eql(u8, segment, value)) return false;
+    }
+    return actual.next() == null;
+}
+
 fn invokeLocalInferenceRoute(
     context: *const inference_connection_abi.InvokeContext,
     method: runtime_http_abi.HttpMethod,
@@ -823,7 +821,7 @@ fn invokeLocalInferenceRoute(
         if (!status.isOk()) return inference_bridge.errorFromStatus(status);
     }
 
-    const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ inference_bridge.ai_api_prefix, operation });
+    const path = if (std.mem.startsWith(u8, operation, "ml/")) try std.fmt.allocPrint(alloc, "/ml/v1/{s}", .{operation[3..]}) else try std.fmt.allocPrint(alloc, "{s}/{s}", .{ inference_bridge.ai_api_prefix, operation });
     defer alloc.free(path);
     const interactive_generate = isInteractiveGeneratePath(path);
     if (interactive_generate)
@@ -833,31 +831,46 @@ fn invokeLocalInferenceRoute(
             _ = enrichment_types.interactive_generate_inflight.fetchSub(1, .monotonic);
     }
     const entries = if (entries_ptr) |ptr| ptr[0..entries_len] else &.{};
-    const route_handle = for (entries) |entry| {
-        if (entry.method == method and std.mem.eql(u8, entry.path.slice(), path))
-            break entry.route_handle;
+    const matched_route = for (entries) |entry| {
+        if (entry.method == method and inferenceRouteMatches(entry.path.slice(), path))
+            break entry;
     } else return error.UnsupportedInferenceOperation;
 
+    var params: std.ArrayList(runtime_http_abi.RouteParamView) = .empty;
+    defer params.deinit(alloc);
+    var pattern_segments = std.mem.splitScalar(u8, matched_route.path.slice(), '/');
+    var path_segments = std.mem.splitScalar(u8, path, '/');
+    while (pattern_segments.next()) |segment| {
+        const value = path_segments.next().?;
+        const name = if (std.mem.startsWith(u8, segment, ":")) segment[1..] else if (std.mem.startsWith(u8, segment, "{") and std.mem.endsWith(u8, segment, "}")) segment[1 .. segment.len - 1] else continue;
+        try params.append(alloc, .{ .name = .init(name), .value = .init(value) });
+    }
+
+    const content_type = context.content_type.slice() orelse "application/json";
     const headers = [_]runtime_http_abi.HeaderView{.{
         .name = runtime_http_abi.Bytes.init("Content-Type"),
-        .value = runtime_http_abi.Bytes.init("application/json"),
+        .value = runtime_http_abi.Bytes.init(content_type),
     }};
     const has_body = method != .get;
     const request = runtime_http_abi.HttpRequestView{
         .method = method,
         .path = runtime_http_abi.Bytes.init(path),
+        .query = context.query,
+        .params_ptr = params.items.ptr,
+        .params_len = params.items.len,
         .headers_ptr = if (has_body) &headers else null,
         .headers_len = if (has_body) headers.len else 0,
-        .body = if (has_body) runtime_http_abi.OptionalBytes.init(body) else .{},
-        .content_type = if (has_body) runtime_http_abi.OptionalBytes.init("application/json") else .{},
+        .body = if (has_body and context.body_source.read == null) runtime_http_abi.OptionalBytes.init(body) else .{},
+        .content_type = if (has_body) runtime_http_abi.OptionalBytes.init(content_type) else .{},
     };
     var response_handle: ?*anyopaque = null;
     var response_view: runtime_http_abi.HttpResponseView = undefined;
     const handle_context = inference_bridge.HttpHandleContext{
         .abi_version = inference_bridge.abi_version,
-        .route_handle = route_handle,
+        .route_handle = matched_route.route_handle,
         .request = &request,
         .cancellation = lifetime.cancellation(),
+        .body_source = context.body_source,
         .stream = context.stream,
         .out_response_handle = &response_handle,
         .out_response = &response_view,
@@ -1484,7 +1497,7 @@ pub fn inferenceProviderChunkInputControlled(
     cancellation: CancellationToken,
 ) anyerror![]inference_chunker.Chunk {
     return switch (input) {
-        .text => try invokeInferenceProviderControlled([]inference_chunker.Chunk, alloc, handle, .chunk_input, .{
+        .text, .source => try invokeInferenceProviderControlled([]inference_chunker.Chunk, alloc, handle, .chunk_input, .{
             .model = model,
             .input = input,
             .config = config,

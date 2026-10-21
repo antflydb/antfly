@@ -1,0 +1,33 @@
+{
+  "entries": [
+    {"expression":"7 BETWEEN SYMMETRIC 9 AND 2","expected":true},
+    {"expression":"7 NOT BETWEEN SYMMETRIC 9 AND 2","expected":false},
+    {"expression":"7 BETWEEN ASYMMETRIC 9 AND 2","expected":false},
+    {"expression":"7 NOT BETWEEN ASYMMETRIC 9 AND 2","expected":true},
+    {"expression":"2 BETWEEN SYMMETRIC 9 AND 2","expected":true},
+    {"expression":"9 BETWEEN SYMMETRIC 9 AND 2","expected":true},
+    {"expression":"10 BETWEEN SYMMETRIC 9 AND 2","expected":false},
+    {"expression":"NULL BETWEEN SYMMETRIC 9 AND 2","expected":null},
+    {"expression":"7 BETWEEN SYMMETRIC NULL AND 2","expected":null},
+    {"expression":"7 BETWEEN SYMMETRIC 9 AND NULL","expected":null},
+    {"expression":"7 NOT BETWEEN SYMMETRIC NULL AND 2","expected":null},
+    {"expression":"0 BETWEEN ASYMMETRIC 1 AND NULL","expected":false},
+    {"expression":"0 NOT BETWEEN ASYMMETRIC 1 AND NULL","expected":true},
+    {"expression":"2 BETWEEN ASYMMETRIC 1 AND NULL","expected":null},
+    {"expression":"7 BETWEEN SYMMETRIC 9 AND 2 AND FALSE","expected":false},
+    {"expression":"FALSE OR 7 BETWEEN SYMMETRIC 9 AND 2","expected":true},
+    {"expression":"'b' BETWEEN SYMMETRIC 'z' AND 'a'","expected":true},
+    {"expression":"9007199254740993 BETWEEN SYMMETRIC 9007199254740994 AND 9007199254740992","expected":true},
+    {"expression":"TRUE IS UNKNOWN","expected":false},
+    {"expression":"FALSE IS UNKNOWN","expected":false},
+    {"expression":"NULL IS UNKNOWN","expected":true},
+    {"expression":"TRUE IS NOT UNKNOWN","expected":true},
+    {"expression":"FALSE IS NOT UNKNOWN","expected":true},
+    {"expression":"NULL IS NOT UNKNOWN","expected":false},
+    {"expression":"(NULL::boolean AND FALSE) IS UNKNOWN","expected":false},
+    {"expression":"(NULL::boolean OR FALSE) IS UNKNOWN","expected":true},
+    {"expression":"(NULL BETWEEN SYMMETRIC 1 AND 2) IS UNKNOWN","expected":true},
+    {"expression":"(1 BETWEEN ASYMMETRIC 2 AND NULL) IS NOT UNKNOWN","expected":true}
+  ],
+  "type_errors": ["1 IS UNKNOWN", "'null'::jsonb IS UNKNOWN", "1 IS NOT UNKNOWN"]
+}

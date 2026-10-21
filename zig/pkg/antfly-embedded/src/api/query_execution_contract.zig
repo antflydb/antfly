@@ -3301,6 +3301,12 @@ pub fn encodeQueryRequestWithGraphWireMode(
     {
         try appendQueryHierarchyField(alloc, &out, &first, req);
     }
+    if (!std.meta.eql(req.value_search_execution, @import("../search/value_query.zig").Policy{})) {
+        try appendJsonFieldName(alloc, &out, &first, "execution");
+        const policy_json = try std.json.Stringify.valueAlloc(alloc, .{ .value_verification = req.value_search_execution }, .{});
+        defer alloc.free(policy_json);
+        try out.appendSlice(alloc, policy_json);
+    }
     if (req.limit != 10) {
         try appendJsonFieldU32(alloc, &out, &first, "limit", req.limit);
     }
@@ -3310,6 +3316,12 @@ pub fn encodeQueryRequestWithGraphWireMode(
     if (req.order_by.len > 0) try appendQueryOrderByField(alloc, &out, &first, req.order_by);
     if (req.search_after.len > 0) try appendQueryCursorField(alloc, &out, &first, "search_after", req.search_after);
     if (req.search_before.len > 0) try appendQueryCursorField(alloc, &out, &first, "search_before", req.search_before);
+    if (req.document_authority_mode != .none) {
+        try appendJsonFieldName(alloc, &out, &first, "_document_authority");
+        const encoded = try std.json.Stringify.valueAlloc(alloc, .{ .mode = req.document_authority_mode, .group = req.document_authority_group, .defer_stored_projection = req.defer_stored_projection }, .{});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+    }
     if (req.native_query_cut) |cut| {
         try appendJsonFieldName(alloc, &out, &first, "_native_cut");
         const encoded = try std.json.Stringify.valueAlloc(alloc, cut.forDeadline(req.execution_deadline_ns), .{});
@@ -3507,6 +3519,7 @@ pub const StorageKernelLookupWireRequest = struct {
     relational_integrity_jobs_json: []const u8 = "",
     relational_activation_json: []const u8 = "",
     relational_index_status_json: []const u8 = "",
+    group_source_query_json: []const u8 = "",
     relational_topology_json: []const u8 = "",
 
     pub fn options(self: StorageKernelLookupWireRequest) db_mod.types.LookupOptions {
@@ -3524,6 +3537,7 @@ pub const StorageKernelLookupWireRequest = struct {
             .relational_integrity_jobs_json = self.relational_integrity_jobs_json,
             .relational_activation_json = self.relational_activation_json,
             .relational_index_status_json = self.relational_index_status_json,
+            .group_source_query_json = self.group_source_query_json,
             .relational_topology_json = self.relational_topology_json,
         };
     }
@@ -3541,7 +3555,7 @@ pub const StorageKernelLookupWireRequest = struct {
 };
 
 pub fn integrityLookupMode(opts: db_mod.types.LookupOptions) bool {
-    return opts.row_policy_receipt != null or opts.relational_integrity_catalog or opts.relational_integrity_action or opts.relational_integrity_jobs_json.len != 0 or opts.relational_index_status_json.len != 0 or opts.relational_activation_json.len != 0 or opts.relational_topology_json.len != 0;
+    return opts.group_source_query_json.len != 0 or opts.row_policy_receipt != null or opts.relational_integrity_catalog or opts.relational_integrity_action or opts.relational_integrity_jobs_json.len != 0 or opts.relational_index_status_json.len != 0 or opts.relational_activation_json.len != 0 or opts.relational_topology_json.len != 0;
 }
 
 test "compiled lookup wire preserves binary scope and every integrity control" {
@@ -3608,6 +3622,7 @@ pub fn encodeStorageKernelLookupRequest(
         .relational_integrity_jobs_json = opts.relational_integrity_jobs_json,
         .relational_activation_json = opts.relational_activation_json,
         .relational_index_status_json = opts.relational_index_status_json,
+        .group_source_query_json = opts.group_source_query_json,
         .relational_topology_json = opts.relational_topology_json,
     }, .{});
 }
@@ -4338,6 +4353,25 @@ pub fn appendTextQueryValue(
 ) !void {
     switch (query) {
         .match_all => try out.appendSlice(alloc, "{\"match_all\":{}}"),
+        .value => |v| {
+            try out.appendSlice(alloc, "{");
+            try appendJsonString(alloc, out, @tagName(v.kind));
+            try out.appendSlice(alloc, ":");
+            try appendJsonString(alloc, out, v.text);
+            try out.appendSlice(alloc, ",\"field\":");
+            try appendJsonString(alloc, out, v.field);
+            try out.appendSlice(alloc, if (v.case_sensitive) ",\"case_sensitive\":true" else ",\"case_sensitive\":false");
+            try appendTextQueryBoost(alloc, out, v.boost);
+            try out.appendSlice(alloc, "}");
+        },
+        .autocomplete => |v| {
+            try out.appendSlice(alloc, "{\"autocomplete\":");
+            try appendJsonString(alloc, out, v.text);
+            try out.appendSlice(alloc, ",\"field\":");
+            try appendJsonString(alloc, out, v.field);
+            try appendTextQueryBoost(alloc, out, v.boost);
+            try out.appendSlice(alloc, "}");
+        },
         .match_none => try out.appendSlice(alloc, "{\"match_none\":{}}"),
         .phrase => |phrase| try appendPhraseTextQueryValue(alloc, out, phrase),
         .multi_phrase => |phrase| try appendMultiPhraseTextQueryValue(alloc, out, phrase),
@@ -4747,43 +4781,274 @@ pub fn parseRemoteSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_m
     };
 }
 
-pub fn parseRemoteSearchResultInner(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {
-    var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, alloc, body, .{});
-    defer parsed.deinit();
-    const responses = parsed.value.responses orelse return error.InvalidQueryRequest;
-    if (responses.len == 0) return error.InvalidQueryRequest;
-    const response = responses[0];
-    const hits_obj = response.hits orelse return error.InvalidQueryRequest;
-    const total_obj = hits_obj.total orelse return error.InvalidQueryRequest;
-    const hits_value = hits_obj.hits orelse return error.InvalidQueryRequest;
-    const total_hits = try query_contract.queryHitsTotalValueToU32(total_obj);
-    const total_hits_relation = try query_contract.parseTotalHitsRelation(total_obj.relation);
+// Metadata stays in an envelope arena; one hit's temporary values are retired
+// before reading the next. Source objects are validated and copied as raw JSON,
+// without constructing their values or serializing them a second time.
+fn expectScanner(scanner: *std.json.Scanner, token: std.json.TokenType) !void {
+    if (try scanner.peekNextTokenType() != token) return error.UnexpectedToken;
+    _ = try scanner.next();
+}
+fn rawObjectSource(alloc: std.mem.Allocator, workspace: *@import("antfly-json").ValueScanner, scanner: *std.json.Scanner, options: std.json.ParseOptions) !?[]u8 {
+    const raw = (try rawObjectSourceRange(workspace, scanner, options, null)) orelse return null;
+    return try alloc.dupe(u8, raw);
+}
+fn rawObjectSourceRange(workspace: *@import("antfly-json").ValueScanner, scanner: *std.json.Scanner, options: std.json.ParseOptions, observer: ?@import("antfly-json").MemberObserver) !?[]const u8 {
+    var start = scanner.*.cursor;
+    while (start < scanner.*.input.len and (std.ascii.isWhitespace(scanner.*.input[start]) or scanner.*.input[start] == ':')) : (start += 1) {}
+    if (try scanner.*.peekNextTokenType() == .null) {
+        _ = try scanner.*.next();
+        return null;
+    }
+    if (try scanner.peekNextTokenType() != .object_begin) return error.UnexpectedToken;
+    try workspace.scan(scanner, options.max_value_len orelse scanner.input.len, observer);
+    return scanner.input[start..scanner.cursor];
+}
 
-    const hits = try alloc.alloc(db_mod.types.SearchHit, hits_value.len);
-    var initialized: usize = 0;
+const RemoteSearchParser = struct {
+    authority_group: ?u64 = null,
+    // Borrow ranges until capability metadata has been checked. Old providers
+    // may put arbitrary user documents in _source; never interpret them early.
+    pending_sources: std.ArrayListUnmanaged(?db_mod.types.document_authority.Pending) = .empty,
+    source_workspace: @import("antfly-json").ValueScanner,
+    alloc: std.mem.Allocator,
+    scanner: std.json.Scanner,
+    metadata: std.heap.ArenaAllocator,
+    scratch: std.heap.ArenaAllocator,
+    options: std.json.ParseOptions,
+    hits: std.ArrayListUnmanaged(db_mod.types.SearchHit) = .empty,
+    rows_seen: bool = false,
+    graph_results: ?[]db_mod.types.GraphSearchResult = null,
+    fn deinit(self: *@This()) void {
+        self.pending_sources.deinit(self.alloc);
+        self.source_workspace.deinit();
+        if (self.graph_results) |results| {
+            for (results) |*result| result.deinit(self.alloc);
+            self.alloc.free(results);
+        }
+        for (self.hits.items) |*hit| hit.deinit(self.alloc);
+        self.hits.deinit(self.alloc);
+        self.scanner.deinit();
+        self.scratch.deinit();
+        self.metadata.deinit();
+    }
+    fn expect(self: *@This(), token: std.json.TokenType) !void {
+        if (try self.scanner.peekNextTokenType() != token) return error.UnexpectedToken;
+        _ = try self.scanner.next();
+    }
+    fn read(self: *@This(), comptime T: type, alloc: std.mem.Allocator) !T {
+        return std.json.innerParse(T, alloc, &self.scanner, self.options);
+    }
+    fn key(self: *@This(), alloc: std.mem.Allocator) !?[]const u8 {
+        if (try self.scanner.peekNextTokenType() == .object_end) {
+            _ = try self.scanner.next();
+            return null;
+        }
+        return try self.read([]const u8, alloc);
+    }
+    fn index(comptime T: type, name: []const u8, seen: *u64) !usize {
+        inline for (@typeInfo(T).@"struct".field_names, 0..) |field, i| if (std.mem.eql(u8, name, field)) {
+            const bit = @as(u64, 1) << i;
+            if (seen.* & bit != 0) return error.DuplicateField;
+            seen.* |= bit;
+            return i;
+        };
+        return error.UnknownField;
+    }
+    fn member(self: *@This(), comptime T: type, target: *T, i: usize, alloc: std.mem.Allocator) !void {
+        inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types, 0..) |field, Field, at| if (i == at) {
+            @field(target.*, field) = try self.read(Field, alloc);
+            return;
+        };
+        unreachable;
+    }
+    fn required(comptime T: type, field: []const u8, seen: u64) bool {
+        inline for (@typeInfo(T).@"struct".field_names, 0..) |name, i| if (std.mem.eql(u8, field, name)) return seen & (@as(u64, 1) << i) != 0;
+        unreachable;
+    }
+    fn source(self: *@This()) !?[]u8 {
+        return rawObjectSource(self.alloc, &self.source_workspace, &self.scanner, self.options);
+    }
+    fn row(self: *@This()) !db_mod.types.SearchHit {
+        if (!self.scratch.reset(.{ .retain_with_limit = 256 * 1024 })) _ = self.scratch.reset(.free_all);
+        const a = self.scratch.allocator();
+        try self.expect(.object_begin);
+        var wire: metadata_openapi.QueryHit = .{ ._id = "", ._score = 0 };
+        var stored: ?[]u8 = null;
+        var pending: ?db_mod.types.document_authority.Pending = null;
+        errdefer if (stored) |value| self.alloc.free(value);
+        var seen: u64 = 0;
+        while (try self.key(a)) |name| {
+            const i = try index(metadata_openapi.QueryHit, name, &seen);
+            if (std.mem.eql(u8, name, "_source")) {
+                if (self.authority_group != null) {
+                    var captured: db_mod.types.document_authority.Pending = .{};
+                    if (try rawObjectSourceRange(&self.source_workspace, &self.scanner, self.options, .{ .ctx = &captured, .member_fn = db_mod.types.document_authority.Pending.observe }) != null) pending = captured;
+                } else stored = try self.source();
+            } else try self.member(metadata_openapi.QueryHit, &wire, i, a);
+        }
+        if (!required(metadata_openapi.QueryHit, "_id", seen) or !required(metadata_openapi.QueryHit, "_score", seen)) return error.MissingField;
+        var hit: db_mod.types.SearchHit = .{ .id = try self.alloc.dupe(u8, wire._id) };
+        errdefer hit.deinit(self.alloc);
+        hit.score = wire._score;
+        hit.score_details = try parseRemoteGraphMetricRerankScoreDetails(self.alloc, wire._score_details);
+        hit.distance = wire._distance;
+        hit.index_scores = try parseRemoteIndexScoresAlloc(self.alloc, wire._index_scores);
+        hit.sort_values = try db_mod.types.cloneJsonValues(self.alloc, wire._sort orelse &.{});
+        hit.ancestor_source_data = try remoteHierarchyAncestorDocumentAlloc(self.alloc, wire.hierarchy, .source);
+        hit.ancestor_unit_data = try remoteHierarchyAncestorDocumentAlloc(self.alloc, wire.hierarchy, .unit);
+        hit.artifact_ref = try parseRemoteHierarchyArtifactRefAlloc(self.alloc, wire.hierarchy);
+        hit.chunk_hits = try parseRemoteHierarchyMatchesAlloc(self.alloc, wire.hierarchy);
+        hit.highlights = try parseRemoteHighlightsAlloc(self.alloc, wire._highlights);
+        if (self.authority_group != null) try self.pending_sources.append(self.alloc, pending);
+        hit.stored_data = stored;
+        stored = null;
+        return hit;
+    }
+    fn rows(self: *@This()) !void {
+        if (try self.scanner.peekNextTokenType() == .null) {
+            _ = try self.scanner.next();
+            return;
+        }
+        try self.expect(.array_begin);
+        self.rows_seen = true;
+        while (try self.scanner.peekNextTokenType() != .array_end) {
+            try self.hits.ensureUnusedCapacity(self.alloc, 1);
+            self.hits.appendAssumeCapacity(try self.row());
+        }
+        try self.expect(.array_end);
+    }
+    fn hitEnvelope(self: *@This()) !?metadata_openapi.QueryHits {
+        if (try self.scanner.peekNextTokenType() == .null) {
+            _ = try self.scanner.next();
+            return null;
+        }
+        try self.expect(.object_begin);
+        var wire: metadata_openapi.QueryHits = .{};
+        var seen: u64 = 0;
+        const a = self.metadata.allocator();
+        while (try self.key(a)) |name| {
+            const i = try index(metadata_openapi.QueryHits, name, &seen);
+            if (std.mem.eql(u8, name, "hits")) try self.rows() else try self.member(metadata_openapi.QueryHits, &wire, i, a);
+        }
+        return wire;
+    }
+    fn response(self: *@This()) !metadata_openapi.QueryResult {
+        try self.expect(.object_begin);
+        var wire: metadata_openapi.QueryResult = .{ .took = 0, .status = 0 };
+        var seen: u64 = 0;
+        const a = self.metadata.allocator();
+        while (try self.key(a)) |name| {
+            const i = try index(metadata_openapi.QueryResult, name, &seen);
+            if (std.mem.eql(u8, name, "hits")) wire.hits = try self.hitEnvelope() else if (std.mem.eql(u8, name, "graph_results")) {
+                if (try self.scanner.peekNextTokenType() == .null) {
+                    _ = try self.scanner.next();
+                } else {
+                    var start = self.scanner.cursor;
+                    while (start < self.scanner.input.len and (std.ascii.isWhitespace(self.scanner.input[start]) or self.scanner.input[start] == ':')) : (start += 1) {}
+                    try self.scanner.skipValue();
+                    self.graph_results = try parseRemoteGraphResultsStreaming(self.alloc, self.scratch.child_allocator, self.scanner.input[start..self.scanner.cursor]);
+                }
+            } else try self.member(metadata_openapi.QueryResult, &wire, i, a);
+        }
+        if (!required(metadata_openapi.QueryResult, "took", seen) or !required(metadata_openapi.QueryResult, "status", seen)) return error.MissingField;
+        return wire;
+    }
+    fn root(self: *@This()) !metadata_openapi.QueryResult {
+        try self.expect(.object_begin);
+        var result: ?metadata_openapi.QueryResult = null;
+        var seen: u64 = 0;
+        const a = self.metadata.allocator();
+        while (try self.key(a)) |name| {
+            _ = try index(metadata_openapi.QueryResponses, name, &seen);
+            if (try self.scanner.peekNextTokenType() == .null) {
+                _ = try self.scanner.next();
+                continue;
+            }
+            try self.expect(.array_begin);
+            if (try self.scanner.peekNextTokenType() != .array_end) result = try self.response();
+            while (try self.scanner.peekNextTokenType() != .array_end) {
+                // Preserve validation of later entries; the single-shard
+                // contract still consumes only the first response.
+                _ = try self.read(metadata_openapi.QueryResult, a);
+            }
+            try self.expect(.array_end);
+        }
+        try self.expect(.end_of_document);
+        return result orelse error.InvalidQueryRequest;
+    }
+};
+
+pub fn parseRemoteSearchResultInner(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {
+    return parseRemoteSearchResultInnerWithScratch(alloc, alloc, body);
+}
+
+pub fn parseRemoteSearchResultWithScratch(alloc: std.mem.Allocator, scratch: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {
+    return parseRemoteSearchResultInnerWithScratch(alloc, scratch, body) catch |err| return if (err == error.OutOfMemory) err else error.InvalidRemoteResponse;
+}
+
+fn parseRemoteSearchResultInnerWithScratch(alloc: std.mem.Allocator, scratch: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {
+    return parseRemoteSearchResultOwned(alloc, scratch, body, null, null);
+}
+
+/// Private authenticated transport: decode the proof from wire and copy only
+/// the document range into its final owner, never an intermediate envelope.
+pub fn parseRemoteSearchResultWithAuthority(alloc: std.mem.Allocator, scratch: std.mem.Allocator, body: []const u8, group: u64, document_allocator: ?std.mem.Allocator) !db_mod.types.SearchResult {
+    return parseRemoteSearchResultOwned(alloc, scratch, body, group, document_allocator) catch |err| return if (err == error.OutOfMemory) err else error.InvalidRemoteResponse;
+}
+fn parseRemoteSearchResultOwned(alloc: std.mem.Allocator, scratch: std.mem.Allocator, body: []const u8, authority_group: ?u64, document_allocator: ?std.mem.Allocator) !db_mod.types.SearchResult {
+    var parser: RemoteSearchParser = .{
+        .authority_group = authority_group,
+        .source_workspace = .init(@import("antfly_platform").allocator.reclaimingScratch(scratch)),
+        .alloc = alloc,
+        .scanner = std.json.Scanner.initCompleteInput(scratch, body),
+        .metadata = std.heap.ArenaAllocator.init(scratch),
+        .scratch = std.heap.ArenaAllocator.init(scratch),
+        .options = .{ .allocate = .alloc_if_needed, .max_value_len = body.len },
+    };
+    defer parser.deinit();
+    const response = try parser.root();
+    const envelope = response.hits orelse return error.InvalidQueryRequest;
+    const total = envelope.total orelse return error.InvalidQueryRequest;
+    if (!parser.rows_seen) return error.InvalidQueryRequest;
+    const hits = try parser.hits.toOwnedSlice(alloc);
     errdefer {
-        for (hits[0..initialized]) |*hit| hit.deinit(alloc);
+        for (hits) |*hit| hit.deinit(alloc);
         alloc.free(hits);
     }
-    for (hits_value, 0..) |item, i| {
-        var hit: db_mod.types.SearchHit = .{ .id = try alloc.dupe(u8, item._id) };
-        errdefer hit.deinit(alloc);
-        hit.score = item._score;
-        hit.score_details = try parseRemoteGraphMetricRerankScoreDetails(alloc, item._score_details);
-        hit.distance = item._distance;
-        hit.index_scores = try parseRemoteIndexScoresAlloc(alloc, item._index_scores);
-        hit.sort_values = try db_mod.types.cloneJsonValues(alloc, item._sort orelse &.{});
-        hit.stored_data = if (item._source) |value| try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})}) else null;
-        hit.ancestor_source_data = try remoteHierarchyAncestorDocumentAlloc(alloc, item.hierarchy, .source);
-        hit.ancestor_unit_data = try remoteHierarchyAncestorDocumentAlloc(alloc, item.hierarchy, .unit);
-        hit.artifact_ref = try parseRemoteHierarchyArtifactRefAlloc(alloc, item.hierarchy);
-        hit.chunk_hits = try parseRemoteHierarchyMatchesAlloc(alloc, item.hierarchy);
-        hit.highlights = try parseRemoteHighlightsAlloc(alloc, item._highlights);
-        hits[i] = hit;
-        initialized += 1;
+    const total_hits = try query_contract.queryHitsTotalValueToU32(total);
+    const relation = try query_contract.parseTotalHitsRelation(total.relation);
+    const graphs = parser.graph_results;
+    parser.graph_results = null;
+    var result = try finishRemoteSearchResult(alloc, response, hits, total_hits, relation, graphs);
+    // The outer errdefer owns the hit metadata until return.
+    errdefer {
+        result.hits = &.{};
+        result.deinit();
     }
+    if (authority_group) |group| {
+        if (result.document_authority_version != 1) return result;
+        const body_allocator = document_allocator orelse alloc;
+        // Hit metadata remains covered by the outer errdefer; bodies can have
+        // a different owner and need their own rollback before it executes.
+        errdefer for (hits) |*hit| {
+            if (hit.stored_data) |bytes| body_allocator.free(bytes);
+            hit.stored_data = null;
+        };
+        for (hits, parser.pending_sources.items) |*hit, source| {
+            const authority_envelope = (try (source orelse return error.InvalidRemoteResponse).finish(scratch)) orelse return error.InvalidRemoteResponse;
+            if (authority_envelope.authority.group != group) return error.InvalidRemoteResponse;
+            const proof = try alloc.create(db_mod.types.document_authority.Authority);
+            proof.* = authority_envelope.authority;
+            hit.document_authority = proof;
+            if (authority_envelope.document) |raw| hit.stored_data = try body_allocator.dupe(u8, raw);
+        }
+        result.stored_data_allocator = document_allocator;
+    }
+    return result;
+}
 
-    const graph_results: []db_mod.types.GraphSearchResult = if (response.graph_results) |graph_results_value|
+fn finishRemoteSearchResult(alloc: std.mem.Allocator, response: metadata_openapi.QueryResult, hits: []db_mod.types.SearchHit, total_hits: u32, total_hits_relation: db_mod.types.TotalHitsRelation, streamed_graphs: ?[]db_mod.types.GraphSearchResult) !db_mod.types.SearchResult {
+    const graph_results: []db_mod.types.GraphSearchResult = if (streamed_graphs) |graphs| graphs else if (response.graph_results) |graph_results_value|
         try parseRemoteGraphResults(alloc, graph_results_value)
     else
         @constCast((&[_]db_mod.types.GraphSearchResult{})[0..]);
@@ -4802,11 +5067,6 @@ pub fn parseRemoteSearchResultInner(alloc: std.mem.Allocator, body: []const u8) 
     var graph_metric_rerank_status = try parseRemoteGraphMetricRerankStatus(alloc, response.profile);
     errdefer if (graph_metric_rerank_status) |*status| status.deinit(alloc);
 
-    // The hit errdefer above already owns its cleanup until we return.
-    errdefer {
-        for (graph_results) |*graph_result| graph_result.deinit(alloc);
-        if (graph_results.len > 0) alloc.free(graph_results);
-    }
     var result: db_mod.types.SearchResult = .{
         .alloc = alloc,
         .hits = hits,
@@ -4816,8 +5076,16 @@ pub fn parseRemoteSearchResultInner(alloc: std.mem.Allocator, body: []const u8) 
         .graph_metric_results = graph_metric_results,
         .graph_metric_rerank_status = graph_metric_rerank_status,
     };
+    errdefer if (result.value_search_profile_json) |json| alloc.free(json);
     if (response.profile) |profile| {
         if (profile != .object) return error.InvalidRemoteResponse;
+        if (profile.object.get("document_authority_version")) |version| {
+            if (version != .integer or version.integer != 1) return error.InvalidRemoteResponse;
+            result.document_authority_version = 1;
+        }
+        if (profile.object.get("value_verification")) |value| {
+            result.value_search_profile_json = try std.json.Stringify.valueAlloc(alloc, value, .{});
+        }
         if (profile.object.get("sort")) |value| {
             if (value != .null) {
                 var sort = try std.json.parseFromValue(metadata_openapi.SortProfile, alloc, value, .{ .ignore_unknown_fields = true });
@@ -4854,6 +5122,26 @@ fn remoteSortProfile(wire: metadata_openapi.SortProfile) !db_mod.types.SortProfi
 
 pub fn parseStorageKernelSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {
     return try parseRemoteSearchResult(alloc, body);
+}
+
+/// Decode private sources only for an admitted internal request. Both HTTP
+/// workers and compiled storage owners serialize the same authority envelope.
+pub fn restoreDocumentAuthority(alloc: std.mem.Allocator, scratch: std.mem.Allocator, group_id: u64, mode: db_mod.types.document_authority.Mode, result: *db_mod.types.SearchResult) !void {
+    if (mode == .none) return;
+    if (result.document_authority_version != 1) return error.StorageReadTemporarilyUnavailable;
+    for (result.hits) |*hit| {
+        if (hit.document_authority != null) return error.InvalidRemoteResponse;
+        const bytes = hit.stored_data orelse return error.InvalidRemoteResponse;
+        const envelope = (try db_mod.types.document_authority.parse(scratch, bytes)) orelse return error.InvalidRemoteResponse;
+        if (envelope.authority.group != group_id or (mode == .hydrate and envelope.document == null)) return error.InvalidRemoteResponse;
+        const proof = try alloc.create(db_mod.types.document_authority.Authority);
+        proof.* = envelope.authority;
+        errdefer alloc.destroy(proof);
+        const document = if (envelope.document) |raw| try alloc.dupe(u8, raw) else null;
+        alloc.free(bytes);
+        hit.stored_data = document;
+        hit.document_authority = proof;
+    }
 }
 
 pub fn parseRemoteHierarchyMatchesAlloc(
@@ -5028,6 +5316,220 @@ pub fn parseRemoteIndexScoresAlloc(
     return trimmed;
 }
 
+// Scan the envelope once for field spans. Payload arrays are then decoded
+// one item at a time, preserving strict discriminator/field validation and
+// bounding temporary typed values independently of final result size.
+fn remoteValueSpan(scanner: *std.json.Scanner) ![]const u8 {
+    var start = scanner.cursor;
+    while (start < scanner.input.len and (std.ascii.isWhitespace(scanner.input[start]) or scanner.input[start] == ':')) : (start += 1) {}
+    try scanner.skipValue();
+    return scanner.input[start..scanner.cursor];
+}
+fn parseRemoteGraphResultsStreaming(alloc: std.mem.Allocator, scratch: std.mem.Allocator, body: []const u8) ![]db_mod.types.GraphSearchResult {
+    var arena = std.heap.ArenaAllocator.init(scratch);
+    defer arena.deinit();
+    var scanner = std.json.Scanner.initCompleteInput(scratch, body);
+    defer scanner.deinit();
+    const options: std.json.ParseOptions = .{ .allocate = .alloc_if_needed, .max_value_len = body.len };
+    if (try scanner.next() != .object_begin) return error.InvalidRemoteResponse;
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(arena.allocator());
+    var results = std.ArrayListUnmanaged(db_mod.types.GraphSearchResult).empty;
+    errdefer {
+        for (results.items) |*result| result.deinit(alloc);
+        results.deinit(alloc);
+    }
+    while (try scanner.peekNextTokenType() != .object_end) {
+        if (results.items.len >= graph_query_mod.max_named_queries) return error.InvalidRemoteResponse;
+        const name = try std.json.innerParse([]const u8, arena.allocator(), &scanner, options);
+        if (!graph_query_mod.isValidQueryName(name)) return error.InvalidRemoteResponse;
+        if ((try seen.getOrPut(arena.allocator(), name)).found_existing) return error.DuplicateField;
+        try results.ensureUnusedCapacity(alloc, 1);
+        results.appendAssumeCapacity(try parseRemoteGraphResultStreaming(alloc, scratch, name, try remoteValueSpan(&scanner)));
+    }
+    _ = try scanner.next();
+    if (try scanner.next() != .end_of_document) return error.InvalidRemoteResponse;
+    return results.toOwnedSlice(alloc);
+}
+fn parseRemoteGraphNodeStreaming(alloc: std.mem.Allocator, scratch: *std.heap.ArenaAllocator, workspace: *@import("antfly-json").ValueScanner, scanner: *std.json.Scanner, options: std.json.ParseOptions) !struct { node: indexes_openapi.GraphResultNode, document: ?[]u8 } {
+    try expectScanner(scanner, .object_begin);
+    var wire: indexes_openapi.GraphResultNode = .{ .key = "", .depth = 0 };
+    var document: ?[]u8 = null;
+    errdefer if (document) |bytes| alloc.free(bytes);
+    var seen: u64 = 0;
+    while (try scanner.peekNextTokenType() != .object_end) {
+        const name = try std.json.innerParse([]const u8, scratch.allocator(), scanner, options);
+        const index = try RemoteSearchParser.index(indexes_openapi.GraphResultNode, name, &seen);
+        if (std.mem.eql(u8, name, "document")) {
+            document = try rawObjectSource(alloc, workspace, scanner, options);
+        } else {
+            inline for (@typeInfo(indexes_openapi.GraphResultNode).@"struct".field_names, @typeInfo(indexes_openapi.GraphResultNode).@"struct".field_types, 0..) |field, Field, i| {
+                if (i == index) @field(wire, field) = try std.json.innerParse(Field, scratch.allocator(), scanner, options);
+            }
+        }
+    }
+    _ = try scanner.next();
+    if (!RemoteSearchParser.required(indexes_openapi.GraphResultNode, "key", seen) or !RemoteSearchParser.required(indexes_openapi.GraphResultNode, "depth", seen)) return error.MissingField;
+    return .{ .node = wire, .document = document };
+}
+fn parseRemoteGraphResultStreaming(alloc: std.mem.Allocator, scratch: std.mem.Allocator, name: []const u8, body: []const u8) !db_mod.types.GraphSearchResult {
+    var envelope_arena = std.heap.ArenaAllocator.init(scratch);
+    defer envelope_arena.deinit();
+    const a = envelope_arena.allocator();
+    var scanner = std.json.Scanner.initCompleteInput(scratch, body);
+    defer scanner.deinit();
+    if (try scanner.next() != .object_begin) return error.InvalidRemoteResponse;
+    const fields = .{ "kind", "nodes", "paths", "rows", "aggregates", "metric_status", "stats", "computed" };
+    var spans: [fields.len]?[]const u8 = @splat(null);
+    const options: std.json.ParseOptions = .{ .allocate = .alloc_if_needed, .max_value_len = body.len };
+    while (try scanner.peekNextTokenType() != .object_end) {
+        const key = try std.json.innerParse([]const u8, a, &scanner, options);
+        const index = inline for (fields, 0..) |field, i| {
+            if (std.mem.eql(u8, field, key)) break i;
+        } else return error.UnknownField;
+        if (spans[index] != null) return error.DuplicateField;
+        spans[index] = try remoteValueSpan(&scanner);
+    }
+    _ = try scanner.next();
+    if (try scanner.next() != .end_of_document) return error.InvalidRemoteResponse;
+    const Kind = enum { nodes, paths, bindings, aggregates };
+    const kind = try std.json.parseFromSliceLeaky(Kind, a, spans[0] orelse return error.MissingField, .{});
+    const payload_index: usize = switch (kind) {
+        .nodes => 1,
+        .paths => 2,
+        .bindings => 3,
+        .aggregates => 4,
+    };
+    const payload = spans[payload_index] orelse return error.MissingField;
+    inline for (fields, 0..) |_, i| if (spans[i] != null and i != 0 and i != payload_index and i != 6 and !(kind == .nodes and i == 5) and !(kind == .bindings and i == 7)) return error.UnknownField;
+    const stats_span = spans[6] orelse return error.MissingField;
+    const stats = if (kind == .nodes or kind == .bindings) try std.json.parseFromSliceLeaky(indexes_openapi.GraphResultStats, a, stats_span, .{}) else exact: {
+        const value = try std.json.parseFromSliceLeaky(indexes_openapi.GraphExactResultStats, a, stats_span, .{});
+        break :exact indexes_openapi.GraphResultStats{ .returned_items = value.returned_items, .truncated = false };
+    };
+    if (spans[7]) |computed| {
+        var values_scanner = std.json.Scanner.initCompleteInput(scratch, computed);
+        defer values_scanner.deinit();
+        var value_arena = std.heap.ArenaAllocator.init(scratch);
+        defer value_arena.deinit();
+        if (try values_scanner.peekNextTokenType() == .null) {
+            _ = try values_scanner.next();
+        } else {
+            try expectScanner(&values_scanner, .array_begin);
+            while (try values_scanner.peekNextTokenType() != .array_end) {
+                if (!value_arena.reset(.{ .retain_with_limit = 256 * 1024 })) _ = value_arena.reset(.free_all);
+                _ = try std.json.innerParse(std.json.ArrayHashMap(std.json.Value), value_arena.allocator(), &values_scanner, options);
+            }
+            _ = try values_scanner.next();
+        }
+        if (try values_scanner.next() != .end_of_document) return error.InvalidRemoteResponse;
+    }
+    var result: db_mod.types.GraphSearchResult = .{ .name = try alloc.dupe(u8, name), .hits = &.{}, .total_hits = 0 };
+    errdefer result.deinit(alloc);
+    result.truncated = stats.truncated;
+    if (spans[5]) |status| result.metric_status = try parseRemoteGraphMetricStatusMap(alloc, try std.json.parseFromSliceLeaky(?std.json.ArrayHashMap(indexes_openapi.GraphMetricStatus), a, status, .{}));
+    if (kind == .aggregates) {
+        const value = try std.json.parseFromSliceLeaky(std.json.ArrayHashMap(indexes_openapi.GraphAggregateValue), a, payload, .{});
+        if (value.map.count() == 0 or value.map.count() > graph_pattern_mod.max_count_aggregates) return error.InvalidRemoteResponse;
+        result.aggregates = try parseRemoteGraphAggregates(alloc, value);
+        if (!remoteGraphReturnedItemsMatch(stats.returned_items, result.aggregates.len)) return error.InvalidRemoteResponse;
+        return result;
+    }
+    var rows = std.json.Scanner.initCompleteInput(scratch, payload);
+    defer rows.deinit();
+    if (try rows.next() != .array_begin) return error.UnexpectedToken;
+    var row_arena = std.heap.ArenaAllocator.init(scratch);
+    defer row_arena.deinit();
+    var source_workspace: @import("antfly-json").ValueScanner = .init(@import("antfly_platform").allocator.reclaimingScratch(scratch));
+    defer source_workspace.deinit();
+    const node_count = if (kind == .nodes) try @import("graph_expand_decode.zig").countObjectRows(payload, 20) else 0;
+    if (node_count > public_limits.max_graph_result_items) return error.InvalidRemoteResponse;
+    var builder = @import("graph_expand_decode.zig").NodeBuilder{ .a = alloc, .total_rows = node_count };
+    if (kind == .nodes) try builder.nodes.ensureTotalCapacityPrecise(alloc, node_count);
+    defer builder.deinit();
+    var nodes = std.ArrayListUnmanaged(graph_query_mod.GraphResultNode).empty;
+    defer nodes.deinit(alloc);
+    errdefer for (nodes.items) |*node| node.deinit(alloc);
+    var hits = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
+    defer hits.deinit(alloc);
+    errdefer for (hits.items) |*hit| hit.deinit(alloc);
+    var paths = std.ArrayListUnmanaged(graph_paths.Path).empty;
+    defer paths.deinit(alloc);
+    errdefer for (paths.items) |path| graph_paths.freePath(alloc, path);
+    var matches = std.ArrayListUnmanaged(db_mod.types.GraphPatternMatch).empty;
+    defer matches.deinit(alloc);
+    errdefer for (matches.items) |*match| match.deinit(alloc);
+    var count: usize = 0;
+    while (try rows.peekNextTokenType() != .array_end) {
+        if (count >= public_limits.max_graph_result_items) return error.InvalidRemoteResponse;
+        if (!row_arena.reset(.{ .retain_with_limit = 256 * 1024 })) _ = row_arena.reset(.free_all);
+        const ra = row_arena.allocator();
+        switch (kind) {
+            .nodes => {
+                var parsed_wire = try parseRemoteGraphNodeStreaming(alloc, &row_arena, &source_workspace, &rows, options);
+                defer if (parsed_wire.document) |bytes| alloc.free(bytes);
+                const wire = parsed_wire.node;
+                var node = try parseRemoteGraphNodeWithKey(ra, wire.key, wire);
+                defer node.deinit(ra);
+                try builder.append(node);
+                if (parsed_wire.document) |document| {
+                    try hits.ensureUnusedCapacity(alloc, 1);
+                    const id = try alloc.dupe(u8, wire.key);
+                    errdefer alloc.free(id);
+                    const table = if (wire.table) |value| try alloc.dupe(u8, value) else null;
+                    hits.appendAssumeCapacity(.{ .id = id, .source_table = table, .stored_data = document });
+                    parsed_wire.document = null;
+                }
+            },
+            .paths => {
+                const wire = try std.json.innerParse(indexes_openapi.GraphPathResult, ra, &rows, options);
+                var parsed = try parseRemoteGraphPathResultNodes(alloc, &.{wire});
+                defer parsed.deinit(alloc);
+                try nodes.appendSlice(alloc, parsed.nodes);
+                alloc.free(parsed.nodes);
+                parsed.nodes = &.{};
+                try hits.appendSlice(alloc, parsed.hits);
+                alloc.free(parsed.hits);
+                parsed.hits = &.{};
+                const values = try parseRemoteCanonicalGraphPathResults(alloc, &.{wire});
+                errdefer {
+                    for (values) |path| graph_paths.freePath(alloc, path);
+                    alloc.free(values);
+                }
+                try paths.appendSlice(alloc, values);
+                alloc.free(values);
+            },
+            .bindings => {
+                const wire = try std.json.innerParse(indexes_openapi.GraphResultRow, ra, &rows, options);
+                var parsed = try parseRemoteGraphRows(alloc, &.{wire});
+                defer parsed.deinit(alloc);
+                try matches.appendSlice(alloc, parsed.matches);
+                alloc.free(parsed.matches);
+                parsed.matches = &.{};
+                try hits.appendSlice(alloc, parsed.hits);
+                alloc.free(parsed.hits);
+                parsed.hits = &.{};
+            },
+            .aggregates => unreachable,
+        }
+        count += 1;
+    }
+    _ = try rows.next();
+    if (try rows.next() != .end_of_document or !remoteGraphReturnedItemsMatch(stats.returned_items, count)) return error.InvalidRemoteResponse;
+    if (kind == .nodes) {
+        const owned = try builder.finish();
+        result.nodes = owned.nodes;
+        result.metric_columns = owned.metrics.columns;
+        result.metric_values_slab = owned.metrics.values;
+        result.metric_value_names = owned.metrics.names;
+    } else result.nodes = try nodes.toOwnedSlice(alloc);
+    result.paths = try paths.toOwnedSlice(alloc);
+    result.matches = try matches.toOwnedSlice(alloc);
+    result.hits = try hits.toOwnedSlice(alloc);
+    result.total_hits = @intCast(count);
+    return result;
+}
+
 pub fn parseRemoteGraphResults(
     alloc: std.mem.Allocator,
     value: std.json.ArrayHashMap(indexes_openapi.GraphResult),
@@ -5141,6 +5643,7 @@ pub fn parseRemoteGraphResults(
         results[initialized] = .{
             .name = try alloc.dupe(u8, entry.key_ptr.*),
             .nodes = parsed_nodes.nodes,
+            .metric_columns = parsed_nodes.metric_columns,
             .paths = paths,
             .matches = parsed_matches.matches,
             .aggregates = aggregates,
@@ -5188,10 +5691,12 @@ pub fn parseRemoteGraphAggregates(
 pub const ParsedRemoteGraphNodes = struct {
     nodes: []graph_query_mod.GraphResultNode = &.{},
     hits: []db_mod.types.SearchHit = &.{},
+    metric_columns: ?*graph_query_mod.GraphMetricColumns = null,
 
     pub fn deinit(self: ParsedRemoteGraphNodes, alloc: std.mem.Allocator) void {
         for (self.nodes) |*node| node.deinit(alloc);
         if (self.nodes.len > 0) alloc.free(self.nodes);
+        if (self.metric_columns) |owner| owner.deinit(alloc);
         for (self.hits) |*hit| hit.deinit(alloc);
         if (self.hits.len > 0) alloc.free(self.hits);
     }
@@ -5209,12 +5714,59 @@ pub const ParsedRemoteGraphMatches = struct {
     }
 };
 
+// A wire node may omit metrics entirely or use a different dictionary. Keep
+// that compatibility path, but decode uniform projections directly into their
+// final column owner without per-node values or duplicated names.
+fn parseRemoteUniformMetricColumns(alloc: std.mem.Allocator, nodes: []const indexes_openapi.GraphResultNode) !?*graph_query_mod.GraphMetricColumns {
+    if (nodes.len == 0) return null;
+    const first = nodes[0].metrics orelse return null;
+    const width = first.map.count();
+    if (width == 0) return null;
+    if (width > graph_query_mod.graph_metric_projection_limit) return error.InvalidRemoteResponse;
+    for (nodes) |node| {
+        const metrics = node.metrics orelse return null;
+        if (metrics.map.count() != width) return null;
+        for (first.map.keys()) |name| if (!metrics.map.contains(name)) return null;
+    }
+    const owner = try alloc.create(graph_query_mod.GraphMetricColumns);
+    errdefer alloc.destroy(owner);
+    const names = try alloc.alloc([]u8, width);
+    var initialized: usize = 0;
+    errdefer {
+        for (names[0..initialized]) |name| alloc.free(name);
+        alloc.free(names);
+    }
+    const scores = try alloc.alloc(f64, try std.math.mul(usize, width, nodes.len));
+    errdefer alloc.free(scores);
+    for (first.map.keys(), names, 0..) |name, *owned, column| {
+        if (!graph_query_mod.isValidIdentifier(name)) return error.InvalidRemoteResponse;
+        owned.* = try alloc.dupe(u8, name);
+        initialized += 1;
+        for (nodes, 0..) |node, row| {
+            const score: f64 = switch (node.metrics.?.map.get(name).?) {
+                .null => std.math.nan(f64),
+                .integer => |value| @floatFromInt(value),
+                .float => |value| blk: {
+                    if (!std.math.isFinite(value)) return error.InvalidRemoteResponse;
+                    break :blk value;
+                },
+                else => return error.InvalidRemoteResponse,
+            };
+            scores[column * nodes.len + row] = score;
+        }
+    }
+    owner.* = .{ .names = names, .scores = scores, .rows = nodes.len };
+    return owner;
+}
+
 pub fn parseRemoteGraphNodes(
     alloc: std.mem.Allocator,
     value: []const indexes_openapi.GraphResultNode,
 ) !ParsedRemoteGraphNodes {
     if (value.len > public_limits.max_graph_result_items)
         return error.InvalidRemoteResponse;
+    const metric_columns = try parseRemoteUniformMetricColumns(alloc, value);
+    errdefer if (metric_columns) |owner| owner.deinit(alloc);
     const nodes = try alloc.alloc(graph_query_mod.GraphResultNode, value.len);
     var initialized: usize = 0;
     errdefer {
@@ -5228,7 +5780,11 @@ pub fn parseRemoteGraphNodes(
     }
 
     for (value, 0..) |item, i| {
-        nodes[i] = try parseRemoteGraphNodeWithKey(alloc, item.key, item);
+        var payload = item;
+        if (metric_columns != null) payload.metrics = null;
+        nodes[i] = try parseRemoteGraphNodeWithKey(alloc, item.key, payload);
+        nodes[i].metric_columns = metric_columns;
+        nodes[i].metric_row = @intCast(i);
         initialized += 1;
         if (item.document) |document| {
             try appendRemoteGraphDocumentHit(alloc, &hits, item.key, item.table, document);
@@ -5236,6 +5792,7 @@ pub fn parseRemoteGraphNodes(
     }
     return .{
         .nodes = nodes,
+        .metric_columns = metric_columns,
         .hits = try hits.toOwnedSlice(alloc),
     };
 }
@@ -5399,6 +5956,7 @@ pub fn appendRemoteGraphBinding(
     alias: []const u8,
     node_value: indexes_openapi.GraphBindingNode,
 ) !void {
+    try bindings.ensureUnusedCapacity(alloc, 1);
     const owned_alias = try alloc.dupe(u8, alias);
     errdefer alloc.free(owned_alias);
     try validateRemoteCanonicalGraphIdentity(node_value.key, node_value.table);
@@ -5406,14 +5964,13 @@ pub fn appendRemoteGraphBinding(
     errdefer alloc.free(owned_key);
     const owned_table = if (node_value.table) |table| try alloc.dupe(u8, table) else null;
     errdefer if (owned_table) |table| alloc.free(table);
-    var node = graph_query_mod.GraphResultNode{
+    const node = graph_query_mod.GraphResultNode{
         .key = owned_key,
         .table = owned_table,
         .depth = 0,
         .distance = 0,
     };
-    errdefer node.deinit(alloc);
-    try bindings.append(alloc, .{ .alias = owned_alias, .node = node });
+    bindings.appendAssumeCapacity(.{ .alias = owned_alias, .node = node });
 }
 
 pub fn parseRemoteGraphRows(
@@ -6501,4 +7058,385 @@ test "ancestors-only hierarchy survives the internal wire re-encode without a st
     try std.testing.expectEqual(@as(usize, 2), second.req.hierarchy_source_fields.len);
     try std.testing.expectEqualStrings("title", second.req.hierarchy_source_fields[0]);
     try std.testing.expectEqualStrings("url", second.req.hierarchy_source_fields[1]);
+}
+
+test "remote graph metric ingress packs reordered dictionaries and preserves heterogeneous presence" {
+    const a = std.testing.allocator;
+    const wire = "[{\"key\":\"a\",\"depth\":0,\"metrics\":{\"rank\":3.5,\"missing\":null}},{\"key\":\"b\",\"depth\":0,\"metrics\":{\"missing\":null,\"rank\":7}}]";
+    const parsed = try std.json.parseFromSlice([]indexes_openapi.GraphResultNode, a, wire, .{});
+    defer parsed.deinit();
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator, source: []const indexes_openapi.GraphResultNode) !void {
+            var result = try parseRemoteGraphNodes(alloc, source);
+            defer result.deinit(alloc);
+            try std.testing.expect(result.metric_columns != null);
+            try std.testing.expectEqual(@as(usize, 0), result.nodes[0].metrics.len);
+            try std.testing.expectEqual(@as(?f64, 3.5), result.nodes[0].metricAt(0).score);
+            try std.testing.expectEqual(@as(?f64, 7), result.nodes[1].metricAt(0).score);
+            try std.testing.expectEqual(@as(?f64, null), result.nodes[1].metricAt(1).score);
+        }
+    };
+    try Runner.run(a, parsed.value);
+    try std.testing.checkAllAllocationFailures(a, Runner.run, .{parsed.value});
+    var heterogeneous = parsed.value[1];
+    heterogeneous.metrics = null;
+    var result = try parseRemoteGraphNodes(a, &.{ parsed.value[0], heterogeneous });
+    defer result.deinit(a);
+    try std.testing.expect(result.metric_columns == null);
+    try std.testing.expectEqual(@as(usize, 2), result.nodes[0].metricCount());
+    try std.testing.expectEqual(@as(usize, 0), result.nodes[1].metricCount());
+    var invalid = parsed.value[0];
+    var map: std.json.ArrayHashMap(std.json.Value) = .{};
+    defer map.deinit(a);
+    try map.map.put(a, "rank", .{ .float = std.math.inf(f64) });
+    invalid.metrics = map;
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteGraphNodes(a, &.{invalid}));
+}
+
+test "remote graph metric ingress allocation measurement" {
+    const a = std.testing.allocator;
+    const n = public_limits.max_graph_result_items;
+    var metrics: std.json.ArrayHashMap(std.json.Value) = .{};
+    defer metrics.deinit(a);
+    try metrics.map.put(a, "rank", .{ .float = 1 });
+    try metrics.map.put(a, "degree", .{ .float = 2 });
+    try metrics.map.put(a, "hub", .{ .float = 3 });
+    try metrics.map.put(a, "missing", .null);
+    const source = try a.alloc(indexes_openapi.GraphResultNode, n);
+    defer a.free(source);
+    for (source) |*node| node.* = .{ .key = "00000001", .depth = 0, .metrics = metrics };
+    for (0..2) |mode| {
+        var counter = @import("../storage/lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+        const alloc = counter.allocator();
+        var parsed: ParsedRemoteGraphNodes = if (mode == 1) try parseRemoteGraphNodes(alloc, source) else legacy: {
+            const nodes = try alloc.alloc(graph_query_mod.GraphResultNode, n);
+            var initialized: usize = 0;
+            errdefer {
+                for (nodes[0..initialized]) |*node| node.deinit(alloc);
+                alloc.free(nodes);
+            }
+            for (source, nodes) |node, *out| {
+                out.* = try parseRemoteGraphNodeWithKey(alloc, node.key, node);
+                initialized += 1;
+            }
+            break :legacy .{ .nodes = nodes };
+        };
+        try std.testing.expectEqual(@as(usize, 4), parsed.nodes[n - 1].metricCount());
+        try std.testing.expectEqual(@as(?f64, null), parsed.nodes[n - 1].metricAt(3).score);
+        std.debug.print("REMOTE_INGRESS mode={d} nodes={d} peak_bytes={d} allocations={d} retained_bytes={d}\n", .{ mode, n, counter.peak, counter.alloc_calls, counter.live });
+        parsed.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), counter.live);
+    }
+}
+
+test "public graph metric borrowed wire streamed search sources preserve validation and ownership" {
+    const a = std.testing.allocator;
+    const body =
+        \\{"responses":[{"took":1,"status":200,"hits":{"hits":[{"_source":{"n":1e2,"text":"a\\b","nested":[{"k":"v"}]},"_score":2,"_id":"a"},{"_id":"b","_score":1,"_source":null}],"total":{"value":2,"relation":"exact"}}}]}
+    ;
+    var result = try parseRemoteSearchResult(a, body);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expect(result.hits[1].stored_data == null);
+    var source = try std.json.parseFromSlice(std.json.Value, a, result.hits[0].stored_data.?, .{});
+    defer source.deinit();
+    try std.testing.expectEqualStrings("a\\b", source.value.object.get("text").?.string);
+    const Run = struct {
+        fn run(alloc: std.mem.Allocator, wire: []const u8) !void {
+            var owned = try parseRemoteSearchResult(alloc, wire);
+            defer owned.deinit();
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Run.run, .{body});
+    for ([_][]const u8{
+        "{\"x\":1,\"x\":2}", "{\"nested\":[{\"a\":1,\"\\u0061\":2}]}", "[]", "{\"a\":[1,]}",
+    }) |invalid| {
+        const wire = try std.fmt.allocPrint(a, "{{\"responses\":[{{\"took\":1,\"status\":200,\"hits\":{{\"total\":{{\"value\":1,\"relation\":\"exact\"}},\"hits\":[{{\"_id\":\"a\",\"_score\":1,\"_source\":{s}}}]}}}}]}}", .{invalid});
+        defer a.free(wire);
+        try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(a, wire));
+    }
+    // Returned source bodies are owned independently of the response buffer.
+    const mutable = try a.dupe(u8, body);
+    var owned = try parseRemoteSearchResult(a, mutable);
+    defer owned.deinit();
+    @memset(mutable, 'x');
+    a.free(mutable);
+    try std.testing.expect(std.mem.startsWith(u8, owned.hits[0].stored_data.?, "{\"n\":1e2"));
+}
+
+test "public graph metric borrowed wire streamed search allocation and CPU measurement" {
+    const a = std.testing.allocator;
+    var wire: std.Io.Writer.Allocating = .init(a);
+    defer wire.deinit();
+    try wire.writer.writeAll("{\"responses\":[{\"took\":1,\"status\":200,\"hits\":{\"total\":{\"value\":64,\"relation\":\"exact\"},\"hits\":[");
+    for (0..64) |row| {
+        if (row != 0) try wire.writer.writeByte(',');
+        try wire.writer.print("{{\"_id\":\"doc{d}\",\"_score\":1,\"_source\":{{\"v\":[", .{row});
+        for (0..2048) |value| {
+            if (value != 0) try wire.writer.writeByte(',');
+            try wire.writer.print("{d}", .{value});
+        }
+        try wire.writer.writeAll("]}}");
+    }
+    try wire.writer.writeAll("]}}]}");
+    const Before = struct {
+        fn decode(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {
+            var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, alloc, body, .{});
+            defer parsed.deinit();
+            const values = parsed.value.responses.?[0].hits.?.hits.?;
+            const hits = try alloc.alloc(db_mod.types.SearchHit, values.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (hits[0..initialized]) |*hit| hit.deinit(alloc);
+                alloc.free(hits);
+            }
+            for (values, hits) |value, *hit| {
+                hit.* = .{ .id = try alloc.dupe(u8, value._id), .score = value._score };
+                initialized += 1;
+                hit.stored_data = try std.json.Stringify.valueAlloc(alloc, value._source.?, .{});
+            }
+            return .{ .alloc = alloc, .hits = hits, .total_hits = @intCast(values.len) };
+        }
+    };
+    const Counter = @import("../storage/lite/test_allocator.zig").BudgetAllocator;
+    var peaks: [2]usize = @splat(0);
+    var calls: [2]usize = @splat(0);
+    var times: [2][7]u64 = undefined;
+    for (0..7) |pair| for (0..2) |turn| {
+        const mode = (pair + turn) % 2;
+        var measured: Counter = .{ .backing = a };
+        const started = platform_time.monotonicNs();
+        var result = if (mode == 0) try Before.decode(measured.allocator(), wire.written()) else try parseRemoteSearchResult(measured.allocator(), wire.written());
+        times[mode][pair] = platform_time.monotonicNs() - started;
+        try std.testing.expectEqual(@as(usize, 64), result.hits.len);
+        try std.testing.expect(std.mem.startsWith(u8, result.hits[0].stored_data.?, "{\"v\":[0,1,2"));
+        peaks[mode] = measured.peak;
+        calls[mode] = measured.alloc_calls;
+        result.deinit();
+        try std.testing.expectEqual(@as(usize, 0), measured.live);
+    };
+    for (&times) |*series| std.sort.pdq(u64, series, {}, std.sort.asc(u64));
+    try std.testing.expect(peaks[1] < peaks[0]);
+    try std.testing.expect(calls[1] < calls[0]);
+    std.debug.print("STREAMED_SEARCH rows=64 values_per_source=2048 wire_bytes={d} before_peak={d} after_peak={d} before_allocations={d} after_allocations={d} before_median_ns={d} after_median_ns={d}\n", .{ wire.written().len, peaks[0], peaks[1], calls[0], calls[1], times[0][3], times[1][3] });
+}
+
+test "public graph metric borrowed wire graph streaming preserves shapes and allocation cleanup" {
+    const Fixture = struct {
+        const body = "{\"responses\":[{\"took\":0,\"status\":200,\"hits\":{\"total\":{\"value\":0,\"relation\":\"exact\"},\"hits\":[]},\"graph_results\":{\"walk\":{\"stats\":{\"returned_items\":2,\"truncated\":false},\"nodes\":[{\"key\":\"a\",\"depth\":0,\"metrics\":{\"rank\":1,\"missing\":null},\"document\":{\"n\":1e2}},{\"key\":\"b\",\"depth\":1,\"metrics\":{\"rank\":2,\"missing\":null}}],\"kind\":\"nodes\"},\"counted\":{\"kind\":\"aggregates\",\"aggregates\":{\"count\":{\"value\":\"2\",\"exact\":true}},\"stats\":{\"returned_items\":1}}}}]}";
+        fn run(alloc: std.mem.Allocator) !void {
+            var result = try parseRemoteSearchResultWithScratch(alloc, alloc, body);
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 2), result.graph_results.len);
+            const graph = result.graph_results[0];
+            try std.testing.expectEqual(@as(usize, 2), graph.nodes.len);
+            try std.testing.expect(graph.metric_columns != null);
+            try std.testing.expectEqual(@as(?f64, 2), graph.nodes[1].metricAt(0).score);
+            try std.testing.expect(graph.nodes[1].metricAt(1).score == null);
+            try std.testing.expectEqualStrings("{\"n\":1e2}", graph.hits[0].stored_data.?);
+            try std.testing.expectEqual(@as(u128, 2), result.graph_results[1].aggregates[0].value);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "public graph metric borrowed wire graph streaming handles every shape and rejects malformed envelopes" {
+    const Fixture = struct {
+        const body = "{\"p\":{\"kind\":\"paths\",\"paths\":[{\"path\":{\"nodes\":[{\"key\":\"a\"}],\"edges\":[],\"objective\":\"min_hops\",\"weight_sum\":0,\"objective_value\":0,\"length\":0},\"document\":{\"n\":1}}],\"stats\":{\"returned_items\":1}},\"b\":{\"kind\":\"bindings\",\"rows\":[{\"n\":{\"key\":\"b\",\"document\":{\"n\":2}},\"missing\":null}],\"computed\":[{\"x\":3}],\"stats\":{\"returned_items\":1,\"truncated\":true}},\"n\":{\"kind\":\"nodes\",\"nodes\":[{\"key\":\"a\",\"depth\":0,\"metrics\":{\"rank\":1}},{\"key\":\"b\",\"depth\":1}],\"stats\":{\"returned_items\":2,\"truncated\":false}}}";
+        fn run(a: std.mem.Allocator) !void {
+            const results = try parseRemoteGraphResultsStreaming(a, a, body);
+            defer {
+                for (results) |*result| result.deinit(a);
+                a.free(results);
+            }
+            try std.testing.expectEqual(@as(usize, 3), results.len);
+            try std.testing.expectEqual(@as(usize, 1), results[0].paths.len);
+            try std.testing.expectEqual(@as(usize, 1), results[0].hits.len);
+            try std.testing.expectEqual(@as(usize, 1), results[1].matches.len);
+            try std.testing.expect(results[1].truncated);
+            try std.testing.expectEqualStrings("missing", results[1].matches[0].null_aliases[0]);
+            try std.testing.expect(results[2].metric_columns == null);
+            try std.testing.expectEqual(@as(?f64, 1), results[2].nodes[0].metricAt(0).score);
+            try std.testing.expectEqual(@as(usize, 0), results[2].nodes[1].metricCount());
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    for ([_][]const u8{
+        "{\"n\":{\"kind\":\"nodes\",\"nodes\":[],\"stats\":{\"returned_items\":1,\"truncated\":false}}}",
+        "{\"n\":{\"kind\":\"nodes\",\"nodes\":[],\"paths\":[],\"stats\":{\"returned_items\":0,\"truncated\":false}}}",
+        "{\"n\":{\"kind\":\"nodes\",\"kind\":\"nodes\",\"nodes\":[],\"stats\":{\"returned_items\":0,\"truncated\":false}}}",
+        "{\"n\":{\"kind\":\"aggregates\",\"aggregates\":{},\"stats\":{\"returned_items\":0}}}",
+        "{\"n\":{\"kind\":\"nodes\",\"nodes\":[{\"key\":\"a\",\"depth\":0,\"document\":{\"x\":1,\"x\":2}}],\"stats\":{\"returned_items\":1,\"truncated\":false}}}",
+    }) |invalid| {
+        const result = parseRemoteGraphResultsStreaming(std.testing.allocator, std.testing.allocator, invalid);
+        if (result) |values| {
+            for (values) |*value| value.deinit(std.testing.allocator);
+            std.testing.allocator.free(values);
+            return error.TestExpectedError;
+        } else |_| {}
+    }
+}
+
+test "public graph metric borrowed wire graph streaming allocation measurement" {
+    const a = std.testing.allocator;
+    var wire: std.Io.Writer.Allocating = .init(a);
+    defer wire.deinit();
+    try wire.writer.writeAll("{\"walk\":{\"kind\":\"nodes\",\"stats\":{\"returned_items\":1000,\"truncated\":false},\"nodes\":[");
+    for (0..1000) |i| {
+        if (i != 0) try wire.writer.writeByte(',');
+        try wire.writer.print("{{\"key\":\"n{d:0>6}\",\"depth\":0,\"metrics\":{{\"rank\":1,\"degree\":2,\"hub\":3,\"missing\":null}}}}", .{i});
+    }
+    try wire.writer.writeAll("]}}");
+    var peaks: [2]usize = undefined;
+    var calls: [2]usize = undefined;
+    for (0..2) |mode| {
+        var counter: @import("../storage/lite/test_allocator.zig").BudgetAllocator = .{ .backing = a };
+        const alloc = counter.allocator();
+        const results = if (mode == 0) old: {
+            var parsed = try std.json.parseFromSlice(std.json.ArrayHashMap(indexes_openapi.GraphResult), alloc, wire.written(), .{});
+            defer parsed.deinit();
+            break :old try parseRemoteGraphResults(alloc, parsed.value);
+        } else try parseRemoteGraphResultsStreaming(alloc, alloc, wire.written());
+        try std.testing.expectEqual(@as(usize, 1000), results[0].nodes.len);
+        try std.testing.expectEqual(@as(?f64, null), results[0].nodes[999].metricAt(3).score);
+        peaks[mode] = counter.peak;
+        calls[mode] = counter.alloc_calls;
+        for (results) |*result| result.deinit(alloc);
+        alloc.free(results);
+        try std.testing.expectEqual(@as(usize, 0), counter.live);
+    }
+    try std.testing.expect(peaks[1] < peaks[0]);
+    std.debug.print("STREAMED_GRAPH nodes=1000 width=4 wire_bytes={d} before_peak={d} after_peak={d} before_allocations={d} after_allocations={d}\n", .{ wire.written().len, peaks[0], peaks[1], calls[0], calls[1] });
+}
+
+test "public graph metric borrowed wire scratch allocator reclaims nested arenas and preserves accounting wrappers" {
+    const a = std.testing.allocator;
+    var quota = std.testing.FailingAllocator.init(a, .{});
+    var outer = std.heap.ArenaAllocator.init(quota.allocator());
+    defer outer.deinit();
+    var inner = std.heap.ArenaAllocator.init(outer.allocator());
+    defer inner.deinit();
+    const scratch = @import("antfly_platform").allocator.reclaimingScratch(inner.allocator());
+    try std.testing.expect(scratch.ptr == quota.allocator().ptr and scratch.vtable == quota.allocator().vtable);
+    const retained = try inner.allocator().dupe(u8, "retained");
+    const temporary = try scratch.alloc(u8, 512 * 1024);
+    const before = quota.freed_bytes;
+    scratch.free(temporary);
+    try std.testing.expectEqual(before + temporary.len, quota.freed_bytes);
+    try std.testing.expectEqualStrings("retained", retained);
+}
+
+test "public graph metric borrowed wire authority decoder copies only final document and retires scratch" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const proof: db_mod.types.document_authority.Authority = .{ .group = 7, .version = 9, .digest = @splat(3) };
+            const envelope = try db_mod.types.document_authority.encode(a, proof, "{\"n\":1e2,\"text\":\"hello\"}");
+            defer a.free(envelope);
+            const wire = try std.fmt.allocPrint(a, "{{\"responses\":[{{\"took\":0,\"status\":200,\"hits\":{{\"total\":{{\"value\":1,\"relation\":\"exact\"}},\"hits\":[{{\"_id\":\"doc\",\"_score\":1,\"_source\":{s}}}]}},\"profile\":{{\"document_authority_version\":1}}}}]}}", .{envelope});
+            defer a.free(wire);
+            var scratch = std.heap.ArenaAllocator.init(a);
+            var live = true;
+            defer if (live) scratch.deinit();
+            var result = try parseRemoteSearchResultWithAuthority(scratch.allocator(), scratch.allocator(), wire, 7, a);
+            // Metadata is still in scratch; extract the final body, then retire
+            // every parser/result metadata allocation before using it.
+            const document = result.hits[0].stored_data.?;
+            defer a.free(document);
+            try std.testing.expect(result.hits[0].document_authority.?.eql(proof));
+            result.hits[0].stored_data = null;
+            result.deinit();
+            scratch.deinit();
+            live = false;
+            try std.testing.expectEqualStrings("{\"n\":1e2,\"text\":\"hello\"}", document);
+        }
+    };
+    try Case.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "public graph metric borrowed wire source scan bounds sibling scratch" {
+    const a = std.testing.allocator;
+    const Counter = @import("../storage/lite/test_allocator.zig").BudgetAllocator;
+    for (0..2) |shape| {
+        var body: std.Io.Writer.Allocating = .init(a);
+        defer body.deinit();
+        try body.writer.writeAll("{\"responses\":[{\"took\":0,\"status\":200,\"hits\":{\"total\":{\"value\":1,\"relation\":\"exact\"},\"hits\":[{\"_id\":\"x\",\"_score\":1,\"_source\":{\"items\":[");
+        const count: usize = if (shape == 0) 50000 else 100;
+        for (0..count) |i| {
+            if (i != 0) try body.writer.writeByte(',');
+            if (shape == 0) {
+                try body.writer.writeAll("{\"\\u0061\":1,\"\\u0062\":2,\"\\u0063\":3}");
+            } else {
+                try body.writer.writeByte('{');
+                for (0..1000) |j| {
+                    if (j != 0) try body.writer.writeByte(',');
+                    try body.writer.print("\"k{d}\":1", .{j});
+                }
+                try body.writer.writeByte('}');
+            }
+        }
+        try body.writer.writeAll("]}}]}}]}");
+        var counter: Counter = .{ .backing = a, .limit = 192 * 1024 };
+        var result = try parseRemoteSearchResultWithScratch(a, counter.allocator(), body.written());
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 0), counter.live);
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        try std.testing.expect(std.mem.startsWith(u8, result.hits[0].stored_data.?, "{\"items\":["));
+        std.debug.print("SOURCE_SCAN shape={d} bytes={d} scratch_peak={d} scratch_allocations={d}\n", .{ shape, body.written().len, counter.peak, counter.alloc_calls });
+    }
+}
+
+test "public graph metric borrowed wire source scan captures proofs after capability validation" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const authority = db_mod.types.document_authority;
+            const proof: authority.Authority = .{ .group = 7, .version = 9, .digest = @splat(3) };
+            const source = "{\"escaped\":\"a\\nb\",\"n\":1e2,\"items\":[{},[]]}";
+            const envelope = try authority.encode(a, proof, source);
+            defer a.free(envelope);
+            for (0..2) |order| {
+                const profile = "\"profile\":{\"document_authority_version\":1},";
+                const wire = try std.fmt.allocPrint(a, "{{\"responses\":[{{{s}\"took\":0,\"hits\":{{\"total\":{{\"value\":1,\"relation\":\"exact\"}},\"hits\":[{{\"_id\":\"doc\",\"_score\":1,\"_source\":{s}}}]}},{s}\"status\":200}}]}}", .{ if (order == 0) profile else "", envelope, if (order == 1) profile else "" });
+                defer a.free(wire);
+                var result = try parseRemoteSearchResultWithAuthority(a, a, wire, 7, null);
+                defer result.deinit();
+                try std.testing.expectEqualStrings(source, result.hits[0].stored_data.?);
+                try std.testing.expect(result.hits[0].document_authority.?.eql(proof));
+            }
+            // Marker-like user fields from old providers are never interpreted.
+            const legacy = "{\"responses\":[{\"took\":0,\"status\":200,\"hits\":{\"total\":{\"value\":1,\"relation\":\"exact\"},\"hits\":[{\"_id\":\"x\",\"_score\":1,\"_source\":{\"__antfly_document_authority_v1\":\"user data\",\"document\":[]}}]}}]}";
+            var result = try parseRemoteSearchResultWithAuthority(a, a, legacy, 7, null);
+            defer result.deinit();
+            try std.testing.expectEqual(@as(u32, 0), result.document_authority_version);
+            try std.testing.expect(result.hits[0].document_authority == null);
+        }
+    };
+    try Case.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "public graph metric borrowed wire source scan rejects invalid authority envelopes" {
+    const a = std.testing.allocator;
+    const proof = "{\"group\":7,\"version\":9,\"sha256\":\"0303030303030303030303030303030303030303030303030303030303030303\"}";
+    const valid = "\"__antfly_document_authority_v1\":" ++ proof;
+    const invalid = [_][]const u8{
+        "null",
+        "{}",
+        "{\"__antfly_document_authority_v1\":null}",
+        "{\"__antfly_document_authority_v1\":{}}",
+        "{\"__antfly_document_authority_v1\":{\"group\":0,\"version\":9,\"sha256\":\"invalid\"}}",
+        "{" ++ valid ++ ",\"document\":null}",
+        "{" ++ valid ++ ",\"document\":[]}",
+        "{" ++ valid ++ ",\"extra\":0}",
+        "{" ++ valid ++ "," ++ valid ++ "}",
+        "{" ++ valid ++ ",\"document\":{},\"\\u0064ocument\":{}}",
+        "{" ++ valid ++ ",\"document\":{\"x\":0,\"\\u0078\":1}}",
+    };
+    for (invalid) |source| {
+        const wire = try std.fmt.allocPrint(a, "{{\"responses\":[{{\"took\":0,\"status\":200,\"hits\":{{\"total\":{{\"value\":1,\"relation\":\"exact\"}},\"hits\":[{{\"_id\":\"doc\",\"_score\":1,\"_source\":{s}}}]}},\"profile\":{{\"document_authority_version\":1}}}}]}}", .{source});
+        defer a.free(wire);
+        try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResultWithAuthority(a, a, wire, 7, null));
+    }
 }

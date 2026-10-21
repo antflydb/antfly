@@ -199,7 +199,7 @@ pub fn executeJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: page
         break :vector_mode retention.direct_vectors;
     };
     const effect_protocol = if (receipt.source.artifact_catalog) |binding| binding.effect_protocol else 0;
-    const graph_copy = vector_copy and effect_protocol == 15;
+    const graph_copy = vector_copy and effect_protocol >= 15;
     // Even a row-only receiver must inspect the certified object kinds: a
     // protocol-14 source cannot silently discard private graph ownership.
     while (receipt.phase == .artifacts and position.object < reader.objectCount() and integrity.items.len + vectors.items.len + proofs.items.len < pages.max_rows and work < pages.max_rows) : (work += 1) {
@@ -272,7 +272,10 @@ pub fn executeJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: page
             }
             const value = try owned.alloc(u8, descriptor.value_len);
             try descriptor.read(&reader, 0, value);
-            if (raw_graph) try @import("online_graph_artifacts.zig").validate(key, value) else try @import("online_vector_artifacts.zig").validate(key, value);
+            if (@import("group_source_transfer.zig").isKey(key)) {
+                if (effect_protocol != 16) return error.SourceSnapshotCorrupt;
+                try @import("group_source_transfer.zig").validate(owned, key, value);
+            } else if (raw_graph) try @import("online_graph_artifacts.zig").validate(key, value) else try @import("online_vector_artifacts.zig").validate(key, value);
             if (vectors.items.len != 0 and std.mem.order(u8, vectors.items[vectors.items.len - 1].key, key) != .lt) return error.SourceSnapshotCorrupt;
             try vectors.append(owned, .{ .key = key, .value = value });
             bytes += key.len + value.len;

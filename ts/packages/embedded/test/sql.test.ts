@@ -45,6 +45,25 @@ describeWithLibrary("SQL", () => {
   it("runs the shared type and SQLSTATE cases", async () => {
     const directory = await mkdtemp(join(tmpdir(), "antfly-sql-"));
     const db = await createWithOptions(join(directory, "db.aflite"), { noSync: true });
+    const fixture = JSON.parse(
+      await readFile(
+        new URL(
+          "../../../../zig/pkg/antfly-embedded/capi-conformance/sql/search-fixture.json",
+          import.meta.url
+        ),
+        "utf8"
+      )
+    );
+    await db.createTable(fixture.table, fixture.schema);
+    await db.createTable("history_items", fixture.history);
+    const table = await db.openTable(fixture.table);
+    try {
+      for (const index of fixture.indexes) await table.addIndex(index);
+      await table.batchJson(fixture.batch);
+      await table.runUntilIdle();
+    } finally {
+      await table.close();
+    }
     const connection = await Connection.open(db);
     try {
       const raw = await readFile(

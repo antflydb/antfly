@@ -29,7 +29,11 @@ class LocalTestPartitions(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="antfly-local-tests-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        # source_owner now attaches the shared decision contract. Copy its
+        # complete authored source closure so these remain real build fixtures.
+        shutil.copytree(ZIG / "lib/decisions", self.root / "lib/decisions")
         for relative in (
+            "pkg/inference/build/decision_modules.zig",
             "build_support/antfly/test_partitions.zig",
             "build_support/antfly/source_paths.zig",
             "build_support/embedded/source_owner.zig",
@@ -143,9 +147,19 @@ pub fn build(b: *std.Build) void {
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text)
 
-    def build(self, *args, succeeds=True, build_options=()):
+    def build(self, *args, succeeds=True, build_options=(), step="test"):
         result = subprocess.run(
-            ["zig", "build", "test", "-j2", *build_options, "--", *args],
+            [
+                "zig",
+                "build",
+                step,
+                "--cache-dir",
+                str(self.root / ".zig-cache"),
+                "-j2",
+                *build_options,
+                "--",
+                *args,
+            ],
             cwd=self.root,
             text=True,
             capture_output=True,
@@ -154,6 +168,81 @@ pub fn build(b: *std.Build) void {
         output = result.stdout + result.stderr
         self.assertEqual(result.returncode == 0, succeeds, output)
         return output
+
+    def test_portable_install_retains_local_tests_after_binding_and_repeated_finalize(
+        self,
+    ):
+        build = self.root / "build.zig"
+        build.write_text(
+            build.read_text().replace(
+                "    const wrapped =",
+                '    @import("build_support/antfly/test_partitions.zig").installLocalArtifact(b, tests, "portable-tests", "Install local owner", "local-tests");\n'
+                "    const wrapped =",
+            )
+        )
+        output = self.build(step="portable-tests")
+        self.assertNotIn("local owned...", output)
+        result = subprocess.run(
+            [
+                str(self.root / "zig-out/bin/local-tests"),
+                "--test-filter",
+                "local owned",
+                "--require-no-skips",
+            ],
+            cwd=self.root,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("local owned...", output)
+        self.assertNotIn("server owned...", output)
+
+    def test_long_run_allows_ready_sibling_compilation(self):
+        self.write("probe.zig", "export fn probe() u32 { return 42; }\n")
+        self.write(
+            "gate.py",
+            """from pathlib import Path
+import sys, time
+mode = sys.argv[1]
+if mode == 'hold': Path('started').write_text('ready')
+if mode == 'release': Path('released').write_text('done')
+else:
+    marker = Path('released' if mode == 'hold' else 'started')
+    deadline = time.monotonic() + 30
+    while not marker.exists():
+        if time.monotonic() >= deadline: raise RuntimeError('ready compiler was blocked by a long Run step')
+        time.sleep(0.01)
+""",
+        )
+        self.write(
+            "build.zig",
+            """const std = @import("std");
+fn gate(b: *std.Build, mode: []const u8) *std.Build.Step.Run {
+    const run = b.addSystemCommand(&.{ "python3", "gate.py", mode });
+    run.expectExitCode(0);
+    run.has_side_effects = true;
+    _ = run.captureStdOut(.{});
+    return run;
+}
+pub fn build(b: *std.Build) void {
+    const hold = gate(b, "hold");
+    const ready = gate(b, "ready");
+    const object = b.addObject(.{ .name = "overlap-probe", .root_module = b.createModule(.{
+        .root_source_file = b.path("probe.zig"), .target = b.graph.host, .optimize = .debug,
+    }) });
+    object.step.dependOn(&ready.step);
+    const release = gate(b, "release");
+    release.step.dependOn(&object.step);
+    const step = b.step("test", "Prove compilation overlaps a running test");
+    step.dependOn(&hold.step);
+    step.dependOn(&release.step);
+}
+""",
+        )
+        self.build()
+        self.assertEqual((self.root / "released").read_text(), "done")
 
     def test_both_owners_run_once_with_shared_types_and_late_options(self):
         output = self.build()

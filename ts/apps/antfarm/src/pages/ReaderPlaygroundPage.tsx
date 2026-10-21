@@ -278,8 +278,8 @@ const ReaderPlaygroundPage: React.FC = () => {
         throw new Error(errorText || `HTTP ${response.status}`);
       }
 
-      const data: ReadResponse = await response.json();
-      setReadResult(data);
+      const data: ReadResponse & { data?: ReadResult[] } = await response.json();
+      setReadResult({ ...data, results: data.data ?? data.results ?? [] });
       setProcessingTime(performance.now() - startTime);
       setSelectedImageIndex(0);
       setOutputTab("text");

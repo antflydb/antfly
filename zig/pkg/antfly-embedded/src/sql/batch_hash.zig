@@ -20,33 +20,49 @@ const std = @import("std");
 const scalar = @import("scalar.zig");
 const A = std.mem.Allocator;
 pub fn encodedColumns(a: A, values: []const @import("execution_batch.zig").Batch, count: usize, grouped: bool) ![]?u64 {
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const physical = try scratch.allocator().alloc(?@import("execution_batch.zig").PhysicalColumn, values.len);
+    for (values, physical) |column, *view| {
+        view.* = try column.physicalColumn(scratch.allocator(), 0);
+        if (view.*) |native| try native.validate();
+    }
+    return encodedColumnsWithPhysical(a, values, physical, count, grouped);
+}
+pub fn encodedColumnsWithPhysical(a: A, values: []const @import("execution_batch.zig").Batch, physical: []const ?@import("execution_batch.zig").PhysicalColumn, count: usize, grouped: bool) ![]?u64 {
+    if (physical.len != values.len) return error.InvalidSqlBackendResponse;
     const states = try a.alloc(std.hash.Wyhash, count);
     defer a.free(states);
     for (states) |*state| state.* = .init(0);
     const result = try a.alloc(?u64, count);
     errdefer a.free(result);
     @memset(result, 0);
-    for (values) |column| {
+    for (values, physical) |column, native| {
         if (column.len() != count or column.width() != 1) return error.InvalidSqlBackendResponse;
         var memo: std.AutoHashMapUnmanaged(u64, u64) = .empty;
         defer memo.deinit(a);
         var text: std.StringHashMapUnmanaged(u64) = .empty;
         defer text.deinit(a);
+        var numeric_scratch = std.heap.ArenaAllocator.init(a);
+        defer numeric_scratch.deinit();
+        const decimal = try column.decimalColumnSelected(numeric_scratch.allocator(), 0, null);
         for (states, result, 0..) |*state, *valid, index| {
-            const cell = try column.cell(a, index, 0);
+            var fixed: @import("numeric_value.zig").ScaledInteger = undefined;
+            var number: @import("numeric_value.zig").Value = undefined;
+            const cell = if (native) |view| try view.cell(index) else if (decimal) |view| try view.cell(index, &fixed, &number) else try column.cell(a, index, 0);
             if (!grouped and cell.sql_null) valid.* = null;
             if (valid.* == null) continue;
-            const semantic = if (cell.sql_null) 0 else if (try column.dictionaryIdentity(index, 0)) |id| blk: {
+            const semantic = if (cell.sql_null) 0 else if (if (native) |view| view.dictionaryIdentity(index) else try column.dictionaryIdentity(index, 0)) |id| blk: {
                 if (memo.get(id)) |hash| break :blk hash;
-                const hash = try scalar.semanticHash(cell.value);
+                const hash = try scalar.semanticHashDatum(cell);
                 if (memo.count() < 4096) try memo.put(a, id, hash);
                 break :blk hash;
             } else if (cell.value == .string) blk: {
                 if (text.get(cell.value.string)) |hash| break :blk hash;
-                const hash = try scalar.semanticHash(cell.value);
+                const hash = try scalar.semanticHashDatum(cell);
                 if (text.count() < 4096) try text.put(a, cell.value.string, hash);
                 break :blk hash;
-            } else try scalar.semanticHash(cell.value);
+            } else try scalar.semanticHashDatum(cell);
             var bytes: [9]u8 = undefined;
             bytes[0] = @intFromBool(cell.sql_null);
             std.mem.writeInt(u64, bytes[1..9], semantic, .little);
@@ -74,11 +90,11 @@ pub fn columns(a: A, values: []const []const scalar.Datum, count: usize, grouped
             if (valid.* == null) continue;
             const semantic = if (cell.sql_null) 0 else if (cell.value == .string) blk: {
                 if (text.get(cell.value.string)) |cached| break :blk cached;
-                const value = try scalar.semanticHash(cell.value);
+                const value = try scalar.semanticHashDatum(cell);
                 // Bound memo state for high-cardinality identifiers.
                 if (text.count() < 4096) try text.put(a, cell.value.string, value);
                 break :blk value;
-            } else try scalar.semanticHash(cell.value);
+            } else try scalar.semanticHashDatum(cell);
             var bytes: [9]u8 = undefined;
             bytes[0] = @intFromBool(cell.sql_null);
             std.mem.writeInt(u64, bytes[1..9], semantic, .little);
@@ -109,10 +125,10 @@ pub fn rows(a: A, values: []const []const scalar.Datum, grouped: bool) ![]?u64 {
             if (valid.* == null) continue;
             const semantic = if (cell.sql_null) 0 else if (cell.value == .string) blk: {
                 if (text.get(cell.value.string)) |hash| break :blk hash;
-                const hash = try scalar.semanticHash(cell.value);
+                const hash = try scalar.semanticHashDatum(cell);
                 if (text.count() < 4096) try text.put(a, cell.value.string, hash);
                 break :blk hash;
-            } else try scalar.semanticHash(cell.value);
+            } else try scalar.semanticHashDatum(cell);
             var bytes: [9]u8 = undefined;
             bytes[0] = @intFromBool(cell.sql_null);
             std.mem.writeInt(u64, bytes[1..9], semantic, .little);

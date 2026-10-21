@@ -141,7 +141,7 @@ pub const Plan = struct {
         defer scratch.deinit();
         const a = scratch.allocator();
         const indexes = if (catalogs.indexes.len == 0) &.{} else try @import("catalog/index_manager.zig").deserializeCatalog(a, catalogs.indexes);
-        const resolver_configs = if (catalogs.resolvers.len == 0) &.{} else try resolvers.deserializeCatalog(a, catalogs.resolvers);
+        const resolver_configs = if (catalogs.resolvers.len == 0) &.{} else try resolvers.deserializeActiveCatalog(a, catalogs.resolvers);
         const enrichment_configs = if (catalogs.enrichments.len == 0) &.{} else try enrichments.deserializeCatalog(a, catalogs.enrichments);
         return compileWithChildren(alloc, catalogs.digest(), templates, indexes, resolver_configs, enrichment_configs);
     }
@@ -188,7 +188,7 @@ test "ordered artifact inventory compiles singleton and producer-defined scope o
             try std.testing.expectError(error.ArtifactCatalogDrift, plan.providerFor(changed));
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 fn compile(alloc: std.mem.Allocator, catalog: publication.Digest, templates: []const requests.GeneratedEnrichmentRequest, indexes: []const types.IndexConfig, resolver_configs: []const resolvers.ResolverConfig) !Plan {
@@ -409,7 +409,7 @@ test "ordered artifact inventory completion plan retains extraction-owned childr
             try std.testing.expectError(error.ArtifactCatalogDrift, missing.unitChild("other"));
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 test "ordered artifact inventory completion plan retains non-provider requirements and stable identities" {
@@ -467,7 +467,7 @@ test "ordered artifact inventory completion plan retains non-provider requiremen
             try std.testing.expectError(error.ArtifactCatalogDrift, plan.page(stale));
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
     const duplicate: requests.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "extract", .artifact_name = "extract", .doc_key = "", .source_field = "body" };
     var consumers = [_][]u8{@constCast("other-consumer")};
     var routed = duplicate;

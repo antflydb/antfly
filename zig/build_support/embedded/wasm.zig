@@ -34,7 +34,10 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     // ReleaseSafe avoids LLVM inference miscompilation and V8's local-variable
     // limit for unoptimized database batch functions.
     const optimize: std.lang.Optimize = .safe;
-    const strip = b.option(bool, "wasm-strip", "Strip embedded WASM debug information") orelse false;
+    // Browser bundles retain ReleaseSafe checks but do not need DWARF in the
+    // shipped module. Keep debugger metadata an explicit opt-in: it accounts
+    // for most of the bundle size and its Linux LLVM build exhausted 24 GiB.
+    const strip = b.option(bool, "wasm-strip", "Strip embedded WASM debug information") orelse true;
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
@@ -117,9 +120,13 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     wasm_vectorindex_mod.addImport("antfly_platform", wasm_platform_mod);
     wasm_vectorindex_mod.addImport("antfly_hash", wasm_hash_mod);
     const fst_mod = b.createModule(.{ .root_source_file = b.path("lib/fst/src/mod.zig"), .target = wasm_target, .optimize = optimize });
+    const grapheme_mod = b.createModule(.{ .root_source_file = b.path("lib/tokenizer/src/grapheme.zig"), .target = wasm_target, .optimize = optimize });
     const regex_mod = b.createModule(.{ .root_source_file = b.path("lib/regex/src/mod.zig"), .target = wasm_target, .optimize = optimize });
     regex_mod.addImport("antfly_fst", fst_mod);
+    regex_mod.addImport("antfly_grapheme", grapheme_mod);
     regex_mod.addImport("antfly_platform", wasm_platform_mod);
+    const sql_regex_mod = @import("../../lib/sql_regex/build.zig").createModule(b, wasm_target, optimize, b.path("lib/sql_regex"));
+    regex_mod.addImport("antfly_capture_regex", sql_regex_mod.import_table.get("antfly_capture_regex").?);
     const chunking_mod = b.createModule(.{ .root_source_file = b.path("lib/chunking/src/mod.zig"), .target = wasm_target, .optimize = optimize });
     chunking_mod.addImport("antfly-json", json_mod);
     chunking_mod.addImport("antfly_chunking_api_openapi", api.chunking_api);
@@ -148,6 +155,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         wasm_hash_mod,
         fst_mod,
         regex_mod,
+        sql_regex_mod,
         wasm_image_mod,
         wasm_font_mod,
         wasm_pdf_mod,
@@ -190,6 +198,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .target = wasm_target,
         .optimize = optimize,
     });
+    wasm_cancellation_mod.addImport("antfly_runtime_abi", wasm_runtime_abi_mod);
     wasm_runtime_abi_mod.addImport("httpx", httpx_mod);
     wasm_runtime_abi_mod.addImport("antfly_platform", wasm_platform_mod);
     embedded_support_wasm_mod.addImport("antfly_runtime_abi", wasm_runtime_abi_mod);
@@ -216,12 +225,12 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .optimize = optimize,
     }));
     const wasm_matcher_mod = b.createModule(.{
-        .root_source_file = b.path("lib/matcher/src/mod.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/matcher/src/mod.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });
     const wasm_resolver_mod = b.createModule(.{
-        .root_source_file = b.path("lib/resolver/src/mod.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/resolver/src/mod.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });
@@ -323,7 +332,6 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
 
     // --- Inference WASM modules for unified antfly.wasm ---
     const inference_wasm_build_options = b.addOptions();
-    inference_wasm_build_options.addOption(bool, "enable_onnx", false);
     inference_wasm_build_options.addOption(bool, "enable_pjrt", false);
     inference_wasm_build_options.addOption(bool, "enable_cuda", false);
     inference_wasm_build_options.addOption([]const u8, "cuda_artifacts", "portable");
@@ -348,6 +356,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .target = wasm_target,
         .optimize = optimize,
     });
+    wasm_inference_tokenizer_mod.addImport("antfly_grapheme", grapheme_mod);
     wasm_inference_tokenizer_mod.addImport("sentencepiece_proto", wasm_sentencepiece_proto_mod);
     wasm_inference_tokenizer_mod.addImport("antfly_platform", wasm_platform_mod);
     const wasm_inference_hf_tokenizer_mod = b.createModule(.{
@@ -382,17 +391,77 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .target = wasm_target,
         .optimize = optimize,
     });
+    @import("antfly_media").support.attach(b, wasm_inference_audio_mod, b.path("lib/media"));
+    // Browser-owned modules must share the same media/image identities as
+    // audio and storage. Never borrow target-specific native runtime modules.
+    const wasm_chunker_mod = b.createModule(.{
+        .root_source_file = b.path("lib/chunker/src/mod.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    wasm_chunker_mod.addImport("inference_audio", wasm_inference_audio_mod);
+    wasm_chunker_mod.addImport("inference_hf_tokenizer", wasm_inference_hf_tokenizer_mod);
+    wasm_chunker_mod.addImport("antfly_image", wasm_image_mod);
+    wasm_chunker_mod.addImport("antfly_hash", wasm_hash_mod);
+    const fixed_tokenizer_files = b.addWriteFiles();
+    _ = fixed_tokenizer_files.addCopyFile(b.path("lib/tokenizer/testdata/embedder/tokenizer.json"), "tokenizer.json");
+    wasm_chunker_mod.addImport("inference_fixed_tokenizer_data", b.createModule(.{
+        .root_source_file = fixed_tokenizer_files.add("root.zig", "pub const tokenizer_json = @embedFile(\"tokenizer.json\");\n"),
+    }));
+    embedded_support_wasm_mod.addImport("inference_chunker", wasm_chunker_mod);
     const inference_wasm_inference_mod = b.createModule(.{
         .root_source_file = b.path("pkg/inference/src/wasm_entry.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });
+    // The native decision owner is wired to native structured-generation
+    // providers. Browser inference owns a separate source identity/profile,
+    // just like the standalone inference WASM product.
+    const wasm_decisions_mod = b.createModule(.{
+        .root_source_file = b.path("lib/decisions/root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+        .single_threaded = true,
+    });
+    const wasm_schema_mod = b.createModule(.{ .root_source_file = b.path("lib/jsonschema/src/mod.zig"), .target = wasm_target, .optimize = optimize });
+    wasm_schema_mod.addImport("antfly-json", json_mod);
+    wasm_schema_mod.addImport("antfly_platform", wasm_platform_mod);
+    wasm_schema_mod.addImport("antfly_regex", regex_mod);
+    const wasm_generating_mod = b.createModule(.{ .root_source_file = b.path("lib/generating/src/mod.zig"), .target = wasm_target, .optimize = optimize });
+    wasm_generating_mod.addImport("antfly-json", json_mod);
+    wasm_generating_mod.addImport("antfly_generating_openapi", api.generating);
+    const wasm_apple_mod = b.createModule(.{ .root_source_file = b.path("lib/apple_native/src/mod.zig"), .target = wasm_target, .optimize = optimize });
+    const apple_options = b.addOptions();
+    apple_options.addOption(bool, "enabled", false);
+    wasm_apple_mod.addOptions("apple_native_options", apple_options);
+    wasm_apple_mod.addImport("antfly_platform", wasm_platform_mod);
+    wasm_apple_mod.addImport("httpx", httpx_mod);
+    wasm_generating_mod.addImport("antfly_apple_native", wasm_apple_mod);
+    const wasm_extracting_mod = b.createModule(.{ .root_source_file = b.path("lib/extracting/src/mod.zig"), .target = wasm_target, .optimize = optimize });
+    wasm_extracting_mod.addImport("httpx", httpx_mod);
+    wasm_extracting_mod.addImport("antfly_extraction_openapi", api.extraction);
+    const wasm_structured_mod = b.createModule(.{ .root_source_file = b.path("lib/structured/root.zig"), .target = wasm_target, .optimize = optimize });
+    wasm_structured_mod.addImport("antfly_jsonschema", wasm_schema_mod);
+    wasm_structured_mod.addImport("antfly_generating", wasm_generating_mod);
+    wasm_structured_mod.addImport("antfly_extracting", wasm_extracting_mod);
+    wasm_decisions_mod.addImport("antfly_structured", wasm_structured_mod);
+    embedded_support_wasm_mod.addImport("antfly_generating", wasm_generating_mod);
+    embedded_support_wasm_mod.addImport("antfly_structured", wasm_structured_mod);
+    embedded_support_wasm_mod.addImport("antfly_decisions", wasm_decisions_mod);
+    inference_wasm_inference_mod.addImport("antfly_decisions", wasm_decisions_mod);
+    inference_wasm_inference_mod.addImport("antfly_extracting", wasm_extracting_mod);
+    inference_wasm_inference_mod.addImport("antfly_runtime_abi", wasm_runtime_abi_mod);
     inference_wasm_inference_mod.addImport("build_options", inference_wasm_build_options_mod);
     inference_wasm_inference_mod.addImport("inference_audio", wasm_inference_audio_mod);
+    inference_wasm_inference_mod.addImport("antfly_media", wasm_inference_audio_mod.import_table.get("antfly_media").?);
     inference_wasm_inference_mod.addImport("inference_linalg", wasm_inference_linalg_mod);
     inference_wasm_inference_mod.addImport("inference_tokenizer", wasm_inference_tokenizer_mod);
     inference_wasm_inference_mod.addImport("inference_hf_tokenizer", wasm_inference_hf_tokenizer_mod);
     inference_wasm_inference_mod.addImport("antfly_image", wasm_image_mod);
+    @import("antfly_video").support.attach(b, inference_wasm_inference_mod, b.path("lib/video"), .{
+        .media = wasm_inference_audio_mod.import_table.get("antfly_media").?,
+        .image = wasm_image_mod,
+    });
     inference_wasm_inference_mod.addImport("antfly_platform", wasm_platform_mod);
     inference_wasm_inference_mod.addImport("jinja", wasm_inference_jinja_mod);
     inference_wasm_inference_mod.addImport("ml", wasm_inference_ml_mod);
@@ -416,10 +485,11 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     const antfly_wasm = b.addExecutable(.{
         .name = "antfly_wasm",
         .root_module = antfly_wasm_mod,
-        // Cold ReleaseSafe LLVM codegen measured 18.45 GB. Reserve 20 GiB
-        // with headroom so full-suite admission does not overlap it with
-        // the large native engine archives beyond the build memory budget.
-        .max_rss = 20 * 1024 * 1024 * 1024,
+        // Keep the production bundle's existing conservative reservation.
+        // The optional DWARF build exceeded the 24 GiB runner envelope; its
+        // larger reservation makes a bounded CI invocation reject that
+        // profile before spending time on a build which cannot fit.
+        .max_rss = (if (strip) @as(u64, 20) else 32) * 1024 * 1024 * 1024,
     });
     antfly_wasm.entry = .disabled;
     antfly_wasm.rdynamic = true;

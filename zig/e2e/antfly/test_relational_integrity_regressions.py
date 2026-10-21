@@ -31,6 +31,8 @@ def test_equivalent_cascades(auth_api, mixed_spelling):
     )
     for table in ["p1", "p2", "child"]:
         schema = _schema()
+        # Independent parent tables need distinct namespace backing indexes.
+        schema["unique_constraints"][0]["name"] = f"{table}_pk"
         schema["document_schemas"]["row"]["schema"]["properties"]["id"] = {
             "type": "number"
         }
@@ -197,6 +199,8 @@ def test_equivalent_datetime_cascades(auth_api, mixed_spelling):
     )
     for table in ["p1", "p2", "child"]:
         schema = _schema()
+        # Independent parent tables need distinct namespace backing indexes.
+        schema["unique_constraints"][0]["name"] = f"{table}_pk"
         schema["document_schemas"]["row"]["schema"]["properties"]["id"] = {
             "type": "datetime",
         }
@@ -264,6 +268,8 @@ def test_conflicting_cascade_has_client_conflict_status(auth_api, explicit_child
     )
     for table in ["p1", "p2", "child"]:
         schema = _schema()
+        # Independent parent tables need distinct namespace backing indexes.
+        schema["unique_constraints"][0]["name"] = f"{table}_pk"
         schema["document_schemas"]["row"]["schema"]["properties"]["id"] = {
             "type": "number"
         }

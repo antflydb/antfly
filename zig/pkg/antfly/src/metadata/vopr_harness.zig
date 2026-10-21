@@ -6911,6 +6911,8 @@ pub const MetadataAdminVoprSource = struct {
             .lake_index_lifecycle_read,
             .lake_index_lifecycle_work,
             .lake_index_lifecycle_mutate,
+            .relation_replace,
+            .relation_schema_mutate,
             .policy_install_snapshot,
             .policy_publication_status,
             .policy_publication_work,
@@ -6967,6 +6969,7 @@ pub const MetadataAdminVoprSource = struct {
             .read => |request| try store.systemCatalogRead(alloc, group_id, request),
             .list_tables => |request| try store.listSystemCatalogTables(alloc, group_id, request),
             .table_status => |request| try store.listSystemCatalogTables(alloc, group_id, request.listing()),
+            .resolver_catalog_read => |request| try store.resolverCatalogRead(alloc, group_id, request),
             .mutate => unreachable,
         };
         errdefer alloc.free(result);

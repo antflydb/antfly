@@ -56,7 +56,7 @@ backend. Receipts retain the requested selector and record the selected format.
 Automatic selection chooses one artifact set: GGUF first, then safetensors,
 then ONNX. `:hybrid` explicitly requests both ONNX and safetensors when available.
 Selection depends on repository artifacts, not the machine that downloads them.
-Architecture/operator support and the CPU, Metal, CUDA, or ONNX Runtime execution
+Architecture/operator support and the CPU, Metal, or CUDA execution
 backend are checked when loading the model; a downloadable file is not a claim
 that every backend can execute it.
 

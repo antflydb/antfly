@@ -2840,6 +2840,10 @@ pub const MetadataHttpServer = struct {
     }
 
     fn metadataMutationError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        if (err == error.ResolverCurationConflict) {
+            try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_not_proposed);
+            return ctx.status(system_catalog.httpStatus(err)).text(@errorName(err));
+        }
         if (err == error.MetadataMutationNotApplied) {
             try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_not_applied);
             try ctx.setHeader("Retry-After", "1");
@@ -7222,7 +7226,8 @@ test "metadata linearizable snapshot detects concurrent projection changes" {
     try std.testing.expect(AdminSource.sameSnapshotFence(before, after));
 
     after.metadata_raft_commit_index += 1;
-    try std.testing.expect(!AdminSource.sameSnapshotFence(before, after));
+    // Pending committed work has not changed the applied snapshot.
+    try std.testing.expect(AdminSource.sameSnapshotFence(before, after));
     after.metadata_raft_commit_index = before.metadata_raft_commit_index;
     after.metadata_raft_applied_index += 1;
     try std.testing.expect(!AdminSource.sameSnapshotFence(before, after));
@@ -7241,6 +7246,10 @@ test "coherent linearizable snapshot retries a torn capture and preserves reques
         snapshot_calls: usize = 0,
         frees: usize = 0,
         saw_request_id: bool = false,
+        torn_captures: usize = 1,
+        commit_only: bool = false,
+        cancel_after_capture: ?usize = null,
+        cancel_signal: ?*std.atomic.Value(bool) = null,
 
         const incarnation: metadata_api.MetadataClusterIncarnation = "22222222222222222222222222222222".*;
 
@@ -7267,14 +7276,16 @@ test "coherent linearizable snapshot retries a torn capture and preserves reques
 
         pub fn adminSnapshotFence(self: *@This()) !service.AdminSnapshotFence {
             defer self.fence_calls += 1;
-            return fence(switch (self.fence_calls) {
-                0 => 1,
-                else => 2,
-            });
+            var captured = fence(if (self.commit_only) 1 else @min((self.fence_calls + 1) / 2, self.torn_captures) + 1);
+            if (self.commit_only) captured.metadata_raft_commit_index = self.fence_calls + 1;
+            return captured;
         }
 
         pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
             self.snapshot_calls += 1;
+            if (self.cancel_after_capture) |limit| {
+                if (self.snapshot_calls >= limit) self.cancel_signal.?.store(true, .release);
+            }
             return .{
                 .status = .{
                     .metadata_group_id = 77,
@@ -7309,6 +7320,36 @@ test "coherent linearizable snapshot retries a torn capture and preserves reques
     try std.testing.expectEqual(@as(u64, 2), snapshot.status.metadata_epoch);
     fake.freeAdminSnapshot(&snapshot);
     try std.testing.expectEqual(@as(usize, 2), fake.frees);
+
+    // More than three real projection collisions must not exhaust a request
+    // that still has time to capture a coherent view.
+    var busy = FakeService{ .torn_captures = 4 };
+    var settled = try AdminSource.coherentLinearizableSnapshot(FakeService, &busy, .{});
+    try std.testing.expectEqual(@as(usize, 1), busy.barrier_calls);
+    try std.testing.expectEqual(@as(usize, 5), busy.snapshot_calls);
+    try std.testing.expectEqual(@as(usize, 4), busy.frees);
+    try std.testing.expectEqual(@as(u64, 5), settled.status.metadata_epoch);
+    busy.freeAdminSnapshot(&settled);
+    try std.testing.expectEqual(@as(usize, 5), busy.frees);
+
+    // Commit advancement alone cannot tear an unchanged applied projection.
+    var commits = FakeService{ .commit_only = true };
+    var unchanged = try AdminSource.coherentLinearizableSnapshot(FakeService, &commits, .{});
+    try std.testing.expectEqual(@as(usize, 1), commits.snapshot_calls);
+    commits.freeAdminSnapshot(&unchanged);
+
+    // Churn must remain cancelable, including cleanup of the last capture.
+    var canceled = std.atomic.Value(bool).init(false);
+    var canceling = FakeService{ .torn_captures = 100, .cancel_after_capture = 5, .cancel_signal = &canceled };
+    try std.testing.expectError(error.Canceled, AdminSource.coherentLinearizableSnapshot(FakeService, &canceling, .{
+        .cancellation = operation.CancellationToken.fromAtomic(&canceled),
+    }));
+    try std.testing.expectEqual(@as(usize, 5), canceling.snapshot_calls);
+    try std.testing.expectEqual(@as(usize, 5), canceling.frees);
+
+    var expired = FakeService{};
+    try std.testing.expectError(error.DeadlineExceeded, AdminSource.coherentLinearizableSnapshot(FakeService, &expired, .{ .deadline_ns = 0 }));
+    try std.testing.expectEqual(@as(usize, 0), expired.snapshot_calls);
 }
 
 test "metadata http server accepts internal reallocate and split merge routes" {

@@ -2,6 +2,7 @@
 // Package: antfly_decision_openapi
 
 const std = @import("std");
+const antfly_generating_openapi = @import("antfly_generating_openapi");
 
 pub const ChoiceDecisionQuestion = struct {
     type: []const u8,
@@ -50,7 +51,11 @@ pub const DecideAnswer = union(enum) {
     embedding_choice_answer: *EmbeddingChoiceAnswer,
     trained_choice_answer: *TrainedChoiceAnswer,
     trained_score_answer: *TrainedScoreAnswer,
+    generated_choice_answer: *GeneratedChoiceAnswer,
+    generated_multi_choice_answer: *GeneratedMultiChoiceAnswer,
     trained_predicate_answer: *TrainedPredicateAnswer,
+    generated_predicate_answer: *GeneratedPredicateAnswer,
+    generated_score_answer: *GeneratedScoreAnswer,
 
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
         const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
@@ -154,6 +159,34 @@ pub const DecideAnswer = union(enum) {
             "name",
             "type",
             "decision_method",
+            "probability_source",
+            "raw_structured_answer",
+            "choice",
+            "probabilities",
+        }) and
+            objectStringEquals(source.object, "type", "choice") and
+            objectStringEquals(source.object, "decision_method", "generated"))
+        {
+            if (try parseStructuralVariant(GeneratedChoiceAnswer, allocator, source, options)) |parsed| return .{ .generated_choice_answer = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "name",
+            "type",
+            "decision_method",
+            "probability_source",
+            "raw_structured_answer",
+            "choices",
+            "probabilities",
+        }) and
+            objectStringEquals(source.object, "type", "multi_choice") and
+            objectStringEquals(source.object, "decision_method", "generated"))
+        {
+            if (try parseStructuralVariant(GeneratedMultiChoiceAnswer, allocator, source, options)) |parsed| return .{ .generated_multi_choice_answer = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "name",
+            "type",
+            "decision_method",
             "confidence",
             "confidence_method",
             "act_probability",
@@ -164,6 +197,32 @@ pub const DecideAnswer = union(enum) {
         {
             if (try parseStructuralVariant(TrainedPredicateAnswer, allocator, source, options)) |parsed| return .{ .trained_predicate_answer = parsed };
         }
+        if (objectHasAnyKey(source.object, &.{
+            "name",
+            "type",
+            "decision_method",
+            "probability_source",
+            "raw_structured_answer",
+            "probability",
+        }) and
+            objectStringEquals(source.object, "type", "predicate") and
+            objectStringEquals(source.object, "decision_method", "generated"))
+        {
+            if (try parseStructuralVariant(GeneratedPredicateAnswer, allocator, source, options)) |parsed| return .{ .generated_predicate_answer = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "name",
+            "type",
+            "decision_method",
+            "probability_source",
+            "raw_structured_answer",
+            "score",
+        }) and
+            objectStringEquals(source.object, "type", "score") and
+            objectStringEquals(source.object, "decision_method", "generated"))
+        {
+            if (try parseStructuralVariant(GeneratedScoreAnswer, allocator, source, options)) |parsed| return .{ .generated_score_answer = parsed };
+        }
         return error.UnexpectedToken;
     }
 
@@ -173,8 +232,58 @@ pub const DecideAnswer = union(enum) {
             .embedding_choice_answer => |v| try jw.write(v.*),
             .trained_choice_answer => |v| try jw.write(v.*),
             .trained_score_answer => |v| try jw.write(v.*),
+            .generated_choice_answer => |v| try jw.write(v.*),
+            .generated_multi_choice_answer => |v| try jw.write(v.*),
             .trained_predicate_answer => |v| try jw.write(v.*),
+            .generated_predicate_answer => |v| try jw.write(v.*),
+            .generated_score_answer => |v| try jw.write(v.*),
         }
+    }
+};
+
+/// Explicit windowing for qualified boundary decision models. Span and embedding decision models reject window mode. Omission preserves rejection of over-limit text.
+pub const DecideLongDocument = struct {
+    mode: ?[]const u8 = null,
+    window_words: ?i64 = null,
+    /// Must be smaller than window_words. Only valid in window mode.
+    overlap_words: ?i64 = null,
+    max_windows: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "mode", "mode", true },
+        .{ "window_words", "window_words", true },
+        .{ "overlap_words", "overlap_words", true },
+        .{ "max_windows", "max_windows", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.mode) |value| {
+            try jw.objectField("mode");
+            try jw.write(value);
+        }
+        if (self.window_words) |value| {
+            try jw.objectField("window_words");
+            try jw.write(value);
+        }
+        if (self.overlap_words) |value| {
+            try jw.objectField("overlap_words");
+            try jw.write(value);
+        }
+        if (self.max_windows) |value| {
+            try jw.objectField("max_windows");
+            try jw.write(value);
+        }
+        try jw.endObject();
     }
 };
 
@@ -279,20 +388,28 @@ pub const DecideQuestion = union(enum) {
 
 /// Supply exactly one of input (single text) or inputs (Antfly batch extension). Question names must be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are bounded at 16 MiB.
 pub const DecideRequest = struct {
+    /// Explicit shared-context transport version. Requires batched inputs and contexts; unknown versions are rejected.
+    context_version: ?i64 = null,
+    /// Shared immutable context strings referenced by context_index. Requires context_version 1. Total expanded input bytes are limited to 16 MiB.
+    contexts: ?[]const []const u8 = null,
     model: []const u8,
     /// Pin the exact EmbeddingGemma 2 assets and embedding recipe.
     model_identity: ?[]const u8 = null,
     input: ?[]const u8 = null,
     inputs: ?[]const DecisionInput = null,
+    long_document: ?DecideLongDocument = null,
     questions: []const DecideQuestion,
     embedding_options: ?EmbeddingDecisionOptions = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "context_version", "context_version", true },
+        .{ "contexts", "contexts", true },
         .{ "model", "model", false },
         .{ "model_identity", "model_identity", true },
         .{ "input", "input", true },
         .{ "inputs", "inputs", true },
+        .{ "long_document", "long_document", true },
         .{ "questions", "questions", false },
         .{ "embedding_options", "embedding_options", true },
     };
@@ -307,6 +424,14 @@ pub const DecideRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.context_version) |value| {
+            try jw.objectField("context_version");
+            try jw.write(value);
+        }
+        if (self.contexts) |value| {
+            try jw.objectField("contexts");
+            try jw.write(value);
+        }
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.model_identity) |value| {
@@ -319,6 +444,10 @@ pub const DecideRequest = struct {
         }
         if (self.inputs) |value| {
             try jw.objectField("inputs");
+            try jw.write(value);
+        }
+        if (self.long_document) |value| {
+            try jw.objectField("long_document");
             try jw.write(value);
         }
         try jw.objectField("questions");
@@ -387,12 +516,15 @@ pub const DecideResponse = struct {
 pub const DecisionBatchItem = struct {
     input_index: i64,
     id: ?[]const u8 = null,
+    /// Generated batches preserve valid siblings; a failed item has an empty answers array and this error code.
+    @"error": ?[]const u8 = null,
     answers: []const DecideAnswer,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "input_index", "input_index", false },
         .{ "id", "id", true },
+        .{ "error", "error", true },
         .{ "answers", "answers", false },
     };
 
@@ -410,6 +542,10 @@ pub const DecisionBatchItem = struct {
         try jw.write(self.input_index);
         if (self.id) |value| {
             try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.@"error") |value| {
+            try jw.objectField("error");
             try jw.write(value);
         }
         try jw.objectField("answers");
@@ -463,11 +599,14 @@ pub const DecisionChoiceProbability = struct {
 pub const DecisionInput = struct {
     id: ?[]const u8 = null,
     input: []const u8,
+    /// Index into request contexts. Requires context_version 1. Effective input is context, newline, then input; the 1 MiB input limit applies after expansion.
+    context_index: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "id", "id", true },
         .{ "input", "input", false },
+        .{ "context_index", "context_index", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -486,6 +625,10 @@ pub const DecisionInput = struct {
         }
         try jw.objectField("input");
         try jw.write(self.input);
+        if (self.context_index) |value| {
+            try jw.objectField("context_index");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -525,6 +668,79 @@ pub const DecisionLevelProbability = struct {
     label: []const u8,
     value: i64,
     probability: f64,
+};
+
+/// A trained decider request or a constrained generator request.
+pub const DecisionRequest = union(enum) {
+    generated_decide_request: *GeneratedDecideRequest,
+    decide_request: *DecideRequest,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectStringEquals(object: std.json.ObjectMap, comptime key: []const u8, comptime expected: []const u8) bool {
+        const value = object.get(key) orelse return false;
+        return value == .string and std.mem.eql(u8, value.string, expected);
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "decision_method",
+            "generator",
+            "input",
+            "inputs",
+            "questions",
+            "instructions",
+            "output",
+            "probabilities",
+            "batch",
+        }) and
+            objectStringEquals(source.object, "decision_method", "generated"))
+        {
+            if (try parseStructuralVariant(GeneratedDecideRequest, allocator, source, options)) |parsed| return .{ .generated_decide_request = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "context_version",
+            "contexts",
+            "model",
+            "model_identity",
+            "input",
+            "inputs",
+            "long_document",
+            "questions",
+            "embedding_options",
+        })) {
+            if (try parseStructuralVariant(DecideRequest, allocator, source, options)) |parsed| return .{ .decide_request = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .generated_decide_request => |v| try jw.write(v.*),
+            .decide_request => |v| try jw.write(v.*),
+        }
+    }
 };
 
 pub const DecisionSimilarity = struct {
@@ -758,6 +974,373 @@ pub const EmbeddingMultiChoiceAnswer = struct {
         try jw.write(self.choices);
         try jw.objectField("similarity_thresholds");
         try jw.write(self.similarity_thresholds);
+        try jw.endObject();
+    }
+};
+
+pub const GeneratedChoiceAnswer = struct {
+    name: []const u8,
+    type: []const u8,
+    decision_method: []const u8,
+    /// Measured decoder evidence, or an explicit verdict-only 0/1 assertion. No model-written confidence.
+    probability_source: []const u8,
+    raw_structured_answer: []const u8,
+    choice: []const u8,
+    probabilities: []const DecisionChoiceProbability,
+};
+
+pub const GeneratedChoiceDecisionQuestion = struct {
+    type: []const u8,
+    name: []const u8,
+    /// May inherit nonempty generated decider instructions.
+    instructions: ?[]const u8 = null,
+    choices: []const DecisionChoice,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "name", "name", false },
+        .{ "instructions", "instructions", true },
+        .{ "choices", "choices", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.instructions) |value| {
+            try jw.objectField("instructions");
+            try jw.write(value);
+        }
+        try jw.objectField("choices");
+        try jw.write(self.choices);
+        try jw.endObject();
+    }
+};
+
+pub const GeneratedDecideQuestion = union(enum) {
+    generated_choice_decision_question: *GeneratedChoiceDecisionQuestion,
+    generated_multi_choice_decision_question: *GeneratedMultiChoiceDecisionQuestion,
+    generated_predicate_decision_question: *GeneratedPredicateDecisionQuestion,
+    generated_score_decision_question: *GeneratedScoreDecisionQuestion,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    fn parseStructuralVariantFromSlice(comptime T: type, allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !*T {
+        const parsed = try std.json.parseFromSliceLeaky(T, allocator, input, options);
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        switch (probe.type) {
+            .value => |disc_str| {
+                if (std.mem.eql(u8, disc_str, "choice")) return .{ .generated_choice_decision_question = try parseStructuralVariantFromSlice(GeneratedChoiceDecisionQuestion, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "multi_choice")) return .{ .generated_multi_choice_decision_question = try parseStructuralVariantFromSlice(GeneratedMultiChoiceDecisionQuestion, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "predicate")) return .{ .generated_predicate_decision_question = try parseStructuralVariantFromSlice(GeneratedPredicateDecisionQuestion, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "score")) return .{ .generated_score_decision_question = try parseStructuralVariantFromSlice(GeneratedScoreDecisionQuestion, allocator, input, options) };
+                return error.UnexpectedToken;
+            },
+            .missing => {
+                return error.MissingField;
+            },
+        }
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
+        const disc_str = switch (disc_val) {
+            .string => |value| value,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "choice")) {
+            const parsed = try parseStructuralVariant(GeneratedChoiceDecisionQuestion, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .generated_choice_decision_question = parsed };
+        }
+        if (std.mem.eql(u8, disc_str, "multi_choice")) {
+            const parsed = try parseStructuralVariant(GeneratedMultiChoiceDecisionQuestion, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .generated_multi_choice_decision_question = parsed };
+        }
+        if (std.mem.eql(u8, disc_str, "predicate")) {
+            const parsed = try parseStructuralVariant(GeneratedPredicateDecisionQuestion, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .generated_predicate_decision_question = parsed };
+        }
+        if (std.mem.eql(u8, disc_str, "score")) {
+            const parsed = try parseStructuralVariant(GeneratedScoreDecisionQuestion, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .generated_score_decision_question = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .generated_choice_decision_question => |v| try jw.write(v.*),
+            .generated_multi_choice_decision_question => |v| try jw.write(v.*),
+            .generated_predicate_decision_question => |v| try jw.write(v.*),
+            .generated_score_decision_question => |v| try jw.write(v.*),
+        }
+    }
+};
+
+/// Supply exactly one of input or inputs. Each question requires instructions unless nonempty decider instructions are supplied. Inference nodes admit registered native generators; hosted execution uses configured producer and SQL runtimes.
+pub const GeneratedDecideRequest = struct {
+    decision_method: []const u8,
+    generator: antfly_generating_openapi.GeneratorConfig,
+    input: ?[]const u8 = null,
+    inputs: ?[]const DecisionInput = null,
+    questions: []const GeneratedDecideQuestion,
+    instructions: ?[]const u8 = null,
+    output: ?antfly_generating_openapi.ConstrainedOutput = null,
+    probabilities: ?antfly_generating_openapi.ConstrainedProbabilities = null,
+    batch: ?antfly_generating_openapi.ConstrainedGenerationBatch = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "decision_method", "decision_method", false },
+        .{ "generator", "generator", false },
+        .{ "input", "input", true },
+        .{ "inputs", "inputs", true },
+        .{ "questions", "questions", false },
+        .{ "instructions", "instructions", true },
+        .{ "output", "output", false },
+        .{ "probabilities", "probabilities", false },
+        .{ "batch", "batch", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("decision_method");
+        try jw.write(self.decision_method);
+        try jw.objectField("generator");
+        try jw.write(self.generator);
+        if (self.input) |value| {
+            try jw.objectField("input");
+            try jw.write(value);
+        }
+        if (self.inputs) |value| {
+            try jw.objectField("inputs");
+            try jw.write(value);
+        }
+        try jw.objectField("questions");
+        try jw.write(self.questions);
+        if (self.instructions) |value| {
+            try jw.objectField("instructions");
+            try jw.write(value);
+        }
+        if (self.output) |value| {
+            try jw.objectField("output");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("output");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.probabilities) |value| {
+            try jw.objectField("probabilities");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("probabilities");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.batch) |value| {
+            try jw.objectField("batch");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("batch");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
+};
+
+pub const GeneratedMultiChoiceAnswer = struct {
+    name: []const u8,
+    type: []const u8,
+    decision_method: []const u8,
+    /// Measured decoder evidence, or an explicit verdict-only 0/1 assertion. No model-written confidence.
+    probability_source: []const u8,
+    raw_structured_answer: []const []const u8,
+    choices: []const []const u8,
+    probabilities: []const DecisionChoiceProbability,
+};
+
+pub const GeneratedMultiChoiceDecisionQuestion = struct {
+    type: []const u8,
+    name: []const u8,
+    /// May inherit nonempty generated decider instructions.
+    instructions: ?[]const u8 = null,
+    choices: []const DecisionChoice,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "name", "name", false },
+        .{ "instructions", "instructions", true },
+        .{ "choices", "choices", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.instructions) |value| {
+            try jw.objectField("instructions");
+            try jw.write(value);
+        }
+        try jw.objectField("choices");
+        try jw.write(self.choices);
+        try jw.endObject();
+    }
+};
+
+pub const GeneratedPredicateAnswer = struct {
+    name: []const u8,
+    type: []const u8,
+    decision_method: []const u8,
+    /// Measured decoder evidence, or an explicit verdict-only 0/1 assertion. No model-written confidence.
+    probability_source: []const u8,
+    raw_structured_answer: bool,
+    probability: f64,
+};
+
+pub const GeneratedPredicateDecisionQuestion = struct {
+    type: []const u8,
+    name: []const u8,
+    /// May inherit nonempty generated decider instructions.
+    instructions: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "name", "name", false },
+        .{ "instructions", "instructions", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.instructions) |value| {
+            try jw.objectField("instructions");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const GeneratedScoreAnswer = struct {
+    name: []const u8,
+    type: []const u8,
+    decision_method: []const u8,
+    /// Measured decoder evidence, or an explicit verdict-only 0/1 assertion. No model-written confidence.
+    probability_source: []const u8,
+    raw_structured_answer: f64,
+    score: f64,
+};
+
+pub const GeneratedScoreDecisionQuestion = struct {
+    type: []const u8,
+    name: []const u8,
+    /// May inherit nonempty generated decider instructions.
+    instructions: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "name", "name", false },
+        .{ "instructions", "instructions", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.instructions) |value| {
+            try jw.objectField("instructions");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };

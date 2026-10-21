@@ -773,9 +773,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer self.context_init_mutex.unlock();
         try self.context.ensure();
         if (self.remote_content_configured) return;
-        const security_json = try common_config.remoteContentSecurityJsonAlloc(self.alloc, self.remote_content);
-        defer self.alloc.free(security_json);
-        try self.context.configureRemoteContentSecurity(security_json);
+        try self.context.configureRemoteContent(self.remote_content);
         try self.context.configureSecrets(self.secret_store);
         self.remote_content_configured = true;
     }
@@ -905,6 +903,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .list_artifact_repair_issues_group_local = listArtifactRepairIssuesGroupLocal,
                 .vector_migration_group_local = vectorMigrationGroupLocal,
                 .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
+                .resolver_operation_group_local = resolverOperationGroupLocal,
                 .repair_artifact_issues_group_local = repairArtifactIssuesGroupLocal,
                 .repair_artifact_issues_group_local_controlled = repairArtifactIssuesGroupLocalControlled,
                 .update_document_artifact_child_range_placement_group_local = updateDocumentArtifactChildRangePlacementGroupLocal,
@@ -912,6 +911,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .local_runtime_statuses = localRuntimeStatuses,
                 .text_memory_attribution_stats_best_effort = textMemoryAttributionStatsBestEffort,
                 .preflight_write_admission_group_local = preflightWriteAdmissionGroupLocal,
+                .preflight_grouped_source_batch_group_local = preflightGroupedSourceBatchGroupLocal,
                 .prepare_hot_standby_seed_snapshot_group_local = prepareHotStandbySeedSnapshotGroupLocal,
                 .capture_hot_standby_seed_snapshot_group_local = captureHotStandbySeedSnapshotGroupLocal,
                 .find_median_key_group_local = findMedianKeyGroupLocal,
@@ -1709,9 +1709,39 @@ pub const ProvisionedKernelOwnerSource = struct {
             .enrichments => .enrichments,
             .full_index => .full_index,
         };
-        var lease = try self.acquire(group_id, table_name);
-        defer lease.deinit();
-        try lease.owner().waitForSyncWithCancellation(table_name, owner_sync_level, cancellation);
+        var target: abi.SyncTarget = .{};
+        const Slice = struct {
+            outer: db_types.CancellationToken,
+            until: u64,
+            fn cancelled(ptr: *const anyopaque) bool {
+                const slice: *const @This() = @ptrCast(@alignCast(ptr));
+                return slice.outer.isCancelled() or platform_time.monotonicNs() >= slice.until;
+            }
+        };
+        while (true) {
+            try cancellation.check();
+            if (target.captured != 0 and platform_time.monotonicNs() >= target.deadline_ns) return error.Timeout;
+            const complete = blk: {
+                // Owner transitions may be prerequisites of derived progress.
+                // Keep a fixed replay target, but never retain this lease for
+                // the entire visibility wait and block those transitions.
+                var lease = try self.acquire(group_id, table_name);
+                defer lease.deinit();
+                const slice = Slice{ .outer = cancellation, .until = @min(platform_time.monotonicNs() +| 50 * std.time.ns_per_ms, if (target.captured != 0) target.deadline_ns else std.math.maxInt(u64)) };
+                lease.owner().waitForSyncTargetWithCancellation(table_name, owner_sync_level, &target, .{ .ptr = &slice, .is_cancelled_fn = Slice.cancelled }) catch |err| switch (err) {
+                    // The storage owner preserves enrichment cancellation's
+                    // typed identity across the native boundary. An expired
+                    // local slice must yield the lease and resume; only the
+                    // outer request token may cancel the whole barrier.
+                    error.Canceled, error.EnrichmentWaitCanceled => break :blk false,
+                    else => return err,
+                };
+                break :blk true;
+            };
+            if (complete) return;
+            try cancellation.check();
+            platform_time.sleepNs(std.time.ns_per_ms);
+        }
     }
 
     pub fn applyHotStandbyReplicationRecordGroupLocal(
@@ -2493,6 +2523,17 @@ pub const ProvisionedKernelOwnerSource = struct {
         return false;
     }
 
+    fn preflightGroupedSourceBatchGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_types.BatchRequest) !?void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        if (!try lease.owner().preflightWriteAdmissionJson(table_name, "")) return {};
+        const encoded = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
+        defer alloc.free(encoded);
+        _ = try lease.owner().preflightWriteAdmissionJson(table_name, encoded);
+        return {};
+    }
+
     fn preflightWriteAdmissionGroupLocal(
         ptr: *anyopaque,
         group_id: u64,
@@ -3135,6 +3176,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         return .ok;
     }
 
+    fn entitySupportsCuration(ptr: ?*anyopaque, supported: *u8) callconv(.c) abi.Status {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+        const sink = self.entity_sink orelse return .invalid_argument;
+        supported.* = @intFromBool(sink.supportsCuration() catch |err| return kernel_error_identity.statusFromError(err));
+        return .ok;
+    }
+
     fn entityUpsert(
         ptr: ?*anyopaque,
         table: abi.BorrowedBytes,
@@ -3165,6 +3213,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .key = source.key.slice(),
             .doc_json = source.doc_json.slice(),
             .delete = source.delete != 0,
+            .skip_if_missing = source.skip_if_missing != 0,
         };
         sink.upsertBatch(self.alloc, entries) catch |err|
             return kernel_error_identity.statusFromError(err);
@@ -3199,7 +3248,9 @@ pub const ProvisionedKernelOwnerSource = struct {
             .coordinated_ttl_enqueue_fn = if (self.coordinated_ttl != null) enqueueCoordinatedTtl else null,
             .native_authority_ctx = if (self.native_migration_policy != null) self else null,
             .native_authority_fn = if (self.native_migration_policy != null) nativeAuthorityPermitted else null,
-            .resolution_candidates = if (self.resolution_candidate_source != null) .{
+            .resolution_candidates = if (self.resolution_candidate_source) |*source| .{
+                .native_view = .fromSlice(std.mem.asBytes(source)),
+                .native_view_contract = .fromSlice(runtime_callbacks.CandidateSource.nativeContractBytes()),
                 .callback_ctx = self,
                 .get_fn = resolutionCandidateGet,
                 .scan_prefix_fn = resolutionCandidateScanPrefix,
@@ -3209,6 +3260,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .callback_ctx = self,
                 .upsert_fn = entityUpsert,
                 .upsert_batch_fn = entityUpsertBatch,
+                .supports_curation_fn = entitySupportsCuration,
             } else .{},
             .promotion_owner_ctx = if (self.promotion_leadership_source != null) self else null,
             .promotion_owner_fn = if (self.promotion_leadership_source != null) promotionOwner else null,
@@ -4741,7 +4793,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (!opts.fk_generation_source_control or !opts.fk_generation_source_read_index_certified or
             key.len != 0 or consistency != .stale or
             opts.relational_integrity_action or opts.relational_integrity_jobs_json.len != 0 or
-            opts.relational_activation_json.len != 0 or opts.relational_index_status_json.len != 0 or
+            opts.relational_activation_json.len != 0 or opts.group_source_query_json.len != 0 or opts.relational_index_status_json.len != 0 or
             opts.row_policy_receipt != null or opts.restore_staging_scope != null or
             opts.include_primary_digest or opts.fields.len != 0) return false;
         if (opts.relational_integrity_catalog)
@@ -4800,7 +4852,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         const handoff_identity = std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}");
         const handoff_receipt = handoff_identity or std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}");
         if (handoff_identity and (fence != null or opts.include_primary_digest or opts.relational_integrity_catalog or opts.relational_integrity_action or
-            opts.relational_integrity_jobs_json.len != 0 or opts.relational_index_status_json.len != 0 or
+            opts.relational_integrity_jobs_json.len != 0 or opts.group_source_query_json.len != 0 or opts.relational_index_status_json.len != 0 or
             opts.relational_activation_json.len != 0 or opts.fields.len != 0 or opts.generation_handoff_install_read_index_certified)) return error.RestoreStagingScopeChanged;
         if (handoff_receipt and (opts.restore_staging_plan_id == null or key.len != 0)) return error.RestoreStagingScopeChanged;
         var descriptor = try self.resolveRestoreDescriptor(alloc, group_id, table_name, scope, opts.restore_staging_plan_id, if (handoff_receipt) .resolve else .read, .{ .deadline_ns = opts.execution_deadline_ns, .deadline_io = opts.execution_io, .cancellation = opts.cancellation orelse .none });
@@ -5050,6 +5102,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer if (private_path) |path| alloc.free(path);
         var lease = if (descriptor) |owned| try self.acquireDescriptor(group_id, table_name, private_path.?, owned) else try self.acquire(group_id, table_name);
         defer lease.deinit();
+        if (descriptor == null and (req.writes.len != 0 or req.transforms.len != 0)) _ = try lease.owner().preflightWriteAdmissionJson(table_name, request_json);
         if (req.transaction != null and req.restore_staging_scope != null) {
             // Private activation uses the batch route to retain exact Plan
             // authority for every transaction phase, including abort/retry.
@@ -6083,6 +6136,21 @@ pub const ProvisionedKernelOwnerSource = struct {
         return try alloc.dupe(u8, response.bytes());
     }
 
+    fn resolverOperationGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?[]u8 {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        var response = try lease.owner().resolverOperationJson(table_name, body);
+        defer response.deinit();
+        return try alloc.dupe(u8, response.bytes());
+    }
+
     fn textStatsGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -6240,6 +6308,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer response.deinit();
         var result = try table_reads.parseStorageKernelSearchResult(alloc, response.bytes());
         errdefer result.deinit();
+        try table_reads.restoreDocumentAuthority(alloc, alloc, group_id, req.document_authority_mode, &result);
         result.identity_read_generation = response.identityReadGeneration();
         if (req.identity_read_generation) |expected| {
             if (result.identity_read_generation != expected)
@@ -7591,4 +7660,37 @@ test "owner recovery bulk callback preserves bounded identities and uncertain st
     try std.testing.expectEqual(abi.Status.invalid_argument, ProvisionedKernelOwnerSource.transactionRecoveryAcknowledgeMany(&owner, &txn, .fromSlice("owner"), &participants, 65));
     try std.testing.expectEqual(abi.Status.invalid_argument, ProvisionedKernelOwnerSource.transactionRecoveryAcknowledgeMany(&owner, &txn, .fromSlice("owner"), null, 2));
     try std.testing.expectEqual(@as(usize, 4), recorder.calls);
+}
+
+test "storage owner entity sink bridge preserves curation capability and missing-row policy" {
+    const Fixture = struct {
+        supported: bool = true,
+        seen: bool = false,
+        fn supports(ptr: *anyopaque) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.supported;
+        }
+        fn upsert(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) anyerror!void {}
+        fn batch(ptr: *anyopaque, _: std.mem.Allocator, entries: []const runtime_callbacks.EntityUpsert) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(usize, 1), entries.len);
+            try std.testing.expect(entries[0].skip_if_missing);
+            try std.testing.expectEqualStrings("table:7", entries[0].storage_table.?);
+            self.seen = true;
+        }
+    };
+    var fixture: Fixture = .{};
+    var source = ProvisionedKernelOwnerSource.init(std.testing.allocator, "/unused", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+    _ = source.withRuntimeHooks(null, .{ .ptr = &fixture, .vtable = &.{ .upsert = Fixture.upsert, .upsert_batch = Fixture.batch, .supports_curation = Fixture.supports } }, null);
+    const hooks = source.runtimeHooksConfig();
+    var supported: u8 = 0;
+    try std.testing.expectEqual(abi.Status.ok, hooks.entity_sink.supports_curation_fn.?(hooks.entity_sink.callback_ctx, &supported));
+    try std.testing.expectEqual(@as(u8, 1), supported);
+    fixture.supported = false;
+    try std.testing.expectEqual(abi.Status.ok, hooks.entity_sink.supports_curation_fn.?(hooks.entity_sink.callback_ctx, &supported));
+    try std.testing.expectEqual(@as(u8, 0), supported);
+    const entries = [_]abi.EntityUpsert{.{ .table = .fromSlice("entities"), .storage_table = .fromSlice("table:7"), .key = .fromSlice("entity/retired"), .doc_json = .fromSlice("{}"), .skip_if_missing = 1 }};
+    try std.testing.expectEqual(abi.Status.ok, hooks.entity_sink.upsert_batch_fn.?(hooks.entity_sink.callback_ctx, &entries, entries.len));
+    try std.testing.expect(fixture.seen);
 }

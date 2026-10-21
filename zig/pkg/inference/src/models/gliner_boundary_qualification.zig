@@ -32,7 +32,10 @@ const model = @import("gliner_boundary.zig");
 const artifact = @import("gliner_boundary_artifact.zig");
 
 pub const policy_version: u32 = 1;
-pub const max_entries: usize = 64;
+// The original table nearly filled 64 bits; exact wrapper profiles require
+// more entries. Geometry remains u64 and each row still matches independently.
+const CandidateMask = u128;
+pub const max_entries: usize = @bitSizeOf(CandidateMask);
 pub const Backend = enum { native, metal, cuda };
 
 /// Required features come from the complete compiled request, never from
@@ -185,11 +188,11 @@ fn fieldLimitError(comptime field_name: []const u8) LengthLimitError {
 /// together, that is a cross-row combination rather than one measured bound;
 /// blame the first field as a conservative default (still a genuine
 /// bounded-length rejection, not an unreviewed request shape).
-fn blamedLengthDimension(entries: []const Entry, previous: u64, observed: LengthContract) LengthLimitError {
+fn blamedLengthDimension(entries: []const Entry, previous: CandidateMask, observed: LengthContract) LengthLimitError {
     inline for (comptime std.meta.fieldNames(LengthContract)) |reflected_name| {
         var covered = false;
         for (entries, 0..) |entry, index| {
-            const bit = @as(u64, 1) << @intCast(index);
+            const bit = @as(CandidateMask, 1) << @intCast(index);
             if (previous & bit != 0 and @field(entry.lengths, reflected_name).contains(@field(observed, reflected_name))) covered = true;
         }
         if (!covered) return fieldLimitError(reflected_name);
@@ -231,13 +234,15 @@ pub const Entry = struct {
 //    qualification measures pinned base checkpoint production geometry").
 //    The bounds below are the exact observed range; widening them requires
 //    new measurement, not extrapolation.
-//  - Throughput: BENCHMARK.md's 2026-09-09 recorded CPU run for this exact
+//  - Throughput: the 2026-09-09 recorded CPU run (scripts/gliner25/BENCHMARK.md
+//    "Reference results"; full receipt in
+//    docs/design/inference/history/gliner2/gliner25-cpu-benchmark-runs.md) for this exact
 //    checkpoint (native/Python latency ratios 0.58-0.80 across the same ten
 //    tasks; mixed-task median 36.174 ms native versus 45.159 ms Python).
 //
 // See zig/pkg/inference/models/gliner2/GLINER25.md for the full record,
 // evidence pointers, and how to re-qualify a wider or different artifact.
-const fastino_gliner25_base_v1 = bundle.Identity{
+pub const fastino_gliner25_base_v1 = bundle.Identity{
     .backbone = .base,
     .precision = .fp32,
     .weight = .{ .size_bytes = 774366564, .sha256 = "7274094de2e0c2a37a386f55fc4e23061a954da5bd7a335e7dfe56f2743c277a".* },
@@ -247,6 +252,17 @@ const fastino_gliner25_base_v1 = bundle.Identity{
         .{ .size_bytes = 8341713, .sha256 = "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3".* },
         .{ .size_bytes = 645, .sha256 = "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1".* },
     },
+};
+
+// Transformers wrapper revision 54785d51df8d86a0d8f2eb212fec15871aad2c4d.
+// Only config.json changed: model_type, architectures, and an inline copy of
+// the encoder sidecar. The checked-in wrapper fixture parses to exactly the
+// same Config; the four other file identities are unchanged. Qualification
+// retains the original backends, features, and bounds (GLINER25.md).
+pub const fastino_gliner25_base_v1_transformers = blk: {
+    var identity = fastino_gliner25_base_v1;
+    identity.sidecars[0] = .{ .size_bytes = 4103, .sha256 = "d6b515c21ae2100c12267fb42a3f02c1e99ad87580366aebedb161efd74441c7".* };
+    break :blk identity;
 };
 
 // Every feature actually exercised, end to end, against the real weights by
@@ -319,7 +335,9 @@ const fastino_gliner25_base_v1_lengths = LengthContract{
 //    canonical schema_version 2 relations shape for a windowed request
 //    native/Metal" (server/gliner_boundary_service_test.zig) exercise this
 //    exact merge path end to end -- one against a real 37KB multi-window
-//    design-doc section (zig/VOPR.md's "Completion-Claim Audit"), one
+//    design-doc section (zig/VOPR.md's "Completion-Claim Audit", frozen at
+//    commit 3ce5aff4ea as testdata/gliner25/long_document_probe/
+//    vopr_completion_claim_audit.txt), one
 //    deterministically against the known repro relation -- through both the
 //    HTTP handler and the in-process provider entry, and assert the
 //    response matches zig/EXTRACT.md's canonical envelope (entities with
@@ -334,7 +352,10 @@ const fastino_gliner25_base_v1_lengths = LengthContract{
 //    percentile and max section size across zig/*.md and work-log/**/*.md):
 //    zig/pkg/antfly/src/storage/lsm/LSM.md's "Read And Scan Work" (6.8KB),
 //    zig/VOPR.md's "Completion-Claim Audit" (37KB), and zig/PDF.md's "Review
-//    findings and required fixes" (99KB) -- plus two synthetic documents
+//    findings and required fixes" (99KB) -- the latter two as frozen
+//    snapshots at commit 3ce5aff4ea under
+//    testdata/gliner25/long_document_probe/ (vopr_completion_claim_audit.txt,
+//    pdf_review_findings.txt) -- plus two synthetic documents
 //    built by concatenating real corpus sections (zig/PDF.md's two largest
 //    real sections, per a docsaf-accurate Go-side sweep of the whole ingest
 //    corpus) up to 130KB and 182KB/28275 words, well past every individual
@@ -494,7 +515,8 @@ const fastino_gliner25_base_v1_fp16_encoder = bundle.Identity{
 //    resolveModelDirectoryFromEnv) rather than copy-pasted: the 37KB VOPR.md
 //    "Completion-Claim Audit" multi-window document through both the HTTP
 //    handler and the in-process provider entry (native and Metal), the
-//    ~99KB PDF.md corpus-maximum section through both entries (native, the
+//    ~99KB PDF.md corpus-maximum section (both frozen snapshots under
+//    testdata/gliner25/long_document_probe/) through both entries (native, the
 //    same backend the fp32 row's corpus-maximum evidence used), and the
 //    corpus-minimum documents (20-byte SCHEMA.md section, 1-byte document)
 //    through the provider entry on both backends -- all pass with the
@@ -539,7 +561,7 @@ const fastino_gliner25_multi_v1 = bundle.Identity{
         .{ .size_bytes = 645, .sha256 = "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1".* },
     },
 };
-const fastino_gliner25_multi_decide = bundle.Identity{
+pub const fastino_gliner25_multi_decide = bundle.Identity{
     .backbone = .multi,
     .precision = .fp32,
     .weight = .{ .size_bytes = 1149461028, .sha256 = "9efe0f88c99f2aa794452e9559dc60e98d60d9fa2bf1b60cf2710411b6da5b4e".* },
@@ -574,68 +596,72 @@ fn classificationFamilyLengths(min_tokens: u64, max_tokens: u64) LengthContract 
 }
 
 const family_options = [_]Feature{ .word_whitespace, .overlap_flat, .offset_codepoints, .offset_utf8, .decoder_auto, .single_window, .confidence, .spans };
-const family_profiles = [_]struct { features: Features, lengths: LengthContract }{
-    .{
-        .features = Features.initMany(&(family_options ++ .{ .entities, .schema_descriptions })),
-        .lengths = .{
-            .request_items = Range.exact(1),
-            .document_bytes = .{ .min = 52, .max = 74 },
-            // Japanese has 8 source words; Spanish and Arabic each have 9.
-            // All three prepared body windows contain 9 processor words.
-            .document_words = .{ .min = 8, .max = 9 },
-            .window_count = Range.exact(1),
-            .window_words = Range.exact(9),
-            .padded_sequence_tokens = Range.exact(61),
+const family_profiles = blk: {
+    // WASM can construct these feature sets before the validation block runs.
+    @setEvalBranchQuota(1 << 14);
+    break :blk [_]struct { features: Features, lengths: LengthContract }{
+        .{
+            .features = Features.initMany(&(family_options ++ .{ .entities, .schema_descriptions })),
+            .lengths = .{
+                .request_items = Range.exact(1),
+                .document_bytes = .{ .min = 52, .max = 74 },
+                // Japanese has 8 source words; Spanish and Arabic each have 9.
+                // All three prepared body windows contain 9 processor words.
+                .document_words = .{ .min = 8, .max = 9 },
+                .window_count = Range.exact(1),
+                .window_words = Range.exact(9),
+                .padded_sequence_tokens = Range.exact(61),
+            },
         },
-    },
-    .{ .features = Features.initMany(&(family_options ++ .{ .entities, .schema_descriptions, .classification_single, .legacy_structures, .relations })), .lengths = familyLengths(Range.exact(63), Range.exact(11), Range.exact(107)) },
-    .{ .features = Features.initMany(&(family_options ++ .{ .classification_single, .classification_structured })), .lengths = .{
-        .request_items = Range.exact(1),
-        .document_bytes = .{ .min = 40, .max = 73 },
-        .document_words = .{ .min = 2, .max = 14 },
-        .window_count = Range.exact(1),
-        .window_words = .{ .min = 3, .max = 14 },
-        .padded_sequence_tokens = .{ .min = 27, .max = 39 },
-    } },
-    .{ .features = Features.initMany(&(family_options ++ .{ .classification_single, .classification_structured, .schema_descriptions })), .lengths = familyLengths(Range.exact(69), Range.exact(16), Range.exact(92)) },
-    .{ .features = Features.initMany(&(family_options ++ .{ .classification_single, .classification_structured, .classification_context })), .lengths = familyLengths(Range.exact(61), Range.exact(13), Range.exact(41)) },
-    // The same mixed schema exercises every listed learned feature together
-    // at one character and a real 658-byte document. ASCII endpoint
-    // parity is checked with both offset units. No long-window, batch, or
-    // public mode=multi permission is inferred from these observations.
-    .{ .features = Features.initMany(&(family_options ++ .{ .offset_utf8, .entities, .relations, .legacy_structures, .classification_single, .classification_structured, .classification_context, .schema_descriptions })), .lengths = .{
-        .request_items = Range.exact(1),
-        .document_bytes = .{ .min = 1, .max = 658 },
-        .document_words = .{ .min = 1, .max = 114 },
-        .window_count = Range.exact(1),
-        .window_words = .{ .min = 2, .max = 114 },
-        .padded_sequence_tokens = .{ .min = 135, .max = 298 },
-    } },
-    // Each classifier feature combination has its own short and long
-    // captures. A bare 18-token prompt cannot widen a mixed-task row or a
-    // described/instructed classifier's measured sequence floor.
-    .{ .features = Features.initMany(&(family_options ++ .{ .offset_utf8, .classification_single, .classification_structured })), .lengths = classificationFamilyLengths(18, 183) },
-    .{ .features = Features.initMany(&(family_options ++ .{ .offset_utf8, .classification_single, .classification_structured, .schema_descriptions })), .lengths = classificationFamilyLengths(55, 218) },
-    .{ .features = Features.initMany(&(family_options ++ .{ .offset_utf8, .classification_single, .classification_structured, .schema_descriptions, .classification_context })), .lengths = classificationFamilyLengths(66, 229) },
-    .{ .features = Features.initMany(&(family_options ++ .{ .offset_utf8, .classification_single, .classification_structured, .classification_context })), .lengths = classificationFamilyLengths(31, 194) },
-    // Bare and described entity rows bind their own short one-source-word,
-    // clean two-byte, and realistic long captures on both public offset units.
-    .{ .features = Features.initMany(&(family_options ++ .{.entities})), .lengths = .{
-        .request_items = Range.exact(1),
-        .document_bytes = .{ .min = 2, .max = 663 },
-        .document_words = .{ .min = 1, .max = 114 },
-        .window_count = Range.exact(1),
-        .window_words = .{ .min = 2, .max = 114 },
-        .padded_sequence_tokens = .{ .min = 17, .max = 181 },
-    } },
-    .{ .features = Features.initMany(&(family_options ++ .{ .entities, .schema_descriptions })), .lengths = .{
-        .request_items = Range.exact(1),
-        .document_bytes = .{ .min = 2, .max = 663 },
-        .document_words = .{ .min = 1, .max = 114 },
-        .window_count = Range.exact(1),
-        .window_words = .{ .min = 2, .max = 114 },
-        .padded_sequence_tokens = .{ .min = 22, .max = 202 },
-    } },
+        .{ .features = Features.initMany(&(family_options ++ .{ .entities, .schema_descriptions, .classification_single, .legacy_structures, .relations })), .lengths = familyLengths(Range.exact(63), Range.exact(11), Range.exact(107)) },
+        .{ .features = Features.initMany(&(family_options ++ .{ .classification_single, .classification_structured })), .lengths = .{
+            .request_items = Range.exact(1),
+            .document_bytes = .{ .min = 40, .max = 73 },
+            .document_words = .{ .min = 2, .max = 14 },
+            .window_count = Range.exact(1),
+            .window_words = .{ .min = 3, .max = 14 },
+            .padded_sequence_tokens = .{ .min = 27, .max = 39 },
+        } },
+        .{ .features = Features.initMany(&(family_options ++ .{ .classification_single, .classification_structured, .schema_descriptions })), .lengths = familyLengths(Range.exact(69), Range.exact(16), Range.exact(92)) },
+        .{ .features = Features.initMany(&(family_options ++ .{ .classification_single, .classification_structured, .classification_context })), .lengths = familyLengths(Range.exact(61), Range.exact(13), Range.exact(41)) },
+        // The same mixed schema exercises every listed learned feature together
+        // at one character and a real 658-byte document. ASCII endpoint
+        // parity is checked with both offset units. No long-window, batch, or
+        // public mode=multi permission is inferred from these observations.
+        .{ .features = Features.initMany(&(family_options ++ .{ .offset_utf8, .entities, .relations, .legacy_structures, .classification_single, .classification_structured, .classification_context, .schema_descriptions })), .lengths = .{
+            .request_items = Range.exact(1),
+            .document_bytes = .{ .min = 1, .max = 658 },
+            .document_words = .{ .min = 1, .max = 114 },
+            .window_count = Range.exact(1),
+            .window_words = .{ .min = 2, .max = 114 },
+            .padded_sequence_tokens = .{ .min = 135, .max = 298 },
+        } },
+        // Each classifier feature combination has its own short and long
+        // captures. A bare 18-token prompt cannot widen a mixed-task row or a
+        // described/instructed classifier's measured sequence floor.
+        .{ .features = Features.initMany(&(family_options ++ .{ .offset_utf8, .classification_single, .classification_structured })), .lengths = classificationFamilyLengths(18, 183) },
+        .{ .features = Features.initMany(&(family_options ++ .{ .offset_utf8, .classification_single, .classification_structured, .schema_descriptions })), .lengths = classificationFamilyLengths(55, 218) },
+        .{ .features = Features.initMany(&(family_options ++ .{ .offset_utf8, .classification_single, .classification_structured, .schema_descriptions, .classification_context })), .lengths = classificationFamilyLengths(66, 229) },
+        .{ .features = Features.initMany(&(family_options ++ .{ .offset_utf8, .classification_single, .classification_structured, .classification_context })), .lengths = classificationFamilyLengths(31, 194) },
+        // Bare and described entity rows bind their own short one-source-word,
+        // clean two-byte, and realistic long captures on both public offset units.
+        .{ .features = Features.initMany(&(family_options ++ .{.entities})), .lengths = .{
+            .request_items = Range.exact(1),
+            .document_bytes = .{ .min = 2, .max = 663 },
+            .document_words = .{ .min = 1, .max = 114 },
+            .window_count = Range.exact(1),
+            .window_words = .{ .min = 2, .max = 114 },
+            .padded_sequence_tokens = .{ .min = 17, .max = 181 },
+        } },
+        .{ .features = Features.initMany(&(family_options ++ .{ .entities, .schema_descriptions })), .lengths = .{
+            .request_items = Range.exact(1),
+            .document_bytes = .{ .min = 2, .max = 663 },
+            .document_words = .{ .min = 1, .max = 114 },
+            .window_count = Range.exact(1),
+            .window_words = .{ .min = 2, .max = 114 },
+            .padded_sequence_tokens = .{ .min = 22, .max = 202 },
+        } },
+    };
 };
 const family_decide_features = Features.initMany(&.{ .classification_single, .classification_context, .schema_descriptions, .word_whitespace, .overlap_flat, .offset_utf8, .decoder_auto, .single_window, .confidence });
 const family_decide_lengths = familyLengths(.{ .min = 74, .max = 81 }, .{ .min = 14, .max = 17 }, .{ .min = 97, .max = 167 });
@@ -658,6 +684,31 @@ fn multilingualEntries() [family_profiles.len * 4 + 2]Entry {
     return entries;
 }
 
+// Bounded composition: encoder/head parity is measured per complete mixed
+// prompt through 1024 tokens. Document bounds are independent planner/merge
+// resource ceilings, enforced before forwards; they do not raise context size.
+// Evidence: gliner_window_parity_test and scripts/gliner25/capture_window_extraction.py.
+const composed_window_features = Features.initMany(&.{
+    .entities,        .relations,     .schema_descriptions,        .classification_single,
+    .word_whitespace, .overlap_flat,  .offset_utf8,                .offset_codepoints,
+    .decoder_auto,    .long_document, .record_identity_occurrence, .confidence,
+    .spans,
+});
+const composed_window_lengths = LengthContract{
+    .request_items = .{ .min = 1, .max = 1 },
+    .document_bytes = .{ .min = 1, .max = 1024 * 1024 },
+    .document_words = .{ .min = 1, .max = 131072 },
+    .window_count = .{ .min = 1, .max = 64 },
+    .window_words = .{ .min = 1, .max = 1024 },
+    .padded_sequence_tokens = .{ .min = 1, .max = 1024 },
+};
+const composed_window_entries = [_]Entry{
+    .{ .identity = fastino_gliner25_base_v1, .backend = .native, .features = composed_window_features, .lengths = composed_window_lengths },
+    .{ .identity = fastino_gliner25_base_v1, .backend = .metal, .features = composed_window_features, .lengths = composed_window_lengths },
+    .{ .identity = fastino_gliner25_multi_decide, .backend = .native, .features = composed_window_features, .lengths = composed_window_lengths },
+    .{ .identity = fastino_gliner25_multi_decide, .backend = .metal, .features = composed_window_features, .lengths = composed_window_lengths },
+};
+
 const base_production_entries = [_]Entry{
     .{ .identity = fastino_gliner25_base_v1, .backend = .native, .features = fastino_gliner25_base_v1_features, .lengths = fastino_gliner25_base_v1_lengths },
     .{ .identity = fastino_gliner25_base_v1, .backend = .metal, .features = fastino_gliner25_base_v1_features, .lengths = fastino_gliner25_base_v1_lengths },
@@ -668,7 +719,19 @@ const base_production_entries = [_]Entry{
     .{ .identity = fastino_gliner25_base_v1_fp16_encoder, .backend = .native, .features = fastino_gliner25_base_v1_long_document_features, .lengths = fastino_gliner25_base_v1_long_document_lengths },
     .{ .identity = fastino_gliner25_base_v1_fp16_encoder, .backend = .metal, .features = fastino_gliner25_base_v1_long_document_features, .lengths = fastino_gliner25_base_v1_long_document_lengths },
 };
-const production_entries: []const Entry = &(base_production_entries ++ multilingualEntries());
+fn transformersWrapperEntries() [6]Entry {
+    var entries: [6]Entry = undefined;
+    for (base_production_entries[0..4], 0..) |entry, index| {
+        entries[index] = entry;
+        entries[index].identity = fastino_gliner25_base_v1_transformers;
+    }
+    for (composed_window_entries[0..2], 4..) |entry, index| {
+        entries[index] = entry;
+        entries[index].identity = fastino_gliner25_base_v1_transformers;
+    }
+    return entries;
+}
+const production_entries: []const Entry = &(base_production_entries ++ multilingualEntries() ++ composed_window_entries ++ transformersWrapperEntries());
 
 comptime {
     // Each entry's five digests are hex-validated one character at a time
@@ -681,6 +744,10 @@ comptime {
 
 /// Coarse closed gate only. True would still require an exact live-session
 /// lookup; it must never authorize a listing that has no consumed identity.
+pub fn publishedProfiles() []const Entry {
+    return production_entries;
+}
+
 pub fn hasPublishedProfiles() bool {
     return production_entries.len != 0;
 }
@@ -727,7 +794,7 @@ pub fn hasQualifiedBackbonePrecision(backbone: model.Backbone, precision: artifa
 /// A bounded selection of private production rows. Treat its representation as
 /// opaque; callers obtain it only from start(). No row data or operation for
 /// widening a selection is exposed. Reuse the SAME value for the whole request.
-pub const Candidates = enum(u64) {
+pub const Candidates = enum(CandidateMask) {
     rejected = 0,
     _,
 
@@ -798,10 +865,10 @@ fn validEntries(entries: []const Entry) bool {
 
 fn startEntries(entries: []const Entry, consumed: bundle.Identity, backend: Backend, required: Features) error{UnsupportedGlinerBoundaryRuntime}!Candidates {
     if (!validEntries(entries)) return error.UnsupportedGlinerBoundaryRuntime;
-    var remaining: u64 = 0;
+    var remaining: CandidateMask = 0;
     for (entries, 0..) |entry, index| {
         if (!equalIdentity(entry.identity, consumed) or entry.backend != backend or !containsFeatures(entry.features, required)) continue;
-        remaining |= @as(u64, 1) << @intCast(index);
+        remaining |= @as(CandidateMask, 1) << @intCast(index);
     }
     if (remaining == 0) return error.UnsupportedGlinerBoundaryRuntime;
     return @fromBackingInt(remaining);
@@ -811,14 +878,14 @@ fn narrowEntries(entries: []const Entry, candidates: *Candidates, observed: Leng
     const previous = @backingInt(candidates.*);
     candidates.* = .rejected;
     if (!validEntries(entries) or !observed.valid()) return error.UnsupportedGlinerBoundaryRuntime;
-    const valid_mask = if (entries.len == max_entries) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(entries.len)) - 1;
+    const valid_mask = if (entries.len == max_entries) std.math.maxInt(CandidateMask) else (@as(CandidateMask, 1) << @intCast(entries.len)) - 1;
     if (previous & ~valid_mask != 0) return error.UnsupportedGlinerBoundaryRuntime;
     // Nothing matched identity/backend/features to begin with: that is an
     // unreviewed request shape, not a bounded-length rejection.
     if (previous == 0) return error.UnsupportedGlinerBoundaryRuntime;
-    var remaining: u64 = 0;
+    var remaining: CandidateMask = 0;
     for (entries, 0..) |entry, index| {
-        const bit = @as(u64, 1) << @intCast(index);
+        const bit = @as(CandidateMask, 1) << @intCast(index);
         if (previous & bit != 0 and entry.lengths.contains(observed)) remaining |= bit;
     }
     candidates.* = @fromBackingInt(remaining);
@@ -913,12 +980,9 @@ test "boundary qualification serves the reviewed fastino gliner2.5 base checkpoi
     mismatched.precision = .q8_0;
     try std.testing.expect(!hasQualifiedIdentity(mismatched));
 
-    // Requiring only .long_document is satisfied by the long-document row
-    // alone (its feature set is a superset), so this reaches geometry: the
-    // single-window row's narrower padded_sequence_tokens minimum (14) falls
-    // under the long-document row's reviewed minimum (103) -- a genuine
-    // bounded-length rejection, named accordingly, not a feature mismatch.
-    try std.testing.expectError(error.GlinerBoundaryPaddedSequenceLimitExceeded, require(identity, .native, Features.initOne(.long_document), fastino_gliner25_base_v1_lengths));
+    // Composed windows also admit tiny prompts below the legacy 103-token
+    // floor, including this single-window geometry.
+    try require(identity, .native, Features.initOne(.long_document), fastino_gliner25_base_v1_lengths);
 
     // Out-of-range geometry, unlike every identity/backend mismatch above, is
     // a bounded-length rejection: identity, backend, and features all matched
@@ -959,7 +1023,8 @@ test "GLiNER multilingual production qualification binds exact artifacts and ind
         changed.weight.sha256[0] = '0';
         try std.testing.expect(!hasQualifiedIdentity(changed));
         try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(identity, .cuda, family_profiles[0].features, family_profiles[0].lengths));
-        try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, supportsFeatures(identity, .native, Features.initOne(.long_document)));
+        if (!equalIdentity(identity, fastino_gliner25_multi_decide))
+            try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, supportsFeatures(identity, .native, Features.initOne(.long_document)));
         try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, supportsFeatures(identity, .native, Features.initOne(.classification_multi)));
     }
     try std.testing.expect(hasQualifiedTypedDecisionIdentity(fastino_gliner25_multi_decide));
@@ -1139,7 +1204,7 @@ test "boundary qualification rejects malformed or oversized tables before matchi
     const rows: [max_entries + 1]Entry = @splat(row);
     try matchEntries(rows[0..max_entries], row.identity, .native, row.features, row.lengths);
     try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, matchEntries(&rows, row.identity, .native, row.features, row.lengths));
-    var invalid_selection: Candidates = @fromBackingInt(@as(u64, 1) << 63);
+    var invalid_selection: Candidates = @fromBackingInt(@as(CandidateMask, 1) << (max_entries - 1));
     try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, narrowEntries(&.{row}, &invalid_selection, row.lengths));
     // Even test-supplied synthetic selections cannot access a production row:
     // the public narrow() always checks against the real production table, so
@@ -1159,4 +1224,34 @@ test "boundary qualification range matching has no saturating or overflow accept
     try matchEntries(&.{row}, row.identity, .native, row.features, observed);
     row.lengths.document_bytes.max -= 1;
     try std.testing.expectError(error.GlinerBoundaryDocumentBytesLimitExceeded, matchEntries(&.{row}, row.identity, .native, row.features, observed));
+}
+
+test "boundary qualification Transformers wrapper has exactly the original fp32 profiles" {
+    const identity = fastino_gliner25_base_v1_transformers;
+    const bytes = try @import("../architectures/gliner/boundary_parity_test.zig").fixtureBytes(std.testing.allocator, "models/base/config_transformers.json");
+    defer std.testing.allocator.free(bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    try std.testing.expectEqual(identity.sidecars[0].sha256, std.fmt.bytesToHex(digest, .lower));
+    try std.testing.expectEqual(identity.sidecars[0].size_bytes, bytes.len);
+    try std.testing.expect(hasQualifiedIdentity(identity));
+    var count: usize = 0;
+    for (publishedProfiles()) |entry| {
+        if (!equalIdentity(entry.identity, fastino_gliner25_base_v1)) continue;
+        try require(identity, entry.backend, entry.features, entry.lengths);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 6), count);
+    for (0..4) |index| {
+        var changed = identity;
+        changed.sidecars[index].sha256[0] = 'f';
+        try std.testing.expect(!hasQualifiedIdentity(changed));
+        changed = identity;
+        changed.sidecars[index].size_bytes += 1;
+        try std.testing.expect(!hasQualifiedIdentity(changed));
+    }
+    var changed = identity;
+    changed.weight.sha256[0] = 'f';
+    try std.testing.expect(!hasQualifiedIdentity(changed));
+    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(identity, .cuda, fastino_gliner25_base_v1_features, fastino_gliner25_base_v1_lengths));
 }

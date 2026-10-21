@@ -33,6 +33,13 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
         if ((declaration.artifact.kind == .algebraic_segment and artifacts.supportsMetadataVersion(declaration.artifact.metadata_version)) or declaration.artifact.kind == .ordered_row_index) break true;
     } else false;
     if (!eligible and publication.directory == null) return &.{};
+    // A replica attempts bounded navigation warming before reporting an index
+    // queryable. Concurrent checks do not duplicate warm I/O. Failure/timeout
+    // is an optional cache miss and does not weaken the source proof below.
+    @import("lake_index_navigation_warming.zig").warmPublicationWithin(a, server, table, request) catch |err| {
+        if (err == error.NavigationWarmupInProgress) return &.{};
+        try request.ensureActive();
+    };
     const normalized = try request.platformDeadline();
     var context: local.serverless_query_lake_read_context.Context = .{ .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
     var sql_table = try server.sql_schema_cache.resolve(server.embedding_provider_runtime.io, sa, table.schema_json, table.table_id, table.name);
@@ -53,7 +60,21 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
         };
         context = reader_lease.?.readContext();
     }
-    var selected = (try @import("lake_index_selection.zig").selectCached(sa, sql_table, &source, &store, context, .automatic, &server.lake_read_cache)) orelse return &.{};
+    var selected = (@import("lake_index_selection.zig").selectCached(sa, sql_table, &source, &store, context, .required, &server.lake_read_cache) catch |err| {
+        try context.ensureActive();
+        if (err == error.OutOfMemory) return err;
+        switch (err) {
+            error.ExternalLakeIndexUnavailable,
+            error.ExternalLakeIndexDefinitionChanged,
+            error.ExternalLakeIndexSourceChanged,
+            error.ExternalLakeSnapshotMismatch,
+            error.ExternalLakeIndexCredentialsChanged,
+            error.ExternalLakeIndexStoreChanged,
+            => try server.requestLakePublication(table.name),
+            else => {},
+        }
+        return &.{};
+    }) orelse return &.{};
     defer selected.deinit();
     const definitions = try std.json.parseFromSliceLeaky(std.json.Value, sa, table.indexes_json, .{});
     if (definitions != .object) return error.InvalidTableIndexMetadata;
@@ -111,7 +132,7 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
             const declaration = for (selected.publication().declarations) |decl| {
                 if (decl.artifact.kind == .text_segment and decl.artifact.metadata_version == native_text.metadata_version and std.mem.eql(u8, decl.name, entry.key_ptr.*)) break decl;
             } else continue;
-            const root = native_text.loadRoot(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.identity, .context = context }) catch |err| {
+            const root = native_text.loadRootDirectory(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.identity, .context = context }) catch |err| {
                 try context.ensureActive();
                 if (err == error.OutOfMemory) return err;
                 continue;
@@ -170,7 +191,7 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
             defer tuple.deinit();
             var predicate: ?local.storage_db_relational_index_predicate.Plan = if (index.where.len == 0) null else try local.storage_db_relational_index_predicate.Plan.init(a, runtime, &layout, index.where);
             defer if (predicate) |*plan| plan.deinit();
-            const root = @import("lake_index_ordered_rows.zig").loadRoot(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.identity, .context = context }) catch |err| {
+            const root = @import("lake_index_ordered_rows.zig").loadRootLazy(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.identity, .context = context }) catch |err| {
                 try context.ensureActive();
                 if (err == error.OutOfMemory) return err;
                 continue;

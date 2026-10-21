@@ -1,0 +1,355 @@
+{
+  "reference": "PostgreSQL 18 NUMERIC constraint predicates",
+  "entries": [
+    {
+      "schema": "{\"minimum\":9007199254740993.2500}",
+      "value": "9007199254740993.2499",
+      "expected": false
+    },
+    {
+      "schema": "{\"minimum\":9007199254740993.2500}",
+      "value": "9007199254740993.25",
+      "expected": true
+    },
+    {
+      "schema": "{\"minimum\":9007199254740993.2500}",
+      "value": "9007199254740993.2501",
+      "expected": true
+    },
+    {
+      "schema": "{\"minimum\":9007199254740993.2500}",
+      "value": "9007199254740993.25001",
+      "expected": true
+    },
+    {
+      "schema": "{\"minimum\":9007199254740993.2500}",
+      "value": "NaN",
+      "expected": true
+    },
+    {
+      "schema": "{\"minimum\":9007199254740993.2500}",
+      "value": "Infinity",
+      "expected": true
+    },
+    {
+      "schema": "{\"minimum\":9007199254740993.2500}",
+      "value": "-Infinity",
+      "expected": false
+    },
+    {
+      "schema": "{\"maximum\":9007199254740993.2500}",
+      "value": "9007199254740993.2499",
+      "expected": true
+    },
+    {
+      "schema": "{\"maximum\":9007199254740993.2500}",
+      "value": "9007199254740993.25",
+      "expected": true
+    },
+    {
+      "schema": "{\"maximum\":9007199254740993.2500}",
+      "value": "9007199254740993.2501",
+      "expected": false
+    },
+    {
+      "schema": "{\"maximum\":9007199254740993.2500}",
+      "value": "9007199254740993.25001",
+      "expected": false
+    },
+    {
+      "schema": "{\"maximum\":9007199254740993.2500}",
+      "value": "NaN",
+      "expected": false
+    },
+    {
+      "schema": "{\"maximum\":9007199254740993.2500}",
+      "value": "Infinity",
+      "expected": false
+    },
+    {
+      "schema": "{\"maximum\":9007199254740993.2500}",
+      "value": "-Infinity",
+      "expected": true
+    },
+    {
+      "schema": "{\"exclusiveMinimum\":9007199254740993.2500}",
+      "value": "9007199254740993.2499",
+      "expected": false
+    },
+    {
+      "schema": "{\"exclusiveMinimum\":9007199254740993.2500}",
+      "value": "9007199254740993.25",
+      "expected": false
+    },
+    {
+      "schema": "{\"exclusiveMinimum\":9007199254740993.2500}",
+      "value": "9007199254740993.2501",
+      "expected": true
+    },
+    {
+      "schema": "{\"exclusiveMinimum\":9007199254740993.2500}",
+      "value": "9007199254740993.25001",
+      "expected": true
+    },
+    {
+      "schema": "{\"exclusiveMinimum\":9007199254740993.2500}",
+      "value": "NaN",
+      "expected": true
+    },
+    {
+      "schema": "{\"exclusiveMinimum\":9007199254740993.2500}",
+      "value": "Infinity",
+      "expected": true
+    },
+    {
+      "schema": "{\"exclusiveMinimum\":9007199254740993.2500}",
+      "value": "-Infinity",
+      "expected": false
+    },
+    {
+      "schema": "{\"exclusiveMaximum\":9007199254740993.2500}",
+      "value": "9007199254740993.2499",
+      "expected": true
+    },
+    {
+      "schema": "{\"exclusiveMaximum\":9007199254740993.2500}",
+      "value": "9007199254740993.25",
+      "expected": false
+    },
+    {
+      "schema": "{\"exclusiveMaximum\":9007199254740993.2500}",
+      "value": "9007199254740993.2501",
+      "expected": false
+    },
+    {
+      "schema": "{\"exclusiveMaximum\":9007199254740993.2500}",
+      "value": "9007199254740993.25001",
+      "expected": false
+    },
+    {
+      "schema": "{\"exclusiveMaximum\":9007199254740993.2500}",
+      "value": "NaN",
+      "expected": false
+    },
+    {
+      "schema": "{\"exclusiveMaximum\":9007199254740993.2500}",
+      "value": "Infinity",
+      "expected": false
+    },
+    {
+      "schema": "{\"exclusiveMaximum\":9007199254740993.2500}",
+      "value": "-Infinity",
+      "expected": true
+    },
+    {
+      "schema": "{\"multipleOf\":0.0001}",
+      "value": "9007199254740993.2499",
+      "expected": true
+    },
+    {
+      "schema": "{\"multipleOf\":0.0001}",
+      "value": "9007199254740993.25",
+      "expected": true
+    },
+    {
+      "schema": "{\"multipleOf\":0.0001}",
+      "value": "9007199254740993.2501",
+      "expected": true
+    },
+    {
+      "schema": "{\"multipleOf\":0.0001}",
+      "value": "9007199254740993.25001",
+      "expected": false
+    },
+    {
+      "schema": "{\"multipleOf\":0.0001}",
+      "value": "NaN",
+      "expected": false
+    },
+    {
+      "schema": "{\"multipleOf\":0.0001}",
+      "value": "Infinity",
+      "expected": false
+    },
+    {
+      "schema": "{\"multipleOf\":0.0001}",
+      "value": "-Infinity",
+      "expected": false
+    },
+    {
+      "schema": "{\"minimum\":1e-1000,\"maximum\":1e1000,\"multipleOf\":1e-1000}",
+      "value": "9007199254740993.25",
+      "expected": true
+    },
+    {
+      "schema": "{\"minimum\":1e-1000,\"maximum\":1e1000,\"multipleOf\":1e-1000}",
+      "value": "9007199254740993.26",
+      "expected": true
+    },
+    {
+      "schema": "{\"minimum\":1e-1000,\"maximum\":1e1000,\"multipleOf\":1e-1000}",
+      "value": "1e-999",
+      "expected": true
+    },
+    {
+      "schema": "{\"minimum\":1e-1000,\"maximum\":1e1000,\"multipleOf\":1e-1000}",
+      "value": "1e-1001",
+      "expected": false
+    },
+    {
+      "schema": "{\"minimum\":1e-1000,\"maximum\":1e1000,\"multipleOf\":1e-1000}",
+      "value": "NaN",
+      "expected": false
+    },
+    {
+      "schema": "{\"minimum\":1e-1000,\"maximum\":1e1000,\"multipleOf\":1e-1000}",
+      "value": "Infinity",
+      "expected": false
+    },
+    {
+      "schema": "{\"minimum\":1e-1000,\"maximum\":1e1000,\"multipleOf\":1e-1000}",
+      "value": "-Infinity",
+      "expected": false
+    },
+    {
+      "schema": "{\"const\":9007199254740993.2500}",
+      "value": "9007199254740993.25",
+      "expected": true
+    },
+    {
+      "schema": "{\"const\":9007199254740993.2500}",
+      "value": "9007199254740993.26",
+      "expected": false
+    },
+    {
+      "schema": "{\"const\":9007199254740993.2500}",
+      "value": "1e-999",
+      "expected": false
+    },
+    {
+      "schema": "{\"const\":9007199254740993.2500}",
+      "value": "1e-1001",
+      "expected": false
+    },
+    {
+      "schema": "{\"const\":9007199254740993.2500}",
+      "value": "NaN",
+      "expected": false
+    },
+    {
+      "schema": "{\"const\":9007199254740993.2500}",
+      "value": "Infinity",
+      "expected": false
+    },
+    {
+      "schema": "{\"const\":9007199254740993.2500}",
+      "value": "-Infinity",
+      "expected": false
+    },
+    {
+      "schema": "{\"const\":\"NaN\"}",
+      "value": "9007199254740993.25",
+      "expected": false
+    },
+    {
+      "schema": "{\"const\":\"NaN\"}",
+      "value": "9007199254740993.26",
+      "expected": false
+    },
+    {
+      "schema": "{\"const\":\"NaN\"}",
+      "value": "1e-999",
+      "expected": false
+    },
+    {
+      "schema": "{\"const\":\"NaN\"}",
+      "value": "1e-1001",
+      "expected": false
+    },
+    {
+      "schema": "{\"const\":\"NaN\"}",
+      "value": "NaN",
+      "expected": true
+    },
+    {
+      "schema": "{\"const\":\"NaN\"}",
+      "value": "Infinity",
+      "expected": false
+    },
+    {
+      "schema": "{\"const\":\"NaN\"}",
+      "value": "-Infinity",
+      "expected": false
+    },
+    {
+      "schema": "{\"const\":\"9007199254740993.25\"}",
+      "value": "9007199254740993.25",
+      "expected": false
+    },
+    {
+      "schema": "{\"const\":\"9007199254740993.25\"}",
+      "value": "9007199254740993.26",
+      "expected": false
+    },
+    {
+      "schema": "{\"const\":\"9007199254740993.25\"}",
+      "value": "1e-999",
+      "expected": false
+    },
+    {
+      "schema": "{\"const\":\"9007199254740993.25\"}",
+      "value": "1e-1001",
+      "expected": false
+    },
+    {
+      "schema": "{\"const\":\"9007199254740993.25\"}",
+      "value": "NaN",
+      "expected": false
+    },
+    {
+      "schema": "{\"const\":\"9007199254740993.25\"}",
+      "value": "Infinity",
+      "expected": false
+    },
+    {
+      "schema": "{\"const\":\"9007199254740993.25\"}",
+      "value": "-Infinity",
+      "expected": false
+    },
+    {
+      "schema": "{\"enum\":[9007199254740993.2500,9007199254740993.25,\"NaN\",\"Infinity\",\"9007199254740993.26\",null,true]}",
+      "value": "9007199254740993.25",
+      "expected": true
+    },
+    {
+      "schema": "{\"enum\":[9007199254740993.2500,9007199254740993.25,\"NaN\",\"Infinity\",\"9007199254740993.26\",null,true]}",
+      "value": "9007199254740993.26",
+      "expected": false
+    },
+    {
+      "schema": "{\"enum\":[9007199254740993.2500,9007199254740993.25,\"NaN\",\"Infinity\",\"9007199254740993.26\",null,true]}",
+      "value": "1e-999",
+      "expected": false
+    },
+    {
+      "schema": "{\"enum\":[9007199254740993.2500,9007199254740993.25,\"NaN\",\"Infinity\",\"9007199254740993.26\",null,true]}",
+      "value": "1e-1001",
+      "expected": false
+    },
+    {
+      "schema": "{\"enum\":[9007199254740993.2500,9007199254740993.25,\"NaN\",\"Infinity\",\"9007199254740993.26\",null,true]}",
+      "value": "NaN",
+      "expected": true
+    },
+    {
+      "schema": "{\"enum\":[9007199254740993.2500,9007199254740993.25,\"NaN\",\"Infinity\",\"9007199254740993.26\",null,true]}",
+      "value": "Infinity",
+      "expected": true
+    },
+    {
+      "schema": "{\"enum\":[9007199254740993.2500,9007199254740993.25,\"NaN\",\"Infinity\",\"9007199254740993.26\",null,true]}",
+      "value": "-Infinity",
+      "expected": false
+    }
+  ]
+}

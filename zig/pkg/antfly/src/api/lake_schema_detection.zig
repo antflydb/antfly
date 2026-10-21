@@ -19,6 +19,25 @@ const std = @import("std");
 const schema = @import("antfly_local_sources").serverless_query_lake_schema;
 const binding_api = @import("antfly_local_sources").serverless_external_source_schema_binding;
 const A = std.mem.Allocator;
+/// New attachments choose their public identity epoch once. Updates retain
+/// the stored epoch even when clients omit/read back this server-owned field.
+pub fn bindIdentity(a: A, input: []const u8, before: []const u8) !?[]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, input, .{ .allocate = .alloc_always, .parse_numbers = false });
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const source = parsed.value.object.getPtr("base_source") orelse return null;
+    if (source.* != .object) return null;
+    const kind = source.object.get("kind") orelse return null;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "external")) return null;
+    var version: u8 = 2;
+    if (before.len != 0) {
+        var prior = try binding_api.externalBindingFromSchemaJsonAlloc(a, before);
+        defer if (prior) |*binding| binding.deinit(a);
+        version = if (prior) |binding| binding.binding.row_identity_version else 2;
+    }
+    try source.object.put(parsed.arena.allocator(), "row_identity_version", .{ .integer = version });
+    return try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+}
 pub fn prepare(a: A, input: []const u8, options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions, context: @import("antfly_local_sources").serverless_query_lake_read_context.Context) !?[]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, a, input, .{ .allocate = .alloc_always, .parse_numbers = false });
     defer parsed.deinit();
@@ -44,11 +63,20 @@ pub fn prepare(a: A, input: []const u8, options: @import("../serverless/configur
     defer if (base) |value| a.free(value);
     var detected = switch (binding.binding.format) {
         .parquet => blk: {
-            var inventory = try @import("antfly_local_sources").serverless_external_source_mod.planParquetPrefixInventoryFromObjectStorageAlloc(a, .{ .client = client, .bucket = store.bucket, .prefix = store.prefix, .source_id = binding.binding.table_id, .source_uri = binding.binding.source_uri, .object_uri_base = base, .schema_fingerprint = "auto" });
-            defer inventory.deinit(a);
+            var committed: ?@import("antfly_local_sources").serverless_query_lake_iceberg_snapshot.SnapshotWithDeletePlan = null;
+            defer if (committed) |*snapshot| snapshot.deinit(a);
+            const manifests = @import("antfly_local_sources").serverless_query_lake_parquet_manifest;
+            if (manifests.isManifest(binding.binding.source_uri)) {
+                var reader_client = client;
+                const bytes = try @import("antfly_local_sources").serverless_query_lake_iceberg_snapshot.readFullObjectAlloc(a, &reader_client, null, base orelse binding.binding.source_uri, .iceberg_metadata, null, 1024 * 1024);
+                defer a.free(bytes);
+                committed = try manifests.plan(a, .{ .client = client, .source = binding.binding.table_id, .uri = binding.binding.source_uri, .schema = "auto", .context = context }, bytes);
+            }
+            var inventory = if (committed) |snapshot| snapshot.inventory else try @import("antfly_local_sources").serverless_external_source_mod.planParquetPrefixInventoryFromObjectStorageAlloc(a, .{ .client = client, .bucket = store.bucket, .prefix = store.prefix, .source_id = binding.binding.table_id, .source_uri = binding.binding.source_uri, .object_uri_base = base, .schema_fingerprint = "auto" });
+            defer if (committed == null) inventory.deinit(a);
             if (binding.binding.snapshot_mode == .object_version_digest) if (!std.mem.eql(u8, inventory.snapshot_id, binding.binding.snapshot_mode.object_version_digest)) return error.ExternalLakeSnapshotMismatch;
             var reader = @import("antfly_local_sources").serverless_query_lake_object_reader.ObjectStorageRangeReader.init(client);
-            break :blk try schema.parquetSchema(a, inventory, reader.parquetReader());
+            break :blk try schema.parquetSchemaWithContext(a, inventory, reader.parquetReader(), context);
         },
         .iceberg => blk: {
             if (binding.binding.catalog != null) {
@@ -251,7 +279,7 @@ test "lake SQL inferred decimal128 and signed timestamps execute through Parquet
         fn scan(_: *anyopaque, _: A, _: catalog.Table, _: catalog.Scan) !catalog.Page {
             return error.UnexpectedStatelessScan;
         }
-        fn mutate(_: *anyopaque, _: A, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(_: *anyopaque, _: A, _: A, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
             return error.UnexpectedMutation;
         }
         fn checkpoint(_: *anyopaque) !void {}
@@ -410,4 +438,24 @@ test "lake SQL independent PyArrow compressed nullable fixtures infer and decode
         }
         try std.testing.expectEqual(@as(usize, 1200), count);
     }
+}
+
+test "lake SQL source identity epoch persists independently of index publication" {
+    const a = std.testing.allocator;
+    const input = "{\"storage_mode\":\"relational\",\"base_source\":{\"kind\":\"external\",\"table_id\":\"source\",\"format\":\"parquet\",\"uri\":\"s3://bucket/source\",\"schema_fingerprint\":\"schema\"}}";
+    const fresh = (try bindIdentity(a, input, "")).?;
+    defer a.free(fresh);
+    var modern = (try binding_api.externalBindingFromSchemaJsonAlloc(a, fresh)).?;
+    defer modern.deinit(a);
+    try std.testing.expectEqual(@as(u8, 2), modern.binding.row_identity_version);
+    const preserved = (try bindIdentity(a, input, fresh)).?;
+    defer a.free(preserved);
+    var same = (try binding_api.externalBindingFromSchemaJsonAlloc(a, preserved)).?;
+    defer same.deinit(a);
+    try std.testing.expectEqual(@as(u8, 2), same.binding.row_identity_version);
+    const legacy = (try bindIdentity(a, fresh, input)).?;
+    defer a.free(legacy);
+    var old = (try binding_api.externalBindingFromSchemaJsonAlloc(a, legacy)).?;
+    defer old.deinit(a);
+    try std.testing.expectEqual(@as(u8, 1), old.binding.row_identity_version);
 }

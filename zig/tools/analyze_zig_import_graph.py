@@ -204,12 +204,44 @@ class ObjectReport:
 
 
 class ImportGraph:
-    def __init__(self, source_root: Path):
+    def __init__(self, source_root: Path, package_roots: dict[str, Path] | None = None):
         self.source_root = source_root.resolve()
         if not self.source_root.is_dir():
             raise ValueError(f"source root is not a directory: {self.source_root}")
         self._edge_cache: dict[Path, tuple[Path, ...]] = {}
         self._line_cache: dict[Path, int] = {}
+        if package_roots is None:
+            package_roots = (
+                {"antfly-embedded": REPO_ROOT / "zig/pkg/antfly-embedded/src"}
+                if self.source_root == DEFAULT_SOURCE_ROOT.resolve()
+                else {}
+            )
+        self.package_roots = {
+            name: root.resolve() for name, root in package_roots.items()
+        }
+        self.local_sources: dict[str, list[Path]] = {}
+        if root := self.package_roots.get("antfly-embedded"):
+            # Analyze potential selected-member edges across physical and
+            # control profiles, without importing either catalog wholesale.
+            for filename in ("source_catalog.zig", "source_catalog_control.zig"):
+                catalog = root / filename
+                if not catalog.is_file():
+                    continue
+                for name, relative in re.findall(
+                    r'pub const (\w+) = @import\("([^"\n]+\.zig)"\);',
+                    catalog.read_text(encoding="utf-8"),
+                ):
+                    target = (root / relative).resolve()
+                    if self.contains(target) and target.is_file():
+                        candidates = self.local_sources.setdefault(name, [])
+                        if target not in candidates:
+                            candidates.append(target)
+
+    def contains(self, path: Path) -> bool:
+        return any(
+            path.is_relative_to(root)
+            for root in (self.source_root, *self.package_roots.values())
+        )
 
     def resolve_source(self, value: str) -> Path:
         path = (self.source_root / value).resolve()
@@ -220,11 +252,22 @@ class ImportGraph:
                 f"source path escapes {self.source_root}: {value}"
             ) from error
         if not path.is_file():
+            # Local engine files keep their logical path after moving into the
+            # Apache package. Custom fixture roots remain strictly confined.
+            for root in self.package_roots.values():
+                candidate = (root / value).resolve()
+                if candidate.is_relative_to(root) and candidate.is_file():
+                    return candidate
             raise ValueError(f"source file does not exist: {path}")
         return path
 
     def relative_name(self, path: Path) -> str:
-        return path.relative_to(self.source_root).as_posix()
+        if path.is_relative_to(self.source_root):
+            return path.relative_to(self.source_root).as_posix()
+        for name, root in self.package_roots.items():
+            if path.is_relative_to(root):
+                return f"@{name}/{path.relative_to(root).as_posix()}"
+        raise ValueError(f"source path escapes configured packages: {path}")
 
     def relative_edges(self, path: Path) -> tuple[Path, ...]:
         cached = self._edge_cache.get(path)
@@ -237,12 +280,20 @@ class ImportGraph:
             if not value.endswith(".zig"):
                 continue
             target = (path.parent / value).resolve()
-            try:
-                target.relative_to(self.source_root)
-            except ValueError:
+            if not self.contains(target):
                 continue
             if target.is_file():
                 targets.append(target)
+        # Follow only selected catalog members, never the entire catalog:
+        # broadening a selector import would invent implementation dependencies.
+        members = re.findall(r'@import\("antfly_local_sources"\)\.(\w+)', text)
+        for alias in re.findall(
+            r'const (\w+) = @import\("antfly_local_sources"\);', text
+        ):
+            members.extend(re.findall(rf"\b{re.escape(alias)}\.(\w+)", text))
+        targets.extend(
+            target for name in members for target in self.local_sources.get(name, ())
+        )
         result = tuple(dict.fromkeys(targets))
         self._edge_cache[path] = result
         return result
@@ -1200,9 +1251,11 @@ def check_compiled_storage_boundary(
         )
         return False
 
+    graph = ImportGraph(source_root)
     forbidden = {
-        (source_root / relative).resolve(): relative
+        (root / relative).resolve(): relative
         for relative in DISTRIBUTED_FORBIDDEN_STORAGE_FILES
+        for root in (graph.source_root, *graph.package_roots.values())
     }
     clean = True
     for report in candidates:
@@ -1221,11 +1274,14 @@ def check_compiled_storage_boundary(
 def check_ha_seed_failure_registry(source_root: Path = DEFAULT_SOURCE_ROOT) -> bool:
     error_pattern = re.compile(r"\berror\.([A-Za-z][A-Za-z0-9_]*)")
     mapping_pattern = re.compile(r"\.err\s*=\s*error\.([A-Za-z][A-Za-z0-9_]*)")
-    registry_path = source_root / "runtime_failure_identity.zig"
+    graph = ImportGraph(source_root)
+    registry_path = graph.resolve_source("runtime_failure_identity.zig")
     registered = set(mapping_pattern.findall(registry_path.read_text()))
     required: set[str] = set()
     for relative in HA_SEED_FAILURE_SOURCE_FILES:
-        required.update(error_pattern.findall((source_root / relative).read_text()))
+        required.update(
+            error_pattern.findall(graph.resolve_source(relative).read_text())
+        )
     missing = sorted(required - registered - HA_SEED_TEST_ONLY_ERRORS)
     for name in missing:
         print(

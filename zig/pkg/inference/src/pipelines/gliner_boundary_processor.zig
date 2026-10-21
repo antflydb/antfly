@@ -25,7 +25,8 @@ const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const Allocator = std.mem.Allocator;
 
 pub const unicode_version = unicode.unicode_version;
-pub const WordSplitter = enum { whitespace, char };
+const shared_text = @import("antfly_extracting").text_processing;
+pub const WordSplitter = shared_text.WordSplitter;
 pub const Item = struct { text: []const u8, schema: *const ir.CompiledSchema };
 pub const Options = struct {
     max_batch_items: usize = 64,
@@ -45,60 +46,16 @@ pub const Options = struct {
         if (self.control) |control| try control.check();
     }
 };
-pub const ByteRange = struct { start: usize, end: usize };
-pub const WordRangeOptions = struct {
-    word_splitter: WordSplitter = .whitespace,
-    max_text_bytes: usize = 1024 * 1024,
-    max_words: usize = 131072,
-    control: ?Control = null,
-};
-
-/// Original-text boundaries for explicit document windowing. This shares the
-/// processor's exact splitter; it adds no enum prefix, terminal punctuation,
-/// lowercasing, or model-token wrappers. Caller owns the returned ranges.
-pub fn sourceWordRanges(allocator: Allocator, text: []const u8, options: WordRangeOptions) ![]ByteRange {
-    if (options.control) |control| try control.check();
-    if (text.len > options.max_text_bytes) return error.BoundaryTextLimitExceeded;
-    if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidUtf8;
-    var result = std.ArrayListUnmanaged(ByteRange).empty;
-    errdefer result.deinit(allocator);
-    var position: usize = 0;
-    while (position < text.len) {
-        if (options.control) |control| try control.check();
-        if (unicode.isWhitespace(codepoint(text, position))) {
-            position = nextCodepoint(text, position);
-            continue;
-        }
-        if (result.items.len >= options.max_words) return error.BoundaryTextLimitExceeded;
-        const start = position;
-        position = wordEnd(text, position, options.word_splitter);
-        try result.append(allocator, .{ .start = start, .end = position });
-    }
-    return result.toOwnedSlice(allocator);
+pub const ByteRange = shared_text.ByteRange;
+pub const WordRangeOptions = struct { word_splitter: WordSplitter = .whitespace, max_text_bytes: usize = 1024 * 1024, max_words: usize = 131072, control: ?Control = null };
+fn textCheckpoint(ptr: *const anyopaque) !void {
+    const control: *const Control = @ptrCast(@alignCast(ptr));
+    try control.check();
 }
-
-/// Whether the processor's synthetic final period consumes another word.
-/// A URL suffix, and an ASCII run under the char splitter, may absorb it.
-pub fn terminalWordAdded(allocator: Allocator, text: []const u8, splitter: WordSplitter) !bool {
-    if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidUtf8;
-    if (text.len == 0) return true;
-    if (std.mem.indexOfScalar(u8, ".!?", text[text.len - 1]) != null) return false;
-    var position: usize = 0;
-    var last: ByteRange = .{ .start = 0, .end = 0 };
-    while (position < text.len) {
-        if (unicode.isWhitespace(codepoint(text, position))) {
-            position = nextCodepoint(text, position);
-            continue;
-        }
-        last.start = position;
-        position = wordEnd(text, position, splitter);
-        last.end = position;
-    }
-    if (last.end != text.len) return true;
-    const suffix = try std.mem.concat(allocator, u8, &.{ text[last.start..], "." });
-    defer allocator.free(suffix);
-    return wordEnd(suffix, 0, splitter) < suffix.len;
+pub fn sourceWordRanges(a: Allocator, text: []const u8, options: WordRangeOptions) ![]ByteRange {
+    return shared_text.sourceWordRanges(a, text, .{ .word_splitter = options.word_splitter, .max_text_bytes = options.max_text_bytes, .max_words = options.max_words, .control = if (options.control) |*control| .{ .ptr = control, .check_fn = textCheckpoint } else null });
 }
+pub const terminalWordAdded = shared_text.terminalWordAdded;
 pub const Word = struct {
     /// Lowercased body token, or verbatim synthetic enum-prefix fragment.
     text: []const u8,
@@ -393,7 +350,7 @@ const Builder = struct {
             if (self.words.items.len - prefix_count >= self.options.max_text_words) return error.BoundaryTextLimitExceeded;
             const start = pos;
             pos = wordEnd(effective_text, pos, self.options.word_splitter);
-            const lowered = try lower(self.allocator, effective_text[start..pos]);
+            const lowered = try lowerTextWord(self.allocator, effective_text[start..pos]);
             const source: ?ByteRange = if (start < original_text.len) .{ .start = start, .end = @min(pos, original_text.len) } else null;
             try self.appendWord(lowered, source, pos > original_text.len);
         }
@@ -530,12 +487,12 @@ const Builder = struct {
         var first_positions = std.StringHashMapUnmanaged(usize).empty;
         for (self.words.items, 0..) |word, i| {
             try self.options.check();
-            const folded = try lower(self.allocator, word.text);
+            const folded = try lowerTextWord(self.allocator, word.text);
             const entry = try first_positions.getOrPut(self.allocator, folded);
             if (!entry.found_existing) entry.value_ptr.* = i;
         }
         for (self.enum_choices.items) |*choice| {
-            const folded = try lower(self.allocator, self.words.items[choice.start].text);
+            const folded = try lowerTextWord(self.allocator, self.words.items[choice.start].text);
             choice.score_start = first_positions.get(folded).?;
         }
     }
@@ -581,82 +538,7 @@ fn zeros(comptime T: type, allocator: Allocator, n: usize) ![]T {
 // Python's default splitter regex, evaluated over the original UTF-8 document.
 // These helpers use the repository's pinned Python 3.12 / Unicode 15 tables.
 fn wordEnd(text: []const u8, start: usize, splitter: WordSplitter) usize {
-    if (splitter == .char) {
-        var end = start;
-        while (end < text.len and (std.ascii.isAlphanumeric(text[end]) or std.mem.indexOfScalar(u8, "@._-+", text[end]) != null)) end += 1;
-        return if (end > start) end else nextCodepoint(text, start);
-    }
-    if (urlPrefixEnd(text, start)) |prefix_end| if (prefix_end < text.len and !unicode.isWhitespace(codepoint(text, prefix_end))) {
-        var end = prefix_end;
-        while (end < text.len and !unicode.isWhitespace(codepoint(text, end))) end = nextCodepoint(text, end);
-        return end;
-    };
-    if (emailEnd(text, start)) |end| return end;
-    if (text[start] == '@' and start + 1 < text.len and asciiRegexWord(codepoint(text, start + 1))) {
-        var end = start + 1;
-        while (end < text.len and asciiRegexWord(codepoint(text, end))) end = nextCodepoint(text, end);
-        return end;
-    }
-    if (unicode.isWord(codepoint(text, start))) {
-        var end = start;
-        while (end < text.len and unicode.isWord(codepoint(text, end))) end = nextCodepoint(text, end);
-        while (end + 1 < text.len and (text[end] == '-' or text[end] == '_') and unicode.isWord(codepoint(text, end + 1))) {
-            end += 1;
-            while (end < text.len and unicode.isWord(codepoint(text, end))) end = nextCodepoint(text, end);
-        }
-        return end;
-    }
-    return nextCodepoint(text, start);
-}
-fn urlPrefixEnd(text: []const u8, start: usize) ?usize {
-    for ([_][]const u8{ "https://", "http://", "www." }) |prefix| {
-        var pos = start;
-        for (prefix) |expected| {
-            if (pos == text.len) break;
-            const cp = codepoint(text, pos);
-            if (unicode.simpleLower(cp) != expected and !(expected == 's' and cp == 0x017f)) break;
-            pos = nextCodepoint(text, pos);
-        } else return pos;
-    }
-    return null;
-}
-fn emailEnd(text: []const u8, start: usize) ?usize {
-    var pos = start;
-    while (pos < text.len) {
-        const cp = codepoint(text, pos);
-        if (!asciiRegexLetter(cp) and !(cp >= '0' and cp <= '9') and !(cp < 128 and std.mem.indexOfScalar(u8, "._%+-", @intCast(cp)) != null)) break;
-        pos = nextCodepoint(text, pos);
-    }
-    if (pos == start or pos == text.len or text[pos] != '@') return null;
-    pos += 1;
-    const domain_start = pos;
-    var separator_valid = false;
-    var tld_letters: usize = 0;
-    var best: ?usize = null;
-    while (pos < text.len) {
-        const cp = codepoint(text, pos);
-        if (!asciiRegexLetter(cp) and !(cp >= '0' and cp <= '9') and cp != '.' and cp != '-') break;
-        const end = nextCodepoint(text, pos);
-        if (cp == '.') {
-            separator_valid = pos > domain_start;
-            tld_letters = 0;
-        } else if (separator_valid and asciiRegexLetter(cp)) {
-            tld_letters += 1;
-            if (tld_letters >= 2) best = end;
-        } else {
-            separator_valid = false;
-            tld_letters = 0;
-        }
-        pos = end;
-    }
-    return best;
-}
-fn asciiRegexLetter(cp: u21) bool {
-    const folded = unicode.simpleLower(cp);
-    return (folded >= 'a' and folded <= 'z') or cp == 0x0130 or cp == 0x0131 or cp == 0x017f;
-}
-fn asciiRegexWord(cp: u21) bool {
-    return asciiRegexLetter(cp) or (cp >= '0' and cp <= '9') or cp == '_';
+    return shared_text.wordEnd(text, start, splitter);
 }
 fn codepoint(text: []const u8, start: usize) u21 {
     return std.unicode.utf8Decode(text[start..nextCodepoint(text, start)]) catch unreachable;
@@ -688,8 +570,9 @@ fn finalSigma(token: []const u8, start: usize) bool {
     }
     return true;
 }
-fn lower(allocator: Allocator, token: []const u8) ![]const u8 {
+pub fn lowerTextWord(allocator: Allocator, token: []const u8) ![]const u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
     var pos: usize = 0;
     while (pos < token.len) : (pos = nextCodepoint(token, pos)) {
         const cp = codepoint(token, pos);
