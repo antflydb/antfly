@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from ..models.graph_metric_profile import GraphMetricProfile
     from ..models.join_profile import JoinProfile
     from ..models.merge_profile import MergeProfile
-    from ..models.query_profile_value_search import QueryProfileValueSearch
+    from ..models.query_profile_value_verification import QueryProfileValueVerification
     from ..models.reranker_profile import RerankerProfile
     from ..models.shards_profile import ShardsProfile
     from ..models.sort_profile import SortProfile
@@ -27,9 +27,9 @@ class QueryProfile:
     when the request sets `profile: true`.
 
         Attributes:
-            value_search (QueryProfileValueSearch | Unset): Actual logical value verification work, summed across
-                participating shards; plans describe selected physical fields and scan fallback reasons. Budgets remain per
-                shard.
+            value_verification (QueryProfileValueVerification | Unset): Actual logical value verification work, summed
+                across participating shards; plans describe selected physical fields and scan fallback reasons. Budgets remain
+                per shard.
             shards (ShardsProfile | Unset): Shard-level execution statistics.
             join (JoinProfile | Unset): Join execution statistics.
             reranker (RerankerProfile | Unset): Reranking execution statistics.
@@ -44,7 +44,7 @@ class QueryProfile:
                 internal debug logs or explicit debug surfaces.
     """
 
-    value_search: QueryProfileValueSearch | Unset = UNSET
+    value_verification: QueryProfileValueVerification | Unset = UNSET
     shards: ShardsProfile | Unset = UNSET
     join: JoinProfile | Unset = UNSET
     reranker: RerankerProfile | Unset = UNSET
@@ -54,9 +54,9 @@ class QueryProfile:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        value_search: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.value_search, Unset):
-            value_search = self.value_search.to_dict()
+        value_verification: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.value_verification, Unset):
+            value_verification = self.value_verification.to_dict()
 
         shards: dict[str, Any] | Unset = UNSET
         if not isinstance(self.shards, Unset):
@@ -88,8 +88,8 @@ class QueryProfile:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
-        if value_search is not UNSET:
-            field_dict["value_search"] = value_search
+        if value_verification is not UNSET:
+            field_dict["value_verification"] = value_verification
         if shards is not UNSET:
             field_dict["shards"] = shards
         if join is not UNSET:
@@ -110,18 +110,18 @@ class QueryProfile:
         from ..models.graph_metric_profile import GraphMetricProfile
         from ..models.join_profile import JoinProfile
         from ..models.merge_profile import MergeProfile
-        from ..models.query_profile_value_search import QueryProfileValueSearch
+        from ..models.query_profile_value_verification import QueryProfileValueVerification
         from ..models.reranker_profile import RerankerProfile
         from ..models.shards_profile import ShardsProfile
         from ..models.sort_profile import SortProfile
 
         d = dict(src_dict)
-        _value_search = d.pop("value_search", UNSET)
-        value_search: QueryProfileValueSearch | Unset
-        if isinstance(_value_search, Unset):
-            value_search = UNSET
+        _value_verification = d.pop("value_verification", UNSET)
+        value_verification: QueryProfileValueVerification | Unset
+        if isinstance(_value_verification, Unset):
+            value_verification = UNSET
         else:
-            value_search = QueryProfileValueSearch.from_dict(_value_search)
+            value_verification = QueryProfileValueVerification.from_dict(_value_verification)
 
         _shards = d.pop("shards", UNSET)
         shards: ShardsProfile | Unset
@@ -168,7 +168,7 @@ class QueryProfile:
             sort = SortProfile.from_dict(_sort)
 
         query_profile = cls(
-            value_search=value_search,
+            value_verification=value_verification,
             shards=shards,
             join=join,
             reranker=reranker,

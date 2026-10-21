@@ -75,7 +75,7 @@ QUERY_REQUEST_PROPERTIES = (
     "offset",
     "timeout_ms",
     "read_requirements",
-    "value_search_execution",
+    "execution",
     "order_by",
     "search_after",
     "search_before",

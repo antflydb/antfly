@@ -45,6 +45,11 @@ class GraphKShortestPathsQuery:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.graph_k_shortest_paths import GraphKShortestPaths
 
+        if set(src_dict) - {
+            "index",
+            "k_shortest_paths",
+        }:
+            raise ValueError("Unexpected properties for GraphKShortestPathsQuery")
         d = dict(src_dict)
         index = d.pop("index")
 

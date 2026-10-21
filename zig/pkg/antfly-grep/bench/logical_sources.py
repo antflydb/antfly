@@ -45,9 +45,16 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--rounds", type=int, default=2)
+    parser.add_argument(
+        "--baseline-legacy-value-wire",
+        action="store_true",
+        help="adapt benchmark requests/responses only for a frozen baseline predating execution.value_verification",
+    )
     parser.add_argument("--clients", default="1,4")
     parser.add_argument(
-        "--suite", choices=("scalable", "concurrency", "both"), default="both"
+        "--suite",
+        choices=("scalable", "concurrency", "ingestion", "hints", "both", "all"),
+        default="both",
     )
     parser.add_argument(
         "--controls",
@@ -62,7 +69,7 @@ def main():
     args = parser.parse_args()
     if args.advise_file_cache and platform.system() != "Linux":
         parser.error("--advise-file-cache requires Linux")
-    if args.advise_file_cache and args.suite == "scalable":
+    if args.advise_file_cache and args.suite not in ("concurrency", "both"):
         parser.error("--advise-file-cache requires the concurrency or both suites")
     assert args.rounds >= 1
     root = Path(__file__).resolve().parents[4]
@@ -77,6 +84,7 @@ def main():
         "host": platform.platform(),
         "logical_cpus": os.cpu_count(),
         "file_cache_advice_requested": args.advise_file_cache,
+        "baseline_legacy_value_wire": args.baseline_legacy_value_wire,
         "driver_sha256": digest(__file__),
         "fixture_sha256": digest(root / "zig/e2e/antfly/test_grep_indexed.py"),
         "artifacts": {
@@ -102,7 +110,13 @@ def main():
                 for n in (16, 32, 64)
             ],
         ]
-    suites = ("scalable", "concurrency") if args.suite == "both" else (args.suite,)
+    suites = (
+        ("scalable", "concurrency", "ingestion", "hints")
+        if args.suite == "all"
+        else ("scalable", "concurrency")
+        if args.suite == "both"
+        else (args.suite,)
+    )
     for round_number in range(args.rounds):
         for label, controls in (
             cases if round_number % 2 == 0 else list(reversed(cases))
@@ -110,16 +124,24 @@ def main():
             for suite in suites:
                 name = f"r{round_number}-{label}-{suite}"
                 destination = args.output / (name + ".json")
-                control_key = (
-                    "ANTFLY_LOGICAL_SCALABLE_REPORT"
-                    if suite == "scalable"
-                    else "ANTFLY_LOGICAL_CONCURRENCY_REPORT"
-                )
-                test = (
-                    "logical_scalable_work_profile"
-                    if suite == "scalable"
-                    else "logical_source_concurrency_profile"
-                )
+                control_key, test = {
+                    "scalable": (
+                        "ANTFLY_LOGICAL_SCALABLE_REPORT",
+                        "logical_scalable_work_profile",
+                    ),
+                    "concurrency": (
+                        "ANTFLY_LOGICAL_CONCURRENCY_REPORT",
+                        "logical_source_concurrency_profile",
+                    ),
+                    "ingestion": (
+                        "ANTFLY_LOGICAL_INGESTION_REPORT",
+                        "logical_substring_ingestion_profile",
+                    ),
+                    "hints": (
+                        "ANTFLY_LOGICAL_HINT_REPORT",
+                        "logical_retained_source_hint_profile",
+                    ),
+                }[suite]
                 binary = binaries["baseline" if label == "baseline" else "candidate"]
                 env = {
                     **base_env,
@@ -128,6 +150,9 @@ def main():
                     "ANTFLY_GREP_BIN": str(args.grep.resolve()),
                     control_key: str(destination),
                     "ANTFLY_LOGICAL_CLIENTS": args.clients,
+                    "ANTFLY_BENCH_LEGACY_VALUE_WIRE": "1"
+                    if args.baseline_legacy_value_wire and label == "baseline"
+                    else "0",
                     "ANTFLY_LOGICAL_EVICT_FILE_CACHE": "1"
                     if args.advise_file_cache
                     else "0",

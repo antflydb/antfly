@@ -21,14 +21,15 @@ const Limits = @import("budget.zig").Limits;
 const A = std.mem.Allocator;
 pub const CandidateIndex = struct { version: u32, field: []const u8, version_field: []const u8 = "grep_trigrams_version" };
 pub const Table = struct { name: []const u8, alias: ?[]const u8 = null, document_field: []const u8 = "grep", candidate_index: ?CandidateIndex = null };
-pub const ValueSearchExecution = struct {
+pub const ValueVerification = struct {
     allow_scan: bool = true,
     max_documents: u64 = 100_000,
     max_bytes: u64 = 64 * 1024 * 1024,
     max_regex_work: u64 = 100_000_000,
 };
+pub const Execution = struct { value_verification: ValueVerification = .{} };
 pub const Config = struct {
-    value_search_execution: ValueSearchExecution = .{},
+    execution: Execution = .{},
     version: u32,
     endpoint: []const u8,
     tables: []const Table,
@@ -44,7 +45,7 @@ pub fn run(search: anytype) !void {
     const parsed = try std.json.parseFromSlice(Config, search.a, bytes, .{});
     defer parsed.deinit();
     const config = parsed.value;
-    const execution = config.value_search_execution;
+    const execution = config.execution.value_verification;
     if (execution.max_documents == 0 or execution.max_bytes == 0 or execution.max_regex_work == 0 or execution.max_documents > std.math.maxInt(i64) or execution.max_bytes > std.math.maxInt(i64) or execution.max_regex_work > std.math.maxInt(i64)) return error.InvalidTableConfig;
     if (config.version != 1 or config.tables.len == 0 or config.page_size == 0 or config.page_size > 1000 or config.max_response_bytes < 1024 or config.max_response_bytes > 256 * 1024 * 1024 or config.max_page_memory < 4096 or config.max_page_memory > 1024 * 1024 * 1024) return error.InvalidTableConfig;
     try @import("providers.zig").validateCustom(config.endpoint);
@@ -329,7 +330,7 @@ const Fetch = struct {
             defer if (!retained) page.deinit(self.a);
             const a = page.arena.allocator();
             const memory = &page.memory;
-            const body = try std.json.Stringify.valueAlloc(a, .{ .query = self.text_query orelse try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"match_all\":{}}", .{}), .value_search_execution = if (self.text_query != null) @as(?ValueSearchExecution, self.config.value_search_execution) else null, .filter_query = self.filter, .fields = self.fields, .order_by = .{.{ .field = "_id", .desc = false }}, .limit = page_size.*, .search_after = request.cursor, .remote_snapshot = request.snapshot, .timeout_ms = self.options.timeout_ms }, .{ .emit_null_optional_fields = false });
+            const body = try std.json.Stringify.valueAlloc(a, .{ .query = self.text_query orelse try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"match_all\":{}}", .{}), .execution = if (self.text_query != null) @as(?Execution, self.config.execution) else null, .filter_query = self.filter, .fields = self.fields, .order_by = .{.{ .field = "_id", .desc = false }}, .limit = page_size.*, .search_after = request.cursor, .remote_snapshot = request.snapshot, .timeout_ms = self.options.timeout_ms }, .{ .emit_null_optional_fields = false });
             const auth = if (self.options.table_token) |token| try std.fmt.allocPrint(a, "Bearer {s}", .{token}) else null;
             const headers: ?[]const [2][]const u8 = if (auth) |value| &.{.{ "Authorization", value }} else null;
             var attempt: usize = 0;

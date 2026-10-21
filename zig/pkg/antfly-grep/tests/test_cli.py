@@ -1304,7 +1304,7 @@ class CliTests(unittest.TestCase):
                 self.assertIn("contains", leaf)
                 self.assertEqual(leaf["field"], "grep.content")
                 self.assertTrue(leaf["case_sensitive"])
-            self.assertTrue(body["value_search_execution"]["allow_scan"])
+            self.assertTrue(body["execution"]["value_verification"]["allow_scan"])
             self.assertNotIn("full_text_search", body)
             self.assertNotIn("full_text_index", body)
             self.assertNotIn("grep_scan", body)

@@ -21,9 +21,18 @@ const A = std.mem.Allocator;
 
 pub const Scope = struct {
     identity: [32]u8,
+    source_identity: [32]u8,
     expires_ms: u64,
     pub fn init(path: []const u8, id: []const u8, namespace: anytype, expires_ms: u64) Scope {
-        return .{ .identity = digest(.{ "logical-values-v1", path, id, namespace }), .expires_ms = expires_ms };
+        return .{ .identity = digest(.{ "logical-values-v1", path, id, namespace }), .source_identity = digest(.{ "logical-source-v1", path, namespace }), .expires_ms = expires_ms };
+    }
+    /// Only a validated physical owner may supply this proof. It covers source
+    /// revision, schema/index publication, replay state and the owner's lifetime.
+    /// A segment ID alone cannot prove unchanged unindexed source values.
+    pub fn withSourceProof(self: Scope, proof: ?[32]u8) Scope {
+        var result = self;
+        if (proof) |value| result.identity = digest(.{ "logical-values-source-v2", self.source_identity, value });
+        return result;
     }
 };
 fn digest(value: anytype) [32]u8 {
@@ -63,6 +72,7 @@ pub const Cache = struct {
         block: []align(@alignOf(u64)) u8,
         arena: std.heap.FixedBufferAllocator,
         facts: Facts,
+        matched_count: usize = 0,
         key: [32]u8,
         expires_ms: u64,
         expiry_index: usize = 0,
@@ -71,11 +81,42 @@ pub const Cache = struct {
         hot: bool = false,
     };
     const Queue = struct { first: ?*Shared = null, last: ?*Shared = null };
+    /// Directory ownership moves here under the mutex. Reclamation happens
+    /// after unlocking; immutable facts and outstanding reader pins survive.
+    const Retired = struct {
+        first: ?*Shared = null,
+        entries: std.AutoHashMapUnmanaged([32]u8, *Shared) = .empty,
+        expiry: std.ArrayListUnmanaged(*Shared) = .empty,
+        fn add(self: *@This(), shared: *Shared) void {
+            shared.next = self.first;
+            self.first = shared;
+        }
+        fn drain(self: *@This(), cache: *Cache) void {
+            while (self.first) |shared| {
+                self.first = shared.next;
+                cache.release(shared);
+            }
+            self.entries.deinit(cache.budget.allocator());
+            self.entries = .empty;
+            self.expiry.deinit(cache.budget.allocator());
+            self.expiry = .empty;
+        }
+    };
+    const expiry_batch = 8;
     pub const Lease = struct {
         cache: *Cache,
         shared: *Shared,
         pub fn facts(self: Lease) *const Facts {
             return &self.shared.facts;
+        }
+        /// Transfer the pin into a generic immutable view without allocating.
+        pub fn intoBorrowed(self: Lease) @import("../encoding/roaring.zig").BorrowedBitmap {
+            return .{ .bitmap = &self.shared.facts.matched, .cached_cardinality = self.shared.matched_count, .context = .{ self.cache, self.shared }, .release = releaseBorrowed };
+        }
+        fn releaseBorrowed(context: [2]*anyopaque) void {
+            const cache: *Cache = @ptrCast(@alignCast(context[0]));
+            const shared: *Shared = @ptrCast(@alignCast(context[1]));
+            cache.release(shared);
         }
         pub fn deinit(self: *Lease) void {
             self.cache.release(self.shared);
@@ -109,20 +150,23 @@ pub const Cache = struct {
         if (queue.last) |last| last.next = shared else queue.first = shared;
         queue.last = shared;
     }
-    fn remove(self: *Cache, shared: *Shared) void {
+    fn remove(self: *Cache, shared: *Shared, retired: *Retired) void {
         self.unlink(shared);
         self.removeExpiry(shared.expiry_index);
         std.debug.assert(self.entries.remove(shared.key));
-        self.release(shared);
+        retired.add(shared);
     }
-    fn evict(self: *Cache) bool {
+    fn evict(self: *Cache, retired: *Retired) bool {
         // A one-shot scan replaces probationary entries before proven reuse.
         // Skip pinned blocks: removing their directory entry cannot free bytes.
+        var examined: usize = 0;
         for ([_]?*Shared{ self.cold.first, self.hot.first }) |first| {
             var node = first;
             while (node) |shared| : (node = shared.next) {
+                if (examined == 64) return false;
+                examined += 1;
                 if (shared.refs.load(.acquire) != 1) continue;
-                self.remove(shared);
+                self.remove(shared, retired);
                 return true;
             }
         }
@@ -164,31 +208,45 @@ pub const Cache = struct {
             current = child;
         }
     }
-    fn expire(self: *Cache, now_ms: u64) void {
-        // Indexed heap removal also covers replacement and eviction: no stale
-        // tombstones accumulate, and staggered deadlines never scan live facts.
-        while (self.expiry.items.len != 0 and self.expiry.items[0].expires_ms <= now_ms) self.remove(self.expiry.items[0]);
-        if (self.entries.count() == 0) {
-            self.entries.deinit(self.budget.allocator());
-            self.entries = .empty;
-            self.expiry.deinit(self.budget.allocator());
-            self.expiry = .empty;
-        }
+    fn expire(self: *Cache, now_ms: u64, retired: *Retired) void {
+        // Cleanup has a fixed foreground work allowance. An expired target is
+        // separately rejected below even when older deadlines exhaust it.
+        var remaining: usize = expiry_batch;
+        while (remaining != 0 and self.expiry.items.len != 0 and self.expiry.items[0].expires_ms <= now_ms) : (remaining -= 1) self.remove(self.expiry.items[0], retired);
+    }
+    fn retireEmptyDirectory(self: *Cache, retired: *Retired) void {
+        if (self.entries.count() != 0) return;
+        retired.entries = self.entries;
+        self.entries = .empty;
+        retired.expiry = self.expiry;
+        self.expiry = .empty;
     }
     pub fn deinit(self: *Cache) void {
-        while (self.cold.first) |shared| self.remove(shared);
-        while (self.hot.first) |shared| self.remove(shared);
-        self.entries.deinit(self.budget.allocator());
-        self.expiry.deinit(self.budget.allocator());
+        var retired: Retired = .{};
+        defer retired.drain(self);
+        while (self.cold.first) |shared| self.remove(shared, &retired);
+        while (self.hot.first) |shared| self.remove(shared, &retired);
+        self.retireEmptyDirectory(&retired);
     }
-    /// Lookup and pin are O(1), with no allocations or bitmap copies. Expiry
-    /// removes only expired entries, with O(log N) work per removal.
-    /// The cache must outlive leases, including leases retired by deinit.
+    /// Lookup and pin allocate no memory or bitmap copies. Foreground expiry
+    /// removes at most eight heap entries plus an expired requested key.
+    /// Reclamation runs outside the directory mutex. The cache must outlive
+    /// leases, including leases retired by deinit.
     pub fn borrow(self: *Cache, identity: [32]u8, now_ms: u64) ?Lease {
+        var retired: Retired = .{};
+        defer retired.drain(self);
         self.lock();
         defer self.mutex.unlock();
-        self.expire(now_ms);
-        const shared = self.entries.get(identity) orelse return null;
+        self.expire(now_ms, &retired);
+        const shared = self.entries.get(identity) orelse {
+            self.retireEmptyDirectory(&retired);
+            return null;
+        };
+        if (shared.expires_ms <= now_ms) {
+            self.remove(shared, &retired);
+            self.retireEmptyDirectory(&retired);
+            return null;
+        }
         self.unlink(shared);
         shared.hot = true;
         self.append(shared);
@@ -204,9 +262,11 @@ pub const Cache = struct {
         if (expires_ms <= now_ms) return;
         const needed = @sizeOf(Shared) + facts.known.cloneStorageBound() + facts.matched.cloneStorageBound() + 32;
         if (needed > 2 * 1024 * 1024 or needed > self.budget.limit) return;
+        var retired: Retired = .{};
+        defer retired.drain(self);
         self.lock();
-        self.expire(now_ms);
-        if (self.entries.get(identity)) |held| if (held.facts.complete) {
+        self.expire(now_ms, &retired);
+        if (self.entries.get(identity)) |held| if (held.facts.complete and held.expires_ms > now_ms) {
             self.mutex.unlock();
             return;
         };
@@ -219,54 +279,72 @@ pub const Cache = struct {
             self.mutex.unlock();
             return;
         };
+        self.mutex.unlock();
+        retired.drain(self);
+        self.lock();
         var available = @import("../sql/memory_budget.zig").headroom(self.budget.allocator()).?;
         if (available < needed) {
-            var iterator = self.entries.valueIterator();
-            while (iterator.next()) |held| if (held.*.refs.load(.acquire) == 1) {
-                available += held.*.block.len;
-                if (available >= needed) break;
-            };
+            // Optional admission examines at most 64 LRU nodes. A cache miss
+            // is preferable to scanning a directory full of pinned readers.
+            var examined: usize = 0;
+            outer: for ([_]?*Shared{ self.cold.first, self.hot.first }) |first| {
+                var node = first;
+                while (node) |held| : (node = held.next) {
+                    if (examined == 64) break :outer;
+                    examined += 1;
+                    if (held.refs.load(.acquire) == 1) available += held.block.len;
+                    if (available >= needed) break :outer;
+                }
+            }
         }
         if (available < needed) {
             self.mutex.unlock();
             return;
         }
-        const block = while (true) {
+        var eviction_attempts: usize = 0;
+        const block = while (true) : (eviction_attempts += 1) {
             if (@import("../sql/memory_budget.zig").headroom(self.budget.allocator()).? >= needed) {
                 break self.budget.allocator().alignedAlloc(u8, .of(u64), needed) catch {
                     self.mutex.unlock();
                     return;
                 };
             }
-            if (!self.evict()) {
+            if (eviction_attempts == 64 or !self.evict(&retired)) {
                 self.mutex.unlock();
                 return;
             }
+            // Detached blocks remain charged until released. Drop the directory
+            // lock for allocator work, then recheck admission after races.
+            self.mutex.unlock();
+            retired.drain(self);
+            self.lock();
         };
         self.mutex.unlock();
+        retired.drain(self);
         const shared: *Shared = @ptrCast(block.ptr);
         shared.* = .{ .block = block, .arena = .init(block[@sizeOf(Shared)..]), .facts = undefined, .key = identity, .expires_ms = expires_ms };
         shared.facts = facts.clone(shared.arena.allocator()) catch {
             self.release(shared);
             return;
         };
+        shared.matched_count = shared.facts.matched.cardinality();
         self.lock();
         defer self.mutex.unlock();
         if (self.entries.get(identity)) |held| {
-            if (held.facts.complete) {
-                self.release(shared);
+            if (held.facts.complete and held.expires_ms > now_ms) {
+                retired.add(shared);
                 return;
             }
             shared.hot = held.hot;
-            self.remove(held);
+            self.remove(held, &retired);
         }
         // Other builders may have used the spare hash capacity while copying.
         self.expiry.ensureUnusedCapacity(self.budget.allocator(), 1) catch {
-            self.release(shared);
+            retired.add(shared);
             return;
         };
         self.entries.ensureUnusedCapacity(self.budget.allocator(), 1) catch {
-            self.release(shared);
+            retired.add(shared);
             return;
         };
         self.entries.putAssumeCapacity(identity, shared);
@@ -438,6 +516,9 @@ test "logical value byte budget admits thousands of tiny retained facts" {
         warm.deinit();
         try std.testing.expect(cache.budget.live <= cache.budget.limit);
         try std.testing.expect(cache.borrow(digest(.{@as(usize, 0)}), 100) == null);
+        // Expiry bursts are reclaimed incrementally rather than making one
+        // reader pay for every expired key under the directory mutex.
+        while (cache.entries.count() != 0) try std.testing.expect(cache.borrow(digest(.{@as(usize, 0)}), 100) == null);
         try std.testing.expectEqual(@as(usize, 0), cache.budget.live);
     }
 }
@@ -456,7 +537,9 @@ test "logical value staggered expiry is logarithmic and keeps pins alive" {
     defer pin.deinit();
     cache.expiry_comparisons = 0;
     for (0..count) |i| {
-        cache.expire(i + 11);
+        var retired: Cache.Retired = .{};
+        cache.expire(i + 11, &retired);
+        retired.drain(&cache);
         try std.testing.expectEqual(count - i - 1, cache.entries.count());
         try std.testing.expectEqual(cache.entries.count(), cache.expiry.items.len);
         if (i + 1 < count) {
@@ -468,4 +551,97 @@ test "logical value staggered expiry is logarithmic and keeps pins alive" {
     std.debug.print("logical_membership_expiry keys={d} comparisons={d} peak_bytes={d}\n", .{ count, cache.expiry_comparisons, cache.budget.peak });
     try std.testing.expect(pin.facts().known.contains(7));
     try std.testing.expect(cache.budget.live != 0);
+}
+
+test "logical value source proof shares cuts only for identical authoritative state" {
+    const first = Scope.init("table", "cut-a", @as(u64, 7), 100);
+    const second = Scope.init("table", "cut-b", @as(u64, 7), 200);
+    try std.testing.expect(!std.mem.eql(u8, &first.identity, &second.identity));
+    const proof: [32]u8 = @splat(42);
+    const a = first.withSourceProof(proof);
+    const b = second.withSourceProof(proof);
+    try std.testing.expectEqualSlices(u8, &a.identity, &b.identity);
+    try std.testing.expectEqual(@as(u64, 200), b.expires_ms);
+    const changed = second.withSourceProof(@as([32]u8, @splat(43)));
+    try std.testing.expect(!std.mem.eql(u8, &a.identity, &changed.identity));
+    const other = Scope.init("table", "cut-b", @as(u64, 8), 200).withSourceProof(proof);
+    try std.testing.expect(!std.mem.eql(u8, &a.identity, &other.identity));
+    try std.testing.expectEqualSlices(u8, &second.identity, &second.withSourceProof(null).identity);
+}
+
+test "logical value borrowed bitmap survives cache expiry without a clone" {
+    const a = std.testing.allocator;
+    var cache: Cache = .{ .budget = .{ .backing = a, .limit = 32768 } };
+    defer cache.deinit();
+    var facts = Facts.init(a);
+    defer facts.deinit();
+    facts.complete = true;
+    try facts.matched.addRange(0, 10000);
+    const key_ = digest(.{"borrowed"});
+    cache.put(key_, 10, 1, facts);
+    var view = cache.borrow(key_, 2).?.intoBorrowed();
+    defer view.deinit();
+    try std.testing.expect(cache.borrow(key_, 11) == null);
+    try std.testing.expectEqual(@as(usize, 10000), view.bitmap.cardinality());
+    try std.testing.expectEqual(@as(?usize, 10000), view.cached_cardinality);
+}
+
+test "logical value expiry bursts bound foreground removals and reclaim outside the lock" {
+    const Checked = struct {
+        parent: A,
+        cache: ?*Cache = null,
+        checked_frees: usize = 0,
+        locked_frees: usize = 0,
+        fn allocator(self: *@This()) A {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+        fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.parent.rawAlloc(len, alignment, ra);
+        }
+        fn resize(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.parent.rawResize(bytes, alignment, len, ra);
+        }
+        fn remap(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.parent.rawRemap(bytes, alignment, len, ra);
+        }
+        fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.cache) |cache| {
+                self.checked_frees += 1;
+                if (cache.mutex.tryLock()) cache.mutex.unlock() else self.locked_frees += 1;
+            }
+            self.parent.rawFree(bytes, alignment, ra);
+        }
+    };
+    const a = std.testing.allocator;
+    var backing: Checked = .{ .parent = a };
+    var cache: Cache = .{ .budget = .{ .backing = backing.allocator(), .limit = 4 * 1024 * 1024 } };
+    defer cache.deinit();
+    var facts = Facts.init(a);
+    defer facts.deinit();
+    facts.complete = true;
+    try facts.matched.add(7);
+    const count = 1024;
+    for (0..count) |i| cache.put(digest(.{i}), 10, 1, facts);
+    const live_key = digest(.{"live-after-expiry-burst"});
+    cache.put(live_key, 100, 1, facts);
+    var pin = cache.borrow(digest(.{@as(usize, count - 1)}), 2).?;
+    defer pin.deinit();
+    backing.cache = &cache;
+    cache.expiry_comparisons = 0;
+    var live = cache.borrow(live_key, 11).?;
+    live.deinit();
+    try std.testing.expectEqual(count + 1 - Cache.expiry_batch, cache.entries.count());
+    try std.testing.expect(cache.expiry_comparisons < 256);
+    // The requested expired entry lies beyond the cleanup allowance. It must
+    // still miss, and its outstanding immutable pin remains usable.
+    const before = cache.entries.count();
+    try std.testing.expect(cache.borrow(digest(.{@as(usize, count - 1)}), 11) == null);
+    try std.testing.expect(before - cache.entries.count() <= Cache.expiry_batch + 1);
+    try std.testing.expect(pin.facts().matched.contains(7));
+    try std.testing.expect(backing.checked_frees != 0);
+    try std.testing.expectEqual(@as(usize, 0), backing.locked_frees);
 }

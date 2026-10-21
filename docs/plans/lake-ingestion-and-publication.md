@@ -649,7 +649,7 @@ configured cursor retention period (five minutes by default, at most one hour) i
 object-store descriptors. Publication and restart preserve the original cut;
 recipe, policy and incarnation changes invalidate it.
 The overlay is reconstructed from durable WAL after restart. Direct SQL SELECT
-requests can opt into `lake_visibility: "accepted"`; session/transaction modes
+requests can opt into `read_requirements: {visibility: "accepted"}`; session/transaction modes
 retain committed visibility. `lake_read` selects accepted or published search
 visibility and optional receipt coverage with a bounded readiness wait. Pending
 vector queries wake background enrichment and wait for coherent native recent

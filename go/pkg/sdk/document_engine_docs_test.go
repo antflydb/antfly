@@ -75,13 +75,13 @@ func TestDocumentEngineGuideExamplesRoundTrip(t *testing.T) {
 			}
 			sawSchema = true
 			assertDocumentEngineSchemaExample(t, block)
-		case root["value_search_execution"] != nil:
+		case root["execution"] != nil:
 			sawLogicalQuery = true
 			var req oapi.QueryRequest
 			if err := json.Unmarshal(block, &req); err != nil {
 				t.Fatal(err)
 			}
-			if !req.ValueSearchExecution.AllowScan || !req.Profile {
+			if !req.Execution.ValueVerification.AllowScan || !req.Profile {
 				t.Fatal("logical example must explicitly permit scans and enable profiling")
 			}
 			var logical oapi.ContainsQuery

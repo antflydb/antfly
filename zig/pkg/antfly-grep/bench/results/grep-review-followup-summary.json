@@ -1,0 +1,1832 @@
+{
+ "protocol": 1,
+ "original_pr": 1164,
+ "followup_pr": 1237,
+ "implementation_parent": "fe2c053443bf23f73f746abbda6bbd57646e9176",
+ "merged_main": "ae0b8856fdc62c7c164125ade966d3ed0cd2dc8e",
+ "host": "macOS-27.0.1-arm64-arm-64bit",
+ "scope": "Shared Apple Silicon host; native macOS and ARM64 Linux VM on this host. Warm filesystem, no independent physical Linux or cold-device qualification. Linux correctness and retrieval/concurrency use two CPUs/1 GiB with swap disabled; paired ingestion uses two CPUs/8 GiB with swap disabled. A separate candidate ingestion admission check uses two CPUs/1 GiB. Stripping artifacts changes file size, not an established runtime memory improvement.",
+ "artifacts": {
+  "macos": {
+   "source_head": "fe2c053443bf23f73f746abbda6bbd57646e9176",
+   "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "sha256": "50bffaba024fc79a8ac1b1b13fa4f1fb2730e7b42abb631db98bd1bc09311473",
+   "bytes": 209029096,
+   "command": [
+    "$ZIG",
+    "build",
+    "--build-file",
+    "zig/build.zig",
+    "antfly",
+    "-Doptimize=ReleaseFast",
+    "-Dstrip=true",
+    "-Dantfly-bin-name=antfly-grep-review-current",
+    "-j1"
+   ],
+   "compiler": "0.17.0",
+   "source_manifest_sha256": "48ecce7e1687e2ff60e87fd127d9be67839e8f118522e1fa23496b0291ab2f91",
+   "source_file_count": 5959,
+   "source_manifest_scope": "Tracked Zig/spec files excluding Markdown, JSON, Python and lockfiles; source_head and diff hash cover the tracked revision."
+  },
+  "linux": {
+   "source_head": "fe2c053443bf23f73f746abbda6bbd57646e9176",
+   "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "sha256": "3e0dd801d6ece53ef596e3a8518f330bb3b4335edf260a5b74c775b3e9bad86b",
+   "bytes": 204090112,
+   "command": [
+    "$ZIG",
+    "build",
+    "--build-file",
+    "zig/build.zig",
+    "antfly",
+    "-Doptimize=ReleaseFast",
+    "-Dstrip=true",
+    "-Dantfly-bin-name=antfly-grep-review-linux",
+    "-j1",
+    "-Dtarget=aarch64-linux-musl",
+    "-Dmetal=false",
+    "-Dsystem-blas=false"
+   ],
+   "compiler": "0.17.0",
+   "source_manifest_sha256": "48ecce7e1687e2ff60e87fd127d9be67839e8f118522e1fa23496b0291ab2f91",
+   "source_file_count": 5959,
+   "source_manifest_scope": "Tracked Zig/spec files excluding Markdown, JSON, Python and lockfiles; source_head and diff hash cover the tracked revision."
+  }
+ },
+ "validation": {
+  "macos": {
+   "exit_code": 0,
+   "records": [
+    {
+     "name": "http",
+     "command": [
+      "$WORKTREE/zig/e2e/antfly/.venv/bin/python",
+      "-m",
+      "pytest",
+      "-q",
+      "zig/e2e/antfly/test_grep_indexed.py",
+      "zig/e2e/antfly/test_logical_source_upgrade.py",
+      "zig/e2e/antfly/test_logical_analyzer_upgrade.py"
+     ],
+     "exit_code": 0,
+     "log_sha256": "0f3f42f7b5f5594a516e2c66fb0e1a2cf5be36649da9d6e679a67b253c681138"
+    },
+    {
+     "name": "bench-all",
+     "command": [
+      "$WORKTREE/zig/e2e/antfly/.venv/bin/python",
+      "zig/pkg/antfly-grep/bench/logical_sources.py",
+      "--baseline",
+      "output/grep-followup/candidate/macos/antfly",
+      "--candidate",
+      "output/grep-followup/review-final/macos/antfly",
+      "--grep",
+      "output/grep-followup/candidate/macos-cli/antfly-grep",
+      "--output",
+      "output/grep-followup/review-final/macos/bench-all",
+      "--rounds",
+      "2",
+      "--suite",
+      "all"
+     ],
+     "exit_code": 0,
+     "log_sha256": "5563dfb5296cf948ab4a60c2067e4d94ca821d4aacbf4f0f3091c22e3f073f0e"
+    }
+   ]
+  },
+  "linux": {
+   "exit_code": 0,
+   "records": [
+    {
+     "name": "http",
+     "command": [
+      "docker",
+      "run",
+      "--rm",
+      "--platform",
+      "linux/arm64",
+      "--cpus",
+      "2",
+      "--memory",
+      "1g",
+      "--memory-swap",
+      "1g",
+      "-v",
+      "$WORKTREE:/work",
+      "-w",
+      "/work",
+      "-e",
+      "ANTFLY_BIN=/work/output/grep-followup/review-final/linux/antfly",
+      "-e",
+      "ANTFLY_GREP_BIN=/work/output/grep-followup/candidate/linux-cli/antfly-grep",
+      "-e",
+      "ANTFLY_LOGICAL_SOURCE_BASELINE_BIN=/work/output/review-followup/linux/antfly",
+      "-e",
+      "ANTFLY_GREP_UPGRADE_BASELINE_BIN=/work/output/logical-scalable/linux/antfly",
+      "antfly-grep-query-arm64:review-1164",
+      "python3",
+      "-m",
+      "pytest",
+      "-q",
+      "zig/e2e/antfly/test_grep_indexed.py",
+      "zig/e2e/antfly/test_logical_source_upgrade.py",
+      "zig/e2e/antfly/test_logical_analyzer_upgrade.py"
+     ],
+     "exit_code": 0,
+     "log_sha256": "af0ac3956a029a420276579e7b7575c618c0ad46af42324ee913214a694ed5d4"
+    },
+    {
+     "name": "bench-both",
+     "command": [
+      "docker",
+      "run",
+      "--rm",
+      "--platform",
+      "linux/arm64",
+      "--cpus",
+      "2",
+      "--memory",
+      "1g",
+      "--memory-swap",
+      "1g",
+      "-v",
+      "$WORKTREE:/work",
+      "-w",
+      "/work",
+      "-e",
+      "ANTFLY_BIN=/work/output/grep-followup/review-final/linux/antfly",
+      "-e",
+      "ANTFLY_GREP_BIN=/work/output/grep-followup/candidate/linux-cli/antfly-grep",
+      "-e",
+      "ANTFLY_LOGICAL_SOURCE_BASELINE_BIN=/work/output/review-followup/linux/antfly",
+      "-e",
+      "ANTFLY_GREP_UPGRADE_BASELINE_BIN=/work/output/logical-scalable/linux/antfly",
+      "antfly-grep-query-arm64:review-1164",
+      "python3",
+      "zig/pkg/antfly-grep/bench/logical_sources.py",
+      "--baseline",
+      "output/grep-followup/candidate/linux/antfly",
+      "--candidate",
+      "output/grep-followup/review-final/linux/antfly",
+      "--grep",
+      "output/grep-followup/candidate/linux-cli/antfly-grep",
+      "--output",
+      "output/grep-followup/review-final/linux/bench-both",
+      "--rounds",
+      "2",
+      "--suite",
+      "both"
+     ],
+     "exit_code": 0,
+     "log_sha256": "a8a025951cdab0e3914c7f6237420fc0bbcb4f1cc864d398c0e56861b42740d1"
+    },
+    {
+     "name": "bench-ingestion",
+     "command": [
+      "docker",
+      "run",
+      "--rm",
+      "--platform",
+      "linux/arm64",
+      "--cpus",
+      "2",
+      "--memory",
+      "8g",
+      "--memory-swap",
+      "8g",
+      "-v",
+      "$WORKTREE:/work",
+      "-w",
+      "/work",
+      "-e",
+      "ANTFLY_BIN=/work/output/grep-followup/review-final/linux/antfly",
+      "-e",
+      "ANTFLY_GREP_BIN=/work/output/grep-followup/candidate/linux-cli/antfly-grep",
+      "-e",
+      "ANTFLY_LOGICAL_SOURCE_BASELINE_BIN=/work/output/review-followup/linux/antfly",
+      "-e",
+      "ANTFLY_GREP_UPGRADE_BASELINE_BIN=/work/output/logical-scalable/linux/antfly",
+      "antfly-grep-query-arm64:review-1164",
+      "python3",
+      "zig/pkg/antfly-grep/bench/logical_sources.py",
+      "--baseline",
+      "output/grep-followup/candidate/linux/antfly",
+      "--candidate",
+      "output/grep-followup/review-final/linux/antfly",
+      "--grep",
+      "output/grep-followup/candidate/linux-cli/antfly-grep",
+      "--output",
+      "output/grep-followup/review-final/linux/bench-ingestion",
+      "--rounds",
+      "2",
+      "--suite",
+      "ingestion"
+     ],
+     "exit_code": 0,
+     "log_sha256": "da8847772593759b28979768b266958a27dc079014e34eca0665431a36c08b64"
+    },
+    {
+     "name": "ingestion-small-node",
+     "command": [
+      "docker",
+      "run",
+      "--rm",
+      "--platform",
+      "linux/arm64",
+      "--cpus",
+      "2",
+      "--memory",
+      "1g",
+      "--memory-swap",
+      "1g",
+      "-v",
+      "$WORKTREE:/work",
+      "-w",
+      "/work",
+      "-e",
+      "ANTFLY_BIN=/work/output/grep-followup/review-final/linux/antfly",
+      "-e",
+      "ANTFLY_GREP_BIN=/work/output/grep-followup/candidate/linux-cli/antfly-grep",
+      "-e",
+      "ANTFLY_LOGICAL_SOURCE_BASELINE_BIN=/work/output/review-followup/linux/antfly",
+      "-e",
+      "ANTFLY_GREP_UPGRADE_BASELINE_BIN=/work/output/logical-scalable/linux/antfly",
+      "-e",
+      "ANTFLY_LOGICAL_INGESTION_REPORT=/work/output/grep-followup/review-final/linux/ingestion-1g.json",
+      "antfly-grep-query-arm64:review-1164",
+      "python3",
+      "-m",
+      "pytest",
+      "-q",
+      "zig/e2e/antfly/test_grep_indexed.py",
+      "-k",
+      "logical_substring_ingestion_profile"
+     ],
+     "exit_code": 0,
+     "log_sha256": "62b4a82fcb729be30d44ead1af6a08f741c32e1d338ec76e746138746395974a"
+    },
+    {
+     "name": "bench-hints",
+     "command": [
+      "docker",
+      "run",
+      "--rm",
+      "--platform",
+      "linux/arm64",
+      "--cpus",
+      "2",
+      "--memory",
+      "1g",
+      "--memory-swap",
+      "1g",
+      "-v",
+      "$WORKTREE:/work",
+      "-w",
+      "/work",
+      "antfly-grep-query-arm64:review-1164",
+      "python3",
+      "zig/pkg/antfly-grep/bench/logical_sources.py",
+      "--baseline",
+      "output/grep-followup/candidate/linux/antfly",
+      "--candidate",
+      "output/grep-followup/review-final/linux/antfly",
+      "--grep",
+      "output/grep-followup/candidate/linux-cli/antfly-grep",
+      "--output",
+      "output/grep-followup/review-final/linux/bench-hints",
+      "--rounds",
+      "2",
+      "--suite",
+      "hints"
+     ],
+     "exit_code": 0,
+     "log_sha256": "1a7ee1c3cce3ac058189c42aa5afb391822b1f6c320a46731828ca45d0128ad9"
+    }
+   ]
+  },
+  "linux_controls": {
+   "exit_code": 0,
+   "records": [
+    {
+     "name": "one-cpu",
+     "cpus": 1,
+     "file_cache_advice": false,
+     "exit_code": 0,
+     "command": [
+      "docker",
+      "run",
+      "--rm",
+      "--platform",
+      "linux/arm64",
+      "--cpus",
+      "1",
+      "--memory",
+      "1g",
+      "--memory-swap",
+      "1g",
+      "-v",
+      "$WORKTREE:/work",
+      "-w",
+      "/work",
+      "antfly-grep-query-arm64:review-1164",
+      "python3",
+      "zig/pkg/antfly-grep/bench/logical_sources.py",
+      "--baseline",
+      "output/grep-followup/candidate/linux/antfly",
+      "--candidate",
+      "output/grep-followup/review-final/linux/antfly",
+      "--grep",
+      "output/grep-followup/candidate/linux-cli/antfly-grep",
+      "--output",
+      "output/grep-followup/review-final/linux/control-one-cpu",
+      "--rounds",
+      "2",
+      "--suite",
+      "concurrency"
+     ],
+     "log_sha256": "6cbac1cb083c80fc77c7932878125062f07507b4f952266913899c2086f9daba"
+    },
+    {
+     "name": "file-cache-advice",
+     "cpus": 2,
+     "file_cache_advice": true,
+     "exit_code": 0,
+     "command": [
+      "docker",
+      "run",
+      "--rm",
+      "--platform",
+      "linux/arm64",
+      "--cpus",
+      "2",
+      "--memory",
+      "1g",
+      "--memory-swap",
+      "1g",
+      "-v",
+      "$WORKTREE:/work",
+      "-w",
+      "/work",
+      "antfly-grep-query-arm64:review-1164",
+      "python3",
+      "zig/pkg/antfly-grep/bench/logical_sources.py",
+      "--baseline",
+      "output/grep-followup/candidate/linux/antfly",
+      "--candidate",
+      "output/grep-followup/review-final/linux/antfly",
+      "--grep",
+      "output/grep-followup/candidate/linux-cli/antfly-grep",
+      "--output",
+      "output/grep-followup/review-final/linux/control-file-cache-advice",
+      "--rounds",
+      "2",
+      "--suite",
+      "concurrency",
+      "--advise-file-cache"
+     ],
+     "log_sha256": "6cbac1cb083c80fc77c7932878125062f07507b4f952266913899c2086f9daba"
+    }
+   ]
+  },
+  "unit_and_sdk": {
+   "sparse-complement-debug.log": {
+    "sha256": "74274efcb216064cba068e61755024f7ae4bfce91e702287ca1e04be09d02256",
+    "test_summaries": [
+     "OK",
+     "OK",
+     "OK",
+     "144 passed; 0 skipped; 0 failed; 0 leaked.",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "84 passed; 1 skipped; 0 failed; 0 leaked."
+    ]
+   },
+   "sparse-complement-release.log": {
+    "sha256": "dbb3fa33c809cffdca225a57bd2a38c7d4d7d3a00a70ef25502470da1d6983f9",
+    "test_summaries": [
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "84 passed; 1 skipped; 0 failed; 0 leaked.",
+     "OK",
+     "OK",
+     "OK",
+     "144 passed; 0 skipped; 0 failed; 0 leaked."
+    ]
+   },
+   "prepared-full-introducer-debug.log": {
+    "sha256": "140e24562f58664f8800a3e5448ab7612e4988848454b2d724fcf94d29fe0805",
+    "test_summaries": [
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "44 passed; 1 skipped; 0 failed; 0 leaked."
+    ]
+   },
+   "prepared-full-introducer-release.log": {
+    "sha256": "5b42b451f3e94131affa9ed6a9c485011c1ba5d15929f5b1ddc03534626d2c64",
+    "test_summaries": [
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "44 passed; 1 skipped; 0 failed; 0 leaked."
+    ]
+   },
+   "prepared-spill-debug.log": {
+    "sha256": "72f8fcb8707e09da69cc6a6f60eb18f9cec1e94f8fac09140f0b3c2a709342a2",
+    "test_summaries": [
+     "OK",
+     "1 passed; 0 skipped; 0 failed; 0 leaked."
+    ]
+   },
+   "prepared-spill-release.log": {
+    "sha256": "9dfb50eff679ab83803785571e22d3c99a553ad4429ed9e779a584aaedda1e2d",
+    "test_summaries": [
+     "OK",
+     "1 passed; 0 skipped; 0 failed; 0 leaked."
+    ]
+   },
+   "explicit-scratch-test.log": {
+    "sha256": "de9b4b8f8f2a352a783a81ca29e691625c4fdeb4886dfb1158590ab67067eb67",
+    "test_summaries": [
+     "OK",
+     "1 passed; 0 skipped; 0 failed; 0 leaked."
+    ]
+   },
+   "schema-projection-linux-test.log": {
+    "sha256": "95f47b38005f043d1dbc124202655a25859711fb19c929256779d85c6b82fb08",
+    "test_summaries": [
+     "OK",
+     "1 passed; 0 skipped; 0 failed; 0 leaked."
+    ]
+   },
+   "inline-postings-bench-final.log": {
+    "sha256": "1ec9f45eaaa06302afd38684d5eba42d8cf324b28f617b5c7076b7ca6be8f03f",
+    "test_summaries": [
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "OK",
+     "87 passed; 1 skipped; 0 failed; 0 leaked.",
+     "1 passed; 0 skipped; 0 failed; 0 leaked."
+    ]
+   },
+   "sdk-union-full-tests-final.log": {
+    "sha256": "5f9124d742779f2f317bd1a340bb09c7480f32321284432ed7accccaa0bc6ef5",
+    "test_summaries": [
+     "667 passed in 2.18s"
+    ]
+   },
+   "sdk-union-check-final.log": {
+    "sha256": "ef1b048b97491ae41011a4b8b3e14ee9a28954180a01e526fa01fe2b3915aac3",
+    "test_summaries": []
+   },
+   "review-boundary-final.log": {
+    "sha256": "67af5d68c290cba08d75c663aa5a622884c0004b908d7aa695edc533940c1455",
+    "test_summaries": []
+   },
+   "all-review-tools-final.log": {
+    "sha256": "cc69ddcd5a6abb73d913b5c11c700e468f8895f0c891906cbed1cd2ef9f03bdd",
+    "test_summaries": [
+     "25 passed, 1 skipped, 13 subtests passed in 0.16s"
+    ]
+   },
+   "review-license-headers-final.log": {
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "test_summaries": []
+   },
+   "review-packaging-final.log": {
+    "sha256": "889c4f9934447d4d1fc00f92822cc1953b98e7d6a4e9c9d4d1f269d5de86c633",
+    "test_summaries": [
+     "OK"
+    ]
+   },
+   "benchmark-tools-current.log": {
+    "sha256": "e355a57654ab1b1c634ec1b55e7dd4c5a84a28c1524372d4f6f40c226e02dc14",
+    "test_summaries": []
+   },
+   "differential-tools-current.log": {
+    "sha256": "e19a86747084065fc6026e9e5463e2291a2e56061843e8a27e0424f4fed284be",
+    "test_summaries": [
+     "OK"
+    ]
+   },
+   "retained-tools-current.log": {
+    "sha256": "a115624924fd80947cf50dfad96b5674af653bb005a473bdf80285aa3ad644ad",
+    "test_summaries": [
+     "OK"
+    ]
+   }
+  }
+ },
+ "limits": [
+  "Verification limits remain per shard request; coordinator-owned request-wide grants are not implemented.",
+  "Writes invalidate whole-generation membership proofs; maintained per-segment source-binding certificates remain future work.",
+  "Warm Boolean counts are allocation-free only for supported complete borrowed leaves within the bounded program; other expressions fall back to owned execution.",
+  "Posting microbenchmarks use the testing allocator as backing and do not measure production malloc or complete ingestion.",
+  "Tracked build allocation, process RSS and node memory allowance are separate quantities."
+ ],
+ "baseline_artifacts": {
+  "macos": {
+   "source_head": "cfb5cbba613cab99a6f28eec34ef602106d2e21f",
+   "source_fingerprint": "dc71d54e775dac4b96cfb2e95a8cebc00fef3bffe416f4e38f5e188ddb71f9eb",
+   "sha256": "f0c1dc68382ea91b9a0fb575775766f8205a901c384179b7f0ec3a93aacd9f52",
+   "bytes": 229031432,
+   "command": [
+    "$ZIG",
+    "build",
+    "antfly",
+    "-Doptimize=ReleaseFast",
+    "-Dantfly-bin-name=antfly-macos-aarch64",
+    "-j1"
+   ],
+   "compiler": "0.17.0"
+  },
+  "linux": {
+   "source_head": "cfb5cbba613cab99a6f28eec34ef602106d2e21f",
+   "source_fingerprint": "dc71d54e775dac4b96cfb2e95a8cebc00fef3bffe416f4e38f5e188ddb71f9eb",
+   "sha256": "55b23d5de65afa28df1c70c8032c94076e11d090256f6a084d839cc5d186876e",
+   "bytes": 1293249056,
+   "command": [
+    "$ZIG",
+    "build",
+    "antfly",
+    "-Doptimize=ReleaseFast",
+    "-Dantfly-bin-name=antfly-linux-aarch64",
+    "-j1",
+    "-Dtarget=aarch64-linux-musl",
+    "-Dmetal=false",
+    "-Dsystem-blas=false"
+   ],
+   "compiler": "0.17.0"
+  }
+ },
+ "packaging": {
+  "exit_code": 0,
+  "scope": "Archives constructed from previously qualified unchanged CLI sources, with current documentation. Verifies packaged binary and asset hashes and executes the packaged binary on its native ISA. No upload or release publication.",
+  "records": [
+   {
+    "platform": "macos",
+    "archive": "output/grep-followup/review-final/packaging/macos/antfly-grep.tar.gz",
+    "sha256": "2e07bcf1353add7033104edad3ba414b415bedf526d351f67a2e9ec6b9568ec5",
+    "bytes": 2778073,
+    "assets": {
+     "antfly-grep": "4e7c8eadda2650340b1ab6179dc54df7e4824c0e696fd185727cf6d66e599ae0",
+     "LICENSE": "e56aea6e2b9b30b1008326f604dee4afa8c88f44a6dea7e3719592ed987b80c4",
+     "THIRD_PARTY_NOTICES.md": "d6542ec2592291421a32175d65e2a85a0d05399e250143bfccd2166e921fbcf0",
+     "LICENSES/Apache-2.0.txt": "e56aea6e2b9b30b1008326f604dee4afa8c88f44a6dea7e3719592ed987b80c4",
+     "completions/antfly-grep.bash": "5e79ff445712daf1843a98d331b4363b90c9542bf0e92803b61868c8e58824d8",
+     "completions/antfly-grep.zsh": "17f869f8faae90bca9774b3048d95cba81cb0380dde7331be48343fac3dcba55",
+     "completions/antfly-grep.fish": "857a32552b9b74f03c11e5bee41d087b2db27f07b505c41bc29d80e0465c5d12",
+     "completions/antfly-grep.ps1": "a84d86f3cf00a51074f78ebfda7123ef1ad0ca9f3fe668199832b25998b3fecd",
+     "share/man/man1/antfly-grep.1": "ea592bb68c607b4ad598b141029e41fb2a990bedb5e249c6ae0120f452a37ebd",
+     "share/antfly-grep/schema/document-v1.json": "2c6e245dffefe476c140affcaee976c5cc047eeacb75fc31965557697bb91147",
+     "share/antfly-grep/schema/tables-v1.json": "2f381037601bfb7906908a5f76cc87fa3331298ce1d2caa98763e6c228c18e4e",
+     "share/antfly-grep/COMPATIBILITY.md": "76d418f0db66eabe4624596b65208d4a9bcae571ce7c563c867b7777cdc6e6fc",
+     "share/antfly-grep/README.md": "134c03a1d2e9626fd0164d4d78f4e6ba846698ff805acc2f1109d0248aa04498"
+    },
+    "manifest": {
+     "schema_version": 1,
+     "binary": "antfly-grep",
+     "sha256": "4e7c8eadda2650340b1ab6179dc54df7e4824c0e696fd185727cf6d66e599ae0"
+    },
+    "version": "antfly-grep dev\nZig 0.17.0 fast\nnative regex, PCRE-style VM/JIT, streaming compression, encoding\ntarget aarch64-macos-none dynamic",
+    "command": [
+     "$WORKTREE/py/packages/sdk/.venv/bin/python",
+     "scripts/packaging/package_grep_release.py",
+     "--binary",
+     "$WORKTREE/output/grep-followup/candidate/macos-cli/antfly-grep",
+     "--output",
+     "$WORKTREE/output/grep-followup/review-final/packaging/macos/antfly-grep.tar.gz",
+     "--mtime",
+     "0"
+    ],
+    "version_command": [
+     "$WORKTREE/output/grep-followup/review-final/packaging/macos/antfly-grep",
+     "--version"
+    ]
+   },
+   {
+    "platform": "linux",
+    "archive": "output/grep-followup/review-final/packaging/linux/antfly-grep.tar.gz",
+    "sha256": "b153ad34364be98761551db76ef49748b9aac07361a264d6b6b0f79acf536463",
+    "bytes": 8158253,
+    "assets": {
+     "antfly-grep": "78e5ede86abec0b77a0c6b0600f162c0d1b01a6675db7b9eaf37fcbbdaa18982",
+     "LICENSE": "e56aea6e2b9b30b1008326f604dee4afa8c88f44a6dea7e3719592ed987b80c4",
+     "THIRD_PARTY_NOTICES.md": "d6542ec2592291421a32175d65e2a85a0d05399e250143bfccd2166e921fbcf0",
+     "LICENSES/Apache-2.0.txt": "e56aea6e2b9b30b1008326f604dee4afa8c88f44a6dea7e3719592ed987b80c4",
+     "completions/antfly-grep.bash": "5e79ff445712daf1843a98d331b4363b90c9542bf0e92803b61868c8e58824d8",
+     "completions/antfly-grep.zsh": "17f869f8faae90bca9774b3048d95cba81cb0380dde7331be48343fac3dcba55",
+     "completions/antfly-grep.fish": "857a32552b9b74f03c11e5bee41d087b2db27f07b505c41bc29d80e0465c5d12",
+     "completions/antfly-grep.ps1": "a84d86f3cf00a51074f78ebfda7123ef1ad0ca9f3fe668199832b25998b3fecd",
+     "share/man/man1/antfly-grep.1": "ea592bb68c607b4ad598b141029e41fb2a990bedb5e249c6ae0120f452a37ebd",
+     "share/antfly-grep/schema/document-v1.json": "2c6e245dffefe476c140affcaee976c5cc047eeacb75fc31965557697bb91147",
+     "share/antfly-grep/schema/tables-v1.json": "2f381037601bfb7906908a5f76cc87fa3331298ce1d2caa98763e6c228c18e4e",
+     "share/antfly-grep/COMPATIBILITY.md": "76d418f0db66eabe4624596b65208d4a9bcae571ce7c563c867b7777cdc6e6fc",
+     "share/antfly-grep/README.md": "134c03a1d2e9626fd0164d4d78f4e6ba846698ff805acc2f1109d0248aa04498"
+    },
+    "manifest": {
+     "schema_version": 1,
+     "binary": "antfly-grep",
+     "sha256": "78e5ede86abec0b77a0c6b0600f162c0d1b01a6675db7b9eaf37fcbbdaa18982"
+    },
+    "version": "antfly-grep dev\nZig 0.17.0 fast\nnative regex, PCRE-style VM/JIT, streaming compression, encoding\ntarget aarch64-linux-musl static",
+    "command": [
+     "$WORKTREE/py/packages/sdk/.venv/bin/python",
+     "scripts/packaging/package_grep_release.py",
+     "--binary",
+     "$WORKTREE/output/grep-followup/candidate/linux-cli/antfly-grep",
+     "--output",
+     "$WORKTREE/output/grep-followup/review-final/packaging/linux/antfly-grep.tar.gz",
+     "--mtime",
+     "0"
+    ],
+    "version_command": [
+     "docker",
+     "run",
+     "--rm",
+     "--platform",
+     "linux/arm64",
+     "--cpus",
+     "1",
+     "--memory",
+     "256m",
+     "--memory-swap",
+     "256m",
+     "-v",
+     "$WORKTREE:/work",
+     "-w",
+     "/work",
+     "antfly-grep-query-arm64:review-1164",
+     "/work/output/grep-followup/review-final/packaging/linux/antfly-grep",
+     "--version"
+    ]
+   }
+  ]
+ },
+ "reused_cli_artifacts": {
+  "macos": {
+   "path": "output/grep-followup/candidate/macos-cli/antfly-grep",
+   "sha256": "4e7c8eadda2650340b1ab6179dc54df7e4824c0e696fd185727cf6d66e599ae0"
+  },
+  "linux": {
+   "path": "output/grep-followup/candidate/linux-cli/antfly-grep",
+   "sha256": "78e5ede86abec0b77a0c6b0600f162c0d1b01a6675db7b9eaf37fcbbdaa18982"
+  }
+ },
+ "cli_source_tree": {
+  "qualified_parent": "cfb5cbba613cab99a6f28eec34ef602106d2e21f",
+  "current_tree": "4cf28d675138aab37cfafc8f5314dd0bbd66bf19",
+  "parent_tree": "4cf28d675138aab37cfafc8f5314dd0bbd66bf19"
+ },
+ "cli_dependency_trees": {
+  "zig/pkg/antfly-grep/build.zig": "36be0e3c1957c0ff02e8ac30d61f7dc1de945c2a",
+  "zig/lib/fst": "20a5b1de228f7a5ff3357e9bb2b5ea414a11ce54",
+  "zig/lib/regex": "7fa67f23b4e1880cf59ebc3c632527ede421fa44",
+  "zig/lib/tokenizer": "88b1123f118b29ea190fa78815a15b7bbf9f8d4a",
+  "zig/lib/json": "1afd751720c4003256d1914d71a9552bda25d0aa",
+  "zig/lib/httpx": "43ecf634e14b6740004b207a9230f56fd82edde9",
+  "zig/lib/encoding": "44d5fade13eeea360ba89f07a6130d223be25ac8",
+  "zig/lib/hash": "f7fda0b5615a8bf60a3ed16f2c6d8a555b0328e8",
+  "zig/lib/compress": "bed35f209302eedc0dab6167cfe1fbfa22cfaa97",
+  "zig/lib/syntax": "124e3513fd82675d69f249c519d8e8f46fc04e68"
+ },
+ "validation_source_hashes": {
+  "py/packages/sdk/tests/test_query_roundtrip.py": "553ed230c1cf72cc802004e94bc94c744050cffa9baff050f2a0013798401d51",
+  "py/packages/sdk/templates/model.py.jinja": "77c2848fa23a3992a1d1131b8cd4328c8a24e88989d4ed1689478052007b51e1",
+  "zig/e2e/antfly/test_grep_indexed.py": "585a3ba2292762918bbaf034a5ccd81685d7f994809432ead820b6732e78962b",
+  "zig/pkg/antfly-grep/bench/logical_sources.py": "1b1d496dda7d6b44e7b303d7b1a55d3a123d58a57bc548401cfc1437f53d559e",
+  "zig/pkg/antfly-grep/tests/check_compatibility.py": "fbd3ee6298df39395e3c14ec746593df920f26afe557d06d7900f3e3b2773342",
+  "zig/pkg/antfly-grep/bench/restore_results.py": "70509ff9a30edaa70171ea0234abe057545603324e3c71e93b63100b34bf2403",
+  "zig/pkg/antfly-grep/bench/results/archive-manifest.json": "ab3b0fd68df1c822d625a82d8c9322d1f95cc7334d2121027b981929b9dd6332"
+ },
+ "prior_qualification": {
+  "path": "output/grep-followup/review-iteration",
+  "linux_artifact_sha256": "b599c887791b3b70deed5081a21b65c5b5d42bc0c90e25043dd25d2f0888ebb5",
+  "explanation": "Earlier frozen candidate passed HTTP and paired timings but failed 1-GiB ingestion with ResourceBudgetExceeded; grouped physical-field analysis fixes the retained duplicate _all path. Raw attempts remain local.",
+  "validation_sha256": "076f1560ecb7a236d26ab7e2fd97277bbc6eb77c463196fb36aba3b5dc0442b8"
+ },
+ "diagnostics": {
+  "shared-field-red.log": {
+   "sha256": "2cf02900e8034573e7d07775cadc960ec24436a40e806f87225f07908b4c99f3",
+   "explanation": "Expected pre-fix ResourceBudgetExceeded regression for simultaneously retained physical fields; final introducer tests cover the repaired path."
+  },
+  "memory-projection-locals.log": {
+   "sha256": "95486b97d86b7865b5877b6c0895a3354c95e49df7d2be1fca6de7cc83db620f",
+   "explanation": "Synthetic first-batch reduction: distinct_word fails at offset zero with two documents."
+  },
+  "sparse-complement-red.log": {
+   "sha256": "ca0d552250b9116b0b61a68d6666553396e227f78a4367811369e15dc9430dbb",
+   "explanation": "Maximum-document-domain count regression before sparse complement arithmetic; expected work-bound failure is retained as a diagnostic."
+  },
+  "review-packaging-wrong-toolchain.log": {
+   "sha256": "ef796dce93c0bb51e0dcf97430aa9976aad33b2c31ddd18544d9ed44f3868cb4",
+   "explanation": "Direct packaging cache-probe invocation found Zig 0.16 on PATH; final packaging suite passes with pinned Zig 0.17 and temporary fixtures under the worktree."
+  },
+  "retained-candidate-smoke.log": {
+   "sha256": "68415d0149593aadb5893628c720e9222bac6a83a3a96644fa9f79ae84fbc6fe",
+   "explanation": "Unfrozen diagnostic binary used a non-antfly basename; the fixture selected its legacy launcher. Final artifacts use antfly."
+  },
+  "retained-candidate-smoke-corrected.log": {
+   "sha256": "bf8cacdd0dd2858e8df3ecfe5107deee8b5b24faee627a5b9a8f3c41db90d825",
+   "explanation": "Unfrozen standalone smoke found public minimum_should_match rejection; fixed in public lowering and covered by final qualification."
+  },
+  "retained-count-diagnostic.log": {
+   "sha256": "eb7bb8e04ec430bc325d4276455ea2afaa93c6ed91fbb5f41d53fcef9c32b80d",
+   "explanation": "Reduced the public threshold rejection before its fix."
+  },
+  "current-startup-diagnostic.log": {
+   "sha256": "175b63e9e6dbbb3d381dddd0b68116f416ab854e84951cdf2bb02f813c220ba3",
+   "explanation": "Preserved the wrong-launcher diagnostic before rerunning with the supported basename."
+  },
+  "memory_debug": {
+   "artifact": {
+    "sha256": "82e32011b2ba1433c1266ca36ad6b840a8eae8c11fdc97224bf7262354695f53",
+    "scope": "Symbolized Debug diagnostic; 8 GiB container with explicit 1 GiB process envelope to preserve the failing 128-MiB build slice while allowing stack symbolization. Not performance qualification."
+   },
+   "validation": {
+    "exit_code": 1,
+    "command": [
+     "docker",
+     "run",
+     "--rm",
+     "--platform",
+     "linux/arm64",
+     "--cpus",
+     "2",
+     "--memory",
+     "8g",
+     "--memory-swap",
+     "8g",
+     "-v",
+     "$WORKTREE:/work",
+     "-w",
+     "/work",
+     "-e",
+     "ANTFLY_BIN=/work/output/grep-followup/memory-debug/linux/antfly",
+     "-e",
+     "ANTFLY_PROCESS_MEMORY_BUDGET_MB=1024",
+     "-e",
+     "ANTFLY_LOGICAL_INGESTION_REPORT=/work/output/grep-followup/memory-debug/linux/ingestion.json",
+     "-e",
+     "ANTFLY_RESOURCE_ALLOCATION_DIAGNOSTICS=1",
+     "antfly-grep-query-arm64:review-1164",
+     "python3",
+     "-m",
+     "pytest",
+     "-q",
+     "--tb=short",
+     "zig/e2e/antfly/test_grep_indexed.py",
+     "-k",
+     "logical_substring_ingestion_profile"
+    ],
+    "log_sha256": "6fc6f3c6cdb1b48f0c750990d3b6b83e141f04891e1eea38671eda69792fa427"
+   },
+   "scope": "Pre-fix, unfrozen symbolized diagnostic. The stack identifies prepareTextMapperDocsPublication -> buildTextSegmentsFromProjectionBatch without postings scratch, unlike the previously tested direct sink path. Not timing qualification."
+  },
+  "hint_harness_oom": {
+   "explanation": "The test tried to read the entire 1.2-GiB unstripped reference binary into Python after timing. Streaming file_digest avoids exhausting the 1-GiB container. Frozen server binaries are unchanged.",
+   "report_sha256": "bf44aad7bb0461ae301c366cf098432340b590e22ebf23da31410bcaf2f96e66"
+  }
+ },
+ "linux_runner": {
+  "image_id": "sha256:aba372743e820dbcb939feaacc653d5015af6190542166021c2e87ab1ad59746",
+  "repo_digests": [
+   "antfly-grep-query-arm64@sha256:aba372743e820dbcb939feaacc653d5015af6190542166021c2e87ab1ad59746"
+  ],
+  "architecture": "arm64",
+  "python": "Python 3.12.15",
+  "dockerfile_sha256": "b19d4f4238da49ef7b4f65d702279ca435498bc38401004e31897c9aac19b30c",
+  "requirements_sha256": "806b0c4b41b4e77a74f74374704549e4bedd5acd2abbd57d0886deb8c22eaa41",
+  "rebuild_log_sha256": "a833d5f0b550251b636f0ab78cc055574cc76be351d0bd5aa097595464bf9bcc",
+  "recovery": "Runner image was deleted by concurrent workspace cleanup; exit-125 attempts did not launch the server. Rebuilt from hash-pinned requirements and reran qualification.",
+  "failed_attempt": {
+   "exit_code": 1,
+   "records": [
+    {
+     "name": "http",
+     "command": [
+      "docker",
+      "run",
+      "--rm",
+      "--platform",
+      "linux/arm64",
+      "--cpus",
+      "2",
+      "--memory",
+      "1g",
+      "--memory-swap",
+      "1g",
+      "-v",
+      "$WORKTREE:/work",
+      "-w",
+      "/work",
+      "-e",
+      "ANTFLY_BIN=/work/output/grep-followup/review-final/linux/antfly",
+      "-e",
+      "ANTFLY_GREP_BIN=/work/output/grep-followup/candidate/linux-cli/antfly-grep",
+      "-e",
+      "ANTFLY_LOGICAL_SOURCE_BASELINE_BIN=/work/output/review-followup/linux/antfly",
+      "-e",
+      "ANTFLY_GREP_UPGRADE_BASELINE_BIN=/work/output/logical-scalable/linux/antfly",
+      "antfly-grep-query-arm64:review-1164",
+      "python3",
+      "-m",
+      "pytest",
+      "-q",
+      "zig/e2e/antfly/test_grep_indexed.py",
+      "zig/e2e/antfly/test_logical_source_upgrade.py",
+      "zig/e2e/antfly/test_logical_analyzer_upgrade.py"
+     ],
+     "exit_code": 125,
+     "log_sha256": "bfc92078f55c0ecf5110f1c8798cc7390828073c1dab0eceec71b9045b1b0e58"
+    }
+   ]
+  }
+ },
+ "archive_restoration": {
+  "files": 356,
+  "bytes": 27735510,
+  "sha256_verified": true,
+  "manifest_sha256": "ab3b0fd68df1c822d625a82d8c9322d1f95cc7334d2121027b981929b9dd6332",
+  "scope": "Every previously restored historical file checked again after checkout cleanup; original Git blobs remain reachable."
+ },
+ "sparse_count_work": {
+  "document_domain": 4294967295,
+  "before_complement_word_steps": 67108864,
+  "after_one_input_word_steps": 0,
+  "after_nested_example_word_steps": 3,
+  "scope": "Regression work counters with sparse immutable inputs, not end-to-end timing or zero total request cost. Clipping and out-of-domain deletions are covered.",
+  "before_log_sha256": "ca0d552250b9116b0b61a68d6666553396e227f78a4367811369e15dc9430dbb",
+  "after_log_sha256": "dbb3fa33c809cffdca225a57bd2a38c7d4d7d3a00a70ef25502470da1d6983f9"
+ },
+ "raw_artifact": {
+  "availability": "local workspace only; not published",
+  "path": "output/grep-followup/review-final/qualification-raw.json",
+  "sha256": "1af26eb4c2f48eeac1c2e8acdd492a18d7fc7ff69d751e4c29f3d2832bb8afaa",
+  "bytes": 1791815
+ },
+ "controls": [
+  {
+   "control": "control-file-cache-advice",
+   "variant": "baseline",
+   "clients": 1,
+   "rounds": 2,
+   "trials": 18,
+   "median_warm_http_ms": 11.815417,
+   "median_restart_first_http_ms": 38.0376665,
+   "median_restart_cpu_ms": 35.0,
+   "sampled_rss_endpoint_max_bytes": 138973184,
+   "cache_advice": [
+    {
+     "mode": "process_restart_with_file_cache_advice",
+     "advised_files": 112,
+     "advised_file_bytes": 1350900,
+     "errors": []
+    },
+    {
+     "mode": "process_restart_with_file_cache_advice",
+     "advised_files": 112,
+     "advised_file_bytes": 1350583,
+     "errors": []
+    }
+   ],
+   "median_restart_process_read_bytes": 901120.0,
+   "median_restart_process_write_bytes": 0.0,
+   "median_restart_process_rchar": 1000708.0
+  },
+  {
+   "control": "control-file-cache-advice",
+   "variant": "baseline",
+   "clients": 4,
+   "rounds": 2,
+   "trials": 72,
+   "median_warm_http_ms": 49.3054585,
+   "median_restart_first_http_ms": 37.807708500000004,
+   "median_restart_cpu_ms": 35.0,
+   "sampled_rss_endpoint_max_bytes": 166137856,
+   "cache_advice": [
+    {
+     "mode": "process_restart_with_file_cache_advice",
+     "advised_files": 134,
+     "advised_file_bytes": 2630677,
+     "errors": []
+    },
+    {
+     "mode": "process_restart_with_file_cache_advice",
+     "advised_files": 136,
+     "advised_file_bytes": 2631948,
+     "errors": []
+    }
+   ],
+   "median_restart_process_read_bytes": 929792.0,
+   "median_restart_process_write_bytes": 0.0,
+   "median_restart_process_rchar": 1000708.0
+  },
+  {
+   "control": "control-file-cache-advice",
+   "variant": "candidate",
+   "clients": 1,
+   "rounds": 2,
+   "trials": 18,
+   "median_warm_http_ms": 11.0168545,
+   "median_restart_first_http_ms": 31.574208499999997,
+   "median_restart_cpu_ms": 30.0,
+   "sampled_rss_endpoint_max_bytes": 142974976,
+   "cache_advice": [
+    {
+     "mode": "process_restart_with_file_cache_advice",
+     "advised_files": 112,
+     "advised_file_bytes": 1351094,
+     "errors": []
+    },
+    {
+     "mode": "process_restart_with_file_cache_advice",
+     "advised_files": 110,
+     "advised_file_bytes": 1348645,
+     "errors": []
+    }
+   ],
+   "median_restart_process_read_bytes": 901120.0,
+   "median_restart_process_write_bytes": 0.0,
+   "median_restart_process_rchar": 982802.0
+  },
+  {
+   "control": "control-file-cache-advice",
+   "variant": "candidate",
+   "clients": 4,
+   "rounds": 2,
+   "trials": 72,
+   "median_warm_http_ms": 48.485771,
+   "median_restart_first_http_ms": 34.00125,
+   "median_restart_cpu_ms": 25.0,
+   "sampled_rss_endpoint_max_bytes": 167444480,
+   "cache_advice": [
+    {
+     "mode": "process_restart_with_file_cache_advice",
+     "advised_files": 134,
+     "advised_file_bytes": 2631121,
+     "errors": []
+    },
+    {
+     "mode": "process_restart_with_file_cache_advice",
+     "advised_files": 138,
+     "advised_file_bytes": 2634020,
+     "errors": []
+    }
+   ],
+   "median_restart_process_read_bytes": 901120.0,
+   "median_restart_process_write_bytes": 0.0,
+   "median_restart_process_rchar": 982802.0
+  },
+  {
+   "control": "control-one-cpu",
+   "variant": "baseline",
+   "clients": 1,
+   "rounds": 2,
+   "trials": 18,
+   "median_warm_http_ms": 11.1486875,
+   "median_restart_first_http_ms": 29.844063,
+   "median_restart_cpu_ms": 30.0,
+   "sampled_rss_endpoint_max_bytes": 139505664,
+   "cache_advice": [
+    {
+     "mode": "process_restart"
+    },
+    {
+     "mode": "process_restart"
+    }
+   ],
+   "median_restart_process_read_bytes": 901120.0,
+   "median_restart_process_write_bytes": 0.0,
+   "median_restart_process_rchar": 982802.0
+  },
+  {
+   "control": "control-one-cpu",
+   "variant": "baseline",
+   "clients": 4,
+   "rounds": 2,
+   "trials": 72,
+   "median_warm_http_ms": 97.33952049999999,
+   "median_restart_first_http_ms": 30.313208500000002,
+   "median_restart_cpu_ms": 25.0,
+   "sampled_rss_endpoint_max_bytes": 165138432,
+   "cache_advice": [
+    {
+     "mode": "process_restart"
+    },
+    {
+     "mode": "process_restart"
+    }
+   ],
+   "median_restart_process_read_bytes": 0.0,
+   "median_restart_process_write_bytes": 0.0,
+   "median_restart_process_rchar": 982802.0
+  },
+  {
+   "control": "control-one-cpu",
+   "variant": "candidate",
+   "clients": 1,
+   "rounds": 2,
+   "trials": 18,
+   "median_warm_http_ms": 11.163875,
+   "median_restart_first_http_ms": 30.821125000000002,
+   "median_restart_cpu_ms": 30.0,
+   "sampled_rss_endpoint_max_bytes": 143360000,
+   "cache_advice": [
+    {
+     "mode": "process_restart"
+    },
+    {
+     "mode": "process_restart"
+    }
+   ],
+   "median_restart_process_read_bytes": 901120.0,
+   "median_restart_process_write_bytes": 0.0,
+   "median_restart_process_rchar": 982802.0
+  },
+  {
+   "control": "control-one-cpu",
+   "variant": "candidate",
+   "clients": 4,
+   "rounds": 2,
+   "trials": 72,
+   "median_warm_http_ms": 97.1272295,
+   "median_restart_first_http_ms": 30.493292,
+   "median_restart_cpu_ms": 20.0,
+   "sampled_rss_endpoint_max_bytes": 160083968,
+   "cache_advice": [
+    {
+     "mode": "process_restart"
+    },
+    {
+     "mode": "process_restart"
+    }
+   ],
+   "median_restart_process_read_bytes": 0.0,
+   "median_restart_process_write_bytes": 0.0,
+   "median_restart_process_rchar": 982802.0
+  }
+ ],
+ "measurements": [
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "concurrency",
+   "case": "1",
+   "rounds": 2,
+   "trials": 18,
+   "median_http_ms": 11.3820625
+  },
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "concurrency",
+   "case": "4",
+   "rounds": 2,
+   "trials": 72,
+   "median_http_ms": 47.163833499999996
+  },
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "hints",
+   "case": "retained_distinct_predicates",
+   "rounds": 2,
+   "trials": 24,
+   "median_http_ms": 58.569500500000004,
+   "median_cpu_ms": 60.0,
+   "median_scalar_reads": 67.0,
+   "median_batches": 15.0,
+   "median_source_read_us": 42248.0,
+   "median_source_parse_us": 120.5,
+   "batch_peak_bytes_max": 2122852
+  },
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "ingestion",
+   "case": "distinct_word",
+   "rounds": 2,
+   "median_http_ms": 1935.623188,
+   "median_cpu_ms": 1790.0,
+   "median_process_rchar": 1535260.0,
+   "median_process_wchar": 38330144.5,
+   "median_process_read_bytes": 96256.0,
+   "median_process_write_bytes": 39303168.0
+  },
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "ingestion",
+   "case": "repetitive",
+   "rounds": 2,
+   "median_http_ms": 363.69825050000003,
+   "median_cpu_ms": 180.0,
+   "median_process_rchar": 1496482.5,
+   "median_process_wchar": 1963358.0,
+   "median_process_read_bytes": 28672.0,
+   "median_process_write_bytes": 2639872.0
+  },
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "ingestion",
+   "case": "source_code",
+   "rounds": 2,
+   "median_http_ms": 388.9387285,
+   "median_cpu_ms": 190.0,
+   "median_process_rchar": 1525414.0,
+   "median_process_wchar": 2923488.0,
+   "median_process_read_bytes": 59392.0,
+   "median_process_write_bytes": 3651584.0
+  },
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "scalable",
+   "case": "nested_source",
+   "rounds": 2,
+   "trials": 18,
+   "median_http_ms": 10.7935625,
+   "median_cpu_ms": 10.0,
+   "median_scalar_reads": 4.5,
+   "median_batches": 119.5,
+   "median_source_read_us": 5576.0,
+   "median_source_parse_us": 457.5,
+   "batch_peak_bytes_max": 271002,
+   "sampled_rss_peak_bytes": 392777728
+  },
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "scalable",
+   "case": "selected_dominant",
+   "rounds": 2,
+   "trials": 18,
+   "median_http_ms": 7.7206045,
+   "median_cpu_ms": 10.0,
+   "median_scalar_reads": 8.0,
+   "median_batches": 254.0,
+   "median_source_read_us": 2401.0,
+   "median_source_parse_us": 903.0,
+   "batch_peak_bytes_max": 595802,
+   "sampled_rss_peak_bytes": 306270208
+  },
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "scalable",
+   "case": "selected_large",
+   "rounds": 2,
+   "trials": 18,
+   "median_http_ms": 14.9697085,
+   "median_cpu_ms": 15.0,
+   "median_scalar_reads": 6.0,
+   "median_batches": 947.0,
+   "median_source_read_us": 4101.0,
+   "median_source_parse_us": 1231.5,
+   "batch_peak_bytes_max": 777514,
+   "sampled_rss_peak_bytes": 255684608
+  },
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "scalable",
+   "case": "tiny",
+   "rounds": 2,
+   "trials": 18,
+   "median_http_ms": 9.215938000000001,
+   "median_cpu_ms": 10.0,
+   "median_scalar_reads": 4.0,
+   "median_batches": 95.5,
+   "median_source_read_us": 1326.5,
+   "median_source_parse_us": 584.0,
+   "batch_peak_bytes_max": 28148,
+   "sampled_rss_peak_bytes": 158998528
+  },
+  {
+   "platform": "linux",
+   "variant": "baseline",
+   "suite": "scalable",
+   "case": "unselected_arrays",
+   "rounds": 2,
+   "trials": 18,
+   "median_http_ms": 9.103646,
+   "median_cpu_ms": 10.0,
+   "median_scalar_reads": 6.0,
+   "median_batches": 219.0,
+   "median_source_read_us": 4654.5,
+   "median_source_parse_us": 196.0,
+   "batch_peak_bytes_max": 130112,
+   "sampled_rss_peak_bytes": 334147584
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "concurrency",
+   "case": "1",
+   "rounds": 2,
+   "trials": 18,
+   "median_http_ms": 12.205646
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "concurrency",
+   "case": "4",
+   "rounds": 2,
+   "trials": 72,
+   "median_http_ms": 49.085021
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "hints",
+   "case": "retained_distinct_predicates",
+   "rounds": 2,
+   "trials": 24,
+   "median_http_ms": 59.125125,
+   "median_cpu_ms": 60.0,
+   "median_scalar_reads": 0.0,
+   "median_batches": 19.0,
+   "median_source_read_us": 42524.5,
+   "median_source_parse_us": 113.5,
+   "batch_peak_bytes_max": 2044686
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "ingestion",
+   "case": "distinct_word",
+   "rounds": 2,
+   "median_http_ms": 2113.107897,
+   "median_cpu_ms": 1975.0,
+   "median_process_rchar": 205910889.0,
+   "median_process_wchar": 95690017.5,
+   "median_process_read_bytes": 98304.0,
+   "median_process_write_bytes": 96708608.0
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "ingestion",
+   "case": "repetitive",
+   "rounds": 2,
+   "median_http_ms": 358.852396,
+   "median_cpu_ms": 185.0,
+   "median_process_rchar": 1496508.0,
+   "median_process_wchar": 1963373.0,
+   "median_process_read_bytes": 28672.0,
+   "median_process_write_bytes": 2641920.0
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "ingestion",
+   "case": "source_code",
+   "rounds": 2,
+   "median_http_ms": 384.64000050000004,
+   "median_cpu_ms": 190.0,
+   "median_process_rchar": 1527528.5,
+   "median_process_wchar": 2924867.0,
+   "median_process_read_bytes": 77824.0,
+   "median_process_write_bytes": 3667968.0
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "scalable",
+   "case": "nested_source",
+   "rounds": 2,
+   "trials": 18,
+   "median_http_ms": 9.8449375,
+   "median_cpu_ms": 10.0,
+   "median_scalar_reads": 4.0,
+   "median_batches": 119.0,
+   "median_source_read_us": 4781.0,
+   "median_source_parse_us": 451.0,
+   "batch_peak_bytes_max": 271002,
+   "sampled_rss_peak_bytes": 395337728
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "scalable",
+   "case": "selected_dominant",
+   "rounds": 2,
+   "trials": 18,
+   "median_http_ms": 7.7945005,
+   "median_cpu_ms": 10.0,
+   "median_scalar_reads": 488.5,
+   "median_batches": 204.0,
+   "median_source_read_us": 2355.0,
+   "median_source_parse_us": 892.5,
+   "batch_peak_bytes_max": 595802,
+   "sampled_rss_peak_bytes": 309420032
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "scalable",
+   "case": "selected_large",
+   "rounds": 2,
+   "trials": 18,
+   "median_http_ms": 15.450375000000001,
+   "median_cpu_ms": 20.0,
+   "median_scalar_reads": 6.0,
+   "median_batches": 947.0,
+   "median_source_read_us": 4164.5,
+   "median_source_parse_us": 1235.0,
+   "batch_peak_bytes_max": 777514,
+   "sampled_rss_peak_bytes": 262414336
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "scalable",
+   "case": "tiny",
+   "rounds": 2,
+   "trials": 18,
+   "median_http_ms": 9.7594165,
+   "median_cpu_ms": 10.0,
+   "median_scalar_reads": 4.0,
+   "median_batches": 107.5,
+   "median_source_read_us": 1474.5,
+   "median_source_parse_us": 664.5,
+   "batch_peak_bytes_max": 44462,
+   "sampled_rss_peak_bytes": 162123776
+  },
+  {
+   "platform": "linux",
+   "variant": "candidate",
+   "suite": "scalable",
+   "case": "unselected_arrays",
+   "rounds": 2,
+   "trials": 18,
+   "median_http_ms": 8.4129795,
+   "median_cpu_ms": 10.0,
+   "median_scalar_reads": 6.0,
+   "median_batches": 219.0,
+   "median_source_read_us": 4272.5,
+   "median_source_parse_us": 198.5,
+   "batch_peak_bytes_max": 130112,
+   "sampled_rss_peak_bytes": 339300352
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "concurrency",
+   "case": "1",
+   "rounds": 2,
+   "trials": 18,
+   "median_http_ms": 5.110875
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "concurrency",
+   "case": "4",
+   "rounds": 2,
+   "trials": 72,
+   "median_http_ms": 9.557646
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "hints",
+   "case": "retained_distinct_predicates",
+   "rounds": 2,
+   "trials": 24,
+   "median_http_ms": 51.3812085,
+   "median_cpu_ms": 51.455417,
+   "median_scalar_reads": 3.0,
+   "median_batches": 24.5,
+   "median_source_read_us": 33183.0,
+   "median_source_parse_us": 91.0,
+   "batch_peak_bytes_max": 1937508
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "ingestion",
+   "case": "distinct_word",
+   "rounds": 2,
+   "median_http_ms": 1390.439478,
+   "median_cpu_ms": 1452.7742505
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "ingestion",
+   "case": "repetitive",
+   "rounds": 2,
+   "median_http_ms": 148.1950415,
+   "median_cpu_ms": 151.871937
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "ingestion",
+   "case": "source_code",
+   "rounds": 2,
+   "median_http_ms": 133.677291,
+   "median_cpu_ms": 138.675979
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "scalable",
+   "case": "nested_source",
+   "rounds": 2,
+   "trials": 18,
+   "median_http_ms": 7.492395999999999,
+   "median_cpu_ms": 6.340666499999999,
+   "median_scalar_reads": 4.0,
+   "median_batches": 119.0,
+   "median_source_read_us": 3207.0,
+   "median_source_parse_us": 408.0,
+   "batch_peak_bytes_max": 302566,
+   "sampled_rss_peak_bytes": 715751424
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "scalable",
+   "case": "selected_dominant",
+   "rounds": 2,
+   "trials": 18,
+   "median_http_ms": 5.948542,
+   "median_cpu_ms": 4.5461670000000005,
+   "median_scalar_reads": 5.0,
+   "median_batches": 139.0,
+   "median_source_read_us": 1264.5,
+   "median_source_parse_us": 804.5,
+   "batch_peak_bytes_max": 595802,
+   "sampled_rss_peak_bytes": 298582016
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "scalable",
+   "case": "selected_large",
+   "rounds": 2,
+   "trials": 18,
+   "median_http_ms": 9.4960205,
+   "median_cpu_ms": 8.221833,
+   "median_scalar_reads": 3.0,
+   "median_batches": 70.5,
+   "median_source_read_us": 2180.0,
+   "median_source_parse_us": 1054.0,
+   "batch_peak_bytes_max": 564370,
+   "sampled_rss_peak_bytes": 230916096
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "scalable",
+   "case": "tiny",
+   "rounds": 2,
+   "trials": 18,
+   "median_http_ms": 7.6534165000000005,
+   "median_cpu_ms": 5.9612915,
+   "median_scalar_reads": 3.0,
+   "median_batches": 70.5,
+   "median_source_read_us": 1143.5,
+   "median_source_parse_us": 515.0,
+   "batch_peak_bytes_max": 17776,
+   "sampled_rss_peak_bytes": 170033152
+  },
+  {
+   "platform": "macos",
+   "variant": "baseline",
+   "suite": "scalable",
+   "case": "unselected_arrays",
+   "rounds": 2,
+   "trials": 18,
+   "median_http_ms": 6.7135625,
+   "median_cpu_ms": 5.462937500000001,
+   "median_scalar_reads": 4.5,
+   "median_batches": 116.5,
+   "median_source_read_us": 3050.5,
+   "median_source_parse_us": 162.0,
+   "batch_peak_bytes_max": 132576,
+   "sampled_rss_peak_bytes": 413990912
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "concurrency",
+   "case": "1",
+   "rounds": 2,
+   "trials": 18,
+   "median_http_ms": 5.266624500000001
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "concurrency",
+   "case": "4",
+   "rounds": 2,
+   "trials": 72,
+   "median_http_ms": 9.877938
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "hints",
+   "case": "retained_distinct_predicates",
+   "rounds": 2,
+   "trials": 24,
+   "median_http_ms": 51.493458000000004,
+   "median_cpu_ms": 51.0518955,
+   "median_scalar_reads": 0.0,
+   "median_batches": 11.0,
+   "median_source_read_us": 33254.5,
+   "median_source_parse_us": 92.5,
+   "batch_peak_bytes_max": 1563548
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "ingestion",
+   "case": "distinct_word",
+   "rounds": 2,
+   "median_http_ms": 1572.538521,
+   "median_cpu_ms": 1660.8291880000002
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "ingestion",
+   "case": "repetitive",
+   "rounds": 2,
+   "median_http_ms": 146.212583,
+   "median_cpu_ms": 150.075125
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "ingestion",
+   "case": "source_code",
+   "rounds": 2,
+   "median_http_ms": 140.827313,
+   "median_cpu_ms": 144.92850049999998
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "scalable",
+   "case": "nested_source",
+   "rounds": 2,
+   "trials": 18,
+   "median_http_ms": 7.9226665,
+   "median_cpu_ms": 6.490792,
+   "median_scalar_reads": 4.0,
+   "median_batches": 119.0,
+   "median_source_read_us": 3273.5,
+   "median_source_parse_us": 401.0,
+   "batch_peak_bytes_max": 302566,
+   "sampled_rss_peak_bytes": 619855872
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "scalable",
+   "case": "selected_dominant",
+   "rounds": 2,
+   "trials": 18,
+   "median_http_ms": 5.8678335,
+   "median_cpu_ms": 4.534271,
+   "median_scalar_reads": 4.0,
+   "median_batches": 130.0,
+   "median_source_read_us": 1224.0,
+   "median_source_parse_us": 793.0,
+   "batch_peak_bytes_max": 737692,
+   "sampled_rss_peak_bytes": 197230592
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "scalable",
+   "case": "selected_large",
+   "rounds": 2,
+   "trials": 18,
+   "median_http_ms": 9.7606245,
+   "median_cpu_ms": 8.385312500000001,
+   "median_scalar_reads": 3.0,
+   "median_batches": 69.5,
+   "median_source_read_us": 2241.0,
+   "median_source_parse_us": 1080.0,
+   "batch_peak_bytes_max": 564370,
+   "sampled_rss_peak_bytes": 214188032
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "scalable",
+   "case": "tiny",
+   "rounds": 2,
+   "trials": 18,
+   "median_http_ms": 6.933542,
+   "median_cpu_ms": 5.4890835,
+   "median_scalar_reads": 3.0,
+   "median_batches": 69.0,
+   "median_source_read_us": 1077.5,
+   "median_source_parse_us": 491.0,
+   "batch_peak_bytes_max": 17776,
+   "sampled_rss_peak_bytes": 153845760
+  },
+  {
+   "platform": "macos",
+   "variant": "candidate",
+   "suite": "scalable",
+   "case": "unselected_arrays",
+   "rounds": 2,
+   "trials": 18,
+   "median_http_ms": 7.981249999999999,
+   "median_cpu_ms": 6.4950415,
+   "median_scalar_reads": 6.0,
+   "median_batches": 219.0,
+   "median_source_read_us": 3354.5,
+   "median_source_parse_us": 166.0,
+   "batch_peak_bytes_max": 132576,
+   "sampled_rss_peak_bytes": 373407744
+  }
+ ],
+ "component_postings": {
+  "scope": "Isolated posting accumulator construction and serialization, same tagged layout and binary for reference owned arrays versus inline promotion. The instrumented BudgetAllocator uses std.testing.allocator as backing; timings include testing allocator overhead and are not production heap or complete indexing throughput. Tracked allocations exclude RSS. Serialization digests are asserted equal. Shared Apple Silicon host.",
+  "binary_sha256": "be15fb2cb22fc28a3a240898d4e042b4054fc9da0f0c5f30b82dc1b7e7e39103",
+  "log_sha256": "1ec9f45eaaa06302afd38684d5eba42d8cf324b28f617b5c7076b7ca6be8f03f",
+  "summary": [
+   {
+    "positions": 0,
+    "occurrences": 1,
+    "owned_arrays": {
+     "median_ns": 1001000,
+     "peak_bytes": 3440129,
+     "allocations": 20002
+    },
+    "inline": {
+     "median_ns": 204000,
+     "peak_bytes": 800129,
+     "allocations": 2
+    }
+   },
+   {
+    "positions": 0,
+    "occurrences": 4,
+    "owned_arrays": {
+     "median_ns": 1769000,
+     "peak_bytes": 3441376,
+     "allocations": 20011
+    },
+    "inline": {
+     "median_ns": 1736000,
+     "peak_bytes": 3441376,
+     "allocations": 20011
+    }
+   },
+   {
+    "positions": 1,
+    "occurrences": 1,
+    "owned_arrays": {
+     "median_ns": 1477000,
+     "peak_bytes": 4760261,
+     "allocations": 30003
+    },
+    "inline": {
+     "median_ns": 275000,
+     "peak_bytes": 800261,
+     "allocations": 3
+    }
+   },
+   {
+    "positions": 1,
+    "occurrences": 4,
+    "owned_arrays": {
+     "median_ns": 2406000,
+     "peak_bytes": 4761791,
+     "allocations": 30014
+    },
+    "inline": {
+     "median_ns": 2496000,
+     "peak_bytes": 4761791,
+     "allocations": 30014
+    }
+   },
+   {
+    "positions": 4,
+    "occurrences": 1,
+    "owned_arrays": {
+     "median_ns": 1616000,
+     "peak_bytes": 4960281,
+     "allocations": 30003
+    },
+    "inline": {
+     "median_ns": 1660000,
+     "peak_bytes": 4960281,
+     "allocations": 30003
+    }
+   },
+   {
+    "positions": 4,
+    "occurrences": 4,
+    "owned_arrays": {
+     "median_ns": 2862000,
+     "peak_bytes": 4961867,
+     "allocations": 30014
+    },
+    "inline": {
+     "median_ns": 2906000,
+     "peak_bytes": 4961867,
+     "allocations": 30014
+    }
+   }
+  ],
+  "trial_count": 108
+ },
+ "changed_source_witnesses": {
+  "zig/lib/handlebars/src/eval.zig": "4bbc89132f4160e50cef06c787a7dd007618e1f04933439de8a2e277744441ec",
+  "zig/lib/handlebars/src/handlebars.zig": "0728e86189c95593a7617eb3a8ff455b1046442c45e8787a1ecbf4c8a74613f2",
+  "zig/lib/scraping/src/mod.zig": "8c35fea002a7325a8c86d4dc7ef39a677bb073dd4909e238ffbc0195df3bf3c9",
+  "zig/pkg/antfly-embedded/src/api/query_contract.zig": "9319be0c6994b60a077b13f2eb552bce404466e0e3b47120f4cebc12ddcbb928",
+  "zig/pkg/antfly-embedded/src/asset_producer_runtime.zig": "85cfb4dd7a06f4f7b9a59f691130cf5855eb22b86e32e90e32d5aa33d3e8f41e",
+  "zig/pkg/antfly-embedded/src/capi/entity_sink.zig": "de3b76b83e379a2ff9799e520d44a0ce7f65031609772b8375f63e408e9ec8e5",
+  "zig/pkg/antfly-embedded/src/chunking/chunk.zig": "6acb284f609facf600dd4f9bfa9f0aa80e36b554c14bb8f8697b39381f9d7d3a",
+  "zig/pkg/antfly-embedded/src/common/credential_safety.zig": "8c13f9ed691e3690e106a5f717c530c208f648f9b9bda1ea4da76f9c091b77aa",
+  "zig/pkg/antfly-embedded/src/encoding/roaring.zig": "b31379b35c5bbebb8be122a9e316ac266fd5e530954ecfe9e155bc56d07772b7",
+  "zig/pkg/antfly-embedded/src/introducer.zig": "e1a75e49d9d95762e997a808c4605ae2a358218e4bc32e858d34535f9af3b4f9",
+  "zig/pkg/antfly-embedded/src/reader_source.zig": "2d1db759a792b8a587312cf611fa155d359c82920ec4f9a92d3f62dc9b5ed8f4",
+  "zig/pkg/antfly-embedded/src/search/query.zig": "7bad89e95ba4c55ab9d17585855f4ac3e8b4b48d93e0bf7fe4f7a3ec11ef3cea",
+  "zig/pkg/antfly-embedded/src/search/value_membership.zig": "4e323c3576889e5586d2e9b44626bac16bc861ca9621d6c3ce50473b7edd66d5",
+  "zig/pkg/antfly-embedded/src/section/inverted.zig": "9415b5195012a160c3cc4d008c50e406eddb8c36a820cab57089d0ea13d18a1d",
+  "zig/pkg/antfly-embedded/src/source_catalog.zig": "9999e2a5d02993954712662f2ced4fa735c34fde08a44de19a1f7c340d788fc8",
+  "zig/pkg/antfly-embedded/src/source_catalog_control.zig": "33b4bef62505a5881b15a6fc7d3b74b2b6704487c016c2d90265f841af6e038a",
+  "zig/pkg/antfly-embedded/src/storage/backup_bundle_io.zig": "fcd011f7ca2a7b6b29d0b2de2bcc8785a5354885ccd71b49085af2ce9069d408",
+  "zig/pkg/antfly-embedded/src/storage/backup_codec.zig": "5014ff371a9b9f0decec7d5dfc88171206aee83a8e13b7a65760c876d701e9b6",
+  "zig/pkg/antfly-embedded/src/storage/db/algebraic/relational_row_codec.zig": "5b844d30675bd23d4403ce941d8a81a19ec457434ca9d01b158d64102d90043e",
+  "zig/pkg/antfly-embedded/src/storage/db/catalog/index_manager.zig": "5ae156cd26257fac0339fb8271843be36a1e93437fb66ceab2f07ae8f2e2b564",
+  "zig/pkg/antfly-embedded/src/storage/db/document_content_hash.zig": "2d4064f17ae4eb9bf593d3735ae734aa980ff55d0006980bca0462923cda90e0",
+  "zig/pkg/antfly-embedded/src/storage/db/document_mapper.zig": "a60cd1ceea6e913db1479cbfb1f033a6485761e5b30b9a05910a136db11b7867",
+  "zig/pkg/antfly-embedded/src/storage/db/enrichment/asset_producer.zig": "99a85a85315091a45738710934acfa85ec99c2c5403a89b5f9875ff130d39ffb",
+  "zig/pkg/antfly-embedded/src/storage/db/enrichment/config_validation.zig": "e16909827142f5aa8d4c8e0ff40bb66c40f5b807b7970167d35dab3f916a234b",
+  "zig/pkg/antfly-embedded/src/storage/db/enrichment/enrichment_runtime.zig": "33ce9770858d1c22cae357d3b5e8f4aa84e33097a0c50297fc4992e06557eff7",
+  "zig/pkg/antfly-embedded/src/storage/db/enrichment/enrichment_types.zig": "5275f017a815b0853200eca53af83762c7f00291f17cf907093e0eb90a26f009",
+  "zig/pkg/antfly-embedded/src/storage/db/group_prior_context.zig": "1558a1d386de8ef94c46fe7d96c8d7282ebc636b5b83aa3c6963debcee45c6f0",
+  "zig/pkg/antfly-embedded/src/storage/db/group_prior_scan.zig": "391b67d74bfac9c629732e6f6dfaa92ec1b9b901b00e9f5686d33247b7befe85",
+  "zig/pkg/antfly-embedded/src/storage/db/query/search_exec.zig": "369f27f9dd74ec1457e0da95e2babf2f5d7daa0caf4b0a6bdc6fa7364c3a5122",
+  "zig/pkg/antfly-embedded/src/storage/db/relational_store.zig": "fff16623e78afb0de977427e9e727ce341bde117ca01e9e713dea807f3010d29",
+  "zig/pkg/antfly-embedded/src/storage/lite/backup_preflight.zig": "3e3fe48dd6b92d06e27a0526388e3c283ee4e5dd3f373a3602e51f960c33b523",
+  "zig/pkg/antfly-embedded/src/storage/lite/restore_staging.zig": "1ec29b5fbbee5f6959094c7fc34666fc3d4b02dd9702bc5fb5468015be28633a",
+  "zig/pkg/antfly-embedded/src/storage/portable_backup.zig": "2c7ae8fa161c22a5a283fc175d4187612d47b8c40d8b0be4a065c15883a17243",
+  "zig/pkg/antfly-embedded/src/template.zig": "d2e6f3a5dfe7747a325469f26e6deefa414729dad058cc16063d0ed1a2f3bda1",
+  "zig/pkg/antfly-embedded/src/template_remote.zig": "9e88d27b7502309f5e8de2e1e0aae56b558d9162a58ca73bde47413db2aab21d",
+  "zig/pkg/antfly-grep/bench/results/.gitignore": "36dd756c71fb26a10c7d99af23ab7c21ef9ae02b18f22d6763871071badef344",
+  "zig/pkg/antfly/build/tests.zig": "944a0464d1a11a0895e8c2a257a4a6c8cf472506cd1d4ded4a2399e24a6cabaf",
+  "zig/pkg/antfly/src/lite_native_test.zig": "941b2b68b1c6e11fc3d289df8a1a0f8af8f7cce9e14c55fc0f6ff61c9575fb9b",
+  "zig/pkg/antfly/src/storage/test_manifest.zig": "9690bc5f68819804175a42c5a024b00945b9e9e0dc0b4d59fe6eafcccabd4011"
+ }
+}

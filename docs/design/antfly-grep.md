@@ -46,7 +46,7 @@ dialect and assume equivalence.
 
 The request uses canonical `query`, preserves the user's `filter_query`, selects
 ascending `_id` order from page one, and replays the predicate for every retained
-snapshot page. `value_search_execution.allow_scan` explicitly permits fallback
+snapshot page. `execution.value_verification.allow_scan` explicitly permits fallback
 when no safe compatible index constraint exists. The server's verification
 budgets and failures remain explicit. Fetch only required source-contract fields,
 then apply permissions/path checks and the complete CLI matcher, including

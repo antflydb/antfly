@@ -172,9 +172,11 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         // scheduler can overlap whichever roots fit without forcing
         // callers to serialize the whole build.
         .inference => @as(usize, if (target.os.tag == .macos) 20 else 16) * 1024 * 1024 * 1024,
+        // ARM64 Linux ReleaseFast CLI peaked at 3.52 GB during the logical
+        // query API qualification; 4 GiB retains headroom above that peak.
         // macOS CLI exceeded the newer 3 GiB claim too; provision 4 GiB
-        // pending a fresh cold-build trace. Keep the Linux claim unchanged.
-        .cli => @as(usize, if (target.os.tag == .macos) 4 else 3) * 1024 * 1024 * 1024,
+        // pending a fresh cold-build trace.
+        .cli => 4 * 1024 * 1024 * 1024,
     };
 }
 

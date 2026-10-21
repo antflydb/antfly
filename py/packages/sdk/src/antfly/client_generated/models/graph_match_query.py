@@ -70,6 +70,12 @@ class GraphMatchQuery:
         from ..models.graph_bindings_return import GraphBindingsReturn
         from ..models.graph_match import GraphMatch
 
+        if set(src_dict) - {
+            "index",
+            "match",
+            "return",
+        }:
+            raise ValueError("Unexpected properties for GraphMatchQuery")
         d = dict(src_dict)
         index = d.pop("index")
 

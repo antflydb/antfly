@@ -5,6 +5,9 @@ pub const types = @import("types.zig");
 
 pub const AutocompleteQuery = types.AutocompleteQuery;
 pub const BoolFieldQuery = types.BoolFieldQuery;
+pub const BoolQuery = types.BoolQuery;
+pub const BoolQueryBody = types.BoolQueryBody;
+pub const BoolQueryClause = types.BoolQueryClause;
 pub const BooleanQuery = types.BooleanQuery;
 pub const Boost = types.Boost;
 pub const ConjunctionQuery = types.ConjunctionQuery;

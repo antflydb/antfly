@@ -90,32 +90,38 @@
       "default": true,
       "description": "Overlap one retained-snapshot page with local processing. At most two decoded pages are live; quiet and finite per-file match limits use sequential retrieval."
     },
-    "value_search_execution": {
+    "execution": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Ordinary query execution policy for logical value predicates. Budgets apply per shard request; exhausted budgets are explicit failures.",
       "properties": {
-        "allow_scan": {
-          "type": "boolean",
-          "default": true
-        },
-        "max_documents": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 9223372036854775807,
-          "default": 100000
-        },
-        "max_bytes": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 9223372036854775807,
-          "default": 67108864
-        },
-        "max_regex_work": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 9223372036854775807,
-          "default": 100000000
+        "value_verification": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Ordinary query execution policy for logical value predicates. Budgets apply per shard request; exhausted budgets are explicit failures.",
+          "properties": {
+            "allow_scan": {
+              "type": "boolean",
+              "default": true
+            },
+            "max_documents": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9223372036854775807,
+              "default": 100000
+            },
+            "max_bytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9223372036854775807,
+              "default": 67108864
+            },
+            "max_regex_work": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9223372036854775807,
+              "default": 100000000
+            }
+          }
         }
       }
     }

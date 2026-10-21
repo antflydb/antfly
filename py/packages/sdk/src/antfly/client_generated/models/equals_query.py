@@ -62,6 +62,13 @@ class EqualsQuery:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        if set(src_dict) - {
+            "equals",
+            "field",
+            "case_sensitive",
+            "boost",
+        }:
+            raise ValueError("Unexpected properties for EqualsQuery")
         d = dict(src_dict)
         equals = d.pop("equals")
 

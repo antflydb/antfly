@@ -53,6 +53,12 @@ class AutocompleteQuery:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        if set(src_dict) - {
+            "autocomplete",
+            "field",
+            "boost",
+        }:
+            raise ValueError("Unexpected properties for AutocompleteQuery")
         d = dict(src_dict)
         autocomplete = d.pop("autocomplete")
 

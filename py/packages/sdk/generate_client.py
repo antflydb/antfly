@@ -36,6 +36,11 @@ IGNORED_NAMES = {"__pycache__", ".ruff_cache"}
 
 
 def run(command: list[str]) -> None:
+    # Keep generation and formatting in this interpreter's locked environment.
+    # PATH can otherwise select an older CLI (or a moved venv's stale shebang).
+    modules = {"openapi-python-client": "openapi_python_client", "ruff": "ruff"}
+    if command[0] in modules:
+        command = [sys.executable, "-m", modules[command[0]], *command[1:]]
     subprocess.run(command, cwd=SDK_ROOT, check=True)
 
 

@@ -44,6 +44,11 @@ class GraphShortestPathQuery:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.graph_shortest_path import GraphShortestPath
 
+        if set(src_dict) - {
+            "index",
+            "shortest_path",
+        }:
+            raise ValueError("Unexpected properties for GraphShortestPathQuery")
         d = dict(src_dict)
         index = d.pop("index")
 

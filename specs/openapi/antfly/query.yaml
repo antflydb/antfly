@@ -296,6 +296,7 @@ components:
         - query
     NumericRangeQuery:
       type: object
+      additionalProperties: false
       properties:
         min:
           type: number
@@ -321,6 +322,7 @@ components:
           $ref: "#/components/schemas/Boost"
     TermRangeQuery:
       type: object
+      additionalProperties: false
       properties:
         min:
           type: string
@@ -344,6 +346,7 @@ components:
           $ref: "#/components/schemas/Boost"
     DateRangeStringQuery:
       type: object
+      additionalProperties: false
       properties:
         start:
           type: string
@@ -367,8 +370,42 @@ components:
           $ref: "#/components/schemas/Boost"
         datetime_parser:
           type: string
+    BoolQuery:
+      type: object
+      additionalProperties: false
+      required: [bool]
+      description: Canonical Boolean wrapper. Must clauses score; filter clauses constrain without scoring.
+      properties:
+        bool:
+          $ref: '#/components/schemas/BoolQueryBody'
+    BoolQueryClause:
+      oneOf:
+        - $ref: '#/components/schemas/Query'
+        - type: array
+          items:
+            $ref: '#/components/schemas/Query'
+    BoolQueryBody:
+      type: object
+      additionalProperties: false
+      properties:
+        must:
+          $ref: '#/components/schemas/BoolQueryClause'
+        should:
+          $ref: '#/components/schemas/BoolQueryClause'
+        must_not:
+          $ref: '#/components/schemas/BoolQueryClause'
+        filter:
+          $ref: '#/components/schemas/BoolQueryClause'
+        minimum_should_match:
+          type: integer
+          format: uint32
+          minimum: 0
+          description: Minimum optional clauses required; omission follows the runtime's required-clause defaults.
+        boost:
+          $ref: '#/components/schemas/Boost'
     BooleanQuery:
       type: object
+      additionalProperties: false
       properties:
         must:
           $ref: "#/components/schemas/ConjunctionQuery"
@@ -616,6 +653,7 @@ components:
         - $ref: "#/components/schemas/NumericRangeQuery"
         - $ref: "#/components/schemas/TermRangeQuery"
         - $ref: "#/components/schemas/DateRangeStringQuery"
+        - $ref: "#/components/schemas/BoolQuery"
         - $ref: "#/components/schemas/BooleanQuery"
         - $ref: "#/components/schemas/ConjunctionQuery"
         - $ref: "#/components/schemas/DisjunctionQuery"

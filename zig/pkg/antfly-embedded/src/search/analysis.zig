@@ -1618,6 +1618,12 @@ pub const SubstringStream = struct {
             if (!self.pairs) {
                 self.first = self.words.next();
                 if (self.first != null) continue;
+                // A source with fewer than two words has no shingles. Avoid
+                // rescanning a potentially very large single identifier.
+                if (self.words.position < 2) {
+                    self.finished = true;
+                    return null;
+                }
                 self.pairs = true;
                 self.words = .{ .text = self.words.text };
                 self.second = self.words.next();

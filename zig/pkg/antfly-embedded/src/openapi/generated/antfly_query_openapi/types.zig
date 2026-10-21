@@ -73,6 +73,77 @@ pub const BoolFieldQuery = struct {
     }
 };
 
+/// Canonical Boolean wrapper. Must clauses score; filter clauses constrain without scoring.
+pub const BoolQuery = struct {
+    bool: BoolQueryBody,
+};
+
+pub const BoolQueryBody = struct {
+    must: ?BoolQueryClause = null,
+    should: ?BoolQueryClause = null,
+    must_not: ?BoolQueryClause = null,
+    filter: ?BoolQueryClause = null,
+    /// Minimum optional clauses required; omission follows the runtime's required-clause defaults.
+    minimum_should_match: ?u32 = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "must", "must", true },
+        .{ "should", "should", true },
+        .{ "must_not", "must_not", true },
+        .{ "filter", "filter", true },
+        .{ "minimum_should_match", "minimum_should_match", true },
+        .{ "boost", "boost", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.must) |value| {
+            try jw.objectField("must");
+            try jw.write(value);
+        }
+        if (self.should) |value| {
+            try jw.objectField("should");
+            try jw.write(value);
+        }
+        if (self.must_not) |value| {
+            try jw.objectField("must_not");
+            try jw.write(value);
+        }
+        if (self.filter) |value| {
+            try jw.objectField("filter");
+            try jw.write(value);
+        }
+        if (self.minimum_should_match) |value| {
+            try jw.objectField("minimum_should_match");
+            try jw.write(value);
+        }
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const BoolQueryClause = std.json.Value;
+
 pub const BooleanQuery = struct {
     must: ?ConjunctionQuery = null,
     should: ?DisjunctionQuery = null,
@@ -1210,6 +1281,7 @@ pub const Query = union(enum) {
     phrase_query: *PhraseQuery,
     autocomplete_query: *AutocompleteQuery,
     bool_field_query: *BoolFieldQuery,
+    bool_query: *BoolQuery,
     conjunction_query: *ConjunctionQuery,
     doc_id_query: *DocIdQuery,
     geo_bounding_polygon_query: *GeoBoundingPolygonQuery,
@@ -1362,6 +1434,11 @@ pub const Query = union(enum) {
             if (try parseStructuralVariant(BoolFieldQuery, allocator, source, options)) |parsed| return .{ .bool_field_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
+            "bool",
+        })) {
+            if (try parseStructuralVariant(BoolQuery, allocator, source, options)) |parsed| return .{ .bool_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
             "conjuncts",
         })) {
             if (try parseStructuralVariant(ConjunctionQuery, allocator, source, options)) |parsed| return .{ .conjunction_query = parsed };
@@ -1448,6 +1525,7 @@ pub const Query = union(enum) {
             .phrase_query => |v| try jw.write(v.*),
             .autocomplete_query => |v| try jw.write(v.*),
             .bool_field_query => |v| try jw.write(v.*),
+            .bool_query => |v| try jw.write(v.*),
             .conjunction_query => |v| try jw.write(v.*),
             .doc_id_query => |v| try jw.write(v.*),
             .geo_bounding_polygon_query => |v| try jw.write(v.*),
