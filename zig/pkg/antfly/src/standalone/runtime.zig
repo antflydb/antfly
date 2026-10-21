@@ -6035,7 +6035,7 @@ fn serveUnifiedInner(
     }
     if (register_inference_routes) {
         if (comptime inline_inference) {
-            try inference_host.linkedInferenceRegisterRoutesOn(antfly_node, &server);
+            try inference_host.linkedInferenceRegisterRoutesOnExcept(antfly_node, &server, @import("../api/inference_gateway.zig").public_paths);
         } else {
             const functions = try linkedInferenceApi(inference_bridge.Capability.route_manifest);
             try registerLinkedInferenceManifest(
@@ -6133,6 +6133,7 @@ fn registerLinkedInferenceManifest(
     if (!status.isOk()) return inference_bridge.errorFromStatus(status);
     const entries = if (entries_ptr) |ptr| ptr[0..entries_len] else &.{};
     for (entries) |entry| {
+        if (@import("../api/inference_gateway.zig").ownsPath(entry.path.slice())) continue;
         const route = try alloc.create(LinkedInferenceRoute);
         errdefer alloc.destroy(route);
         route.* = .{
@@ -6593,8 +6594,7 @@ fn isHttpToken(value: []const u8) bool {
 }
 
 fn isInferenceApiPath(path: []const u8) bool {
-    return hasPathComponentPrefix(path, inference_bridge.ai_api_prefix) or
-        hasPathComponentPrefix(path, inference_bridge.public_api_prefix);
+    return @import("../api/inference_route_policy.zig").isInferenceApiPath(path);
 }
 
 const isInteractiveGeneratePath = inference_provider.isInteractiveGeneratePath;
@@ -9576,7 +9576,10 @@ test "standalone inference middleware reuses public API authentication" {
     var user = try manager.createUser("admin", "admin", &.{});
     defer user.deinit(alloc);
 
+    var public_config = try antfly.common.config.Config.parseFromSlice(alloc, "{\"public_inference\":{\"enabled\":true}}");
+    defer public_config.deinit();
     var api_server = antfly.public_api.http_server.ApiHttpServer.init(alloc, .{
+        .node_config = &public_config,
         .auth_enabled = true,
         .user_manager = &manager,
     }, .{ .ptr = undefined, .vtable = undefined }, null, null);
@@ -9587,7 +9590,7 @@ test "standalone inference middleware reuses public API authentication" {
     var table_read = try antfly.usermgr.Permission.initOwned(alloc, .table, "documents", .read);
     defer table_read.deinit(alloc);
     try manager.addPermissionToUser("admin", table_read);
-    for ([_][]const u8{ "/ai/v1/models", "/ml/v1/metrics" }) |path| {
+    for ([_][]const u8{ "/ai/v1/models", "/ml/v1/metrics", "/ai//v1/models/", "//ml/v1/metrics" }) |path| {
         try Harness.expect(middleware, path, null, 401);
         try Harness.expect(middleware, path, "Basic YWRtaW46d3Jvbmc=", 401);
         try Harness.expect(middleware, path, "Basic YWRtaW46YWRtaW4=", 403);
@@ -9596,7 +9599,7 @@ test "standalone inference middleware reuses public API authentication" {
     var inference_read = try antfly.usermgr.Permission.initOwned(alloc, .inference, "*", .read);
     defer inference_read.deinit(alloc);
     try manager.addPermissionToUser("admin", inference_read);
-    for ([_][]const u8{ "/ai/v1/models", "/ml/v1/metrics" }) |path| {
+    for ([_][]const u8{ "/ai/v1/models", "/ml/v1/metrics", "/ai//v1/models/", "//ml/v1/metrics" }) |path| {
         try Harness.expect(middleware, path, "Basic YWRtaW46YWRtaW4=", 204);
     }
     try Harness.expectMethod(middleware, .POST, "/ai/v1/generate", "Basic YWRtaW46YWRtaW4=", 403);

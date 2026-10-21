@@ -1360,13 +1360,16 @@ func extractModelNames(r io.Reader) ([]string, error) {
 var modelCategoryOperations = map[string][]OperationType{
 	"embedders":    {"embed", "embeddings"},
 	"generators":   {"generate", "generate.batch", "chat.completions"},
+	"chains":       {"generate", "generate.batch", "chat.completions"},
 	"readers":      {"read"},
 	"rerankers":    {"rerank"},
 	"chunkers":     {"chunk"},
 	"extractors":   {"extract"},
 	"deciders":     {"decide"},
 	"rewriters":    {"rewrite"},
-	"transcribers": {"transcribe"},
+	"transcribers": {"transcribe", "dictate", "transcription.sessions"},
+	"synthesizers": {"synthesize"},
+	"predictors":   {"predict"},
 }
 
 func extractModelOperations(r io.Reader) (map[string]map[OperationType]bool, error) {
@@ -1429,7 +1432,18 @@ func extractModelOperations(r io.Reader) (map[string]map[OperationType]bool, err
 	}
 	for category, operations := range modelCategoryOperations {
 		if raw, ok := doc[category]; ok {
-			addFromCollection(raw, operations)
+			if category == "predictors" {
+				var schemas map[string]json.RawMessage
+				if json.Unmarshal(raw, &schemas) == nil {
+					for name, schema := range schemas {
+						if validPredictorSchema(schema) {
+							add(name, operations)
+						}
+					}
+				}
+			} else {
+				addFromCollection(raw, operations)
+			}
 		}
 	}
 	return result, nil
@@ -1885,6 +1899,8 @@ type Proxy struct {
 	capabilityLeases       map[string]proxyCapabilityLease
 	capabilityLeaseByID    map[[sha256.Size]byte]string
 	verifiedSource         VerifiedSourceResolver
+	sessionMu              sync.Mutex
+	sessions               map[string]proxySession
 }
 
 // VerifiedSourceResolver authenticates source-scoped routing attributes for an
@@ -1921,6 +1937,8 @@ type leasedEndpoint struct {
 	operations  map[OperationType]bool
 }
 
+// A lease binds an inventory task and a logical policy operation independently.
+// Generated decide/extract use task=generate without gaining generation policy.
 type proxyCapabilityLease struct {
 	identity            [sha256.Size]byte
 	model               string
@@ -2079,14 +2097,23 @@ func (p *Proxy) Start(ctx context.Context) error {
 	apiMux.HandleFunc("/ai/v1/chunk", p.handleChunk)
 	apiMux.HandleFunc("/ai/v1/rerank", p.handleRerank)
 	apiMux.HandleFunc("/ai/v1/extract", p.handleExtract)
+	// Canonical runtime contract; /decide remains a compatibility alias.
+	apiMux.HandleFunc("/ai/v1/decisions", p.handleDecide)
 	apiMux.HandleFunc("/ai/v1/decide", p.handleDecide)
 	apiMux.HandleFunc("/ai/v1/rewrite", p.handleRewrite)
 	apiMux.HandleFunc("/ai/v1/transcribe", p.handleTranscribe)
+	apiMux.HandleFunc("/ai/v1/dictate", func(w http.ResponseWriter, r *http.Request) { p.proxyRequest(w, r, "dictate") })
+	apiMux.HandleFunc("/ai/v1/synthesize", func(w http.ResponseWriter, r *http.Request) { p.proxyRequest(w, r, "synthesize") })
+	apiMux.HandleFunc("/ai/v1/transcription/sessions", p.handleTranscriptionSession)
+	apiMux.HandleFunc("/ai/v1/transcription/sessions/", p.handleTranscriptionSession)
+	apiMux.HandleFunc("/ml/v1/predict", func(w http.ResponseWriter, r *http.Request) { p.proxyRequest(w, r, "predict") })
 	apiMux.HandleFunc("/ai/v1/read", p.handleRead)
 	apiMux.HandleFunc("/ai/v1/generate", p.handleGenerate)
 	apiMux.HandleFunc("/ai/v1/generate/batch", p.handleGenerateBatch)
 	apiMux.HandleFunc("/ai/v1/chat/completions", p.handleChatCompletions)
 	apiMux.HandleFunc("/ai/v1/models", p.handleModels)
+	apiMux.HandleFunc("/ml/v1/models", p.handlePredictors)
+	apiMux.HandleFunc("/ml/v1/predictors", p.handlePredictors)
 	apiMux.HandleFunc("/healthz", p.handleHealth)
 	apiMux.HandleFunc("/readyz", p.handleReady)
 
@@ -2257,6 +2284,14 @@ const maxConcurrentGenerateBatchPartitions = 8
 // Results and execution reports are reconstructed in stable partition/item
 // order.
 func (p *Proxy) proxyGenerateBatchRequest(w http.ResponseWriter, r *http.Request) {
+	// One deadline covers admission, all partitions, and every upstream attempt.
+	ctx, cancel := inferenceRequestContext(r)
+	defer cancel()
+	r = r.WithContext(ctx)
+	if ctx.Err() != nil {
+		http.Error(w, "inference deadline exceeded", http.StatusGatewayTimeout)
+		return
+	}
 	start := time.Now()
 	routing, err := p.routingContextForRequest(r, start)
 	if err != nil {
@@ -2782,6 +2817,13 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ctx, cancel := inferenceRequestContext(r)
+	defer cancel()
+	r = r.WithContext(ctx)
+	if writeInferenceContextFailure(w, ctx) {
+		return
+	}
+
 	model := strings.TrimSpace(r.URL.Query().Get("model"))
 	task := strings.TrimSpace(r.URL.Query().Get("task"))
 	operation := strings.TrimSpace(r.URL.Query().Get("operation"))
@@ -2811,12 +2853,13 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		routing.ExplicitPool = pool
 		cohort, err := p.prepareCatalogEndpointCohort(r.Context(), routing, model, taskScope.Operation)
 		if err != nil {
+			if writeInferenceContextFailure(w, ctx) {
+				return
+			}
 			if writeResolutionError(w, err) {
 				return
 			}
-			if r.Context().Err() != nil {
-				http.Error(w, "inference model catalog request canceled", http.StatusRequestTimeout)
-			} else {
+			if !writeInferenceContextFailure(w, ctx) {
 				p.logger.Warn("failed to prepare inference capability cohort", zap.Error(err))
 				http.Error(w, "inference capability cohort activation unavailable", http.StatusServiceUnavailable)
 			}
@@ -2893,6 +2936,9 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err := p.catalogAdmission.Acquire(r.Context(), catalogBytes); err != nil {
+		if writeInferenceContextFailure(w, ctx) {
+			return
+		}
 		status := http.StatusServiceUnavailable
 		if !errors.Is(err, errByteAdmissionRequestTooLarge) {
 			status = http.StatusRequestTimeout
@@ -2933,6 +2979,7 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 				if authorization != "" {
 					request.Header.Set("Authorization", authorization)
 				}
+				setInferenceHopBudgets(request)
 				response, err := p.registry.client.Do(request)
 				if err != nil {
 					results <- catalogResult{err: err}
@@ -3010,6 +3057,11 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// Drain all workers before returning admission, even when canceled. Their
+	// transports share ctx, so expired requests cannot mint partial leases.
+	if writeInferenceContextFailure(w, ctx) {
+		return
+	}
 	if mergedTooLarge {
 		http.Error(w, "merged inference model catalog is too large", http.StatusBadGateway)
 		return
@@ -3023,6 +3075,10 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if model != "" && taskScope.Category == "predictors" && !canonicalCatalogContainsTaskModel(categories, taskScope, model) {
+		http.Error(w, "predictor schema is incompatible across inference endpoints", http.StatusServiceUnavailable)
+		return
+	}
 	response := make(map[string]any, len(categories)+1)
 	for category, models := range categories {
 		response[category] = models
@@ -3032,9 +3088,31 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		names = append(names, model)
 	}
 	sort.Strings(names)
-	data := make([]map[string]string, 0, len(names))
+	data := make([]map[string]any, 0, len(names))
 	for _, model := range names {
-		data = append(data, map[string]string{"id": model})
+		item := map[string]any{"id": model}
+		var tasks []string
+		// Derive task identity from the merged task collections so physical
+		// models retain it through the proxy. Multiple roles remain explicit.
+		for _, entry := range []struct{ category, task string }{
+			{"generators", "generate"}, {"chains", "generate"}, {"embedders", "embed"},
+			{"readers", "read"}, {"rerankers", "rerank"}, {"chunkers", "chunk"},
+			{"extractors", "extract"}, {"deciders", "decide"}, {"rewriters", "rewrite"},
+			{"transcribers", "transcribe"}, {"synthesizers", "synthesize"}, {"predictors", "predict"},
+		} {
+			if descriptor, ok := categories[entry.category][model]; ok && (entry.category != "predictors" || validPredictorSchema(descriptor)) {
+				if len(tasks) == 0 || tasks[len(tasks)-1] != entry.task {
+					tasks = append(tasks, entry.task)
+				}
+			}
+		}
+		if len(tasks) > 0 {
+			item["tasks"] = tasks
+		}
+		if len(tasks) == 1 {
+			item["task"] = tasks[0]
+		}
+		data = append(data, item)
 	}
 	response["data"] = data
 	responseBody, err := json.Marshal(response)
@@ -3047,6 +3125,9 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	// silently escape the process admission contract.
 	if len(responseBody) > maxMergedModelCatalogBytes {
 		http.Error(w, "merged inference model catalog is too large", http.StatusBadGateway)
+		return
+	}
+	if writeInferenceContextFailure(w, ctx) {
 		return
 	}
 	descriptorDigest := sha256.Sum256(responseBody)
@@ -3229,7 +3310,11 @@ func (p *Proxy) validateCapabilityLease(token, revision, model string, operation
 }
 
 func (p *Proxy) capabilityLeaseEndpoints(token, revision, model string, operation OperationType, authorizationDigest [sha256.Size]byte) (map[string]endpointRef, error) {
-	lease, err := p.validatedCapabilityLease(token, revision, model, operation, authorizationDigest)
+	return p.capabilityLeaseEndpointsForPlacement(token, revision, model, operation, operation, authorizationDigest)
+}
+
+func (p *Proxy) capabilityLeaseEndpointsForPlacement(token, revision, model string, operation, endpointOperation OperationType, authorizationDigest [sha256.Size]byte) (map[string]endpointRef, error) {
+	lease, err := p.validatedCapabilityLease(token, revision, model, operation, endpointOperation, authorizationDigest)
 	return lease.endpoints, err
 }
 
@@ -3239,7 +3324,7 @@ type validatedCapabilityLease struct {
 	scoped          bool
 }
 
-func (p *Proxy) validatedCapabilityLease(token, revision, model string, operation OperationType, authorizationDigest [sha256.Size]byte) (validatedCapabilityLease, error) {
+func (p *Proxy) validatedCapabilityLease(token, revision, model string, operation, endpointOperation OperationType, authorizationDigest [sha256.Size]byte) (validatedCapabilityLease, error) {
 	if token == "" {
 		if revision != "" {
 			return validatedCapabilityLease{}, staleCapabilityResolutionError("inference capability lease is incomplete")
@@ -3254,7 +3339,7 @@ func (p *Proxy) validatedCapabilityLease(token, revision, model string, operatio
 		ok = false
 	}
 	p.capabilityLeaseMu.Unlock()
-	if !ok || lease.model != model || lease.task != semanticTaskForOperation(operation) || lease.operation != operation ||
+	if !ok || lease.model != model || lease.task != semanticTaskForOperation(endpointOperation) || lease.operation != operation ||
 		lease.descriptorRevision == "" || lease.descriptorRevision != revision ||
 		lease.authorizationDigest != authorizationDigest {
 		return validatedCapabilityLease{}, staleCapabilityResolutionError("inference capability lease is stale")
@@ -3331,15 +3416,19 @@ type catalogTaskScope struct {
 }
 
 var catalogTaskScopes = map[string]catalogTaskScope{
-	"read":       {Operation: "read", Category: "readers"},
-	"generate":   {Operation: "generate.batch", Category: "generators"},
-	"embed":      {Operation: "embed", Category: "embedders"},
-	"rerank":     {Operation: "rerank", Category: "rerankers"},
-	"chunk":      {Operation: "chunk", Category: "chunkers"},
-	"extract":    {Operation: "extract", Category: "extractors"},
-	"decide":     {Operation: "decide", Category: "deciders"},
-	"rewrite":    {Operation: "rewrite", Category: "rewriters"},
-	"transcribe": {Operation: "transcribe", Category: "transcribers"},
+	"read":                   {Operation: "read", Category: "readers"},
+	"generate":               {Operation: "generate.batch", Category: "generators"},
+	"embed":                  {Operation: "embed", Category: "embedders"},
+	"rerank":                 {Operation: "rerank", Category: "rerankers"},
+	"chunk":                  {Operation: "chunk", Category: "chunkers"},
+	"extract":                {Operation: "extract", Category: "extractors"},
+	"decide":                 {Operation: "decide", Category: "deciders"},
+	"rewrite":                {Operation: "rewrite", Category: "rewriters"},
+	"transcribe":             {Operation: "transcribe", Category: "transcribers"},
+	"dictate":                {Operation: "dictate", Category: "transcribers"},
+	"transcription.sessions": {Operation: "transcription.sessions", Category: "transcribers"},
+	"synthesize":             {Operation: "synthesize", Category: "synthesizers"},
+	"predict":                {Operation: "predict", Category: "predictors"},
 }
 
 func catalogTaskScopeFor(raw string) (catalogTaskScope, error) {
@@ -3363,8 +3452,11 @@ func catalogTaskScopeForOperation(rawTask, rawOperation string) (catalogTaskScop
 		return scope, err
 	}
 	requested := OperationType(strings.TrimSpace(rawOperation))
-	valid := false
-	for _, candidate := range semanticOperationsForTask(rawTask, scope.Operation) {
+	// Generated decisions/extractions use generator inventory under their own
+	// route policy. Keep both identities in the lease instead of broadening a
+	// generation lease to authorize ordinary task requests.
+	valid := scope.Category == "generators" && (requested == "decide" || requested == "extract")
+	for _, candidate := range semanticOperationsForTask(strings.TrimSpace(rawTask), scope.Operation) {
 		if candidate == requested {
 			valid = true
 			break
@@ -3377,24 +3469,35 @@ func catalogTaskScopeForOperation(rawTask, rawOperation string) (catalogTaskScop
 	return scope, nil
 }
 
+func (scope catalogTaskScope) categories() []string {
+	if scope.Category == "generators" {
+		return []string{"generators", "chains"}
+	}
+	return []string{scope.Category}
+}
+
 func catalogContainsTaskModel(catalog map[string]json.RawMessage, scope catalogTaskScope, model string) bool {
-	raw, ok := catalog[scope.Category]
-	if !ok {
-		return false
+	for _, category := range scope.categories() {
+		var models map[string]json.RawMessage
+		if json.Unmarshal(catalog[category], &models) != nil {
+			continue
+		}
+		if _, ok := catalogModelDescriptor(models, category, model); ok {
+			return true
+		}
 	}
-	var models map[string]json.RawMessage
-	if json.Unmarshal(raw, &models) != nil {
-		return false
-	}
-	_, ok = catalogModelDescriptor(models, scope.Category, model)
-	return ok
+	return false
 }
 
 type modelCatalogSnapshot map[string]map[string]json.RawMessage
 
 func canonicalCatalogContainsTaskModel(catalog modelCatalogSnapshot, scope catalogTaskScope, model string) bool {
-	_, ok := catalogModelDescriptor(catalog[scope.Category], scope.Category, model)
-	return ok
+	for _, category := range scope.categories() {
+		if _, ok := catalogModelDescriptor(catalog[category], category, model); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func canonicalCatalogModel(category, model string) string {
@@ -3406,11 +3509,16 @@ func canonicalCatalogModel(category, model string) string {
 
 func catalogModelDescriptor(models map[string]json.RawMessage, category, model string) (json.RawMessage, bool) {
 	canonical := canonicalCatalogModel(category, model)
-	if descriptor, ok := models[canonical]; ok {
+	if descriptor, ok := models[canonical]; ok && (category != "predictors" || validPredictorSchema(descriptor)) {
 		return descriptor, true
 	}
+	// Only chunk names have alternate spellings. Other task collections use
+	// exact keys, keeping merged task metadata construction linear in models.
+	if category != "chunkers" {
+		return nil, false
+	}
 	for candidate, descriptor := range models {
-		if canonicalCatalogModel(category, candidate) == canonical {
+		if canonicalCatalogModel(category, candidate) == canonical && (category != "predictors" || validPredictorSchema(descriptor)) {
 			return descriptor, true
 		}
 	}
@@ -3456,6 +3564,9 @@ func mergeCanonicalCatalogModel(
 	descriptor json.RawMessage,
 	modelNames map[string]bool,
 ) int {
+	if category == "predictors" && !validPredictorSchema(descriptor) {
+		descriptor = json.RawMessage(`{"unavailable":true}`)
+	}
 	added := 0
 	models := target[category]
 	if models == nil {
@@ -3468,6 +3579,11 @@ func mergeCanonicalCatalogModel(
 
 	model = canonicalCatalogModel(category, model)
 	if existing, duplicate := models[model]; duplicate {
+		if category == "predictors" && !equalPredictorSchema(existing, descriptor) {
+			// Retain no callable schema for a heterogeneous pool; equal vector
+			// dimensions alone do not establish output or feature semantics.
+			descriptor = json.RawMessage(`{"unavailable":true}`)
+		}
 		replacement := conservativeModelDescriptor(existing, descriptor)
 		models[model] = replacement
 		return catalogSizeAdd(added, len(replacement)-len(existing))
@@ -3482,15 +3598,15 @@ func mergeCanonicalCatalogModel(
 	if !modelNames[model] {
 		modelNames[model] = true
 		// Compatibility data item: comma + {"id":<escaped model>}.
-		added = catalogSizeAdd(added, 1+len(`{"id":}`))
+		added = catalogSizeAdd(added, 1+len(`{"id":}`)+256)
 		added = catalogSizeAdd(added, catalogJSONQuotedUpperBound(model))
 	}
 	return added
 }
 
 var modelCatalogCategories = []string{
-	"embedders", "generators", "readers", "rerankers", "chunkers",
-	"extractors", "deciders", "rewriters", "transcribers",
+	"embedders", "generators", "chains", "readers", "rerankers", "chunkers",
+	"extractors", "deciders", "rewriters", "transcribers", "synthesizers", "predictors",
 }
 
 // parseCanonicalModelCatalog pays JSON validation and descriptor normalization
@@ -3551,11 +3667,13 @@ func mergeCanonicalModelCatalog(target map[string]map[string]json.RawMessage, so
 }
 
 func mergeCanonicalScopedModelCatalog(target map[string]map[string]json.RawMessage, source modelCatalogSnapshot, scope catalogTaskScope, model string, modelNames map[string]bool) int {
-	descriptor, ok := catalogModelDescriptor(source[scope.Category], scope.Category, model)
-	if !ok {
-		return 0
+	added := 0
+	for _, category := range scope.categories() {
+		if descriptor, ok := catalogModelDescriptor(source[category], category, model); ok {
+			added = catalogSizeAdd(added, mergeCanonicalCatalogModel(target, category, model, descriptor, modelNames))
+		}
 	}
-	return mergeCanonicalCatalogModel(target, scope.Category, model, descriptor, modelNames)
+	return added
 }
 
 func mergeModelCatalog(target map[string]map[string]json.RawMessage, source map[string]json.RawMessage, modelNames map[string]bool) int {
@@ -3577,21 +3695,19 @@ func mergeModelCatalog(target map[string]map[string]json.RawMessage, source map[
 }
 
 func mergeScopedModelCatalog(target map[string]map[string]json.RawMessage, source map[string]json.RawMessage, scope catalogTaskScope, model string, modelNames map[string]bool) int {
-	raw := source[scope.Category]
-	var models map[string]json.RawMessage
-	if json.Unmarshal(raw, &models) != nil {
-		return 0
+	added := 0
+	for _, category := range scope.categories() {
+		var models map[string]json.RawMessage
+		if json.Unmarshal(source[category], &models) != nil {
+			continue
+		}
+		if descriptor, ok := catalogModelDescriptor(models, category, model); ok {
+			added = catalogSizeAdd(added, mergeCatalogModel(target, category, model, descriptor, modelNames))
+		}
 	}
-	descriptor, ok := catalogModelDescriptor(models, scope.Category, model)
-	if !ok {
-		return 0
-	}
-	return mergeCatalogModel(target, scope.Category, model, descriptor, modelNames)
+	return added
 }
 
-// Capability descriptors are admission contracts, so a malformed descriptor
-// from even one eligible endpoint must poison the merged model instead of
-// being silently weakened into a plausible-looking subset.
 func sanitizeModelDescriptor(raw json.RawMessage) json.RawMessage {
 	var descriptor map[string]any
 	if json.Unmarshal(raw, &descriptor) != nil {
@@ -4302,10 +4418,18 @@ func intersectStringValues(left, right any) []string {
 }
 
 func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation string) {
+	ctx, cancel := inferenceRequestContext(r)
+	defer cancel()
+	r = r.WithContext(ctx)
 	start := time.Now()
 	routing, err := p.routingContextForRequest(r, start)
 	if err != nil {
 		http.Error(w, "source authentication failed", http.StatusUnauthorized)
+		return
+	}
+
+	if _, pinned := r.Context().Value(proxySessionContextKey{}).(proxySession); pinned && strings.HasSuffix(r.URL.Path, "/stream") {
+		p.proxySessionStream(w, r, operation, start, routing)
 		return
 	}
 
@@ -4680,6 +4804,17 @@ func (p *Proxy) proxyRequestWithBody(w http.ResponseWriter, r *http.Request, ope
 }
 
 func (p *Proxy) proxyRequestWithReplayBody(w http.ResponseWriter, r *http.Request, operation string, start time.Time, routing RoutingContext, routingPayload []byte, replay proxyReplayBody) {
+	// Session identity is transport independent. Never accept model/placement
+	// selection from JSON or framed metadata on a pinned follow-up.
+	if pinned, ok := r.Context().Value(proxySessionContextKey{}).(proxySession); ok {
+		ref, valid := p.registry.endpointRefAtIncarnation(pinned.address, pinned.incarnation)
+		if !valid {
+			http.Error(w, "session endpoint is gone", http.StatusConflict)
+			return
+		}
+		routing.pinnedEndpoint = &ref
+		routingPayload, _ = json.Marshal(map[string]string{"model": pinned.model})
+	}
 	model, err := proxyRequestModel(routingPayload, operation)
 	if err != nil {
 		if errors.Is(err, errProxyGenerateBatchTooLarge) {
@@ -4694,6 +4829,11 @@ func (p *Proxy) proxyRequestWithReplayBody(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	if generatedProxyRequest(routingPayload, operation) {
+		// Endpoint capability differs from the logical task. Route policy and
+		// admission must still see decide/extract.
+		routing.endpointOperation = "generate"
+	}
 	lease, err := p.acquireRequestResolution(r.Context(), OperationType(operation), model, routing)
 	if err != nil {
 		if writeResolutionError(w, err) {
@@ -4719,6 +4859,30 @@ func (p *Proxy) proxyRequestWithReplayBody(w http.ResponseWriter, r *http.Reques
 	attempts := 1
 	if matchedRoute != nil && matchedRoute.RetryAttempts > 1 {
 		attempts = int(matchedRoute.RetryAttempts)
+	}
+	if operation == "transcription.sessions" {
+		attempts = 1
+	}
+	attempts = inferenceAttemptLimit(r, attempts)
+	if attempts == 0 {
+		lease.Release()
+		http.Error(w, "inference attempt budget exhausted", http.StatusTooManyRequests)
+		return
+	}
+	if operation == "transcription.sessions" && r.URL.Path == "/ai/v1/transcription/sessions" {
+		reservation, err := p.reserveSession(r, model, resolution.Endpoint, routingPayload)
+		if err != nil {
+			lease.Release()
+			status := http.StatusServiceUnavailable
+			if errors.Is(err, errSessionCapacity) {
+				status = http.StatusTooManyRequests
+			}
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "session owner capacity unavailable", status)
+			return
+		}
+		defer reservation.release()
+		r = r.WithContext(context.WithValue(r.Context(), proxySessionReservationKey{}, reservation))
 	}
 	spillReservation := int64(0)
 	if attempts > 1 {
@@ -4789,6 +4953,22 @@ func (p *Proxy) proxyRequestWithReplayBody(w http.ResponseWriter, r *http.Reques
 			continue
 		}
 
+		if r.URL.Path == "/ai/v1/transcription/sessions" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			if err := p.pinSessionResponse(r, resp, endpoint); err != nil {
+				_ = resp.Body.Close()
+				lease.RecordFailure()
+				http.Error(w, "invalid session response", http.StatusBadGateway)
+				return
+			}
+		}
+		if pinned, ok := r.Context().Value(proxySessionContextKey{}).(proxySession); ok {
+			if err := rewriteSessionResponse(resp, pinned.publicID); err != nil {
+				_ = resp.Body.Close()
+				lease.RecordFailure()
+				http.Error(w, "invalid session response", http.StatusBadGateway)
+				return
+			}
+		}
 		streamErr := copyResponse(w, resp)
 		p.registry.RecordModelLatency(endpoint.address, model, time.Since(attemptStarted))
 
@@ -4991,15 +5171,55 @@ func readProxyRequestBody(reader io.Reader, contentLength, maxBytes int64) ([]by
 	}
 }
 
+func generatedProxyRequest(body []byte, operation string) bool {
+	var request struct {
+		DecisionMethod string `json:"decision_method"`
+		Method         string `json:"method"`
+	}
+	if operation != "decide" && operation != "extract" {
+		return false
+	}
+	if json.Unmarshal(body, &request) != nil {
+		return false
+	}
+	return (operation == "decide" && request.DecisionMethod == "generated") || (operation == "extract" && request.Method == "generated")
+}
+
 func proxyRequestModel(body []byte, operation string) (string, error) {
+	if generatedProxyRequest(body, operation) {
+		var request struct {
+			Model     json.RawMessage `json:"model"`
+			Generator struct {
+				Model string `json:"model"`
+			} `json:"generator"`
+		}
+		if err := json.Unmarshal(body, &request); err != nil {
+			return "", err
+		}
+		if len(request.Model) != 0 {
+			return "", errors.New("generated requests select generator.model")
+		}
+		return strings.TrimSpace(request.Generator.Model), nil
+	}
 	if operation == "chunk" {
 		var request struct {
+			Model  json.RawMessage `json:"model"`
 			Config *struct {
 				Model string `json:"model"`
 			} `json:"config"`
 		}
 		if err := json.Unmarshal(body, &request); err != nil {
 			return "", err
+		}
+		if len(request.Model) != 0 {
+			var model string
+			if err := json.Unmarshal(request.Model, &model); err != nil {
+				return "", err
+			}
+			if strings.TrimSpace(model) == "" {
+				return "", errors.New("model must not be empty")
+			}
+			return canonicalChunkModel(model), nil
 		}
 		if request.Config == nil || strings.TrimSpace(request.Config.Model) == "" {
 			return "fixed", nil
@@ -5890,6 +6110,10 @@ func (p *Proxy) forwardRequestWithRetry(r *http.Request, replay proxyReplayBody,
 	} else {
 		attemptCtx, cancel = context.WithCancel(r.Context())
 	}
+	if err := attemptCtx.Err(); err != nil {
+		cancel()
+		return nil, err
+	}
 	responseOwnsAttempt := false
 	defer func() {
 		if !responseOwnsAttempt {
@@ -5908,6 +6132,11 @@ func (p *Proxy) forwardRequestWithRetry(r *http.Request, replay proxyReplayBody,
 		RawPath:  r.URL.RawPath,
 		RawQuery: r.URL.RawQuery,
 	})
+	if outReq.URL.Path == "/ai/v1/decide" {
+		outReq.URL.Path = "/ai/v1/decisions"
+		outReq.URL.RawPath = ""
+	}
+	setInferenceHopBudgets(outReq)
 	outReq.Host = targetURL.Host
 	outReq.RequestURI = ""
 	body, err := replay.Open()
@@ -5916,13 +6145,18 @@ func (p *Proxy) forwardRequestWithRetry(r *http.Request, replay proxyReplayBody,
 	}
 	outReq.Body = body
 	outReq.GetBody = nil
+	if _, duplex := body.(*proxySessionUpload); duplex {
+		outReq.Header.Del("Expect")
+	}
 	outReq.ContentLength = replay.Len()
 	if authorization := p.upstreamAuthorizationForRequest(r); authorization != "" {
 		outReq.Header.Set("Authorization", authorization)
 	}
 
 	resp, err := p.registry.client.Do(outReq)
-	_ = body.Close()
+	if _, duplex := body.(*proxySessionUpload); !duplex {
+		_ = body.Close()
+	}
 	finishUpload := func(retry bool) error {
 		if finalizer, ok := body.(interface {
 			Finish(context.Context, bool) error
@@ -6012,7 +6246,21 @@ func (b *forwardingBody) Close() error {
 	return err
 }
 
-func copyResponse(w io.Writer, resp *http.Response) error {
+type proxyFlushingWriter struct{ writer http.ResponseWriter }
+
+func (w proxyFlushingWriter) Write(data []byte) (int, error) {
+	n, err := w.writer.Write(data)
+	if err == nil {
+		err = http.NewResponseController(w.writer).Flush()
+	}
+	return n, err
+}
+
+func copyResponse(w io.Writer, resp *http.Response) (result error) {
+	// Retain the original observer when SSE flushing wraps the writer.
+	if recorder, ok := w.(interface{ recordProxyTransportError(error) }); ok {
+		defer func() { recorder.recordProxyTransportError(result) }()
+	}
 	if writer, ok := w.(http.ResponseWriter); ok {
 		if metadataWriter, ok := writer.(interface{ copyProxyResponseMetadata(http.Header) }); ok {
 			metadataWriter.copyProxyResponseMetadata(resp.Header)
@@ -6024,6 +6272,13 @@ func copyResponse(w io.Writer, resp *http.Response) error {
 			}
 		}
 		writer.WriteHeader(resp.StatusCode)
+		if strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+			if err := http.NewResponseController(writer).Flush(); err != nil {
+				_ = resp.Body.Close()
+				return err
+			}
+			w = proxyFlushingWriter{writer: writer}
+		}
 	}
 
 	var copyErr error
@@ -6031,14 +6286,11 @@ func copyResponse(w io.Writer, resp *http.Response) error {
 		_, copyErr = io.Copy(w, resp.Body)
 	}
 	closeErr := resp.Body.Close()
-	result := copyErr
+	result = copyErr
 	if result == nil {
 		result = closeErr
 	} else if closeErr != nil {
 		result = errors.Join(copyErr, closeErr)
-	}
-	if recorder, ok := w.(interface{ recordProxyTransportError(error) }); ok {
-		recorder.recordProxyTransportError(result)
 	}
 	return result
 }
@@ -6089,4 +6341,53 @@ func (p *Proxy) waitForQueuedDestination(ctx context.Context, route *Route, req 
 			}
 		}
 	}
+}
+
+// A task descriptor is not a native predictor schema. Only complete schemas
+// may advertise prediction or participate in a capability lease.
+func validPredictorSchema(raw json.RawMessage) bool {
+	var schema struct {
+		Task          string   `json:"task"`
+		NumFeatures   int64    `json:"num_features"`
+		NumOutputs    int64    `json:"num_outputs"`
+		FeatureNames  []string `json:"feature_names"`
+		ModelIdentity *string  `json:"model_identity"`
+		Unavailable   bool     `json:"unavailable"`
+	}
+	if json.Unmarshal(raw, &schema) != nil || schema.Unavailable || schema.NumFeatures <= 0 || schema.NumOutputs <= 0 {
+		return false
+	}
+	switch schema.Task {
+	case "regression", "binary_classification", "multiclass", "ranking":
+	default:
+		return false
+	}
+	return schema.FeatureNames == nil || int64(len(schema.FeatureNames)) == schema.NumFeatures
+}
+
+func equalPredictorSchema(left, right json.RawMessage) bool {
+	if !validPredictorSchema(left) || !validPredictorSchema(right) {
+		return false
+	}
+	var a, b map[string]json.RawMessage
+	if json.Unmarshal(left, &a) != nil || json.Unmarshal(right, &b) != nil {
+		return false
+	}
+	for _, field := range []string{"task", "num_features", "num_outputs", "feature_names", "model_identity"} {
+		var x, y any
+		if raw := a[field]; raw != nil {
+			if json.Unmarshal(raw, &x) != nil {
+				return false
+			}
+		}
+		if raw := b[field]; raw != nil {
+			if json.Unmarshal(raw, &y) != nil {
+				return false
+			}
+		}
+		if !reflect.DeepEqual(x, y) {
+			return false
+		}
+	}
+	return true
 }

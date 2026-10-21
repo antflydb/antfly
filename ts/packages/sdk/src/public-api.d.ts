@@ -5414,6 +5414,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ml/v1/predictors": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List predictor feature schemas through the gateway */
+        get: operations["listGatewayPredictors"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/synthesize": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Synthesize speech using a named text-to-speech configuration */
+        post: operations["synthesizeSpeech"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/extensions/v1/packages": {
         parameters: {
             query?: never;
@@ -6795,6 +6829,8 @@ export interface components {
          *     }
          */
         EmbedderConfig: (components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"]) & {
+            /** @description This named embedder produces sparse index/value vectors. */
+            sparse?: boolean;
             rate_limit?: components["schemas"]["RateLimitConfig"];
             provider: components["schemas"]["EmbedderProvider"];
             /**
@@ -6959,10 +6995,16 @@ export interface components {
          *     classify.
          * @enum {string}
          */
-        ConnectedModelType: "embedder" | "generator" | "reranker" | "chunker" | "classifier" | "rewriter" | "reader" | "transcriber" | "extractor" | "other";
+        ConnectedModelType: "embedder" | "generator" | "reranker" | "chunker" | "classifier" | "rewriter" | "reader" | "transcriber" | "extractor" | "decider" | "synthesizer" | "predictor" | "other";
         ConnectedModel: {
             /** @description Model identifier as reported by the provider. */
             name: string;
+            /** @description Canonical public gateway identity when available. */
+            id?: string;
+            /** @description Availability observation independent of capability support. */
+            availability?: string;
+            /** @description Whether metadata is configured, live, or cached. */
+            freshness?: string;
             /** @description Human-readable model name when the provider reports one. */
             display_name?: string;
             /** @description Embedding output dimension when known. */
@@ -6972,7 +7014,7 @@ export interface components {
         };
         InferenceConnection: {
             provider: components["schemas"]["InferenceProviderType"];
-            /** @description Resolved endpoint URL when applicable. */
+            /** @description Transport endpoint. Omitted from public inference discovery to keep server-owned URLs private. */
             url?: string;
             /** @description Cloud region (Bedrock). */
             region?: string;
@@ -21072,6 +21114,8 @@ export interface components {
             source_framework?: string;
         };
         InferencePredictorsResponse: {
+            /** @description Whether public inference execution is enabled on this deployment. */
+            public_inference_enabled?: boolean;
             /**
              * @description Response object type.
              * @enum {string}
@@ -21163,7 +21207,7 @@ export interface components {
             data: components["schemas"]["InferenceEmbeddingObject"][];
             /** @description Model used for embedding generation */
             model: string;
-            usage: components["schemas"]["InferenceEmbeddingUsage"];
+            usage?: components["schemas"]["InferenceEmbeddingUsage"];
             /** @description Indexed per-input failures. Only populated when request error_policy is per_item. */
             errors?: components["schemas"]["InferenceEmbeddingItemError"][];
             summary?: components["schemas"]["InferenceEmbeddingBatchSummary"];
@@ -21343,7 +21387,7 @@ export interface components {
             data: components["schemas"]["InferenceRerankObject"][];
             /** @description Name of model used for reranking */
             model: string;
-            usage: components["schemas"]["InferenceGenerateUsage"];
+            usage?: components["schemas"]["InferenceGenerateUsage"];
         };
         InferenceRerankObject: {
             /** @enum {string} */
@@ -21470,7 +21514,7 @@ export interface components {
             data: components["schemas"]["InferenceReadObject"][];
             /** @description Name of model used for reading */
             model: string;
-            usage: components["schemas"]["InferenceGenerateUsage"];
+            usage?: components["schemas"]["InferenceGenerateUsage"];
             /** @description Observed execution path. Omitted by older compatible servers. */
             execution?: components["schemas"]["InferenceBatchExecutionReport"];
         };
@@ -21496,6 +21540,8 @@ export interface components {
              * @example en
              */
             language?: string;
+            /** @description Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for transcribe, on for dictate). */
+            timestamps?: boolean;
             /** @description Label each segment with a speaker. Runs a local speaker-embedding model (pull `csukuangfj/speaker-embedding-models:3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx`) and clusters phrases by voice; labels are `SPEAKER_00`, `SPEAKER_01`, ... in order of first appearance. */
             diarization?: boolean;
         };
@@ -21509,7 +21555,7 @@ export interface components {
             data: components["schemas"]["InferenceTranscribeObject"][];
             /** @description Name of model used for transcription */
             model: string;
-            usage: components["schemas"]["InferenceGenerateUsage"];
+            usage?: components["schemas"]["InferenceGenerateUsage"];
         };
         InferenceTranscribeObject: {
             /** @enum {string} */
@@ -21557,6 +21603,8 @@ export interface components {
              * @example en
              */
             language?: string;
+            /** @description Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for transcribe, on for dictate). */
+            timestamps?: boolean;
             /**
              * @description Generator model from models_dir/generators/ that rewrites the transcript. Omit to return the raw transcript.
              * @example ggml-org/gemma-4-E4B-it-GGUF
@@ -21621,7 +21669,7 @@ export interface components {
             transcript: components["schemas"]["InferenceDictationTranscript"];
             /** @description Cleaned text, or the raw transcript when no cleanup ran. */
             text: string;
-            usage: components["schemas"]["InferenceGenerateUsage"];
+            usage?: components["schemas"]["InferenceGenerateUsage"];
         };
         /**
          * @description One Server-Sent Event of a streaming dictation. `dictation.transcript`
@@ -21840,6 +21888,8 @@ export interface components {
             usage: components["schemas"]["DecisionUsage"];
         };
         InferenceModelsResponse: {
+            /** @description Whether public inference execution is enabled on this deployment. Internal database inference is independent. Omitted by standalone inference runtimes without deployment policy. */
+            public_inference_enabled?: boolean;
             /**
              * @description OpenAI-compatible response object type.
              * @enum {string}
@@ -22182,7 +22232,8 @@ export interface components {
             model: string;
             /** @description List of completion choices (currently always 1) */
             choices: components["schemas"]["InferenceGenerateChoice"][];
-            usage: components["schemas"]["InferenceGenerateUsage"];
+            /** @description Provider-reported token usage, or null when the provider does not supply it. */
+            usage?: components["schemas"]["InferenceGenerateUsage"] | null;
             speculation?: components["schemas"]["InferenceGenerateSpeculationStatus"] | null;
         };
         /** @description Effective speculative-decoding decision for this completion. */
@@ -22785,6 +22836,15 @@ export interface components {
             prompt_tokens: number;
             /** @description Total tokens used */
             total_tokens: number;
+        };
+        InferenceSynthesisRequest: {
+            /** @description Canonical synthesizers/name target or qualified connection model. */
+            model: string;
+            text: string;
+            voice?: string;
+            /** @enum {string} */
+            format?: "mp3" | "wav" | "opus" | "aac" | "flac" | "pcm";
+            speed?: number;
         };
         /** @enum {string} */
         PackageKind: "extension";
@@ -35699,6 +35759,101 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["InferenceError"];
                 };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    listGatewayPredictors: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Predictor schemas keyed by callable model ID. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferencePredictorsResponse"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    synthesizeSpeech: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferenceSynthesisRequest"];
+            };
+        };
+        responses: {
+            /** @description Synthesized audio in the requested format; usage is reported only when supplied by the provider. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "audio/mpeg": string;
+                    "audio/wav": string;
+                };
+            };
+            /** @description Invalid or unsupported synthesis options */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Upstream synthesis failure */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
             503: {

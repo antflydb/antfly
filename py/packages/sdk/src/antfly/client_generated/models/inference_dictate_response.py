@@ -27,8 +27,8 @@ class InferenceDictateResponse:
         model (str): Transcriber model used.
         transcript (InferenceDictationTranscript):
         text (str): Cleaned text, or the raw transcript when no cleanup ran.
-        usage (InferenceGenerateUsage):
         cleanup_model (str | Unset): Generator model used for cleanup, when one ran.
+        usage (InferenceGenerateUsage | Unset):
     """
 
     object_: InferenceDictateResponseObject
@@ -37,8 +37,8 @@ class InferenceDictateResponse:
     model: str
     transcript: InferenceDictationTranscript
     text: str
-    usage: InferenceGenerateUsage
     cleanup_model: str | Unset = UNSET
+    usage: InferenceGenerateUsage | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -54,9 +54,11 @@ class InferenceDictateResponse:
 
         text = self.text
 
-        usage = self.usage.to_dict()
-
         cleanup_model = self.cleanup_model
+
+        usage: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.usage, Unset):
+            usage = self.usage.to_dict()
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -68,11 +70,12 @@ class InferenceDictateResponse:
                 "model": model,
                 "transcript": transcript,
                 "text": text,
-                "usage": usage,
             }
         )
         if cleanup_model is not UNSET:
             field_dict["cleanup_model"] = cleanup_model
+        if usage is not UNSET:
+            field_dict["usage"] = usage
 
         return field_dict
 
@@ -94,9 +97,14 @@ class InferenceDictateResponse:
 
         text = d.pop("text")
 
-        usage = InferenceGenerateUsage.from_dict(d.pop("usage"))
-
         cleanup_model = d.pop("cleanup_model", UNSET)
+
+        _usage = d.pop("usage", UNSET)
+        usage: InferenceGenerateUsage | Unset
+        if isinstance(_usage, Unset):
+            usage = UNSET
+        else:
+            usage = InferenceGenerateUsage.from_dict(_usage)
 
         inference_dictate_response = cls(
             object_=object_,
@@ -105,8 +113,8 @@ class InferenceDictateResponse:
             model=model,
             transcript=transcript,
             text=text,
-            usage=usage,
             cleanup_model=cleanup_model,
+            usage=usage,
         )
 
         inference_dictate_response.additional_properties = d

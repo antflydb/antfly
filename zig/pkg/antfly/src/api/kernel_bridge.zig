@@ -415,10 +415,7 @@ const OpaqueHttpxHandler = struct {
         for (entries) |entry| {
             const path = entry.path.slice();
             const is_probe = std.mem.eql(u8, path, "/healthz") or std.mem.eql(u8, path, "/readyz");
-            const is_generated = std.mem.eql(u8, path, "/db/v1") or
-                std.mem.startsWith(u8, path, "/db/v1/") or
-                std.mem.eql(u8, path, "/auth/v1") or
-                std.mem.startsWith(u8, path, "/auth/v1/");
+            const is_generated = isGeneratedPublicPath(path);
             switch (selection) {
                 .all => {},
                 .all_without_probes => if (is_probe) continue,
@@ -441,6 +438,10 @@ const OpaqueHttpxHandler = struct {
                 .delete => .DELETE,
                 .patch => .PATCH,
             };
+            if (entry.request_body == .streaming_raw) {
+                try server.routeStreamingRawWithData(method, path, runtimeApiHttpHandler, route);
+                continue;
+            }
             if (method == .POST) {
                 if (@import("http_routes.zig").publicPostBodyLimit(path)) |limit| {
                     try server.routeWithDataAndBodyLimit(method, path, runtimeApiHttpHandler, route, limit);
@@ -515,7 +516,7 @@ fn runtimeApiHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
     };
     var transport = runtime_http_bridge.Outbound{ .context = context };
     const borrowed_io = context.io;
-    const body_source = if (route.request_body == .buffered) transport.bodySource() else abi.RequestBodySource{};
+    const body_source = if (route.request_body != .none) transport.bodySource() else abi.RequestBodySource{};
     try callError(route.functions.handler_handle_http(&.{
         .abi_version = abi.abi_version,
         .route_handle = route.kernel_route_handle,
@@ -791,4 +792,17 @@ test "linked transport admits a streaming body before the kernel pulls it" {
     try std.testing.expect(FakeKernel.saw_streaming_source);
     try std.testing.expect(FakeKernel.saw_body);
     try std.testing.expectEqual(@as(usize, 1), body_state.calls);
+}
+
+fn isGeneratedPublicPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "/db/v1") or std.mem.startsWith(u8, path, "/db/v1/") or
+        std.mem.eql(u8, path, "/auth/v1") or std.mem.startsWith(u8, path, "/auth/v1/") or
+        @import("inference_gateway.zig").ownsPath(path);
+}
+
+test "api kernel includes inference gateway in generated public route selection" {
+    for (@import("inference_gateway.zig").public_paths) |path| try std.testing.expect(isGeneratedPublicPath(path));
+    try std.testing.expect(isGeneratedPublicPath("/db/v1/query"));
+    try std.testing.expect(!isGeneratedPublicPath("/ai/v1/models/load"));
+    try std.testing.expect(!isGeneratedPublicPath("/internal/groups/1"));
 }

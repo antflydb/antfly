@@ -28,6 +28,7 @@ pub const Request = struct {
     version: types.Version = .HTTP_1_1,
     headers: Headers,
     body: ?[]const u8 = null,
+    body_stream: ?BodyStream = null,
     /// Replayable, borrowed body segments. The outer slice and every segment
     /// must remain alive until synchronous execution (including redirects and
     /// retries) returns. Keeping large media as segments avoids materializing
@@ -69,6 +70,21 @@ pub const Request = struct {
         if (self.delivery_observer) |observer| observer.before_send(observer.context);
     }
 
+    pub const BodyStream = struct {
+        context: *anyopaque,
+        read: *const fn (*anyopaque, []u8) anyerror!usize,
+    };
+
+    pub fn setBodyStream(self: *Self, source: BodyStream) !void {
+        self.freeOwnedBody();
+        self.body_stream = source;
+        self.headers.removeAll("Content-Length");
+        try self.headers.set("Transfer-Encoding", "chunked");
+        // A single-use duplex exchange is never returned to a connection pool.
+        try self.headers.set("Connection", "close");
+        self.max_retries = 0;
+    }
+
     const Self = @This();
 
     /// Creates a new request with the given method and URL.
@@ -99,8 +115,8 @@ pub const Request = struct {
 
     /// Releases all allocated memory.
     pub fn deinit(self: *Self) void {
-        self.headers.deinit();
         self.freeOwnedBody();
+        self.headers.deinit();
         if (self.body_budget) |budget| budget.release(self.body_budget_reserved);
         self.body_budget_reserved = 0;
         if (self.query_builder) |*builder| {
@@ -130,6 +146,7 @@ pub const Request = struct {
     }
 
     fn freeOwnedBody(self: *Self) void {
+        if (self.body_stream != null) self.headers.removeAll("Transfer-Encoding");
         if (self.body_owned) {
             if (self.body_allocation) |allocation| {
                 self.allocator.free(allocation);
@@ -139,6 +156,7 @@ pub const Request = struct {
         }
         self.body = null;
         self.body_segments = null;
+        self.body_stream = null;
         self.body_segments_len = 0;
         self.body_owned = false;
         self.body_allocation = null;
@@ -201,7 +219,7 @@ pub const Request = struct {
     }
 
     pub fn hasBody(self: *const Self) bool {
-        return self.bodyLen() > 0;
+        return self.bodyLen() > 0 or self.body_stream != null;
     }
 
     /// Sets the request body as JSON with appropriate headers.
@@ -295,6 +313,7 @@ pub const Request = struct {
 
     /// Writes the body without joining borrowed segments.
     pub fn writeBody(self: *const Self, writer: anytype) !void {
+        if (self.body_stream != null) return error.StreamingRequestRequiresWriter;
         if (self.body) |body| {
             try writer.writeAll(body);
         } else if (self.body_segments) |segments| {

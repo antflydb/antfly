@@ -6084,3 +6084,307 @@ func (r *errReadCloser) Read(p []byte) (int, error) {
 func (r *errReadCloser) Close() error {
 	return r.closeErr
 }
+
+func TestDecisionCanonicalAndLegacyPathsUseSameScopedOperation(t *testing.T) {
+	t.Parallel()
+	for _, path := range []string{"/ai/v1/decisions", "/ai/v1/decide"} {
+		t.Run(path, func(t *testing.T) {
+			p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "default"}, Logger: zap.NewNop()})
+			p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.Path != "/ai/v1/decisions" {
+					t.Fatalf("upstream path = %q", req.URL.Path)
+				}
+				if req.Header.Get("Authorization") != "Bearer tenant-key" {
+					t.Fatal("credential scope lost")
+				}
+				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"answers":[]}`)), Request: req}, nil
+			})}
+			p.RegisterEndpoint("http://inference.internal", "default", WorkloadTypeGeneral)
+			advertiseModelOperation(p.registry, "http://inference.internal", "decide", "triage")
+			req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"triage","input":"hello","questions":[]}`))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer tenant-key")
+			recorder := httptest.NewRecorder()
+			p.handleDecide(recorder, req)
+			if recorder.Code != 200 {
+				t.Fatalf("status %d: %s", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestChainCatalogSupportsScopedLeasesAndExecution(t *testing.T) {
+	const catalog = `{"data":[{"id":"chains/fallback"}],"chains":{"chains/fallback":{"task":"generate","executor":"chain"}},"generators":{"unrelated":{}},"readers":{"unrelated-reader":{}}}`
+	operations, err := extractModelOperations(strings.NewReader(catalog))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, operation := range []OperationType{"generate", "generate.batch", "chat.completions"} {
+		if !operations["chains/fallback"][operation] {
+			t.Fatalf("chain missing operation %s: %#v", operation, operations)
+		}
+	}
+	snapshot, _, err := parseCanonicalModelCatalog([]byte(catalog))
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope, err := catalogTaskScopeForOperation("generate", "chat.completions")
+	if err != nil || !canonicalCatalogContainsTaskModel(snapshot, scope, "chains/fallback") {
+		t.Fatalf("chain missing from canonical scoped catalog: %v", err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(catalog), &raw); err != nil {
+		t.Fatal(err)
+	}
+	if !catalogContainsTaskModel(raw, scope, "chains/fallback") || catalogContainsTaskModel(raw, catalogTaskScopes["read"], "chains/fallback") {
+		t.Fatal("chain task qualification changed")
+	}
+	merged := make(map[string]map[string]json.RawMessage)
+	mergeScopedModelCatalog(merged, raw, scope, "chains/fallback", make(map[string]bool))
+	if len(merged) != 1 || len(merged["chains"]) != 1 {
+		t.Fatalf("scoped catalog contains unrelated targets: %#v", merged)
+	}
+
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, Logger: zap.NewNop()})
+	var invocations atomic.Int32
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body := catalog
+		if req.Method == http.MethodPost {
+			invocations.Add(1)
+			if req.URL.Path != "/ai/v1/chat/completions" {
+				t.Errorf("unexpected execution path: %s", req.URL.Path)
+			}
+			body = `{"choices":[{"message":{"content":"ok"}}]}`
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+	})}
+	p.RegisterEndpoint("http://runtime.internal", "primary", WorkloadTypeGeneral)
+	p.registry.UpdateModelOperations("http://runtime.internal", operations)
+	listed := httptest.NewRecorder()
+	p.handleModels(listed, httptest.NewRequest(http.MethodGet, "/ai/v1/models?task=generate&operation=chat.completions&model=chains%2Ffallback", nil))
+	if listed.Code != http.StatusOK || !strings.Contains(listed.Body.String(), `"chains/fallback"`) || strings.Contains(listed.Body.String(), `"unrelated"`) {
+		t.Fatalf("scoped discovery: %d %s", listed.Code, listed.Body.String())
+	}
+	if listed.Header().Get(capabilityTokenHeader) == "" {
+		t.Fatal("scoped chain discovery did not issue a lease")
+	}
+	request := httptest.NewRequest(http.MethodPost, "/ai/v1/chat/completions", strings.NewReader(`{"model":"chains/fallback","messages":[{"role":"user","content":"hello"}]}`))
+	for _, header := range []string{capabilityTokenHeader, capabilityRevisionHeader} {
+		request.Header.Set(header, listed.Header().Get(header))
+	}
+	response := httptest.NewRecorder()
+	p.handleChatCompletions(response, request)
+	if response.Code != http.StatusOK || invocations.Load() != 1 {
+		t.Fatalf("leased chain execution: %d %s (%d invocations)", response.Code, response.Body.String(), invocations.Load())
+	}
+}
+
+func TestGatewayRequestSelectors(t *testing.T) {
+	for _, test := range []struct{ operation, body, model string }{
+		{"chunk", `{"model":"chunkers/paragraphs","input":"hello"}`, "chunkers/paragraphs"},
+		{"chunk", `{"model":"chunkers/paragraphs","config":{"model":"fixed"}}`, "chunkers/paragraphs"},
+		{"chunk", `{"model":"fixed-bert-tokenizer"}`, "fixed"},
+		{"decide", `{"decision_method":"generated","generator":{"provider":"antfly","model":"generators/native"}}`, "generators/native"},
+		{"extract", `{"method":"generated","generator":{"provider":"antfly","model":"native"}}`, "native"},
+		{"decide", `{"model":"deciders/typed","decision_method":"typed"}`, "deciders/typed"},
+	} {
+		t.Run(test.operation+test.body, func(t *testing.T) {
+			got, err := proxyRequestModel([]byte(test.body), test.operation)
+			if err != nil || got != test.model {
+				t.Fatalf("model=%q, err=%v; want %q", got, err, test.model)
+			}
+		})
+	}
+	for _, test := range []struct{ operation, body string }{
+		{"chunk", `{"model":"","config":{"model":"fixed"}}`},
+		{"chunk", `{"model":null,"config":{"model":"fixed"}}`},
+		{"extract", `{"model":null,"method":"generated","generator":{"model":"native"}}`},
+		{"decide", `{"model":"other","decision_method":"generated","generator":{"model":"native"}}`},
+		{"extract", `{"model":"other","method":"generated","generator":{"model":"native"}}`},
+	} {
+		if _, err := proxyRequestModel([]byte(test.body), test.operation); err == nil {
+			t.Fatalf("accepted conflicting/empty selection: %s", test.body)
+		}
+	}
+}
+
+func TestGatewaySelectorsRouteBySelectedModelAndPreserveEnvelope(t *testing.T) {
+	for _, test := range []struct{ operation, selectionOperation, model, path, body string }{
+		{"chunk", "chunk", "chunkers/paragraphs", "/ai/v1/chunk", `{"model":"chunkers/paragraphs","config":{"model":"fixed"},"input":"hello"}`},
+		{"decide", "generate", "generators/native", "/ai/v1/decisions", `{"decision_method":"generated","generator":{"provider":"antfly","model":"generators/native"},"input":"source","questions":[{"name":"present","type":"predicate","instructions":"Present?"}]}`},
+		{"extract", "generate", "generators/native", "/ai/v1/extract", `{"method":"generated","generator":{"provider":"antfly","model":"generators/native"},"inputs":[{"content":"source"}],"schema":{"entities":["person"]}}`},
+	} {
+		t.Run(test.operation, func(t *testing.T) {
+			p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "default"}, Logger: zap.NewNop()})
+			p.RegisterEndpoint("http://selected", "default", WorkloadTypeGeneral)
+			advertiseModelOperation(p.registry, "http://selected", OperationType(test.selectionOperation), test.model)
+			p.RegisterEndpoint("http://fixed-only", "default", WorkloadTypeGeneral)
+			advertiseModelOperation(p.registry, "http://fixed-only", "chunk", "fixed")
+			calls := 0
+			p.registry.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				calls++
+				if r.URL.Host != "selected" || r.URL.Path != test.path {
+					t.Fatalf("wrong destination: %s", r.URL)
+				}
+				body, err := io.ReadAll(r.Body)
+				if err != nil || string(body) != test.body {
+					t.Fatalf("changed envelope: %s (%v)", body, err)
+				}
+				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{}`)), Request: r}, nil
+			})}
+			r := httptest.NewRequest("POST", test.path, strings.NewReader(test.body))
+			r.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			p.proxyRequest(w, r, test.operation)
+			if w.Code != 200 || calls != 1 {
+				t.Fatalf("status=%d calls=%d body=%s", w.Code, calls, w.Body)
+			}
+		})
+	}
+}
+
+func TestGeneratedTasksRespectLogicalRejectRoute(t *testing.T) {
+	for _, operation := range []string{"decide", "extract"} {
+		t.Run(operation, func(t *testing.T) {
+			p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "default"}, Logger: zap.NewNop()})
+			p.RegisterEndpoint("http://default-runtime", "default", WorkloadTypeGeneral)
+			advertiseModelOperation(p.registry, "http://default-runtime", "generate", "native")
+			_, err := p.Router().RouteManager().UpsertRoute(&Route{Name: "reject-tasks", Operations: map[OperationType]bool{"decide": true, "extract": true}, Fallback: &Fallback{Action: "reject", StatusCode: 403}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			p.registry.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				calls++
+				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{}`)), Request: r}, nil
+			})}
+			field := "decision_method"
+			path := "/ai/v1/decisions"
+			if operation == "extract" {
+				field = "method"
+				path = "/ai/v1/extract"
+			}
+			send := func(body string) *httptest.ResponseRecorder {
+				r := httptest.NewRequest("POST", path, strings.NewReader(body))
+				r.Header.Set("Content-Type", "application/json")
+				w := httptest.NewRecorder()
+				p.proxyRequest(w, r, operation)
+				return w
+			}
+			control := send(`{"model":"native"}`)
+			if control.Code != 403 {
+				t.Fatalf("control status=%d body=%s", control.Code, control.Body)
+			}
+			generated := send(`{"` + field + `":"generated","generator":{"provider":"antfly","model":"native"}}`)
+			if generated.Code != 403 || calls != 0 {
+				t.Fatalf("task reject bypassed: generated status=%d upstream calls=%d body=%s", generated.Code, calls, generated.Body)
+			}
+			catalog := httptest.NewRecorder()
+			p.handleModels(catalog, httptest.NewRequest("GET", "/ai/v1/models?model=native&task=generate&operation="+operation, nil))
+			if catalog.Code == 200 || catalog.Header().Get(capabilityTokenHeader) != "" || calls != 0 {
+				t.Fatalf("task reject bypassed by discovery: status=%d calls=%d body=%s", catalog.Code, calls, catalog.Body)
+			}
+		})
+	}
+}
+
+func TestGeneratedTasksKeepRouteAdmissionAndGeneratorPlacementAcrossRetries(t *testing.T) {
+	for _, operation := range []string{"decide", "extract"} {
+		t.Run(operation, func(t *testing.T) {
+			p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "default"}, Logger: zap.NewNop()})
+			for _, address := range []string{"http://selected-a", "http://selected-b"} {
+				p.RegisterEndpoint(address, "task-pool", WorkloadTypeGeneral)
+				advertiseModelOperation(p.registry, address, "generate", "native")
+			}
+			p.RegisterEndpoint("http://default-runtime", "default", WorkloadTypeGeneral)
+			advertiseModelOperation(p.registry, "http://default-runtime", "generate", "native")
+			_, err := p.Router().RouteManager().UpsertRoute(&Route{Name: "task-policy", Operations: map[OperationType]bool{OperationType(operation): true}, Destinations: []Destination{{Pool: "task-pool", Weight: 100}}, RateLimiter: NewRateLimiter(1, 1, false), RetryAttempts: 2, RetryOnStatuses: map[int]bool{503: true}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			p.registry.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if !strings.HasPrefix(r.URL.Host, "selected-") {
+					t.Fatalf("logical route bypassed: %s", r.URL)
+				}
+				if r.Method == http.MethodGet {
+					return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"generators":{"native":{}}}`)), Request: r}, nil
+				}
+				calls++
+				status := 200
+				if calls == 1 {
+					status = 503
+				}
+				return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{}`)), Request: r}, nil
+			})}
+			catalog := httptest.NewRecorder()
+			p.handleModels(catalog, httptest.NewRequest("GET", "/ai/v1/models?model=native&task=generate&operation="+operation, nil))
+			token, revision := catalog.Header().Get(capabilityTokenHeader), catalog.Header().Get(capabilityRevisionHeader)
+			if catalog.Code != 200 || token == "" || revision == "" {
+				t.Fatalf("discovery status=%d body=%s", catalog.Code, catalog.Body)
+			}
+			field, path := "decision_method", "/ai/v1/decisions"
+			if operation == "extract" {
+				field, path = "method", "/ai/v1/extract"
+			}
+			send := func() *httptest.ResponseRecorder {
+				r := httptest.NewRequest("POST", path, strings.NewReader(`{"`+field+`":"generated","generator":{"provider":"antfly","model":"native"}}`))
+				r.Header.Set("Content-Type", "application/json")
+				r.Header.Set(capabilityTokenHeader, token)
+				r.Header.Set(capabilityRevisionHeader, revision)
+				w := httptest.NewRecorder()
+				p.proxyRequest(w, r, operation)
+				return w
+			}
+			first := send()
+			if first.Code != 200 || calls != 2 {
+				t.Fatalf("retry failed: status=%d calls=%d body=%s", first.Code, calls, first.Body)
+			}
+			second := send()
+			if second.Code != 429 || calls != 2 {
+				t.Fatalf("logical rate limit bypassed: status=%d calls=%d body=%s", second.Code, calls, second.Body)
+			}
+		})
+	}
+}
+
+func TestGeneratedTaskLeaseScopeIsolation(t *testing.T) {
+	for _, operation := range []OperationType{"decide", "extract"} {
+		t.Run(string(operation), func(t *testing.T) {
+			p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, Logger: zap.NewNop()})
+			p.RegisterEndpoint("http://runtime", "primary", WorkloadTypeGeneral)
+			endpoints := map[string]leasedEndpoint{"http://runtime": {incarnation: p.registry.endpoints["http://runtime"].incarnation, operations: map[OperationType]bool{operation: true}}}
+			token, err := p.issueCapabilityLease("native", "generate", operation, p.Router().RouteManager().Generation(), "revision", "", endpoints)
+			if err != nil {
+				t.Fatal(err)
+			}
+			allowed, err := p.capabilityLeaseEndpointsForPlacement(token, "revision", "native", operation, "generate", sha256.Sum256(nil))
+			if err != nil || len(allowed) != 1 {
+				t.Fatalf("generated lease: allowed=%v err=%v", allowed, err)
+			}
+			for _, scope := range [][2]OperationType{{operation, operation}, {"generate", "generate"}, {"decide", "extract"}, {"extract", "generate"}, {"decide", "generate"}} {
+				if scope[0] == operation && scope[1] == "generate" {
+					continue
+				}
+				if _, err := p.capabilityLeaseEndpointsForPlacement(token, "revision", "native", scope[0], scope[1], sha256.Sum256(nil)); err == nil {
+					t.Fatalf("generated lease authorized %v", scope)
+				}
+			}
+			typedToken, err := p.issueCapabilityLease("native", string(operation), operation, p.Router().RouteManager().Generation(), "revision", "", endpoints)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if typedToken == token {
+				t.Fatal("typed and generated snapshots shared identity")
+			}
+			if _, err := p.capabilityLeaseEndpointsForPlacement(typedToken, "revision", "native", operation, "generate", sha256.Sum256(nil)); err == nil {
+				t.Fatal("typed lease authorized generated work")
+			}
+			for _, bad := range []string{"embed", "read", "predict", "generate.batch"} {
+				if _, err := catalogTaskScopeForOperation(bad, string(operation)); err == nil {
+					t.Fatalf("accepted inventory %s for generated task", bad)
+				}
+			}
+		})
+	}
+}

@@ -181,6 +181,7 @@ pub const Adapter = struct {
                     .secret_store = self.server.cfg.secret_store,
                     .antfly_provider = self.server.antfly_provider,
                     .antfly_url = config.inference.api_url,
+                    .antfly_api_key = config.inference.api_key,
                 };
             }
         }
