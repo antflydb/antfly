@@ -145624,3 +145624,101 @@ test "db prepared transaction effects required native authored writes retain gro
     defer read.abort();
     try std.testing.expect((try acceptance.readCurrent(&read, db.root_incarnation, "member", artifact)) != null);
 }
+
+test "db prepared transaction effects required baseline materializer observes physical document and relational preimages" {
+    const a = std.testing.allocator;
+    const reads = @import("prepared_read_set.zig");
+    const mutations = @import("group_source_mutations.zig");
+    for ([_]bool{ false, true }) |relational| {
+        var directory = try TestDirectory.init("observed-baseline-row");
+        defer directory.cleanup();
+        var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .start_independent_maintenance = false });
+        defer db.close();
+        const columns = [_]schema_mod.RelationalColumn{.{ .name = "body", .path = "body", .column_type = .string }};
+        if (relational) try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+        try db.batch(.{ .writes = &.{.{ .key = "member", .value = "{\"body\":\"before\"}" }} });
+        var captured = reads.Owned.init(a, null);
+        defer captured.deinit();
+        {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const reader = reads.observe(db.core.store, &captured);
+            const row = (try mutations.currentRowWithReader(db.core, reader, arena.allocator(), "member")).?;
+            try std.testing.expectEqualStrings("before", row.object.get("body").?.string);
+            try std.testing.expect((try mutations.currentRowWithReader(db.core, reader, arena.allocator(), "missing")) == null);
+            const key = if (relational) try @import("relational_store.zig").keyAlloc(arena.allocator(), "member") else try internal_keys.documentKeyAlloc(arena.allocator(), "member");
+            // A baseline callback must see the physical preimage even when the
+            // surrounding overlay has already staged a different postimage.
+            var overlay: mutations.Overlay = .{ .allocator = arena.allocator(), .reader = mutations.Reader.fromStore(db.core.store), .captured_reads = &captured };
+            try overlay.put(key, "staged postimage");
+            try std.testing.expectEqualStrings("staged postimage", try overlay.get(key));
+            const again = (try mutations.currentRowWithReader(db.core, reader, arena.allocator(), "member")).?;
+            try std.testing.expectEqualStrings("before", again.object.get("body").?.string);
+            try captured.finish();
+        }
+        var owned = try captured.take();
+        defer owned.deinit();
+        try std.testing.expectEqual(@as(usize, 2), owned.points.items.len);
+        try owned.validate(db.core.store, null);
+        try db.batch(.{ .writes = &.{.{ .key = "unrelated", .value = "{\"body\":\"other\"}" }} });
+        try owned.validate(db.core.store, null);
+        try db.batch(.{ .writes = &.{.{ .key = "missing", .value = "{\"body\":\"arrived\"}" }} });
+        try std.testing.expectError(error.PreparedReadSetChanged, owned.validate(db.core.store, null));
+        try db.batch(.{ .deletes = &.{"missing"} });
+        try owned.validate(db.core.store, null);
+        try db.batch(.{ .writes = &.{.{ .key = "member", .value = "{\"body\":\"after\"}" }} });
+        try std.testing.expectError(error.PreparedReadSetChanged, owned.validate(db.core.store, null));
+    }
+}
+
+test "db prepared transaction effects required resolver review retains accepted rejected and receipt observations" {
+    const a = std.testing.allocator;
+    const reads = @import("prepared_read_set.zig");
+    const review = @import("resolver_review.zig");
+    var directory = try TestDirectory.init("observed-resolver-review");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .start_optional_runtimes = false, .start_index_workers = false, .start_independent_maintenance = false });
+    defer db.close();
+    try db.addResolver(.{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "concept/{{uslug _entity.text}}", .promote = false, .config_generation = 1 });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const artifact = try internal_keys.resolutionArtifactKeyAlloc(scratch, "source", "resolved");
+    const raw = "{\"config_generation\":1,\"entities\":[{\"local_id\":\"a\",\"doc_ref\":{\"table\":\"entities\",\"key\":\"concept/alpha\"},\"confidence\":0.7,\"decision\":\"review\",\"label\":\"concept\",\"surface_form\":\"Alpha\"}]}";
+    try db.core.store.put(artifact, raw);
+    var namespace: [24]u8 = undefined;
+    doc_identity.encodeNamespace(&namespace, db.core.identity_namespace);
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(raw, &hash, .{});
+    const expected = std.fmt.bytesToHex(hash, .lower);
+    for (0..3) |mode| {
+        var command: review.Command = .{ .namespace = namespace, .resolver = "concepts", .document = "source", .source_artifact = "kg", .resolution_artifact = "resolved", .local_id = "a", .expected_hash = &expected, .config_generation = 1, .curation_revision = 0, .decision = .suppressed, .table = "entities", .key = "" };
+        if (mode == 1) command.expected_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        const receipt_key = try command.receiptKey(scratch);
+        if (mode == 2) try db.core.store.put(receipt_key, try std.json.Stringify.valueAlloc(scratch, review.Receipt{ .digest = try command.digest(scratch), .accepted = true, .sequence = 17 }, .{}));
+        var captured = reads.Owned.init(a, null);
+        defer captured.deinit();
+        {
+            var temporary = std.heap.ArenaAllocator.init(a);
+            defer temporary.deinit();
+            const plan = try review.planWithReader(temporary.allocator(), db.core, reads.observe(db.core.store, &captured), command, true);
+            try std.testing.expectEqual(mode != 1, plan.accepted);
+            try std.testing.expectEqual(mode == 2, plan.previous != null);
+            if (mode == 0) try std.testing.expectEqualStrings(try internal_keys.artifactNamedPrefixAlloc(scratch, "source", "asset", "kg"), plan.source_key.?);
+            try captured.finish();
+        }
+        var owned = try captured.take();
+        defer owned.deinit();
+        try std.testing.expectEqual(@as(usize, if (mode == 2) 1 else 4), owned.points.items.len);
+        try owned.validate(db.core.store, null);
+        // Every point actually used by the selected branch is authoritative,
+        // including absence proofs; validation survives all plan allocations.
+        for (owned.points.items) |point| {
+            const previous = db.core.store.get(scratch, point.key) catch |err| if (err == error.NotFound) null else return err;
+            try db.core.store.put(point.key, "changed");
+            try std.testing.expectError(error.PreparedReadSetChanged, owned.validate(db.core.store, null));
+            if (previous) |bytes| try db.core.store.put(point.key, bytes) else try db.core.store.delete(point.key);
+            try owned.validate(db.core.store, null);
+        }
+    }
+}

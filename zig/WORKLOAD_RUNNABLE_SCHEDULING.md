@@ -6147,3 +6147,47 @@ Writer coverage, complete preparation/commit separation, owned live execution
 and DB lifetimes, recovery resources/derived-log quota, migration/peer eligibility,
 normal required PREPARE negotiation and broader scheduler/default/session scope
 remain incomplete. Strong provider defaults remain off; the full goal is active.
+
+
+### Preparation point observations beyond the group overlay (2026-10-20)
+
+After merging origin/main at `dd49f55102`, preparation now shares a read-only
+`prepared_read_set.observe` point adapter. It preserves caller-owned get buffers,
+records absence and value fingerprints, frees a returned buffer if observation
+fails, and uses the existing poisoned capture/original-control handling. Group
+overlay baseline gets use the same adapter; staged overlay values remain local
+postimages rather than source observations.
+
+Resolver review's policy, receipt, override and resolution reads now use the
+observed reader. Resolver configuration selection still runs under apply and is
+protected separately by the retained catalog revision/schema namespace; this
+change does not make live catalog access safe outside that fence. Group baseline
+materializer callbacks use the physical reader for both document and relational
+rows, including historical row decoding through the existing schema view path.
+The callback context is stack-bound to the synchronous baseline page call.
+
+Capture begins before graph lifecycle assembly once native-authored vector
+eligibility is known. Lifecycle generation, retired-direct-graph TTL preimages,
+and subsequent direct contender, cleanup-job, chunk-manifest and integrity
+catalog point reads join the same owner. Ordinary paths retain get passthrough.
+The capture still uses the preparation allocator and retires with the physical
+plan. No ABI, wire, reader-version, or durable-format change is introduced.
+
+Verified `observed-preparation-points-v1`: 79/79 build steps; 95 test executions
+(prepared effects53, required preparation DB35, local grouped production7), with
+no skips, failures or leaks. Existing exhaustive allocation/control rejection
+coverage now exercises the shared adapter through the overlay. New DB tests
+cover plain/relational baseline reads, missing rows, staged-vs-physical preimages,
+unrelated writes, changed values and post-plan allocation retirement. Resolver
+tests cover accepted decisions, rejected hash CAS and existing-receipt replay;
+every observed point, including absences, detects a change after plan retirement.
+Pinned Darwin Zig and worktree caches were used; full qualification remains
+waived. Native inputs and log hashes are retained in the phase receipt.
+
+This is still local optimistic observation validation. Earlier direct/probe
+reads, imported/mixed graph contender scans and other backend helpers remain
+outside the read surface. Their point/range observations, durable writer-honored
+conflict authority, full predecision assembly/lifetime ownership and recovery
+resources/derived-log quota remain required, along with migration/peer eligibility,
+normal required PREPARE drivers and the broader scheduler/default/session scope.
+Strong defaults remain off; the full objective is incomplete.

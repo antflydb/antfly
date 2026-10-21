@@ -141,6 +141,9 @@ pub const Reader = struct {
     ptr: *anyopaque,
     get_fn: *const fn (*anyopaque, A, []const u8) anyerror![]const u8,
     cursor_fn: *const fn (*anyopaque, A) anyerror!OwnedCursor,
+    pub fn get(self: Reader, a: A, key: []const u8) ![]const u8 {
+        return self.get_fn(self.ptr, a, key);
+    }
     pub fn fromStore(store: anytype) Reader {
         const T = @TypeOf(store);
         const Bridge = struct {
@@ -183,14 +186,7 @@ pub const Overlay = struct {
     }
     pub fn get(self: *Overlay, key: []const u8) ![]const u8 {
         if (self.effects.getEntry(key)) |entry| return entry.value_ptr.* orelse error.NotFound;
-        if (self.captured_reads) |captured| try captured.check();
-        const value = self.reader.get_fn(self.reader.ptr, self.allocator, key) catch |err| {
-            if (err == error.NotFound) if (self.captured_reads) |captured| try captured.recordPoint(key, null);
-            return err;
-        };
-        errdefer self.allocator.free(value);
-        if (self.captured_reads) |captured| try captured.recordPoint(key, value);
-        return value;
+        return read_set.observe(self.reader, self.captured_reads).get(self.allocator, key);
     }
     pub fn put(self: *Overlay, key: []const u8, value: []const u8) !void {
         try self.effects.put(self.allocator, try self.allocator.dupe(u8, key), try self.allocator.dupe(u8, value));
@@ -254,12 +250,17 @@ pub fn stagePrepared(overlay: *Overlay, plan: *const Plan, table: u128, document
 }
 
 pub fn currentRow(core: anytype, a: A, document: []const u8) !?V {
+    return currentRowWithReader(core, core.store, a, document);
+}
+/// Read the physical preimage, not staged overlay effects. Schema views remain
+/// bound to the core's schema namespace retained by preparation dependencies.
+pub fn currentRowWithReader(core: anytype, reader: anytype, a: A, document: []const u8) !?V {
     var view = core.acquireSchemaView();
     defer if (view) |*value| value.release();
     const relational = if (view) |value| value.storageMode() == .relational else false;
     const rows = @import("relational_store.zig");
     const selected = if (relational) try rows.keyAlloc(a, document) else try @import("../internal_keys.zig").documentKeyAlloc(a, document);
-    const raw = core.store.get(a, selected) catch |err| return if (err == error.NotFound) null else err;
+    const raw = reader.get(a, selected) catch |err| return if (err == error.NotFound) null else err;
     const bytes = if (relational) blk: {
         const version = try rows.rowSchemaVersion(raw);
         var historical = (try core.acquireSchemaVersionView(version)) orelse return error.UnknownSchemaVersion;

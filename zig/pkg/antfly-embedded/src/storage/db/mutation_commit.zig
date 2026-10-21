@@ -1930,10 +1930,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try appendGraphEdgeArtifactWrite(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, &explicit_graph_artifact_writes, graph_write, generation, graph_entry.ttl_duration_ns, batch_timestamp_ns);
             }
 
+            const capture_preparation_points = (if (opts.transaction_resolution) |resolution| resolution.accepted_effects != null else false) or
+                (S.ownerField(self, "root_incarnation").* != 0 and explicit_embedding_artifact_writes.items.len != 0);
+            metadata_reads.control = publication_control;
+            const observed_store = @import("prepared_read_set.zig").observe(S.ownerField(self, "core").*.store, if (capture_preparation_points) metadata_reads else null);
             const cleanup_contract = @import("../graph_cleanup_contract.zig");
             var graph_lifecycle_generation: u64 = if (effective_req.graph_endpoint_cleanup or effective_req.graph_deletes.len != 0 or effective_req.deletes.len != 0 or
                 (std.mem.indexOfScalar(bool, derived_changed_flags, true) != null))
-                try appendGraphLifecycleGeneration(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, if (opts.ordered_apply_receipt) |entry| entry.index else 0, &store_writes, &owned_store_values)
+                try appendGraphLifecycleGeneration(S.ownerField(self, "alloc").*, observed_store, if (opts.ordered_apply_receipt) |entry| entry.index else 0, &store_writes, &owned_store_values)
             else
                 0;
 
@@ -1976,7 +1980,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         defer S.ownerField(self, "alloc").*.free(state);
                         const contender = try internal_keys.graphGlobalEdgeContenderKeyAlloc(S.ownerField(self, "alloc").*, clear.index_name, graph_entry.config.coverage_generation, entry.key, @intCast(graph_mod.direct_source_priority), state);
                         defer S.ownerField(self, "alloc").*.free(contender);
-                        const direct = S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, contender) catch |err| switch (err) {
+                        const direct = observed_store.get(S.ownerField(self, "alloc").*, contender) catch |err| switch (err) {
                             error.NotFound => null,
                             else => return err,
                         };
@@ -2197,7 +2201,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const job_key = try cleanup_contract.ownerJobKeyAlloc(S.ownerField(self, "alloc").*, write.key);
                 var key_owned = true;
                 defer if (key_owned) S.ownerField(self, "alloc").*.free(job_key);
-                const pending = S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, job_key) catch |err| switch (err) {
+                const pending = observed_store.get(S.ownerField(self, "alloc").*, job_key) catch |err| switch (err) {
                     error.NotFound => null,
                     else => return err,
                 };
@@ -2243,7 +2247,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // every retirement receives this commit's nonzero lifecycle stamp.
             if (graph_lifecycle_generation == 0) for (deleted_artifact_keys) |artifact| {
                 if (internal_keys.graphInlineTargetComponent(artifact) == null) continue;
-                graph_lifecycle_generation = try appendGraphLifecycleGeneration(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, if (opts.ordered_apply_receipt) |entry| entry.index else 0, &store_writes, &owned_store_values);
+                graph_lifecycle_generation = try appendGraphLifecycleGeneration(S.ownerField(self, "alloc").*, observed_store, if (opts.ordered_apply_receipt) |entry| entry.index else 0, &store_writes, &owned_store_values);
                 break;
             };
             try appendGraphEndpointRetirements(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, graph_lifecycle_generation, effective_req.deletes, S.ownerField(self, "core").*.index_manager.hasGraphIndexes(), deleted_artifact_keys, &store_writes, &owned_store_keys, &owned_store_values);
@@ -2374,7 +2378,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             );
             try appendRetiredDirectGraphTtlDueDeletes(
                 S.ownerField(self, "alloc").*,
-                S.ownerField(self, "core").*.store,
+                observed_store,
                 S.ownerField(self, "core").*.index_manager,
                 store_writes.items,
                 delete_keys.items,
@@ -2400,11 +2404,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // instead of reserving a sequence that would either be lost (and make
             // the in-memory generation move backwards after restart) or require a
             // synthetic replay item that every managed consumer must drain.
-            const capture_group_reads = (if (opts.transaction_resolution) |resolution| resolution.accepted_effects != null else false) or
-                (S.ownerField(self, "root_incarnation").* != 0 and explicit_embedding_artifact_writes.items.len != 0);
-            metadata_reads.control = publication_control;
-            var group_overlay = group_mutations.Overlay{ .captured_reads = if (capture_group_reads) metadata_reads else null, .completion_root = S.ownerField(self, "root_incarnation").*, .source_revision = if (opts.ordered_apply_receipt) |receipt| receipt.index else null, .owner_incarnation = @import("group_source_owner_identity.zig").fromNamespace(S.ownerField(self, "core").*.identity_namespace, S.ownerField(self, "root_incarnation").*), .allocator = group_alloc, .reader = group_mutations.Reader.fromStore(S.ownerField(self, "core").*.store) };
-            const review_plan = if (opts.resolver_review_command) |command| try @import("resolver_review.zig").plan(group_alloc, S.ownerField(self, "core").*, command.*, true) else null;
+            var group_overlay = group_mutations.Overlay{ .captured_reads = if (capture_preparation_points) metadata_reads else null, .completion_root = S.ownerField(self, "root_incarnation").*, .source_revision = if (opts.ordered_apply_receipt) |receipt| receipt.index else null, .owner_incarnation = @import("group_source_owner_identity.zig").fromNamespace(S.ownerField(self, "core").*.identity_namespace, S.ownerField(self, "root_incarnation").*), .allocator = group_alloc, .reader = group_mutations.Reader.fromStore(S.ownerField(self, "core").*.store) };
+            const review_plan = if (opts.resolver_review_command) |command| try @import("resolver_review.zig").planWithReader(group_alloc, S.ownerField(self, "core").*, observed_store, command.*, true) else null;
             if (review_plan) |review| if (review.source_key) |key| try appendUniqueOwnedKeyIndexed(S.ownerField(self, "alloc").*, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, key);
             var group_staged = @import("group_source_snapshot.zig").Staged{ .changed = &.{}, .deleted = &.{}, .sequence = 0 };
             var transferred_group_changed: std.ArrayList([]const u8) = .empty;
@@ -2477,12 +2478,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 } else if (command.action == .backfill) {
                     const Owner = @TypeOf(S.ownerField(self, "core").*);
                     const Materializer = struct {
+                        owner: Owner,
+                        reader: @TypeOf(observed_store),
                         fn read(ptr: *anyopaque, a: Allocator, document: []const u8) !?std.json.Value {
-                            const owner: Owner = @ptrCast(@alignCast(ptr));
-                            return group_mutations.currentRow(owner, a, document);
+                            const context: *@This() = @ptrCast(@alignCast(ptr));
+                            return group_mutations.currentRowWithReader(context.owner, context.reader, a, document);
                         }
                     };
-                    try @import("group_source_baseline.zig").applyPage(internal_keys, group_alloc, &group_overlay, command.definition, @import("group_source_baseline.zig").sourceGeneration(S.ownerField(self, "core").*.index_manager.activeSchemaVersion() orelse 0, namespace, S.ownerField(self, "core").*.byteRange().start, S.ownerField(self, "core").*.byteRange().end, S.ownerField(self, "root_incarnation").*), command.backfill.?.page.?, .{ .ptr = S.ownerField(self, "core").*, .read_fn = Materializer.read }, group_mutations.Plan.Projector{ .entry = matched_entry.?, .bounds = .{ .start = S.ownerField(self, "core").*.byteRange().start, .end = S.ownerField(self, "core").*.byteRange().end } });
+                    var materializer: Materializer = .{ .owner = S.ownerField(self, "core").*, .reader = observed_store };
+                    try @import("group_source_baseline.zig").applyPage(internal_keys, group_alloc, &group_overlay, command.definition, @import("group_source_baseline.zig").sourceGeneration(S.ownerField(self, "core").*.index_manager.activeSchemaVersion() orelse 0, namespace, S.ownerField(self, "core").*.byteRange().start, S.ownerField(self, "core").*.byteRange().end, S.ownerField(self, "root_incarnation").*), command.backfill.?.page.?, .{ .ptr = &materializer, .read_fn = Materializer.read }, group_mutations.Plan.Projector{ .entry = matched_entry.?, .bounds = .{ .start = S.ownerField(self, "core").*.byteRange().start, .end = S.ownerField(self, "core").*.byteRange().end } });
                 } else group_staged = @import("group_source_apply.zig").stage(group_alloc, &group_overlay, command.*, S.ownerField(self, "core").*.nextDerivedAppendSequence(), matched_entry.?.horizons) catch |err| switch (err) {
                     error.EnrichmentSourceChanged, error.ArtifactPublicationPending, error.GroupedSourceRetirementPending, error.GroupedSourceBusy, error.GroupedSourceEarlierWorkPending => blk: {
                         // A committed control race is an ordered rejection. No
@@ -2931,7 +2935,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 if (page_plan != .unchanged) {
                     const chunks = @import("merge_page_chunks.zig");
-                    const manifest = S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, chunks.manifest_key) catch |err| switch (err) {
+                    const manifest = observed_store.get(S.ownerField(self, "alloc").*, chunks.manifest_key) catch |err| switch (err) {
                         error.NotFound => null,
                         else => return err,
                     };
@@ -2980,7 +2984,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 if (plan.applies_checkpoint and coordinated_handoff and (checkpoint.kind == .finalize or checkpoint.kind == .rollback)) {
                     const catalog = @import("relational_integrity_catalog.zig");
-                    const raw_catalog = try S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, catalog.key);
+                    const raw_catalog = try observed_store.get(S.ownerField(self, "alloc").*, catalog.key);
                     defer S.ownerField(self, "alloc").*.free(raw_catalog);
                     const coverage = try @import("relational_integrity_handoff.zig").coverageForRange(S.ownerField(self, "alloc").*, raw_catalog, S.ownerField(self, "core").*.identity_namespace, plan.range);
                     try owned_store_values.append(S.ownerField(self, "alloc").*, coverage);
@@ -3053,7 +3057,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // shadow records commit with primary/index effects and receipt.
                 if (!coordinated_handoff) return error.CoordinatedConstraintTopologyUnsupported;
                 const catalog_mod = @import("relational_integrity_catalog.zig");
-                const raw = try S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, catalog_mod.key);
+                const raw = try observed_store.get(S.ownerField(self, "alloc").*, catalog_mod.key);
                 defer S.ownerField(self, "alloc").*.free(raw);
                 var compiled = try catalog_mod.decode(S.ownerField(self, "alloc").*, raw);
                 defer compiled.deinit();

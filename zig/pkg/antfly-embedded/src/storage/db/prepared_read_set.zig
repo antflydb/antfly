@@ -22,6 +22,29 @@ const DocStore = @import("../docstore.zig").DocStore;
 const Entry = @import("../backend_erased.zig").Entry;
 const A = std.mem.Allocator;
 
+/// A read-only point surface for preparation helpers. It returns caller-owned
+/// bytes just like the physical store; the witness owns only keys/fingerprints.
+/// It deliberately exposes no writes or unobserved transaction/cursor escape.
+pub fn observe(store: anytype, observations: ?*Owned) PointReader(@TypeOf(store)) {
+    return .{ .store = store, .observations = observations };
+}
+pub fn PointReader(comptime Store: type) type {
+    return struct {
+        store: Store,
+        observations: ?*Owned,
+        pub fn get(self: @This(), a: A, key: []const u8) ![]const u8 {
+            if (self.observations) |captured| try captured.check();
+            const value = self.store.get(a, key) catch |err| {
+                if (err == error.NotFound) if (self.observations) |captured| try captured.recordPoint(key, null);
+                return err;
+            };
+            errdefer a.free(value);
+            if (self.observations) |captured| try captured.recordPoint(key, value);
+            return value;
+        }
+    };
+}
+
 fn checkpoint(control: ?admission.Port, failure: ?*?anyerror) !void {
     if (failure) |slot| if (slot.* != null) return error.ReadAdmissionRejected;
     if (control) |original| original.checkpoint() catch |err| {

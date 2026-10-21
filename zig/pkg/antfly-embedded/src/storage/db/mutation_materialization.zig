@@ -2198,7 +2198,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn appendGraphLifecycleGeneration(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             ordered_index: u64,
             writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
             owned_values: *std.ArrayListUnmanaged([]u8),
@@ -3047,7 +3047,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn appendRetiredDirectGraphTtlDueDeletes(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             index_manager: *index_manager_mod.IndexManager,
             writes: []const docstore_mod.KVPair,
             deletes: []const []const u8,

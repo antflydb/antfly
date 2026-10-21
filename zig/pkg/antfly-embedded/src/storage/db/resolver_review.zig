@@ -114,6 +114,12 @@ pub fn receipt(a: A, store: anytype, command: Command) !?Receipt {
 /// Runs under the ordinary primary apply lock on every replica. A stale CAS
 /// records rejection and still advances the ordered apply receipt atomically.
 pub fn plan(a: A, core: anytype, command: Command, policy_disabled: bool) !Plan {
+    return planWithReader(a, core, core.store, command, policy_disabled);
+}
+/// Store observations join the owned preparation read set. The core supplies
+/// resolver/schema metadata, protected separately by its retained catalog
+/// revision and schema namespace; this reader cannot mutate or stage effects.
+pub fn planWithReader(a: A, core: anytype, reader: anytype, command: Command, policy_disabled: bool) !Plan {
     try command.validate();
     var namespace: [24]u8 = undefined;
     @import("doc_identity.zig").encodeNamespace(&namespace, core.identity_namespace);
@@ -122,19 +128,19 @@ pub fn plan(a: A, core: anytype, command: Command, policy_disabled: bool) !Plan 
     // version may describe unrelated catalog features; retain an existing
     // higher floor, including when re-admitting a prior accepted receipt.
     const minimum_reader = @max(if (command.origin != null) catalog.curation_provenance_reader_version else catalog.curation_reader_version, core.index_manager.minimum_reader_version.load(.acquire));
-    if (try receipt(a, core.store, command)) |previous| return .{ .command = command, .accepted = previous.accepted, .previous = previous, .minimum_reader = minimum_reader };
+    if (try receipt(a, reader, command)) |previous| return .{ .command = command, .accepted = previous.accepted, .previous = previous, .minimum_reader = minimum_reader };
     const rejected = Plan{ .command = command };
     if (!policy_disabled) return rejected;
-    if (!std.mem.eql(u8, &command.policy_digest, &(try policyDigest(a, core.store)))) return rejected;
+    if (!std.mem.eql(u8, &command.policy_digest, &(try policyDigest(a, reader)))) return rejected;
     const configs = try core.listResolvers(a);
     const cfg = for (configs) |cfg| {
         if (std.mem.eql(u8, cfg.name, command.resolver)) break cfg;
     } else return rejected;
     if (cfg.effectiveGeneration() != command.config_generation or cfg.curation_revision != command.curation_revision or
         !std.mem.eql(u8, cfg.source_artifact, command.source_artifact) or !std.mem.eql(u8, cfg.resolution_artifact, command.resolution_artifact) or !std.mem.eql(u8, cfg.table, command.table)) return rejected;
-    if (!std.mem.eql(u8, &command.override_digest, &(try overrideDigest(a, core.store, command.document, command.source_artifact, command.resolution_artifact)))) return rejected;
+    if (!std.mem.eql(u8, &command.override_digest, &(try overrideDigest(a, reader, command.document, command.source_artifact, command.resolution_artifact)))) return rejected;
     const resolution_key = try keys.resolutionArtifactKeyAlloc(a, command.document, command.resolution_artifact);
-    const raw = (try optional(a, core.store, resolution_key)) orelse return rejected;
+    const raw = (try optional(a, reader, resolution_key)) orelse return rejected;
     var hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(raw, &hash, .{});
     if (!std.mem.eql(u8, &std.fmt.bytesToHex(hash, .lower), command.expected_hash)) return rejected;
@@ -155,7 +161,7 @@ pub fn plan(a: A, core: anytype, command: Command, policy_disabled: bool) !Plan 
         if (try policy.pinnedDistinct(a, original, command.key)) return rejected;
     }
     const override_key = try runtime.reviewOverrideArtifactKeyAlloc(a, command.document, command.source_artifact, command.resolution_artifact);
-    return .{ .command = command, .accepted = true, .minimum_reader = minimum_reader, .override_key = override_key, .override_value = try runtime.buildReviewDecisionsBytesAlloc(a, try optional(a, core.store, override_key), &.{.{ .local_id = command.local_id, .decision = command.decision, .table = command.table, .key = command.key, .origin = command.origin }}), .source_key = (try runtime.sourceExtractionKeyForResolutionKeyAlloc(a, &.{cfg}, resolution_key)) orelse return error.InvalidResolverCurationRequest };
+    return .{ .command = command, .accepted = true, .minimum_reader = minimum_reader, .override_key = override_key, .override_value = try runtime.buildReviewDecisionsBytesAlloc(a, try optional(a, reader, override_key), &.{.{ .local_id = command.local_id, .decision = command.decision, .table = command.table, .key = command.key, .origin = command.origin }}), .source_key = (try runtime.sourceExtractionKeyForResolutionKeyAlloc(a, &.{cfg}, resolution_key)) orelse return error.InvalidResolverCurationRequest };
 }
 pub fn validateRequest(req: anytype) !void {
     const command = req.resolver_review orelse return;
