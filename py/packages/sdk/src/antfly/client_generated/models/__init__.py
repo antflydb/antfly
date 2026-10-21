@@ -58,6 +58,7 @@ from .artifact_sources_capability_state import ArtifactSourcesCapabilityState
 from .audio_chunk_options import AudioChunkOptions
 from .auth_subject import AuthSubject
 from .auth_subject_kind import AuthSubjectKind
+from .autocomplete_query import AutocompleteQuery
 from .backup_already_exists_conflict import BackupAlreadyExistsConflict
 from .backup_already_exists_conflict_code import BackupAlreadyExistsConflictCode
 from .backup_info import BackupInfo
@@ -185,6 +186,7 @@ from .constrained_generator_producer_config import ConstrainedGeneratorProducerC
 from .constrained_generator_producer_config_output_schema import ConstrainedGeneratorProducerConfigOutputSchema
 from .constrained_output import ConstrainedOutput
 from .constrained_probabilities import ConstrainedProbabilities
+from .contains_query import ContainsQuery
 from .create_algebraic_index_request import CreateAlgebraicIndexRequest
 from .create_algebraic_index_request_type import CreateAlgebraicIndexRequestType
 from .create_api_key_request import CreateApiKeyRequest
@@ -373,6 +375,7 @@ from .entity_distinct_request import EntityDistinctRequest
 from .entity_merge_request import EntityMergeRequest
 from .entity_suppress_request import EntitySuppressRequest
 from .entity_suppress_request_absorbed import EntitySuppressRequestAbsorbed
+from .equals_query import EqualsQuery
 from .error import Error
 from .eval_config import EvalConfig
 from .eval_options import EvalOptions
@@ -548,10 +551,14 @@ from .failed_operation import FailedOperation
 from .failed_operation_operation import FailedOperationOperation
 from .fetch_config import FetchConfig
 from .field_capability import FieldCapability
-from .field_capability_index_sort_order import FieldCapabilityIndexSortOrder
-from .field_capability_query_modes_item import FieldCapabilityQueryModesItem
+from .field_capability_kind import FieldCapabilityKind
 from .field_capability_sort_lifecycle_state import FieldCapabilitySortLifecycleState
+from .field_capability_value_operations_item import FieldCapabilityValueOperationsItem
 from .field_mapping_type import FieldMappingType
+from .field_representation import FieldRepresentation
+from .field_representation_index_sort_order import FieldRepresentationIndexSortOrder
+from .field_representation_query_modes_item import FieldRepresentationQueryModesItem
+from .field_representation_sort_lifecycle_state import FieldRepresentationSortLifecycleState
 from .field_statistics import FieldStatistics
 from .filter_spec import FilterSpec
 from .filter_spec_operator import FilterSpecOperator
@@ -904,6 +911,7 @@ from .inference_credentials import InferenceCredentials
 from .inference_decide_long_document import InferenceDecideLongDocument
 from .inference_decide_long_document_mode import InferenceDecideLongDocumentMode
 from .inference_decide_request import InferenceDecideRequest
+from .inference_decide_request_context_version import InferenceDecideRequestContextVersion
 from .inference_decide_response import InferenceDecideResponse
 from .inference_dictate_request import InferenceDictateRequest
 from .inference_dictate_response import InferenceDictateResponse
@@ -1139,6 +1147,7 @@ from .match_none_query import MatchNoneQuery
 from .match_none_query_match_none import MatchNoneQueryMatchNone
 from .match_phrase_query import MatchPhraseQuery
 from .match_query import MatchQuery
+from .matches_query import MatchesQuery
 from .media_chunk_policy import MediaChunkPolicy
 from .media_content_part import MediaContentPart
 from .media_content_part_type import MediaContentPartType
@@ -1254,6 +1263,10 @@ from .query_hits import QueryHits
 from .query_hits_total import QueryHitsTotal
 from .query_hits_total_relation import QueryHitsTotalRelation
 from .query_profile import QueryProfile
+from .query_profile_value_search import QueryProfileValueSearch
+from .query_profile_value_search_plans_item import QueryProfileValueSearchPlansItem
+from .query_profile_value_search_plans_item_operation import QueryProfileValueSearchPlansItemOperation
+from .query_profile_value_search_plans_item_verification import QueryProfileValueSearchPlansItemVerification
 from .query_request import QueryRequest
 from .query_request_aggregations import QueryRequestAggregations
 from .query_request_embeddings import QueryRequestEmbeddings
@@ -1653,6 +1666,7 @@ from .update_password_request import UpdatePasswordRequest
 from .user import User
 from .user_metadata_type_0 import UserMetadataType0
 from .vad_options import VADOptions
+from .value_search_execution import ValueSearchExecution
 from .vector_source_storage_status import VectorSourceStorageStatus
 from .vertex_embedder_config import VertexEmbedderConfig
 from .vertex_embedder_config_provider import VertexEmbedderConfigProvider
@@ -1732,6 +1746,7 @@ __all__ = (
     "AudioChunkOptions",
     "AuthSubject",
     "AuthSubjectKind",
+    "AutocompleteQuery",
     "BackupAlreadyExistsConflict",
     "BackupAlreadyExistsConflictCode",
     "BackupInfo",
@@ -1859,6 +1874,7 @@ __all__ = (
     "ConstrainedGeneratorProducerConfigOutputSchema",
     "ConstrainedOutput",
     "ConstrainedProbabilities",
+    "ContainsQuery",
     "CreateAlgebraicIndexRequest",
     "CreateAlgebraicIndexRequestType",
     "CreateApiKeyRequest",
@@ -2043,6 +2059,7 @@ __all__ = (
     "EntityMergeRequest",
     "EntitySuppressRequest",
     "EntitySuppressRequestAbsorbed",
+    "EqualsQuery",
     "Error",
     "EvalConfig",
     "EvalOptions",
@@ -2212,10 +2229,14 @@ __all__ = (
     "FailedOperationOperation",
     "FetchConfig",
     "FieldCapability",
-    "FieldCapabilityIndexSortOrder",
-    "FieldCapabilityQueryModesItem",
+    "FieldCapabilityKind",
     "FieldCapabilitySortLifecycleState",
+    "FieldCapabilityValueOperationsItem",
     "FieldMappingType",
+    "FieldRepresentation",
+    "FieldRepresentationIndexSortOrder",
+    "FieldRepresentationQueryModesItem",
+    "FieldRepresentationSortLifecycleState",
     "FieldStatistics",
     "FilterSpec",
     "FilterSpecOperator",
@@ -2568,6 +2589,7 @@ __all__ = (
     "InferenceDecideLongDocument",
     "InferenceDecideLongDocumentMode",
     "InferenceDecideRequest",
+    "InferenceDecideRequestContextVersion",
     "InferenceDecideResponse",
     "InferenceDictateRequest",
     "InferenceDictateResponse",
@@ -2797,6 +2819,7 @@ __all__ = (
     "MaintainLakeTableResponse200",
     "MatchAllQuery",
     "MatchAllQueryMatchAll",
+    "MatchesQuery",
     "MatchNoneQuery",
     "MatchNoneQueryMatchNone",
     "MatchPhraseQuery",
@@ -2912,6 +2935,10 @@ __all__ = (
     "QueryHitsTotal",
     "QueryHitsTotalRelation",
     "QueryProfile",
+    "QueryProfileValueSearch",
+    "QueryProfileValueSearchPlansItem",
+    "QueryProfileValueSearchPlansItemOperation",
+    "QueryProfileValueSearchPlansItemVerification",
     "QueryRequest",
     "QueryRequestAggregations",
     "QueryRequestEmbeddings",
@@ -3311,6 +3338,7 @@ __all__ = (
     "User",
     "UserMetadataType0",
     "VADOptions",
+    "ValueSearchExecution",
     "VectorSourceStorageStatus",
     "VertexEmbedderConfig",
     "VertexEmbedderConfigProvider",

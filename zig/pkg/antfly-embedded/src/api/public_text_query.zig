@@ -73,6 +73,32 @@ pub fn parseStatefulDirectTextOperatorQueryAlloc(
     boost: f32,
 ) anyerror!?db_types.TextQuery {
     if (value != .object) return null;
+    inline for (.{ "equals", "contains", "matches", "autocomplete" }) |operator| {
+        if (value.object.get(operator)) |operand| {
+            if (operand != .string) return error.InvalidQueryRequest;
+            const field_value = value.object.get("field") orelse return error.InvalidQueryRequest;
+            if (field_value != .string or field_value.string.len == 0) return error.InvalidQueryRequest;
+            var recognized: usize = 0;
+            inline for (.{ operator, "field", "boost" }) |key| {
+                if (value.object.contains(key)) recognized += 1;
+            }
+            var sensitive = true;
+            if (value.object.get("case_sensitive")) |flag| {
+                if (comptime std.mem.eql(u8, operator, "autocomplete")) return error.InvalidQueryRequest;
+                if (flag != .bool) return error.InvalidQueryRequest;
+                sensitive = flag.bool;
+                recognized += 1;
+            }
+            if (recognized != value.object.count()) return error.InvalidQueryRequest;
+            const field = try alloc.dupe(u8, field_value.string);
+            errdefer alloc.free(field);
+            const text = try alloc.dupe(u8, operand.string);
+            errdefer alloc.free(text);
+            const query_boost = try directOperatorBoost(value, operator, boost);
+            if (comptime std.mem.eql(u8, operator, "autocomplete")) return .{ .autocomplete = .{ .field = field, .text = text, .boost = query_boost } };
+            return .{ .value = .{ .field = field, .text = text, .kind = @field(@import("../search/value_query.zig").Kind, operator), .case_sensitive = sensitive, .boost = query_boost } };
+        }
+    }
     if (try parseStatefulDirectTextMultiMatchQueryAlloc(alloc, value, boost)) |query| return query;
     // The generated public FuzzyQuery is structurally a term query plus
     // `fuzziness`/`prefix_length`. Leave that shape for the generated-schema

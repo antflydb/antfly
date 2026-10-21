@@ -408,6 +408,8 @@ const mappings = [_]Mapping{
     .{ .status = .invalid_aggregation, .err = error.InvalidAggregation },
     .{ .status = .unsupported_aggregation, .err = error.UnsupportedAggregation },
     .{ .status = .query_candidate_budget_exceeded, .err = error.QueryCandidateBudgetExceeded },
+    .{ .status = .value_search_requires_scan, .err = error.ValueSearchRequiresScan },
+    .{ .status = .value_search_limit_exceeded, .err = error.ValueSearchLimitExceeded },
     .{ .status = .decision_limit_exceeded, .err = error.DecisionLimitExceeded },
     .{ .status = .invalid_index_config, .err = error.InvalidIndexConfig },
     .{ .status = .algebraic_planner_scan_too_large, .err = error.AlgebraicPlannerScanTooLarge },
@@ -1223,4 +1225,11 @@ test "external lake evaluation limits survive the compiled query owner boundary"
     try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
     try std.testing.expectError(error.DecisionLimitExceeded, statusToError(failure.status));
     try std.testing.expectEqualStrings("DecisionLimitExceeded", failure.errorName());
+}
+
+test "logical value query policy errors retain identity across compiled storage boundaries" {
+    inline for (.{ error.ValueSearchRequiresScan, error.ValueSearchLimitExceeded }) |err| {
+        try std.testing.expect(statusFromError(err) != .internal);
+        try std.testing.expectError(err, statusToError(statusFromError(err)));
+    }
 }

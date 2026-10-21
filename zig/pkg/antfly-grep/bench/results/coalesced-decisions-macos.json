@@ -1,0 +1,197 @@
+{
+  "fixture_only": true,
+  "files": 128,
+  "threads": 8,
+  "provider_lanes": 2,
+  "fixture_delay_ms": 20,
+  "host": {
+    "platform": "macOS-27.0.1-arm64-arm-64bit",
+    "cpu_count": 14
+  },
+  "fixture_source_sha256": "9fcd9a4e8f7507942f954e9770ddda8ccc398af884f6a72bb5dbc62bc8c9589d",
+  "limitations": "Synthetic constant-score fixture with bounded provider lanes; warm filesystem, no cache, no model relevance or billed-token savings established",
+  "binaries": {
+    "antfly-grep": {
+      "sha256": "b042bbae3320252e14b55ac92c14164568ad3f35adae35faea862706bf093633",
+      "version": "antfly-grep 0.1.0-dev\nZig 0.17.0 fast\nnative regex, PCRE-style VM/JIT, streaming compression, encoding\ntarget aarch64-macos-none dynamic"
+    },
+    "baseline": {
+      "sha256": "916e251d1a4cca0da2aae84d14a829e9826c2a7320226d5b21062c1915478832",
+      "version": "antfly-grep 0.1.0-dev\nZig 0.17.0 fast\nnative regex, PCRE-style VM/JIT, streaming compression, encoding\ntarget aarch64-macos-none dynamic"
+    }
+  },
+  "cases": {
+    "antfly-grep": {
+      "runs": [
+        {
+          "seconds": 0.5251595,
+          "peak_rss_kib": 6400.0,
+          "exit": 0,
+          "load_average": [
+            8.72021484375,
+            8.6298828125,
+            7.08544921875
+          ],
+          "user_seconds": 0.006287,
+          "system_seconds": 0.029536,
+          "minor_faults": 740,
+          "major_faults": 0,
+          "requests": 16,
+          "inputs": 128
+        },
+        {
+          "seconds": 0.5554044170000001,
+          "peak_rss_kib": 6432.0,
+          "exit": 0,
+          "load_average": [
+            8.90234375,
+            8.6689453125,
+            7.10791015625
+          ],
+          "user_seconds": 0.0063609999999999995,
+          "system_seconds": 0.027143,
+          "minor_faults": 692,
+          "major_faults": 0,
+          "requests": 16,
+          "inputs": 128
+        },
+        {
+          "seconds": 0.5637197499999997,
+          "peak_rss_kib": 6432.0,
+          "exit": 0,
+          "load_average": [
+            8.90234375,
+            8.6689453125,
+            7.10791015625
+          ],
+          "user_seconds": 0.006375,
+          "system_seconds": 0.028428,
+          "minor_faults": 684,
+          "major_faults": 0,
+          "requests": 16,
+          "inputs": 128
+        },
+        {
+          "seconds": 0.5175256249999993,
+          "peak_rss_kib": 6368.0,
+          "exit": 0,
+          "load_average": [
+            9.23046875,
+            8.74072265625,
+            7.14208984375
+          ],
+          "user_seconds": 0.005939,
+          "system_seconds": 0.025516,
+          "minor_faults": 687,
+          "major_faults": 0,
+          "requests": 16,
+          "inputs": 128
+        },
+        {
+          "seconds": 0.5652307499999996,
+          "peak_rss_kib": 6400.0,
+          "exit": 0,
+          "load_average": [
+            9.23046875,
+            8.74072265625,
+            7.14208984375
+          ],
+          "user_seconds": 0.0061129999999999995,
+          "system_seconds": 0.026673,
+          "minor_faults": 722,
+          "major_faults": 0,
+          "requests": 16,
+          "inputs": 128
+        }
+      ],
+      "median_seconds": 0.5554044170000001,
+      "median_requests": 16
+    },
+    "baseline": {
+      "runs": [
+        {
+          "seconds": 2.019962958,
+          "peak_rss_kib": 7904.0,
+          "exit": 0,
+          "load_average": [
+            8.72021484375,
+            8.6298828125,
+            7.08544921875
+          ],
+          "user_seconds": 0.011132,
+          "system_seconds": 0.029681,
+          "minor_faults": 780,
+          "major_faults": 0,
+          "requests": 128,
+          "inputs": 128
+        },
+        {
+          "seconds": 1.9762035419999995,
+          "peak_rss_kib": 7888.0,
+          "exit": 0,
+          "load_average": [
+            8.72021484375,
+            8.6298828125,
+            7.08544921875
+          ],
+          "user_seconds": 0.012825999999999999,
+          "system_seconds": 0.032971,
+          "minor_faults": 816,
+          "major_faults": 0,
+          "requests": 128,
+          "inputs": 128
+        },
+        {
+          "seconds": 1.9862055839999986,
+          "peak_rss_kib": 7920.0,
+          "exit": 0,
+          "load_average": [
+            8.90234375,
+            8.6689453125,
+            7.10791015625
+          ],
+          "user_seconds": 0.013222,
+          "system_seconds": 0.035448,
+          "minor_faults": 828,
+          "major_faults": 0,
+          "requests": 128,
+          "inputs": 128
+        },
+        {
+          "seconds": 1.9354619170000014,
+          "peak_rss_kib": 7888.0,
+          "exit": 0,
+          "load_average": [
+            8.90234375,
+            8.6689453125,
+            7.10791015625
+          ],
+          "user_seconds": 0.013796,
+          "system_seconds": 0.033776,
+          "minor_faults": 781,
+          "major_faults": 2,
+          "requests": 128,
+          "inputs": 128
+        },
+        {
+          "seconds": 1.998978083999999,
+          "peak_rss_kib": 7792.0,
+          "exit": 0,
+          "load_average": [
+            9.23046875,
+            8.74072265625,
+            7.14208984375
+          ],
+          "user_seconds": 0.014809,
+          "system_seconds": 0.039224999999999996,
+          "minor_faults": 805,
+          "major_faults": 0,
+          "requests": 128,
+          "inputs": 128
+        }
+      ],
+      "median_seconds": 1.9862055839999986,
+      "median_requests": 128
+    }
+  }
+}

@@ -28,12 +28,14 @@ pub fn create(b: *std.Build, options: struct {
     protobuf: *std.Build.Module,
     platform: *std.Build.Module,
     sentencepiece_proto: *std.Build.Module,
+    grapheme: ?*std.Build.Module = null,
 }) Modules {
     const tokenizer = b.createModule(.{
         .root_source_file = options.root.path(b, "src/tokenizer.zig"),
         .target = options.target,
         .optimize = options.optimize,
         .imports = &.{
+            .{ .name = "antfly_grapheme", .module = options.grapheme orelse b.createModule(.{ .root_source_file = options.root.path(b, "src/grapheme.zig"), .target = options.target, .optimize = options.optimize }) },
             .{ .name = "protobuf", .module = options.protobuf },
             .{ .name = "antfly_platform", .module = options.platform },
             .{ .name = "sentencepiece_proto", .module = options.sentencepiece_proto },

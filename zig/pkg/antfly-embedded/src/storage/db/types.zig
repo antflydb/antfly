@@ -1051,6 +1051,8 @@ pub const TextMultiMatchField = struct {
 };
 
 pub const TextQuery = union(enum) {
+    value: @import("../../search/value_query.zig").Spec,
+    autocomplete: struct { field: []const u8, text: []const u8, boost: f32 = 1.0 },
     match_none: void,
     match_all: void,
     phrase: struct {
@@ -1177,6 +1179,14 @@ pub const TextQuery = union(enum) {
 
     pub fn deinit(self: *TextQuery, alloc: Allocator) void {
         switch (self.*) {
+            .value => |v| {
+                alloc.free(v.field);
+                alloc.free(v.text);
+            },
+            .autocomplete => |v| {
+                alloc.free(v.field);
+                alloc.free(v.text);
+            },
             .match_none, .match_all => {},
             .phrase => |phrase| {
                 alloc.free(phrase.field);
@@ -1906,6 +1916,9 @@ pub const SearchRequest = struct {
     }
 
     /// Trusted request-local preparation, never decoded from public input.
+    value_search_execution: @import("../../search/value_query.zig").Policy = .{},
+    value_search_work: ?*@import("../../search/value_query.zig").Work = null,
+    value_search_scope: ?@import("../../search/value_membership.zig").Scope = null,
     native_text_tie_rank: ?@import("../../search/scorer.zig").TieRank = null,
     text_navigation_plan: ?*const @import("../../search/search.zig").TextNavigationPlan = null,
     text_pattern_programs: ?*@import("../../search/query.zig").PatternPrograms = null,
@@ -2100,6 +2113,8 @@ const hierarchy_children_validated_fields = [_][]const u8{
 };
 
 const hierarchy_children_supported_internal_fields = [_][]const u8{
+    "value_search_work",
+    "value_search_scope",
     "document_authority_mode",
     "document_authority_group",
     "document_output_allocator",
@@ -2133,6 +2148,7 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
 };
 
 const hierarchy_children_rejected_fields = [_][]const u8{
+    "value_search_execution",
     "evaluation_json",
     "evaluation_limit",
     "evaluation_matches",
@@ -2973,6 +2989,7 @@ pub const ShardIdentityReadGeneration = struct {
 };
 
 pub const SearchResult = struct {
+    value_search_profile_json: ?[]u8 = null,
     /// Only private hydration results may split body ownership from metadata.
     /// Move bodies into the destination before retiring worker scratch.
     stored_data_allocator: ?Allocator = null,
@@ -3022,6 +3039,7 @@ pub const SearchResult = struct {
     }
 
     pub fn deinit(self: *SearchResult) void {
+        if (self.value_search_profile_json) |json| self.alloc.free(json);
         if (self.sort_profile_storage) |storage| self.alloc.free(storage);
         for (self.hits) |*hit| {
             if (self.stored_data_allocator) |body_allocator| {
