@@ -2,6 +2,11 @@ import type { ConnectedModel, ConnectedModelType, Connection } from "@antfly/sdk
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { isProductEnabled } from "@/config/products";
 import { useApiConfig } from "@/hooks/use-api-config";
+import {
+  INFERENCE_MODEL_GROUPS,
+  INFERENCE_MODEL_GROUP_TYPES,
+  inferenceModelGroups,
+} from "@/lib/inference-model-tasks";
 
 const FETCH_TIMEOUT = 15000; // 15 seconds — model expansion fans out to providers
 // Bounds how stale a rendered model list can be. Remote provider listings are
@@ -278,16 +283,9 @@ interface DirectModelInfo {
   inputs?: string[];
 }
 
-interface DirectModelsResponse {
-  embedders?: Record<string, DirectModelInfo>;
-  rerankers?: Record<string, DirectModelInfo>;
-  chunkers?: Record<string, DirectModelInfo>;
-  generators?: Record<string, DirectModelInfo>;
-  extractors?: Record<string, DirectModelInfo>;
-  rewriters?: Record<string, DirectModelInfo>;
-  readers?: Record<string, DirectModelInfo>;
-  transcribers?: Record<string, DirectModelInfo>;
-}
+type DirectModelsResponse = Partial<
+  Record<(typeof INFERENCE_MODEL_GROUPS)[number], Record<string, DirectModelInfo>>
+>;
 
 function directModelEntries(models: Record<string, DirectModelInfo> | undefined): ConnectedModel[] {
   return Object.entries(models ?? {}).map(([name, info]) => ({
@@ -328,19 +326,16 @@ function useDirectInferenceModels(enabled: boolean): ConnectedModelsState {
         if (!response.ok) throw new Error(`Model discovery failed (${response.status})`);
         const body = (await response.json()) as DirectModelsResponse;
         if (generation !== generationRef.current || request !== requestRef.current) return;
-        const groups = {
-          embedders: directModelEntries(body.embedders),
-          rerankers: directModelEntries(body.rerankers),
-          chunkers: directModelEntries(body.chunkers),
-          generators: directModelEntries(body.generators),
-          extractors: directModelEntries(body.extractors),
-          rewriters: directModelEntries(body.rewriters),
-          readers: directModelEntries(body.readers),
-          transcribers: directModelEntries(body.transcribers),
-        };
-        const modelKinds = Object.entries(groups)
-          .filter(([, entries]) => entries.length > 0)
-          .map(([key]) => key.replace(/s$/, ""));
+        const groups = Object.fromEntries(
+          INFERENCE_MODEL_GROUPS.map((group) => [group, directModelEntries(body[group])])
+        );
+        const modelKinds = [
+          ...new Set(
+            INFERENCE_MODEL_GROUPS.filter((group) => groups[group].length > 0).map(
+              (group) => INFERENCE_MODEL_GROUP_TYPES[group]
+            )
+          ),
+        ];
         setProviders([
           {
             id: "local-inference",
@@ -351,7 +346,7 @@ function useDirectInferenceModels(enabled: boolean): ConnectedModelsState {
             capabilities: modelKinds.map((kind) => `models.${kind}`),
             inference: {
               provider: "antfly",
-              configured_model_types: modelKinds as ConnectedModelType[],
+              configured_model_types: modelKinds,
               models: groups,
             },
           } as Connection,
@@ -440,7 +435,7 @@ export function useSelectedInferenceModels(kind: ConnectedModelType): {
   const models = useMemo<SelectedInferenceModel[]>(
     () =>
       [
-        ...(listed?.[kind === "other" ? "other" : `${kind}s`] ?? []),
+        ...inferenceModelGroups(kind).flatMap((group) => listed?.[group] ?? []),
         ...(kind === "generator" ? (listed?.other ?? []) : []),
       ] as SelectedInferenceModel[],
     [kind, listed]
@@ -483,7 +478,7 @@ export function liveModelSuggestions(
     const models = provider.models;
     if (!models) continue;
     const names = [
-      ...(models[`${kind}s`] ?? []),
+      ...inferenceModelGroups(kind).flatMap((group) => models[group] ?? []),
       ...(kind === "generator" ? (models.other ?? []) : []),
     ]
       .map((model) => model.name)

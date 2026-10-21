@@ -9,6 +9,7 @@ import {
   useConnectedModels,
   useConnectionsWithModels,
 } from "./use-connections";
+import { transformConnectionModels } from "./use-inference-registry";
 
 const { listConnections, apiUrlRef, client } = vi.hoisted(() => {
   const listConnections = vi.fn();
@@ -107,6 +108,24 @@ describe("liveModelSuggestions", () => {
     expect(suggestions.anthropic).toEqual(["claude-sonnet-4-5"]);
   });
 
+  it("includes chain aliases in generator suggestions without duplicating shared IDs", () => {
+    const suggestions = liveModelSuggestions(
+      [
+        providerConnection({
+          inference: {
+            provider: "antfly",
+            models: {
+              generators: [{ name: "owner/chat" }],
+              chains: [{ name: "chains/support" }, { name: "owner/chat" }],
+            },
+          },
+        }),
+      ],
+      "generator"
+    );
+    expect(suggestions.antfly).toEqual(["owner/chat", "chains/support"]);
+  });
+
   it("merges unclassified models into generator suggestions", () => {
     const suggestions = liveModelSuggestions([providerConnection()], "generator");
     expect(suggestions.openai).toEqual(["gpt-4o"]);
@@ -149,6 +168,50 @@ describe("useConnectedModels compatibility", () => {
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
+  });
+
+  it("retains the complete direct catalog and deduplicates configured task aliases", async () => {
+    listConnections.mockResolvedValue(undefined);
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          deciders: { "owner/decider": { capabilities: ["typed_decisions"], inputs: ["text"] } },
+          synthesizers: { "owner/voice": { inputs: ["text"] } },
+          predictors: { risk: {} },
+          generators: { "owner/chat": {} },
+          chains: { "chains/support": {} },
+          other: { unclassified: {} },
+        }),
+        { headers: { "content-type": "application/json" } }
+      )
+    );
+    const hook = renderHook(() => useConnectedModels());
+    await waitFor(() => expect(hook.result.current.providers).toHaveLength(1));
+    const provider = hook.result.current.providers[0];
+    expect(provider.inference?.models).toMatchObject({
+      deciders: [{ name: "owner/decider", capabilities: ["typed_decisions"], inputs: ["text"] }],
+      synthesizers: [{ name: "owner/voice", inputs: ["text"] }],
+      predictors: [{ name: "risk" }],
+      chains: [{ name: "chains/support" }],
+      other: [{ name: "unclassified" }],
+    });
+    expect(provider.inference?.configured_model_types).toEqual(
+      expect.arrayContaining(["decider", "synthesizer", "predictor", "generator", "other"])
+    );
+    expect(
+      provider.inference?.configured_model_types?.filter((kind) => kind === "generator")
+    ).toHaveLength(1);
+    // The same shared taxonomy feeds the visible Models catalog.
+    const catalog = transformConnectionModels([provider]);
+    expect(catalog.map(({ type, source }) => [type, source])).toEqual(
+      expect.arrayContaining([
+        ["decider", "owner/decider"],
+        ["synthesizer", "owner/voice"],
+        ["predictor", "risk"],
+        ["generator", "chains/support"],
+        ["generator", "unclassified"],
+      ])
+    );
   });
 
   it("falls back to direct local discovery when the server predates connections", async () => {

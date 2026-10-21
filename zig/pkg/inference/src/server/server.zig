@@ -3517,12 +3517,22 @@ fn loadedModelRequestIdentifier(canonical_models_dir: []const u8, canonical_mode
     return identifier;
 }
 
-fn loadedModelRequestIdentifierAlloc(
+const LoadedModelRequestIdentity = struct {
+    value: []u8,
+    source: enum { managed, relative },
+
+    fn instanceIdentifier(self: @This()) []const u8 {
+        // Receipt names already carry the authoritative Hub namespace.
+        return if (self.source == .managed) self.value else Node.stripRuntimeTaskPrefix(self.value);
+    }
+};
+
+fn loadedModelRequestIdentityAlloc(
     allocator: std.mem.Allocator,
     io: std.Io,
     canonical_models_dir: []const u8,
     canonical_model_dir: []const u8,
-) !?[]u8 {
+) !?LoadedModelRequestIdentity {
     const managed_identifier = registry_mod.managedModelRequestNameAlloc(
         allocator,
         io,
@@ -3531,13 +3541,72 @@ fn loadedModelRequestIdentifierAlloc(
         error.OutOfMemory => return err,
         else => null,
     };
-    if (managed_identifier) |identifier| return identifier;
+    if (managed_identifier) |identifier| return .{ .value = identifier, .source = .managed };
 
     const relative = loadedModelRequestIdentifier(
         canonical_models_dir,
         canonical_model_dir,
     ) orelse return null;
-    return try allocator.dupe(u8, relative);
+    return .{ .value = try allocator.dupe(u8, relative), .source = .relative };
+}
+
+fn loadedModelRequestIdentifierAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    canonical_models_dir: []const u8,
+    canonical_model_dir: []const u8,
+) !?[]u8 {
+    const identity = (try loadedModelRequestIdentityAlloc(allocator, io, canonical_models_dir, canonical_model_dir)) orelse return null;
+    return identity.value;
+}
+
+test "instance identifiers preserve managed task namespaces and strip only legacy directories" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "models/artifact");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/artifact/model.gguf", .data = "decoder" });
+    const models_root = try tmp.dir.realPathFileAlloc(io, "models", allocator);
+    defer allocator.free(models_root);
+    const artifact_dir = try tmp.dir.realPathFileAlloc(io, "models/artifact", allocator);
+    defer allocator.free(artifact_dir);
+
+    for (Node.runtime_model_tasks) |task| {
+        const owner = Node.runtimeTaskDir(task);
+        for ([_][]const u8{ "auto", "gguf:Q4_K_M" }) |variant| {
+            const receipt = try std.fmt.allocPrint(
+                allocator,
+                "{{\"version\":2,\"source\":{{\"owner\":\"{s}\",\"name\":\"example\",\"variant\":\"{s}\"}},\"artifacts\":[{{\"path\":\"model.gguf\",\"size\":7}}]}}",
+                .{ owner, variant },
+            );
+            defer allocator.free(receipt);
+            try tmp.dir.writeFile(io, .{ .sub_path = "models/artifact/.antfly-download-complete.json", .data = receipt });
+            const identity = (try loadedModelRequestIdentityAlloc(allocator, io, models_root, artifact_dir)).?;
+            defer allocator.free(identity.value);
+            const expected = if (std.mem.eql(u8, variant, "auto"))
+                try std.fmt.allocPrint(allocator, "{s}/example", .{owner})
+            else
+                try std.fmt.allocPrint(allocator, "{s}/example:{s}", .{ owner, variant });
+            defer allocator.free(expected);
+            try std.testing.expectEqual(.managed, identity.source);
+            try std.testing.expectEqualStrings(expected, identity.instanceIdentifier());
+            // Catalog callers continue to receive the identical receipt name.
+            const catalog_name = (try loadedModelRequestIdentifierAlloc(allocator, io, models_root, artifact_dir)).?;
+            defer allocator.free(catalog_name);
+            try std.testing.expectEqualStrings(expected, catalog_name);
+        }
+        // A missing legacy directory still identifies an already loaded model.
+        // Strip one task directory, preserving an owner with the same spelling.
+        const legacy_dir = try std.fs.path.join(allocator, &.{ models_root, owner, owner, "example" });
+        defer allocator.free(legacy_dir);
+        const legacy = (try loadedModelRequestIdentityAlloc(allocator, io, models_root, legacy_dir)).?;
+        defer allocator.free(legacy.value);
+        const legacy_expected = try std.fmt.allocPrint(allocator, "{s}/example", .{owner});
+        defer allocator.free(legacy_expected);
+        try std.testing.expectEqual(.relative, legacy.source);
+        try std.testing.expectEqualStrings(legacy_expected, legacy.instanceIdentifier());
+    }
 }
 
 test "loaded model listing uses model directories and safe relative identifiers" {
@@ -21169,13 +21238,13 @@ pub const Node = struct {
         entry: model_manager_mod.RuntimeSnapshotEntry,
     ) !?[]const u8 {
         _ = self;
-        const identifier = (try loadedModelRequestIdentifierAlloc(
+        const identity = (try loadedModelRequestIdentityAlloc(
             allocator,
             io,
             canonical_models_dir,
             entry.model_dir,
         )) orelse return null;
-        return stripRuntimeTaskPrefix(identifier);
+        return identity.instanceIdentifier();
     }
 
     /// Build one resource per incarnation, independent of task catalog aliases.
