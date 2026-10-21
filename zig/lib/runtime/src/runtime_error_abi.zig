@@ -25,6 +25,7 @@ const std = @import("std");
 pub const abi_version: u32 = 1;
 
 test "runnable demand error remains append-only and rejects forged behavior" {
+    try std.testing.expectEqual(@backingInt(Detail.resolver_curation_conflict) + 1, @backingInt(Detail.invalid_embedding_identity));
     try std.testing.expectEqual(@backingInt(Detail.backend_runtime_unavailable) + 1, @backingInt(Detail.invalid_runnable_demand));
     const value = statusFromError(error.InvalidRunnableDemand);
     try std.testing.expectEqual(@backingInt(Code.invalid_argument), value.code);
@@ -908,6 +909,7 @@ pub const Detail = enum(c_int) {
     unsupported_constrained_schema,
     unsupported_generated_extraction_schema,
     resolver_curation_conflict,
+    invalid_embedding_identity,
     // Reserve a separate range for the unpublished pooling extension so future
     // main-branch additions cannot renumber either set of detail identities.
     runnable_wait_timeout = 0x10000,
@@ -1030,6 +1032,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.ChunkRequestFailed => status(.unavailable, .model_chunk_chunk_request_failed),
         error.ChunkUnitTooLarge => status(.invalid_argument, .model_chunk_chunk_unit_too_large),
         error.EmbeddingIdentityMismatch => status(.conflict, .model_chunk_embedding_identity_mismatch),
+        error.InvalidEmbeddingIdentity => status(.invalid_argument, .invalid_embedding_identity),
         error.EmptyEmbeddingInput => status(.invalid_argument, .model_chunk_empty_embedding_input),
         error.EmptyResponse => status(.unavailable, .model_chunk_empty_response),
         error.EmptySource => status(.invalid_argument, .model_chunk_empty_source),
@@ -1875,6 +1878,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .model_chunk_chunk_request_failed => "ChunkRequestFailed",
         .model_chunk_chunk_unit_too_large => "ChunkUnitTooLarge",
         .model_chunk_embedding_identity_mismatch => "EmbeddingIdentityMismatch",
+        .invalid_embedding_identity => "InvalidEmbeddingIdentity",
         .model_chunk_empty_embedding_input => "EmptyEmbeddingInput",
         .model_chunk_empty_response => "EmptyResponse",
         .model_chunk_empty_source => "EmptySource",
@@ -2939,6 +2943,7 @@ test "model-aware chunk failures preserve retry and source fencing semantics" {
         .{ .err = error.StaleChunkContinuation, .code = .conflict },
         .{ .err = error.SourceVersionChanged, .code = .conflict },
         .{ .err = error.EmbeddingIdentityMismatch, .code = .conflict },
+        .{ .err = error.InvalidEmbeddingIdentity, .code = .invalid_argument },
         .{ .err = error.IncompleteChunkCoverage, .code = .invalid_argument },
         .{ .err = error.ChunkOutputTooLarge, .code = .invalid_argument },
         .{ .err = error.MemoryBudgetExceeded, .code = .retryable },

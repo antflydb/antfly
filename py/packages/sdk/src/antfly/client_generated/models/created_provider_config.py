@@ -18,6 +18,7 @@ class CreatedProviderConfig:
         Attributes:
             provider (str): Configured provider discriminator.
             model (str | Unset): Configured provider model when applicable.
+            model_identity (str | Unset): Pinned immutable embedding asset and recipe identity.
             models (list[str] | Unset):
             project_id (str | Unset):
             location (str | Unset):
@@ -41,6 +42,7 @@ class CreatedProviderConfig:
 
     provider: str
     model: str | Unset = UNSET
+    model_identity: str | Unset = UNSET
     models: list[str] | Unset = UNSET
     project_id: str | Unset = UNSET
     location: str | Unset = UNSET
@@ -65,6 +67,8 @@ class CreatedProviderConfig:
         provider = self.provider
 
         model = self.model
+
+        model_identity = self.model_identity
 
         models: list[str] | Unset = UNSET
         if not isinstance(self.models, Unset):
@@ -115,6 +119,8 @@ class CreatedProviderConfig:
         )
         if model is not UNSET:
             field_dict["model"] = model
+        if model_identity is not UNSET:
+            field_dict["model_identity"] = model_identity
         if models is not UNSET:
             field_dict["models"] = models
         if project_id is not UNSET:
@@ -163,6 +169,8 @@ class CreatedProviderConfig:
 
         model = d.pop("model", UNSET)
 
+        model_identity = d.pop("model_identity", UNSET)
+
         models = cast(list[str], d.pop("models", UNSET))
 
         project_id = d.pop("project_id", UNSET)
@@ -204,6 +212,7 @@ class CreatedProviderConfig:
         created_provider_config = cls(
             provider=provider,
             model=model,
+            model_identity=model_identity,
             models=models,
             project_id=project_id,
             location=location,
