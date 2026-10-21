@@ -366,6 +366,25 @@ fn releaseClaims(txn: anytype, id: Id) !void {
         try txn.delete(&claimKey(id, hash));
     }
 }
+/// Complete assembled mutation roots must have been owned before the decision.
+/// The caller retains the writer/apply fence through materialization. The
+/// ordinary materialize path revalidates the full grant/claim set before release.
+pub fn validateMutationPlan(txn: anytype, id: Id, plan: @import("prepared_replay_plan.zig").Plan, original: ?control.Port) !void {
+    const grant = (try load(txn, id)) orelse return error.PreparedEffectsRequired;
+    if (grant.phase != .prepared) return error.PreparedEffectsConflict;
+    if (try plan.base.encodedBytes() > try grant.budget()) return error.InvalidHAOutbox;
+    for (plan.roots) |root| {
+        if (original) |port| try port.checkpoint();
+        const hash = try documentHash(root);
+        const held = (try owner(txn, hash)) orelse return error.PreparedEffectsMismatch;
+        if (!std.meta.eql(held, id)) return error.PreparedEffectsMismatch;
+        const raw = (try readOptional(txn, &claimKey(id, hash))) orelse return error.PreparedEffectsMismatch;
+        const claim = try Claim.decode(raw);
+        if (!std.meta.eql(claim.owner, id) or !std.meta.eql(claim.frame, grant.frame)) return error.PreparedEffectsMismatch;
+    }
+    if (original) |port| try port.checkpoint();
+}
+
 pub fn materialize(txn: anytype, id: Id, payload: []const u8) !bool {
     var grant = (try load(txn, id)) orelse return false;
     _ = try @import("db/derived/change_journal.zig").inspectBinaryRecord(payload, null);

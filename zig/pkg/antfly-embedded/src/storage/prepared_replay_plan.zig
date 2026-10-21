@@ -231,6 +231,34 @@ pub fn deriveWithPrimaryKeys(a: A, primary: PrimaryKeys, request: derived.Derive
     return .{ .allocator = a, .base = builder.base, .roots = roots };
 }
 
+/// Capture the complete assembled primary-store key footprint and canonical
+/// replay shape. Values are never read or retained. The owning preparation
+/// pipeline supplies its final physical writes/deletes, including auxiliary
+/// effects which cannot be reconstructed from an input DerivedBatch alone.
+pub fn deriveFromMutations(a: A, writes: anytype, deletes: []const []const u8, replay: []const u8, original: ?control.Port) !Plan {
+    const inspected = try @import("db/derived/change_journal.zig").inspectBinaryRecord(replay, original);
+    var builder: Builder = .{ .allocator = a, .original = original };
+    defer builder.deinit();
+    comptime assertFields(shape.Record, &.{ "changed_doc_keys", "deleted_doc_keys", "overwritten_doc_keys", "changed_artifact_keys" });
+    inline for (.{ "changed_doc_keys", "deleted_doc_keys", "overwritten_doc_keys", "changed_artifact_keys" }, 0..) |lane, index| {
+        @field(builder.base, lane) = .{ .count = inspected.key_counts[index], .key_bytes = inspected.key_bytes[index] };
+    }
+    // The canonical encoder omits empty lists. Reject alternate encodings
+    // rather than deriving a scalar size smaller than the actual wire record.
+    if (try builder.base.encodedBytes() != replay.len) return error.InvalidPreparedEffects;
+    for (writes) |write| {
+        try builder.checkpoint();
+        if (keys.isInternalUserKey(write.key)) try builder.physicalRoot(write.key);
+    }
+    for (deletes) |key| {
+        try builder.checkpoint();
+        if (keys.isInternalUserKey(key)) try builder.physicalRoot(key);
+    }
+    try builder.checkpoint();
+    const roots = try builder.roots.toOwnedSlice(a);
+    return .{ .allocator = a, .base = builder.base, .roots = roots };
+}
+
 const Fixture = struct {
     fn run(a: A) !void {
         const types = @import("db/types.zig");
@@ -426,6 +454,81 @@ test "prepared replay plan authoritative primary floor unwinds all owned allocat
             var plan = try deriveWithPrimaryKeys(a, .{ .writes = &.{ "binary\x00key", "other" }, .deletes = &.{"removed"} }, .{ .documents = &.{.{ .key = "other" }} }, .{}, if (checks != null) control.Port.init(&payload) else null);
             defer plan.deinit();
             try std.testing.expectEqual(@as(usize, 3), plan.roots.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Checks.run, .{@as(?*Checks, null)});
+    var baseline: Checks = .{};
+    try Checks.run(std.testing.allocator, &baseline);
+    for (1..baseline.calls + 1) |fail_at| {
+        var checks: Checks = .{ .fail_at = fail_at };
+        try std.testing.expectError(error.DeadlineExceeded, Checks.run(std.testing.allocator, &checks));
+    }
+}
+
+test "prepared replay plan assembled mutations capture every physical root without copying values" {
+    const a = std.testing.allocator;
+    const row = try keys.documentKeyAlloc(a, "row");
+    defer a.free(row);
+    const artifact = try keys.embeddingArtifactKeyForDocumentAlloc(a, "row", "v");
+    defer a.free(artifact);
+    const foreign = try keys.documentKeyAlloc(a, "group-result");
+    defer a.free(foreign);
+    const payload = try @import("db/derived/change_journal.zig").encodeRecord(a, .{ .sequence = 1, .changed_doc_keys = &.{ "row", "group-result" } });
+    defer a.free(payload);
+    const large_value: [65536]u8 = @splat('v');
+    const writes = [_]@import("docstore.zig").KVPair{
+        .{ .key = row, .value = &large_value },                           .{ .key = artifact, .value = &large_value },
+        .{ .key = "\x00\x00__metadata__:opaque", .value = &large_value },
+    };
+    var buffer: [4096]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&buffer);
+    var plan = try deriveFromMutations(bounded.allocator(), &writes, &.{ foreign, row }, payload, null);
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(usize, 2), plan.roots.len);
+    try std.testing.expectEqual(@as(u64, payload.len), try plan.base.encodedBytes());
+    try std.testing.expectEqual(@as(u64, 2), plan.base.changed_doc_keys.count);
+}
+
+test "prepared replay plan assembled mutations refuse malformed physical keys and noncanonical records" {
+    const a = std.testing.allocator;
+    const journal = @import("db/derived/change_journal.zig");
+    const empty = try journal.encodeRecord(a, .{ .sequence = 1 });
+    defer a.free(empty);
+    const writes = [_]@import("docstore.zig").KVPair{.{ .key = "\x01unterminated", .value = "ignored" }};
+    try std.testing.expectError(error.InvalidArgument, deriveFromMutations(a, &writes, &.{}, empty, null));
+    // A zero-length list can be inspected, but is not the encoder's canonical
+    // omission. Its four wire bytes must not disappear from a derived budget.
+    var alternate: [20]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 16), empty.len);
+    @memcpy(alternate[0..16], empty);
+    alternate[15] = 1;
+    std.mem.writeInt(u32, alternate[16..20], 0, .little);
+    const no_writes: []const @import("docstore.zig").KVPair = &.{};
+    try std.testing.expectError(error.InvalidPreparedEffects, deriveFromMutations(a, no_writes, &.{}, &alternate, null));
+}
+
+test "prepared replay plan assembled mutations unwind allocations and every original checkpoint" {
+    const Checks = struct {
+        calls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == self.fail_at) return error.DeadlineExceeded;
+        }
+        fn run(a: A, checks: ?*@This()) !void {
+            const backing = std.testing.allocator;
+            const row = try keys.documentKeyAlloc(backing, "row\x00binary");
+            defer backing.free(row);
+            const other = try keys.documentKeyAlloc(backing, "other");
+            defer backing.free(other);
+            const payload = try @import("db/derived/change_journal.zig").encodeRecord(backing, .{ .sequence = 1, .changed_doc_keys = &.{"row\x00binary"}, .deleted_doc_keys = &.{"other"} });
+            defer backing.free(payload);
+            const writes = [_]@import("docstore.zig").KVPair{.{ .key = row, .value = "not retained" }};
+            var owner: control.Payload = .{ .ptr = checks orelse undefined, .vtable = &.{ .checkpoint = check } };
+            var plan = try deriveFromMutations(a, &writes, &.{other}, payload, if (checks != null) control.Port.init(&owner) else null);
+            defer plan.deinit();
+            try std.testing.expectEqual(@as(usize, 2), plan.roots.len);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Checks.run, .{@as(?*Checks, null)});

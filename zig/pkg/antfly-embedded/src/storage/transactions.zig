@@ -3544,6 +3544,9 @@ pub const TxnManager = struct {
                     // publisher is temporarily absent. Outbox deletion is its
                     // separate acknowledgement; local replay consumption is not.
                     const entry = replay orelse return error.PreparedEffectsRequired;
+                    var physical_plan = try @import("prepared_replay_plan.zig").deriveFromMutations(self.alloc, writes, deletes, entry.payload, control);
+                    defer physical_plan.deinit();
+                    try @import("prepared_replay_credit.zig").validateMutationPlan(&batch, decision.id, physical_plan, control);
                     const key = makeTransactionReplicationReplayOutboxKey(decision.id);
                     try batch.put(&key, entry.payload);
                 },
@@ -8237,4 +8240,57 @@ test "prepared transaction effects replay seal derives primary floors from exact
     defer a.free(payload);
     try std.testing.expect((try f.manager.resolvePreparedIntents(F.id, 2, &accepted, .{ .deletes = &.{artifact}, .replay = .{ .sequence = 1, .payload = payload } }, null)).applied);
     try f.manager.clearReplicationOutbox(F.id, .replay);
+}
+
+test "prepared transaction effects assembled auxiliary mutations require preowned roots even when replay fits" {
+    const a = std.testing.allocator;
+    const F = PreparedReplaySealFixture;
+    for ([_]bool{ false, true }) |deleting| for ([_]bool{ false, true }) |covered| {
+        var f: F = .{};
+        try f.init();
+        defer f.deinit();
+        const frame = try f.frame();
+        defer a.free(frame);
+        const request: @import("db/derived/derived_types.zig").DerivedBatch = if (!covered) .{} else if (deleting)
+            .{ .deleted_keys = &.{"aux"} }
+        else
+            .{ .documents = &.{.{ .key = "aux" }} };
+        try f.manager.sealPreparedEffectsAndReplayPlan(F.id, frame, F.catalog, .deferred, null, request, .{}, null);
+        var accepted = (try f.manager.loadPreparedEffects(a, F.id, null)).?;
+        defer accepted.deinit();
+        const auxiliary = try internal_keys.documentKeyAlloc(a, "aux");
+        defer a.free(auxiliary);
+        const changed: []const []const u8 = if (deleting) &.{"row"} else &.{ "row", "aux" };
+        const payload = try @import("db/derived/change_journal.zig").encodeRecord(a, .{ .sequence = 1, .changed_doc_keys = changed, .deleted_doc_keys = if (deleting) &.{"aux"} else &.{} });
+        defer a.free(payload);
+        {
+            var read = try f.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expect(payload.len <= try (try F.credit.load(&read, F.id)).?.budget());
+        }
+        const writes = [_]docstore.KVPair{.{ .key = auxiliary, .value = "published" }};
+        const outcome = f.manager.resolvePreparedIntents(F.id, 2, &accepted, .{
+            .writes = if (deleting) &.{} else &writes,
+            .deletes = if (deleting) &.{auxiliary} else &.{},
+            .replay = .{ .sequence = 1, .payload = payload },
+        }, null);
+        if (covered) {
+            try std.testing.expect((try outcome).applied);
+            try std.testing.expect(!try f.manager.hasPreparedEffects(F.id));
+            if (!deleting) {
+                const value = try f.store.get(a, auxiliary);
+                defer a.free(value);
+                try std.testing.expectEqualStrings("published", value);
+            }
+            try f.manager.clearReplicationOutbox(F.id, .replay);
+        } else {
+            try std.testing.expectError(error.PreparedEffectsMismatch, outcome);
+            try std.testing.expect(try f.manager.hasPreparedEffects(F.id));
+            try std.testing.expectEqual(TxnStatus.pending, try f.manager.getTransactionStatus(F.id));
+            try std.testing.expectError(error.NotFound, f.store.get(a, auxiliary));
+            var read = try f.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqual(F.credit.Phase.prepared, (try F.credit.load(&read, F.id)).?.phase);
+        }
+    };
 }

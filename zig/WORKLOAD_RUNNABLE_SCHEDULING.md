@@ -5908,3 +5908,44 @@ derived-log quota, minimum executable recovery bundles, legacy/import/restore
 eligibility, normal required PREPARE negotiation and the original broader
 scheduler/default-policy scope remain incomplete. Strong provider defaults stay
 off and the full goal remains active.
+
+
+### Assembled physical mutations must use preowned document roots
+
+`deriveFromMutations` now derives the canonical replay shape and document-root
+projection from the final primary-store write/delete lists. It covers auxiliary
+physical user keys as well as original inputs; control/identity/replay metadata
+outside the document namespace does not invent document roots. It reads only
+keys and replay metadata, never mutation values, and returns owned root prefixes
+plus scalar wire totals. Noncanonical empty-list encodings are rejected rather
+than deriving a scalar size smaller than their wire representation.
+
+Funded committed resolution derives this plan from its complete assembled batch
+before materializing replay or deleting the frame. Every affected document root
+must have a matching owner and frame-bound claim in the existing grant, and the
+actual replay must fit its budget. A missing auxiliary root fails atomically even
+when the replay bytes fit; reserved auxiliary writes and deletions succeed.
+The ordinary materialization path still validates the entire grant/claim set
+before releasing claims. Transactions without grants retain their existing path.
+No ABI, reader version or durable format changes are introduced.
+
+Three new planner cases cover all physical key families through the common
+prefix projection, metadata exclusion, duplicate roots, malformed keys and
+noncanonical records. A 4 KiB bounded allocator successfully plans mutations
+with 64 KiB values, proving the planner does not copy those values. Caller-owned
+allocation failures and every enumerated original checkpoint unwind their
+owners. A new transaction case exercises auxiliary writes and absent deletions
+with both covered and unreserved roots, including byte budgets large enough for
+the refused replay. `prepared-physical-plan-v2.json` and its log record 141 test
+executions and 97/97 build steps, zero skips, failures or leaks.
+
+This is final assembled-key coverage at local resolution, not complete
+predecision capture or certification of values/read dependencies. The pure
+assembly derivation is shared groundwork for moving preparation before the vote;
+that move still needs an owned complete plan and retained schema/catalog/route
+and mutable read-set witnesses. Separate derived-log quota, minimum executable
+recovery RAM/CPU/I/O/dependency funding, migration/legacy eligibility, normal
+required PREPARE negotiation and original broader scheduling/default-policy
+scope remain incomplete. Strong provider defaults stay off. External HA-cluster,
+public source consumer and full provider/storage archive qualification were not
+rerun here. Full Linux qualification remains waived.
