@@ -1451,7 +1451,9 @@ test "backup preflight model chunker source references and inline media share ru
     try inspector.document("doc", "{\"body\":{\"type\":\"source\",\"uri\":\"s3://bucket/clip.mp4\",\"mime_type\":\"video/mp4\",\"version\":\"v1\",\"version_kind\":\"s3_version_id\",\"length\":419430400}}", "");
     try std.testing.expectEqual(@as(u64, 1), count(report, .connection));
     try std.testing.expectEqual(@as(u64, 0), count(report, .source_local));
-    try inspector.document("local", "{\"body\":{\"type\":\"source\",\"uri\":\"file:///private/clip.mp4\",\"mime_type\":\"video/mp4\",\"version\":\"v1\",\"length\":419430400}}", "");
+    const local = try std.json.Stringify.valueAlloc(a, .{ .body = .{ .type = "source", .uri = "https://localhost/clip.mp4", .mime_type = "video/mp4", .version = "\"v1\"", .length = 419430400 } }, .{});
+    defer a.free(local);
+    try inspector.document("local", local, "");
     try std.testing.expectEqual(@as(u64, 1), count(report, .source_local));
     try inspector.document("inline", "{\"body\":{\"type\":\"media\",\"mime_type\":\"image/png\",\"data\":\"AQID\"}}", "");
     try std.testing.expectEqual(@as(u64, 1), count(report, .embedded));
@@ -2549,4 +2551,53 @@ test "backup preflight definition substitutions may complete media delimiters" {
     try std.testing.expectEqual(@as(u64, 1), count(report, .source_external));
     try std.testing.expectEqual(@as(u64, 0), count(report, .source_unresolved));
     try std.testing.expect(report.analysis_complete);
+}
+
+test "backup preflight immutable source contracts cannot be overridden by capabilities" {
+    const a = std.testing.allocator;
+    const Case = struct {
+        uri: []const u8 = "https://example.org/clip.mp4",
+        version: []const u8,
+        version_kind: []const u8 = "strong_etag",
+        valid: bool = false,
+    };
+    const long_version: [4097]u8 = @splat('x');
+    for ([_]Case{
+        .{ .version = "" },
+        .{ .version = "v1" },
+        .{ .version = "W/\"v1\"" },
+        .{ .version = "\"bad\netag\"" },
+        .{ .version = &long_version },
+        .{ .version = "v1", .version_kind = "s3_version_id" },
+        .{ .uri = "s3://bucket/clip.mp4", .version = "null", .version_kind = "s3_version_id" },
+        .{ .uri = "data:video/mp4;base64,AQID", .version = "\"v1\"" },
+        .{ .uri = "gs://bucket/clip.mp4", .version = "v1", .version_kind = "s3_version_id" },
+        .{ .uri = "https://example.org/clip.mp4#page=2", .version = "\"v1\"" },
+        .{ .version = "\"v1\"", .valid = true },
+        .{ .uri = "s3://bucket/clip.mp4", .version = "v1", .version_kind = "s3_version_id", .valid = true },
+        .{ .uri = "s3://bucket/clip.mp4", .version = "\"etag\"", .valid = true },
+    }) |case| {
+        var report: Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        try inspector.metadataJson(
+            \\[{"name":"chunks","kind":"chunk","source_field":"body","chunker_json":"{\"provider\":\"antfly\",\"embedding\":{\"model\":\"media-model\",\"dimensions\":3}}"}]
+        );
+        const document_json = try std.json.Stringify.valueAlloc(a, .{ .body = .{ .type = "source", .uri = case.uri, .mime_type = "video/mp4", .version = case.version, .version_kind = case.version_kind, .length = 1024 } }, .{});
+        defer a.free(document_json);
+        try inspector.document("doc", document_json, "");
+        try std.testing.expectEqual(case.valid, report.analysis_complete);
+        try std.testing.expectEqual(@as(u64, if (case.valid) 0 else 1), count(report, .source_unresolved));
+        const caps = try a.alloc(Capability, report.requirements.items.len);
+        defer a.free(caps);
+        for (report.requirements.items, caps) |*r, *cap| cap.* = .{ .requirement_sha256 = &r.sha256, .supported = true, .query_embedding = true, .future_ingestion = true, .model_revision_verified = true, .preprocessing_verified = true, .vector_space_verified = true, .dimensions = r.dimensions };
+        const evidence = try std.json.Stringify.valueAlloc(a, Destination{ .version = 1, .configuration_id = "all-evidence", .requirements = caps }, .{});
+        defer a.free(evidence);
+        const json = try report.jsonAlloc(evidence);
+        defer a.free(json);
+        var parsed = try std.json.parseFromSlice(Value, a, json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(if (case.valid) "compatible" else "blocked", parsed.value.object.get("compatibility").?.object.get("verdict").?.string);
+    }
 }

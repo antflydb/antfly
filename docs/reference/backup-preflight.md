@@ -119,7 +119,11 @@ Model-aware chunking uses the execution path's source-input parser. Immutable
 source references contribute their URI's access requirements; inline media
 remains embedded. Its model requirement binds the enclosing chunk definition,
 including the source selector, chunk policy, embedding target and dimensions.
-Unrecognized or incomplete structured inputs remain unresolved.
+Source references use the range transport's shared offline validation for immutable
+pins, version kinds, supported schemes and URI bounds. Invalid contracts remain
+unresolved even when destination capabilities attest support. No transport or
+credential lookup is needed for this validation. Unrecognized or incomplete
+structured inputs remain unresolved.
 
 Active resolver catalogs include frozen adjudication models and credentials.
 Their model evidence binds the complete resolver policy. A resolver's

@@ -3038,3 +3038,62 @@ test "backup preflight Lite and portable preserve resolver and model media depen
         try std.testing.expect(std.mem.indexOf(u8, json, "s3://bucket") == null);
     }
 }
+
+test "backup preflight Lite and portable reject unpinned sources despite complete capabilities" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const lite_path = try std.fs.path.join(a, &.{ root, "unpinned.aflite" });
+    defer a.free(lite_path);
+    const portable_path = try std.fs.path.join(a, &.{ root, "unpinned.afb2" });
+    defer a.free(portable_path);
+    const catalog = try @import("../db/catalog/enrichment_catalog.zig").serializeCatalog(a, &.{.{ .name = "chunks", .kind = .chunk, .source_field = "body", .chunker_json = "{\"provider\":\"antfly\",\"embedding\":{\"model\":\"media-model\",\"dimensions\":3}}" }});
+    defer a.free(catalog);
+    {
+        var lite = try LiteDb.createWithOptions(a, lite_path, true, .{ .fsync = false });
+        defer lite.close();
+        try lite.db.core.store.put("\x00\x00__metadata__:enrichments", catalog);
+        const key = try internal_keys.documentKeyAlloc(a, "clip");
+        defer a.free(key);
+        try lite.db.core.store.put(key, "{\"body\":{\"type\":\"source\",\"uri\":\"https://example.org/clip.mp4\",\"mime_type\":\"video/mp4\",\"version\":\"\",\"length\":1024}}");
+        var file = try tmp.dir.createFile(io, "unpinned.afb2", .{});
+        defer file.close(io);
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        try portable_backup.exportPortableToWriter(a, lite.db.core.store, &writer.interface);
+        try writer.end();
+    }
+    for ([_][]const u8{ lite_path, portable_path }) |path| {
+        const inventory = try inspectInputJsonAlloc(a, path, null, .{});
+        defer a.free(inventory);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, inventory, .{});
+        defer parsed.deinit();
+        const requirements = parsed.value.object.get("inventory").?.object.get("requirements").?.array.items;
+        const caps = try a.alloc(preflight.Capability, requirements.len);
+        defer a.free(caps);
+        for (requirements, caps) |requirement, *cap| cap.* = .{
+            .requirement_sha256 = requirement.object.get("sha256").?.string,
+            .supported = true,
+            .query_embedding = true,
+            .future_ingestion = true,
+            .model_revision_verified = true,
+            .preprocessing_verified = true,
+            .vector_space_verified = true,
+            .dimensions = @intCast(requirement.object.get("dimensions").?.integer),
+        };
+        const evidence = try std.json.Stringify.valueAlloc(a, preflight.Destination{ .version = 1, .configuration_id = "all-evidence", .requirements = caps }, .{});
+        defer a.free(evidence);
+        const json = try inspectInputJsonAlloc(a, path, evidence, .{});
+        defer a.free(json);
+        var result = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer result.deinit();
+        const completeness = result.value.object.get("completeness").?;
+        try std.testing.expect(completeness.object.get("scan_complete").?.bool);
+        try std.testing.expect(!completeness.object.get("dependency_analysis_complete").?.bool);
+        try std.testing.expectEqualStrings("blocked", result.value.object.get("compatibility").?.object.get("verdict").?.string);
+        try std.testing.expect(result.value.object.get("source").?.object.get("sha256").? == .string);
+    }
+}

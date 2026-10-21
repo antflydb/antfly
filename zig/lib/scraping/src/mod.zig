@@ -772,23 +772,37 @@ pub const PinnedRange = struct {
     backend: ?union(enum) { http: httpx.Client, s3: objectstore.S3.Client } = null,
     headers: []const HTTPHeader = &.{},
 
-    pub fn create(alloc: Allocator, context: DownloadContext, uri: []const u8, version: []const u8, kind: VersionKind, length: u64, security: ?*const ContentSecurityConfig, credentials: ?*const S3CredentialsConfig, headers: []const HTTPHeader) !*PinnedRange {
-        try context.check();
-        if (length == 0 or version.len == 0 or version.len > 4096 or uri.len > 16 * 1024 or headers.len > 128) return error.InvalidSourceReference;
+    /// Validate the immutable source contract without allocation, credential
+    /// resolution, transport construction or I/O. Destination policy and
+    /// credentials are checked separately when creating the transport.
+    pub fn validateReference(uri: []const u8, version: []const u8, kind: VersionKind, length: u64) !std.Uri {
+        if (length == 0 or version.len == 0 or version.len > 4096 or uri.len > 16 * 1024) return error.InvalidSourceReference;
         if (kind == .strong_etag) {
             if (version.len < 2 or version[0] != '"' or version[version.len - 1] != '"') return error.ImmutableVersionRequired;
             for (version[1 .. version.len - 1]) |byte| if (byte < 0x21 or byte == 0x22 or byte == 0x7f) return error.ImmutableVersionRequired;
         } else if (std.mem.eql(u8, version, "null")) return error.ImmutableVersionRequired;
         const parsed = try std.Uri.parse(uri);
         if (parsed.user != null or parsed.password != null or parsed.fragment != null) return error.InvalidSourceReference;
+        if (std.ascii.eqlIgnoreCase(parsed.scheme, "http") or std.ascii.eqlIgnoreCase(parsed.scheme, "https")) {
+            if (kind != .strong_etag) return error.InvalidSourceReference;
+            try validateHttpUri(parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.scheme, "s3")) {
+            const host = parsed.host orelse return error.InvalidS3Url;
+            if (host.percent_encoded.len == 0 or trimLeftSlash(parsed.path.percent_encoded).len == 0) return error.InvalidS3Url;
+        } else return error.UnsupportedUrlScheme;
+        return parsed;
+    }
+
+    pub fn create(alloc: Allocator, context: DownloadContext, uri: []const u8, version: []const u8, kind: VersionKind, length: u64, security: ?*const ContentSecurityConfig, credentials: ?*const S3CredentialsConfig, headers: []const HTTPHeader) !*PinnedRange {
+        try context.check();
+        if (headers.len > 128) return error.InvalidSourceReference;
+        const parsed = try validateReference(uri, version, kind, length);
         const self = try alloc.create(PinnedRange);
         self.* = .{ .allocator = alloc, .context = context, .security = security, .kind = kind, .length = length, .headers = headers };
         errdefer self.destroy();
         self.uri = try alloc.dupe(u8, uri);
         self.version = try alloc.dupe(u8, version);
         if (std.ascii.eqlIgnoreCase(parsed.scheme, "http") or std.ascii.eqlIgnoreCase(parsed.scheme, "https")) {
-            if (kind != .strong_etag) return error.InvalidSourceReference;
-            try validateHttpUri(parsed);
             try validateUrlSecurity(parsed, security);
             self.identity = try alloc.dupe(u8, uri);
             for (headers) |header| {
@@ -2152,4 +2166,44 @@ test "pinned remote ranges enforce immutable length and version without whole ob
             try std.testing.expectEqualStrings("2345", &out);
         }
     }
+}
+
+test "pinned source reference validation is shared and requires no allocator or transport" {
+    const Case = struct {
+        uri: []const u8 = "https://example.org/clip.mp4",
+        version: []const u8 = "\"v1\"",
+        kind: PinnedRange.VersionKind = .strong_etag,
+        length: u64 = 1024,
+        expected: anyerror,
+    };
+    const long_version: [4097]u8 = @splat('x');
+    const long_uri: [16 * 1024 + 1]u8 = @splat('x');
+    const cases = [_]Case{
+        .{ .version = "", .expected = error.InvalidSourceReference },
+        .{ .version = "v1", .expected = error.ImmutableVersionRequired },
+        .{ .version = "W/\"v1\"", .expected = error.ImmutableVersionRequired },
+        .{ .version = "\"bad\"etag\"", .expected = error.ImmutableVersionRequired },
+        .{ .version = "\"bad\netag\"", .expected = error.ImmutableVersionRequired },
+        .{ .version = &long_version, .expected = error.InvalidSourceReference },
+        .{ .uri = &long_uri, .expected = error.InvalidSourceReference },
+        .{ .length = 0, .expected = error.InvalidSourceReference },
+        .{ .kind = .s3_version_id, .expected = error.InvalidSourceReference },
+        .{ .uri = "https://user:password@example.org/clip.mp4", .expected = error.InvalidSourceReference },
+        .{ .uri = "https://example.org/clip.mp4#page=2", .expected = error.InvalidSourceReference },
+        .{ .uri = "data:video/mp4;base64,AQID", .expected = error.UnsupportedUrlScheme },
+        .{ .uri = "gs://bucket/clip.mp4", .expected = error.UnsupportedUrlScheme },
+        .{ .uri = "s3://bucket/clip.mp4", .version = "null", .kind = .s3_version_id, .expected = error.ImmutableVersionRequired },
+        .{ .uri = "s3://bucket", .version = "v1", .kind = .s3_version_id, .expected = error.InvalidS3Url },
+    };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    for (cases) |case| {
+        try std.testing.expectError(case.expected, PinnedRange.validateReference(case.uri, case.version, case.kind, case.length));
+        // Runtime rejects the same contract before allocating or constructing
+        // an HTTP/S3 client; no destination credentials are required here.
+        try std.testing.expectError(case.expected, PinnedRange.create(failing.allocator(), .{ .io = std.testing.io }, case.uri, case.version, case.kind, case.length, null, null, &.{}));
+    }
+    _ = try PinnedRange.validateReference("https://example.org/clip.mp4", "\"v1\"", .strong_etag, 1024);
+    _ = try PinnedRange.validateReference("http://example.org/clip.mp4", "\"\"", .strong_etag, 1024);
+    _ = try PinnedRange.validateReference("s3://bucket/clip.mp4", "v1", .s3_version_id, 1024);
+    _ = try PinnedRange.validateReference("s3://endpoint/bucket/clip.mp4", "\"etag\"", .strong_etag, 1024);
 }
