@@ -2281,6 +2281,8 @@ def test_logical_retained_source_hint_profile(stateful_api):
                 "profile": profile,
             }
         )
+    with Path(os.environ["ANTFLY_BIN"]).open("rb") as binary:
+        binary_sha256 = hashlib.file_digest(binary, "sha256").hexdigest()
     destination = Path(report)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(
@@ -2288,9 +2290,7 @@ def test_logical_retained_source_hint_profile(stateful_api):
             {
                 "protocol": 1,
                 "platform": platform.platform(),
-                "binary_sha256": hashlib.sha256(
-                    Path(os.environ["ANTFLY_BIN"]).read_bytes()
-                ).hexdigest(),
+                "binary_sha256": binary_sha256,
                 "scope": "Warm retained source, distinct unindexed predicates; every measured request verifies the entire corpus. Latency includes HTTP and host contention. No predicate-hit speedup is included.",
                 "records": [
                     {

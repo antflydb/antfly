@@ -4193,3 +4193,80 @@ MCP schemas are regenerated. Complete cached predicate facts remain memory-only;
 validated whole-generation owner proofs allow reuse across equivalent cuts.
 Writes invalidate those proofs. Finer reuse across writes requires maintained
 per-segment source-binding certificates.
+
+
+### Review follow-up: bounded counts and prepared indexing
+
+The [review follow-up qualification](bench/results/grep-review-followup-summary.json)
+supersedes the preceding qualification for the server fixes below. It records
+frozen artifacts, paired trials, exact build commands, source hashes, unsuccessful
+diagnostic attempts, and remaining limits. Raw trials and logs are local ignored
+artifacts, not published downloads. The reference server is unstripped and the
+candidate is stripped; these comparisons do not isolate algorithm-only latency,
+executable-size, or RSS changes.
+
+The Python SDK preserves closed query variants through union decoding, including
+nested Boolean predicates and explicit `minimum_should_match` values. Public
+Boolean lowering preserves those thresholds through distributed execution.
+Supported complete cached Boolean counts borrow immutable membership facts and
+avoid allocating result bitmaps. Sparse negation uses cached cardinality and
+exceptions instead of traversing absent document words: the maximum-domain
+regression falls from 67,108,864 word-program steps to zero for one input and
+three for the nested example. This is bounded component work, not zero request
+cost. Authorization, query parsing, read-cut validation, and requested output
+still run.
+
+Lookup expiry maintenance retires at most eight heap entries plus the requested
+expired key, and frees retired ownership after releasing the cache mutex.
+Optional admission bounds its eviction search. Provider timing hints have a fixed
+capacity and TTL, influence batching only, and never certify predicate membership.
+The distinct-predicate fixture requires source verification on every request.
+
+Prepared text publication now enables the same private postings spill path as
+direct sink construction. Repeated physical-field contributions are grouped in
+stable order, analyzed one group at a time, and spilled before the next group.
+An explicit reclaiming scratch allocator owns transient maps and position
+vectors; encoded results retain separate ownership. The native preparation
+regression uses about 62.6 MiB of tracked build allocation in ReleaseFast under
+a 128 MiB allowance. Its opaque-region allocator regression reduces tracked
+construction peak from 36.8 to 21.6 MiB. These counters exclude process RSS and
+the rest of publication. Private runs use temporary disk scratch; no persistent
+query-result cache is added.
+
+The final server passes 21 integration/upgrade cases on each platform, with six
+opt-in skips. Debug and ReleaseFast each pass 84 logical-query, 144 query-contract,
+and 44 introducer cases plus the focused preparation regression, with no leaks;
+667 SDK tests and generation consistency pass. Linux additionally passes the
+actual ingestion fixture with two CPUs, 1 GiB RAM and swap disabled. That resolves
+the small-node admission failure recorded in the preceding qualification.
+
+Two alternating warm-filesystem rounds on this shared Apple Silicon host produce
+these HTTP medians in milliseconds. Linux uses native ARM64 instructions in the
+VM, two CPUs and 1 GiB for retrieval/concurrency; paired ingestion uses equal
+8 GiB envelopes. The separate 1 GiB check establishes candidate admission, not
+performance equivalence under the smaller envelope.
+
+| Workload | macOS reference → candidate | Linux reference → candidate |
+|---|---:|---:|
+| Tiny values | 7.65 → 6.93 | 9.22 → 9.76 |
+| Selected 4 KiB values | 9.50 → 9.76 | 14.97 → 15.45 |
+| Dominant selected 16 KiB values | 5.95 → 5.87 | 7.72 → 7.79 |
+| Unselected escaped arrays | 6.71 → 7.98 | 9.10 → 8.41 |
+| Nested source contract | 7.49 → 7.92 | 10.79 → 9.84 |
+| One concurrent client | 5.11 → 5.27 | 11.38 → 12.21 |
+| Four concurrent clients | 9.56 → 9.88 | 47.16 → 49.09 |
+| Repetitive ingestion | 148.20 → 146.21 | 363.70 → 358.85 |
+| Source-like ingestion | 133.68 → 140.83 | 388.94 → 384.64 |
+| Distinct-word ingestion | 1390.44 → 1572.54 | 1935.62 → 2113.11 |
+
+Results are mixed. Bounded spill fixes admission and reduces scratch retention,
+but distinct-word ingestion takes about 13% longer on macOS and 9% longer on
+Linux in this comparison. These trials establish neither a general latency win
+nor an RSS reduction. Process restarts and fixture-file cache advice do not
+establish cold-device performance.
+
+The broader cost target still requires coordinator-owned request-wide verification
+grants and maintained per-segment source-binding certificates. Current budgets
+remain per shard request, and writes invalidate whole-generation proofs. The
+[execution design](../../../docs/design/logical-field-queries.md) records ownership,
+fallback behavior, and the required fences for those remaining changes.
