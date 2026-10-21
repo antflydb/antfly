@@ -203,6 +203,10 @@ pub fn ObservedReader(comptime Store: type) type {
             if (self.observations) |captured| try captured.check();
             return .{ .txn = try self.store.beginProbeTxn(), .observations = self.observations };
         }
+        pub fn beginProbeTxnWithBlockCacheAdmission(self: @This(), mode: @import("../backend_types.zig").Namespace.BlockCacheAdmission) !Transaction {
+            if (self.observations) |captured| try captured.check();
+            return .{ .txn = try self.store.beginProbeTxnWithBlockCacheAdmission(mode), .observations = self.observations };
+        }
         pub fn beginReadTxn(self: @This()) !Transaction {
             if (self.observations) |captured| try captured.check();
             return .{ .txn = try self.store.beginReadTxn(), .observations = self.observations };

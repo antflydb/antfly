@@ -3028,7 +3028,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (persisted_range) |range| try S.ownerField(self, "core").*.index_manager.validateRangeTransition(range);
             try appendDenseArtifactCounterMutations(
                 S.ownerField(self, "alloc").*,
-                S.ownerField(self, "core").*.store,
+                observed_store,
                 S.ownerField(self, "core").*.index_manager,
                 &store_writes,
                 delete_keys.items,
@@ -3042,7 +3042,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // responsible only for requests retained in generated_enrichment_refs.
             // Local producer receipts are fenced by the latest primary mutation,
             // not by the immutable document identity. Stamp in the primary batch.
-            if (S.ownerField(self, "core").*.hasGeneratedEnrichmentTargets() and !try orderedCoverageActive(S.ownerField(self, "core").*.store)) {
+            if (S.ownerField(self, "core").*.hasGeneratedEnrichmentTargets() and !try orderedCoverageActive(observed_store)) {
                 const readiness = @import("artifact_producer_readiness.zig");
                 for (identity_upsert_keys.items, identity_upsert_write_indexes.items) |document, write_index| {
                     // An identical logical row creates no producer replay debt.
@@ -3076,7 +3076,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer local_coverage_guard.release();
             try appendPrecomputedCoverageOutcomeMutations(
                 S.ownerField(self, "alloc").*,
-                S.ownerField(self, "core").*.store,
+                observed_store,
                 S.ownerField(self, "core").*.index_manager,
                 precomputed_generated.coverage_outcomes,
                 sequence,
@@ -5560,7 +5560,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return open_mode == .query_readonly or open_mode == .status_only;
         }
 
-        pub fn orderedCoverageActive(store: *docstore_mod.DocStore) !bool {
+        pub fn orderedCoverageActive(store: anytype) !bool {
             var probe = try store.beginProbeTxnWithBlockCacheAdmission(.transient);
             defer probe.abort();
             return try @import("artifact_publication.zig").authority(&probe) != null;

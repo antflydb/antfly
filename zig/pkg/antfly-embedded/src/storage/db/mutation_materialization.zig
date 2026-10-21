@@ -412,7 +412,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn appendDenseArtifactCounterMutations(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             index_manager: *const index_manager_mod.IndexManager,
             store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
             delete_keys: []const []const u8,
@@ -433,7 +433,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn appendDenseArtifactCounterMutationsWithPromotions(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             index_manager: *const index_manager_mod.IndexManager,
             store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
             delete_keys: []const []const u8,
@@ -717,7 +717,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn applyDenseArtifactCounterDelta(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             catalog: *const DenseArtifactCounterCatalog,
             mutations: *std.AutoHashMapUnmanaged(usize, PendingDenseArtifactCounterMutation),
             artifact_key: []const u8,
@@ -956,7 +956,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn loadDenseArtifactCounterBootstrap(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             index_name: []const u8,
         ) !?DenseArtifactCounterBootstrap {
             const key = try denseArtifactCounterBootstrapKeyAlloc(alloc, index_name);
@@ -969,7 +969,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return try decodeDenseArtifactCounterBootstrap(raw);
         }
 
-        pub fn loadDenseArtifactTargetCounter(alloc: Allocator, store: *docstore_mod.DocStore, index_name: []const u8) !?u64 {
+        pub fn loadDenseArtifactTargetCounter(alloc: Allocator, store: anytype, index_name: []const u8) !?u64 {
             const key = try denseArtifactTargetCounterKeyAlloc(alloc, index_name);
             defer alloc.free(key);
             const raw = store.get(alloc, key) catch |err| switch (err) {
@@ -2839,7 +2839,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn appendPrecomputedCoverageOutcomeMutations(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             index_manager: *index_manager_mod.IndexManager,
             outcomes: []const PrecomputedCoverageOutcome,
             source_sequence: u64,
@@ -7409,7 +7409,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn derivedCoverageOutcomeCounterValueForStore(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             index_name: []const u8,
             generation: u64,
             outcome: []const u8,
@@ -9260,7 +9260,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn loadDerivedCoverageOutcomeCounterFromStore(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             index_name: []const u8,
             generation: u64,
             outcome: []const u8,
@@ -11844,7 +11844,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn scanDerivedCoverageOutcomeFromStore(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             index_name: []const u8,
             generation: u64,
             outcome: []const u8,

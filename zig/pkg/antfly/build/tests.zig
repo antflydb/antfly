@@ -6103,6 +6103,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("docstore-required-prepare-db-test", "Verify durable required preparation through DB intent, resolution and recovery paths")
         .dependOn(&addCuratedTestRunArtifact(b, required_prepare_db_tests, &.{ "db prepared transaction effects required", "ordered artifact inventory DB authored acceptance survives projection and reopen" }).step);
+    const counter_materialization_filters = [_][]const u8{
+        "db inline dense coverage counters rebase with range ownership",
+        "db dense artifact counter bootstrap combines snapshot with concurrent write delta",
+        "db dense artifact counter bootstrap fences stale concurrent attempt",
+        "db dense artifact counters include derived chunk embedding artifacts",
+    };
+    const counter_materialization_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &counter_materialization_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("docstore-counter-materialization-test", "Verify artifact counter deltas, bootstrap fencing and range coverage")
+        .dependOn(&addCuratedTestRunArtifact(b, counter_materialization_tests, &counter_materialization_filters).step);
     const prepared_contender_filters = [_][]const u8{ "db graph untimed migration", "db graph ttl projects source contenders across reopen", "db portable restore rebuilds multi-source graph contender provenance" };
     const prepared_contender_tests = b.addTest(.{
         .root_module = antfly_test_mod,

@@ -146395,3 +146395,160 @@ test "db prepared transaction effects required speculative graph TTL captures un
         try std.testing.expectError(cause, Checks.run(a, db.core.store, key, &checks));
     };
 }
+
+const PreparedCounterObservationTest = struct {
+    const reads = @import("prepared_read_set.zig");
+    fn dense(alloc: Allocator, db: *DB, captured: *reads.Owned, artifact: []const u8, payload: []const u8, promotion: ?[]const u8) !void {
+        // Assembly scratch must die before the retained read set is validated.
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
+        var keys: std.ArrayListUnmanaged([]u8) = .empty;
+        var values: std.ArrayListUnmanaged([]u8) = .empty;
+        if (promotion == null) try writes.append(a, .{ .key = artifact, .value = payload });
+        const promotions: []const enrichment_runtime_mod.GeneratedArtifactPromotion = if (promotion) |staged| &.{.{ .staged_key = staged, .final_key = artifact }} else &.{};
+        try DB.appendDenseArtifactCounterMutationsWithPromotions(a, reads.observe(db.core.store, captured), db.core.index_manager, &writes, &.{}, promotions, &keys, &values);
+        try captured.finish();
+    }
+    fn coverage(alloc: Allocator, db: *DB, captured: *reads.Owned) !void {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
+        var keys: std.ArrayListUnmanaged([]u8) = .empty;
+        var values: std.ArrayListUnmanaged([]u8) = .empty;
+        const outcomes = [_]PrecomputedCoverageOutcome{.{ .index_name = @constCast("vector"), .doc_key = @constCast("doc\x00a"), .outcome = .produced }};
+        try appendPrecomputedCoverageOutcomeMutations(a, reads.observe(db.core.store, captured), db.core.index_manager, &outcomes, 17, &writes, &keys, &values);
+        try captured.finish();
+    }
+};
+
+test "db prepared transaction effects required dense counter observations retain overwrite absence bootstrap and staged promotion inputs" {
+    const a = std.testing.allocator;
+    const H = PreparedCounterObservationTest;
+    var directory = try TestDirectory.init("prepared-counter-observations");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .start_independent_maintenance = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "vector", .kind = .dense_vector, .config_json = "{\"field\":\"v\",\"dims\":3,\"external\":true}", .coverage_generation = 42 });
+    const artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "doc\x00a", "vector");
+    defer a.free(artifact);
+    const payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, null, &.{ 1, 2, 3 });
+    defer a.free(payload);
+    const counter = try DB.denseArtifactTargetCounterKeyAlloc(a, "vector");
+    defer a.free(counter);
+    const bootstrap = try DB.denseArtifactCounterBootstrapKeyAlloc(a, "vector");
+    defer a.free(bootstrap);
+    const staged = "\x00\x00prepared-counter-stage";
+    const one = [_]u8{ 1, 0, 0, 0, 0, 0, 0, 0 };
+    for (0..4) |mode| {
+        try db.core.store.putBatch(&.{}, &.{ artifact, counter, bootstrap, staged });
+        if (mode != 1) try db.core.store.put(artifact, payload);
+        if (mode < 2) try db.core.store.put(counter, &one);
+        if (mode == 2) {
+            var bytes: [DB.dense_artifact_counter_bootstrap_encoded_len]u8 = undefined;
+            DB.encodeDenseArtifactCounterBootstrap(.{ .repair_id = 1, .attempt_id = 2, .delta = 0 }, &bytes);
+            try db.core.store.put(bootstrap, &bytes);
+        }
+        if (mode == 3) try db.core.store.put(staged, payload);
+        var dependencies = try PreparedDependencyTest.capture(&db, &.{}, &.{});
+        defer dependencies.deinit();
+        var captured = H.reads.Owned.init(a, null);
+        defer captured.deinit();
+        try H.dense(a, &db, &captured, artifact, payload, if (mode == 3) staged else null);
+        dependencies.metadata_reads = try captured.take();
+        try PreparedDependencyTest.validate(&db, &dependencies);
+        // Control metadata is independent of the artifact/counter inputs.
+        try db.core.store.put("\x00\x00prepared-counter-control-ack", "ack");
+        try PreparedDependencyTest.validate(&db, &dependencies);
+        const selected: []const []const u8 = if (mode == 3) &.{ artifact, counter, bootstrap, staged } else if (mode == 2) &.{ artifact, counter, bootstrap } else &.{ artifact, counter };
+        for (selected) |key| {
+            const old = db.core.store.get(a, key) catch |err| if (err == error.NotFound) null else return err;
+            defer if (old) |raw| a.free(raw);
+            try db.core.store.put(key, "changed input");
+            try std.testing.expectError(error.PreparedReadSetChanged, PreparedDependencyTest.validate(&db, &dependencies));
+            if (old) |raw| try db.core.store.put(key, raw) else try db.core.store.delete(key);
+            try PreparedDependencyTest.validate(&db, &dependencies);
+        }
+    }
+}
+
+test "db prepared transaction effects required coverage observations retain authority counters outcomes and fallback scan gaps" {
+    const a = std.testing.allocator;
+    const H = PreparedCounterObservationTest;
+    var directory = try TestDirectory.init("prepared-coverage-observations");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .start_independent_maintenance = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "vector", .kind = .dense_vector, .config_json = "{\"field\":\"v\",\"dims\":3,\"external\":true}", .coverage_generation = 42 });
+    const marker = try internal_keys.derivedCoverageOutcomeKeyAlloc(a, "vector", 42, "doc\x00a");
+    defer a.free(marker);
+    const other = try internal_keys.derivedCoverageOutcomeKeyAlloc(a, "vector", 42, "other");
+    defer a.free(other);
+    const counter = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(a, "vector", 42, "produced");
+    defer a.free(counter);
+    const authority = @import("artifact_publication.zig").authority_key;
+    for ([_]bool{ false, true }) |counter_present| {
+        try db.core.store.put(marker, "skipped");
+        if (counter_present) try db.core.store.put(counter, &@as([8]u8, @splat(0))) else try db.core.store.delete(counter);
+        var dependencies = try PreparedDependencyTest.capture(&db, &.{}, &.{});
+        defer dependencies.deinit();
+        var captured = H.reads.Owned.init(a, null);
+        defer captured.deinit();
+        try H.coverage(a, &db, &captured);
+        dependencies.metadata_reads = try captured.take();
+        try PreparedDependencyTest.validate(&db, &dependencies);
+        for ([_][]const u8{ marker, counter, authority }) |key| {
+            const old = db.core.store.get(a, key) catch |err| if (err == error.NotFound) null else return err;
+            defer if (old) |raw| a.free(raw);
+            try db.core.store.put(key, "changed input");
+            try std.testing.expectError(error.PreparedReadSetChanged, PreparedDependencyTest.validate(&db, &dependencies));
+            if (old) |raw| try db.core.store.put(key, raw) else try db.core.store.delete(key);
+            try PreparedDependencyTest.validate(&db, &dependencies);
+        }
+        // Even an inserted non-produced result changes the fallback scan's
+        // transcript. Absence/gap reads cannot be reduced to the old count.
+        try db.core.store.put(other, "terminal_failed");
+        try std.testing.expectError(error.PreparedReadSetChanged, PreparedDependencyTest.validate(&db, &dependencies));
+        try db.core.store.delete(other);
+        try PreparedDependencyTest.validate(&db, &dependencies);
+    }
+}
+
+test "db prepared transaction effects required counter observation allocations and original rejection unwind" {
+    const a = std.testing.allocator;
+    const H = PreparedCounterObservationTest;
+    const admission = @import("../../common/read_admission.zig");
+    const Checks = struct {
+        calls: usize = 0,
+        stop: usize = std.math.maxInt(usize),
+        cause: anyerror = error.NotFound,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == self.stop) return self.cause;
+        }
+        fn run(alloc: Allocator, db: *DB, checks: ?*@This()) !void {
+            var payload: admission.Payload = .{ .ptr = checks orelse undefined, .vtable = &.{ .checkpoint = check } };
+            var captured = H.reads.Owned.init(alloc, if (checks != null) admission.Port.init(&payload) else null);
+            defer captured.deinit();
+            H.coverage(alloc, db, &captured) catch |err| return captured.failure orelse err;
+            var sealed = try captured.take();
+            defer sealed.deinit();
+            try sealed.validate(db.core.store, null);
+        }
+    };
+    var directory = try TestDirectory.init("prepared-counter-refusals");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .start_independent_maintenance = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "vector", .kind = .dense_vector, .config_json = "{\"field\":\"v\",\"dims\":3,\"external\":true}", .coverage_generation = 42 });
+    try std.testing.checkAllAllocationFailures(a, Checks.run, .{ &db, @as(?*Checks, null) });
+    var baseline: Checks = .{};
+    try Checks.run(a, &db, &baseline);
+    for ([_]anyerror{ error.NotFound, error.OutOfMemory, error.DeadlineExceeded }) |cause| for (1..baseline.calls + 1) |stop| {
+        var checks: Checks = .{ .stop = stop, .cause = cause };
+        try std.testing.expectError(cause, Checks.run(a, &db, &checks));
+    };
+}

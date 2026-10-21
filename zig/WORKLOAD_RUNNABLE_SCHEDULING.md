@@ -6493,3 +6493,35 @@ native commands exited zero and source hashes remained unchanged. Evidence:
 post-guards-main-v1.json/log in the cumulative integration receipt directory.
 Full Linux qualification remains waived. Strong defaults and normal required
 PREPARE drivers remain off; the full design is incomplete. No push.
+
+### Counter and coverage preparation observations (2026-10-21)
+
+Dense-artifact counter assembly and precomputed coverage now use the retained
+observed reader. Capture includes sorted artifact overwrite/absence probes,
+target counters and bootstrap state, staged promotion bytes, ordered producer
+authority, terminal outcome markers/counters and fallback scan transcripts.
+The helper chain accepts the read-only preparation surface; ordinary callers
+retain the existing DocStore path. Added the observed transient probe adapter,
+without exposing raw transactions or adding mutable runtime fields.
+
+Three new required-preparation DB regressions prove scratch retirement, binary
+keys, existing/missing/changed metadata, fallback gap insertion, unrelated ACK
+progress, allocation cleanup and exact original NotFound/OOM/deadline rejection.
+Added docstore-counter-materialization-test for four existing counter delta,
+range ownership, bootstrap and derived-chunk regressions. Final receipt
+prepared-counter-observations-v3: all four native commands exit0, 5491 input
+hashes unchanged, 79/79 build steps. Coverage is 171 passing cases (45 required
+DB, 71 effects, four counter behavior, 43/1/7 failure contracts), no skips,
+failures or leaks. The 116 unchanged DB/effects cases reuse successful v2 runs;
+v3 freshly executes four counter cases and 51 contract cases. Only the added
+build target differs from v2. V1 failed solely on a fixture helper reference,
+corrected before v2; v2 passes all 167 cases.
+
+These are optimistic observations checked under apply, not durable arbitrary
+metadata/range exclusion across a global decision. Live core/cache/policy/route
+inputs, complete pure assembly, executable recovery funding and derived-log
+quota, owner lifetimes, raw-writer/import/restore/restart/peer eligibility, normal
+required PREPARE drivers and broader scheduler/default/session rollout remain
+open. Existing metadata guard predicates and private ABI epochs are unchanged.
+Strong defaults remain off. No full archive/public-consumer requalification;
+full Linux qualification remains waived. No push; full goal remains active.
