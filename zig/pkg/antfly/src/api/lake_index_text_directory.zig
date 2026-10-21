@@ -176,6 +176,7 @@ pub const Mutations = struct {
     forest: @import("lake_index_delta_runs.zig").Forest,
     reduction: @FieldType(tree.Store, "reduce") = null,
     ordinal: u64 = 0,
+    addition_first: bool = false,
     pub fn init(a: A, manager: *local.sql_spill.Manager, storage: tree.Store) Mutations {
         var sort = local.sql_spill.Sort.init(a, manager, &.{.{}}, 1024 * 1024);
         sort.shared_runs = true;
@@ -210,6 +211,7 @@ pub const Mutations = struct {
             sort: *local.sql_spill.Sort,
             scratch: std.heap.ArenaAllocator,
             owned: std.heap.ArenaAllocator,
+            addition_first: bool,
             pending: ?local.sql_operators.Row = null,
             pub fn next(self_: *@This()) !?tree.Cursor.Record {
                 _ = self_.owned.reset(.retain_capacity);
@@ -221,14 +223,15 @@ pub const Mutations = struct {
                 while (self_.pending) |next_| {
                     if (!std.mem.eql(u8, k, next_.keys[0].value.string)) break;
                     const value = next_.values[0];
-                    encoded = if (value.sql_null or value.value == .null) &.{0} else try std.mem.concat(a, u8, &.{ &.{1}, value.value.string });
+                    if (!self_.addition_first or encoded.len == 0 or encoded[0] == 0 or (!value.sql_null and value.value != .null))
+                        encoded = if (value.sql_null or value.value == .null) &.{0} else try std.mem.concat(a, u8, &.{ &.{1}, value.value.string });
                     _ = self_.scratch.reset(.retain_capacity);
                     self_.pending = try self_.sort.next(self_.scratch.allocator());
                 }
                 return .{ .key = k, .value = encoded };
             }
         };
-        var source: Source = .{ .sort = &self.sort, .scratch = .init(self.a), .owned = .init(self.a) };
+        var source: Source = .{ .sort = &self.sort, .scratch = .init(self.a), .owned = .init(self.a), .addition_first = self.addition_first };
         defer source.scratch.deinit();
         defer source.owned.deinit();
         try self.forest.add(&source);
@@ -335,6 +338,15 @@ pub const Publisher = struct {
     }
     pub fn add(self: *Publisher, group: corpus.FileGroup, ref: Chunk, deleting: bool) !void {
         try self.metadata.add(group, ref, deleting);
+    }
+    /// Final additions supersede removals regardless of lazy discovery order.
+    /// This affects private mutation runs only; persisted directory values keep
+    /// their existing format and the prior roots are updated exactly once.
+    pub fn preferAdditions(self: *Publisher) void {
+        inline for (.{ "files", "segments", "routing" }) |name| {
+            @field(self, name).addition_first = true;
+            @field(self, name).forest.policy = .addition_first;
+        }
     }
     pub fn finish(self: *Publisher, old: Roots) !Roots {
         return .{ .files = try self.files.finish(old.files), .segments = try self.segments.finish(old.segments), .routing = try self.routing.finish(old.routing) };
@@ -1247,3 +1259,33 @@ pub const SelectedCursor = struct {
         return if (count == 0) null else .{ .identities = output[0..count], .doc_offset = 0 };
     }
 };
+
+test "external lake serving metadata additions override late deletions within and across durable runs" {
+    const a = std.testing.allocator;
+    var temporary = try local.common_test_directory.TestDirectory.init("serving-directory-addition-priority");
+    defer temporary.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, temporary.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(7), 1, std.testing.io);
+    var publisher: Publisher = undefined;
+    try publisher.init(a, &store, .none, std.testing.io);
+    defer publisher.deinit();
+    publisher.preferAdditions();
+    const id = corpus.term_directory.identity("replacement");
+    const removed = corpus.term_directory.identity("removed");
+    try publisher.files.add(id, "replacement", 11);
+    try publisher.files.add(id, null, 11);
+    try publisher.files.flush();
+    try publisher.files.add(id, null, 11);
+    try publisher.files.add(removed, null, 3);
+    try publisher.files.flush();
+    try publisher.files.add(id, "newest", 6);
+    try publisher.files.add(id, null, 6);
+    const root = (try publisher.files.finish(null)).?;
+    try std.testing.expectEqual(@as(u64, 1), root.records);
+    var cursor = try tree.Cursor.init(a, publisher.pages.store(), root, "", null);
+    defer cursor.deinit();
+    try std.testing.expectEqualStrings("newest", (try cursor.next()).?.value);
+    try std.testing.expect(try cursor.next() == null);
+}

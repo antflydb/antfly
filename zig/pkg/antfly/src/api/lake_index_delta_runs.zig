@@ -19,7 +19,7 @@ const std = @import("std");
 const tree = @import("../serverless/graph_segment/page_tree.zig");
 const A = std.mem.Allocator;
 pub const Run = struct { page: tree.Ref, level: u8 };
-pub const Policy = enum { sum, contribution, latest };
+pub const Policy = enum { sum, contribution, latest, addition_first };
 pub const Forest = struct {
     a: A,
     store: tree.Store,
@@ -96,6 +96,10 @@ pub const Forest = struct {
                     self_.advance_right = order != .lt;
                     if (order != .eq) return if (order == .lt) self_.l else self_.r;
                     if (self_.policy == .latest) return self_.r;
+                    if (self_.policy == .addition_first) {
+                        if (self_.l.?.value.len == 0 or self_.r.?.value.len == 0) return error.InvalidNativeLakeDeltaRun;
+                        return if (self_.l.?.value[0] > self_.r.?.value[0]) self_.l else self_.r;
+                    }
                     const l = self_.l.?;
                     const r = self_.r.?;
                     if (l.value.len < 8 or r.value.len < 8) return error.InvalidNativeLakeDeltaRun;

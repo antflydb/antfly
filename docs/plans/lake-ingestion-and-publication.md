@@ -3370,3 +3370,59 @@ releases the reducer memory, and verifies successful required publication with
 no retained buffers or reservations. Transport overlap and absence of redundant
 fresh-manifest GETs are deterministic contracts; archive/cloud latency and the
 write cost of the two directory phases still require controlled measurement.
+
+
+### Local compaction intermediates, metadata replay, and optional-memory isolation
+
+Intermediate serving tiers now use operation-private SQL spill files instead of
+uploading segments and summaries that a later tier immediately reads and merges.
+Only final packs produce seekable artifacts and term summaries. Private inputs
+carry explicit retained file ownership, and range readers borrow that ownership
+until the merge drains. The existing four tiers and eight-input fan-in bound
+resident descriptors and open files; a separate 64 MiB spill quota bounds their
+live payloads. Files are unlinked on creation and closed on success, allocation
+failure, backend error, or cancellation. Local range reads and writes use the
+publication I/O capability, and each tier releases its merge workspace before
+opening the next. Final roots retain ordinary durable references only; restart
+and fenced publication continue through the canonical durable maintenance state.
+
+Canonical metadata reducers write a sequential, authenticated local replay while
+they decode changed manifests. Serving compaction consumes that replay directly,
+including expanded source spans. It retains no per-file memory index. The replay
+has a 128 MiB disk quota and checks source identity, frame size, payload checksum,
+and decoded group validity. If that optional cache fills, its complete prefix
+remains usable and subsequent files use authenticated artifact reads. This avoids
+repeated remote metadata transport for the cached prefix without requiring an
+archive-sized memory queue or unbounded disk. Replay files share the normal
+private spill lifecycle and never become publication dependencies. Optional
+cache-write failures discard any partial replay and retain the ordinary artifact
+path; replay decode OOM releases partial allocations and cached buffers before
+retrying the required paged manifest path. Cancellation and integrity failures
+remain explicit errors.
+
+Serving file, segment, and routing updates now use three bounded mutation sorts
+and one update of each prior root. Their private delta runs explicitly prefer
+additions over removals, including when lazy tier activation discovers a removal
+later. Equal-priority writes retain chronological order. This replaces the two
+separate deletion/addition directory applications and preserves existing durable
+page values and lookup semantics.
+
+Optional manifest prefetch no longer borrows the required reducer's working-set
+quota. It reserves its own bounded retained bytes through node-level admission
+before launching a transient I/O task. That reservation survives task completion
+until the result is consumed or canceled; a separate allocator enforces the same
+byte bound, and completed results retain no I/O slot. Required reducer work may
+use its full already-admitted quota while prefetch is running or complete. Node
+memory saturation declines prefetch, and optional allocation failures still fall
+back to required authenticated reads. This supersedes the earlier shared-quota
+prefetch pressure behavior described above.
+
+Deterministic regressions cover successful and in-flight prefetch under a fully
+used required quota, retained node-reservation release, optional OOM fallback,
+replay identity/integrity and quota fallback, and interleaved additions/removals
+across private durable runs. The 128-file cross-file compaction case publishes one
+final seekable segment and reads zero canonical manifests through the provider
+when supplied its local replay; coordinate, rank, restart, append, replacement,
+and removal checks remain in that same test. Allocation fault injection checks
+private segment file/allocator cleanup. These contracts establish work reduction;
+cloud latency and identical full-archive throughput remain qualification work.

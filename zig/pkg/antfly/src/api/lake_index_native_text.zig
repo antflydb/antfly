@@ -441,18 +441,20 @@ pub const ManifestReader = struct {
     store: stores.ArtifactStore,
     domain: [32]u8,
     token: Cancellation,
-    pending: ?struct { ref: artifacts.ChunkRef, task: local.sql_parallel_scheduler.Task(anyerror![]u8) } = null,
+    speculative: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = 0 },
+    pending: ?struct { ref: artifacts.ChunkRef, task: local.sql_parallel_scheduler.Task(anyerror![]u8), scheduler: *local.sql_parallel_scheduler.Scheduler, reservation: usize } = null,
     pub fn deinit(self: *ManifestReader) void {
         if (self.pending) |*pending| {
             const bytes = pending.task.cancel(self.store.io_phase.?.io) catch null;
-            if (bytes) |value| self.a.free(value);
+            if (bytes) |value| self.speculative.allocator().free(value);
+            pending.scheduler.releasePull(0, pending.reservation);
         }
         self.pending = null;
     }
     fn fetch(self: *ManifestReader, ref: artifacts.ChunkRef) anyerror![]u8 {
         var backend = self.store;
         backend.io_phase = null;
-        return artifacts.readArtifact(self.a, backend, ref, self.token, null);
+        return artifacts.readArtifact(self.speculative.allocator(), backend, ref, self.token, null);
     }
     pub fn prefetch(self: *ManifestReader, ref: artifacts.ChunkRef) void {
         if (self.pending != null) return;
@@ -465,8 +467,16 @@ pub const ManifestReader = struct {
         const available = @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(self.a) orelse return;
         const bytes: usize = @intCast(ref.byte_len);
         if (available < bytes * 3 + 64 * 1024) return;
-        const task = scheduler.submitIoTransient(phase.io, bytes * 2, fetch, .{ self, ref }) orelse return;
-        self.pending = .{ .ref = ref, .task = task };
+        // Optional retained memory has its own node reservation. It must not
+        // consume the already-admitted reducer quota, even while in flight.
+        const reservation = bytes * 2 + 64 * 1024;
+        if (!scheduler.reservePull(0, reservation)) return;
+        self.speculative.limit = reservation;
+        const task = scheduler.submitIoTransient(phase.io, 0, fetch, .{ self, ref }) orelse {
+            scheduler.releasePull(0, reservation);
+            return;
+        };
+        self.pending = .{ .ref = ref, .task = task, .scheduler = scheduler, .reservation = reservation };
     }
     pub fn load(self: *ManifestReader, a: A, ref: artifacts.ChunkRef) !FileGroup {
         try self.token.check();
@@ -479,11 +489,14 @@ pub const ManifestReader = struct {
                 // admission waits for the child, without holding a CPU lane.
                 var phase = try self.store.beginIo(1);
                 defer phase.abort();
+                const scheduler = pending.scheduler;
+                const reservation = pending.reservation;
                 const result = pending.task.await(self.store.io_phase.?.io);
+                defer scheduler.releasePull(0, reservation);
                 self.pending = null;
                 const bytes = result catch |err| {
-                    // Speculation may lose its allocation headroom while the
-                    // reducer runs. Drain it and retry as a required read after
+                    // Optional provider staging may exceed its isolated quota.
+                    // Drain it and retry as a required read after
                     // restoring CPU admission; integrity/provider failures stay
                     // fatal and cancellation is checked before the retry.
                     try phase.finish();
@@ -491,13 +504,98 @@ pub const ManifestReader = struct {
                     if (err == error.OutOfMemory) return loadFileManifestPublication(a, self.store, ref, self.domain, self.token);
                     return err;
                 };
-                defer self.a.free(bytes);
+                defer self.speculative.allocator().free(bytes);
                 try phase.finish();
                 try self.token.check();
                 return decodeFileManifest(a, self.store, ref, self.domain, self.token, null, null, true, bytes);
             }
         }
         return loadFileManifestPublication(a, self.store, ref, self.domain, self.token);
+    }
+};
+
+/// Sequential, operation-private metadata replay. The quota bounds disk rather
+/// than retaining decoded groups or a per-file lookup map. A full spool keeps
+/// its complete prefix; remaining inputs use ordinary authenticated reads.
+pub const ManifestReplay = struct {
+    token: Cancellation,
+    manager: local.sql_spill.Manager = undefined,
+    file: ?local.sql_spill.File = null,
+    count: usize = 0,
+    consumed: usize = 0,
+    offset: u64 = 0,
+    full: bool = false,
+    const header_bytes = 72;
+    pub fn init(self: *ManifestReplay, a: A, io: std.Io, token: Cancellation) void {
+        self.* = .{ .token = token };
+        self.manager = .{ .alloc = a, .io = io, .context = self, .checkpoint = check, .max_bytes = 128 * 1024 * 1024, .async_writes = false };
+    }
+    fn check(raw: *anyopaque) !void {
+        try @as(*ManifestReplay, @ptrCast(@alignCast(raw))).token.check();
+    }
+    pub fn deinit(self: *ManifestReplay) void {
+        if (self.file) |*file| file.close();
+        self.file = null;
+        self.manager.deinit();
+    }
+    pub fn discard(self: *ManifestReplay) void {
+        if (self.file) |*file| file.close();
+        self.file = null;
+        self.count = 0;
+        self.consumed = 0;
+        self.offset = 0;
+        self.full = true;
+    }
+    pub fn append(self: *ManifestReplay, a: A, ref: artifacts.ChunkRef, group: FileGroup) !void {
+        try self.token.check();
+        if (self.full) return;
+        self.appendInner(a, ref, group) catch |err| {
+            // This cache is optional, including after a partial frame write.
+            // Drop the whole prefix rather than exposing a truncated record.
+            self.discard();
+            try self.token.check();
+            if (err == error.Canceled) return err;
+        };
+    }
+    fn appendInner(self: *ManifestReplay, a: A, ref: artifacts.ChunkRef, group: FileGroup) !void {
+        const bytes = std.json.Stringify.valueAlloc(a, group, .{}) catch {
+            self.full = true;
+            return;
+        };
+        defer a.free(bytes);
+        if (bytes.len > 2 * max_root_bytes or bytes.len + header_bytes > self.manager.max_bytes -| self.manager.live_bytes) {
+            self.full = true;
+            return;
+        }
+        if (self.file == null) self.file = try self.manager.create();
+        var header: [header_bytes]u8 = undefined;
+        std.mem.writeInt(u64, header[0..8], bytes.len, .little);
+        header[8..40].* = term_directory.identity(ref.artifact_id);
+        std.crypto.hash.sha2.Sha256.hash(bytes, header[40..72], .{});
+        const offset = self.file.?.size;
+        try self.file.?.writeRaw(offset, &header);
+        try self.file.?.writeRaw(offset + header.len, bytes);
+        self.count += 1;
+    }
+    pub fn next(self: *ManifestReplay, a: A, ref: artifacts.ChunkRef, domain: [32]u8) !?FileGroup {
+        if (self.consumed == self.count) return null;
+        try text_directory.validateRef(ref, domain);
+        var header: [header_bytes]u8 = undefined;
+        try self.file.?.readRaw(self.offset, &header);
+        if (!std.mem.eql(u8, header[8..40], &term_directory.identity(ref.artifact_id))) return error.InvalidNativeLakeTextCorpus;
+        const length = std.mem.readInt(u64, header[0..8], .little);
+        if (length == 0 or length > 2 * max_root_bytes) return error.InvalidNativeLakeTextCorpus;
+        const bytes = try a.alloc(u8, @intCast(length));
+        defer a.free(bytes);
+        try self.file.?.readRaw(self.offset + header.len, bytes);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        if (!std.mem.eql(u8, &digest, header[40..72])) return error.InvalidNativeLakeTextCorpus;
+        const group = try std.json.parseFromSliceLeaky(FileGroup, a, bytes, .{ .allocate = .alloc_always });
+        try group.validate(domain);
+        self.offset += header.len + length;
+        self.consumed += 1;
+        return group;
     }
 };
 
@@ -1238,6 +1336,9 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         }
         var totals: CollectionBuilder = .{ .a = a };
         defer totals.deinit();
+        var manifest_replay: ManifestReplay = undefined;
+        manifest_replay.init(a, provider.context.io orelse return error.UnsupportedSqlExecution, cancellation);
+        defer manifest_replay.deinit();
         const publication = directory_publication: {
             var metadata_publisher: text_directory.Publisher = undefined;
             try metadata_publisher.init(a, store, cancellation, provider.context.io orelse return error.UnsupportedSqlExecution);
@@ -1262,6 +1363,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             for (added_files.items, 0..) |record, index| {
                 _ = file_arena.reset(.free_all);
                 const group = try manifests.load(file_arena.allocator(), record.manifest);
+                try manifest_replay.append(a, record.manifest, group);
                 if (index + 1 < added_files.items.len) manifests.prefetch(added_files.items[index + 1].manifest);
                 try metadata_publisher.add(group, record.manifest, false);
                 for (group.summaries, group.segments) |summary, segment| {
@@ -1279,7 +1381,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         root.source_layout_version = 1;
         root.source_routes_version = 1;
         root.inventory_delta_version = if (provider.native_delta != null) 2 else if (source.inventory.deleted_row_groups.len == 0 and (if (source.scanner.iceberg_delete_plan) |deletes| deletes.files.len == 0 else true)) 1 else 0;
-        root.serving = try @import("lake_index_serving_compaction.zig").publishDelta(a, ca, store, root, baseline, .{ .removed = removed_files.items, .added = added_files.items }, &plan, provider.context, cancellation);
+        root.serving = try @import("lake_index_serving_compaction.zig").publishDelta(a, ca, store, root, baseline, .{ .removed = removed_files.items, .added = added_files.items, .replay = &manifest_replay }, &plan, provider.context, cancellation);
         try root.validate();
         const bytes = try std.json.Stringify.valueAlloc(ca, root, .{});
         if (bytes.len > max_root_bytes) return error.NativeLakeTextCorpusTooLarge;
@@ -2033,6 +2135,7 @@ test "external lake publication manifest prefetch overlaps CPU bounds ownership 
         gate: std.Io.Event = .unset,
         blocked: bool = true,
         failure: ?anyerror = null,
+        oom_once: std.atomic.Value(bool) = .init(false),
         cancel_resume: bool = false,
         canceled: bool = false,
         reads: std.atomic.Value(usize) = .init(0),
@@ -2042,6 +2145,7 @@ test "external lake publication manifest prefetch overlaps CPU bounds ownership 
             self.entered.set(std.testing.io);
             if (self.blocked) try self.gate.wait(std.testing.io);
             if (self.failure) |err| return err;
+            if (self.oom_once.swap(false, .acq_rel)) return error.OutOfMemory;
             const bytes = try self.backend.getAllocWithCancellationUsingAllocator(a, id, token);
             errdefer a.free(bytes);
             if (bytes.len > maximum) return error.ArtifactTooLarge;
@@ -2121,6 +2225,12 @@ test "external lake publication manifest prefetch overlaps CPU bounds ownership 
     try std.testing.expectError(error.ArtifactIntegrityMismatch, manifests.load(arena.allocator(), ref));
     try std.testing.expect(probe.execution.active);
     probe.failure = null;
+    probe.oom_once.store(true, .release);
+    manifests.prefetch(ref);
+    const retried = try manifests.load(arena.allocator(), ref);
+    try std.testing.expectEqualStrings("one", retried.file.id);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
+    try std.testing.expectEqual(@as(usize, 0), manifests.speculative.live);
     probe.cancel_resume = true;
     manifests.prefetch(ref);
     try std.testing.expectError(error.Canceled, manifests.load(arena.allocator(), ref));
@@ -2137,8 +2247,8 @@ test "external lake publication manifest prefetch overlaps CPU bounds ownership 
     try probe.entered.wait(std.testing.io);
     manifests.deinit();
     try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
-    // A reducer can consume the advisory headroom before the child allocates.
-    // Once it releases that memory, required publication must still succeed.
+    // Required work keeps its whole quota while prefetch is in flight and
+    // after successful completion; only node-admitted optional state is held.
     {
         const Limits = @import("../serverless/build/lake_build_limits.zig");
         var budget = try Limits.WorkingSetAllocator.init(a, .{ .max_working_set_bytes = 1024 * 1024 });
@@ -2158,16 +2268,27 @@ test "external lake publication manifest prefetch overlaps CPU bounds ownership 
         while (!manifests.pending.?.task.isComplete()) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
         bounded.free(held);
         try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+        // A completed successful read retains only its independently admitted
+        // bytes: required reducer allocations may still use their entire quota.
+        const required_work = try bounded.alloc(u8, budget.max_live_bytes);
+        bounded.free(required_work);
+        try std.testing.expect(scheduler.pull_bytes != 0);
         const before = probe.reads.load(.acquire);
         var required = std.heap.ArenaAllocator.init(bounded);
         const recovered = try manifests.load(required.allocator(), ref);
         try std.testing.expectEqualStrings("one", recovered.file.id);
-        try std.testing.expectEqual(before + 1, probe.reads.load(.acquire));
+        try std.testing.expectEqual(before, probe.reads.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
         try std.testing.expect(manifests.pending == null and probe.execution.active);
         try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
         required.deinit();
         try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
     }
+    // A completed result retains its independent node reservation until join.
+    scheduler.max_pull_bytes = 1;
+    manifests.prefetch(ref);
+    try std.testing.expect(manifests.pending == null);
+    scheduler.max_pull_bytes = 2 * 1024 * 1024 * 1024;
     // Saturation and opaque allocator wrappers decline optional work.
     {
         probe.gate = .unset;
@@ -2187,4 +2308,64 @@ test "external lake publication manifest prefetch overlaps CPU bounds ownership 
     manifests.a = unknown.allocator();
     manifests.prefetch(ref);
     try std.testing.expect(manifests.pending == null);
+}
+
+test "external lake publication metadata replay bounds disk preserves groups and checks identity integrity" {
+    const a = std.testing.allocator;
+    var temporary = try local.common_test_directory.TestDirectory.init("publication-metadata-replay");
+    defer temporary.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, temporary.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(7), 1, std.testing.io);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const group: FileGroup = .{ .file = .{ .id = "one", .digest = @splat(1) }, .segments = &.{} };
+    const ref = try publishFileManifest(a, arena.allocator(), &store, group, .none);
+    const other = try publishFileManifest(a, arena.allocator(), &store, .{ .file = .{ .id = "two", .digest = @splat(2) }, .segments = &.{} }, .none);
+    var replay: ManifestReplay = undefined;
+    replay.init(a, std.testing.io, .none);
+    defer replay.deinit();
+    try replay.append(a, ref, group);
+    try std.testing.expectEqual(@as(usize, 1), replay.count);
+    replay.manager.max_bytes = replay.manager.live_bytes;
+    try replay.append(a, other, group);
+    try std.testing.expect(replay.full);
+    try std.testing.expectEqual(@as(usize, 1), replay.count);
+    var invalid = ref;
+    invalid.byte_len = 0;
+    try std.testing.expectError(error.InvalidNativeLakeTextCorpus, replay.next(arena.allocator(), invalid, store.upload_scope.?.domain));
+    try std.testing.expectError(error.InvalidNativeLakeTextCorpus, replay.next(arena.allocator(), ref, @splat(8)));
+    try std.testing.expectError(error.InvalidNativeLakeTextCorpus, replay.next(arena.allocator(), other, store.upload_scope.?.domain));
+    const decoded = (try replay.next(arena.allocator(), ref, store.upload_scope.?.domain)).?;
+    try std.testing.expectEqualStrings(group.file.id, decoded.file.id);
+    try std.testing.expect(try replay.next(arena.allocator(), other, store.upload_scope.?.domain) == null);
+    replay.offset = 0;
+    replay.consumed = 0;
+    try replay.file.?.writeRaw(ManifestReplay.header_bytes, "!");
+    try std.testing.expectError(error.InvalidNativeLakeTextCorpus, replay.next(arena.allocator(), ref, store.upload_scope.?.domain));
+    replay.file.?.close();
+    replay.file = null;
+    try std.testing.expectEqual(@as(u64, 0), replay.manager.live_bytes);
+    try std.testing.expectEqual(@as(usize, 0), replay.manager.files);
+}
+
+test "external lake publication metadata replay declines allocation failures after opening spill storage" {
+    const a = std.testing.allocator;
+    const group: FileGroup = .{ .file = .{ .id = "one", .digest = @splat(1) }, .segments = &.{} };
+    var saw_open_failure = false;
+    for (0..8) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+        var replay: ManifestReplay = undefined;
+        replay.init(failing.allocator(), std.testing.io, .none);
+        defer replay.deinit();
+        try replay.append(failing.allocator(), .{ .artifact_id = "cache-only-test", .checksum = "", .byte_len = 1 }, group);
+        if (replay.full) {
+            try std.testing.expectEqual(@as(usize, 0), replay.count);
+            try std.testing.expectEqual(@as(usize, 0), replay.manager.files);
+            try std.testing.expectEqual(@as(u64, 0), replay.manager.live_bytes);
+            if (replay.manager.dir != null) saw_open_failure = true;
+        } else try std.testing.expectEqual(@as(usize, 1), replay.count);
+    }
+    try std.testing.expect(saw_open_failure);
 }

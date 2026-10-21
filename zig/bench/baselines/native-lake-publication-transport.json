@@ -10,7 +10,10 @@
     "capture_width_with_8_mib_headroom": 3,
     "capture_width_with_1_mib_headroom": 2,
     "physical_upload_peak_measured_independently": true,
-    "required_peak_uploads": {"greater_than": 1, "at_most": 3},
+    "required_peak_uploads": {
+      "greater_than": 1,
+      "at_most": 3
+    },
     "unchanged_refresh_new_uploads": 0,
     "ordered_parallel_and_inline_identities": "equal",
     "failure_contract": "drain children, release metadata, restore CPU before returning backend error"
@@ -29,7 +32,11 @@
     ]
   },
   "text_publication": {
-    "shared_manifest_consumers": ["collection statistics", "term directory", "file/segment/routing directories"],
+    "shared_manifest_consumers": [
+      "collection statistics",
+      "term directory",
+      "file/segment/routing directories"
+    ],
     "changed_manifests_in_test": 256,
     "manifest_payload_reads_across_shared_consumers": 256,
     "decode_arena_reset_after_each_manifest": true,
@@ -39,7 +46,10 @@
     "data_packs_in_test": 13,
     "maximum_packs_per_wave": 8,
     "io_slots_in_test": 3,
-    "required_peak_pack_uploads": {"greater_than": 1, "at_most": 3},
+    "required_peak_pack_uploads": {
+      "greater_than": 1,
+      "at_most": 3
+    },
     "serial_and_parallel_directory_identities": "equal",
     "partial_upload_failure": "drain children before returning; no directory published"
   },
@@ -56,7 +66,7 @@
     "retained_serving_sources_in_heap_test": 12,
     "retained_serving_source_heap_budget_bytes": 16384,
     "new_serving_manifest_payload_reads": 0,
-    "serving_directory_delta_order": "all deletions before additions through bounded spill reducers",
+    "serving_directory_delta_order": "addition-priority private runs; one application per prior root",
     "legacy_navigation_bootstrap": "old inventory before signed changes",
     "maximum_prefetched_manifests": 1,
     "maximum_prefetched_manifest_payload_bytes": 4194304,
@@ -67,7 +77,19 @@
     "maximum_retained_text_column_owners": 8,
     "maximum_retained_text_column_bytes": 8388608,
     "typed_projection_reference_segment_identity": "equal across schema, selected-field, stored-source and borrowing modes",
-    "unleased_projection_payloads": "owned copies"
+    "unleased_projection_payloads": "owned copies",
+    "maximum_compaction_intermediate_spill_bytes": 67108864,
+    "maximum_canonical_metadata_replay_bytes": 134217728,
+    "canonical_replay_quota_fallback": "complete prefix replayed; remaining manifests fetched normally",
+    "canonical_manifests_in_compaction_test": 128,
+    "canonical_manifest_provider_reads_with_replay": 0,
+    "seekable_segments_published_in_compaction_test": 1,
+    "intermediate_segment_provider_uploads": 0,
+    "prefetch_retained_memory": "independent node reservation held until join or cancellation",
+    "prefetch_uses_required_reducer_quota": false,
+    "maximum_prefetch_retained_reservation_bytes": 8454144,
+    "canonical_replay_write_failure": "discard partial cache and use authenticated artifacts",
+    "canonical_replay_decode_oom": "reset partial decode, discard cache, retry authenticated artifacts with identical root"
   },
   "qualification_outstanding": [
     "Controlled identical-fixture base/head HN one-file and 1024-file latency and post-GC footprint",
