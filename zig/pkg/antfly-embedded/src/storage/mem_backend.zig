@@ -312,6 +312,8 @@ pub const Backend = struct {
         }
 
         fn open(backend: *Backend, namespace: backend_types.Namespace, read_only: bool) !BoundTxn {
+            if (!read_only and !backend.serialized_write_mutex.tryLock()) return error.WriterLocked;
+            errdefer if (!read_only) backend.serialized_write_mutex.unlock();
             lockBackend(backend);
             defer backend.mutex.unlock();
             const current = try backend.ensureStateLocked();
@@ -350,6 +352,7 @@ pub const Backend = struct {
             releaseState(self.allocator, rc);
             self.backend.mutex.unlock();
             self.rc = null;
+            if (!self.read_only) self.backend.serialized_write_mutex.unlock();
         }
 
         pub fn commit(self: *@This()) !void {
@@ -361,6 +364,7 @@ pub const Backend = struct {
             self.backend.state = rc;
             releaseState(self.allocator, old);
             self.rc = null;
+            if (!self.read_only) self.backend.serialized_write_mutex.unlock();
         }
 
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
@@ -409,6 +413,8 @@ pub const Backend = struct {
         rc: ?*RcState,
 
         fn open(backend: *Backend, read_only: bool) !NamespaceTxn {
+            if (!read_only and !backend.serialized_write_mutex.tryLock()) return error.WriterLocked;
+            errdefer if (!read_only) backend.serialized_write_mutex.unlock();
             lockBackend(backend);
             defer backend.mutex.unlock();
             const current = try backend.ensureStateLocked();
@@ -436,6 +442,7 @@ pub const Backend = struct {
             releaseState(self.allocator, rc);
             self.backend.mutex.unlock();
             self.rc = null;
+            if (!self.read_only) self.backend.serialized_write_mutex.unlock();
         }
 
         pub fn commit(self: *@This()) !void {
@@ -447,6 +454,7 @@ pub const Backend = struct {
             self.backend.state = rc;
             releaseState(self.allocator, old);
             self.rc = null;
+            if (!self.read_only) self.backend.serialized_write_mutex.unlock();
         }
 
         pub fn get(self: *@This(), namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
@@ -644,4 +652,60 @@ test "memory backend read transactions are snapshot isolated" {
         defer read_after.abort();
         try std.testing.expectEqualStrings("after", try read_after.get("doc:a"));
     }
+}
+
+test "memory backend enforces single snapshot writer across bound and namespace views" {
+    const a = std.testing.allocator;
+    var backend = Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{});
+    defer runtime.deinit();
+    {
+        var writer = try backend.beginWrite();
+        defer writer.abort();
+        try std.testing.expectError(error.WriterLocked, backend.beginWrite());
+        try std.testing.expectError(error.WriterLocked, backend.beginBatch());
+        try std.testing.expectError(error.WriterLocked, runtime.beginWrite());
+        try std.testing.expectError(error.WriterLocked, runtime.beginBatch());
+        // A physical writer never excludes an immutable reader.
+        var reader = try runtime.beginRead();
+        reader.abort();
+    }
+    {
+        var writer = try runtime.beginWrite();
+        errdefer writer.abort();
+        try std.testing.expectError(error.WriterLocked, backend.beginWrite());
+        try writer.put("first", "value");
+        try writer.commit();
+    }
+    {
+        var writer = try backend.beginWrite();
+        errdefer writer.abort();
+        try writer.put(.{}, "second", "value");
+        try writer.commit();
+    }
+    var reader = try runtime.beginRead();
+    defer reader.abort();
+    try std.testing.expectEqualStrings("value", try reader.get("first"));
+    try std.testing.expectEqualStrings("value", try reader.get("second"));
+}
+
+test "memory backend failed snapshot writer creation releases its single writer claim" {
+    const Check = struct {
+        fn run(allocator: Allocator) !void {
+            var backend = Backend.init(allocator, .{});
+            defer backend.close();
+            var writer = backend.beginWrite() catch |cause| {
+                const available = backend.serialized_write_mutex.tryLock();
+                try std.testing.expect(available);
+                if (available) backend.serialized_write_mutex.unlock();
+                return cause;
+            };
+            writer.abort();
+            const available = backend.serialized_write_mutex.tryLock();
+            try std.testing.expect(available);
+            if (available) backend.serialized_write_mutex.unlock();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }

@@ -25,7 +25,9 @@ const std = @import("std");
 pub const abi_version: u32 = 1;
 
 test "runnable demand error remains append-only and rejects forged behavior" {
-    try std.testing.expectEqual(@backingInt(Detail.resolver_curation_conflict) + 1, @backingInt(Detail.invalid_embedding_identity));
+    try std.testing.expectEqual(@as(c_int, 776), @backingInt(Detail.value_search_requires_scan));
+    try std.testing.expectEqual(@as(c_int, 777), @backingInt(Detail.value_search_limit_exceeded));
+    try std.testing.expectEqual(@as(c_int, 778), @backingInt(Detail.invalid_embedding_identity));
     try std.testing.expectEqual(@backingInt(Detail.backend_runtime_unavailable) + 1, @backingInt(Detail.invalid_runnable_demand));
     const value = statusFromError(error.InvalidRunnableDemand);
     try std.testing.expectEqual(@backingInt(Code.invalid_argument), value.code);

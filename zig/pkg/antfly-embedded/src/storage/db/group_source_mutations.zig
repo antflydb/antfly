@@ -858,3 +858,216 @@ test "prepared transaction effects child manifests retain presence absence and d
         if (!present) try fixture.store.delete(key);
     }
 }
+
+const WriterGuardTest = struct {
+    const guards = @import("../transaction_read_guards.zig");
+    const keys = @import("../internal_keys.zig");
+    fn key(a: A, logical: []const u8) ![]u8 {
+        const result = try a.alloc(u8, guards.prefix.len + 4 + logical.len + 16);
+        @memcpy(result[0..guards.prefix.len], guards.prefix);
+        std.mem.writeInt(u32, result[guards.prefix.len..][0..4], @intCast(logical.len), .big);
+        @memcpy(result[guards.prefix.len + 4 ..][0..logical.len], logical);
+        @memset(result[result.len - 16 ..], 7);
+        return result;
+    }
+    fn install(store: *DocStore, logical: []const u8) ![]u8 {
+        const a = std.testing.allocator;
+        const framed = try key(a, logical);
+        errdefer a.free(framed);
+        var writer = try store.beginWriteTxn();
+        errdefer writer.abort();
+        try writer.put(framed, "");
+        var count: [8]u8 = undefined;
+        std.mem.writeInt(u64, &count, 1, .little);
+        try writer.put(guards.count_key, &count);
+        try writer.commit();
+        return framed;
+    }
+};
+
+test "prepared transaction effects writer read guards fence native transaction batch and append commits" {
+    const a = std.testing.allocator;
+    const H = WriterGuardTest;
+    for ([_]bool{ false, true }) |relational| for (0..5) |mode| {
+        var fixture: ReadCaptureTest = .{};
+        try fixture.init();
+        defer fixture.deinit();
+        const physical = if (relational) try H.keys.relationalRowKeyAlloc(a, "doc\x00") else try H.keys.documentKeyAlloc(a, "doc\x00");
+        defer a.free(physical);
+        try fixture.store.put(physical, "before");
+        const guard = try H.install(&fixture.store, "doc\x00");
+        defer a.free(guard);
+        if (mode < 2) {
+            var writer = try fixture.store.beginWriteTxn();
+            defer writer.abort();
+            if (mode == 0) try writer.put(physical, "after") else try writer.delete(physical);
+            try std.testing.expectError(error.IntentConflict, writer.commit());
+            try std.testing.expectError(error.IntentConflict, writer.commit());
+        } else {
+            var writer = try fixture.store.beginWriteBatch();
+            defer writer.abort();
+            if (mode == 2) try writer.put(physical, "after") else if (mode == 3) try writer.delete(physical) else try writer.asTxn().appendPut(physical, "after");
+            try std.testing.expectError(error.IntentConflict, writer.commit());
+            try std.testing.expectError(error.IntentConflict, writer.commit());
+        }
+        const actual = try fixture.store.get(a, physical);
+        defer a.free(actual);
+        try std.testing.expectEqualStrings("before", actual);
+        const still_guarded = try fixture.store.get(a, guard);
+        defer a.free(still_guarded);
+        try std.testing.expectEqual(@as(usize, 0), still_guarded.len);
+    };
+}
+
+test "prepared transaction effects writer read guards preserve exact framing control progress and atomic own retirement" {
+    const a = std.testing.allocator;
+    const H = WriterGuardTest;
+    var fixture: ReadCaptureTest = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const physical = try H.keys.documentKeyAlloc(a, "doc\x00");
+    defer a.free(physical);
+    try fixture.store.put(physical, "before");
+    const guard = try H.install(&fixture.store, "doc\x00");
+    defer a.free(guard);
+    const neighbor = try H.keys.documentKeyAlloc(a, "doc");
+    defer a.free(neighbor);
+    try fixture.store.put(neighbor, "neighbor");
+    // Transaction/ACK metadata is outside the existing predicate surface.
+    try fixture.store.put("\x00\x00__txn_participant_ack__:other", "done");
+    for ([_]bool{ false, true }) |batch| {
+        if (batch) {
+            const restored = try H.install(&fixture.store, "doc\x00");
+            a.free(restored);
+            var writer = try fixture.store.beginWriteBatch();
+            errdefer writer.abort();
+            try writer.put(physical, "batch");
+            try writer.delete(guard);
+            try writer.delete(H.guards.count_key);
+            try writer.commit();
+        } else {
+            var writer = try fixture.store.beginWriteTxn();
+            errdefer writer.abort();
+            try writer.put(physical, "transaction");
+            try writer.delete(guard);
+            try writer.delete(H.guards.count_key);
+            try writer.commit();
+        }
+    }
+    const actual = try fixture.store.get(a, physical);
+    defer a.free(actual);
+    try std.testing.expectEqualStrings("batch", actual);
+    {
+        var writer = try fixture.store.beginWriteTxn();
+        defer writer.abort();
+        try writer.put(physical, "unguarded");
+        try std.testing.expectEqual(@as(usize, 0), writer.read_guards.logical_keys.count());
+        // Installing a guard after a skipped capture cannot bless those writes.
+        const one: [8]u8 = .{ 1, 0, 0, 0, 0, 0, 0, 0 };
+        try std.testing.expectError(error.InvalidTxnRecord, writer.put(H.guards.count_key, &one));
+        try std.testing.expectError(error.InvalidTxnRecord, writer.commit());
+    }
+}
+
+test "prepared transaction effects writer read guards cover recursive range counters metadata and malformed state" {
+    const a = std.testing.allocator;
+    const H = WriterGuardTest;
+    const ranges = @import("../range_protection.zig");
+    for (0..3) |mode| {
+        var fixture: ReadCaptureTest = .{};
+        try fixture.init();
+        defer fixture.deinit();
+        const physical = try H.keys.documentKeyAlloc(a, "doc");
+        defer a.free(physical);
+        try fixture.store.put(physical, "before");
+        const counter = ranges.counterKey(ranges.bucket("doc"));
+        const head = @import("relational_index_catalog.zig").head_key;
+        if (mode == 0) try fixture.store.put(ranges.activation_key, ranges.activation_value);
+        const guard = try H.install(&fixture.store, if (mode == 0) &counter else if (mode == 1) head else "doc");
+        defer a.free(guard);
+        if (mode == 2) try fixture.store.put(guard, "invalid");
+        var writer = try fixture.store.beginWriteTxn();
+        defer writer.abort();
+        try writer.put(if (mode == 1) head else physical, "after");
+        try std.testing.expectError(if (mode == 2) error.InvalidTxnRecord else error.IntentConflict, writer.commit());
+    }
+}
+
+test "prepared transaction effects writer read guards unwind capture allocations and preserve first failure" {
+    const a = std.testing.allocator;
+    const H = WriterGuardTest;
+    const View = struct {
+        const Cursor = struct {
+            pub fn seekAtOrAfter(_: *@This(), _: []const u8) !?@import("../backend_erased.zig").Entry {
+                return null;
+            }
+            pub fn close(_: *@This()) void {}
+        };
+        pub fn get(_: *@This(), _: []const u8) ![]const u8 {
+            return &.{ 1, 0, 0, 0, 0, 0, 0, 0 };
+        }
+        pub fn openPhysicalCursorAdapter(_: *@This()) !Cursor {
+            return .{};
+        }
+        fn run(allocator: A, physical: []const u8) !void {
+            var captured: H.guards.Capture = .{};
+            defer captured.deinit(allocator);
+            var view: @This() = .{};
+            var debt: @import("../publication_backlog.zig").Capture = .{};
+            defer debt.release();
+            var gate: std.atomic.Mutex = .unlocked;
+            captured.touch(allocator, &view, &debt, &gate, physical) catch |cause| {
+                try std.testing.expectError(cause, captured.check());
+                try std.testing.expectError(cause, captured.validate(allocator, &view));
+                return cause;
+            };
+            try captured.touch(allocator, &view, &debt, &gate, physical);
+            try std.testing.expectEqual(@as(usize, 1), captured.logical_keys.count());
+            try captured.validate(allocator, &view);
+        }
+    };
+    for ([_]bool{ false, true }) |relational| {
+        const physical = if (relational) try H.keys.relationalRowKeyAlloc(a, "doc\x00") else try H.keys.documentKeyAlloc(a, "doc\x00");
+        defer a.free(physical);
+        try std.testing.checkAllAllocationFailures(a, View.run, .{physical});
+    }
+}
+
+test "prepared transaction effects writer read guards serialize admission across views without fencing unrelated control" {
+    const a = std.testing.allocator;
+    const H = WriterGuardTest;
+    var fixture: ReadCaptureTest = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    var other = try DocStore.openRuntime(a, try fixture.backend.runtimeStore(a, .{}));
+    defer other.close();
+    const physical = try H.keys.documentKeyAlloc(a, "doc");
+    defer a.free(physical);
+    try fixture.store.put(physical, "before");
+    {
+        var writer = try fixture.store.beginWriteTxn();
+        errdefer writer.abort();
+        try writer.put(physical, "after");
+        // Admission cannot race the absent-count fast path of an active writer.
+        try std.testing.expectError(error.Backpressured, H.install(&other, "doc"));
+        const control = "\x00\x00__txn_participant_ack__:concurrent";
+        try other.put(control, "done");
+        try writer.commit();
+        const actual = try fixture.store.get(a, control);
+        defer a.free(actual);
+        try std.testing.expectEqualStrings("done", actual);
+    }
+    {
+        // LSM writers may exist before they stage data. A guard committed in
+        // that interval must be visible when the data writer acquires its gate.
+        var writer = try fixture.store.beginWriteBatch();
+        defer writer.abort();
+        const guard = try H.install(&other, "doc");
+        defer a.free(guard);
+        try writer.put(physical, "stale");
+        try std.testing.expectError(error.IntentConflict, writer.commit());
+    }
+    const actual = try fixture.store.get(a, physical);
+    defer a.free(actual);
+    try std.testing.expectEqualStrings("after", actual);
+}

@@ -6066,6 +6066,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("docstore-prepared-transaction-effects-test", "Verify bounded durable prepared effect encoding and original controls")
         .dependOn(&addCuratedTestRunArtifact(b, prepared_effects_tests, &.{"prepared transaction effects"}).step);
+    const writer_read_guard_tests = b.addTest(.{
+        .root_module = prepared_effects_mod,
+        .filters = &.{ "storage.transactions.", "storage.mem_backend." },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("docstore-writer-read-guards-test", "Run transaction admission, shared read guards and atomic resolution regressions")
+        .dependOn(&addCuratedTestRunArtifact(b, writer_read_guard_tests, &.{ "storage.transactions.", "storage.mem_backend." }).step);
+    const docstore_writer_tests = b.addTest(.{
+        .root_module = prepared_effects_mod,
+        .filters = &.{"storage.docstore."},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("docstore-writer-boundary-test", "Run DocStore mutation, credit, shared-gate and control-progress regressions")
+        .dependOn(&addCuratedTestRunArtifact(b, docstore_writer_tests, &.{"storage.docstore."}).step);
     const cleanup_planning_filters = [_][]const u8{ "graph endpoint cleanup", "graph owner revival", "graph incoming directory", "child range manifest releases", "child range planning uses caller" };
     const cleanup_planning_tests = b.addTest(.{
         .root_module = prepared_effects_mod,

@@ -81,7 +81,8 @@ const builtin = @import("builtin");
 // native handles before interpreting the added callback slot.
 // Owners must enforce prepared replay credits through inventory mutation and HA acknowledgement.
 // Backend batches can atomically reserve prepared replay credit with seals.
-pub const abi_version: u32 = 53;
+// Fence merged logical-query layouts and failure/guard contracts.
+pub const abi_version: u32 = 54;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

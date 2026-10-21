@@ -8048,7 +8048,7 @@ test "H1 direct connections disable Nagle" {
     defer listener.deinit();
     var client = Client.init(std.testing.allocator, io);
     defer client.deinit();
-    var socket = try client.connectHostDirect("127.0.0.1", listener.getLocalAddress().getPort());
+    var socket = try client.connectHostDirect("127.0.0.1", listener.getLocalAddress().getPort(), null);
     defer socket.close();
     var value: c_int = 0;
     var size: std.posix.socklen_t = @sizeOf(c_int);

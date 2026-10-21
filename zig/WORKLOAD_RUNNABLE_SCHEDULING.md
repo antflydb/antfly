@@ -6419,3 +6419,64 @@ scope. Strong defaults remain off. No ABI/wire/reader/durable-format change;
 public-consumer/full-archive qualification was not rerun, and full Linux
 qualification remains waived. The existing branch already includes origin/main
 `dd49f55102f81a430491a36a9932f46e697ef15a`; no additional fetch was needed.
+
+
+### Existing read guards enforced by native writers; main integration (2026-10-20)
+
+Merged origin/main `3d3fef422e2130e5f789ca5ea1373466714358eb` in
+`17f5a682661a67d892641f3a8b49e5a1d22aa530` in the canonical worktree/branch.
+Conflict resolution retains controlled HTTP connection setup and upstream H1
+TCP_NODELAY, both helper/test additions, the C allocator export, and merged error
+identities. The new upstream direct-connection test supplies the control argument.
+Released runtime detail IDs776/777/778 remain fixed; pooling's reserved range is
+unchanged. Native54, storage-owner112, API59 and failure67 fence merged private
+layouts/statuses; runnable18 and descriptor getterv29 are unchanged.
+
+A shared transaction_read_guards module now defines the existing guard framing,
+count and narrow metadata predicate surface for admission and physical writers.
+DocStore transactions, batches and append adapters capture protected logical keys
+and validate the final staged guard view immediately before native commit. Atomic
+resolution can retire its own guard rows in the same batch; a remaining foreign
+guard rejects publication. Capture failures poison later mutations/commit and
+preserve the original cause. No source buffers or borrowed controls escape.
+
+Guard admission and protected mutations acquire the existing shared publication
+mutation gate before reading even an absent guard count. LSM commit serialization
+alone does not serialize its staged writer lifetime. The gate closes that race
+across store views while unrelated transaction/ACK metadata continues to commit.
+No-reader writes retain no copied key set; installing guards after such a skipped
+data capture in the same writer is rejected. Memory's snapshot-cloning bound and
+namespace writers now enforce their advertised single-writer contract before
+cloning and release the claim on OOM, abort and commit. This prevents a stale COW
+writer from erasing newly admitted guards.
+
+Final `writer-read-guards-main-v5`: all four native commands exit0, 5488 source
+inputs unchanged, 158/158 build steps and 509 fresh executions, no failures/leaks.
+The simple suites run prepared71, DB42, grouped7, graph4, identity33, cleanup14,
+transactions/memory105, all DocStore88, HTTP lifetime16, logical query67 and
+logical DB2; standalone error/failure contracts43/1/7 and independent runtime9
+also pass. Five new guard cases cover every writer adapter, binary framing,
+recursive range counters, catalog metadata, malformed state, exact unwind,
+first-error poisoning, atomic retirement, cross-view admission races and
+concurrent unrelated ACK durability. Two memory cases cover snapshot writer
+exclusion and allocation cleanup. The existing native restart case directly
+rejects physical bypass before/after reopen and with one shared reader remaining,
+then successfully resolves its final writer.
+
+The unchanged full HTTP artifact is reused from `writer-read-guards-http-v4`:
+696 pass,14 skip, actual exit0. System Python's LibreSSL lacks TLS1.3; both final
+receipts record the supported ANTFLY_TEST_TLS_PYTHON override using OpenSSL3.6.4.
+All28 source-boundary fixture tests pass with pinned Zig0.17 and worktree-local
+fixture/global caches; the initial PATH0.16 invocation was discarded. Fixture
+checks do not qualify a production storage archive. Normal hooks remain enabled;
+full Linux qualification is waived, and no public-consumer/provider image or
+full-archive qualification is claimed. Linux uses pinned Nix glibc Zig.
+
+This enforces existing guards, not a complete prepared-read certificate. Captured
+arbitrary metadata/physical cursor dependencies still need semantic point/range
+write authority and bound retirement; raw runtime/import/restore eligibility,
+live policy/catalog/route inputs, full pure assembly before vote, funded minimum
+executable recovery RAM/CPU/I/O/dependencies and derived-log quota, DB/execution
+lifetimes and normal required PREPARE drivers remain open. Broader fair/default/
+session/whole-node/tenant/remote rollout remains incomplete. Strong defaults stay
+off, the full objective remains active, and nothing was pushed.

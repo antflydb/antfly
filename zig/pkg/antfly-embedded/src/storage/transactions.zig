@@ -80,10 +80,10 @@ const IntentCost = struct { bytes: u64, retained: u64, retained_keys: u64 = 0 };
 // delete its parent row after the check but before the coordinator commits.
 // Readers share key-oriented entries, while the transaction-oriented members
 // make resolution proportional to its own read set (never all readers).
-const read_guards_prefix = "\x00\x00__txn_read_guards__:";
+const read_guards_prefix = writer_read_guards.prefix;
 const read_members_prefix = "\x00\x00__txn_read_members__:";
 const read_admission_prefix = "\x00\x00__txn_read_admission__:";
-const read_guard_count_key = "\x00\x00__txn_read_guard_count";
+const read_guard_count_key = writer_read_guards.count_key;
 pub const max_read_guards_per_transaction = 65_536;
 // Durable epoch leases. A prepare vote and its schema identity are one atomic
 // mutation; resolution retires both. Historical immutable schemas remain
@@ -181,23 +181,9 @@ pub fn intentAdmissionBytesWithAdmission(intent: WriteIntent, control: ?read_con
 /// derived index/vector writes. AROW metadata replacement preserves length.
 /// Document numbers retain their exact source spelling. Only special-field
 /// stripping serializes JSON; count its exact output with a bounded writer.
-fn isRawMetadataIntentKey(key: []const u8) bool {
-    return range_protection.counterBucket(key) != null or
-        range_protection.indexCounterDigest(key) != null or
-        std.mem.startsWith(u8, key, "\x00\x00__metadata__:relational_integrity:") or
-        std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_activation") or
-        std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_retirement") or
-        std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_generation_retirement") or
-        std.mem.eql(u8, key, "\x00\x00__metadata__:restore_staging_owner") or
-        @import("db/relational_index_maintenance_contract.zig").isControlKey(key);
-}
-
-fn isRawMetadataPredicateKey(key: []const u8) bool {
-    return isRawMetadataIntentKey(key) or
-        std.mem.eql(u8, key, @import("db/relational_index_catalog.zig").head_key) or
-        (key.len == @import("db/relational_index_jobs.zig").progress_prefix.len + range_protection.index_id_bytes and
-            std.mem.startsWith(u8, key, @import("db/relational_index_jobs.zig").progress_prefix));
-}
+const writer_read_guards = @import("transaction_read_guards.zig");
+const isRawMetadataIntentKey = writer_read_guards.isRawMetadataIntentKey;
+const isRawMetadataPredicateKey = writer_read_guards.isRawMetadataPredicateKey;
 
 fn retainedIntentBytes(alloc: Allocator, intent: WriteIntent) !u64 {
     return retainedIntentBytesWithAdmission(alloc, intent, null);
@@ -5771,6 +5757,8 @@ test "transaction shared read guards fence writes and survive restart until reso
             before.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
             after.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
         );
+        // Direct physical writers must honor the same durable guards.
+        try std.testing.expectError(error.IntentConflict, putVisibleDoc(&store, alloc, "parent", "bypass"));
         try manager.writeIntents(first, &.{}, &parent);
         try std.testing.expectEqual(@as(u64, 2), try manager.readGuardCount());
     }
@@ -5783,8 +5771,10 @@ test "transaction shared read guards fence writes and survive restart until reso
         var manager = try TxnManager.init(alloc, &store);
         defer manager.deinit();
         try std.testing.expectError(error.IntentConflict, manager.checkOrdinaryWriteConflict("parent"));
+        try std.testing.expectError(error.IntentConflict, putVisibleDoc(&store, alloc, "parent", "after restart"));
         try manager.resolveIntents(second, .aborted, 700);
         try std.testing.expectEqual(@as(u64, 1), try manager.readGuardCount());
+        try std.testing.expectError(error.IntentConflict, putVisibleDoc(&store, alloc, "parent", "one reader remains"));
         // Sole reader can upgrade without releasing its dependency first.
         try manager.writeIntents(first, &.{.{ .key = "parent", .value = "updated" }}, &.{});
         try manager.resolveIntents(first, .committed, 701);
