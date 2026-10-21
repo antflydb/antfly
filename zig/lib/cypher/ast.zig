@@ -30,6 +30,8 @@ pub const Expr = struct {
     execution_range_binding: bool = false,
     /// Stable invocation-local ownership key for a proved closed repeatable value.
     execution_invariant: ?u64 = null,
+    /// Invocation-local lexical source closure; never set on prepared ASTs.
+    execution_list_source: ?usize = null,
     value: union(enum) {
         literal: Value,
         variable: []const u8,

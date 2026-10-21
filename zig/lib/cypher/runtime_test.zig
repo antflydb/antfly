@@ -2968,7 +2968,11 @@ test "bound affine parameters retain invocation types nulls and overflow" {
 
 test "invariant and affine choice proofs release failed allocations" {
     const Campaign = struct {
-        fn run(a: std.mem.Allocator) !void {
+        fn run(backing: std.mem.Allocator) !void {
+            // Fail-index coverage requires deterministic arena growth. A
+            // successful backing remap otherwise changes allocation counts.
+            var fixed: FixedAllocation = .{ .backing = backing };
+            const a: std.mem.Allocator = .{ .ptr = &fixed, .vtable = &.{ .alloc = FixedAllocation.alloc, .resize = FixedAllocation.resize, .remap = FixedAllocation.remap, .free = FixedAllocation.free } };
             var diagnostic: c.Diagnostic = .{};
             var compiled = try c.compile(a, "MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) WITH length(p) AS n,b.rank AS k UNWIND [n,n+k] AS x RETURN min(x),max(x),avg(x)", .{}, &diagnostic);
             defer compiled.deinit();
@@ -4113,6 +4117,7 @@ test "ordinary comprehension scopes and list sources release failed allocations"
     inline for (.{
         "RETURN [x IN range(1,3)|{a:toString(x)}],head([x IN range(1,3)|{a:toString(x)}]),[x IN range(1,4)|toString(x)][-2..]",
         "RETURN any(x IN range(1,3) WHERE toString(x)='3'),reduce(s='',x IN range(1,3)|s+toString(x)),size([x IN range(1,3) WHERE x>1|null])",
+        "WITH 3 AS n WITH [x IN range(1,n)|toString(x)] AS xs,n AS n WITH xs AS ys,n+1 AS n UNWIND reverse(ys) AS x RETURN n,collect(x)",
     }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{@as([]const u8, text)});
 }
 
@@ -4209,6 +4214,11 @@ test "producer summaries and scalar seeds release every failed allocation" {
         "WITH range(1,3) AS xs,toString(4) AS seed UNWIND xs AS x RETURN collect(x),min(seed)",
         "MATCH(a:Document {id:'a'}) UNWIND [1,2,3] AS n RETURN 'Beta' IN [(a)-[:CITES]->(b)|b.title]",
         "MATCH(a:Document {id:'a'}) RETURN [(a)-[:CITES]->(b)|[(b)-[:CITES]->(d)|d.title]]",
+        "WITH 3 AS n WITH range(1,n) AS xs,9 AS n WITH (xs+[n]) AS ys,n+1 AS n UNWIND (reverse(ys)+[n]) AS x RETURN n,collect(x)",
+        "UNWIND [[1,null,2],[]] AS xs RETURN head(reverse(xs)),reverse(xs)[1..2],size(reverse(xs))",
+        "WITH [x IN [1,2,3]|toString(x)] AS xs,1 AS seed WITH xs AS ys,seed AS seed UNWIND (ys+ys) AS x RETURN collect(x)",
+        "WITH range(1,3) AS xs UNWIND (xs+range(4,6)) AS x RETURN count(*)",
+        "UNWIND [1,1.0,1] AS x RETURN {k:[x]},[x/2]",
     }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{@as([]const u8, text)});
 }
 
@@ -4472,4 +4482,1076 @@ test "wide captured membership keeps probe metadata across producer epochs" {
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
     for (result.rows) |row| try std.testing.expect(row[0].boolean);
+}
+
+test "validated producer replay stops at consumer completion" {
+    for ([_][]const u8{
+        "UNWIND reverse(range(1,1000000000)) AS x RETURN x LIMIT 1",
+        "UNWIND (range(1000000000,1,-1)+[]) AS x RETURN x LIMIT 1",
+        "UNWIND reverse(reverse(range(1000000000,1,-1))+[]) AS x RETURN x LIMIT 1",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = 1 << 20, .intermediate_states = 1000 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, 1000000000), result.rows[0][0].integer);
+    }
+    // Initial source validation must still evaluate the entire eager list,
+    // including operands which replay will never visit after LIMIT.
+    for ([_][]const u8{
+        "UNWIND [x IN [1,0]|1/x] AS x RETURN x LIMIT 1",
+        "UNWIND [x IN reverse(range(0,1))|1/x] AS x RETURN x LIMIT 1",
+        "UNWIND [x IN (range(1,1)+[0])|1/x] AS x RETURN x LIMIT 1",
+        "UNWIND reverse([x IN [0,1]|1/x]) AS x RETURN x LIMIT 1",
+        "UNWIND (range(1,1000000000)+[x IN [0]|1/x]) AS x RETURN x LIMIT 1",
+        "UNWIND reverse(range(1,1000000000)) AS x RETURN 1/0 LIMIT 1",
+        "UNWIND (range(1,1000000000)+[]) AS x RETURN 1/0 LIMIT 1",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "UNWIND [x IN (range(1,1)+[0])|size(range(1,2,x))] AS x RETURN 1/0 LIMIT 1", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    try std.testing.expectError(error.CypherInvalidRange, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 1000 }));
+}
+
+test "deferred source closures cross sibling WITH chains and reversed consumers" {
+    for ([_][]const u8{
+        "WITH range(1,1000000000) AS xs,1 AS seed WITH xs AS ys,seed+1 AS seed UNWIND ys AS x RETURN count(*),min(seed)",
+        "WITH range(1,1000000000) AS xs UNWIND reverse(xs) AS x RETURN count(*),min(2)",
+        "WITH range(1,1000000000) AS xs,1 AS seed WITH seed+1 AS seed,xs AS ys WITH ys AS zs,seed AS seed UNWIND reverse(zs) AS x RETURN count(*),min(seed)",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = 1 << 20, .intermediate_states = 1000 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, 1000000000), result.rows[0][0].integer);
+        try std.testing.expectEqual(@as(i64, 2), result.rows[0][1].integer);
+    }
+    try check("WITH 3 AS n,7 AS _producer_capture_0 WITH range(1,n) AS xs,9 AS n,_producer_capture_0 AS z WITH xs AS ys,n+1 AS n,z AS z UNWIND reverse(ys) AS x RETURN n,z,collect(x)", "[[10,7,[3,2,1]]]");
+    try check("WITH 3 AS seed WITH range(1,seed) AS xs,seed AS seed WITH xs AS ys,seed+1 AS seed UNWIND reverse(ys) AS x RETURN seed,collect(x)", "[[4,[3,2,1]]]");
+    try check("WITH range(1,3) AS xs,1 AS seed WITH xs AS ys,size(xs) AS seed UNWIND reverse(ys) AS x RETURN seed,collect(x)", "[[3,[3,2,1]]]");
+    try check("WITH range(1,2) AS xs,1 AS seed WITH xs AS ys,seed AS seed UNWIND ys AS x RETURN ys,x", "[[[1,2],1],[[1,2],2]]");
+}
+
+test "runtime reverse cursors retain list string NULL and invalid overload behavior" {
+    try check("UNWIND [[1,2,3],[],null] AS xs UNWIND reverse(xs) AS x RETURN collect(x)", "[[[3,2,1]]]");
+    try check("UNWIND [[1,2,3],[]] AS xs UNWIND reverse(reverse(xs)) AS x RETURN collect(x)", "[[[1,2,3]]]");
+    try check("UNWIND ['aé🌱',null] AS xs UNWIND reverse(xs) AS x RETURN collect(x)", "[[[\"🌱éa\"]]]");
+    try check("UNWIND ['aé🌱'] AS xs UNWIND reverse(reverse(xs)) AS x RETURN x", "[[\"aé🌱\"]]");
+    try check("UNWIND [[null,1],[],null] AS xs RETURN 1 IN reverse(xs)", "[[true],[false],[null]]");
+    for ([_][]const u8{ "UNWIND [1] AS xs UNWIND reverse(xs) AS x RETURN x", "UNWIND ['abc'] AS xs RETURN 'a' IN reverse(xs)" }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherTypeMismatch, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "UNWIND reverse($xs) AS x RETURN x LIMIT 1", .{}, &diagnostic);
+    defer compiled.deinit();
+    const items = try std.testing.allocator.alloc(v.Value, 100000);
+    defer std.testing.allocator.free(items);
+    for (items, 0..) |*item, i| item.* = .{ .integer = @intCast(i) };
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{.{ .name = "xs", .value = .{ .list = items } }}, .{ .memory_bytes = 1 << 20, .intermediate_states = 200000 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 99999), result.rows[0][0].integer);
+    var repeated = try c.compile(std.testing.allocator, "UNWIND range(1,100) AS n RETURN count(CASE WHEN n IN reverse($xs) THEN 1 END)", .{}, &diagnostic);
+    defer repeated.deinit();
+    var cached = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &repeated, &.{.{ .name = "xs", .value = .{ .list = items[0..10000] } }}, .{ .memory_bytes = 8 << 20, .intermediate_states = 200000 });
+    defer cached.deinit();
+    try std.testing.expectEqual(@as(i64, 100), cached.rows[0][0].integer);
+}
+
+test "pattern collection summaries memoize captured bindings after lowering" {
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "UNWIND range(1,100) AS i MATCH(a:Document {id:'a'}) RETURN i,size([(a)-[:CITES]->(b)|b.rank]) AS n", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .explored_edges = 4 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 100), result.rows.len);
+    try std.testing.expectEqual(@as(i64, 100), result.rows[99][0].integer);
+    try std.testing.expectEqual(@as(i64, 2), result.rows[99][1].integer);
+    try std.testing.expect(result.stats.explored_edges <= 4);
+    try check("UNWIND [1,2,1,3,2] AS i MATCH(a:Document {id:'a'}) RETURN i,size([(a)-[:CITES]->(b) WHERE b.rank<=i|b.rank])", "[[1,0],[2,2],[1,0],[3,2],[2,2]]");
+    try check("UNWIND [1,1.0,1] AS i MATCH(a:Document {id:'a'}) RETURN head([(a)-[:CITES]->(b)|i/2])", "[[0],[0.5],[0]]");
+    var windows = try c.compile(std.testing.allocator, "UNWIND range(1,100) AS i MATCH(a:Document {id:'a'}) RETURN i,head([(a)-[:CITES]->(b)|b.rank]),size([(a)-[:CITES]->(b)|b.rank])", .{}, &diagnostic);
+    defer windows.deinit();
+    var bounded = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &windows, &.{}, .{ .explored_edges = 8 });
+    defer bounded.deinit();
+    try std.testing.expectEqual(@as(usize, 100), bounded.rows.len);
+    try std.testing.expectEqual(@as(i64, 2), bounded.rows[99][1].integer);
+    try std.testing.expectEqual(@as(i64, 2), bounded.rows[99][2].integer);
+}
+
+test "deferred transformations preserve arithmetic sources and operand scopes" {
+    for ([_][]const u8{
+        "WITH range(1,1000000000) AS xs UNWIND (xs+[]) AS x RETURN count(*)",
+        "WITH range(1,1000000000) AS xs,1 AS seed WITH reverse(xs) AS ys,seed AS seed UNWIND ys AS x RETURN count(*)",
+        "WITH range(1,1000000000) AS xs WITH ([]+reverse(xs)) AS ys UNWIND (ys+[]) AS x RETURN count(*)",
+        "UNWIND reverse(range(1,1000000000)) AS x RETURN count(x)",
+        "UNWIND reverse(range(1,1000000000)) AS x RETURN count(DISTINCT x)",
+        "WITH range(1,1000000000) AS xs WITH reverse(xs) AS ys UNWIND ys AS x RETURN count(x),count(DISTINCT x)",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = 1 << 20, .intermediate_states = 1000 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, 1000000000), result.rows[0][0].integer);
+    }
+    try check("WITH 3 AS n WITH range(1,n) AS xs,9 AS n WITH (xs+[n]) AS ys,n+1 AS n UNWIND (ys+[n]) AS x RETURN n,collect(x)", "[[10,[1,2,3,9,10]]]");
+    try check("WITH range(1,3) AS xs WITH (9+reverse(xs)) AS ys UNWIND (ys+7) AS x RETURN collect(x)", "[[[9,3,2,1,7]]]");
+    try check("WITH range(1,3) AS xs WITH (xs+null) AS ys UNWIND reverse(ys) AS x RETURN count(*)", "[[0]]");
+    try check("WITH range(1,3) AS xs WITH reverse(xs) AS ys UNWIND ys AS x RETURN ys,x", "[[[3,2,1],3],[[3,2,1],2],[[3,2,1],1]]");
+    // Individually shallow clauses must not build an unbounded source AST.
+    var chain: std.ArrayList(u8) = .empty;
+    defer chain.deinit(std.testing.allocator);
+    try chain.appendSlice(std.testing.allocator, "WITH range(1,3) AS xs ");
+    for (0..80) |_| try chain.appendSlice(std.testing.allocator, "WITH reverse(xs) AS xs ");
+    try chain.appendSlice(std.testing.allocator, "UNWIND xs AS x RETURN collect(x)");
+    try check(chain.items, "[[[1,2,3]]]");
+    for ([_][]const u8{
+        "WITH range(1,3,0) AS xs UNWIND (xs+[1/0]) AS x RETURN x LIMIT 1",
+        "WITH range(1,3) AS xs WITH (xs+[size(range(1,2,0))]) AS ys,1/0 AS n UNWIND ys AS x RETURN x",
+        "WITH range(1,3) AS xs UNWIND ((xs+[size(range(1,2,0))])+[1/0]) AS x RETURN x LIMIT 1",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherInvalidRange, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}
+
+test "evaluated list axes carry multiplicity and reversed consumers retain only demand" {
+    const items = try std.testing.allocator.alloc(v.Value, 100000);
+    defer std.testing.allocator.free(items);
+    for (items, 0..) |*item, i| item.* = .{ .integer = @intCast(i) };
+    for ([_][]const u8{
+        "RETURN size(reverse($xs)),head(reverse($xs)),last(reverse($xs)),reverse($xs)[-1],reverse($xs)[1..3]",
+        "UNWIND (reverse($xs)+[]) AS x RETURN x LIMIT 1",
+        "UNWIND ([]+reverse($xs)) AS x RETURN x LIMIT 1",
+        "UNWIND range(1,30) AS i UNWIND $xs AS x RETURN i,count(*)",
+    }, 0..) |text, i| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{.{ .name = "xs", .value = .{ .list = items } }}, .{ .memory_bytes = 1 << 20, .intermediate_states = 150000 });
+        defer result.deinit();
+        if (i == 0) {
+            try std.testing.expectEqual(@as(i64, 100000), result.rows[0][0].integer);
+            try std.testing.expectEqual(@as(i64, 99999), result.rows[0][1].integer);
+            try std.testing.expectEqual(@as(i64, 0), result.rows[0][2].integer);
+            try std.testing.expectEqual(@as(i64, 0), result.rows[0][3].integer);
+            try std.testing.expectEqual(@as(i64, 99998), result.rows[0][4].list[0].integer);
+            try std.testing.expectEqual(@as(i64, 99997), result.rows[0][4].list[1].integer);
+        } else if (i == 3) {
+            try std.testing.expectEqual(@as(usize, 30), result.rows.len);
+            try std.testing.expectEqual(@as(i64, 100000), result.rows[29][1].integer);
+        } else try std.testing.expectEqual(@as(i64, 99999), result.rows[0][0].integer);
+    }
+    try check("UNWIND [[1,null,2],[],null] AS xs UNWIND range(1,2) AS i UNWIND xs AS x RETURN i,count(*)", "[[1,3],[2,3]]");
+    try check("UNWIND [[1,null,2]] AS xs UNWIND xs AS x RETURN count(x),count(*)", "[[2,3]]");
+    try check("UNWIND ['aé🌱',null] AS xs RETURN size(reverse(xs))", "[[3],[null]]");
+    try check("UNWIND [[1,2,3],[],null] AS xs RETURN head(reverse(xs)),reverse(xs)[-1],reverse(xs)[1..2]", "[[3,1,[2]],[null,null,[]],[null,null,null]]");
+    try check("UNWIND ['abc'] AS xs RETURN reverse(xs)[null],reverse(xs)[null..1]", "[[null,null]]");
+    for ([_][]const u8{
+        "UNWIND ['abc'] AS xs RETURN head(reverse(xs))",
+        "UNWIND ['abc'] AS xs RETURN reverse(xs)[0]",
+        "UNWIND ['abc'] AS xs RETURN reverse(xs)[0..1]",
+        "UNWIND [1] AS xs RETURN size(reverse(xs))",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherTypeMismatch, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}
+
+test "lexical source DAGs share validation and keep added producer frames" {
+    for ([_][]const u8{
+        "WITH range(1,1000000000) AS xs UNWIND (xs+range(1000000001,2000000000)) AS x RETURN count(*)",
+        "WITH range(1,1000000000) AS xs UNWIND (xs+xs) AS x RETURN count(*)",
+        "WITH range(1,1000000000) AS xs WITH (xs+xs) AS ys UNWIND reverse(ys) AS x RETURN count(*)",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = 1 << 20, .intermediate_states = 1000 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, 2000000000), result.rows[0][0].integer);
+    }
+    var chain: std.ArrayList(u8) = .empty;
+    defer chain.deinit(std.testing.allocator);
+    try chain.appendSlice(std.testing.allocator, "WITH [x IN range(1,10000)|toString(x)] AS xs,1 AS seed ");
+    for (0..16) |_| try chain.appendSlice(std.testing.allocator, "WITH xs AS xs,seed AS seed ");
+    try chain.appendSlice(std.testing.allocator, "UNWIND xs AS x RETURN count(*)");
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, chain.items, .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = 2 << 20, .intermediate_states = 100000 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 10000), result.rows[0][0].integer);
+    // A source without a replay proof still streams once when no intervening
+    // sibling/transform needs its eager result. It must not acquire a closure.
+    var once_query = try c.compile(std.testing.allocator, "WITH [x IN range(1,10000)|EXISTS { RETURN 1 }] AS xs UNWIND xs AS x RETURN count(x)", .{}, &diagnostic);
+    defer once_query.deinit();
+    var once = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &once_query, &.{}, .{ .memory_bytes = 256 << 10 });
+    defer once.deinit();
+    try std.testing.expectEqual(@as(i64, 10000), once.rows[0][0].integer);
+    var direct_query = try c.compile(std.testing.allocator, "UNWIND [x IN range(1,10000)|EXISTS { RETURN 1 }] AS x RETURN count(x)", .{}, &diagnostic);
+    defer direct_query.deinit();
+    var direct = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &direct_query, &.{}, .{ .memory_bytes = 256 << 10 });
+    defer direct.deinit();
+    try std.testing.expect(once.stats.intermediate_states <= direct.stats.intermediate_states + 20100);
+    try check("WITH 2 AS n WITH range(1,n) AS xs,5 AS n WITH (xs+range(n,n+1)) AS ys,n+1 AS n UNWIND (ys+range(n,n+1)) AS x RETURN collect(x)", "[[[1,2,5,6,6,7]]]");
+    try check("WITH [x IN [1,null,2]|x] AS xs UNWIND (xs+xs) AS x RETURN count(x),count(*),collect(x)", "[[4,6,[1,2,1,2]]]");
+    try check("WITH [x IN [1,2,3]|toString(x)] AS xs WITH xs AS ys,1 AS seed UNWIND reverse(ys) AS x RETURN collect(x)", "[[[\"3\",\"2\",\"1\"]]]");
+    try check("WITH [x IN [1,2]|x] AS xs UNWIND [y IN (xs+xs)|y/2] AS x RETURN collect(x)", "[[[0,1,0,1]]]");
+    for ([_][]const u8{
+        "WITH [x IN [1,0]|1/x] AS xs UNWIND (xs+range(1,3,0)) AS x RETURN x LIMIT 1",
+        "WITH range(1,3) AS xs UNWIND (xs+[x IN [0]|1/x]) AS x RETURN x LIMIT 1",
+        "WITH range(1,3) AS xs WITH (xs+[x IN [0]|1/x]) AS ys,1 AS seed UNWIND ys AS x RETURN x LIMIT 1",
+    }) |text| {
+        var bad = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer bad.deinit();
+        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &bad, &.{}, .{}));
+    }
+}
+
+test "returned values share immutable allocations across the result ownership boundary" {
+    const payload = try std.testing.allocator.alloc(u8, 200000);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 'x');
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(std.testing.allocator);
+    try text.appendSlice(std.testing.allocator, "RETURN ");
+    for (0..16) |i| {
+        if (i != 0) try text.appendSlice(std.testing.allocator, ",");
+        const field = try std.fmt.allocPrint(std.testing.allocator, "$s AS c{d}", .{i});
+        defer std.testing.allocator.free(field);
+        try text.appendSlice(std.testing.allocator, field);
+    }
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, text.items, .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{.{ .name = "s", .value = .{ .string = payload } }}, .{ .memory_bytes = 1 << 20 });
+    defer result.deinit();
+    for (result.rows[0]) |cell| {
+        try std.testing.expectEqual(@as(usize, 200000), cell.string.len);
+        try std.testing.expectEqual(result.rows[0][0].string.ptr, cell.string.ptr);
+    }
+    @memset(payload, 'z');
+    try std.testing.expectEqual(@as(u8, 'x'), result.rows[0][0].string[0]);
+    var typed_query = try c.compile(std.testing.allocator, "UNWIND [1,1.0,1] AS x RETURN {k:[x]}", .{}, &diagnostic);
+    defer typed_query.deinit();
+    var typed = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &typed_query, &.{}, .{});
+    defer typed.deinit();
+    try std.testing.expect(typed.rows[0][0].map[0].value.list[0] == .integer);
+    try std.testing.expect(typed.rows[1][0].map[0].value.list[0] == .number);
+    try std.testing.expect(typed.rows[2][0].map[0].value.list[0] == .integer);
+    var dag_query = try c.compile(std.testing.allocator, "RETURN reduce(xs=[1],i IN range(1,16)|[xs,xs])", .{}, &diagnostic);
+    defer dag_query.deinit();
+    var dag = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &dag_query, &.{}, .{ .memory_bytes = 1 << 20 });
+    defer dag.deinit();
+    const children = dag.rows[0][0].list;
+    try std.testing.expectEqual(@as(usize, 2), children.len);
+    try std.testing.expectEqual(children[0].list.ptr, children[1].list.ptr);
+
+    try check("UNWIND [1,1.0,1] AS x RETURN {k:[x]},[x/2]", "[[{\"k\":[1]},[0]],[{\"k\":[1]},[0.5]],[{\"k\":[1]},[0]]]");
+}
+
+test "read-only graph summaries retain identity keys without copying wide entity properties" {
+    const Wide = struct {
+        const payload: [600000]u8 = @splat('x');
+        fn widen(a: std.mem.Allocator, node: *const v.Node) !*const v.Node {
+            if (!node.identity.eql(Fixture.nodes[0].identity)) return node;
+            const fields = try a.alloc(v.Entry, node.properties.len + 1);
+            @memcpy(fields[0..node.properties.len], node.properties);
+            fields[node.properties.len] = .{ .name = "payload", .value = .{ .string = &payload } };
+            const copy = try a.create(v.Node);
+            copy.* = node.*;
+            copy.properties = fields;
+            return copy;
+        }
+        fn scan(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8, cursor: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
+            var page = try Fixture.scan(ptr, a, name, cursor, limit);
+            const nodes = try a.alloc(*const v.Node, page.items.len);
+            for (page.items, nodes) |node, *out| out.* = try widen(a, node);
+            page.items = nodes;
+            return page;
+        }
+        fn get(ptr: *anyopaque, a: std.mem.Allocator, identity: v.Identity) !?*const v.Node {
+            return if (try Fixture.get(ptr, a, identity)) |node| try widen(a, node) else null;
+        }
+    };
+    var fixture: Fixture = .{};
+    var backend = fixture.backend();
+    var vtable = backend.vtable.*;
+    vtable.scan = Wide.scan;
+    vtable.get = Wide.get;
+    backend.vtable = &vtable;
+    var diagnostic: c.Diagnostic = .{};
+    for ([_][]const u8{
+        "MATCH(a:Document {id:'a'}) UNWIND range(1,30) AS i RETURN i,size([(a)-[:CITES]->(b) WHERE size(a.payload)>=0|b.rank])",
+        "MATCH(a:Document {id:'a'}) UNWIND range(1,30) AS i CALL { WITH a MATCH(a)-[:CITES]->(b) WHERE size(a.payload)>=0 RETURN count(*) AS c } RETURN i,c",
+        "MATCH(a:Document {id:'a'}) UNWIND range(1,30) AS i CALL { WITH a MATCH(a)-[:CITES]->(b) WITH a,count(*) AS c RETURN c,a.payload AS p } RETURN i,c,size(p)",
+        "MATCH(a:Document {id:'a'}) UNWIND range(1,100) AS i CALL { WITH a MATCH(a)-[:CITES]->(b) WITH a,count(*) AS c RETURN c,a.payload AS p } RETURN i,c,size(p)",
+        "MATCH(a:Document {id:'a'}) UNWIND range(1,100) AS i CALL { WITH a MATCH(a)-[:CITES]->(b) WITH a,count(*) AS c RETURN c,a.payload AS p } RETURN i,c,head([z IN [1,2]|size(p)])",
+        "MATCH(a:Document {id:'a'}) UNWIND range(1,30) AS i CALL { WITH a MATCH(a)-[:CITES]->(b) WITH a,count(*) AS c RETURN c,a.payload AS p } RETURN i,c,p ORDER BY i",
+    }) |text| {
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, backend, graph, &compiled, &.{}, .{ .memory_bytes = 8 << 20, .explored_edges = 6, .intermediate_states = if (std.mem.indexOf(u8, text, "RETURN i,c,p ORDER") != null) 1000000 else 100000 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, if (std.mem.indexOf(u8, text, "range(1,100)") != null) 100 else 30), result.rows.len);
+        for (result.rows) |row| try std.testing.expectEqual(@as(i64, 2), row[1].integer);
+    }
+}
+
+test "read-policy grouping reuses statement-owned payloads through WITH projections" {
+    const Wide = struct {
+        fn scan(_: *anyopaque, a: std.mem.Allocator, table: []const u8, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
+            if (!std.mem.eql(u8, table, "docs")) return .{ .items = &.{}, .unfiltered = true };
+            const start = if (after) |cursor| (try std.fmt.parseInt(usize, cursor[1..], 10)) + 1 else 0;
+            const end = @min(@as(usize, 3000), start + @min(limit, 3000));
+            const nodes = try a.alloc(*const v.Node, end - start);
+            for (nodes, start..) |*out, i| {
+                const key = try std.fmt.allocPrint(a, "n{d:0>8}", .{i});
+                const payload = try a.alloc(u8, 4092);
+                @memset(payload, 'x');
+                _ = try std.fmt.bufPrint(payload[0..12], "{d:0>12}", .{i});
+                const properties = try a.alloc(v.Entry, 3);
+                properties[0] = .{ .name = "id", .value = .{ .string = key } };
+                properties[1] = .{ .name = "rank", .value = .{ .integer = @intCast(i) } };
+                properties[2] = .{ .name = "payload", .value = .{ .string = payload } };
+                const node = try a.create(v.Node);
+                node.* = .{ .identity = .{ .table = "docs", .key = key }, .labels = &.{"Document"}, .properties = properties };
+                out.* = node;
+            }
+            return .{ .items = nodes, .next = if (end < 3000) nodes[nodes.len - 1].identity.key else null, .unfiltered = true };
+        }
+        fn versions(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, _: ?[]const u8, _: usize) !b.Page(*const v.Node) {
+            var page = try scan(ptr, a, table, null, 3);
+            for (page.items, "zam") |node, first| {
+                @constCast(node).identity.key = "same";
+                @constCast(node.properties[2].value.string)[0] = first;
+            }
+            page.next = null;
+            return page;
+        }
+        // The callback deliberately prevents entity-field pruning. Ownership
+        // reuse must preserve the complete policy-visible node, not drop fields.
+        fn project(_: *anyopaque, _: std.mem.Allocator, node: *const v.Node) !?*const v.Node {
+            return node;
+        }
+    };
+    var fixture: Fixture = .{};
+    var backend = fixture.backend();
+    var vtable = backend.vtable.*;
+    vtable.scan = Wide.scan;
+    vtable.project_node = Wide.project;
+    backend.vtable = &vtable;
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH(n:Document) WITH n,min(n.payload) AS p RETURN n.rank,size(p) ORDER BY n.rank", .{}, &diagnostic);
+    defer compiled.deinit();
+    // Forbid arena extension so the budget also covers the worst allocation
+    // layout, independently of neighboring allocations in a larger test run.
+    var allocation_vtable = std.testing.allocator.vtable.*;
+    allocation_vtable.resize = std.mem.Allocator.noResize;
+    allocation_vtable.remap = std.mem.Allocator.noRemap;
+    const backing: std.mem.Allocator = .{ .ptr = std.testing.allocator.ptr, .vtable = &allocation_vtable };
+    var result = try runtime.execute(backing, backend, graph, &compiled, &.{}, .{ .memory_bytes = 40 << 20 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 3000), result.rows.len);
+    for (result.rows, 0..) |row, i| {
+        try std.testing.expectEqual(@as(i64, @intCast(i)), row[0].integer);
+        try std.testing.expectEqual(@as(i64, 4092), row[1].integer);
+    }
+    // Equal entity identities may arrive with different policy-visible fields.
+    // Only the first input's exact allocations may be borrowed from its key;
+    // subsequent MIN/MAX/COLLECT inputs must retain their own actual payloads.
+    vtable.scan = Wide.versions;
+    var versions = try c.compile(std.testing.allocator, "MATCH(n:Document) WITH n,min(CASE WHEN EXISTS { RETURN 1 } THEN n.payload END) AS lo,max(n.payload) AS hi,collect(n.payload) AS xs RETURN substring(n.payload,0,1),substring(lo,0,1),substring(hi,0,1),[x IN xs|substring(x,0,1)]", .{}, &diagnostic);
+    defer versions.deinit();
+    var distinct_views = try runtime.execute(std.testing.allocator, backend, graph, &versions, &.{}, .{});
+    defer distinct_views.deinit();
+    try std.testing.expectEqual(@as(usize, 1), distinct_views.rows.len);
+    const cells = distinct_views.rows[0];
+    try std.testing.expectEqualStrings("z", cells[0].string);
+    try std.testing.expectEqualStrings("a", cells[1].string);
+    try std.testing.expectEqualStrings("z", cells[2].string);
+    for (cells[3].list, "zam") |cell, expected| try std.testing.expectEqual(expected, cell.string[0]);
+}
+
+test "statement payload slabs transfer result ownership and release every allocation failure" {
+    const Campaign = struct {
+        const large: [70000]u8 = @splat('L');
+        const small: [4092]u8 = @splat('s');
+        fn run(allocator: std.mem.Allocator) !void {
+            var vtable = allocator.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const backing: std.mem.Allocator = .{ .ptr = allocator.ptr, .vtable = &vtable };
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(backing, "RETURN $large,[$large,$small],{p:$small}", .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(backing, fixture.backend(), graph, &compiled, &.{ .{ .name = "large", .value = .{ .string = &large } }, .{ .name = "small", .value = .{ .string = &small } } }, .{});
+            defer result.deinit();
+            try std.testing.expect(result.statement_byte_pool != null);
+            try std.testing.expectEqual(result.rows[0][0].string.ptr, result.rows[0][1].list[0].string.ptr);
+            try std.testing.expectEqualStrings(&large, result.rows[0][0].string);
+            try std.testing.expectEqualStrings(&small, result.rows[0][2].map[0].value.string);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
+}
+
+test "multiple deferred producer bindings retain lexical frames and eager validation" {
+    for ([_][]const u8{
+        "WITH range(1,1000000000) AS xs,range(1000000001,2000000000) AS ys UNWIND (xs+ys) AS x RETURN count(*)",
+        "WITH range(1,1000000000) AS xs WITH xs,range(1000000001,2000000000) AS ys UNWIND (xs+ys) AS x RETURN count(*)",
+        "WITH range(1,1000000000) AS xs WITH xs AS ys,xs AS zs UNWIND (reverse(ys)+zs) AS x RETURN count(*)",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = 1 << 20, .intermediate_states = 1000 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, 2000000000), result.rows[0][0].integer);
+    }
+    try check("WITH 2 AS n WITH range(1,n) AS xs,range(n+1,n+2) AS ys,n+10 AS n WITH reverse(xs) AS a,(ys+xs) AS b,n+1 AS n UNWIND (a+b+range(n,n)) AS x RETURN collect(x),min(n)", "[[[2,1,3,4,1,2,13],13]]");
+    try check("WITH range(1,2) AS xs,range(3,4) AS ys UNWIND (xs+ys) AS z RETURN collect(z)", "[[[1,2,3,4]]]");
+    try check("WITH range(1,3) AS xs,range(4,5) AS ys UNWIND xs AS x RETURN collect(x),head(collect(ys))", "[[[1,2,3],[4,5]]]");
+    try check("WITH [x IN null|x] AS xs,range(1,3) AS ys UNWIND (xs+ys) AS x RETURN count(*)", "[[0]]");
+    try check("WITH range(1,2) AS xs,range(3,4) AS ys UNWIND [x IN (xs+ys)|x/2] AS z RETURN collect(z)", "[[[0,1,1,2]]]");
+    var diagnostic: c.Diagnostic = .{};
+    var fixture: Fixture = .{};
+    for ([_][]const u8{
+        "WITH range(1,1000000000) AS xs,[x IN [0]|1/x] AS ys UNWIND xs AS x RETURN count(*)",
+        "WITH range(1,1000000000) AS xs,1/0 AS n,range(1,2,0) AS ys UNWIND (xs+ys) AS x RETURN count(*)",
+        "WITH [x IN null|x] AS xs,[x IN [0]|1/x] AS ys UNWIND (xs+ys) AS x RETURN x LIMIT 1",
+    }) |text| {
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 1000 }));
+    }
+    var bad = try c.compile(std.testing.allocator, "WITH range(1,2,0) AS xs,1/0 AS n,range(1,3) AS ys UNWIND (xs+ys) AS x RETURN count(*)", .{}, &diagnostic);
+    defer bad.deinit();
+    try std.testing.expectError(error.CypherInvalidRange, runtime.execute(std.testing.allocator, fixture.backend(), graph, &bad, &.{}, .{}));
+}
+
+test "immutable list count facts share DISTINCT domains across groups and merge overlaps" {
+    const items = try std.testing.allocator.alloc(v.Value, 10002);
+    defer std.testing.allocator.free(items);
+    for (items[0..10000], 0..) |*item, i| item.* = .{ .integer = @intCast(i) };
+    items[10000] = .{ .number = 1.0 };
+    items[10001] = .null;
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "UNWIND range(1,30) AS i UNWIND $xs AS x RETURN i,count(x),count(DISTINCT x),count(*),count(null),count(DISTINCT i) ORDER BY i", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{.{ .name = "xs", .value = .{ .list = items } }}, .{ .memory_bytes = 4 << 20, .intermediate_states = 100000 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 30), result.rows.len);
+    for (result.rows, 1..) |row, i| {
+        try std.testing.expectEqual(@as(i64, @intCast(i)), row[0].integer);
+        try std.testing.expectEqual(@as(i64, 10001), row[1].integer);
+        try std.testing.expectEqual(@as(i64, 10000), row[2].integer);
+        try std.testing.expectEqual(@as(i64, 10002), row[3].integer);
+        try std.testing.expectEqual(@as(i64, 0), row[4].integer);
+        try std.testing.expectEqual(@as(i64, 1), row[5].integer);
+    }
+    const lists: v.Value = .{ .list = &.{
+        .{ .list = &.{ .{ .integer = 1 }, .{ .integer = 2 }, .null } },
+        .{ .list = &.{ .{ .number = 2.0 }, .{ .integer = 3 } } },
+        .{ .list = &.{.null} },
+        .{ .list = &.{} },
+        .{ .list = &.{ .{ .integer = 1 }, .{ .integer = 2 } } },
+    } };
+    var union_query = try c.compile(std.testing.allocator, "UNWIND $lists AS xs UNWIND xs AS x RETURN count(x),count(DISTINCT x),count(*)", .{}, &diagnostic);
+    defer union_query.deinit();
+    var merged = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &union_query, &.{.{ .name = "lists", .value = lists }}, .{});
+    defer merged.deinit();
+    try std.testing.expectEqual(@as(i64, 6), merged.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 3), merged.rows[0][1].integer);
+    try std.testing.expectEqual(@as(i64, 8), merged.rows[0][2].integer);
+    var fallback_query = try c.compile(std.testing.allocator, "UNWIND [1,2] AS i UNWIND CASE WHEN i=1 THEN $xs ELSE [i,3] END AS x RETURN count(x),count(DISTINCT x),count(*)", .{}, &diagnostic);
+    defer fallback_query.deinit();
+    var fallback = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &fallback_query, &.{.{ .name = "xs", .value = .{ .list = &.{ .{ .integer = 1 }, .{ .integer = 2 } } } }}, .{});
+    defer fallback.deinit();
+    try std.testing.expectEqual(@as(i64, 4), fallback.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 3), fallback.rows[0][1].integer);
+    try std.testing.expectEqual(@as(i64, 4), fallback.rows[0][2].integer);
+    const Policy = struct {
+        fn project(_: *anyopaque, _: std.mem.Allocator, node: *const v.Node) !?*const v.Node {
+            return if (node.identity.eql(Fixture.nodes[1].identity)) null else node;
+        }
+    };
+    var backend = fixture.backend();
+    var callbacks = backend.vtable.*;
+    callbacks.project_node = Policy.project;
+    backend.vtable = &callbacks;
+    var entities_query = try c.compile(std.testing.allocator, "UNWIND $xs AS x RETURN count(x),count(DISTINCT x),count(*)", .{}, &diagnostic);
+    defer entities_query.deinit();
+    var entities = try runtime.execute(std.testing.allocator, backend, graph, &entities_query, &.{.{ .name = "xs", .value = .{ .list = &.{ .{ .node = &Fixture.nodes[0] }, .{ .node = &Fixture.nodes[1] } } } }}, .{});
+    defer entities.deinit();
+    try std.testing.expectEqual(@as(i64, 1), entities.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 1), entities.rows[0][1].integer);
+    try std.testing.expectEqual(@as(i64, 2), entities.rows[0][2].integer);
+}
+
+test "multiple source frames and shared list count domains release failed allocations" {
+    const Campaign = struct {
+        fn run(allocator: std.mem.Allocator, text: []const u8) !void {
+            var vtable = allocator.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const backing: std.mem.Allocator = .{ .ptr = allocator.ptr, .vtable = &vtable };
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(backing, text, .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            const lists: v.Value = .{ .list = &.{
+                .{ .list = &.{ .{ .integer = 1 }, .{ .integer = 2 }, .null } },
+                .{ .list = &.{ .{ .number = 2.0 }, .{ .integer = 3 } } },
+            } };
+            var result = try runtime.execute(backing, fixture.backend(), graph, &compiled, &.{.{ .name = "lists", .value = lists }}, .{});
+            defer result.deinit();
+        }
+    };
+    for ([_][]const u8{
+        "WITH range(1,3) AS xs,range(4,6) AS ys WITH reverse(xs) AS a,(ys+xs) AS b UNWIND (a+b) AS x RETURN collect(x)",
+        "UNWIND $lists AS xs UNWIND xs AS x RETURN count(DISTINCT x),count(x),count(*)",
+        "UNWIND [1,2] AS i UNWIND CASE WHEN i=1 THEN $lists[0] ELSE [i,3] END AS x RETURN count(DISTINCT x),count(*)",
+    }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{text});
+}
+
+test "composed arithmetic count domains preserve overlaps aliases and eager errors" {
+    for ([_]struct { text: []const u8, count: i64, distinct: i64 }{
+        .{ .text = "WITH range(1,1000000000) AS xs,range(500000001,1500000000) AS ys UNWIND (reverse(xs)+ys) AS x RETURN count(x),count(DISTINCT x),count(*)", .count = 2000000000, .distinct = 1500000000 },
+        .{ .text = "WITH range(1,1000000000,2) AS xs,range(1000000000,1,-3) AS ys UNWIND (xs+ys) AS x WITH x AS y WITH y AS z RETURN count(z),count(DISTINCT z),count(*)", .count = 833333334, .distinct = 666666667 },
+        .{ .text = "UNWIND (range(1,1000000000)+range(1,1000000000)) AS x RETURN count(x),count(DISTINCT x),count(*)", .count = 2000000000, .distinct = 1000000000 },
+    }) |case| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, case.text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = 1 << 20, .intermediate_states = 2000 });
+        defer result.deinit();
+        try std.testing.expectEqual(case.count, result.rows[0][0].integer);
+        try std.testing.expectEqual(case.distinct, result.rows[0][1].integer);
+        try std.testing.expectEqual(case.count, result.rows[0][2].integer);
+    }
+    try check("UNWIND (range(null,3)+range(1,3)) AS x RETURN count(x),count(DISTINCT x)", "[[0,0]]");
+    try check("UNWIND (range(3,1)+range(5,7)) AS x RETURN count(x),count(DISTINCT x)", "[[3,3]]");
+    try check("UNWIND [1,2] AS i UNWIND (range(1,3)+range(2,4)) AS x RETURN count(x),count(DISTINCT x),count(*)", "[[12,4,12]]");
+    try check("UNWIND (range(1,3)+range(2,4)) AS x WITH x AS y,x AS z RETURN count(y),count(DISTINCT z)", "[[6,4]]");
+    var fixture: Fixture = .{};
+    var diagnostic: c.Diagnostic = .{};
+    var bad = try c.compile(std.testing.allocator, "UNWIND (range(null,3)+range(1,3,0)) AS x RETURN count(x)", .{}, &diagnostic);
+    defer bad.deinit();
+    try std.testing.expectError(error.CypherInvalidRange, runtime.execute(std.testing.allocator, fixture.backend(), graph, &bad, &.{}, .{}));
+}
+
+test "immutable list aggregate facts survive renames and preserve extrema representations" {
+    const items = try std.testing.allocator.alloc(v.Value, 10002);
+    defer std.testing.allocator.free(items);
+    for (items[0..10000], 0..) |*item, i| item.* = .{ .integer = @intCast(i) };
+    items[10000] = .{ .number = 1.0 };
+    items[10001] = .null;
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "UNWIND range(1,30) AS i UNWIND $xs AS x WITH i,x AS y WITH i AS j,y AS z RETURN j,count(z),count(DISTINCT z),min(z),max(DISTINCT z),count(*) ORDER BY j", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{.{ .name = "xs", .value = .{ .list = items } }}, .{ .memory_bytes = 4 << 20, .intermediate_states = 200000 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 30), result.rows.len);
+    for (result.rows, 1..) |row, i| {
+        try std.testing.expectEqual(@as(i64, @intCast(i)), row[0].integer);
+        for ([_]i64{ 10001, 10000, 0, 9999, 10002 }, row[1..]) |expected, value| try std.testing.expectEqual(expected, value.integer);
+    }
+    var ties = try c.compile(std.testing.allocator, "UNWIND $xs AS x RETURN min(x),max(x),count(x)", .{}, &diagnostic);
+    defer ties.deinit();
+    var tied = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &ties, &.{.{ .name = "xs", .value = .{ .list = &.{ .null, .{ .number = 1.0 }, .{ .integer = 1 } } } }}, .{});
+    defer tied.deinit();
+    try std.testing.expect(tied.rows[0][0] == .number and tied.rows[0][1] == .number);
+    try std.testing.expectEqual(@as(i64, 2), tied.rows[0][2].integer);
+}
+
+test "shared source summaries and CALL escape release failed allocations" {
+    const Campaign = struct {
+        fn run(allocator: std.mem.Allocator, text: []const u8) !void {
+            var vtable = allocator.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const a: std.mem.Allocator = .{ .ptr = allocator.ptr, .vtable = &vtable };
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, text, .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{.{ .name = "xs", .value = .{ .list = &.{ .{ .integer = 3 }, .null, .{ .integer = 1 }, .{ .number = 1.0 } } } }}, .{});
+            defer result.deinit();
+        }
+    };
+    for ([_][]const u8{
+        "WITH range(1,9,2) AS xs,range(10,1,-3) AS ys UNWIND (xs+ys) AS x WITH x AS y RETURN count(y),count(DISTINCT y)",
+        "UNWIND [1,2] AS i UNWIND $xs AS x WITH i,x AS y RETURN i,count(y),count(DISTINCT y),min(y),max(y)",
+        "MATCH(a:Document {id:'a'}) UNWIND [1,2,3] AS i CALL {WITH a MATCH(a)-[:CITES]->(b) RETURN collect(b.title) AS titles} RETURN i,titles",
+    }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{text});
+}
+
+test "arithmetic domain certificates preserve source DAG sharing" {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(std.testing.allocator);
+    try text.appendSlice(std.testing.allocator, "WITH range(1,1000000000) AS xs ");
+    for (0..20) |_| try text.appendSlice(std.testing.allocator, "WITH (xs+xs) AS xs ");
+    try text.appendSlice(std.testing.allocator, "UNWIND xs AS x RETURN count(x),count(DISTINCT x)");
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, text.items, .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = 2 << 20, .intermediate_states = 10000 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 1000000000) << 20, result.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 1000000000), result.rows[0][1].integer);
+}
+
+test "CALL memo result sharing preserves maximum user value depth" {
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "UNWIND [1,2,3] AS i CALL {RETURN reduce(xs=0,x IN range(1,64)|[xs]) AS xs} RETURN i,xs ORDER BY i", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 3), result.rows.len);
+    for (result.rows) |row| {
+        var value = row[1];
+        for (0..64) |_| value = value.list[0];
+        try std.testing.expectEqual(@as(i64, 0), value.integer);
+    }
+}
+
+test "source summaries cross independent projections and certify integer sums" {
+    const items = try std.testing.allocator.alloc(v.Value, 10000);
+    defer std.testing.allocator.free(items);
+    for (items, 0..) |*item, i| item.* = .{ .integer = @intCast(i) };
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "UNWIND range(1,30) AS i UNWIND $xs AS x WITH i+1 AS j,x AS y RETURN j,count(y),sum(y),min(y),max(y) ORDER BY j", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{.{ .name = "xs", .value = .{ .list = items } }}, .{ .memory_bytes = 4 << 20, .intermediate_states = 150000 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 30), result.rows.len);
+    for (result.rows, 2..) |row, j| {
+        try std.testing.expectEqual(@as(i64, @intCast(j)), row[0].integer);
+        for ([_]i64{ 10000, 49995000, 0, 9999 }, row[1..]) |expected, value| try std.testing.expectEqual(expected, value.integer);
+    }
+}
+
+test "integer list sum certificates preserve prefix overflow mixed domains and deferred errors" {
+    const inputs = [_]v.Value{
+        .{ .list = &.{ .{ .integer = 9223372036854775807 }, .{ .integer = 1 }, .{ .integer = -1 } } },
+        .{ .list = &.{ .{ .integer = -9223372036854775808 }, .{ .integer = -1 }, .{ .integer = 1 } } },
+    };
+    var fixture: Fixture = .{};
+    var diagnostic: c.Diagnostic = .{};
+    var overflow = try c.compile(std.testing.allocator, "UNWIND $xs AS x RETURN sum(x)", .{}, &diagnostic);
+    defer overflow.deinit();
+    for (inputs) |value| try std.testing.expectError(error.CypherNumericOverflow, runtime.execute(std.testing.allocator, fixture.backend(), graph, &overflow, &.{.{ .name = "xs", .value = value }}, .{}));
+    var scalar_error = try c.compile(std.testing.allocator, "UNWIND $xs AS x WITH x AS y,1/0 AS n RETURN sum(y),min(n)", .{}, &diagnostic);
+    defer scalar_error.deinit();
+    try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &scalar_error, &.{.{ .name = "xs", .value = inputs[0] }}, .{}));
+    try check("UNWIND [[1,2,null],[-3,4],[],[null]] AS xs UNWIND xs AS x RETURN sum(x),count(x)", "[[4,4]]");
+    // Floating and non-integral domains keep their original evaluation order.
+    const mixed: v.Value = .{ .list = &.{ .{ .list = &.{.{ .number = 1e16 }} }, .{ .list = &.{ .{ .integer = -1 }, .{ .integer = -1 } } } } };
+    var grouped = try c.compile(std.testing.allocator, "UNWIND $lists AS xs UNWIND xs AS x RETURN sum(x)", .{}, &diagnostic);
+    defer grouped.deinit();
+    var actual = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &grouped, &.{.{ .name = "lists", .value = mixed }}, .{});
+    defer actual.deinit();
+    try std.testing.expectEqual(@as(f64, 1e16), actual.rows[0][0].number);
+    var deferred = try c.compile(std.testing.allocator, "UNWIND $xs AS x RETURN CASE WHEN false THEN sum(x) ELSE 7 END", .{}, &diagnostic);
+    defer deferred.deinit();
+    var unused = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &deferred, &.{.{ .name = "xs", .value = inputs[0] }}, .{});
+    defer unused.deinit();
+    try std.testing.expectEqual(@as(i64, 7), unused.rows[0][0].integer);
+}
+
+test "arithmetic extrema compose without enumerating cells" {
+    for ([_]struct { text: []const u8, low: i64, high: i64 }{
+        .{ .text = "UNWIND range(1,1000000000) AS x RETURN min(x),max(x)", .low = 1, .high = 1000000000 },
+        .{ .text = "WITH range(1000000000,1,-3) AS xs,range(-1000000000,-1,2) AS ys UNWIND (reverse(xs)+ys) AS x WITH x AS y,2+3 AS n RETURN min(DISTINCT y),max(y),min(n)", .low = -1000000000, .high = 1000000000 },
+    }) |case| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, case.text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = 1 << 20, .intermediate_states = 1000 });
+        defer result.deinit();
+        try std.testing.expectEqual(case.low, result.rows[0][0].integer);
+        try std.testing.expectEqual(case.high, result.rows[0][1].integer);
+    }
+    try check("UNWIND range(3,1) AS x RETURN min(x),max(x)", "[[null,null]]");
+    try check("UNWIND (range(null,1)+range(1,2)) AS x RETURN min(x),max(x)", "[[null,null]]");
+}
+
+test "new source aggregate and metadata owners release every failed allocation" {
+    const Campaign = struct {
+        const payload: [300]u8 = @splat('x');
+        fn run(allocator: std.mem.Allocator, text: []const u8) !void {
+            var vtable = allocator.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const a: std.mem.Allocator = .{ .ptr = allocator.ptr, .vtable = &vtable };
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, text, .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{ .{ .name = "xs", .value = .{ .list = &.{ .{ .integer = 3 }, .null, .{ .integer = -1 }, .{ .integer = 2 } } } }, .{ .name = "s", .value = .{ .string = &payload } } }, .{});
+            defer result.deinit();
+        }
+    };
+    for ([_][]const u8{
+        "UNWIND [1,2] AS i UNWIND $xs AS x WITH i+1 AS j,x AS y RETURN j,sum(y),count(y),min(y),max(y)",
+        "WITH range(1,3) AS xs,range(5,2,-1) AS ys UNWIND (xs+ys) AS x RETURN min(x),max(x),count(DISTINCT x)",
+        "UNWIND [1,2,3] AS i CALL {RETURN $s AS p} RETURN i,size(p),toUpper(p)",
+        "UNWIND [1,2] AS i UNWIND $xs AS x WITH i,x+1 AS y RETURN i,sum(DISTINCT y),sum(y)",
+        "UNWIND reverse(range(-2,3)+range(2,5)) AS x RETURN sum(x)",
+        "UNWIND [1,2,3] AS i RETURN substring($s,i,1)",
+    }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{text});
+}
+
+test "fragmented arithmetic certificates fit a budget cheaper than pairwise proof" {
+    const Builder = struct {
+        fn append(a: std.mem.Allocator, text: *std.ArrayList(u8), first: usize, end: usize) !void {
+            if (end - first == 1) {
+                const leaf = try std.fmt.allocPrint(a, "range({d},{d})", .{ first, first });
+                defer a.free(leaf);
+                return text.appendSlice(a, leaf);
+            }
+            try text.append(a, '(');
+            const middle = first + (end - first) / 2;
+            try append(a, text, first, middle);
+            try text.append(a, '+');
+            try append(a, text, middle, end);
+            try text.append(a, ')');
+        }
+    };
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(std.testing.allocator);
+    try text.appendSlice(std.testing.allocator, "UNWIND ");
+    try Builder.append(std.testing.allocator, &text, 0, 256);
+    try text.appendSlice(std.testing.allocator, " AS x RETURN count(DISTINCT x)");
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, text.items, .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 3000 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 256), result.rows[0][0].integer);
+}
+
+test "mapped immutable axes share transformed domains across groups" {
+    const items = try std.testing.allocator.alloc(v.Value, 1000);
+    defer std.testing.allocator.free(items);
+    for (items, 0..) |*item, i| item.* = .{ .integer = @intCast(i) };
+    var fixture: Fixture = .{};
+    var diagnostic: c.Diagnostic = .{};
+    for ([_][]const u8{
+        "UNWIND range(1,30) AS i UNWIND $xs AS x WITH i,x+1 AS y RETURN i,count(y),sum(y),sum(DISTINCT y) ORDER BY i",
+        "UNWIND range(1,30) AS i UNWIND $xs AS x WITH i,x+1 AS y WITH i,y*2 AS z RETURN i,count(z),sum(z)/2,sum(DISTINCT z)/2 ORDER BY i",
+    }) |text| {
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{.{ .name = "xs", .value = .{ .list = items } }}, .{ .memory_bytes = 4 << 20, .intermediate_states = 100000 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 30), result.rows.len);
+        for (result.rows, 1..) |row, i| {
+            try std.testing.expectEqual(@as(i64, @intCast(i)), row[0].integer);
+            for ([_]i64{ 1000, 500500, 500500 }, row[1..]) |expected, value| try std.testing.expectEqual(expected, value.integer);
+        }
+    }
+    try check("UNWIND [1,2,null] AS x WITH x+1 AS y RETURN count(y),sum(y)", "[[2,5]]");
+    try check("UNWIND [1,2] AS i UNWIND [1,2] AS x WITH i,x+i AS y RETURN i,sum(y) ORDER BY i", "[[1,5],[2,7]]");
+    // A speculative mapping failure must not displace an earlier sibling error.
+    var failed = try c.compile(std.testing.allocator, "UNWIND $xs AS x WITH 1/0 AS n,x+1 AS y RETURN min(n),sum(y)", .{}, &diagnostic);
+    defer failed.deinit();
+    try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &failed, &.{.{ .name = "xs", .value = .{ .list = &.{ .{ .integer = 1 }, .{ .integer = std.math.maxInt(i64) } } } }}, .{}));
+}
+
+test "distinct integer summaries preserve ordered support and overlapping domains" {
+    try check("UNWIND [[1,2,2,null],[2,3,1],[3,4]] AS xs UNWIND xs AS x RETURN sum(DISTINCT x),count(DISTINCT x),collect(DISTINCT x)", "[[10,4,[1,2,3,4]]]");
+    try check("UNWIND [[1,2],[2.0,3.0],[4]] AS xs UNWIND xs AS x RETURN sum(DISTINCT x),count(DISTINCT x)", "[[10,4]]");
+    try check("UNWIND [[null],[],[null]] AS xs UNWIND xs AS x RETURN sum(DISTINCT x)", "[[0]]");
+    try check("UNWIND [[1,2],[2,3],[1,2]] AS xs UNWIND xs AS x RETURN CASE WHEN false THEN sum(DISTINCT x) ELSE 7 END", "[[7]]");
+    var fixture: Fixture = .{};
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "UNWIND $xs AS x RETURN sum(DISTINCT x)", .{}, &diagnostic);
+    defer compiled.deinit();
+    try std.testing.expectError(error.CypherNumericOverflow, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{.{ .name = "xs", .value = .{ .list = &.{ .{ .integer = std.math.maxInt(i64) }, .{ .integer = 1 }, .{ .integer = -1 } } } }}, .{}));
+}
+
+test "ordered arithmetic sums preserve prefix extrema and source bag multiplicity" {
+    var fixture: Fixture = .{};
+    var diagnostic: c.Diagnostic = .{};
+    for ([_]struct { text: []const u8, expected: i64 }{
+        .{ .text = "UNWIND range(1,1000000000) AS x RETURN sum(x)", .expected = 500000000500000000 },
+        .{ .text = "UNWIND reverse(range(-1000000000,1000000000)) AS x RETURN sum(x)", .expected = 0 },
+        .{ .text = "WITH range(1,1000000) AS xs WITH xs,xs+xs AS ys UNWIND reverse(ys)+xs AS x RETURN sum(x)", .expected = 1500001500000 },
+    }) |case| {
+        var compiled = try c.compile(std.testing.allocator, case.text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = 1 << 20, .intermediate_states = 1000 });
+        defer result.deinit();
+        try std.testing.expectEqual(case.expected, result.rows[0][0].integer);
+    }
+    for ([_][]const u8{
+        "UNWIND range(-9223372036854775808,9223372036854775807) AS x RETURN sum(x)",
+        "UNWIND range(9223372036854775807,9223372036854775807)+range(1,1)+range(-1,-1) AS x RETURN sum(x)",
+    }) |text| {
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        try std.testing.expectError(error.CypherNumericOverflow, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+    try check("UNWIND range(3,1) AS x RETURN sum(x)", "[[0]]");
+    try check("UNWIND range(1,3) AS x RETURN sum(x),sum(0.1)", "[[6,0.30000000000000004]]");
+    // Compare independent enumerating reducers over generated source geometries.
+    var random = std.Random.DefaultPrng.init(0x8a31e7);
+    for (0..150) |_| {
+        const start = random.random().intRangeAtMost(i64, -100, 100);
+        const end = random.random().intRangeAtMost(i64, -100, 100);
+        const step: i64 = if (random.random().boolean()) 3 else -2;
+        const text = try std.fmt.allocPrint(std.testing.allocator, "UNWIND reverse(range({d},{d},{d})+range(-5,7)) AS x RETURN sum(x)", .{ start, end, step });
+        defer std.testing.allocator.free(text);
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{});
+        defer result.deinit();
+        var expected: i64 = 13;
+        var value = start;
+        while (if (step > 0) value <= end else value >= end) : (value += step) expected += value;
+        try std.testing.expectEqual(expected, result.rows[0][0].integer);
+    }
+}
+
+test "dynamic string windows reuse root validation and bounded Unicode offsets" {
+    const ascii = try std.testing.allocator.alloc(u8, 1000000);
+    defer std.testing.allocator.free(ascii);
+    @memset(ascii, 'x');
+    const unicode = try std.testing.allocator.alloc(u8, 1200000);
+    defer std.testing.allocator.free(unicode);
+    for (0..unicode.len / 6) |i| @memcpy(unicode[i * 6 ..][0..6], "é🙂");
+    var fixture: Fixture = .{};
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "UNWIND range(100000,100099) AS i RETURN substring($s,i,1)", .{}, &diagnostic);
+    defer compiled.deinit();
+    for ([_][]const u8{ ascii, unicode }, 0..) |text, kind| {
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{.{ .name = "s", .value = .{ .string = text } }}, .{ .memory_bytes = 4 << 20, .intermediate_states = 150000 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 100), result.rows.len);
+        for (result.rows, 0..) |row, i| try std.testing.expectEqualStrings(if (kind == 0) "x" else if (i % 2 == 0) "é" else "🙂", row[0].string);
+    }
+}
+
+test "shared mapped and distinct summaries match sequential reducers over generated domains" {
+    const Compare = struct {
+        fn run(text: []const u8, parameters: []const v.Entry) !void {
+            var diagnostic: c.Diagnostic = .{};
+            var fast = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+            defer fast.deinit();
+            const control = try std.fmt.allocPrint(std.testing.allocator, "{s},sum(0)+size(collect(null)[0..0])", .{text});
+            defer std.testing.allocator.free(control);
+            var slow = try c.compile(std.testing.allocator, control, .{}, &diagnostic);
+            defer slow.deinit();
+            var fixture: Fixture = .{};
+            var actual = runtime.execute(std.testing.allocator, fixture.backend(), graph, &fast, parameters, .{}) catch |err| {
+                try std.testing.expectError(err, runtime.execute(std.testing.allocator, fixture.backend(), graph, &slow, parameters, .{}));
+                return;
+            };
+            defer actual.deinit();
+            var expected = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &slow, parameters, .{});
+            defer expected.deinit();
+            try std.testing.expectEqual(expected.rows.len, actual.rows.len);
+            for (actual.rows, expected.rows) |a, e| for (a, e[0..a.len]) |left, right| {
+                try std.testing.expectEqual(std.meta.activeTag(right), std.meta.activeTag(left));
+                try std.testing.expect(v.Value.eql(left, right));
+            };
+        }
+    };
+    var random = std.Random.DefaultPrng.init(0x7e91a2);
+    const choices = [_]v.Value{ .null, .{ .integer = 0 }, .{ .integer = -2 }, .{ .integer = 3 }, .{ .integer = std.math.maxInt(i64) }, .{ .integer = std.math.minInt(i64) }, .{ .number = 1e16 }, .{ .number = 2.5 }, .{ .number = 3 }, .{ .boolean = true }, .{ .string = "a" } };
+    for (0..180) |iteration| {
+        var cells: [24]v.Value = undefined;
+        for (&cells) |*cell| cell.* = choices[random.random().uintLessThan(usize, if (iteration < 80) 4 else choices.len)];
+        const lists = [_]v.Value{ .{ .list = cells[0..8] }, .{ .list = cells[8..16] }, .{ .list = cells[16..24] }, .{ .list = cells[0..8] } };
+        const parameters: []const v.Entry = &.{.{ .name = "lists", .value = .{ .list = &lists } }};
+        for ([_][]const u8{
+            "UNWIND $lists AS xs UNWIND xs AS x RETURN sum(DISTINCT x),count(DISTINCT x)",
+            "UNWIND $lists AS xs UNWIND xs AS x WITH x+1 AS y RETURN sum(y),count(y)",
+            "UNWIND $lists AS xs UNWIND xs AS x WITH x*2 AS y RETURN sum(DISTINCT y),count(DISTINCT y)",
+            "UNWIND $lists AS xs UNWIND xs AS x RETURN CASE WHEN false THEN sum(DISTINCT x) ELSE 7 END",
+        }) |text| try Compare.run(text, parameters);
+    }
+}
+
+test "synthetic mapped domains do not consume the user value depth allowance" {
+    var levels: [65]v.Value = undefined;
+    levels[0] = .{ .integer = 1 };
+    for (1..levels.len) |i| levels[i] = .{ .list = levels[i - 1 .. i] };
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "UNWIND $xs AS x WITH [x] AS y RETURN count(y)", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{.{ .name = "xs", .value = levels[64] }}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 1), result.rows[0][0].integer);
+}
+
+test "range sum fallback cursors retain reversal when shape proof is depth bounded" {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(std.testing.allocator);
+    try text.appendSlice(std.testing.allocator, "UNWIND ");
+    for (0..65) |_| try text.appendSlice(std.testing.allocator, "reverse(");
+    try text.appendSlice(std.testing.allocator, "range(-9223372036854775808,9223372036854775806,9223372036854775807)");
+    for (0..65) |_| try text.append(std.testing.allocator, ')');
+    try text.appendSlice(std.testing.allocator, " AS x RETURN sum(x)");
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, text.items, .{ .max_depth = 256 }, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, -3), result.rows[0][0].integer);
+}
+
+test "ordered reduction memos cover multiple outputs floats reversals and overlapping domains" {
+    const a = std.testing.allocator;
+    const xs = try a.alloc(v.Value, 1000);
+    defer a.free(xs);
+    var fixture: Fixture = .{};
+    var diagnostic: c.Diagnostic = .{};
+    const cases = [_]struct { text: []const u8, expected: []const v.Value, floating: bool = false }{
+        .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x WITH i,x+1 AS y,x*2 AS z RETURN i,sum(y),sum(z) ORDER BY i", .expected = &.{ .{ .integer = 500500 }, .{ .integer = 999000 } } },
+        .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x RETURN i,avg(x) ORDER BY i", .expected = &.{.{ .number = 499.5 }} },
+        .{ .text = "UNWIND range(1,30) AS i UNWIND reverse($xs) AS x RETURN i,sum(x) ORDER BY i", .expected = &.{.{ .integer = 499500 }} },
+        .{ .text = "UNWIND range(1,30) AS i UNWIND $lists AS xs UNWIND xs AS x RETURN i,sum(DISTINCT x),count(DISTINCT x) ORDER BY i", .expected = &.{ .{ .integer = 280875 }, .{ .integer = 750 } } },
+        .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x RETURN i,sum(x) ORDER BY i", .expected = &.{.{ .number = 49950 }}, .floating = true },
+    };
+    for (cases) |case| {
+        for (xs, 0..) |*value, i| value.* = if (case.floating) .{ .number = @as(f64, @floatFromInt(i)) / 10 } else .{ .integer = @intCast(i) };
+        const lists = [_]v.Value{ .{ .list = xs[0..500] }, .{ .list = xs[250..750] } };
+        var compiled = try c.compile(a, case.text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{ .{ .name = "xs", .value = .{ .list = xs } }, .{ .name = "lists", .value = .{ .list = &lists } } }, .{ .memory_bytes = 4 << 20, .intermediate_states = 100000 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 30), result.rows.len);
+        for (result.rows, 1..) |row, i| {
+            try std.testing.expectEqual(@as(i64, @intCast(i)), row[0].integer);
+            for (row[1..], case.expected) |actual, expected| {
+                try std.testing.expectEqual(std.meta.activeTag(expected), std.meta.activeTag(actual));
+                try std.testing.expect(v.Value.eql(expected, actual));
+            }
+        }
+    }
+}
+
+test "ordered memo traces preserve reached scalar errors and empty tails" {
+    var fixture: Fixture = .{};
+    var diagnostic: c.Diagnostic = .{};
+    for ([_][]const u8{
+        "UNWIND [1,2] AS i UNWIND [1] AS x WITH i,1/0 AS bad,x AS y UNWIND [] AS z RETURN i,avg(y)",
+        "UNWIND [1,2] AS i UNWIND [1,2] AS x WITH i,1/0 AS bad,1/(x-1) AS y RETURN i,avg(y)",
+        "UNWIND [1,2] AS i UNWIND [1,2] AS x WITH i,x+1 AS y,1/(i-2) AS bad RETURN i,avg(y)",
+    }) |text| {
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+    try check("UNWIND [1,2] AS i UNWIND [] AS x WITH i,1/0 AS bad,x AS y RETURN i,avg(y)", "[]");
+    try check("UNWIND [1,2] AS i UNWIND [1,2] AS x RETURN i,CASE WHEN false THEN avg('bad') ELSE 7 END", "[[1,7],[2,7]]");
+    try check("UNWIND [1,1,2] AS i UNWIND [1.0,2.0,3.0] AS x RETURN i,avg(x),sum(x) ORDER BY i", "[[1,2,12],[2,2,6]]");
+    try check("UNWIND [1,1,2] AS i UNWIND [[1,2],[2,3],[1.0,4]] AS xs UNWIND xs AS x RETURN i,avg(DISTINCT x),sum(DISTINCT x),count(DISTINCT x) ORDER BY i", "[[1,2.5,10,4],[2,2.5,10,4]]");
+}
+
+test "ordered reduction snapshots match independent sequential execution across partitions" {
+    const Compare = struct {
+        fn run(text: []const u8, parameters: []const v.Entry) !void {
+            const a = std.testing.allocator;
+            var diagnostic: c.Diagnostic = .{};
+            var fast = try c.compile(a, text, .{}, &diagnostic);
+            defer fast.deinit();
+            const control = try std.fmt.allocPrint(a, "{s},sum(0)+size(collect(null)[0..0])", .{text});
+            defer a.free(control);
+            var slow = try c.compile(a, control, .{}, &diagnostic);
+            defer slow.deinit();
+            var fixture: Fixture = .{};
+            var actual = runtime.execute(a, fixture.backend(), graph, &fast, parameters, .{}) catch |err| {
+                try std.testing.expectError(err, runtime.execute(a, fixture.backend(), graph, &slow, parameters, .{}));
+                return;
+            };
+            defer actual.deinit();
+            var expected = try runtime.execute(a, fixture.backend(), graph, &slow, parameters, .{});
+            defer expected.deinit();
+            try std.testing.expectEqual(expected.rows.len, actual.rows.len);
+            for (actual.rows, expected.rows) |left, right| for (left, right[0..left.len]) |x, y| {
+                try std.testing.expectEqual(std.meta.activeTag(y), std.meta.activeTag(x));
+                if (x == .number) try std.testing.expectEqual(@as(u64, @bitCast(y.number)), @as(u64, @bitCast(x.number))) else try std.testing.expect(v.Value.eql(x, y));
+            };
+        }
+    };
+    var random = std.Random.DefaultPrng.init(0xa328d4);
+    const choices = [_]v.Value{ .null, .{ .integer = 0 }, .{ .integer = -2 }, .{ .integer = 3 }, .{ .integer = std.math.maxInt(i64) }, .{ .integer = std.math.minInt(i64) }, .{ .number = 1e16 }, .{ .number = 2.5 }, .{ .number = 3 }, .{ .number = -0.0 }, .{ .boolean = true }, .{ .string = "bad" } };
+    for (0..160) |iteration| {
+        var cells: [18]v.Value = undefined;
+        for (&cells) |*value| value.* = choices[random.random().uintLessThan(usize, if (iteration < 60) 4 else choices.len)];
+        const lists = [_]v.Value{ .{ .list = cells[0..6] }, .{ .list = cells[6..12] }, .{ .list = cells[12..] }, .{ .list = cells[0..6] } };
+        const parameters: []const v.Entry = &.{.{ .name = "lists", .value = .{ .list = &lists } }};
+        for ([_][]const u8{
+            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x RETURN i,sum(x),avg(x),sum(DISTINCT x),avg(DISTINCT x),count(DISTINCT x)",
+            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x+1 AS y,x*2 AS z RETURN i,sum(y),avg(z)",
+            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND reverse(xs) AS x RETURN i,sum(x),avg(x),sum(DISTINCT x)",
+            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x RETURN i,CASE WHEN i=2 THEN avg(x) ELSE 7 END",
+        }) |text| try Compare.run(text, parameters);
+    }
+}
+
+test "ordered reduction memo owners release every failed allocation" {
+    const Campaign = struct {
+        fn run(backing: std.mem.Allocator, text: []const u8) !void {
+            var vtable = backing.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const a: std.mem.Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, text, .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{});
+            defer result.deinit();
+        }
+    };
+    for ([_][]const u8{
+        "UNWIND [1,2] AS i UNWIND [1,2,3] AS x WITH i,x+1 AS y,x*2 AS z RETURN i,sum(y),avg(z)",
+        "UNWIND [1,2] AS i UNWIND [[1,2],[2,3]] AS xs UNWIND xs AS x RETURN i,sum(DISTINCT x),avg(DISTINCT x),count(DISTINCT x)",
+    }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{text});
 }

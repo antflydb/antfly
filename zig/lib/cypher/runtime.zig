@@ -48,6 +48,7 @@ pub const Result = struct {
     graph_incarnation: u64,
     graph_revision: u64,
     complete: bool = true,
+    statement_byte_pool: ?*v.BytePool = null,
     pub fn jsonStringify(self: Result, writer: anytype) !void {
         try writer.beginObject();
         try writer.objectField("wire_version");
@@ -80,6 +81,7 @@ pub const Result = struct {
     }
     pub fn deinit(self: *Result) void {
         const backing = self.budget.backing;
+        if (self.statement_byte_pool) |pool| pool.deinit();
         self.arena.deinit();
         backing.destroy(self.budget);
         self.* = undefined;
@@ -472,6 +474,7 @@ pub const NodeCursor = struct {
         engine.strings = engine.newStringWork(a);
         errdefer engine.regex.deinit();
         errdefer if (engine.invariants) |state_value| state_value.deinit();
+        errdefer if (engine.statement_byte_pool) |pool| pool.deinit();
         const columns = try a.alloc([]const u8, projection.items.len);
         for (owned_query.clauses[1].operation.project.value.items, columns) |item, *out| out.* = item.alias orelse try engine.expressionName(item.expression);
         const fields = try @import("read_fields.zig").required(a, owned_query, graph);
@@ -985,6 +988,7 @@ pub const NodeCursor = struct {
         self.engine.regex.deinit();
         if (self.engine.invariants) |state_value| state_value.deinit();
         if (self.engine.expression_memo) |*memo| memo.deinit();
+        if (self.engine.statement_byte_pool) |pool| pool.deinit();
         self.arena.deinit();
         allocator.destroy(budget);
         allocator.destroy(self);
@@ -1000,6 +1004,7 @@ fn executeBudget(budget: *Budget, backend: backend_mod.Backend, graph: catalog.G
     defer engine.regex.deinit();
     defer if (engine.invariants) |state_value| state_value.deinit();
     defer if (engine.expression_memo) |*memo| memo.deinit();
+    errdefer if (engine.statement_byte_pool) |pool| pool.deinit();
     for (compiled.parameters) |name| {
         _ = lookup(parameters, name) orelse return error.MissingCypherParameter;
     }
@@ -1047,13 +1052,18 @@ fn executeBudget(budget: *Budget, backend: backend_mod.Backend, graph: catalog.G
     // Result shape is bound independently of row production. In particular,
     // RETURN * must retain its columns when every branch produces zero rows.
     engine.columns = try @import("binder.zig").columns(engine.a, graph, compiled.query);
+    // Detach the ownership proof before admitting external source addresses to
+    // the final clone memo. Nested policy reads must never mistake a borrowed
+    // parameter/page address for a statement-owned allocation.
+    const output_ownership = try engine.statementOwnership();
+    engine.statement_ownership = null;
     const output = try engine.a.alloc([]const v.Value, combined.items.len);
     for (combined.items, output) |row, *out| {
         const cells = try engine.a.alloc(v.Value, engine.columns.len);
         for (engine.columns, cells) |name, *cell| {
             const value = try engine.readValue(lookup(row, name) orelse return error.UnboundCypherVariable);
             try engine.values.output(value);
-            cell.* = try value.clone(engine.a);
+            cell.* = try output_ownership.clone(value);
         }
         out.* = cells;
     }
@@ -1061,7 +1071,7 @@ fn executeBudget(budget: *Budget, backend: backend_mod.Backend, graph: catalog.G
     for (engine.columns, columns) |name, *out| out.* = try engine.a.dupe(u8, name);
     const stages = try engine.stages.toOwnedSlice(engine.a);
     engine.stats.memory_bytes = budget.peak;
-    var result: Result = .{ .arena = arena, .budget = budget, .columns = columns, .rows = output, .stages = stages, .stats = engine.stats, .read_only = !writes, .graph_incarnation = graph.incarnation, .graph_revision = graph.revision };
+    var result: Result = .{ .arena = arena, .budget = budget, .columns = columns, .rows = output, .stages = stages, .stats = engine.stats, .read_only = !writes, .graph_incarnation = graph.incarnation, .graph_revision = graph.revision, .statement_byte_pool = engine.statement_byte_pool };
     var checkpoint_backend = backend;
     // Reserve room for the host's durable receipt. Count escaped wire bytes
     // before a write decision, so an oversized RETURN rolls back the overlay.
@@ -1095,6 +1105,12 @@ fn cloneRow(a: A, row: Row) !Row {
     for (row, result) |entry, *out| out.* = .{ .name = try a.dupe(u8, entry.name), .value = try entry.value.clone(a) };
     return result;
 }
+/// Execution rows do not add a level to the user value depth budget.
+fn cloneRowContext(row: Row, context: *v.CloneContext) !Row {
+    const result = try context.a.alloc(v.Entry, row.len);
+    for (row, result) |entry, *out| out.* = .{ .name = try context.a.dupe(u8, entry.name), .value = try context.clone(entry.value) };
+    return result;
+}
 fn lookup(row: Row, name: []const u8) ?v.Value {
     for (row) |entry| if (std.mem.eql(u8, entry.name, name)) return entry.value;
     return null;
@@ -1116,6 +1132,7 @@ const aggregateName = @import("expressions.zig").aggregateName;
 const aggregates = @import("expressions.zig").aggregates;
 const Engine = struct {
     const Invariants = struct {
+        const MappingKey = struct { expression: *const ast.Expr, source: Identity };
         const Identity = struct { address: usize, length: usize };
         work: value_work.Work,
         parent: ?*Invariants = null,
@@ -1127,6 +1144,8 @@ const Engine = struct {
         membership_budget: ?*Budget = null,
         captured_lists: ?ProducerMemo = null,
         owned_lists: std.AutoHashMapUnmanaged(Identity, @import("invariant_membership.zig").Membership) = .empty,
+        list_counts: std.AutoHashMapUnmanaged(Identity, *ListCountFacts) = .empty,
+        mapped_lists: std.AutoHashMapUnmanaged(MappingKey, ?v.Value) = .empty,
         fn deinit(self: *@This()) void {
             if (self.bytes) |pool| pool.deinit();
             if (self.captured_lists) |*memo| memo.deinit();
@@ -1156,6 +1175,11 @@ const Engine = struct {
     stream_fold: ?*StreamFold = null,
     expression_memo: ?CallMemo = null,
     expression_memo_scoped: bool = false,
+    statement_ownership: ?*v.CloneContext = null,
+    statement_byte_pool: ?*v.BytePool = null,
+    input_clones: ?*v.CloneContext = null,
+    capture_input_clones: ?*v.CloneContext = null,
+    producer_sources: std.ArrayList(ProducerSource) = .empty,
     moment_targets: []const SummaryTarget = &.{},
     external_summary: ?[]const u8 = null,
     external_linear_summary: bool = false,
@@ -1477,6 +1501,200 @@ const Engine = struct {
             return context.clone(self.accumulator);
         }
     };
+    /// Facts belong to the statement's immutable input owner. Distinct keys
+    /// borrow that owner's values, and can be shared by any number of groups.
+    const ListCountFacts = struct {
+        input: []const v.Value,
+        non_null: u64,
+        distinct: ?[]const v.Value = null,
+        minimum: ?v.Value = null,
+        maximum: ?v.Value = null,
+        sum_checked: bool = false,
+        integer_sum: ?IntegerListSum = null,
+        distinct_sum_checked: bool = false,
+        distinct_integer_sum: ?IntegerListSum = null,
+    };
+    const IntegerListSum = struct {
+        total: i128 = 0,
+        low: i128 = 0,
+        high: i128 = 0,
+        positive: bool = false,
+        negative: bool = false,
+        fn concat(left: @This(), right: @This()) ?@This() {
+            return .{
+                .total = std.math.add(i128, left.total, right.total) catch return null,
+                .low = @min(left.low, std.math.add(i128, left.total, right.low) catch return null),
+                .high = @max(left.high, std.math.add(i128, left.total, right.high) catch return null),
+                .positive = left.positive or right.positive,
+                .negative = left.negative or right.negative,
+            };
+        }
+        fn reversed(self: @This()) ?@This() {
+            var result = self;
+            result.low = std.math.sub(i128, self.total, self.high) catch return null;
+            result.high = std.math.sub(i128, self.total, self.low) catch return null;
+            return result;
+        }
+        fn range(sequence: @import("range.zig").Range) @This() {
+            if (sequence.length == 0) return .{};
+            const n: i128 = @intCast(sequence.length);
+            const Prefix = struct {
+                fn at(r: @import("range.zig").Range, k: i128) i128 {
+                    return @intCast(@divTrunc(@as(i256, k) * (2 * @as(i256, r.start) + (k - 1) * @as(i256, r.step)), 2));
+                }
+            };
+            const total = Prefix.at(sequence, n);
+            var result: @This() = .{ .total = total, .low = @min(0, total), .high = @max(0, total) };
+            // Prefix extrema occur at an endpoint or where contributions cross zero.
+            const crossing = @divFloor(-@as(i128, sequence.start), @as(i128, sequence.step));
+            for ([_]i128{ crossing, crossing + 1, crossing + 2 }) |candidate| {
+                const value = Prefix.at(sequence, std.math.clamp(candidate, 0, n));
+                result.low = @min(result.low, value);
+                result.high = @max(result.high, value);
+            }
+            const last = sequence.at(sequence.length - 1).integer;
+            result.positive = @max(sequence.start, last) > 0;
+            result.negative = @min(sequence.start, last) < 0;
+            return result;
+        }
+    };
+    fn integerSum(self: *Engine, input: []const v.Value) !?IntegerListSum {
+        var summary: IntegerListSum = .{};
+        for (input) |value| {
+            try self.state();
+            if (value == .null) continue;
+            if (value != .integer) return null;
+            summary.total = std.math.add(i128, summary.total, value.integer) catch return null;
+            summary.low = @min(summary.low, summary.total);
+            summary.high = @max(summary.high, summary.total);
+            summary.positive = summary.positive or value.integer > 0;
+            summary.negative = summary.negative or value.integer < 0;
+        }
+        return summary;
+    }
+    fn listIntegerSum(self: *Engine, facts: *ListCountFacts, is_distinct: bool) !?IntegerListSum {
+        const checked = if (is_distinct) &facts.distinct_sum_checked else &facts.sum_checked;
+        const cached = if (is_distinct) &facts.distinct_integer_sum else &facts.integer_sum;
+        if (checked.*) return cached.*;
+        if (is_distinct) try self.listDistinctFacts(facts);
+        cached.* = try self.integerSum(if (is_distinct) facts.distinct.? else facts.input);
+        checked.* = true;
+        return cached.*;
+    }
+    /// Only mappings closed over the observed axis and parameters qualify.
+    /// Failed scalar probes decline: the ordinary projection then reports the
+    /// error in its original row/item order, after any preceding sibling error.
+    fn mappedList(self: *Engine, input: v.Value, expression: *const ast.Expr, alias: []const u8) !?v.Value {
+        const rules = @import("expressions.zig");
+        if (!rules.rowLocal(expression, struct {
+            alias: []const u8,
+            pub fn permits(context: @This(), name: []const u8) bool {
+                return std.mem.eql(u8, context.alias, name);
+            }
+        }{ .alias = alias })) return null;
+        _ = try self.listCountFacts(input) orelse return null;
+        const owner = self.invariants.?;
+        const key: Invariants.MappingKey = .{ .expression = expression, .source = Invariants.Identity{ .address = @intFromPtr(input.list.ptr), .length = input.list.len } };
+        if (owner.mapped_lists.get(key)) |cached| return cached;
+        var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
+        defer scratch.deinit();
+        const mapped = try scratch.allocator().alloc(v.Value, input.list.len);
+        for (input.list, mapped) |item, *output| {
+            const scope = EvalScope.enter(self, scratch.allocator());
+            defer scope.leave(self);
+            try self.state();
+            output.* = self.eval(expression, &.{.{ .name = alias, .value = item }}, null) catch |err| {
+                if (!StreamingAggregate.consumerFailure(err)) return err;
+                try owner.mapped_lists.put(self.planning_allocator, key, null);
+                return null;
+            };
+        }
+        const result = self.cloneScoped(.{ .list = mapped }, self.planning_allocator) catch |err| {
+            // The synthetic domain adds a list level that the scalar projection
+            // does not expose. Decline if that wrapper exceeds value depth.
+            if (!StreamingAggregate.consumerFailure(err)) return err;
+            try owner.mapped_lists.put(self.planning_allocator, key, null);
+            return null;
+        };
+        _ = owner.work.info(result) catch |err| {
+            if (!StreamingAggregate.consumerFailure(err)) return err;
+            try owner.mapped_lists.put(self.planning_allocator, key, null);
+            return null;
+        };
+        try owner.mapped_lists.put(self.planning_allocator, key, result);
+        return result;
+    }
+    fn listCountFacts(self: *Engine, value: v.Value) !?*ListCountFacts {
+        if (!self.read_only or value != .list) return null;
+        const owner = self.immutableOwner(value) orelse return null;
+        // Aggregate domains can outlive an element/loop scope. Only the root
+        // immutable owner licenses borrowed support keys across those scopes.
+        if (owner != self.invariants) return null;
+        // Reading an entity can apply authorization or rehydrate its visible
+        // value. Raw input cardinalities cannot replace those reads.
+        if ((try owner.work.info(value)).entities) return null;
+        const identity: Invariants.Identity = .{ .address = @intFromPtr(value.list.ptr), .length = value.list.len };
+        if (owner.list_counts.get(identity)) |facts| return facts;
+        try chargeWork(self, value.list.len);
+        var non_null: u64 = 0;
+        for (value.list) |item| non_null += @intFromBool(item != .null);
+        const facts = try self.planning_allocator.create(ListCountFacts);
+        facts.* = .{ .input = value.list, .non_null = non_null };
+        try owner.list_counts.put(self.planning_allocator, identity, facts);
+        return facts;
+    }
+    fn listExtreme(self: *Engine, facts: *ListCountFacts, minimum: bool) !v.Value {
+        const cached = if (minimum) &facts.minimum else &facts.maximum;
+        if (cached.*) |value| return value;
+        var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
+        defer scratch.deinit();
+        var work: value_work.Work = .{ .a = scratch.allocator(), .ptr = self, .charge = chargeWork };
+        var best: v.Value = .null;
+        for (facts.input) |value| {
+            try self.state();
+            if (value == .null) continue;
+            if (best == .null) {
+                best = value;
+                continue;
+            }
+            const order = try work.order(value, best);
+            if (order == (if (minimum) std.math.Order.lt else .gt)) best = value;
+        }
+        // Inputs are owned by the immutable root; ties retain the first
+        // representation, exactly as the ordinary MIN/MAX reducer does.
+        cached.* = best;
+        return best;
+    }
+    fn listDistinctFacts(self: *Engine, facts: *ListCountFacts) !void {
+        if (facts.distinct != null) return;
+        var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var work: value_work.Work = .{ .a = a, .ptr = self, .charge = chargeWork, .parent = &self.invariants.?.work };
+        const mutable = self.scratch_allocator;
+        var index: value_work.Index = .{};
+        defer index.deinit(mutable);
+        var keys: std.ArrayList(v.Value) = .empty;
+        defer keys.deinit(mutable);
+        for (facts.input) |value| {
+            if (value == .null) continue;
+            const hash = (try work.info(value)).hash;
+            var candidate = index.head(hash);
+            var found = false;
+            while (candidate) |position| {
+                const link = index.links.items[position];
+                if (try work.eql(keys.items[link.index], value)) {
+                    found = true;
+                    break;
+                }
+                candidate = link.next;
+            }
+            if (found) continue;
+            try index.insert(mutable, hash, keys.items.len);
+            try keys.append(mutable, value);
+        }
+        facts.distinct = try self.planning_allocator.dupe(v.Value, keys.items);
+    }
     const StreamingAggregate = struct {
         function: ast.Function,
         consumer_row: Row = &.{},
@@ -1489,6 +1707,8 @@ const Engine = struct {
         distinct_bytes: ?*v.BytePool = null,
         distinct_index: value_work.Index = .{},
         distinct_support: ?*Statistic.SupportSet = null,
+        list_domain: ?*const ListCountFacts = null,
+        list_domains: std.AutoHashMapUnmanaged(*const ListCountFacts, void) = .empty,
         cohort: ?*DistinctConsumer = null,
         count: u64 = 0,
         sum: v.Value = .{ .integer = 0 },
@@ -1678,6 +1898,7 @@ const Engine = struct {
             };
         }
         fn addSupport(self: *StreamingAggregate, engine: *Engine, support: StatisticSupport) !void {
+            try self.materializeListDomain(engine);
             const a = self.distinct_arena.allocator();
             if (self.distinct_support == null) {
                 const set = try a.create(Statistic.SupportSet);
@@ -1697,6 +1918,90 @@ const Engine = struct {
             try Engine.chargeWork(engine, support.value.words.len * 2);
             self.count = try addPathCount(self.count, try self.distinct_support.?.add(a, support.value, support.offset));
         }
+        fn materializeListDomain(self: *StreamingAggregate, engine: *Engine) anyerror!void {
+            const domain = self.list_domain orelse return;
+            try self.list_domains.put(self.distinct_arena.allocator(), domain, {});
+            self.list_domain = null;
+            self.count = 0;
+            if (std.ascii.eqlIgnoreCase(self.function.name, "sum")) self.sum = .{ .integer = 0 };
+            if (std.ascii.eqlIgnoreCase(self.function.name, "avg")) {
+                self.mean = 0;
+                self.mean_weight = 0;
+                self.mean_scaled = null;
+            }
+            const token = engine.distinct_input_token;
+            engine.distinct_input_token = null;
+            defer engine.distinct_input_token = token;
+            for (domain.distinct.?) |value| try self.addValue(engine, value, Count.one);
+        }
+        fn addListCount(self: *StreamingAggregate, engine: *Engine, facts: *ListCountFacts, weight: Count) anyerror!void {
+            if (std.ascii.eqlIgnoreCase(self.function.name, "sum")) return self.addIntegerListSum(engine, facts, weight);
+            if (std.ascii.eqlIgnoreCase(self.function.name, "min") or std.ascii.eqlIgnoreCase(self.function.name, "max"))
+                return self.addValue(engine, try engine.listExtreme(facts, std.ascii.eqlIgnoreCase(self.function.name, "min")), Count.one);
+            if (!self.function.distinct) return self.addValue(engine, .{ .integer = 1 }, try weight.multiply(engine.a, Count.init(facts.non_null)));
+            try engine.listDistinctFacts(facts);
+            if (self.list_domain == facts or self.list_domains.contains(facts)) return;
+            if (self.list_domain == null and self.count == 0) {
+                self.list_domain = facts;
+                self.count = @intCast(facts.distinct.?.len);
+                return;
+            }
+            // Different input lists may overlap. Promote the shared first
+            // domain once, then merge each additional domain exactly once.
+            try self.materializeListDomain(engine);
+            try self.list_domains.put(self.distinct_arena.allocator(), facts, {});
+            const token = engine.distinct_input_token;
+            engine.distinct_input_token = null;
+            defer engine.distinct_input_token = token;
+            for (facts.distinct.?) |value| try self.addValue(engine, value, Count.one);
+        }
+        fn addIntegerListSum(self: *StreamingAggregate, engine: *Engine, facts: *ListCountFacts, weight: Count) anyerror!void {
+            if (self.function.distinct) {
+                if (self.list_domain == facts or self.list_domains.contains(facts)) return;
+                if (self.list_domain == null and self.count == 0 and self.distinct_values.items.len == 0 and self.distinct_support == null and self.list_domains.count() == 0 and self.sum == .integer) {
+                    try self.addIntegerSummary(engine, facts.distinct_integer_sum.?, Count.one, @intCast(facts.distinct.?.len));
+                    self.list_domain = facts;
+                    return;
+                }
+                try self.materializeListDomain(engine);
+                // The summary is per ordered support. A different domain can
+                // overlap existing keys; merge normally before marking it seen.
+                const token = engine.distinct_input_token;
+                engine.distinct_input_token = null;
+                defer engine.distinct_input_token = token;
+                for (facts.distinct.?) |value| try self.addValue(engine, value, Count.one);
+                try self.list_domains.put(self.distinct_arena.allocator(), facts, {});
+                return;
+            }
+            if (self.sum != .integer) {
+                // A previous domain may have introduced floating arithmetic.
+                // Preserve its exact contribution order and rounding.
+                for (facts.input) |value| {
+                    try engine.state();
+                    try self.addValue(engine, value, weight);
+                }
+                return;
+            }
+            return self.addIntegerSummary(engine, facts.integer_sum.?, weight, facts.non_null);
+        }
+        fn addIntegerSummary(self: *StreamingAggregate, engine: *Engine, summary: IntegerListSum, weight: Count, non_null: u64) !void {
+            if (engine.numeric_consolidation) {
+                if ((summary.positive and summary.negative) or (summary.positive and self.sum_sign == .negative) or (summary.negative and self.sum_sign == .positive)) return error.CypherNumericRegroupingDeclined;
+                if (summary.positive) self.sum_sign = .positive;
+                if (summary.negative) self.sum_sign = .negative;
+            }
+            const multiplier = weight.exact() orelse {
+                if (summary.low != 0 or summary.high != 0) return error.CypherNumericOverflow;
+                self.count +|= if (non_null == 0) 0 else std.math.maxInt(u64);
+                return;
+            };
+            const base: i256 = self.sum.integer;
+            const low = base + @as(i256, summary.low) * multiplier;
+            const high = base + @as(i256, summary.high) * multiplier;
+            if (low < std.math.minInt(i64) or high > std.math.maxInt(i64)) return error.CypherNumericOverflow;
+            self.sum = .{ .integer = @intCast(base + @as(i256, summary.total) * multiplier) };
+            self.count +|= (try weight.multiply(engine.a, Count.init(non_null))).cap(std.math.maxInt(u64));
+        }
         fn addStatisticBin(self: *StreamingAggregate, engine: *Engine, row: Row, value: i64, weight: Count) !void {
             const literal: ast.Expr = .{ .span = .{}, .value = .{ .literal = .{ .integer = value } } };
             const saved = self.function;
@@ -1706,7 +2011,11 @@ const Engine = struct {
         }
         fn addWeighted(self: *StreamingAggregate, engine: *Engine, row: Row, multiplicity: Count) !void {
             const value = if (self.function.star) v.Value{ .integer = 1 } else try engine.eval(self.function.args[0], row, null);
+            return self.addValue(engine, value, multiplicity);
+        }
+        fn addValue(self: *StreamingAggregate, engine: *Engine, value: v.Value, multiplicity: Count) anyerror!void {
             if (value == .null) return;
+            try self.materializeListDomain(engine);
             // Retention is bounded, evaluation is not: every argument above
             // still runs, even after this consumer has received its prefix.
             if (!self.function.collect_summary and self.function.collect_suffix == 0) if (self.function.collect_limit) |limit| if (self.collected.items.len >= limit) return;
@@ -1846,7 +2155,7 @@ const Engine = struct {
             };
             if (self.count == 1 or (order == .lt and std.ascii.eqlIgnoreCase(self.function.name, "min")) or (order == .gt and std.ascii.eqlIgnoreCase(self.function.name, "max"))) {
                 _ = self.arena.reset(.retain_capacity);
-                self.best = try value.clone(self.arena.allocator());
+                self.best = try engine.cloneAggregateScoped(value, self.arena.allocator());
             }
         }
         fn retainCollection(self: *@This(), engine: *Engine, value: v.Value, weight: Count, distinct_owned: ?v.Value) !void {
@@ -1854,7 +2163,7 @@ const Engine = struct {
             const remaining = if (self.function.collect_limit) |limit| limit - self.collected.items.len else std.math.maxInt(usize);
             const copies = if (self.function.collect_limit != null) std.math.cast(usize, weight.cap(remaining)).? else std.math.cast(usize, weight.exact() orelse return error.CypherStateBudgetExceeded) orelse return error.CypherStateBudgetExceeded;
             if (copies != 0) {
-                const owned = if (self.function.distinct and self.function.collect_suffix == 0 and !self.function.collect_summary) distinct_owned orelse self.distinct_values.items[self.distinct_values.items.len - 1] else try engine.cloneScoped(value, retained);
+                const owned = if (self.function.distinct and self.function.collect_suffix == 0 and !self.function.collect_summary) distinct_owned orelse self.distinct_values.items[self.distinct_values.items.len - 1] else try engine.cloneAggregateScoped(value, retained);
                 try Engine.chargeWork(engine, copies);
                 try self.collected.ensureUnusedCapacity(retained, copies);
                 for (0..copies) |_| self.collected.appendAssumeCapacity(owned);
@@ -2349,6 +2658,21 @@ const Engine = struct {
             else => true,
         };
     }
+    fn forwardedAxis(p: ast.Projection, alias: []const u8) ?[]const u8 {
+        if (p.wildcard or p.distinct or p.predicate != null or p.order.len != 0 or p.skip != null or p.limit != null) return null;
+        var target: ?[]const u8 = null;
+        for (p.items) |item| {
+            if (item.expression.value != .variable) {
+                if (aggregates(item.expression) or !independentExpressions(item.expression, alias)) return null;
+                continue;
+            }
+            if (std.mem.eql(u8, item.expression.value.variable, alias)) {
+                if (target != null) return null;
+                target = item.alias orelse alias;
+            }
+        }
+        return target;
+    }
     fn identityAxis(p: ast.Projection, alias: []const u8) bool {
         if (p.wildcard or p.distinct or p.predicate != null or p.order.len != 0 or p.skip != null or p.limit != null) return false;
         var preserved = false;
@@ -2393,7 +2717,221 @@ const Engine = struct {
             else => true,
         };
     }
+    /// A bounded, ordered reduction memo. Entries contain exact transition
+    /// states, not algebraically regrouped SUM/AVG results. DISTINCT support
+    /// stays shared until a group receives another contribution domain.
+    const AxisPlan = struct {
+        clauses: []const ast.Clause,
+        dependent: []const []const bool,
+        captures: Names,
+        memo: CallMemo,
+    };
+    const AxisTrace = struct { reached: []bool, count: Count = Count.init(0) };
+    fn axisHasSource(value: anytype) bool {
+        if (@TypeOf(value) == *const ast.Expr) {
+            if (value.execution_list_source != null or value.execution_range_binding) return true;
+            return axisHasSource(value.value);
+        }
+        return switch (@typeInfo(@TypeOf(value))) {
+            .pointer => |pointer| blk: {
+                if (pointer.size == .slice and pointer.child != u8) for (value) |child| if (axisHasSource(child)) break :blk true;
+                break :blk false;
+            },
+            .@"struct" => |structure| blk: {
+                inline for (structure.field_names) |name| if (axisHasSource(@field(value, name))) break :blk true;
+                break :blk false;
+            },
+            .@"union" => switch (value) {
+                inline else => |payload| axisHasSource(payload),
+            },
+            .optional => if (value) |child| axisHasSource(child) else false,
+            else => false,
+        };
+    }
+    fn axisPure(expression: *const ast.Expr) bool {
+        if (axisHasSource(expression)) return false;
+        return @import("expressions.zig").rowLocal(expression, struct {
+            pub fn permits(_: @This(), _: []const u8) bool {
+                return true;
+            }
+        }{});
+    }
+    fn axisReferences(self: *Engine, names: *Names, expression: *const ast.Expr) !void {
+        try self.retainReferences(names, &.{}, expression);
+    }
+    fn axisDepends(expression: *const ast.Expr, names: Names) bool {
+        var keys = names.keyIterator();
+        while (keys.next()) |name| if (@import("expressions.zig").references(expression, name.*)) return true;
+        return false;
+    }
+    fn axisPlan(self: *Engine, fold: *StreamFold, index: usize) !?*AxisPlan {
+        const previous = self.a;
+        self.a = fold.retained;
+        defer self.a = previous;
+        const a = self.a;
+        var dependencies: Names = .empty;
+        const tail = fold.middle[index..];
+        const dependent = try a.alloc([]const bool, tail.len);
+        for (tail, dependent) |clause, *flags| switch (clause.operation) {
+            .unwind => |u| {
+                if (!axisPure(u.expression)) return null;
+                try dependencies.put(a, u.alias, {});
+                flags.* = &.{};
+            },
+            .project => |step| {
+                const p = step.value;
+                if (p.wildcard or p.distinct or p.predicate != null or p.order.len != 0 or p.skip != null or p.limit != null) return null;
+                var next: Names = .empty;
+                const bits = try a.alloc(bool, p.items.len);
+                for (p.items, bits) |item, *bit| {
+                    if (aggregates(item.expression) or !axisPure(item.expression)) return null;
+                    bit.* = axisDepends(item.expression, dependencies);
+                    if (bit.*) try next.put(a, item.alias orelse try self.expressionName(item.expression), {});
+                }
+                dependencies = next;
+                flags.* = bits;
+            },
+            else => return null,
+        };
+        var group_required: Names = .empty;
+        for (fold.projection.items) |item| if (!aggregates(item.expression)) {
+            if (!axisPure(item.expression) or axisDepends(item.expression, dependencies)) return null;
+            try self.axisReferences(&group_required, item.expression);
+        };
+        var required: Names = .empty;
+        for (fold.calls) |expression| {
+            const call_value = expression.value.call;
+            if (!std.ascii.eqlIgnoreCase(call_value.name, "count") and !std.ascii.eqlIgnoreCase(call_value.name, "sum") and !std.ascii.eqlIgnoreCase(call_value.name, "avg") and !std.ascii.eqlIgnoreCase(call_value.name, "min") and !std.ascii.eqlIgnoreCase(call_value.name, "max")) return null;
+            for (call_value.args) |argument| {
+                if (!axisPure(argument)) return null;
+                try self.axisReferences(&required, argument);
+            }
+        }
+        const clauses = try a.dupe(ast.Clause, tail);
+        var cursor = clauses.len;
+        while (cursor != 0) {
+            cursor -= 1;
+            switch (clauses[cursor].operation) {
+                .unwind => |u| {
+                    _ = required.remove(u.alias);
+                    _ = group_required.remove(u.alias);
+                    try self.axisReferences(&required, u.expression);
+                },
+                .project => |*step| {
+                    var selected: std.ArrayList(ast.Item) = .empty;
+                    var before: Names = .empty;
+                    var group_before: Names = .empty;
+                    for (step.value.items) |item| if (group_required.contains(item.alias orelse try self.expressionName(item.expression))) try self.axisReferences(&group_before, item.expression);
+                    group_required = group_before;
+                    for (step.value.items) |item| if (required.contains(item.alias orelse try self.expressionName(item.expression))) {
+                        try selected.append(a, item);
+                        try self.axisReferences(&before, item.expression);
+                    };
+                    step.value.items = try selected.toOwnedSlice(a);
+                    required = before;
+                },
+                else => unreachable,
+            }
+        }
+        // A cache key determining the group can never initialize a second
+        // fresh group. Avoid retaining one-use states for correlated axes.
+        var reusable = false;
+        var group_names = group_required.keyIterator();
+        while (group_names.next()) |name| if (!required.contains(name.*)) {
+            reusable = true;
+            break;
+        };
+        if (!reusable) return null;
+        const plan = try a.create(AxisPlan);
+        plan.* = .{ .clauses = clauses, .dependent = dependent, .captures = required, .memo = .{ .identity_keys = true, .budget = .{ .backing = self.scratch_allocator, .limit = @min(4 << 20, self.limits.memory_bytes / 32) } } };
+        return plan;
+    }
+    fn axisSnapshot(self: *Engine, state_value: *StreamingAggregate) !Row {
+        if (state_value.mean_scaled != null or state_value.distinct_support != null) return error.CypherAxisMemoDeclined;
+        var members: v.Value = .null;
+        const function_call = state_value.function;
+        if (function_call.distinct and state_value.failure == null and !std.ascii.eqlIgnoreCase(function_call.name, "min") and !std.ascii.eqlIgnoreCase(function_call.name, "max")) {
+            const keys = if (state_value.list_domain) |facts| facts.distinct.? else if (state_value.cohort) |cohort| blk: {
+                if (cohort.membership.values.items.len == state_value.count) break :blk cohort.membership.values.items;
+                var kept: std.ArrayList(v.Value) = .empty;
+                for (cohort.membership.values.items, 0..) |value, ordinal| if (state_value.consumedOrdinal(ordinal)) try kept.append(self.a, value);
+                break :blk kept.items;
+            } else state_value.distinct_values.items;
+            // Arithmetic cardinality-only proofs do not own an enumerable set.
+            if (keys.len != state_value.count) return error.CypherAxisMemoDeclined;
+            members = .{ .list = keys };
+            if ((try self.values.info(members)).entities) return error.CypherAxisMemoDeclined;
+        }
+        if ((try self.values.info(state_value.best)).entities) return error.CypherAxisMemoDeclined;
+        return self.a.dupe(v.Entry, &.{
+            .{ .name = "count", .value = .{ .integer = @bitCast(state_value.count) } },
+            .{ .name = "sum", .value = state_value.sum },
+            .{ .name = "mean", .value = .{ .number = state_value.mean } },
+            .{ .name = "mean_weight", .value = .{ .number = state_value.mean_weight } },
+            .{ .name = "best", .value = state_value.best },
+            .{ .name = "members", .value = members },
+            .{ .name = "failure", .value = .{ .integer = if (state_value.failure) |err| @intFromError(err) else 0 } },
+            .{ .name = "sign", .value = .{ .integer = @backingInt(state_value.sum_sign) } },
+        });
+    }
+    fn axisRestore(self: *Engine, state_value: *StreamingAggregate, row: Row) !void {
+        state_value.count = @bitCast(row[0].value.integer);
+        state_value.sum = row[1].value;
+        state_value.mean = row[2].value.number;
+        state_value.mean_weight = row[3].value.number;
+        state_value.best = row[4].value;
+        if (row[5].value != .null) {
+            // Read-only memo hits promote their complete rows to statement
+            // storage. Register that destination before borrowing its support.
+            _ = try (try self.rootInvariantState()).work.info(row[5].value);
+            const facts = (try self.listCountFacts(row[5].value)) orelse return error.CypherInvalidBackendPage;
+            facts.distinct = facts.input;
+            state_value.list_domain = facts;
+        }
+        state_value.failure = if (row[6].value.integer == 0) null else @errorFromInt(@as(u16, @intCast(row[6].value.integer)));
+        state_value.sum_sign = @fromBackingInt(@intCast(row[7].value.integer));
+    }
+    fn computeAxis(self: *Engine, parent: *StreamFold, plan: *AxisPlan, key: Row) anyerror!WeightedRows {
+        const columns = self.columns;
+        defer self.columns = columns;
+        var groups: std.ArrayList(StreamGroup) = .empty;
+        defer for (groups.items) |*group| group.deinit();
+        var group_index: value_work.Index = .{};
+        var top: ?TopK = null;
+        const counts = try self.a.alloc(usize, plan.clauses.len + 1);
+        @memset(counts, 0);
+        const distinct_rows = try self.a.alloc(DistinctRows, plan.clauses.len);
+        @memset(distinct_rows, .{});
+        var matched: usize = 0;
+        const items = try self.a.alloc(ast.Item, parent.calls.len);
+        for (items, parent.calls) |*item, expression| item.* = .{ .expression = expression };
+        const projection: ast.Projection = .{ .items = items };
+        try groups.append(self.a, try self.newStreamGroup(self.a, &.{}, &.{}, null, projection, parent.calls, parent.membership_leaders));
+        var trace: AxisTrace = .{ .reached = try self.a.alloc(bool, plan.clauses.len) };
+        @memset(trace.reached, false);
+        var child: StreamFold = .{ .retained = self.a, .middle = plan.clauses, .projection = projection, .calls = parent.calls, .membership_leaders = parent.membership_leaders, .call_aliases = parent.call_aliases, .top = &top, .groups = &groups, .group_index = &group_index, .stage_counts = counts, .matched = &matched, .distinct = distinct_rows, .has_keys = false, .single_seed = true, .defer_aggregates = true, .record_rows = true, .axis_enabled = false, .axis_trace = &trace };
+        try child.expand(self, key, 0);
+        const rows = try self.a.alloc(Row, parent.calls.len + 1);
+        const weights = try self.a.alloc(Count, rows.len);
+        @memset(weights, Count.one);
+        weights[0] = trace.count;
+        const reached = try self.a.alloc(v.Value, trace.reached.len);
+        for (reached, trace.reached) |*value, yes| value.* = .{ .boolean = yes };
+        const stage_values = try self.a.alloc(v.Value, counts.len);
+        for (stage_values, counts) |*value, stage_count| value.* = .{ .integer = @bitCast(@as(u64, stage_count)) };
+        rows[0] = try self.a.dupe(v.Entry, &.{ .{ .name = "reached", .value = .{ .list = reached } }, .{ .name = "counts", .value = .{ .list = stage_values } } });
+        for (rows[1..], groups.items[0].states) |*row, *state_value| row.* = try self.axisSnapshot(state_value);
+        // Clone before reducer arenas close. These are temporary snapshots;
+        // the bounded memo subsequently owns and promotes successful entries.
+        var copies: v.CloneContext = .{ .a = self.a, .scratch = self.a };
+        for (rows) |*row| row.* = try cloneRowContext(row.*, &copies);
+        return .{ .rows = rows, .weights = weights };
+    }
     const StreamFold = struct {
+        axis_enabled: bool = true,
+        axis_plans: std.AutoHashMapUnmanaged(usize, ?*AxisPlan) = .empty,
+        axis_trace: ?*AxisTrace = null,
+        axis_packet: ?[]const Row = null,
         retained: A,
         middle: []const ast.Clause,
         projection: ast.Projection,
@@ -2423,7 +2961,92 @@ const Engine = struct {
         defer_aggregates: bool = false,
         single_seed: bool = false,
         range_counts: ?[]const bool = null,
+        range_extrema: ?RangeExtrema = null,
+        range_sum: ?struct { value: IntegerListSum, weight: Count, length: u64 } = null,
+        range_distinct_count: ?struct { value: Count, weight: Count } = null,
+        list_counts: ?struct { facts: *ListCountFacts, slots: []const bool, weight: Count } = null,
         continuation: ?struct { parent: *StreamFold, index: usize, apply: ?Row = null, returned: ?*bool = null, capture: ?*StreamCapture = null, admission: bool = false } = null,
+        fn closeAxes(fold: *@This()) void {
+            var plans = fold.axis_plans.valueIterator();
+            while (plans.next()) |slot| if (slot.*) |plan| plan.memo.deinit();
+        }
+        fn recordAxisStages(fold: *@This(), summary: WeightedRows, index: usize) void {
+            if (!fold.record_rows) return;
+            for (summary.rows[0][1].value.list[1..], index..) |stage_count, offset| fold.stage_counts[offset + 1] +|= @intCast(@as(u64, @bitCast(stage_count.integer)));
+        }
+        fn memoAxis(fold: *@This(), engine: *Engine, row: Row, index: usize) anyerror!bool {
+            if (!fold.axis_enabled or !fold.has_keys or !engine.read_only or !fold.defer_aggregates or !fold.weight.isOne() or fold.consumer != null or fold.continuation != null or fold.group_window != null or fold.top.* != null or fold.active_calls != null or fold.calls.len == 0 or fold.projection.wildcard) return false;
+            if (fold.single_seed) {
+                const repeated = for (fold.middle[0..index]) |clause| {
+                    if (clause.operation == .unwind) break true;
+                } else false;
+                if (!repeated) return false;
+            }
+            const plan = (if (fold.axis_plans.get(index)) |known| known else blk: {
+                const computed = try engine.axisPlan(fold, index);
+                try fold.axis_plans.put(fold.retained, index, computed);
+                break :blk computed;
+            }) orelse return false;
+            if (plan.memo.disabled) return false;
+            var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+            defer scratch.deinit();
+            const scope = EvalScope.enter(engine, scratch.allocator());
+            defer scope.leave(engine);
+            var key: std.ArrayList(v.Entry) = .empty;
+            for (row) |entry| if (plan.captures.contains(entry.name)) {
+                if ((try engine.values.info(entry.value)).entities) return false;
+                try key.append(engine.a, entry);
+            };
+            var packet = try plan.memo.find(engine, key.items, null);
+            if (packet == null) {
+                const computed = engine.computeAxis(fold, plan, key.items) catch |err| {
+                    // Pruned independent siblings may fail earlier in the real
+                    // pipeline. A scalar probe failure must retain that order.
+                    if (!StreamingAggregate.consumerFailure(err) and err != error.CypherAxisMemoDeclined) return err;
+                    plan.memo.disabled = true;
+                    return false;
+                };
+                plan.memo.put(engine, key.items, null, computed) catch |err| {
+                    if (!StreamingAggregate.consumerFailure(err)) return err;
+                    plan.memo.disabled = true;
+                    return false;
+                };
+                packet = try plan.memo.find(engine, key.items, null);
+                if (packet == null) return false;
+            }
+            const summary = packet.?;
+            var representative = row;
+            for (fold.middle[index..], plan.dependent, summary.rows[0][0].value.list) |clause, flags, reached| {
+                if (!reached.boolean) break;
+                switch (clause.operation) {
+                    .unwind => |u| representative = try engine.replace(representative, u.alias, .null),
+                    .project => |step| {
+                        const projected = try engine.a.alloc(v.Entry, step.value.items.len);
+                        for (projected, step.value.items, flags) |*entry, item, dependent| entry.* = .{ .name = item.alias orelse try engine.expressionName(item.expression), .value = if (dependent) .null else try engine.eval(item.expression, representative, null) };
+                        representative = projected;
+                    },
+                    else => unreachable,
+                }
+            }
+            if (summary.weights[0].cap(1) == 0) {
+                fold.recordAxisStages(summary, index);
+                return true;
+            }
+            const previous_packet = fold.axis_packet;
+            fold.axis_packet = summary.rows[1..];
+            defer fold.axis_packet = previous_packet;
+            const previous_weight = fold.weight;
+            fold.weight = summary.weights[0];
+            defer fold.weight = previous_weight;
+            const matched = fold.matched.*;
+            fold.expand(engine, representative, fold.middle.len) catch |err| {
+                if (err != error.CypherAxisMemoDeclined) return err;
+                fold.matched.* = matched;
+                return false;
+            };
+            fold.recordAxisStages(summary, index);
+            return true;
+        }
         fn add(fold: *@This(), engine: *Engine, initial: Row) anyerror!void {
             const weight = @as(usize, @intCast(fold.weight.cap(std.math.maxInt(usize))));
             fold.had_match = true;
@@ -2431,14 +3054,58 @@ const Engine = struct {
             return fold.expand(engine, initial, 0);
         }
         fn expand(fold: *@This(), engine: *Engine, row: Row, index: usize) anyerror!void {
+            if (fold.axis_trace) |trace| {
+                for (row) |entry| if ((try engine.values.info(entry.value)).entities) return error.CypherAxisMemoDeclined;
+                if (index < fold.middle.len) trace.reached[index] = true else trace.count = try trace.count.add(engine.a, fold.weight);
+            }
             if (index < fold.middle.len) {
                 const clause = fold.middle[index];
                 switch (clause.operation) {
                     .unwind => |unwind| {
-                        if (projectedSource(unwind.expression)) {
+                        // Composed arithmetic producers carry exact bag and set
+                        // domains, independently of their deferred lexical names.
+                        if (projectedSource(unwind.expression) and reduction_plan.repeatable(unwind.expression) and arithmeticDomainShape(engine, unwind.expression, 0)) {
+                            if (try fold.rangeCountProof(engine, unwind.alias, index + 1)) |slots| {
+                                var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+                                defer scratch.deinit();
+                                const domain = try engine.arithmeticDomain(unwind.expression, row);
+                                if (domain.null_source or domain.length.cap(1) == 0) return;
+                                var needs_distinct = false;
+                                for (slots, fold.calls) |qualified, call_value| if (qualified and call_value.value.call.distinct and std.ascii.eqlIgnoreCase(call_value.value.call.name, "count")) {
+                                    needs_distinct = true;
+                                };
+                                var needs_sum = false;
+                                for (slots, fold.calls) |qualified, call_value| if (qualified and std.ascii.eqlIgnoreCase(call_value.value.call.name, "sum")) {
+                                    needs_sum = true;
+                                };
+                                const unique_count = if (needs_sum and domain.integer_sum == null) @as(?u128, null) else if (needs_distinct) try @import("range.zig").distinctCardinalityWork(scratch.allocator(), domain.ranges, engine, chargeWork) else @as(?u128, 0);
+                                if (unique_count) |unique| {
+                                    const previous = fold.weight;
+                                    const previous_counts = fold.range_counts;
+                                    const previous_sum = fold.range_sum;
+                                    defer fold.range_sum = previous_sum;
+                                    fold.range_sum = if (domain.integer_sum) |summary| .{ .value = summary, .weight = previous, .length = domain.length.cap(std.math.maxInt(u64)) } else null;
+                                    const previous_extrema = fold.range_extrema;
+                                    defer fold.range_extrema = previous_extrema;
+                                    fold.range_extrema = domain.extrema();
+                                    const previous_distinct = fold.range_distinct_count;
+                                    defer fold.weight = previous;
+                                    defer fold.range_counts = previous_counts;
+                                    defer fold.range_distinct_count = previous_distinct;
+                                    fold.range_counts = slots;
+                                    fold.range_distinct_count = .{ .value = try engine.domainCount(unique), .weight = previous };
+                                    fold.weight = try previous.multiply(engine.a, domain.length);
+                                    try engine.state();
+                                    if (fold.record_rows) fold.stage_counts[index + 1] +|= @intCast(fold.weight.cap(std.math.maxInt(usize)));
+                                    return fold.expand(engine, try engine.replace(row, unwind.alias, domain.ranges[0].at(0)), index + 1);
+                                }
+                            }
+                        }
+                        if (projectedSource(unwind.expression) and !arithmeticSource(unwind.expression)) {
                             const independent = fold.independentTail(unwind.alias, index + 1);
+                            if (!independent and try fold.memoAxis(engine, row, index)) return;
                             var consumer: UnwindReceiver = .{ .fold = fold, .row = row, .index = index, .owner = engine.local_invariants, .locals = engine.projection_locals, .weighted = independent };
-                            var receiver: ListReceiver = .{ .ptr = &consumer, .emit = UnwindReceiver.add, .destination = fold.retained, .observer = .{ .name = "collect", .args = &.{}, .collect_limit = if (independent) 0 else null } };
+                            var receiver: ListReceiver = .{ .ptr = &consumer, .emit = UnwindReceiver.add, .complete = UnwindReceiver.isComplete, .destination = fold.retained, .observer = .{ .name = "collect", .args = &.{}, .collect_limit = if (independent) 0 else null } };
                             _ = try engine.produceList(unwind.expression, row, null, &receiver);
                             try receiver.check();
                             if (consumer.complete) |err| return err;
@@ -2446,23 +3113,38 @@ const Engine = struct {
                         }
                         var source = (try engine.unwindSource(unwind.expression, row)) orelse return;
                         const counts = if (source.values == .range) try fold.rangeCountProof(engine, unwind.alias, index + 1) else null;
-                        // An unobserved arithmetic axis is a bag multiplicity,
-                        // not a sequence of concrete rows. The proof covers
-                        // every remaining binding and consumer before collapsing.
-                        if (source.values == .range and (counts != null or fold.independentTail(unwind.alias, index + 1))) {
-                            const length = source.values.range.length;
+                        const list_counts = if (source.values == .list and !source.reversed) try fold.listCountProof(engine, unwind.alias, index + 1, .{ .list = source.values.list }) else null;
+                        // An evaluated list supplies exact bag multiplicity when
+                        // its elements are unobserved. Arithmetic ranges also
+                        // carry the non-NULL/uniqueness proof for COUNT(alias).
+                        // Both proofs cover every remaining binding and consumer.
+                        if ((source.values == .range or source.values == .list) and (counts != null or list_counts != null or fold.independentTail(unwind.alias, index + 1))) {
+                            const length = source.length();
                             if (length == 0) return;
                             const cardinality = if (std.math.cast(u64, length)) |n| Count.init(n) else try Count.init(std.math.maxInt(u64)).add(engine.a, Count.one);
                             const previous = fold.weight;
                             const previous_counts = fold.range_counts;
+                            const previous_sum = fold.range_sum;
+                            defer fold.range_sum = previous_sum;
+                            fold.range_sum = if (source.values == .range) .{ .value = if (source.reversed) IntegerListSum.range(source.values.range).reversed().? else IntegerListSum.range(source.values.range), .weight = previous, .length = cardinality.cap(std.math.maxInt(u64)) } else null;
+                            const previous_extrema = fold.range_extrema;
+                            defer fold.range_extrema = previous_extrema;
+                            fold.range_extrema = if (source.values == .range) (ArithmeticDomain{ .ranges = &.{source.values.range} }).extrema() else null;
+                            const previous_distinct = fold.range_distinct_count;
+                            fold.range_distinct_count = null;
+                            defer fold.range_distinct_count = previous_distinct;
+                            const previous_lists = fold.list_counts;
+                            fold.list_counts = if (list_counts) |proof| .{ .facts = proof.facts, .slots = proof.slots, .weight = previous } else null;
+                            defer fold.list_counts = previous_lists;
                             fold.range_counts = counts;
                             defer fold.range_counts = previous_counts;
                             fold.weight = try previous.multiply(engine.a, cardinality);
                             defer fold.weight = previous;
                             try engine.state();
                             if (fold.record_rows) fold.stage_counts[index + 1] +|= @intCast(fold.weight.cap(std.math.maxInt(usize)));
-                            return fold.expand(engine, try engine.replace(row, unwind.alias, source.values.range.at(0)), index + 1);
+                            return fold.expand(engine, try engine.replace(row, unwind.alias, source.at(0)), index + 1);
                         }
+                        if (try fold.memoAxis(engine, row, index)) return;
                         var arena = std.heap.ArenaAllocator.init(engine.scratch_allocator);
                         defer arena.deinit();
                         while (source.next()) |item| {
@@ -2602,6 +3284,19 @@ const Engine = struct {
                 if (fold.projection.limit != null and fold.projection.order.len == 0 and top.capacity != 0 and top.total == top.capacity) return error.CypherStreamComplete;
                 return;
             }
+            // Each expanded input row owns its source-address epoch. Never
+            // carry these keys across UNWIND branches or nested scratch frames.
+            var input_scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+            defer input_scratch.deinit();
+            var input_clones: v.CloneContext = .{ .a = engine.planning_allocator, .scratch = input_scratch.allocator(), .min_shared_string_bytes = 256, .max_shared_allocations = 16384 };
+            const saved_input = engine.input_clones;
+            const saved_capture = engine.capture_input_clones;
+            defer {
+                engine.input_clones = saved_input;
+                engine.capture_input_clones = saved_capture;
+            }
+            engine.input_clones = null;
+            engine.capture_input_clones = null;
             var key: std.ArrayList(v.Value) = .empty;
             for (fold.projection.items) |item| if (!aggregates(item.expression)) try key.append(engine.a, try engine.eval(item.expression, row, null));
             const hash = (try engine.values.info(.{ .list = key.items })).hash;
@@ -2629,6 +3324,8 @@ const Engine = struct {
                 } else {
                     found = fold.groups.items.len;
                     try fold.group_index.insert(fold.retained, hash, found.?);
+                    engine.capture_input_clones = &input_clones;
+                    defer engine.capture_input_clones = null;
                     try fold.groups.append(fold.retained, try engine.newStreamGroup(fold.retained, key.items, row, fold.retention, fold.projection, fold.calls, fold.membership_leaders));
                 }
             } else if (!fold.has_keys and fold.groups.items[0].source.len == 0) {
@@ -2641,6 +3338,13 @@ const Engine = struct {
                     fold.groups.items[0].source = retained_source.items;
                 }
             }
+            if (fold.axis_packet) |packet| {
+                for (fold.groups.items[found.?].states) |state_value| if (state_value.count != 0 or state_value.failure != null) return error.CypherAxisMemoDeclined;
+                for (fold.groups.items[found.?].states, packet) |*state_value, snapshot| try engine.axisRestore(state_value, snapshot);
+                return;
+            }
+            input_clones.owned_parent = engine.statement_ownership;
+            engine.input_clones = &input_clones;
             // One ordinary fold emission feeds the same repeatable argument to
             // every member. Reuse its ordinal instead of rehashing wide values.
             // Synthetic statistic bins and moment inputs have independent
@@ -2672,15 +3376,42 @@ const Engine = struct {
                     continue;
                 };
                 if (accumulator.failure != null) continue;
+                if (fold.list_counts) |proof| if (proof.slots[i]) {
+                    accumulator.addListCount(engine, proof.facts, proof.weight) catch |err| {
+                        if (!fold.defer_aggregates or !StreamingAggregate.consumerFailure(err)) return err;
+                        accumulator.failure = err;
+                    };
+                    continue;
+                };
+                if (fold.range_counts) |slots| if (slots[i]) {
+                    if (std.ascii.eqlIgnoreCase(accumulator.function.name, "sum")) {
+                        const packet = fold.range_sum.?;
+                        accumulator.addIntegerSummary(engine, packet.value, packet.weight, packet.length) catch |err| {
+                            if (!fold.defer_aggregates or !StreamingAggregate.consumerFailure(err)) return err;
+                            accumulator.failure = err;
+                        };
+                        continue;
+                    }
+                    const minimum = std.ascii.eqlIgnoreCase(accumulator.function.name, "min");
+                    if (minimum or std.ascii.eqlIgnoreCase(accumulator.function.name, "max")) {
+                        const extrema = fold.range_extrema.?;
+                        try accumulator.addValue(engine, .{ .integer = if (minimum) extrema.minimum else extrema.maximum }, Count.one);
+                        continue;
+                    }
+                };
                 const saved_function = accumulator.function;
+                var multiplicity = fold.weight;
                 if (fold.range_counts) |counts| if (counts[i]) {
                     // The range packet proves non-NULL values, and DISTINCT
                     // additionally proves one disjoint axis in this group scope.
+                    if (accumulator.function.distinct) if (fold.range_distinct_count) |packet| {
+                        multiplicity = try packet.weight.multiply(engine.a, packet.value);
+                    };
                     accumulator.function.star = true;
                     accumulator.function.distinct = false;
                 };
                 defer accumulator.function = saved_function;
-                accumulator.addWeighted(engine, row, fold.weight) catch |err| {
+                accumulator.addWeighted(engine, row, multiplicity) catch |err| {
                     if (!fold.defer_aggregates or !StreamingAggregate.consumerFailure(err)) return err;
                     accumulator.failure = err;
                 };
@@ -2726,9 +3457,10 @@ const Engine = struct {
             const slots = fold.call_aliases orelse return null;
             // Identity projections can drop a captured producer scope. Any
             // filter, rebinding or further axis needs its own domain proof.
+            var observed_alias = alias;
             for (fold.middle[index..]) |clause| {
                 if (clause.operation != .project) return null;
-                if (!identityAxis(clause.operation.project.value, alias)) return null;
+                observed_alias = forwardedAxis(clause.operation.project.value, observed_alias) orelse return null;
             }
             var unique = fold.single_seed and fold.weight.isOne();
             for (fold.middle[0 .. index - 1]) |clause| if (clause.operation != .project) {
@@ -2738,12 +3470,63 @@ const Engine = struct {
             var observed = false;
             for (fold.calls, counts) |expression, *qualified| {
                 const c = expression.value.call;
-                if (std.ascii.eqlIgnoreCase(c.name, "sum") or std.ascii.eqlIgnoreCase(c.name, "avg")) return null;
-                qualified.* = std.ascii.eqlIgnoreCase(c.name, "count") and !c.star and (!c.distinct or unique) and c.args.len == 1 and c.args[0].value == .variable and std.mem.eql(u8, c.args[0].value.variable, alias);
+                if (std.ascii.eqlIgnoreCase(c.name, "avg")) return null;
+                const sum = std.ascii.eqlIgnoreCase(c.name, "sum");
+                if (sum and (c.distinct or c.star or c.args.len != 1 or c.args[0].value != .variable or !std.mem.eql(u8, c.args[0].value.variable, observed_alias))) return null;
+                const is_count = std.ascii.eqlIgnoreCase(c.name, "count");
+                const extreme = std.ascii.eqlIgnoreCase(c.name, "min") or std.ascii.eqlIgnoreCase(c.name, "max");
+                qualified.* = (is_count or extreme or sum) and !c.star and (extreme or !c.distinct or unique) and c.args.len == 1 and c.args[0].value == .variable and std.mem.eql(u8, c.args[0].value.variable, observed_alias);
                 observed = observed or qualified.*;
             }
-            if (!observed or !axisExpressions(fold.projection, alias, slots, counts)) return null;
+            if (!observed or !axisExpressions(fold.projection, observed_alias, slots, counts)) return null;
             return counts;
+        }
+        const ListCountProof = struct { facts: *ListCountFacts, slots: []const bool };
+        fn listCountProof(fold: *@This(), engine: *Engine, alias: []const u8, index: usize, input: v.Value) !?ListCountProof {
+            if (!engine.read_only or fold.consumer != null or fold.continuation != null or fold.group_window != null or fold.projection.wildcard or fold.calls.len == 0) return null;
+            const slots = fold.call_aliases orelse return null;
+            for (fold.calls) |expression| {
+                const name = expression.value.call.name;
+                if (!std.ascii.eqlIgnoreCase(name, "count") and !std.ascii.eqlIgnoreCase(name, "min") and !std.ascii.eqlIgnoreCase(name, "max") and !std.ascii.eqlIgnoreCase(name, "sum")) return null;
+            }
+            var observed_alias = alias;
+            var mappings: std.ArrayList(struct { expression: *const ast.Expr, alias: []const u8 }) = .empty;
+            for (fold.middle[index..]) |clause| {
+                if (clause.operation != .project) return null;
+                const p = clause.operation.project.value;
+                if (forwardedAxis(p, observed_alias)) |forwarded| {
+                    observed_alias = forwarded;
+                    continue;
+                }
+                if (p.wildcard or p.distinct or p.predicate != null or p.order.len != 0 or p.skip != null or p.limit != null) return null;
+                var mapping: ?ast.Item = null;
+                for (p.items) |item| {
+                    if (independentExpressions(item.expression, observed_alias)) continue;
+                    if (mapping != null or item.alias == null or aggregates(item.expression)) return null;
+                    mapping = item;
+                }
+                const item = mapping orelse return null;
+                try mappings.append(engine.a, .{ .expression = item.expression, .alias = observed_alias });
+                observed_alias = item.alias.?;
+            }
+            const counts = try engine.a.alloc(bool, fold.calls.len);
+            var observed = false;
+            for (fold.calls, counts) |expression, *qualified| {
+                const c = expression.value.call;
+                if (std.ascii.eqlIgnoreCase(c.name, "avg")) return null;
+                const sum = std.ascii.eqlIgnoreCase(c.name, "sum");
+                if (sum and (c.star or c.args.len != 1 or c.args[0].value != .variable or !std.mem.eql(u8, c.args[0].value.variable, observed_alias))) return null;
+                qualified.* = (std.ascii.eqlIgnoreCase(c.name, "count") or std.ascii.eqlIgnoreCase(c.name, "min") or std.ascii.eqlIgnoreCase(c.name, "max") or sum) and !c.star and c.args.len == 1 and c.args[0].value == .variable and std.mem.eql(u8, c.args[0].value.variable, observed_alias);
+                observed = observed or qualified.*;
+            }
+            if (!observed or !axisExpressions(fold.projection, observed_alias, slots, counts)) return null;
+            var mapped_input = input;
+            for (mappings.items) |mapping| mapped_input = (try engine.mappedList(mapped_input, mapping.expression, mapping.alias)) orelse return null;
+            const facts = try engine.listCountFacts(mapped_input) orelse return null;
+            for (fold.calls, counts) |expression, qualified| if (qualified and std.ascii.eqlIgnoreCase(expression.value.call.name, "sum")) {
+                if (try engine.listIntegerSum(facts, expression.value.call.distinct) == null) return null;
+            };
+            return .{ .facts = facts, .slots = counts };
         }
         fn progress(fold: *@This()) usize {
             if (fold.continuation) |next| return next.parent.progress();
@@ -3608,13 +4391,14 @@ const Engine = struct {
         const distinct_stages = try retained.alloc(DistinctRows, middle.len);
         @memset(distinct_stages, .{});
         const applies = try retained.alloc(ApplyMemo, middle.len);
-        for (applies, middle) |*apply, clause| apply.* = .{ .memo = .{ .budget = .{ .backing = self.scratch_allocator, .limit = @min(8 << 20, self.limits.memory_bytes / 16) }, .disabled = clause.operation != .subquery or !pureReturningCall(clause.operation.subquery) } };
+        for (applies, middle) |*apply, clause| apply.* = .{ .memo = .{ .identity_keys = self.read_only, .budget = .{ .backing = self.scratch_allocator, .limit = @min(8 << 20, self.limits.memory_bytes / 16) }, .disabled = clause.operation != .subquery or !pureReturningCall(clause.operation.subquery) } };
         defer for (applies) |*apply| apply.memo.deinit();
         const probes = try retained.alloc(CallMemo, middle.len);
         for (probes, middle) |*probe, clause| probe.* = .{ .budget = .{ .backing = self.scratch_allocator, .limit = @min(4 << 20, self.limits.memory_bytes / 32) }, .disabled = clause.operation != .match and clause.operation != .subquery };
         defer for (probes) |*probe| probe.deinit();
         const retention: GroupRetention = if (grouped) try self.groupRetention(projection) else .{ .a = self.a };
         var fold: StreamFold = .{ .single_seed = scalar_seed and input.len == 1 and (input_weights == null or input_weights.?[0].isOne()), .defer_aggregates = scalar_seed and group_window == null, .consumer = consumer, .retention = &retention, .probes = probes, .optional = operation.optional, .applies = applies, .continuation = continuation, .distinct = distinct_stages, .retained = retained, .middle = middle, .projection = projection, .calls = calls.items, .membership_leaders = calls.distinct_leaders.items, .group_window = if (group_window) |*window| window else null, .call_aliases = &calls.index.pointers, .top = &top, .groups = &groups, .group_index = &group_index, .has_keys = has_keys, .stage_counts = stage_counts, .matched = &matched };
+        defer fold.closeAxes();
         var adaptive_probe = adaptive_candidate;
         if (adaptive_probe) for (input) |row| {
             if (operation.predicate) |predicate| if (!endpointExpression(predicate, path, row)) {
@@ -4185,82 +4969,195 @@ const Engine = struct {
         }
         return self.run(clauses, rows, false, preserve_rows);
     }
-    /// Forward a single producer binding into its sole UNWIND consumer. This
-    /// is closure conversion, not substitution into every use: the source is
-    /// evaluated in its original input scope, then that scope is dropped.
-    /// Sibling bindings evaluate once in their original source order. Filters,
-    /// multiple input rows and escaping aliases retain their projection barrier.
+    /// A deferred producer is a lexical closure: its source retains the old
+    /// scope, while each WITH evaluates ordinary siblings once in its own
+    /// input scope. Preflight the entire binding path before evaluating anything.
     const ForwardedUnwind = struct { clauses: []const ast.Clause, row: Row };
-    fn forwardUnwind(self: *Engine, clauses: []const ast.Clause, input: Row) !?ForwardedUnwind {
-        if (clauses.len < 2 or clauses[0].operation != .project) return null;
-        const first = clauses[0].operation.project;
-        const p = first.value;
-        if (first.final or p.wildcard or p.distinct or p.predicate != null or p.order.len != 0 or p.skip != null or p.limit != null or p.items.len == 0) return null;
-        // A single deferred producer can share a WITH with ordinary bindings.
-        // Sibling expressions still evaluate exactly once in the old scope.
-        var producer_index: ?usize = null;
-        for (p.items, 0..) |item, i| {
-            if (aggregates(item.expression)) return null;
-            if (isRange(item.expression) or projectedSource(item.expression)) {
-                if (producer_index != null) return null;
-                producer_index = i;
-            }
+    /// A source is eagerly checked at its original WITH/operand position. Its
+    /// lexical frame and completed count summary then travel together. Only
+    /// repeatable read-only sources may replay into a value-observing consumer.
+    const ProducerSource = struct {
+        expression: *const ast.Expr,
+        row: Row,
+        owner: ?*Invariants,
+        locals: ?*const @import("expressions.zig").Local,
+        summary: v.Value,
+        arithmetic: ?@import("range.zig").Range = null,
+        arithmetic_shape: ?bool = null,
+        arithmetic_domain: ?ArithmeticDomain = null,
+    };
+    fn captureProducerSource(self: *Engine, expression: *const ast.Expr, row: Row, captured: *std.ArrayList(v.Entry), alias: []const u8) !*const ast.Expr {
+        const arithmetic = if (isRange(expression)) try self.rangeInput(expression, row, null) else null;
+        const summary = if (isRange(expression)) try self.sourceSummary(if (arithmetic) |sequence| .{ .values = .{ .range = sequence } } else null, .{ .name = "collect", .args = &.{}, .collect_limit = 0 }) else try self.listSummary(.{ .name = "collect", .args = &.{expression}, .collect_limit = 0, .collect_summary = true }, row, null);
+        const id = self.producer_sources.items.len;
+        try self.producer_sources.append(self.planning_allocator, .{ .expression = expression, .row = try self.a.dupe(v.Entry, row), .owner = self.local_invariants, .locals = self.projection_locals, .summary = summary, .arithmetic = arithmetic });
+        const reference = @constCast(try self.captureProducerOperand(captured, .null, expression.span, alias));
+        reference.execution_list_source = id;
+        reference.execution_range_binding = isRange(expression);
+        return reference;
+    }
+    fn captureAddedProducer(self: *Engine, expression: *const ast.Expr, row: Row, captured: *std.ArrayList(v.Entry), alias: []const u8) !*const ast.Expr {
+        if (reduction_plan.knownList(expression) and reduction_plan.repeatable(expression))
+            return self.captureProducerSource(expression, row, captured, alias);
+        return self.captureProducerOperand(captured, try self.eval(expression, row, null), expression.span, alias);
+    }
+    fn captureProducerOperand(self: *Engine, captured: *std.ArrayList(v.Entry), value: v.Value, span: ast.Span, alias: []const u8) !*const ast.Expr {
+        var suffix = captured.items.len;
+        const hidden = while (true) : (suffix += 1) {
+            const candidate = try std.fmt.allocPrint(self.a, "_producer_capture_{d}", .{suffix});
+            if (lookup(captured.items, candidate) == null and !std.mem.eql(u8, candidate, alias)) break candidate;
+        };
+        try captured.append(self.a, .{ .name = hidden, .value = value });
+        const reference = try self.a.create(ast.Expr);
+        reference.* = .{ .span = span, .value = .{ .variable = hidden } };
+        return reference;
+    }
+    const ProducerBinding = struct { name: []const u8, depth: usize, expression: ?*const ast.Expr = null };
+    fn producerBinding(bindings: []const ProducerBinding, name: []const u8) ?ProducerBinding {
+        for (bindings) |binding| if (std.mem.eql(u8, binding.name, name)) return binding;
+        return null;
+    }
+    fn referencesProducers(self: *Engine, expression: *const ast.Expr, bindings: []const ProducerBinding) !bool {
+        for (bindings) |binding| {
+            if (!@import("expressions.zig").references(expression, binding.name)) continue;
+            var references: Names = .empty;
+            try self.retainReferences(&references, &.{.{ .name = binding.name, .value = .null }}, expression);
+            if (references.contains(binding.name)) return true;
         }
-        const selected = producer_index orelse return null;
-        const source = p.items[selected].expression;
-        if (p.items.len > 1 and (!self.read_only or !reduction_plan.repeatable(source))) return null;
-        var name = p.items[selected].alias orelse return null;
+        return false;
+    }
+    /// Prove the complete source graph before evaluating any binding. Unknown
+    /// consumers retain their WITH barrier; every deferred leaf is repeatable.
+    fn producerFrameDepth(self: *Engine, expression: *const ast.Expr, bindings: []const ProducerBinding) anyerror!?usize {
+        if (!try self.referencesProducers(expression, bindings))
+            return if (reduction_plan.knownList(expression) and reduction_plan.repeatable(expression)) 1 else null;
+        if (expression.value == .variable) return (producerBinding(bindings, expression.value.variable) orelse return null).depth;
+        if (reduction_plan.reversedInput(expression)) |input| return (try self.producerFrameDepth(input, bindings) orelse return null) +| 1;
+        if (expression.value == .binary and expression.value.binary.op == .add) {
+            const addition = expression.value.binary;
+            const left = if (try self.referencesProducers(addition.left, bindings)) try self.producerFrameDepth(addition.left, bindings) orelse return null else 1;
+            const right = if (try self.referencesProducers(addition.right, bindings)) try self.producerFrameDepth(addition.right, bindings) orelse return null else 1;
+            return @max(left, right) +| 1;
+        }
+        return null;
+    }
+    /// Substitute the whole lexical source frame, capturing ordinary operands
+    /// once and preserving left-to-right validation even under NULL absorption.
+    fn transformProducerFrame(self: *Engine, expression: *const ast.Expr, bindings: []const ProducerBinding, row: Row, captured: *std.ArrayList(v.Entry), alias: []const u8) anyerror!*const ast.Expr {
+        if (expression.value == .variable) if (producerBinding(bindings, expression.value.variable)) |binding| return binding.expression.?;
+        if (!try self.referencesProducers(expression, bindings)) return self.captureAddedProducer(expression, row, captured, alias);
+        const result = try self.a.create(ast.Expr);
+        if (reduction_plan.reversedInput(expression)) |input| {
+            const child = try self.transformProducerFrame(input, bindings, row, captured, alias);
+            result.* = .{ .span = expression.span, .depth = child.depth + 1, .value = .{ .call = .{ .name = "reverse", .args = try self.a.dupe(*const ast.Expr, &.{child}) } } };
+        } else {
+            const addition = expression.value.binary;
+            const left = try self.transformProducerFrame(addition.left, bindings, row, captured, alias);
+            const right = try self.transformProducerFrame(addition.right, bindings, row, captured, alias);
+            result.* = .{ .span = expression.span, .depth = @max(left.depth, right.depth) + 1, .value = .{ .binary = .{ .op = .add, .left = left, .right = right } } };
+        }
+        // A transformed node is itself a validated closure. Later aliases
+        // share its source descriptor and summary, rather than recursively
+        // expanding the same expression DAG on every validation or proof.
+        return self.captureProducerSource(result, captured.items, captured, alias);
+    }
+    fn forwardedClauses(self: *Engine, clauses: []const ast.Clause, index: usize, source: *const ast.Expr, ordinary: Row, captured: *std.ArrayList(v.Entry)) !ForwardedUnwind {
+        const unwind = clauses[index].operation.unwind;
+        const output = try self.a.alloc(ast.Clause, 2 + clauses.len - index - 1);
+        output[0] = clauses[index];
+        output[0].operation.unwind.expression = source;
+        var items: std.ArrayList(ast.Item) = .empty;
+        const binding = try self.a.create(ast.Expr);
+        binding.* = .{ .span = clauses[index].span, .value = .{ .variable = unwind.alias } };
+        try items.append(self.a, .{ .expression = binding, .alias = unwind.alias });
+        for (ordinary) |entry| {
+            if (std.mem.eql(u8, entry.name, unwind.alias)) continue;
+            const reference = try self.captureProducerOperand(captured, entry.value, clauses[index].span, unwind.alias);
+            try items.append(self.a, .{ .expression = reference, .alias = entry.name });
+        }
+        output[1] = .{ .span = clauses[0].span, .operation = .{ .project = .{ .final = false, .value = .{ .items = try items.toOwnedSlice(self.a) } } } };
+        @memcpy(output[2..], clauses[index + 1 ..]);
+        return .{ .clauses = output, .row = try captured.toOwnedSlice(self.a) };
+    }
+    fn producerEscapes(self: *Engine, bindings: []const ProducerBinding, unwind: anytype, tail: []const ast.Clause) !bool {
+        for (bindings) |binding| if (!std.mem.eql(u8, binding.name, unwind.alias)) {
+            var references: Names = .empty;
+            try self.retainQueryReferences(&references, &.{.{ .name = binding.name, .value = .null }}, tail);
+            if (references.contains(binding.name)) return true;
+        };
+        return false;
+    }
+    fn forwardUnwind(self: *Engine, clauses: []const ast.Clause, input: Row) !?ForwardedUnwind {
+        if (!self.read_only or clauses.len < 2 or clauses[0].operation != .project) return null;
+        if (try self.forwardProducerFrame(clauses, input)) |forwarded| return forwarded;
+        // Nonrepeatable graph sources can still flow once through pure aliases.
+        // They must never acquire an eager validation/replay closure.
+        const first = clauses[0].operation.project;
+        if (first.final or first.value.wildcard or first.value.distinct or first.value.predicate != null or first.value.order.len != 0 or first.value.skip != null or first.value.limit != null or first.value.items.len != 1) return null;
+        const source = first.value.items[0].expression;
+        if (!projectedSource(source) or reduction_plan.repeatable(source)) return null;
+        var name = first.value.items[0].alias orelse return null;
         var index: usize = 1;
         while (index < clauses.len and clauses[index].operation == .project) : (index += 1) {
-            const step = clauses[index].operation.project;
-            const value = step.value;
-            if (step.final or value.wildcard or value.distinct or value.predicate != null or value.order.len != 0 or value.skip != null or value.limit != null or value.items.len != 1) return null;
-            const expression = value.items[0].expression;
-            if (expression.value != .variable or !std.mem.eql(u8, expression.value.variable, name)) return null;
-            name = value.items[0].alias orelse name;
+            const p = clauses[index].operation.project;
+            if (p.final or p.value.wildcard or p.value.distinct or p.value.predicate != null or p.value.order.len != 0 or p.value.skip != null or p.value.limit != null or p.value.items.len != 1) return null;
+            const item = p.value.items[0];
+            if (item.expression.value != .variable or !std.mem.eql(u8, item.expression.value.variable, name)) return null;
+            name = item.alias orelse name;
         }
         if (index + 1 >= clauses.len or clauses[index].operation != .unwind) return null;
         const unwind = clauses[index].operation.unwind;
         if (unwind.expression.value != .variable or !std.mem.eql(u8, unwind.expression.value.variable, name)) return null;
-        var references: Names = .empty;
-        try self.retainQueryReferences(&references, &.{.{ .name = name, .value = .null }}, clauses[index + 1 ..]);
-        if (references.contains(name)) return null;
-        const output = try self.a.alloc(ast.Clause, 2 + clauses.len - index - 1);
-        output[0] = clauses[index];
-        output[0].operation.unwind.expression = source;
-        const binding = try self.a.create(ast.Expr);
-        binding.* = .{ .span = clauses[index].span, .value = .{ .variable = unwind.alias } };
-        output[1] = .{ .span = clauses[0].span, .operation = .{ .project = .{ .final = false, .value = .{ .items = &.{} } } } };
-        const keep_siblings = index == 1;
-        const items = try self.a.alloc(ast.Item, 1 + if (keep_siblings) p.items.len - 1 else @as(usize, 0));
-        items[0] = .{ .expression = binding, .alias = unwind.alias };
+        if (try self.producerEscapes(&.{.{ .name = name, .depth = 1 }}, unwind, clauses[index + 1 ..])) return null;
         var captured: std.ArrayList(v.Entry) = .empty;
         try captured.appendSlice(self.a, input);
-        var next_item: usize = 1;
-        if (p.items.len > 1) for (p.items, 0..) |item, i| {
-            if (i == selected) {
-                // Complete the producer's eager source phase in its original
-                // position before evaluating the following sibling expression.
-                _ = try self.listSummary(.{ .name = "collect", .args = &.{source}, .collect_limit = 0, .collect_summary = true }, input, null);
-            } else {
-                const value = try self.eval(item.expression, input, null);
-                if (!keep_siblings) continue;
-                var suffix: usize = i;
-                var hidden: []const u8 = undefined;
-                while (true) : (suffix += 1) {
-                    hidden = try std.fmt.allocPrint(self.a, "_producer_capture_{d}", .{suffix});
-                    if (lookup(captured.items, hidden) == null) break;
-                }
-                try captured.append(self.a, .{ .name = hidden, .value = value });
-                const reference = try self.a.create(ast.Expr);
-                reference.* = .{ .span = item.expression.span, .value = .{ .variable = hidden } };
-                items[next_item] = .{ .expression = reference, .alias = item.alias orelse try self.expressionName(item.expression) };
-                next_item += 1;
+        return try self.forwardedClauses(clauses, index, source, &.{}, &captured);
+    }
+    fn forwardProducerFrame(self: *Engine, clauses: []const ast.Clause, input: Row) !?ForwardedUnwind {
+        var bindings: []const ProducerBinding = &.{};
+        var plans: std.ArrayList([]const bool) = .empty;
+        var index: usize = 0;
+        while (index < clauses.len and clauses[index].operation == .project) : (index += 1) {
+            const step = clauses[index].operation.project;
+            const p = step.value;
+            if (step.final or p.wildcard or p.distinct or p.predicate != null or p.order.len != 0 or p.skip != null or p.limit != null or p.items.len == 0) return null;
+            const deferred = try self.a.alloc(bool, p.items.len);
+            var next: std.ArrayList(ProducerBinding) = .empty;
+            for (p.items, deferred) |item, *selected| {
+                if (aggregates(item.expression)) return null;
+                const depth = try self.producerFrameDepth(item.expression, bindings);
+                selected.* = depth != null;
+                if (depth) |extent| {
+                    if (extent > self.limits.recursion_depth) return null;
+                    try next.append(self.a, .{ .name = item.alias orelse try self.expressionName(item.expression), .depth = extent });
+                } else if (try self.referencesProducers(item.expression, bindings)) return null;
             }
-        };
-        output[1].operation.project.value.items = items;
-        @memcpy(output[2..], clauses[index + 1 ..]);
-        return .{ .clauses = output, .row = try captured.toOwnedSlice(self.a) };
+            try plans.append(self.a, deferred);
+            bindings = try next.toOwnedSlice(self.a);
+        }
+        if (bindings.len == 0 or index + 1 >= clauses.len or clauses[index].operation != .unwind) return null;
+        const unwind = clauses[index].operation.unwind;
+        const depth = try self.producerFrameDepth(unwind.expression, bindings) orelse return null;
+        if (depth > self.limits.recursion_depth or try self.producerEscapes(bindings, unwind, clauses[index + 1 ..])) return null;
+        var captured: std.ArrayList(v.Entry) = .empty;
+        try captured.appendSlice(self.a, input);
+        var current = input;
+        bindings = &.{};
+        for (plans.items, 0..) |deferred, stage| {
+            var ordinary: std.ArrayList(v.Entry) = .empty;
+            var next: std.ArrayList(ProducerBinding) = .empty;
+            for (clauses[stage].operation.project.value.items, deferred) |item, selected| {
+                const name = item.alias orelse try self.expressionName(item.expression);
+                if (selected) {
+                    const source = try self.transformProducerFrame(item.expression, bindings, current, &captured, unwind.alias);
+                    try next.append(self.a, .{ .name = name, .depth = source.depth, .expression = source });
+                } else try ordinary.append(self.a, .{ .name = name, .value = try self.eval(item.expression, current, null) });
+            }
+            current = try ordinary.toOwnedSlice(self.a);
+            bindings = try next.toOwnedSlice(self.a);
+        }
+        const source = try self.transformProducerFrame(unwind.expression, bindings, current, &captured, unwind.alias);
+        return try self.forwardedClauses(clauses, index, source, current, &captured);
     }
     fn runWeighted(self: *Engine, clauses: []const ast.Clause, initial: WeightedRows, preserve_rows: bool) anyerror![]const Row {
         return (try self.runWeightedRows(clauses, initial, preserve_rows, false)).rows;
@@ -4396,7 +5293,10 @@ const Engine = struct {
     // only captured bindings and the child's row goal. Binding equality keeps
     // numeric representation (including nested 1 versus 1.0) observable.
     const CallMemo = struct {
-        const Entry = struct { key: Row, goal: ?usize, children: WeightedRows, probe: bool = false };
+        // Snapshot-local read-only expressions and CALLs can key entities by
+        // identity. Mutable queries retain complete captured bindings.
+        const Entry = struct { key: Row, goal: ?usize, children: WeightedRows, shared: ?WeightedRows = null, probe: bool = false };
+        identity_keys: bool = false,
         budget: Budget,
         arena: ?std.heap.ArenaAllocator = null,
         index: value_work.Index = .{},
@@ -4417,12 +5317,27 @@ const Engine = struct {
             var candidate = memo.index.head(hash);
             while (candidate) |position| {
                 const link = memo.index.links.items[position];
-                const entry = memo.entries.items[link.index];
+                const entry = &memo.entries.items[link.index];
                 if (entry.probe == probe and entry.goal == goal and try work.eql(.{ .map = key }, .{ .map = entry.key })) {
+                    if (engine.read_only and memo.identity_keys) {
+                        if (entry.shared) |shared| return shared;
+                        const rows = try engine.planning_allocator.alloc(Row, entry.children.rows.len);
+                        const weights = try engine.planning_allocator.alloc(Count, rows.len);
+                        const owner = try engine.statementOwnership();
+                        var copies: v.CloneContext = .{ .a = engine.planning_allocator, .scratch = scratch.allocator(), .owned_parent = owner, .byte_pool = owner.byte_pool, .byte_allocator = engine.scratch_allocator };
+                        for (rows, weights, entry.children.rows, entry.children.weights) |*row, *weight, old_row, old_weight| {
+                            row.* = try cloneRowContext(old_row, &copies);
+                            weight.* = try old_weight.clone(engine.planning_allocator);
+                        }
+                        try owner.adoptClones(&copies);
+                        if (engine.capture_input_clones) |input| try input.captureInputStrings(&copies);
+                        entry.shared = .{ .rows = rows, .weights = weights };
+                        return entry.shared;
+                    }
                     const rows = try engine.a.alloc(Row, entry.children.rows.len);
                     const weights = try engine.a.alloc(Count, rows.len);
                     for (rows, weights, entry.children.rows, entry.children.weights) |*row, *weight, old_row, old_weight| {
-                        row.* = (try (v.Value{ .map = old_row }).clone(engine.a)).map;
+                        row.* = try engine.cloneRowScoped(old_row, engine.a);
                         weight.* = try old_weight.clone(engine.a);
                     }
                     return .{ .rows = rows, .weights = weights };
@@ -4452,11 +5367,16 @@ const Engine = struct {
             const hash = (try work.info(.{ .map = key })).hash;
             const rows = try a.alloc(Row, children.rows.len);
             const weights = try a.alloc(Count, rows.len);
+            // A read-only cache may borrow proven statement-owned results.
+            // Other child values still receive complete memo-owned snapshots.
+            // The root registry never retains recyclable memo source addresses.
+            var results: v.CloneContext = .{ .a = a, .scratch = scratch.allocator(), .borrowed_parent = if (engine.read_only and memo.identity_keys) try engine.statementOwnership() else null };
             for (rows, weights, children.rows, children.weights) |*row, *weight, old_row, old_weight| {
-                row.* = (try (v.Value{ .map = old_row }).clone(a)).map;
+                row.* = try cloneRowContext(old_row, &results);
                 weight.* = try old_weight.clone(a);
             }
-            const owned_key = (try (v.Value{ .map = key }).clone(a)).map;
+            var context: v.CloneContext = .{ .a = a, .scratch = scratch.allocator(), .identity_only = memo.identity_keys };
+            const owned_key = (try context.clone(.{ .map = key })).map;
             try memo.entries.ensureUnusedCapacity(a, 1);
             try memo.index.insert(a, hash, memo.entries.items.len);
             memo.entries.appendAssumeCapacity(.{ .key = owned_key, .goal = goal, .children = .{ .rows = rows, .weights = weights }, .probe = probe });
@@ -4538,6 +5458,8 @@ const Engine = struct {
         return .{ .rows = rows, .weights = weights };
     }
     fn runWeightedRowsImpl(self: *Engine, original_clauses: []const ast.Clause, initial: WeightedRows, preserve_rows: bool, retain_final: bool) anyerror!WeightedRows {
+        const source_mark = self.producer_sources.items.len;
+        defer self.producer_sources.shrinkRetainingCapacity(source_mark);
         var clauses = original_clauses;
         var bags = initial;
         const saved_retention = self.retain_windows;
@@ -4717,7 +5639,7 @@ const Engine = struct {
                     const demand = try self.matchDemand(clauses[clause_index + 1 ..]);
                     const goal = if (unit) null else self.callRowGoal(clauses[clause_index + 1 ..]);
                     var produced: usize = 0;
-                    var apply: ApplyMemo = .{ .memo = .{ .budget = .{ .backing = self.scratch_allocator, .limit = @min(8 << 20, self.limits.memory_bytes / 16) }, .disabled = !weightedExpression(inner) or unit } };
+                    var apply: ApplyMemo = .{ .memo = .{ .identity_keys = self.read_only, .budget = .{ .backing = self.scratch_allocator, .limit = @min(8 << 20, self.limits.memory_bytes / 16) }, .disabled = !weightedExpression(inner) or unit } };
                     defer apply.memo.deinit();
                     for (bags.rows, bags.weights) |row, weight| {
                         if (goal) |bound| if (produced >= bound) break;
@@ -4769,6 +5691,8 @@ const Engine = struct {
         return bags;
     }
     fn run(self: *Engine, original_clauses: []const ast.Clause, input: []const Row, explain: bool, preserve_rows: bool) anyerror![]const Row {
+        const source_mark = self.producer_sources.items.len;
+        defer self.producer_sources.shrinkRetainingCapacity(source_mark);
         var clauses = original_clauses;
         const prior_retention = self.retain_windows;
         defer self.retain_windows = prior_retention;
@@ -8488,7 +9412,11 @@ const Engine = struct {
         };
     }
     fn readValue(self: *Engine, value: v.Value) anyerror!v.Value {
-        if (!(try self.values.info(value)).entities) return value;
+        const metadata = if (self.read_only and self.statement_ownership != null and self.statement_ownership.?.owns(value))
+            try (try self.rootInvariantState()).work.info(value)
+        else
+            try self.values.info(value);
+        if (!metadata.entities) return value;
         if (self.backend.vtable.project_node != null or self.backend.vtable.get_relationship != null or self.has_deletions or self.postimages.count() != 0) try self.values.entityTraversal(value);
         return self.readValueInner(value);
     }
@@ -8573,6 +9501,20 @@ const Engine = struct {
         return self.eval(expression, row, null);
     }
     fn eval(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row) anyerror!v.Value {
+        if (expression.execution_list_source) |id| {
+            const source = self.producer_sources.items[id];
+            if (expression.execution_range_binding) {
+                const sequence = source.arithmetic orelse return .null;
+                return self.rangeCells(sequence, 0, sequence.length);
+            }
+            const previous_owner = self.local_invariants;
+            const previous_locals = self.projection_locals;
+            self.local_invariants = source.owner;
+            self.projection_locals = source.locals;
+            defer self.local_invariants = previous_owner;
+            defer self.projection_locals = previous_locals;
+            return self.eval(source.expression, source.row, null);
+        }
         // Validate only reached affine stages. Hoisting this check to the bag
         // producer would incorrectly evaluate errors behind an earlier filter.
         try self.validateMomentNode(expression);
@@ -8583,10 +9525,13 @@ const Engine = struct {
                 .{ .integer = @bitCast(@as(u64, @truncate(range.length))) }, .{ .integer = @intCast(range.length >> 64) },
             }) };
         }
-        const memoizable = self.read_only and self.projection_overrides == null and self.aggregate_overrides == null and (expression.value == .pattern_comprehension or expression.value == .exists or (expression.value == .call and std.ascii.eqlIgnoreCase(expression.value.call.name, "size") and expression.value.call.args.len == 1 and expression.value.call.args[0].value == .pattern_comprehension)) and weightedExpression(expression);
+        // Cardinality/window lowering wraps a graph producer in a private
+        // execution-list summary. Cache that bounded summary on its captured
+        // bindings just as we cache the original SIZE(pattern) expression.
+        const memoizable = self.read_only and self.projection_overrides == null and self.aggregate_overrides == null and (expression.value == .pattern_comprehension or expression.value == .exists or (expression.value == .call and (expression.value.call.execution_list or std.ascii.eqlIgnoreCase(expression.value.call.name, "size")) and expression.value.call.args.len == 1 and expression.value.call.args[0].value == .pattern_comprehension)) and weightedExpression(expression);
         var key: Row = &.{};
         if (memoizable) {
-            if (self.expression_memo == null) self.expression_memo = .{ .budget = .{ .backing = self.scratch_allocator, .limit = @min(8 << 20, self.limits.memory_bytes / 16) } };
+            if (self.expression_memo == null) self.expression_memo = .{ .identity_keys = true, .budget = .{ .backing = self.scratch_allocator, .limit = @min(8 << 20, self.limits.memory_bytes / 16) } };
             var references: Names = .empty;
             try self.retainReferences(&references, row, expression);
             var captured: std.ArrayList(v.Entry) = .empty;
@@ -8623,6 +9568,10 @@ const Engine = struct {
         if (memoizable) try self.expression_memo.?.put(self, key, @intFromPtr(expression), .{ .rows = &.{&.{.{ .name = "value", .value = result }}}, .weights = &.{Count.one} });
         if (expression.value == .parameter or (expression.value == .literal and result == .string)) {
             _ = try (try self.invariantState()).work.info(result);
+        } else if (self.read_only and self.statement_ownership != null and self.statement_ownership.?.owns(result)) {
+            // A destination owned by the statement cannot be recycled by a
+            // row/producer epoch. Cache its analysis in that same root epoch.
+            _ = try (try self.rootInvariantState()).work.info(result);
         } else _ = try self.values.info(result);
         return result;
     }
@@ -8633,6 +9582,10 @@ const Engine = struct {
         return self.scalar_strings orelse &self.strings;
     }
     fn immutableOwner(self: *Engine, value: v.Value) ?*Invariants {
+        // Prefer the longest proven lifetime, even if a loop has also observed
+        // this value. A new loop must not discard a root-owned string's analysis.
+        // Roots introduced after a loop entered need no parent link to that loop.
+        if (self.invariants) |owner| if (owner.work.hasMetadata(value)) return owner;
         return immutableOwnerFrom(self.scalarOwner(), value);
     }
     fn immutableOwnerFrom(start: ?*Invariants, value: v.Value) ?*Invariants {
@@ -8659,6 +9612,14 @@ const Engine = struct {
     }
     fn scalarOwner(self: *Engine) ?*Invariants {
         return if (self.local_invariants) |owner| owner else self.invariants;
+    }
+    fn rootInvariantState(self: *Engine) !*Invariants {
+        if (self.invariants == null) {
+            const owner = try self.planning_allocator.create(Invariants);
+            owner.* = .{ .work = .{ .a = self.planning_allocator, .ptr = self, .charge = chargeWork } };
+            self.invariants = owner;
+        }
+        return self.invariants.?;
     }
     fn invariantState(self: *Engine) !*Invariants {
         if (self.scalarOwner() == null) {
@@ -8778,6 +9739,18 @@ const Engine = struct {
             const range = (try self.rangeInput(right, row, group)) orelse return .null;
             return range.contains(left);
         }
+        if (reduction_plan.reversedInput(right) != null) {
+            // Unknown overloads resolve at runtime. List membership ignores
+            // direction and shares the original allocation's equality index.
+            // Do not feed an already-owned parameter through a bounded
+            // projected-source cache and repeatedly rescan oversized inputs.
+            const source = (try self.sequenceSource(right, row, group)) orelse return .null;
+            return switch (source.values) {
+                .range => |range| range.contains(left),
+                .list => |items| self.membershipValue(left, .{ .list = items }),
+                .scalar => |value| self.binary(.in, left, value),
+            };
+        }
         const invariant = self.read_only and right.execution_invariant != null;
         if (projectedSource(right)) {
             var candidate: ?*@import("invariant_membership.zig").Producer = null;
@@ -8821,19 +9794,7 @@ const Engine = struct {
                 return if (membership.found) .{ .boolean = true } else if (membership.unknown) .null else .{ .boolean = false };
             }
         }
-        if (!invariant) {
-            const value = try self.eval(right, row, group);
-            if (self.read_only and value == .list) if (self.invariants) |owner| if (owner.work.hasMetadata(value)) {
-                // Forwarded parameter lists have statement-owned provenance.
-                // Key by allocation, since one row variable can alternate lists.
-                const id: Invariants.Identity = .{ .address = @intFromPtr(value.list.ptr), .length = value.list.len };
-                if (owner.owned_lists.getPtr(id)) |cached| return cached.contains(&self.values, left);
-                const built = try @import("invariant_membership.zig").Membership.init(self.planning_allocator, self.scratch_allocator, &owner.bytes, &owner.work, value);
-                try owner.owned_lists.put(self.planning_allocator, id, built);
-                return owner.owned_lists.getPtr(id).?.contains(&self.values, left);
-            };
-            return self.binary(.in, left, value);
-        }
+        if (!invariant) return self.membershipValue(left, try self.eval(right, row, group));
         const state_value = try self.invariantState();
         if (state_value.lists.getPtr(right.execution_invariant.?)) |cached| return cached.contains(&self.values, left);
         // Evaluate in its original position, then acquire independent ownership
@@ -8852,6 +9813,18 @@ const Engine = struct {
         try state_value.lists.put(self.planning_allocator, right.execution_invariant.?, built);
         return state_value.lists.getPtr(right.execution_invariant.?).?.contains(&self.values, left);
     }
+    fn membershipValue(self: *Engine, left: v.Value, value: v.Value) !v.Value {
+        if (self.read_only and value == .list) if (self.invariants) |owner| if (owner.work.hasMetadata(value)) {
+            // Forwarded parameter lists have statement-owned provenance.
+            // Key by allocation, since one row variable can alternate lists.
+            const id: Invariants.Identity = .{ .address = @intFromPtr(value.list.ptr), .length = value.list.len };
+            if (owner.owned_lists.getPtr(id)) |cached| return cached.contains(&self.values, left);
+            const built = try @import("invariant_membership.zig").Membership.init(self.planning_allocator, self.scratch_allocator, &owner.bytes, &owner.work, value);
+            try owner.owned_lists.put(self.planning_allocator, id, built);
+            return owner.owned_lists.getPtr(id).?.contains(&self.values, left);
+        };
+        return self.binary(.in, left, value);
+    }
     /// The source owns its values in the caller's evaluation scope. RANGE is
     /// represented arithmetically; each consumer decides when to stop visiting.
     /// General expressions are evaluated eagerly before the consumer starts, so
@@ -8859,17 +9832,33 @@ const Engine = struct {
     const ListSource = struct {
         values: union(enum) { list: []const v.Value, range: @import("range.zig").Range, scalar: v.Value },
         position: u128 = 0,
+        reversed: bool = false,
+        fn length(self: @This()) u128 {
+            return switch (self.values) {
+                .scalar => 1,
+                .list => |items| items.len,
+                .range => |sequence| sequence.length,
+            };
+        }
+        fn at(self: @This(), position: u128) v.Value {
+            const ordinal = if (self.reversed) self.length() - position - 1 else position;
+            return switch (self.values) {
+                .scalar => |value| value,
+                .list => |items| items[@intCast(ordinal)],
+                .range => |sequence| sequence.at(ordinal),
+            };
+        }
         fn next(self: *@This()) ?v.Value {
             return self.nextDirection(false);
         }
         fn nextDirection(self: *@This(), reverse: bool) ?v.Value {
-            const length: u128 = switch (self.values) {
+            const extent: u128 = switch (self.values) {
                 .scalar => 1,
                 .list => |x| x.len,
                 .range => |x| x.length,
             };
-            if (self.position >= length) return null;
-            const ordinal = if (reverse) length - self.position - 1 else self.position;
+            if (self.position >= extent) return null;
+            const ordinal = if (reverse != self.reversed) extent - self.position - 1 else self.position;
             const value = switch (self.values) {
                 .scalar => |value| if (self.position == 0) value else return null,
                 .list => |items| items[@intCast(ordinal)],
@@ -8880,25 +9869,65 @@ const Engine = struct {
         }
     };
     fn listSource(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row) !?ListSource {
+        const source = (try self.sequenceSource(expression, row, group)) orelse return null;
+        if (source.values == .scalar) return error.CypherTypeMismatch;
+        return source;
+    }
+    fn unwindSource(self: *Engine, expression: *const ast.Expr, row: Row) !?ListSource {
+        return self.sequenceSource(expression, row, null);
+    }
+    /// Resolve overloads once, keeping list direction in a cursor rather than
+    /// allocating a reversed copy. Scalar UNWIND and string REVERSE retain
+    /// their ordinary behavior; list-only callers check the resulting kind.
+    fn sequenceSource(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row) !?ListSource {
         if (isRange(expression)) {
             const sequence = (try self.rangeInput(expression, row, group)) orelse return null;
             return .{ .values = .{ .range = sequence } };
         }
+        if (reduction_plan.reversedInput(expression)) |input| {
+            try self.state();
+            var source = (try self.sequenceSource(input, row, group)) orelse return null;
+            switch (source.values) {
+                .list, .range => source.reversed = !source.reversed,
+                .scalar => |value| {
+                    if (value != .string) return error.CypherTypeMismatch;
+                    source.values = .{ .scalar = try self.stringResult(value, .{ .string = try self.stringInputWork(value).reverse(value.string) }) };
+                },
+            }
+            return source;
+        }
         const value = try self.eval(expression, row, group);
-        if (value == .null) return null;
-        if (value != .list) return error.CypherTypeMismatch;
-        return .{ .values = .{ .list = value.list } };
-    }
-    fn unwindSource(self: *Engine, expression: *const ast.Expr, row: Row) !?ListSource {
-        if (isRange(expression)) return self.listSource(expression, row, null);
-        const value = try self.eval(expression, row, null);
         if (value == .null) return null;
         return .{ .values = if (value == .list) .{ .list = value.list } else .{ .scalar = value } };
     }
     fn cloneScoped(self: *Engine, value: v.Value, allocator: A) !v.Value {
         var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
         defer scratch.deinit();
-        var context: v.CloneContext = .{ .a = allocator, .scratch = scratch.allocator() };
+        const parent = if (self.read_only and allocator.ptr == self.planning_allocator.ptr and allocator.vtable == self.planning_allocator.vtable) try self.statementOwnership() else null;
+        var context: v.CloneContext = .{ .a = allocator, .scratch = scratch.allocator(), .owned_parent = parent, .byte_pool = if (parent) |proof| proof.byte_pool else null, .byte_allocator = self.scratch_allocator };
+        const owned = try context.clone(value);
+        if (parent) |proof| {
+            try proof.adoptClones(&context);
+            if (self.capture_input_clones) |input| try input.captureInputStrings(&context);
+        }
+        return owned;
+    }
+    fn cloneRowScoped(self: *Engine, row: Row, allocator: A) !Row {
+        var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
+        defer scratch.deinit();
+        const parent = if (self.read_only and allocator.ptr == self.planning_allocator.ptr and allocator.vtable == self.planning_allocator.vtable) try self.statementOwnership() else null;
+        var context: v.CloneContext = .{ .a = allocator, .scratch = scratch.allocator(), .owned_parent = parent, .byte_pool = if (parent) |proof| proof.byte_pool else null, .byte_allocator = self.scratch_allocator };
+        const owned = try cloneRowContext(row, &context);
+        if (parent) |proof| {
+            try proof.adoptClones(&context);
+            if (self.capture_input_clones) |input| try input.captureInputStrings(&context);
+        }
+        return owned;
+    }
+    fn cloneAggregateScoped(self: *Engine, value: v.Value, allocator: A) !v.Value {
+        var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
+        defer scratch.deinit();
+        var context: v.CloneContext = .{ .a = allocator, .scratch = scratch.allocator(), .borrowed_parent = if (self.read_only) self.input_clones else null };
         return context.clone(value);
     }
     const ListDemand = union(enum) { all, count, window: reduction_plan.Bounds };
@@ -8912,6 +9941,10 @@ const Engine = struct {
         observer: ast.Function,
         failure: ?anyerror = null,
         range: ?*const fn (*anyopaque, *Engine, @import("range.zig").Range) anyerror!void = null,
+        complete: ?*const fn (*anyopaque) bool = null,
+        fn isComplete(self: *const @This()) bool {
+            return self.failure != null or (if (self.complete) |complete| complete(self.ptr) else false);
+        }
         fn accept(self: *@This(), engine: *Engine, value: v.Value, weight: Count, borrowed: ?*const value_work.Work) !void {
             if (self.failure != null) return;
             self.emit(self.ptr, engine, value, weight, borrowed) catch |err| {
@@ -8959,6 +9992,10 @@ const Engine = struct {
         locals: ?*const @import("expressions.zig").Local,
         complete: ?anyerror = null,
         weighted: bool,
+        fn isComplete(ptr: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.complete != null;
+        }
         fn add(ptr: *anyopaque, engine: *Engine, value: v.Value, weight: Count, _: ?*const value_work.Work) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const copies = if (self.weighted) 1 else std.math.cast(usize, weight.exact() orelse return error.CypherStateBudgetExceeded) orelse return error.CypherStateBudgetExceeded;
@@ -9003,6 +10040,10 @@ const Engine = struct {
         scratch: std.heap.ArenaAllocator,
         embedding_failure: bool = false,
         repeatable: bool,
+        fn isComplete(ptr: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.output.isComplete();
+        }
         fn add(ptr: *anyopaque, engine: *Engine, value: v.Value, weight: Count, borrowed: ?*const value_work.Work) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const c = self.expression.value.comprehension;
@@ -9095,25 +10136,51 @@ const Engine = struct {
         if (consumer.embedding_failure) return error.CypherValueDepthExceeded;
         return true;
     }
+    /// Completion propagates only through a producer whose own projections
+    /// have finished their eager phase. Validating an input does not validate
+    /// an enclosing mapper: that mapper must still visit every source value.
+    const ProductionPhase = enum { initial, replay };
     fn produceList(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row, receiver: *ListReceiver) anyerror!bool {
-        return self.produceListOrder(expression, row, group, receiver, false);
+        return self.produceListOrder(expression, row, group, receiver, false, .initial);
     }
-    fn produceListOrder(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row, receiver: *ListReceiver, reverse: bool) anyerror!bool {
+    fn produceListOrder(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row, receiver: *ListReceiver, reverse: bool, phase: ProductionPhase) anyerror!bool {
+        if (phase == .replay and receiver.isComplete()) return true;
+        if (expression.execution_list_source) |id| if (!isRange(expression)) {
+            const source = self.producer_sources.items[id];
+            if (source.summary.list[0] == .null) return false;
+            if (receiver.observer.collect_limit == 0 and receiver.observer.collect_filters.len == 0 and !receiver.observer.distinct and source.summary.list[0].integer >= 0) {
+                const length: u64 = @intCast(source.summary.list[0].integer);
+                if (length != 0) try receiver.accept(self, .null, Count.init(length), null);
+                return true;
+            }
+            const previous_owner = self.local_invariants;
+            const previous_locals = self.projection_locals;
+            self.local_invariants = source.owner;
+            self.projection_locals = source.locals;
+            defer self.local_invariants = previous_owner;
+            defer self.projection_locals = previous_locals;
+            return self.produceListOrder(source.expression, source.row, null, receiver, reverse, .replay);
+        };
+
         if (self.read_only and reduction_plan.repeatable(expression)) if (reduction_plan.reversedList(expression)) |input| {
             // Reverse changes encounter order only after its eager input phase.
             // Validate repeatable projections in original order, then replay
             // them against a source cursor which walks in the other direction.
-            const summary = try self.listSummary(.{ .name = "collect", .args = &.{input}, .collect_limit = 0, .collect_summary = true }, row, group);
-            if (summary.list[0] == .null) return false;
-            return self.produceListOrder(input, row, group, receiver, !reverse);
+            if (phase == .initial) {
+                const summary = try self.listSummary(.{ .name = "collect", .args = &.{input}, .collect_limit = 0, .collect_summary = true }, row, group);
+                if (summary.list[0] == .null) return false;
+            }
+            return self.produceListOrder(input, row, group, receiver, !reverse, .replay);
         };
         if (self.read_only and reduction_plan.repeatable(expression)) if (reduction_plan.concatenatedList(expression)) |b| {
             // Addition evaluates both complete operands before exposing a list.
             // Validate into bounded summaries first, including NULL absorption
             // and scalar embedding checks. Repeatable sources can then replay
             // into the consumer without retaining their intermediate payloads.
-            const summary = try self.concatSummary(.{ .name = "collect", .args = &.{expression}, .collect_limit = 0, .collect_summary = true }, b.left, b.right, row, group);
-            if (summary.list[0] == .null) return false;
+            if (phase == .initial) {
+                const summary = try self.concatSummary(.{ .name = "collect", .args = &.{expression}, .collect_limit = 0, .collect_summary = true }, b.left, b.right, row, group);
+                if (summary.list[0] == .null) return false;
+            }
             try self.produceAddedOperand(if (reverse) b.right else b.left, row, group, receiver, reverse);
             try self.produceAddedOperand(if (reverse) b.left else b.right, row, group, receiver, reverse);
             return true;
@@ -9133,8 +10200,8 @@ const Engine = struct {
             defer mapper.scratch.deinit();
             // A nested mapping is an ordered full observer of its input. Its
             // own output demand still bounds retention in the next receiver.
-            var mapped: ListReceiver = .{ .ptr = &mapper, .emit = ListMapper.add, .destination = receiver.destination, .observer = .{ .name = "collect", .args = &.{} } };
-            const present = try self.produceListOrder(expression.value.comprehension.input, row, group, &mapped, reverse);
+            var mapped: ListReceiver = .{ .ptr = &mapper, .emit = ListMapper.add, .complete = if (phase == .replay) ListMapper.isComplete else null, .destination = receiver.destination, .observer = .{ .name = "collect", .args = &.{} } };
+            const present = try self.produceListOrder(expression.value.comprehension.input, row, group, &mapped, reverse, phase);
             try mapped.check();
             if (mapper.embedding_failure) return error.CypherValueDepthExceeded;
             return present;
@@ -9161,12 +10228,14 @@ const Engine = struct {
         const metadata = self.values;
         const borrowed = if (self.a.ptr == receiver.destination.ptr and self.a.vtable == receiver.destination.vtable) &metadata else null;
         while (source.nextDirection(reverse)) |value| {
+            if (phase == .replay and receiver.isComplete()) break;
             try self.state();
             try receiver.accept(self, value, Count.one, borrowed);
         }
         return true;
     }
     fn produceAddedOperand(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row, receiver: *ListReceiver, reverse: bool) anyerror!void {
+        if (receiver.isComplete()) return;
         // The enclosing summary already validated this entire addition tree.
         // Replay nested additions directly, rather than validating every
         // prefix again (which would make a long concatenation quadratic).
@@ -9176,18 +10245,17 @@ const Engine = struct {
             return;
         }
         if (isRange(expression) or projectedSource(expression)) {
-            _ = try self.produceListOrder(expression, row, group, receiver, reverse);
+            _ = try self.produceListOrder(expression, row, group, receiver, reverse, .replay);
             return;
         }
-        const value = try self.eval(expression, row, group);
-        if (value == .null) return;
-        if (value == .list) {
-            for (0..value.list.len) |i| {
-                try self.state();
-                try receiver.accept(self, value.list[if (reverse) value.list.len - i - 1 else i], Count.one, null);
-            }
-        } else try receiver.accept(self, value, Count.one, null);
+        var source = (try self.sequenceSource(expression, row, group)) orelse return;
+        while (source.nextDirection(reverse)) |value| {
+            if (receiver.isComplete()) break;
+            try self.state();
+            try receiver.accept(self, value, Count.one, null);
+        }
     }
+
     const ListWriter = struct {
         demand: ListDemand,
         destination: A,
@@ -9246,8 +10314,111 @@ const Engine = struct {
             try self.reducer.retainCollection(engine, value, weight, null);
         }
     };
+    const RangeExtrema = struct { minimum: i64, maximum: i64 };
+    const ArithmeticDomain = struct {
+        ranges: []const @import("range.zig").Range = &.{},
+        length: Count = Count.init(0),
+        null_source: bool = false,
+        integer_sum: ?IntegerListSum = .{},
+        fn extrema(self: @This()) ?RangeExtrema {
+            var minimum: i64 = std.math.maxInt(i64);
+            var maximum: i64 = std.math.minInt(i64);
+            var present = false;
+            for (self.ranges) |range| {
+                if (range.length == 0) continue;
+                const last = range.at(range.length - 1).integer;
+                minimum = @min(minimum, @min(range.start, last));
+                maximum = @max(maximum, @max(range.start, last));
+                present = true;
+            }
+            return if (present) .{ .minimum = minimum, .maximum = maximum } else null;
+        }
+    };
+    fn arithmeticDomainShape(self: *Engine, expression: *const ast.Expr, depth: usize) bool {
+        if (depth > 64) return false;
+        if (expression.execution_list_source) |id| {
+            if (self.producer_sources.items[id].arithmetic_shape) |known| return known;
+            const shape = self.arithmeticDomainShape(self.producer_sources.items[id].expression, depth + 1);
+            self.producer_sources.items[id].arithmetic_shape = shape;
+            return shape;
+        }
+        if (isRange(expression)) return true;
+        if (reduction_plan.reversedList(expression)) |input| return self.arithmeticDomainShape(input, depth + 1);
+        if (reduction_plan.concatenatedList(expression)) |b| return self.arithmeticDomainShape(b.left, depth + 1) and self.arithmeticDomainShape(b.right, depth + 1);
+        return false;
+    }
+    fn arithmeticDomain(self: *Engine, expression: *const ast.Expr, row: Row) anyerror!ArithmeticDomain {
+        try self.state();
+        if (expression.execution_list_source) |id| {
+            const source = self.producer_sources.items[id];
+            if (source.arithmetic_domain) |domain| return domain;
+            const owner = self.local_invariants;
+            const locals = self.projection_locals;
+            self.local_invariants = source.owner;
+            self.projection_locals = source.locals;
+            defer self.local_invariants = owner;
+            defer self.projection_locals = locals;
+            const domain = try self.arithmeticDomain(source.expression, source.row);
+            self.producer_sources.items[id].arithmetic_domain = domain;
+            return domain;
+        }
+        if (isRange(expression)) {
+            const range = (try self.rangeInput(expression, row, null)) orelse return .{ .null_source = true };
+            if (range.length == 0) return .{};
+            const ranges = try self.planning_allocator.alloc(@import("range.zig").Range, 1);
+            ranges[0] = range;
+            return .{ .length = try self.domainCount(range.length), .ranges = ranges, .integer_sum = IntegerListSum.range(range) };
+        }
+        if (reduction_plan.reversedList(expression)) |input| {
+            var domain = try self.arithmeticDomain(input, row);
+            domain.integer_sum = if (domain.integer_sum) |summary| summary.reversed() else null;
+            return domain;
+        }
+        const b = reduction_plan.concatenatedList(expression).?;
+        // Both operands retain eager validation even when one is NULL.
+        const left = try self.arithmeticDomain(b.left, row);
+        const right = try self.arithmeticDomain(b.right, row);
+        var domain: ArithmeticDomain = .{ .length = try left.length.add(self.planning_allocator, right.length), .null_source = left.null_source or right.null_source, .integer_sum = if (left.integer_sum != null and right.integer_sum != null) left.integer_sum.?.concat(right.integer_sum.?) else null };
+        if (left.ranges.len == 0) {
+            domain.ranges = right.ranges;
+            return domain;
+        }
+        if (right.ranges.len == 0 or (left.ranges.ptr == right.ranges.ptr and left.ranges.len == right.ranges.len)) {
+            domain.ranges = left.ranges;
+            return domain;
+        }
+        if (left.ranges.len == 1 and right.ranges.len == 1) if (@import("range.zig").mergeCompatible(left.ranges[0], right.ranges[0])) |merged| {
+            const ranges = try self.planning_allocator.alloc(@import("range.zig").Range, 1);
+            ranges[0] = merged;
+            domain.ranges = ranges;
+            return domain;
+        };
+        // Bag multiplicity is separate from set support. Repeated source DAG
+        // branches share their certificate instead of expanding it exponentially.
+        var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
+        defer scratch.deinit();
+        var index: std.AutoHashMapUnmanaged(@import("range.zig").Range, void) = .empty;
+        var ranges: std.ArrayList(@import("range.zig").Range) = .empty;
+        for ([_][]const @import("range.zig").Range{ left.ranges, right.ranges }) |part| for (part) |range| {
+            try self.state();
+            const entry = try index.getOrPut(scratch.allocator(), range);
+            if (!entry.found_existing) try ranges.append(scratch.allocator(), range);
+        };
+        domain.ranges = try self.planning_allocator.dupe(@import("range.zig").Range, ranges.items);
+        return domain;
+    }
+    fn domainCount(self: *Engine, length: u128) !Count {
+        const low = Count.init(@truncate(length));
+        const high = Count.init(@intCast(length >> 64));
+        return if (high.small == 0) low else (try (try high.multiply(self.planning_allocator, Count.init(std.math.maxInt(u64)))).add(self.planning_allocator, high)).add(self.planning_allocator, low);
+    }
+    fn arithmeticSource(expression: *const ast.Expr) bool {
+        var input = expression;
+        while (reduction_plan.reversedInput(input)) |child| input = child;
+        return isRange(input);
+    }
     fn projectedSource(expression: *const ast.Expr) bool {
-        return expression.value == .comprehension or expression.value == .pattern_comprehension or reduction_plan.reversedList(expression) != null or (reduction_plan.concatenatedList(expression) != null and reduction_plan.repeatable(expression));
+        return expression.execution_list_source != null or expression.value == .comprehension or expression.value == .pattern_comprehension or reduction_plan.reversedList(expression) != null or (reduction_plan.concatenatedList(expression) != null and reduction_plan.repeatable(expression));
     }
     fn rangeSummary(self: *Engine, call_value: ast.Function, row: Row, group: ?[]const Row) !v.Value {
         const sequence = try self.rangeInput(call_value.args[0], row, group);
@@ -9289,6 +10460,13 @@ const Engine = struct {
         return self.cloneScoped(try reducer.finish(self), self.a);
     }
     fn listSummary(self: *Engine, call_value: ast.Function, row: Row, group: ?[]const Row) !v.Value {
+        if (call_value.args[0].execution_list_source) |id| {
+            const source = self.producer_sources.items[id];
+            if (call_value.collect_filters.len == 0 and call_value.collect_limit == 0 and call_value.collect_suffix == 0) return source.summary;
+            if (call_value.args[0].execution_range_binding and call_value.collect_filters.len == 0)
+                return self.sourceSummary(if (source.arithmetic) |sequence| .{ .values = .{ .range = sequence } } else null, call_value);
+        }
+
         if (isRange(call_value.args[0])) return self.rangeSummary(call_value, row, group);
         if (call_value.collect_filters.len == 0) if (reduction_plan.concatenatedList(call_value.args[0])) |b| return self.concatSummary(call_value, b.left, b.right, row, group);
         if (call_value.collect_filters.len == 0) if (reduction_plan.reversedList(call_value.args[0])) |input| {
@@ -9308,6 +10486,9 @@ const Engine = struct {
             @memcpy(output[2..], reversed);
             return .{ .list = output };
         };
+        if (call_value.collect_filters.len == 0 and call_value.collect_limit != null and reduction_plan.reversedInput(call_value.args[0]) != null) {
+            return self.sourceSummary(try self.listSource(call_value.args[0], row, group), call_value);
+        }
         var reducer: StreamingAggregate = .{ .function = call_value, .consumer_row = row, .arena = std.heap.ArenaAllocator.init(self.scratch_allocator), .distinct_arena = std.heap.ArenaAllocator.init(self.scratch_allocator) };
         defer reducer.deinit();
         reducer.function.name = "collect";
@@ -9342,24 +10523,30 @@ const Engine = struct {
         // List addition also prepends/appends arbitrary scalar values. Unknown
         // operands retain normal evaluation and NULL absorption; embedding
         // depth is checked after both operands, just like ordinary addition.
-        const value = try self.eval(expression, row, group);
+        const source = try self.sequenceSource(expression, row, group);
         var embedding_failure = false;
-        if (value != .list and value != .null) _ = self.values.info(.{ .list = &.{value} }) catch |err| blk: {
+        if (source != null and source.?.values == .scalar) _ = self.values.info(.{ .list = &.{source.?.values.scalar} }) catch |err| blk: {
             if (err != error.CypherValueDepthExceeded) return err;
             embedding_failure = true;
             break :blk null;
         };
-        const length: usize = if (value == .null) 0 else if (value == .list) value.list.len else 1;
-        const prefix = @min(call_value.collect_limit orelse return error.CypherInvalidAggregate, length);
-        const suffix = @min(call_value.collect_suffix, length - prefix);
-        const retained = std.math.add(usize, prefix, suffix) catch return error.CypherStateBudgetExceeded;
+        return .{ .value = try self.sourceSummary(source, call_value), .embedding_failure = embedding_failure };
+    }
+    /// Summarize an already evaluated sequence without visiting discarded cells.
+    /// No projections or predicates remain here; their eager evaluation happened
+    /// before the cursor was created. Direction changes only retained positions.
+    fn sourceSummary(self: *Engine, source: ?ListSource, demand: ast.Function) !v.Value {
+        const length = if (source) |input| input.length() else 0;
+        const prefix = @min(demand.collect_limit orelse return error.CypherInvalidAggregate, length);
+        const suffix = @min(demand.collect_suffix, length - prefix);
+        const retained = std.math.cast(usize, prefix + suffix) orelse return error.CypherStateBudgetExceeded;
         try chargeWork(self, retained);
         const output = try self.a.alloc(v.Value, std.math.add(usize, retained, 2) catch return error.CypherStateBudgetExceeded);
-        output[0] = if (value == .null) .null else .{ .integer = std.math.cast(i64, length) orelse -1 };
+        output[0] = if (source == null) .null else .{ .integer = std.math.cast(i64, length) orelse -1 };
         output[1] = .{ .integer = @intCast(retained) };
-        for (0..prefix) |i| output[2 + i] = if (value == .list) value.list[i] else value;
-        for (0..suffix) |i| output[2 + prefix + i] = if (value == .list) value.list[length - suffix + i] else value;
-        return .{ .value = .{ .list = output }, .embedding_failure = embedding_failure };
+        for (0..@intCast(prefix)) |i| output[2 + i] = source.?.at(i);
+        for (0..@intCast(suffix)) |i| output[2 + @as(usize, @intCast(prefix)) + i] = source.?.at(length - suffix + i);
+        return .{ .list = output };
     }
 
     fn concatSummary(self: *Engine, call_value: ast.Function, left: *const ast.Expr, right: *const ast.Expr, row: Row, group: ?[]const Row) !v.Value {
@@ -9416,6 +10603,7 @@ const Engine = struct {
         return try self.cloneScoped(value, self.a);
     }
     fn rangeInput(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row) !?@import("range.zig").Range {
+        if (expression.execution_list_source) |id| return self.producer_sources.items[id].arithmetic;
         if (expression.execution_range_binding and expression.value == .variable) {
             const packet = try self.eval(expression, row, group);
             if (packet == .null) return null;
@@ -9441,6 +10629,53 @@ const Engine = struct {
             item.* = sequence.at(first + i);
         }
         return .{ .list = items };
+    }
+    /// Runtime overload dispatch lets list consumers inspect a directional view
+    /// while string REVERSE keeps its Unicode validation and allocation rules.
+    fn directionalConsumer(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row) !?v.Value {
+        const base = switch (expression.value) {
+            .call => |call_value| if (!call_value.star and !call_value.distinct and call_value.args.len == 1 and
+                (std.ascii.eqlIgnoreCase(call_value.name, "size") or std.ascii.eqlIgnoreCase(call_value.name, "head") or std.ascii.eqlIgnoreCase(call_value.name, "last"))) call_value.args[0] else return null,
+            .index => |index| index.base,
+            .slice => |slice| slice.base,
+            else => return null,
+        };
+        if (reduction_plan.reversedInput(base) == null or reduction_plan.reversedList(base) != null) return null;
+        const source = try self.sequenceSource(base, row, group);
+        switch (expression.value) {
+            .call => |call_value| {
+                const input = source orelse return v.Value.null;
+                if (std.ascii.eqlIgnoreCase(call_value.name, "size")) {
+                    const length = if (input.values == .scalar) try self.stringInputWork(input.values.scalar).size(input.values.scalar.string) else input.length();
+                    return v.Value{ .integer = std.math.cast(i64, length) orelse return error.CypherNumericOverflow };
+                }
+                if (input.values == .scalar) return error.CypherTypeMismatch;
+                return if (input.length() == 0) v.Value.null else input.at(if (std.ascii.eqlIgnoreCase(call_value.name, "head")) 0 else input.length() - 1);
+            },
+            .index => |index| {
+                const position = try self.eval(index.index, row, group);
+                if (source == null or position == .null) return v.Value.null;
+                if (source.?.values == .scalar or position != .integer) return error.CypherTypeMismatch;
+                const length: i128 = @intCast(source.?.length());
+                const ordinal = if (position.integer < 0) length + position.integer else position.integer;
+                return if (ordinal < 0 or ordinal >= length) v.Value.null else source.?.at(@intCast(ordinal));
+            },
+            .slice => |slice| {
+                const first = if (slice.start) |bound| try self.eval(bound, row, group) else v.Value{ .integer = 0 };
+                const last = if (slice.end) |bound| try self.eval(bound, row, group) else v.Value{ .integer = if (source != null and source.?.values != .scalar) std.math.cast(i64, source.?.length()) orelse return error.CypherNumericOverflow else 0 };
+                if (source == null or first == .null or last == .null) return v.Value.null;
+                if (source.?.values == .scalar or first != .integer or last != .integer) return error.CypherTypeMismatch;
+                const length: i128 = @intCast(source.?.length());
+                const begin: u128 = @intCast(std.math.clamp(if (first.integer < 0) length + first.integer else first.integer, 0, length));
+                const end: u128 = @intCast(std.math.clamp(if (last.integer < 0) length + last.integer else last.integer, 0, length));
+                const retained = std.math.cast(usize, @max(begin, end) - begin) orelse return error.CypherStateBudgetExceeded;
+                try chargeWork(self, retained);
+                const items = try self.a.alloc(v.Value, retained);
+                for (items, 0..) |*item, i| item.* = source.?.at(begin + i);
+                return v.Value{ .list = items };
+            },
+            else => unreachable,
+        }
     }
     fn rangeConsumer(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row) !?v.Value {
         const base = switch (expression.value) {
@@ -9508,6 +10743,7 @@ const Engine = struct {
         };
         try self.checkpoint();
         if (expression.value == .call and expression.value.call.execution_list) return self.listSummary(expression.value.call, row, group);
+        if (try self.directionalConsumer(expression, row, group)) |result| return result;
         if (try self.rangeConsumer(expression, row, group)) |result| return result;
         if (try self.projectedConsumer(expression, row, group)) |result| return result;
         if (expression.value == .call) {
@@ -10029,7 +11265,7 @@ const Engine = struct {
             if (text == .null or start == .null or substring_length == .null) return .null;
             if (text != .string or start != .integer or substring_length != .integer) return error.CypherTypeMismatch;
             if (start.integer < 0 or substring_length.integer < 0) return error.CypherInvalidSubstring;
-            return .{ .string = try self.stringWork().substring(text.string, std.math.cast(usize, start.integer) orelse std.math.maxInt(usize), std.math.cast(usize, substring_length.integer) orelse std.math.maxInt(usize)) };
+            return .{ .string = try self.stringInputWork(text).substring(text.string, std.math.cast(usize, start.integer) orelse std.math.maxInt(usize), std.math.cast(usize, substring_length.integer) orelse std.math.maxInt(usize)) };
         }
         if (args.len != 1) return error.CypherFunctionArity;
         const value = try self.eval(args[0], row, group);
@@ -10373,14 +11609,35 @@ const Engine = struct {
         const owned = try self.cloneProjected(candidate, arena.allocator());
         return .{ .arena = arena, .value = owned };
     }
+    /// One stable ownership boundary for returned values. Metadata lives in
+    /// the statement arena; large bytes use bounded slabs to avoid geometric
+    /// arena slack. The result/cursor releases the slabs before the arena.
+    fn statementOwnership(self: *Engine) !*v.CloneContext {
+        if (self.statement_ownership == null) {
+            const context = try self.planning_allocator.create(v.CloneContext);
+            // Copying tiny scalars is cheaper than retaining a registry entry.
+            // Bound metadata independently of total rows; admission exhaustion
+            // falls back to an ordinary owned copy without changing results.
+            context.* = .{ .a = self.planning_allocator, .scratch = self.planning_allocator, .min_shared_string_bytes = 256, .min_adopted_bytes = 256, .max_shared_allocations = @min(16384, self.limits.memory_bytes / 2048), .byte_pool = &self.statement_byte_pool, .byte_allocator = self.scratch_allocator };
+            self.statement_ownership = context;
+        }
+        return self.statement_ownership.?;
+    }
     fn cloneProjected(self: *Engine, candidate: Projected, a: A) !Projected {
         var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
         defer scratch.deinit();
-        var context: v.CloneContext = .{ .a = a, .scratch = scratch.allocator() };
+        const enclosing = if (self.read_only) try self.statementOwnership() else null;
+        const parent = if (a.ptr == self.planning_allocator.ptr and a.vtable == self.planning_allocator.vtable) enclosing else null;
+        // Picks may borrow proven statement-owned values. Their own new
+        // allocations remain private and must be copied when the pick escapes.
+        var context: v.CloneContext = .{ .a = a, .scratch = scratch.allocator(), .owned_parent = parent, .borrowed_parent = if (parent == null) enclosing else null, .byte_pool = if (parent) |proof| proof.byte_pool else null, .byte_allocator = self.scratch_allocator };
         const row = try a.alloc(v.Entry, candidate.row.len);
         for (candidate.row, row) |entry, *out| out.* = .{ .name = try a.dupe(u8, entry.name), .value = try context.clone(entry.value) };
         const keys = try a.alloc(v.Value, candidate.keys.len);
         for (candidate.keys, keys) |key, *out| out.* = try context.clone(key);
+        // Only statement-owned copies can be adopted by the final result.
+        // Top-k picks and group scratch arenas must still be copied on escape.
+        if (parent) |proof| try proof.adoptClones(&context);
         return .{ .row = row, .source = &.{}, .group = null, .keys = keys, .sequence = candidate.sequence, .weight = candidate.weight, .multiplicity = if (candidate.multiplicity) |weight| try weight.clone(a) else null };
     }
     const TopK = struct {
@@ -10490,7 +11747,7 @@ const Engine = struct {
                     const discarded = @min(skip, item.weight);
                     skip -= discarded;
                     if (item.weight == discarded) continue;
-                    try rows.append(retained, try cloneRow(retained, item.row));
+                    try rows.append(retained, try engine.cloneRowScoped(item.row, retained));
                     try weights.append(retained, try (try (item.multiplicity orelse Count.init(item.weight)).clone(retained)).subtract(retained, discarded));
                 }
                 engine.pending_window = .{ .rows = rows.items, .weights = weights.items };
@@ -10503,7 +11760,7 @@ const Engine = struct {
                 const discarded = @min(skip, item.weight);
                 skip -= discarded;
                 if (item.weight == discarded) continue;
-                const owned = try cloneRow(retained, item.row);
+                const owned = try engine.cloneRowScoped(item.row, retained);
                 for (0..item.weight - discarded) |_| {
                     try engine.state();
                     output[position] = owned;

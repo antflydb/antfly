@@ -139,12 +139,28 @@ pub const Value = union(enum) {
         if (depth > 64) return error.CypherValueDepthExceeded;
         // Equality keys prune entities and do not need an allocation-identity
         // memo per input. Keep that path free of scratch allocation churn.
-        const key = if (context != null and context.?.share_allocations) CloneContext.key(self) else null;
+        const key = if (context) |ctx| ctx.sharingKey(self) else null;
         if (context) |ctx| {
             if (key) |k| if (ctx.memo.get(k)) |owned| {
                 if (depth + owned.height > 64) return error.CypherValueDepthExceeded;
                 if (depth != 0) ctx.heights[depth - 1] = @max(ctx.heights[depth - 1], owned.height + 1);
                 return owned.value;
+            };
+            if (key) |k| if (ctx.owned_parent) |parent| if (parent.memo.get(k)) |owned| {
+                std.debug.assert(ctx.a.ptr == parent.a.ptr and ctx.a.vtable == parent.a.vtable);
+                std.debug.assert(ctx.identity_only == parent.identity_only);
+                if (depth + owned.height > 64) return error.CypherValueDepthExceeded;
+                if (depth != 0) ctx.heights[depth - 1] = @max(ctx.heights[depth - 1], owned.height + 1);
+                return owned.value;
+            };
+            if (key) |k| if (ctx.borrowed_parent) |parent| {
+                const owned = parent.memo.get(k) orelse if (parent.owned_parent) |root| root.memo.get(k) else null;
+                if (owned) |retained| {
+                    std.debug.assert(ctx.identity_only == parent.identity_only);
+                    if (depth + retained.height > 64) return error.CypherValueDepthExceeded;
+                    if (depth != 0) ctx.heights[depth - 1] = @max(ctx.heights[depth - 1], retained.height + 1);
+                    return retained.value;
+                }
             };
             ctx.heights[depth] = 0;
         }
@@ -199,7 +215,7 @@ pub const Value = union(enum) {
         };
         if (context) |ctx| {
             const height = ctx.heights[depth];
-            if (key) |k| try ctx.memo.put(ctx.scratch, k, .{ .value = result, .height = height });
+            if (key) |k| if (ctx.memo.count() < ctx.max_shared_allocations) try ctx.memo.put(ctx.scratch, k, .{ .value = result, .height = height });
             if (depth != 0) ctx.heights[depth - 1] = @max(ctx.heights[depth - 1], height + 1);
         }
         return result;
@@ -555,7 +571,19 @@ pub const CloneContext = struct {
     a: std.mem.Allocator,
     scratch: std.mem.Allocator,
     identity_only: bool = false,
+    /// A same-arena registry containing only proven immutable destination
+    /// allocations, never recyclable source-address memo keys.
+    owned_parent: ?*const CloneContext = null,
+    /// Ephemeral source-address mappings whose retained values outlive this
+    /// destination. Aggregate retention and read-only memo snapshots use this
+    /// cross-arena borrowing only with an explicit enclosing owner.
+    borrowed_parent: ?*const CloneContext = null,
     share_allocations: bool = true,
+    /// Long-lived ownership registries can restrict admission; transient clone
+    /// contexts retain their existing full sharing by default.
+    min_shared_string_bytes: usize = 0,
+    min_adopted_bytes: usize = 0,
+    max_shared_allocations: usize = std.math.maxInt(usize),
     byte_pool: ?*?*BytePool = null,
     byte_allocator: ?std.mem.Allocator = null,
     memo: std.AutoHashMapUnmanaged(Key, struct { value: Value, height: usize }) = .empty,
@@ -570,6 +598,31 @@ pub const CloneContext = struct {
             else => null,
         };
     }
+    fn sharingKey(self: *const @This(), value: Value) ?Key {
+        if (!self.share_allocations) return null;
+        // Small container nodes can encode an exponentially shared subtree.
+        // Their clone memo must preserve sharing regardless of shallow size.
+        if (value == .string and value.string.len < self.min_shared_string_bytes) return null;
+        return key(value);
+    }
+    /// Only destination addresses adopted by an enclosing ownership registry
+    /// license metadata whose lifetime spans evaluation epochs.
+    pub fn owns(self: *const @This(), value: Value) bool {
+        const candidate = key(value) orelse return false;
+        return self.memo.contains(candidate);
+    }
+    fn adoptionKey(self: *const @This(), value: Value) ?Key {
+        const candidate = self.sharingKey(value) orelse return null;
+        const bytes = switch (value) {
+            .string => |items| items.len,
+            .list => |items| items.len *| @sizeOf(Value),
+            .map => |items| items.len *| @sizeOf(Entry),
+            .node => @sizeOf(Node),
+            .relationship => @sizeOf(Relationship),
+            else => return null,
+        };
+        return if (bytes >= self.min_adopted_bytes) candidate else null;
+    }
     fn cloneBytes(self: *@This(), bytes: []const u8) std.mem.Allocator.Error![]const u8 {
         // Small values stay with their metadata, avoiding a pool per tiny group.
         if (bytes.len >= 256) if (self.byte_pool) |slot| {
@@ -582,6 +635,27 @@ pub const CloneContext = struct {
         };
         return self.a.dupe(u8, bytes);
     }
+    /// Import allocations which another clone context has already placed in
+    /// the same destination ownership boundary. Source allocations are never
+    /// imported: their addresses can belong to recyclable producer pages.
+    pub fn adoptClones(self: *@This(), other: *const CloneContext) std.mem.Allocator.Error!void {
+        std.debug.assert(self.a.ptr == other.a.ptr and self.a.vtable == other.a.vtable);
+        var entries = other.memo.valueIterator();
+        while (entries.next()) |entry| if (self.adoptionKey(entry.value)) |owned| {
+            if (self.memo.count() < self.max_shared_allocations) try self.memo.put(self.scratch, owned, entry.*);
+        };
+    }
+    /// Preserve source mappings only for the current input row. Entity wrappers
+    /// may be stack temporaries; strings remain live through aggregate updates.
+    pub fn captureInputStrings(self: *@This(), other: *const CloneContext) std.mem.Allocator.Error!void {
+        std.debug.assert(self.a.ptr == other.a.ptr and self.a.vtable == other.a.vtable);
+        var entries = other.memo.iterator();
+        while (entries.next()) |entry| {
+            const source = entry.key_ptr.*;
+            if (source.tag != .string or source.length < 256) continue;
+            if (self.memo.count() < self.max_shared_allocations) try self.memo.put(self.scratch, source, entry.value_ptr.*);
+        }
+    }
     pub fn clone(self: *@This(), value: Value) Value.CloneError!Value {
         return value.cloneOwned(self.a, 0, self);
     }
@@ -593,7 +667,7 @@ pub fn cloneEquality(value: Value, a: std.mem.Allocator) Value.CloneError!Value 
     return context.clone(value);
 }
 
-/// Byte slabs keep large membership payloads out of geometrically growing
+/// Byte slabs keep large retained payloads out of geometrically growing
 /// metadata arenas. Slab growth stops at 64 KiB; oversized strings own an
 /// exact allocation without disturbing the current slab.
 pub const BytePool = struct {
@@ -721,4 +795,56 @@ fn membershipBytesScenario(allocator: std.mem.Allocator) !void {
 }
 test "membership byte slabs bound retention and release every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, membershipBytesScenario, .{});
+}
+
+test "bounded ownership adoption imports owned addresses without retaining recyclable source keys" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    const a = arena.allocator();
+    var source: [512]u8 = @splat('x');
+    var copier: CloneContext = .{ .a = a, .scratch = scratch.allocator() };
+    const owned = try copier.clone(.{ .string = &source });
+    var result: CloneContext = .{ .a = a, .scratch = scratch.allocator(), .min_shared_string_bytes = 256, .max_shared_allocations = 1 };
+    try result.adoptClones(&copier);
+    try std.testing.expectEqual(@as(usize, 1), result.memo.count());
+    try std.testing.expectEqual(owned.string.ptr, (try result.clone(owned)).string.ptr);
+    // The producer page can be recycled after its owned copy has escaped.
+    @memset(&source, 'z');
+    const fresh = try result.clone(.{ .string = &source });
+    try std.testing.expectEqual(@as(u8, 'z'), fresh.string[0]);
+    try std.testing.expectEqual(@as(u8, 'x'), owned.string[0]);
+    try std.testing.expectEqualStrings("small", (try result.clone(.{ .string = "small" })).string);
+    try std.testing.expectEqual(@as(usize, 1), result.memo.count());
+    // Exhausted admission remains a fully owned copy, with no source borrowing.
+    @memset(&source, 'w');
+    try std.testing.expectEqual(@as(u8, 'z'), fresh.string[0]);
+}
+
+test "aggregate borrowing expires source addresses at each row while retaining owned bytes" {
+    var root = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer root.deinit();
+    var aggregate = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer aggregate.deinit();
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    var source: [512]u8 = @splat('x');
+    var wrapper: Node = .{ .identity = .{ .table = "t", .key = "n" }, .properties = &.{.{ .name = "p", .value = .{ .string = &source } }} };
+    var copied: CloneContext = .{ .a = root.allocator(), .scratch = scratch.allocator() };
+    const owned = try copied.clone(.{ .node = &wrapper });
+    var input: CloneContext = .{ .a = root.allocator(), .scratch = scratch.allocator() };
+    try input.captureInputStrings(&copied);
+    try std.testing.expectEqual(@as(usize, 1), input.memo.count());
+    var first: CloneContext = .{ .a = aggregate.allocator(), .scratch = scratch.allocator(), .borrowed_parent = &input };
+    const saved = try first.clone(.{ .list = &.{.{ .string = &source }} });
+    try std.testing.expectEqual(owned.property("p").string.ptr, saved.list[0].string.ptr);
+    // A recycled page at the same address belongs to a new row epoch.
+    input.memo.clearRetainingCapacity();
+    @memset(&source, 'y');
+    var second: CloneContext = .{ .a = aggregate.allocator(), .scratch = scratch.allocator(), .borrowed_parent = &input };
+    const fresh = try second.clone(.{ .string = &source });
+    @memset(&source, 'z');
+    try std.testing.expectEqual(@as(u8, 'x'), saved.list[0].string[0]);
+    try std.testing.expectEqual(@as(u8, 'y'), fresh.string[0]);
 }

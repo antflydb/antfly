@@ -75,7 +75,6 @@ pub const DistributedCandidateSource = struct {
             }
         }
         if (self.request_context) |context| {
-            req.execution_deadline_ns = context.deadline_ns;
             req.cancellation = context.cancellation;
         }
         return req;
@@ -114,7 +113,6 @@ pub const DistributedCandidateSource = struct {
         var opts = options;
         opts.execution_deadline_ns = self.readDeadline();
         if (self.request_context) |context| {
-            opts.execution_deadline_ns = context.deadline_ns;
             opts.cancellation = context.cancellation;
         }
         var row = (try self.reads.lookup(a, physical, key, opts, self.consistency)) orelse return null;
@@ -123,7 +121,9 @@ pub const DistributedCandidateSource = struct {
     }
 
     fn readDeadline(self: *const DistributedCandidateSource) u64 {
-        return @import("antfly_platform").time.monotonicNs() +| self.read_timeout_ns;
+        const bounded = @import("antfly_platform").time.monotonicNs() +| self.read_timeout_ns;
+        if (self.request_context) |context| if (context.deadline_ns) |deadline| return @min(bounded, deadline);
+        return bounded;
     }
 
     pub fn candidateSource(self: *DistributedCandidateSource) CandidateSource {
@@ -334,7 +334,6 @@ pub const DistributedCandidateSource = struct {
         };
         if (self.read_filter) |policy| scan_options.filter_query_json = try policy.get(policy.ptr, allocator, physical);
         if (self.request_context) |context| {
-            scan_options.execution_deadline_ns = context.deadline_ns;
             scan_options.cancellation = context.cancellation;
         }
         var resp = (try self.reads.scan(allocator, physical, prefix, upper, scan_options, self.consistency)) orelse return;

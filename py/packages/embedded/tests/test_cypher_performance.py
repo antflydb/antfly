@@ -5377,3 +5377,613 @@ def test_arithmetic_membership_composes_through_aliases_and_addition(graph_db):
             "g", {"query": query, "limits": {"memory_bytes": 1 << 20, "intermediate_states": 1000}}
         )
         assert response["rows"][0][0]["value"] is True
+
+
+def test_validated_producer_replay_stops_after_limit(graph_db):
+    for query, expected in (
+        ("UNWIND reverse(range(1,1000000000)) AS x RETURN x LIMIT 1", "1000000000"),
+        ("UNWIND (range(1,1000000000)+[]) AS x RETURN x LIMIT 1", "1"),
+        ("UNWIND reverse(reverse(range(1,1000000000))+[]) AS x RETURN x LIMIT 1", "1"),
+    ):
+        response = graph_db.cypher_json(
+            "g", {"query": query, "limits": {"memory_bytes": 1 << 20, "intermediate_states": 1000}}
+        )
+        assert response["rows"][0][0]["value"] == expected
+        assert response["stats"]["intermediate_states"] < 1000
+    for query in (
+        "UNWIND [x IN [1,0]|1/x] AS x RETURN x LIMIT 1",
+        "UNWIND [x IN reverse(range(0,1))|1/x] AS x RETURN x LIMIT 1",
+        "UNWIND [x IN (range(1,1)+[0])|1/x] AS x RETURN x LIMIT 1",
+        "UNWIND reverse([x IN [0,1]|1/x]) AS x RETURN x LIMIT 1",
+        "UNWIND (range(1,1000000000)+[x IN [0]|1/x]) AS x RETURN x LIMIT 1",
+        "UNWIND reverse(range(1,1000000000)) AS x RETURN 1/0 LIMIT 1",
+        "UNWIND (range(1,1000000000)+[]) AS x RETURN 1/0 LIMIT 1",
+    ):
+        with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
+            graph_db.cypher_json("g", {"query": query})
+
+    with pytest.raises(af.AntflyError, match="CypherInvalidRange"):
+        graph_db.cypher_json(
+            "g", {"query": "UNWIND [x IN (range(1,1)+[0])|size(range(1,2,x))] AS x RETURN 1/0 LIMIT 1"}
+        )
+
+
+def test_deferred_producers_keep_siblings_across_with_chains(graph_db):
+    for query in (
+        "WITH range(1,1000000000) AS xs,1 AS seed WITH xs AS ys,seed+1 AS seed UNWIND ys AS x RETURN seed,count(*)",
+        "WITH range(1,1000000000) AS xs,1 AS seed WITH seed+1 AS seed,xs AS ys WITH ys AS zs,seed AS seed UNWIND reverse(zs) AS x RETURN seed,count(*)",
+        "WITH range(1,1000000000) AS xs,2 AS seed UNWIND reverse(xs) AS x RETURN seed,count(*)",
+    ):
+        response = graph_db.cypher_json(
+            "g", {"query": query, "limits": {"memory_bytes": 1 << 20, "intermediate_states": 1000}}
+        )
+        assert [cell["value"] for cell in response["rows"][0]] == ["2", "1000000000"]
+    response = graph_db.cypher_json(
+        "g",
+        {
+            "query": "WITH 3 AS n WITH range(1,n) AS xs,9 AS n WITH xs AS ys,n+1 AS n UNWIND reverse(ys) AS x RETURN n,collect(x)"
+        },
+    )
+    assert response["rows"][0][0]["value"] == "10"
+    assert [cell["value"] for cell in response["rows"][0][1]["value"]] == ["3", "2", "1"]
+    for query, error in (
+        (
+            "WITH range(1,3,0) AS xs,1/0 AS seed WITH xs AS ys,seed AS seed UNWIND ys AS x RETURN x",
+            "CypherInvalidRange",
+        ),
+        (
+            "WITH 1/0 AS seed,range(1,3,0) AS xs WITH xs AS ys,seed AS seed UNWIND ys AS x RETURN x",
+            "CypherDivisionByZero",
+        ),
+        ("WITH range(1,3,0) AS xs WITH xs AS ys,1/0 AS seed UNWIND ys AS x RETURN x", "CypherInvalidRange"),
+    ):
+        with pytest.raises(af.AntflyError, match=error):
+            graph_db.cypher_json("g", {"query": query})
+
+
+def test_runtime_reversed_lists_use_cursors_without_full_copies(graph_db):
+    xs = list(range(100000))
+    for expression, expected in (("reverse($xs)", "99999"), ("reverse(reverse($xs))", "0")):
+        response = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"UNWIND {expression} AS x RETURN x LIMIT 1",
+                "parameters": {"xs": xs},
+                "limits": {"memory_bytes": 1 << 20, "intermediate_states": 150000},
+            },
+        )
+        assert response["rows"][0][0]["value"] == expected
+        assert response["stats"]["memory_bytes"] < 1 << 20
+    for value, expected in (("aé🌱", "🌱éa"), (None, None)):
+        response = graph_db.cypher_json(
+            "g", {"query": "UNWIND reverse($xs) AS x RETURN x", "parameters": {"xs": value}}
+        )
+        assert response["rows"] == ([] if expected is None else [[{"type": "string", "value": expected}]])
+    with pytest.raises(af.AntflyError, match="CypherTypeMismatch"):
+        graph_db.cypher_json("g", {"query": "UNWIND reverse($xs) AS x RETURN x", "parameters": {"xs": 1}})
+
+
+def test_runtime_reverse_membership_shares_the_owned_input_index(graph_db):
+    response = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND range(1,100) AS n RETURN count(CASE WHEN n IN reverse($xs) THEN 1 END)",
+            "parameters": {"xs": list(range(10000))},
+            "limits": {"memory_bytes": 8 << 20, "intermediate_states": 200000},
+        },
+    )
+    assert response["rows"][0][0]["value"] == "100"
+
+
+def test_deferred_transformations_preserve_source_facts_and_scopes(graph_db):
+    for query in (
+        "WITH range(1,1000000000) AS xs UNWIND (xs+[]) AS x RETURN count(*)",
+        "WITH range(1,1000000000) AS xs,1 AS seed WITH reverse(xs) AS ys,seed AS seed UNWIND ys AS x RETURN count(*)",
+        "WITH range(1,1000000000) AS xs WITH ([]+reverse(xs)) AS ys UNWIND (ys+[]) AS x RETURN count(*)",
+        "UNWIND reverse(range(1,1000000000)) AS x RETURN count(x),count(DISTINCT x)",
+    ):
+        response = graph_db.cypher_json(
+            "g", {"query": query, "limits": {"memory_bytes": 1 << 20, "intermediate_states": 1000}}
+        )
+        assert all(cell["value"] == "1000000000" for cell in response["rows"][0])
+    response = graph_db.cypher_json(
+        "g",
+        {
+            "query": "WITH 3 AS n WITH range(1,n) AS xs,9 AS n WITH (xs+[n]) AS ys,n+1 AS n UNWIND (ys+[n]) AS x RETURN n,collect(x)"
+        },
+    )
+    assert response["rows"][0][0]["value"] == "10"
+    assert [cell["value"] for cell in response["rows"][0][1]["value"]] == ["1", "2", "3", "9", "10"]
+    for query in (
+        "WITH range(1,3,0) AS xs UNWIND (xs+[1/0]) AS x RETURN x LIMIT 1",
+        "WITH range(1,3) AS xs WITH (xs+[size(range(1,2,0))]) AS ys,1/0 AS n UNWIND ys AS x RETURN x",
+    ):
+        with pytest.raises(af.AntflyError, match="CypherInvalidRange"):
+            graph_db.cypher_json("g", {"query": query})
+
+
+def test_evaluated_list_axes_use_cardinality_for_independent_groups(graph_db):
+    response = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND range(1,30) AS i UNWIND $xs AS x RETURN i,count(*)",
+            "parameters": {"xs": list(range(10000)) + [None]},
+            "limits": {"memory_bytes": 1 << 20, "intermediate_states": 30000},
+        },
+    )
+    assert len(response["rows"]) == 30
+    assert all(row[1]["value"] == "10001" for row in response["rows"])
+    assert response["stats"]["intermediate_states"] < 30000
+
+
+def test_reverse_scalar_windows_and_concat_avoid_parameter_copies(graph_db):
+    xs = list(range(100000))
+    for query, expected in (
+        ("RETURN head(reverse($xs))", "99999"),
+        ("RETURN last(reverse($xs))", "0"),
+        ("RETURN size(reverse($xs))", "100000"),
+        ("RETURN reverse($xs)[-1]", "0"),
+        ("UNWIND (reverse($xs)+[]) AS x RETURN x LIMIT 1", "99999"),
+        ("UNWIND ([]+reverse($xs)) AS x RETURN x LIMIT 1", "99999"),
+    ):
+        response = graph_db.cypher_json(
+            "g",
+            {
+                "query": query,
+                "parameters": {"xs": xs},
+                "limits": {"memory_bytes": 1 << 20, "intermediate_states": 150000},
+            },
+        )
+        assert response["rows"][0][0]["value"] == expected
+    response = graph_db.cypher_json(
+        "g",
+        {
+            "query": "RETURN reverse($xs)[1..3]",
+            "parameters": {"xs": xs},
+            "limits": {"memory_bytes": 1 << 20, "intermediate_states": 150000},
+        },
+    )
+    assert [cell["value"] for cell in response["rows"][0][0]["value"]] == ["99998", "99997"]
+
+
+def test_source_dags_keep_added_and_reused_producers_deferred(graph_db):
+    for query in (
+        "WITH range(1,1000000000) AS xs UNWIND (xs+range(1000000001,2000000000)) AS x RETURN count(*)",
+        "WITH range(1,1000000000) AS xs UNWIND (xs+xs) AS x RETURN count(*)",
+        "WITH range(1,1000000000) AS xs WITH (xs+xs) AS ys UNWIND reverse(ys) AS x RETURN count(*)",
+    ):
+        result = graph_db.cypher_json(
+            "g", {"query": query, "limits": {"memory_bytes": 1 << 20, "intermediate_states": 1000}}
+        )
+        assert result["rows"][0][0]["value"] == "2000000000"
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": "WITH 2 AS n WITH range(1,n) AS xs,5 AS n WITH (xs+range(n,n+1)) AS ys,n+1 AS n UNWIND (ys+range(n,n+1)) AS x RETURN collect(x)"
+        },
+    )
+    assert [cell["value"] for cell in result["rows"][0][0]["value"]] == ["1", "2", "5", "6", "6", "7"]
+
+
+def test_identity_forwarding_reuses_completed_source_validation(graph_db):
+    query = (
+        "WITH [x IN range(1,10000)|toString(x)] AS xs,1 AS seed "
+        + "WITH xs AS xs,seed AS seed " * 16
+        + "UNWIND xs AS x RETURN count(*)"
+    )
+    result = graph_db.cypher_json(
+        "g", {"query": query, "limits": {"memory_bytes": 2 << 20, "intermediate_states": 100000}}
+    )
+    assert result["rows"][0][0]["value"] == "10000"
+
+
+def test_wide_entity_payloads_do_not_disable_read_only_graph_summary_memos(graph_db):
+    db = graph_db
+    db.sql("CREATE TABLE memo_docs(id TEXT,score BIGINT,payload TEXT)")
+    with db.open_table("memo_docs") as table:
+        table.add_index({"name": "links", "kind": "graph", "config_json": "{}"})
+    db.graph_catalog_json(
+        {
+            "action": "put",
+            "name": "memo_wide",
+            "definition": {
+                "labels": [{"name": "D", "table": "memo_docs"}],
+                "relationships": [
+                    {"name": "R", "index": "links", "source_label": "D", "target_label": "D", "stored_type": "link"}
+                ],
+            },
+        }
+    )
+    db.cypher_json(
+        "memo_wide",
+        {
+            "query": "CREATE(a:D {id:'root',score:0}) WITH a UNWIND range(1,100) AS i CREATE(b:D {id:toString(i),score:i}),(a)-[:R]->(b)"
+        },
+    )
+    db.cypher_json("memo_wide", {"query": "MATCH(a:D {id:'root'}) SET a.payload=$s", "parameters": {"s": "x" * 600000}})
+    for query in (
+        "MATCH(a:D {id:'root'}) UNWIND range(1,30) AS i RETURN i,size([(a)-[:R]->(b) WHERE size(a.payload)>=0|b.score])",
+        "MATCH(a:D {id:'root'}) UNWIND range(1,30) AS i CALL { WITH a MATCH(a)-[:R]->(b) WHERE size(a.payload)>=0 RETURN count(*) AS c } RETURN i,c",
+    ):
+        result = db.cypher_json(
+            "memo_wide",
+            {"query": query, "limits": {"memory_bytes": 8 << 20, "explored_edges": 100}},
+        )
+        assert len(result["rows"]) == 30
+        assert all(row[1]["value"] == "100" for row in result["rows"])
+        assert result["stats"]["explored_edges"] == 100
+    represented = db.cypher_json(
+        "memo_wide",
+        {
+            "query": "MATCH(a:D {id:'root'}) UNWIND [1,1.0,1] AS i CALL { WITH a,i MATCH(a)-[:R]->(b) WHERE size(a.payload)>=0 AND i/2=0 RETURN count(*) AS c } RETURN i,c"
+        },
+    )
+    assert [row[1]["value"] for row in represented["rows"]] == ["100", "0", "100"]
+
+
+def test_final_output_preserves_shared_immutable_payloads(graph_db):
+    payload = "x" * 200000
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": "RETURN " + ",".join(f"$s AS c{i}" for i in range(16)),
+            "parameters": {"s": payload},
+            "limits": {"memory_bytes": 1 << 20},
+        },
+    )
+    assert len(result["rows"][0]) == 16
+    assert all(cell["value"] == payload for cell in result["rows"][0])
+    shared = graph_db.cypher_json(
+        "g",
+        {"query": "RETURN reduce(xs=[1],i IN range(1,16)|[xs,xs])", "limits": {"memory_bytes": 1 << 20}},
+    )["rows"][0][0]
+    for _ in range(16):
+        assert shared["type"] == "list" and len(shared["value"]) == 2
+        shared = shared["value"][0]
+    assert shared["value"][0]["value"] == "1"
+
+
+def test_multiple_producer_bindings_share_deferred_frames(graph_db):
+    for query in (
+        "WITH range(1,1000000000) AS xs,range(1000000001,2000000000) AS ys UNWIND (xs+ys) AS x RETURN count(*)",
+        "WITH range(1,1000000000) AS xs WITH xs,range(1000000001,2000000000) AS ys UNWIND (xs+ys) AS x RETURN count(*)",
+        "WITH range(1,1000000000) AS xs WITH xs AS ys,xs AS zs UNWIND (reverse(ys)+zs) AS x RETURN count(*)",
+    ):
+        result = graph_db.cypher_json(
+            "g", {"query": query, "limits": {"memory_bytes": 1 << 20, "intermediate_states": 1000}}
+        )
+        assert result["rows"][0][0]["value"] == "2000000000"
+    lexical = graph_db.cypher_json(
+        "g",
+        {
+            "query": "WITH 2 AS n WITH range(1,n) AS xs,range(n+1,n+2) AS ys,n+10 AS n WITH reverse(xs) AS a,(ys+xs) AS b,n+1 AS n UNWIND (a+b+range(n,n)) AS x RETURN collect(x),min(n)"
+        },
+    )
+    assert [cell["value"] for cell in lexical["rows"][0][0]["value"]] == ["2", "1", "3", "4", "1", "2", "13"]
+    assert lexical["rows"][0][1]["value"] == "13"
+    for query, error in (
+        ("WITH range(1,1000000000) AS xs,[x IN [0]|1/x] AS ys UNWIND xs AS x RETURN count(*)", "CypherDivisionByZero"),
+        ("WITH range(1,2,0) AS xs,1/0 AS n,range(1,3) AS ys UNWIND (xs+ys) AS x RETURN count(*)", "CypherInvalidRange"),
+    ):
+        with pytest.raises(af.AntflyError, match=error):
+            graph_db.cypher_json("g", {"query": query, "limits": {"intermediate_states": 1000}})
+
+
+def test_immutable_list_count_domains_are_shared_across_groups(graph_db):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND range(1,30) AS i UNWIND $xs AS x RETURN i,count(x),count(DISTINCT x),count(*),count(null),count(DISTINCT i) ORDER BY i",
+            "parameters": {"xs": list(range(10000)) + [1.0, None]},
+            "limits": {"memory_bytes": 4 << 20, "intermediate_states": 100000},
+        },
+    )
+    assert [[int(cell["value"]) for cell in row] for row in result["rows"]] == [
+        [i, 10001, 10000, 10002, 0, 1] for i in range(1, 31)
+    ]
+    merged = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND $lists AS xs UNWIND xs AS x RETURN count(x),count(DISTINCT x),count(*)",
+            "parameters": {"lists": [[1, 2, None], [2.0, 3], [None], [], [1, 2]]},
+        },
+    )
+    assert [cell["value"] for cell in merged["rows"][0]] == ["6", "3", "8"]
+    fallback = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND [1,2] AS i UNWIND CASE WHEN i=1 THEN $xs ELSE [i,3] END AS x RETURN count(x),count(DISTINCT x),count(*)",
+            "parameters": {"xs": [1, 2]},
+        },
+    )
+    assert [cell["value"] for cell in fallback["rows"][0]] == ["4", "3", "4"]
+
+
+def test_composed_ranges_retain_exact_bag_and_distinct_domains(graph_db):
+    for source, count, distinct in (
+        ("range(1,1000000000)+range(500000001,1500000000)", 2000000000, 1500000000),
+        ("reverse(range(1,1000000000,2))+range(1000000000,1,-3)", 833333334, 666666667),
+    ):
+        for prefix, producer in (("", source), (f"WITH {source} AS xs ", "xs")):
+            result = graph_db.cypher_json(
+                "g",
+                {
+                    "query": prefix
+                    + f"UNWIND ({producer}) AS x WITH x AS y RETURN count(y),count(DISTINCT y),count(*)",
+                    "limits": {"memory_bytes": 1 << 20, "intermediate_states": 2000},
+                },
+            )
+            assert [int(cell["value"]) for cell in result["rows"][0]] == [count, distinct, count]
+    with pytest.raises(af.AntflyError, match="CypherInvalidRange"):
+        graph_db.cypher_json("g", {"query": "UNWIND (range(null,3)+range(1,3,0)) AS x RETURN count(x)"})
+
+
+def test_immutable_list_summaries_survive_renames_and_mixed_extrema(graph_db):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND range(1,30) AS i UNWIND $xs AS x WITH i,x AS y WITH i AS j,y AS z RETURN j,count(z),count(DISTINCT z),min(z),max(DISTINCT z),count(*) ORDER BY j",
+            "parameters": {"xs": list(range(10000)) + [1.0, None]},
+            "limits": {"memory_bytes": 4 << 20, "intermediate_states": 200000},
+        },
+    )
+    assert [[int(cell["value"]) for cell in row] for row in result["rows"]] == [
+        [i, 10001, 10000, 0, 9999, 10002] for i in range(1, 31)
+    ]
+    for xs, expected in (([None, 1.0, 1], [1.0, 1.0, 2]), ([None], [None, None, 0])):
+        tied = graph_db.cypher_json(
+            "g", {"query": "UNWIND $xs AS x RETURN min(x),max(x),count(x)", "parameters": {"xs": xs}}
+        )["rows"][0]
+        assert [cell.get("value") for cell in tied] == [str(x) if isinstance(x, int) else x for x in expected]
+        if xs == [None, 1.0, 1]:
+            assert tied[0]["type"] == tied[1]["type"] == "number"
+
+
+@pytest.mark.parametrize("payload_size", [200000, 600000])
+def test_call_memo_shares_wide_results_after_cache_scope_ends(graph_db, payload_size):
+    db = graph_db
+    db.sql("CREATE TABLE result_docs(id TEXT,payload TEXT)")
+    with db.open_table("result_docs") as table:
+        table.add_index({"name": "links", "kind": "graph", "config_json": "{}"})
+    db.graph_catalog_json(
+        {
+            "action": "put",
+            "name": "result_memo",
+            "definition": {
+                "labels": [{"name": "D", "table": "result_docs"}],
+                "relationships": [
+                    {"name": "R", "index": "links", "source_label": "D", "target_label": "D", "stored_type": "link"}
+                ],
+            },
+        }
+    )
+    payload = "x" * payload_size
+    db.cypher_json(
+        "result_memo",
+        {
+            "query": "CREATE(a:D {id:'root'}) WITH a UNWIND range(1,100) AS i CREATE(b:D {id:toString(i)}),(a)-[:R]->(b)",
+        },
+    )
+    db.cypher_json("result_memo", {"query": "MATCH(a:D {id:'root'}) SET a.payload=$s", "parameters": {"s": payload}})
+    prefix = "MATCH(a:D {id:'root'}) UNWIND range(1,30) AS i CALL {WITH a MATCH(a)-[:R]->(b) WITH a,count(*) AS c RETURN c,a.payload AS p} "
+    result = db.cypher_json(
+        "result_memo",
+        {"query": prefix + "RETURN i,c,size(p)", "limits": {"memory_bytes": 8 << 20, "explored_edges": 100}},
+    )
+    assert [[int(cell["value"]) for cell in row] for row in result["rows"]] == [
+        [i, 100, payload_size] for i in range(1, 31)
+    ]
+    for suffix in ("RETURN i,c,size(p)", "RETURN i,c,head([z IN [1,2]|size(p)])"):
+        analyzed = db.cypher_json(
+            "result_memo",
+            {
+                "query": prefix.replace("range(1,30)", "range(1,100)") + suffix,
+                "limits": {"memory_bytes": 8 << 20, "explored_edges": 100, "intermediate_states": 100000},
+            },
+        )
+        assert [[int(cell["value"]) for cell in row] for row in analyzed["rows"]] == [
+            [i, 100, payload_size] for i in range(1, 101)
+        ]
+    escaped = db.cypher_json(
+        "result_memo",
+        {"query": prefix + "RETURN i,p ORDER BY i", "limits": {"memory_bytes": 8 << 20, "explored_edges": 100}},
+    )
+    assert len(escaped["rows"]) == 30
+    assert all(row[1]["value"] == payload for row in escaped["rows"])
+
+
+def test_composed_range_domain_certificates_preserve_dag_sharing(graph_db):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": "WITH range(1,1000000000) AS xs "
+            + "WITH (xs+xs) AS xs " * 20
+            + "UNWIND xs AS x RETURN count(x),count(DISTINCT x)",
+            "limits": {"memory_bytes": 2 << 20, "intermediate_states": 10000},
+        },
+    )
+    assert [int(cell["value"]) for cell in result["rows"][0]] == [1000000000 << 20, 1000000000]
+
+
+def test_independent_projections_preserve_integer_aggregate_summaries(graph_db):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND range(1,30) AS i UNWIND $xs AS x WITH i+1 AS j,x AS y RETURN j,count(y),sum(y),min(y),max(y) ORDER BY j",
+            "parameters": {"xs": list(range(10000))},
+            "limits": {"memory_bytes": 4 << 20, "intermediate_states": 150000},
+        },
+    )
+    assert [[int(cell["value"]) for cell in row] for row in result["rows"]] == [
+        [j, 10000, 49995000, 0, 9999] for j in range(2, 32)
+    ]
+    for values in ([2**63 - 1, 1, -1], [-(2**63), -1, 1]):
+        with pytest.raises(af.AntflyError, match="CypherNumericOverflow"):
+            graph_db.cypher_json("g", {"query": "UNWIND $xs AS x RETURN sum(x)", "parameters": {"xs": values}})
+        with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
+            graph_db.cypher_json(
+                "g",
+                {
+                    "query": "UNWIND $xs AS x WITH x AS y,1/0 AS n RETURN sum(y),min(n)",
+                    "parameters": {"xs": values},
+                },
+            )
+
+
+def test_arithmetic_extrema_are_constant_in_range_cardinality(graph_db):
+    for source, low, high in (
+        ("range(1,1000000000)", 1, 1000000000),
+        ("reverse(range(1000000000,1,-3))+range(-1000000000,-1,2)", -1000000000, 1000000000),
+    ):
+        result = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"WITH {source} AS xs UNWIND xs AS x WITH x AS y,2+3 AS n RETURN min(DISTINCT y),max(y),min(n)",
+                "limits": {"memory_bytes": 1 << 20, "intermediate_states": 1000},
+            },
+        )
+        assert [int(cell["value"]) for cell in result["rows"][0]] == [low, high, 5]
+
+
+def test_fragmented_range_certificates_respect_the_enumeration_budget(graph_db):
+    def balanced(parts):
+        if len(parts) == 1:
+            return parts[0]
+        middle = len(parts) // 2
+        return f"({balanced(parts[:middle])}+{balanced(parts[middle:])})"
+
+    source = balanced([f"range({i},{i})" for i in range(256)])
+    result = graph_db.cypher_json(
+        "g",
+        {"query": f"UNWIND {source} AS x RETURN count(DISTINCT x)", "limits": {"intermediate_states": 3000}},
+    )
+    assert result["rows"][0][0]["value"] == "256"
+
+
+def test_mapped_axes_and_distinct_sums_share_immutable_domains(graph_db):
+    for projection, count, total in (
+        ("WITH i,x+1 AS y", 1000, 500500),
+        ("WITH i,x+1 AS z WITH i,z*2 AS y", 1000, 1001000),
+    ):
+        result = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"UNWIND range(1,30) AS i UNWIND $xs AS x {projection} RETURN i,count(y),sum(y),sum(DISTINCT y) ORDER BY i",
+                "parameters": {"xs": list(range(1000))},
+                "limits": {"memory_bytes": 4 << 20, "intermediate_states": 100000},
+            },
+        )
+        assert [[int(cell["value"]) for cell in row] for row in result["rows"]] == [
+            [i, count, total, total] for i in range(1, 31)
+        ]
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND range(1,30) AS i UNWIND $xs AS x RETURN i,sum(DISTINCT x) ORDER BY i",
+            "parameters": {"xs": list(range(1000)) * 2},
+            "limits": {"memory_bytes": 4 << 20, "intermediate_states": 100000},
+        },
+    )
+    assert [[int(cell["value"]) for cell in row] for row in result["rows"]] == [[i, 499500] for i in range(1, 31)]
+    merged = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND $lists AS xs UNWIND xs AS x RETURN sum(DISTINCT x),count(DISTINCT x),collect(DISTINCT x)",
+            "parameters": {"lists": [[1, 2, 2, None], [2, 3, 1], [3, 4]]},
+        },
+    )
+    assert [int(cell["value"]) for cell in merged["rows"][0][:2]] == [10, 4]
+    assert [int(cell["value"]) for cell in merged["rows"][0][2]["value"]] == [1, 2, 3, 4]
+    with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
+        graph_db.cypher_json(
+            "g",
+            {
+                "query": "UNWIND $xs AS x WITH 1/0 AS n,x+1 AS y RETURN min(n),sum(y)",
+                "parameters": {"xs": [1, 2**63 - 1]},
+            },
+        )
+
+
+def test_range_sum_certificates_preserve_order_and_bag_multiplicity(graph_db):
+    for source, expected in (
+        ("range(1,1000000000)", 500000000500000000),
+        ("reverse(range(-1000000000,1000000000))", 0),
+        ("range(1,1000000)+reverse(range(1,1000000))+range(1,1000000)", 1500001500000),
+        ("range(3,1)", 0),
+    ):
+        result = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"UNWIND {source} AS x RETURN sum(x)",
+                "limits": {"memory_bytes": 1 << 20, "intermediate_states": 1000},
+            },
+        )
+        assert int(result["rows"][0][0]["value"]) == expected
+    for source in (
+        "range(-9223372036854775808,9223372036854775807)",
+        "range(9223372036854775807,9223372036854775807)+range(1,1)+range(-1,-1)",
+    ):
+        with pytest.raises(af.AntflyError, match="CypherNumericOverflow"):
+            graph_db.cypher_json("g", {"query": f"UNWIND {source} AS x RETURN sum(x)"})
+
+
+@pytest.mark.parametrize("payload", ["x" * 1000000, "é🙂" * 55000], ids=["ascii", "unicode"])
+def test_dynamic_substrings_share_validation_and_unicode_offsets(graph_db, payload):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND range(100000,100099) AS i RETURN substring($s,i,1)",
+            "parameters": {"s": payload},
+            "limits": {"memory_bytes": 4 << 20, "intermediate_states": 150000},
+        },
+    )
+    assert [row[0]["value"] for row in result["rows"]] == list(payload[100000:100100])
+
+
+@pytest.mark.parametrize("case", ["mapped", "avg", "float_sum", "reversed", "overlap"])
+def test_ordered_aggregate_domains_share_exact_reducer_states(graph_db, case):
+    parameters = {"xs": list(range(1000)), "lists": [list(range(500)), list(range(250, 750))]}
+    tails = {
+        "mapped": ("UNWIND $xs AS x WITH i,x+1 AS y,x*2 AS z RETURN i,sum(y),sum(z)", [500500, 999000]),
+        "avg": ("UNWIND $xs AS x RETURN i,avg(x)", [499.5]),
+        "float_sum": ("UNWIND $xs AS x RETURN i,sum(x)", [49950.0]),
+        "reversed": ("UNWIND reverse($xs) AS x RETURN i,sum(x)", [499500]),
+        "overlap": (
+            "UNWIND $lists AS xs UNWIND xs AS x RETURN i,sum(DISTINCT x),count(DISTINCT x)",
+            [280875, 750],
+        ),
+    }
+    if case == "float_sum":
+        parameters["xs"] = [i / 10 for i in range(1000)]
+    tail, expected = tails[case]
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND range(1,30) AS i " + tail + " ORDER BY i",
+            "parameters": parameters,
+            "limits": {"memory_bytes": 4 << 20, "intermediate_states": 100000},
+        },
+    )
+    convert = float if case in ("avg", "float_sum") else int
+    assert [[int(row[0]["value"]), *[convert(cell["value"]) for cell in row[1:]]] for row in result["rows"]] == [
+        [i, *expected] for i in range(1, 31)
+    ]
+
+
+def test_ordered_memo_partitions_preserve_collisions_and_reached_errors(graph_db):
+    query = (
+        "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x "
+        "RETURN i,avg(x),sum(x),avg(DISTINCT x),sum(DISTINCT x) ORDER BY i"
+    )
+    parameters = {"lists": [[1.0, 2.0], [2, 3], [1, 4]]}
+    actual = graph_db.cypher_json("g", {"query": query, "parameters": parameters})
+    # The zero-retention COLLECT prevents ordered-domain memoization in the
+    # reference without retaining an input-sized auxiliary result.
+    control = query.replace(" ORDER BY i", ",sum(0)+size(collect(null)[0..0]) AS forced ORDER BY i")
+    expected = graph_db.cypher_json("g", {"query": control, "parameters": parameters})
+    assert actual["rows"] == [row[:-1] for row in expected["rows"]]
+    with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
+        graph_db.cypher_json(
+            "g",
+            {"query": "UNWIND [1,2] AS i UNWIND [1] AS x WITH i,1/0 AS bad,x AS y UNWIND [] AS z RETURN i,avg(y)"},
+        )

@@ -23,6 +23,8 @@ const A = std.mem.Allocator;
 const Key = struct { address: usize, length: usize };
 const Record = struct {
     analysis: ?unicode.Analysis = null,
+    offsets: ?[]const usize = null,
+    offset_stride: usize = 0,
     reversed: ?[]const u8 = null,
     lower: ?[]const u8 = null,
     upper: ?[]const u8 = null,
@@ -97,17 +99,53 @@ pub const Runtime = struct {
         slot.reversed = output;
         return output;
     }
+    /// The input owner's cache retains validation and a bounded sparse index.
+    /// Dynamic slices borrow bytes, but never register arbitrary slice identities.
     pub fn substring(self: *Runtime, text: []const u8, start: usize, length: usize) ![]const u8 {
-        // Slices can be borrowed: the input is immutable for the whole query.
-        try self.reserve(text.len, 1);
-        var iterator = (std.unicode.Utf8View.init(text) catch return error.CypherTypeMismatch).iterator();
-        var position: usize = 0;
-        var checked: usize = 0;
-        while (position < start and iterator.nextCodepointSlice() != null) : (position += 1) try unicode.Checkpoint.check(self.check(), iterator.i, &checked);
-        const begin = iterator.i;
-        position = 0;
-        while (position < length and iterator.nextCodepointSlice() != null) : (position += 1) try unicode.Checkpoint.check(self.check(), iterator.i, &checked);
-        return text[begin..iterator.i];
+        const analysis = try self.analyze(text);
+        const first = @min(start, analysis.codepoints);
+        const last = first + @min(length, analysis.codepoints - first);
+        if (analysis.codepoints == text.len) return text[first..last];
+        const slot = try self.record(text);
+        if (slot.offsets == null and analysis.codepoints >= 256) {
+            const capacity = @min(@as(usize, 1024), (self.prefix_budget -| self.prefix_bytes) / @sizeOf(usize));
+            if (capacity >= 2) {
+                const stride = @max(@as(usize, 256), std.math.divCeil(usize, analysis.codepoints, capacity - 1) catch unreachable);
+                const count = analysis.codepoints / stride + 1;
+                const offsets = try self.a.alloc(usize, count);
+                try self.reserve(text.len, 1);
+                var iterator = (std.unicode.Utf8View{ .bytes = text }).iterator();
+                var ordinal: usize = 0;
+                var checked: usize = 0;
+                offsets[0] = 0;
+                while (iterator.nextCodepointSlice() != null) {
+                    ordinal += 1;
+                    if (ordinal % stride == 0) offsets[ordinal / stride] = iterator.i;
+                    try unicode.Checkpoint.check(self.check(), iterator.i, &checked);
+                }
+                slot.offsets = offsets;
+                slot.offset_stride = stride;
+                self.prefix_bytes += count * @sizeOf(usize);
+            }
+        }
+        const begin = try self.byteOffset(text, first, slot);
+        const end = if (last == first) begin else try self.byteOffset(text, last, slot);
+        return text[begin..end];
+    }
+    fn byteOffset(self: *Runtime, text: []const u8, ordinal: usize, slot: *const Record) !usize {
+        const byte_checkpoint = if (slot.offsets) |offsets| offsets[ordinal / slot.offset_stride] else 0;
+        const remaining = if (slot.offsets != null) ordinal % slot.offset_stride else ordinal;
+        var iterator = (std.unicode.Utf8View{ .bytes = text[byte_checkpoint..] }).iterator();
+        var charged: usize = 0;
+        for (0..remaining) |_| {
+            _ = iterator.nextCodepointSlice();
+            if (iterator.i - charged >= 64) {
+                try self.reserve(iterator.i - charged, 1);
+                charged = iterator.i;
+            }
+        }
+        try self.reserve(iterator.i - charged, 1);
+        return byte_checkpoint + iterator.i;
     }
     pub fn integer(self: *Runtime, text: []const u8) !v.Value {
         const slot = try self.record(text);
@@ -295,4 +333,47 @@ test "cached and temporary search tables release every failed allocation" {
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{@as(usize, 0)});
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{@as(usize, 4096)});
+}
+
+test "sparse substring indices are bounded and fallback preserves Unicode windows" {
+    const Counter = struct {
+        units: usize = 0,
+        fn charge(ptr: *anyopaque, n: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.units += n;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const text = try arena.allocator().alloc(u8, 60000);
+    for (0..text.len / 6) |i| @memcpy(text[i * 6 ..][0..6], "é🙂");
+    for ([_]usize{ 0, 16, 8192 }) |budget| {
+        var counter: Counter = .{};
+        var runtime: Runtime = .{ .a = arena.allocator(), .scratch = std.testing.allocator, .ptr = &counter, .charge = Counter.charge, .prefix_budget = budget };
+        try std.testing.expectEqualStrings("é🙂", try runtime.substring(text, 10000, 2));
+        try std.testing.expectEqualStrings("🙂", try runtime.substring(text, 19999, 100));
+        try std.testing.expectEqualStrings("", try runtime.substring(text, 20000, 1));
+        try std.testing.expectEqualStrings("", try runtime.substring(text, std.math.maxInt(usize), std.math.maxInt(usize)));
+        try std.testing.expectEqualStrings("", try runtime.substring(text, 3, 0));
+        try std.testing.expect(runtime.prefix_bytes <= budget);
+        const previous = counter.units;
+        for (0..50) |_| try std.testing.expectEqualStrings("é", try runtime.substring(text, 10000, 1));
+        if (budget == 8192) try std.testing.expect(counter.units - previous < 1000);
+    }
+}
+
+test "substring validation and index construction release failed allocations" {
+    const Campaign = struct {
+        fn charge(_: *anyopaque, _: usize) !void {}
+        fn run(a: A) !void {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const text = try arena.allocator().alloc(u8, 1800);
+            for (0..text.len / 6) |i| @memcpy(text[i * 6 ..][0..6], "é🙂");
+            var dummy: u8 = 0;
+            var runtime: Runtime = .{ .a = arena.allocator(), .scratch = a, .ptr = &dummy, .charge = charge };
+            try std.testing.expectEqualStrings("🙂é", try runtime.substring(text, 301, 2));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
 }

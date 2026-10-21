@@ -424,7 +424,7 @@ test "distributed graph captures the whole cohort and pages immutable owners" {
                 return null;
             }
             self.held += 1;
-            return .{ .ptr = &self.owners[target.group_id - 1], .validate = Owner.validate, .fork = Owner.fork, .release = Owner.release };
+            return .{ .ptr = &self.owners[@intCast(target.group_id - 1)], .validate = Owner.validate, .fork = Owner.fork, .release = Owner.release };
         }
     };
     var fixture: Fixture = .{};

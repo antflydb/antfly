@@ -3234,7 +3234,8 @@ test "merged runtime error details preserve main wire identifiers" {
     try std.testing.expectEqual(@as(c_int, 675), @backingInt(Detail.inference_worker_unavailable));
     try std.testing.expectEqual(@as(c_int, 676), @backingInt(Detail.model_chunk_audio_too_large));
     try std.testing.expectEqual(@as(c_int, 729), @backingInt(Detail.decision_limit_exceeded));
-    try std.testing.expectEqual(@as(c_int, 730), @backingInt(Detail.cypher_aggregate_scope));
+    try std.testing.expectEqual(@as(c_int, 778), @backingInt(Detail.invalid_embedding_identity));
+    try std.testing.expectEqual(@as(c_int, 779), @backingInt(Detail.cypher_aggregate_scope));
 }
 
 test "logical query work and scan policy failures retain their identities" {
