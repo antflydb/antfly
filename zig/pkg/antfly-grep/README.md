@@ -4111,3 +4111,24 @@ For native ARM64 Linux, add `-Dtarget=aarch64-linux-musl -Dmetal=false
 -Dsystem-blas=false`, then run the resulting executable on Linux. The build-only
 target installs the implementation test partition after its imports finalize;
 installing only the consumer test binary would omit named-dependency tests.
+
+
+The incremental-execution follow-up adds a separate ingestion workload to the
+logical-source benchmark driver. It exercises repetitive text, source-like text
+and seeded distinct words through the real substring index. Requests and typed
+profiles use `execution.value_verification` and `profile.value_verification`.
+For frozen binaries from before that API cleanup, the benchmark-only adapter
+translates those two wire spellings; functional tests always use the public API.
+
+```sh
+python3 zig/pkg/antfly-grep/bench/logical_sources.py \
+  --baseline /path/to/frozen-antfly --candidate /path/to/current-antfly \
+  --grep /path/to/current-antfly-grep --output output/new-qualification \
+  --suite all --rounds 2 --baseline-legacy-value-wire
+```
+
+Use a new output directory for each qualification. The report records artifact
+hashes, fixture hashes, raw HTTP trials, ingestion CPU and wall time, and
+source-reader work. Process restarts do not establish cold-storage performance.
+The execution design and cache-proof limitations are recorded in
+[logical field queries](../../../docs/design/logical-field-queries.md).
