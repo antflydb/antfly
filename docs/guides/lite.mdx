@@ -162,6 +162,33 @@ curl http://127.0.0.1:8080/db/v1/status
 
 HTTP serving uses the ELv2 standalone database server. The Apache Lite library and CLI expose in-process APIs and file commands; `lite serve` has been removed. Use the full server binary for the command above.
 
+Direct adoption currently supports the embedded root as the `default` table,
+with its schema, full-text index configurations and supported enrichments.
+Native dense, sparse, graph and algebraic indexes, resolver catalogs, and
+additional embedded tables are rejected before adoption. Stored embeddings
+alone do not imply a supported ANN index.
+
+Adoption requires the public JSON contract for an existing schema and verifies
+that it matches the stored runtime schema. A binary-only schema written through
+native `DB.setSchema()` is rejected before ownership transfers. While the file
+is still embedded-owned, publish the intended public schema at a newer version
+through `setSchemaJson()` or `lite schema set`, then retry adoption. The runtime
+schema cannot be inverted into a public contract without losing semantics.
+
+Once adopted, the standalone catalog owns schema, index, enrichment, resolver
+and table definitions. Embedded clients can still read, search and edit
+documents offline, but definition changes must go through the standalone API.
+This rule also applies to SQL DDL and persists in physical snapshots, keeping
+one catalog authoritative when a returned file is served again.
+
+Ordinary schema migrations preserve single-file handoff: stop the writer, copy
+the file, and reopen it with a fresh standalone data directory. Schema cleanup
+reuses and validates FK publication authority only when publication admission
+already acquired it. Files with that directory-bound FK authority still require
+the associated physical root; copying the file alone does not transfer hidden
+owner authority.
+
+
 ## Backups, Snapshots, and Imports
 
 ```bash
@@ -214,6 +241,19 @@ restore reader, and streams files through temporary disk storage. Portable
 backups retain their bytes; Lite exports retain the metadata from the same
 snapshot as their documents. A native AFB2 bundle keeps its native representation.
 Delta bundles need their base and are not supported by this input path.
+
+For an offline source inventory and compatibility report, use:
+
+```bash
+antfly backup inspect --input app.aflite
+antfly backup inspect --input app.afb --destination-capabilities destination.json
+```
+
+Inspection runs without a server connection. Exit success means a JSON report
+was produced; check completeness and `compatibility.verdict` before using it.
+It does not reserve a destination or validate a live restore request. See
+[Backup inspection](/docs/reference/backup-preflight) for the report and
+capability-attestation contract.
 
 The default preparation limits are 64 GiB of input and 128 GiB per prepared
 artifact or expanded logical stream. These are safety limits, not a guarantee

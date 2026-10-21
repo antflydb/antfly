@@ -462,6 +462,14 @@ pub const Handle = struct {
         try self.native_docstore.?.putCatalogRecord(artifact_profile_catalog_key, standalone_artifact_profile);
     }
 
+    /// Adoption transfers catalog authority to standalone metadata. Physical
+    /// snapshots preserve this marker, so an offline client cannot create a
+    /// second schema/index authority that the server would later overwrite.
+    pub fn requireEmbeddedCatalogOwnership(self: *const Handle) !void {
+        if (self.hasStandaloneRootAdoption() or try self.isStandaloneArtifact())
+            return error.StandaloneLiteCatalogRequiresApi;
+    }
+
     pub fn isStandaloneArtifact(self: *const Handle) !bool {
         return try self.artifactHasProfile(standalone_artifact_profile);
     }
