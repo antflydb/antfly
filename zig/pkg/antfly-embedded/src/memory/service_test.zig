@@ -2826,3 +2826,195 @@ test "memory cancellation consistently projects readiness and immutable decision
         }
     }
 }
+
+test "memory publication rechecks uncited context and preserves denied work" {
+    const Model = struct {
+        fn generate(ptr: *anyopaque, a: A, config: m.types.Config, sources: []const m.types.StoredEvidence) !m.types.Generated {
+            const output = try success(ptr, a, config, sources);
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.resource_state = .denied;
+            return output;
+        }
+        fn success(ptr: *anyopaque, a: A, config: m.types.Config, sources: []const m.types.StoredEvidence) !m.types.Generated {
+            const output = try fakeGenerate(ptr, a, config, sources);
+            const claims = try a.dupe(m.types.Assertion, output.assertions);
+            claims[0].evidence = &.{.{ .id = "e2" }};
+            return .{ .assertions = claims };
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    _ = try managedSetup(&store);
+    // The model cites only e1; the ordinary record is admitted as context.
+    _ = try modelService(&store, 3).execute(a, .observe, "", "{\"evidence\":[{\"id\":\"context\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}}]}", "context");
+    const observed = try modelService(&store, 4).execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e2\",\"source_id\":\"note2\",\"source_version\":\"1\",\"text\":\"Deployment\"}],\"context_evidence_ids\":[\"e1\",\"context\"]}", "with-context");
+    const pending = try std.json.parseFromSliceLeaky(m.types.Operation, a, observed, .{});
+    const revision = store.revision;
+    var service = modelService(&store, 5);
+    service.backend.generate = Model.generate;
+    try std.testing.expectError(error.MemorySourceAccessDenied, service.execute(a, .advance, pending.id, "{}", "attempt"));
+    try std.testing.expectEqual(revision, store.revision);
+    const status = try modelService(&store, 6).execute(a, .operation, pending.id, "{}", "");
+    const unchanged = try std.json.parseFromSliceLeaky(m.types.Operation, a, status, .{});
+    try std.testing.expectEqual(@as(u8, 0), unchanged.attempts);
+    try std.testing.expectEqual(m.types.Stage.pending, unchanged.phase);
+    store.resource_state = .current;
+    service = modelService(&store, 7);
+    service.backend.generate = Model.success;
+    const retried = try service.execute(a, .advance, pending.id, "{}", "attempt");
+    const ready = try std.json.parseFromSliceLeaky(m.types.Operation, a, retried, .{});
+    try std.testing.expectEqual(m.types.Stage.succeeded, ready.phase);
+    _ = try modelService(&store, 8).execute(a, .get, "managed", "{}", "");
+}
+
+test "memory generation rejects changed source revisions without partial publication" {
+    const Model = struct {
+        fn generate(ptr: *anyopaque, a: A, config: m.types.Config, sources: []const m.types.StoredEvidence) !m.types.Generated {
+            const output = try fakeGenerate(ptr, a, config, sources);
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.resource_revision += 1;
+            return output;
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const config: m.types.Config = .{ .processing = .managed, .features = .{ .assertion_distillation = true }, .models = .{ .generator = fake_model } };
+    _ = try modelService(&store, 1).execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    const observed = try modelService(&store, 2).execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e1\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}}]}", "observe");
+    const pending = try std.json.parseFromSliceLeaky(m.types.Operation, a, observed, .{});
+    var service = modelService(&store, 3);
+    service.backend.generate = Model.generate;
+    const result = try service.execute(a, .advance, pending.id, "{}", "attempt");
+    const cancelled = try std.json.parseFromSliceLeaky(m.types.Operation, a, result, .{});
+    try std.testing.expectEqual(m.types.Stage.cancelled, cancelled.phase);
+    try std.testing.expect(!cancelled.assertions_ready);
+    var rows = store.values.keyIterator();
+    while (rows.next()) |key| try std.testing.expect(!std.mem.startsWith(u8, key.*, "assertion/"));
+}
+
+test "memory listing batches selective scans and resumes at consumed rows" {
+    var store = Store.init();
+    defer store.deinit();
+    try setup(&store);
+    const a = store.arena.allocator();
+    var claims: [256]m.types.Assertion = undefined;
+    for (&claims, 0..) |*claim, i| claim.* = .{ .id = try std.fmt.allocPrint(a, "claim-{d}", .{i}), .subject = try std.fmt.allocPrint(a, "subject-{d}", .{i}), .predicate = if (i % 3 == 0) "selected" else "other", .value = "Helm", .statement = "Deployment", .evidence = &.{.{ .id = "e1" }} };
+    for (0..4) |batch| {
+        _ = try store.service("alice", true, 3).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = claims[batch * 64 ..][0..64] }, .{}), try std.fmt.allocPrint(a, "claims-{d}", .{batch}));
+    }
+    store.scans = 0;
+    const empty = try store.service("alice", true, 4).execute(a, .list, "", "{\"predicate\":\"missing\",\"limit\":1}", "");
+    const PageResult = struct { items: []const m.types.StoredAssertion, next_cursor: ?[]const u8, complete: bool, revision: u64 };
+    const no_matches = try std.json.parseFromSliceLeaky(PageResult, a, empty, .{});
+    try std.testing.expect(no_matches.complete);
+    try std.testing.expectEqual(@as(usize, 0), no_matches.items.len);
+    try std.testing.expectEqual(@as(usize, 2), store.scans);
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    var cursor: ?[]const u8 = null;
+    while (true) {
+        const body = try std.json.Stringify.valueAlloc(a, .{ .predicate = "selected", .limit = @as(u16, 7), .cursor = cursor }, .{});
+        const result = try store.service("alice", true, 5).execute(a, .list, "", body, "");
+        const page = try std.json.parseFromSliceLeaky(PageResult, a, result, .{});
+        for (page.items) |record| {
+            try std.testing.expect(!seen.contains(record.assertion.id));
+            try seen.put(a, record.assertion.id, {});
+        }
+        cursor = page.next_cursor;
+        if (page.complete) break;
+        try std.testing.expect(cursor != null);
+    }
+    try std.testing.expectEqual(@as(usize, 86), seen.count());
+}
+
+test "memory embedding and reconciliation revalidate source authority" {
+    const Model = struct {
+        fn embed(ptr: *anyopaque, a: A, model: m.types.Model, text: []const u8) ![]const f32 {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.resource_state = .denied;
+            return fakeEmbed(ptr, a, model, text);
+        }
+        fn decide(ptr: *anyopaque, a: A, config: m.types.Config, claim: m.types.Assertion, candidates: []const m.types.StoredAssertion) !m.types.ReconciliationDecision {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.resource_state = .denied;
+            return reviewDecide(ptr, a, config, claim, candidates);
+        }
+    };
+    for ([_]bool{ false, true }) |semantic| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        var service = modelService(&store, 1);
+        service.backend.decide = reviewDecide;
+        const config: m.types.Config = .{ .features = .{ .semantic_recall = semantic, .reconciliation = if (semantic) .explicit else .model }, .models = .{ .embedder = if (semantic) fake_model else null, .decider = if (semantic) null else fake_model }, .predicates = &.{.{ .name = "deploys_with", .cardinality = .one }} };
+        _ = try service.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+        _ = try service.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e1\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}}]}", "source");
+        _ = try service.execute(a, .assertions, "", helm, "helm");
+        const revision = store.revision;
+        service.backend.embed = Model.embed;
+        service.backend.decide = Model.decide;
+        try std.testing.expectError(error.MemorySourceAccessDenied, service.execute(a, .assertions, "", terraform, "terraform"));
+        try std.testing.expectEqual(revision, store.revision);
+        store.resource_state = .current;
+        const existing = try service.execute(a, .get, "helm", "{}", "");
+        const record = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, existing, .{});
+        try std.testing.expectEqual(m.types.Lifecycle.active, record.lifecycle);
+        try std.testing.expectError(error.MemoryNotFound, service.execute(a, .get, "terraform", "{}", ""));
+    }
+}
+
+test "memory inferred publication checks sources after final authorization" {
+    const Authority = struct {
+        fn check(ptr: *anyopaque) !void {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.resource_state = .denied;
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const config: m.types.Config = .{ .processing = .managed, .features = .{ .assertion_distillation = true }, .models = .{ .generator = fake_model } };
+    _ = try modelService(&store, 1).execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    const observed = try modelService(&store, 2).execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e1\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}}]}", "observe");
+    const pending = try std.json.parseFromSliceLeaky(m.types.Operation, a, observed, .{});
+    var service = modelService(&store, 3);
+    service.context.final_check_ptr = &store;
+    service.context.final_check_fn = Authority.check;
+    const revision = store.revision;
+    try std.testing.expectError(error.MemorySourceAccessDenied, service.execute(a, .advance, pending.id, "{}", "attempt"));
+    try std.testing.expectEqual(revision, store.revision);
+    store.resource_state = .current;
+    try std.testing.expectError(error.MemoryNotFound, modelService(&store, 4).execute(a, .get, "managed", "{}", ""));
+}
+
+test "memory reindex source changes roll back projections and release configuration admission" {
+    const Model = struct {
+        fn embed(ptr: *anyopaque, a: A, model: m.types.Model, text: []const u8) ![]const f32 {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.resource_revision += 1;
+            return fakeEmbed(ptr, a, model, text);
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    _ = try modelService(&store, 1).execute(a, .create, "", "{}", "create");
+    _ = try modelService(&store, 2).execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e1\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}}]}", "source");
+    _ = try modelService(&store, 3).execute(a, .assertions, "", helm, "helm");
+    const previous = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    const config: m.types.Config = .{ .features = .{ .semantic_recall = true }, .models = .{ .embedder = fake_model } };
+    const configured = try modelService(&store, 4).execute(a, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = previous.revision, .config = config }, .{}), "configure");
+    const pending = try std.json.parseFromSliceLeaky(m.types.Operation, a, configured, .{});
+    var service = modelService(&store, 5);
+    service.backend.embed = Model.embed;
+    const result = try service.execute(a, .advance, pending.id, "{}", "advance");
+    const receipt = try std.json.parseFromSliceLeaky(m.types.Operation, a, result, .{});
+    try std.testing.expectEqual(m.types.Stage.cancelled, receipt.phase);
+    const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    try std.testing.expect(state.pending_config == null);
+    try std.testing.expectEqual(previous.config.generation, state.config.generation);
+    var keys = store.values.keyIterator();
+    while (keys.next()) |key| try std.testing.expect(!std.mem.startsWith(u8, key.*, "vector/"));
+    _ = try modelService(&store, 6).execute(a, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = state.revision, .config = previous.config }, .{}), "next-configuration");
+}

@@ -128,6 +128,18 @@ Model calls use existing qualified Antfly producers and embedders, without
 persisting consumer session credentials. Each enabled role is qualified
 independently even when one model serves several roles.
 
+Source snapshots are scoped to a native execution. After generation, reconciliation,
+or embedding releases its lease, the service revalidates every ordinary resource
+read by the plan, including uncited context and candidate dependencies. It checks
+again immediately before committing inferred changes. Revoked access rolls back
+the attempt without spending the durable retry budget; a changed source cancels
+work admitted against that revision. Results never silently adopt a newer source.
+These live checks accompany the memory control-row CAS; they do not create a
+cross-table serializable transaction with ordinary source writers.
+
+Structural enumeration reads batches of up to 128 rows within its 4096-row work
+budget. Its cursor identifies the last consumed row, including filtered rows, so
+stopping partway through a fetched batch cannot skip records on the next page.
 Structural enumeration paginates the accessible set; ranked recall is budgeted
 and reports omitted candidates, scan limits, revisions and actual retrieval
 path. A truncated ranking is never a completeness claim. Context and authoritative

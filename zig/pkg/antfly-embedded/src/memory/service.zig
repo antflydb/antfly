@@ -237,6 +237,7 @@ pub const Service = struct {
             if (op.phase == .pending and (action == .observe or action == .configure)) try run.put(try key(a, "pending", op.id), .{ .id = op.id });
             try run.put("control", run.state);
             try self.context.finish();
+            if (run.inferred) try run.validateResources();
             try self.backend.commit(self.backend.ptr, a, state_row, run.changes.items);
             output = try run.encode(publicOperation(op));
         } else {
@@ -262,6 +263,7 @@ pub const Service = struct {
 };
 
 const Run = struct {
+    const ResourceRead = struct { reference: prov.Resource, snapshot: prov.Snapshot };
     service: Service,
     a: A,
     state: t.State = undefined,
@@ -275,7 +277,8 @@ const Run = struct {
     support_work: usize = 0,
     historical_resource_reads: bool = false,
     retention_maintenance: bool = false,
-    resource_states: std.StringHashMapUnmanaged(prov.Snapshot) = .empty,
+    resource_states: std.StringHashMapUnmanaged(ResourceRead) = .empty,
+    inferred: bool = false,
     explanation_decisions: std.StringHashMapUnmanaged(void) = .empty,
     explanation_truncated: bool = false,
     explanation_incomplete_history: bool = false,
@@ -458,11 +461,37 @@ const Run = struct {
         if (!reference.external()) return error.InvalidResourceReference;
         if (!eql(u8, reference.database, self.state.database)) return error.Forbidden;
         const cache_key = try hash(self.a, .{ reference, self.service.context.principal });
-        if (self.resource_states.get(cache_key)) |value| return value;
+        if (self.resource_states.get(cache_key)) |value| return value.snapshot;
         const resolve = self.service.backend.resource orelse return error.MemoryCapabilityUnavailable;
         const value = try resolve(self.service.backend.ptr, self.a, reference);
-        try self.resource_states.put(self.a, cache_key, value);
+        try self.cacheResource(reference, value);
         return value;
+    }
+    fn cacheResource(self: *Run, reference: prov.Resource, snapshot: prov.Snapshot) !void {
+        try self.resource_states.put(self.a, try hash(self.a, .{ reference, self.service.context.principal }), .{ .reference = reference, .snapshot = snapshot });
+    }
+    // Inference releases native leases. Re-read every resource observed by the
+    // plan, including uncited context and reconciliation candidates, before
+    // accepting its result. Never replace the admitted snapshot with a newer one.
+    fn validateResources(self: *Run) !void {
+        var reads = self.resource_states.valueIterator();
+        while (reads.next()) |read_resource| {
+            try self.service.context.check();
+            const current = try self.service.backend.resource.?(self.service.backend.ptr, self.a, read_resource.reference);
+            const admitted = read_resource.snapshot;
+            if (current.state == .denied and admitted.state != .denied) return error.MemorySourceAccessDenied;
+            if (current.state != admitted.state or current.table_id != admitted.table_id or current.revision != admitted.revision or current.payload_truncated != admitted.payload_truncated or
+                !eql(u8, current.json, admitted.json) or !eql(u8, current.digest orelse "", admitted.digest orelse "")) return error.MemoryResourceChanged;
+        }
+    }
+    fn inferenceCompleted(self: *Run) !void {
+        self.inferred = true;
+        try self.validateResources();
+    }
+    fn embed(self: *Run, model: t.Model, text: []const u8) ![]const f32 {
+        const result = try self.service.backend.embed.?(self.service.backend.ptr, self.a, model, text);
+        try self.inferenceCompleted();
+        return result;
     }
     fn resourceCurrent(self: *Run, source: t.StoredEvidence) !bool {
         const reference = source.evidence.resource orelse return true;
@@ -692,7 +721,7 @@ const Run = struct {
                 if (snapshot.table_id == reference.table_id and pinned.storage_name == null) pinned.storage_name = snapshot.storage_name;
                 if (snapshot.state == .current and pinned.digest == null) pinned.digest = snapshot.digest;
                 @field(origin, field) = pinned;
-                try self.resource_states.put(self.a, try hash(self.a, .{ pinned, self.service.context.principal }), snapshot);
+                try self.cacheResource(pinned, snapshot);
             };
         }
         if (request.evidence.len == 0 or request.evidence.len > t.max_items or request.context_evidence_ids.len > t.max_items or request.entities.len > self.state.config.max_output_items) return error.InvalidMemoryRequest;
@@ -724,7 +753,7 @@ const Run = struct {
                 pinned.storage_name = snapshot.storage_name;
                 source.resource = pinned;
                 source.resource_selector = null;
-                try self.resource_states.put(self.a, try hash(self.a, .{ pinned, self.service.context.principal }), snapshot);
+                try self.cacheResource(pinned, snapshot);
             }
             if (source.resource) |initial_reference| {
                 if (self.service.context.durable_execution_required and self.state.execution_signature.len == 0) return error.MemoryExecutionIdentityRequired;
@@ -733,7 +762,7 @@ const Run = struct {
                 if (reference.storage_name == null) reference.storage_name = snapshot.storage_name;
                 if (reference.digest == null) reference.digest = snapshot.digest;
                 source.resource = reference;
-                try self.resource_states.put(self.a, try hash(self.a, .{ reference, self.service.context.principal }), snapshot);
+                try self.cacheResource(reference, snapshot);
                 if (snapshot.state == .denied) return error.Forbidden;
                 if (snapshot.state != .current) return error.MemoryResourceChanged;
                 if (snapshot.payload_truncated) return error.MemoryInputTooLarge;
@@ -924,7 +953,7 @@ const Run = struct {
                 continue;
             }
             if (self.state.config.features.semantic_recall and claim.embedding == null) {
-                claim.embedding = try self.service.backend.embed.?(self.service.backend.ptr, self.a, self.state.config.models.embedder.?, claim.statement);
+                claim.embedding = try self.embed(self.state.config.models.embedder.?, claim.statement);
                 claim.embedding_model = self.state.config.models.embedder;
             }
             try self.validateAssertion(claim, generated);
@@ -981,6 +1010,7 @@ const Run = struct {
         // same transaction, so a self-reference to that row is not a snapshot.
         const incoming_reason = if (claim.reconciliation_reason != null) previous_reason else null;
         const decision = try decide(self.service.backend.ptr, self.a, self.state.config, claim.*, prior);
+        try self.inferenceCompleted();
         if (decision.reason.len == 0 or decision.reason.len > t.max_text_bytes) return error.MemoryUngroundedOutput;
         for (decision.supersedes) |target| {
             var found = false;
@@ -1591,7 +1621,7 @@ const Run = struct {
                 if (err == error.MemorySourceAccessDenied) return err;
                 if (err != error.MemoryExternalVectorRequired) pending.attempts += 1;
                 try self.processingFailure(path, &pending, err);
-                if (pending.phase == .failed) {
+                if (pending.phase == .failed or pending.phase == .cancelled) {
                     self.state.pending_config = null;
                     try self.put("cleanup", .{ .cursor = @as(?[]const u8, null) });
                 }
@@ -1628,6 +1658,7 @@ const Run = struct {
         pending.attempts += 1;
         const generate = self.service.backend.generate orelse return error.MemoryCapabilityUnavailable;
         const generated = generate(self.service.backend.ptr, self.a, self.state.config, sources.items) catch |err| return self.processingFailure(path, &pending, err);
+        self.inferenceCompleted() catch |err| return self.processingFailure(path, &pending, err);
         self.publishGenerated(pending, generated, sources.items) catch |err| return self.processingFailure(path, &pending, err);
         pending.phase = .succeeded;
         pending.assertions_ready = true;
@@ -1668,9 +1699,14 @@ const Run = struct {
         return true;
     }
     fn processingFailure(self: *Run, path: []const u8, pending: *t.Operation, err: anyerror) !void {
+        // Authorization failure rolls back the whole attempt, preserving both
+        // the durable obligation and its retry budget.
+        if (err == error.MemorySourceAccessDenied) return err;
+        self.inferred = false;
+        self.decision_targets.clearRetainingCapacity();
         // A rejected model output publishes no partial assertions or entities.
         self.changes.clearRetainingCapacity();
-        pending.phase = if (err == error.MemoryForgotten) .cancelled else if (pending.attempts >= self.state.config.max_attempts) .failed else .pending;
+        pending.phase = if (err == error.MemoryForgotten or err == error.MemoryResourceChanged) .cancelled else if (pending.attempts >= self.state.config.max_attempts) .failed else .pending;
         pending.error_code = @errorName(err);
         pending.assertions_ready = false;
         pending.next_retry_at = if (pending.phase == .pending) self.service.context.now_ms +| (@as(i64, 1000) * (@as(i64, 1) << @intCast(@min(pending.attempts, 10)))) else null;
@@ -1744,7 +1780,7 @@ const Run = struct {
             if (eql(u8, config.models.embedder.?.provider, "external")) {
                 if (try self.vectorFor(config, record.assertion) == null) return error.MemoryExternalVectorRequired;
             } else {
-                const embedding = try self.service.backend.embed.?(self.service.backend.ptr, self.a, config.models.embedder.?, record.assertion.statement);
+                const embedding = try self.embed(config.models.embedder.?, record.assertion.statement);
                 try self.putVector(config, record.assertion, embedding);
             }
         }
@@ -2387,38 +2423,36 @@ const Run = struct {
         var visited: usize = 0;
         var more = true;
         while (items.items.len < request.limit and visited < 4096) {
-            const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "assertion/", after, 1);
-            if (page.rows.len == 0) {
-                more = false;
-                break;
+            try self.service.context.check();
+            const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "assertion/", after, @intCast(@min(128, 4096 - visited)));
+            more = page.next != null;
+            for (page.rows, 0..) |row, index| {
+                after = row.key;
+                visited += 1;
+                more = index + 1 < page.rows.len or page.next != null;
+                var record = try parse(t.StoredAssertion, self.a, row.json);
+                if (request.known_at) |known| record = (try self.asOf(record.assertion.id, known)) orelse continue;
+                self.authorize(record.owner, record.assertion.visibility) catch continue;
+                if (!try self.evidenceVisibleTime(record, request.known_at, request.valid_at orelse if (!request.include_history) self.service.context.now_ms else null, 0)) continue;
+                const claim = record.assertion;
+                if (!relationsMatch(request, claim)) continue;
+                if (!matchesTime(request, record, self.service.context.now_ms)) continue;
+                if (!request.include_provisional and claim.stability == .provisional) continue;
+                const canonical_subject = (try self.canonical(claim.subject)) orelse continue;
+                if (self.objectTyped(claim.predicate) and try self.canonical(claim.value) == null) continue;
+                if (request.subject) |v| {
+                    const wanted = (try self.canonical(v)) orelse continue;
+                    if (!eql(u8, wanted, canonical_subject)) continue;
+                }
+                if (request.predicate) |v| if (!eql(u8, v, claim.predicate)) continue;
+                if (request.scope) |v| if (!eql(u8, v, claim.scope)) continue;
+                if (request.kind) |v| if (claim.kind != v) continue;
+                if (request.environment) |v| if (claim.environment != null and !eql(u8, v, claim.environment.?)) continue;
+                if (request.task) |v| if (claim.task != null and !eql(u8, v, claim.task.?)) continue;
+                try items.append(self.a, try self.publicRecord(record));
+                if (items.items.len == request.limit) break;
             }
-            const row = page.rows[0];
-            after = row.key;
-            visited += 1;
-            var record = try parse(t.StoredAssertion, self.a, row.json);
-            if (request.known_at) |known| record = (try self.asOf(record.assertion.id, known)) orelse continue;
-            self.authorize(record.owner, record.assertion.visibility) catch continue;
-            if (!try self.evidenceVisibleTime(record, request.known_at, request.valid_at orelse if (!request.include_history) self.service.context.now_ms else null, 0)) continue;
-            const claim = record.assertion;
-            if (!relationsMatch(request, claim)) continue;
-            if (!matchesTime(request, record, self.service.context.now_ms)) continue;
-            if (!request.include_provisional and claim.stability == .provisional) continue;
-            const canonical_subject = (try self.canonical(claim.subject)) orelse continue;
-            if (self.objectTyped(claim.predicate) and try self.canonical(claim.value) == null) continue;
-            if (request.subject) |v| {
-                const wanted = (try self.canonical(v)) orelse continue;
-                if (!eql(u8, wanted, canonical_subject)) continue;
-            }
-            if (request.predicate) |v| if (!eql(u8, v, claim.predicate)) continue;
-            if (request.scope) |v| if (!eql(u8, v, claim.scope)) continue;
-            if (request.kind) |v| if (claim.kind != v) continue;
-            if (request.environment) |v| if (claim.environment != null and !eql(u8, v, claim.environment.?)) continue;
-            if (request.task) |v| if (claim.task != null and !eql(u8, v, claim.task.?)) continue;
-            try items.append(self.a, try self.publicRecord(record));
-            if (page.next == null) {
-                more = false;
-                break;
-            }
+            if (!more) break;
         }
         return self.encode(.{ .items = items.items, .next_cursor = if (more) try self.encodeCursor("assertion/", after) else null, .complete = !more, .revision = self.state.revision });
     }
@@ -2436,7 +2470,7 @@ const Run = struct {
             if (request.embedding_model == null or !eql(u8, try self.encode(request.embedding_model.?), try self.encode(model)) or supplied.len != model.dimensions.?) return error.MemoryEmbeddingMismatch;
             for (supplied) |value| if (!std.math.isFinite(value)) return error.MemoryEmbeddingMismatch;
         }
-        if (self.state.config.features.semantic_recall and vector == null and request.query.len > 0) vector = try self.service.backend.embed.?(self.service.backend.ptr, self.a, self.state.config.models.embedder.?, request.query);
+        if (self.state.config.features.semantic_recall and vector == null and request.query.len > 0) vector = try self.embed(self.state.config.models.embedder.?, request.query);
         var more = false;
         while (true) {
             try self.service.context.check();
