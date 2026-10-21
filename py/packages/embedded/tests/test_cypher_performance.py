@@ -5941,13 +5941,42 @@ def test_dynamic_substrings_share_validation_and_unicode_offsets(graph_db, paylo
 
 
 @pytest.mark.parametrize(
-    "case", ["mapped", "avg", "float_sum", "reversed", "overlap", "filtered", "distinct_stage", "bounded"]
+    "case",
+    [
+        "mapped",
+        "avg",
+        "float_sum",
+        "reversed",
+        "overlap",
+        "filtered",
+        "distinct_stage",
+        "bounded",
+        "wildcard",
+        "any",
+        "filtered_head",
+        "reduce",
+        "ordered",
+        "scalar_call",
+        "scoped_call",
+        "wildcard_call",
+    ],
 )
 def test_ordered_aggregate_domains_share_exact_reducer_states(graph_db, case):
     parameters = {"xs": list(range(1000)), "lists": [list(range(500)), list(range(250, 750))]}
     tails = {
         "mapped": ("UNWIND $xs AS x WITH i,x+1 AS y,x*2 AS z RETURN i,sum(y),sum(z)", [500500, 999000]),
         "avg": ("UNWIND $xs AS x RETURN i,avg(x)", [499.5]),
+        "wildcard": ("UNWIND $xs AS x WITH * WHERE x>500 RETURN i,avg(x)", [750.0]),
+        "any": ("UNWIND $xs AS x RETURN i,avg(x),any(v IN collect(x) WHERE v>500)", [499.5, True]),
+        "filtered_head": ("UNWIND $xs AS x RETURN i,avg(x),head([v IN collect(x) WHERE v>500])", [499.5, 501]),
+        "reduce": ("UNWIND $xs AS x RETURN i,avg(x),reduce(s=0,v IN collect(x)|s+v)", [499.5, 499500]),
+        "ordered": ("UNWIND $xs AS x WITH i,x ORDER BY x DESC RETURN i,avg(x),head(collect(x))", [499.5, 999]),
+        "scalar_call": ("UNWIND $xs AS x CALL {RETURN x*2 AS y} RETURN i,avg(y)", [999.0]),
+        "scoped_call": (
+            "UNWIND $xs AS x CALL {WITH x AS t WHERE t>500 RETURN t*2 AS y,7 AS z} RETURN i,avg(y),z",
+            [1500.0, 7],
+        ),
+        "wildcard_call": ("UNWIND $xs AS x CALL {WITH * RETURN x*2 AS y} RETURN i,avg(y)", [999.0]),
         "filtered": ("UNWIND $xs AS x WITH i,x WHERE x>500 RETURN i,avg(x)", [750.0]),
         "distinct_stage": ("UNWIND $xs AS x WITH DISTINCT i,x RETURN i,avg(x)", [499.5]),
         "bounded": ("UNWIND $xs AS x RETURN i,avg(x),head(collect(x)),last(collect(x))", [499.5, 0, 999]),
@@ -5973,7 +6002,9 @@ def test_ordered_aggregate_domains_share_exact_reducer_states(graph_db, case):
         [
             int(row[0]["value"]),
             *[
-                (float if isinstance(value, float) else int)(cell["value"])
+                cell["value"]
+                if isinstance(value, bool)
+                else (float if isinstance(value, float) else int)(cell["value"])
                 for cell, value in zip(row[1:], expected, strict=True)
             ],
         ]
@@ -6015,3 +6046,47 @@ def test_partition_membership_and_bounded_collection_continuations_match_referen
     actual = graph_db.cypher_json("g", {"query": query, "parameters": parameters})
     expected = graph_db.cypher_json("g", {"query": control, "parameters": parameters})
     assert actual["rows"] == [row[:-1] for row in expected["rows"]]
+
+
+@pytest.mark.parametrize(
+    "xs",
+    [[], [None], [1, 2, 1, None, 3], [1.0, 2, 2.0, -0.0], [1e16, 1, -1e16], [1, "bad", {"x": 1}]],
+)
+def test_scalar_domain_reuse_preserves_scopes_consumers_and_order(graph_db, xs):
+    parameters = {"xs": xs, "lists": [xs, [], [None, 2], xs]}
+
+    def outcome(query):
+        try:
+            return ("ok", graph_db.cypher_json("g", {"query": query, "parameters": parameters})["rows"])
+        except af.AntflyError as error:
+            return ("error", str(error))
+
+    queries = [
+        "UNWIND [1,2,1] AS i UNWIND $xs AS x WITH * WHERE x IS NOT NULL RETURN i,avg(x) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $xs AS x WITH *,x AS y RETURN i,head(collect(y)) ORDER BY i",
+        "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x RETURN i,any(v IN collect(x) WHERE v>1),all(v IN collect(x) WHERE v>1),none(v IN collect(x) WHERE v>1),single(v IN collect(x) WHERE v>1) ORDER BY i",
+        "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x RETURN i,reduce(s=0,v IN collect(DISTINCT x)|s+v),last([v IN collect(DISTINCT x) WHERE v>1]),head([v IN collect(x) WHERE v>1|v*2]) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $xs AS x RETURN i,any(v IN collect(x) WHERE v>i),reduce(s=i,v IN collect(x)|s+v) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $xs AS x RETURN i,CASE WHEN false THEN reduce(s=1/0,v IN collect(x)|s+v) ELSE 7 END ORDER BY i",
+        "UNWIND [2,1] AS i UNWIND $xs AS x WITH i,x ORDER BY x DESC RETURN i,avg(x),head(collect(x)),last(collect(x)) ORDER BY i",
+        "UNWIND [1,2,1] AS i UNWIND $xs AS x WITH i,x ORDER BY x DESC RETURN i,head(collect(x)),last(collect(x)) ORDER BY i",
+        "UNWIND [1,1.0,2] AS i UNWIND $xs AS x WITH i,x ORDER BY x DESC RETURN i,count(*),head(collect(x)) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $xs AS x WITH i,x ORDER BY x DESC LIMIT 2 RETURN i,count(*),head(collect(x)) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $xs AS x WITH i,x ORDER BY x+i DESC RETURN i,head(collect(x)) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $xs AS x WITH i,x AS y ORDER BY y DESC RETURN i AS y,head(collect(y)) ORDER BY y",
+        "UNWIND [1,2,1] AS i UNWIND $xs AS x CALL {WITH * RETURN x*2 AS y} RETURN i,avg(y) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $xs AS x CALL {WITH * CALL {RETURN x AS t} WITH t WHERE t IS NOT NULL RETURN CASE WHEN t>0 THEN t ELSE 7 END AS y,7 AS z} RETURN i,avg(y),min(z) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $xs AS x CALL {WITH *,1/0 AS bad RETURN x AS y} RETURN i,avg(y) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $xs AS x CALL {WITH * WHERE false RETURN 1/0 AS y} RETURN i,avg(y) ORDER BY i",
+    ]
+    for query in queries:
+        # Force a sequential reducer with an unbounded NULL collection. Keep
+        # the original final ordering and every original typed output column.
+        split = query.rfind(" ORDER BY ")
+        control = query[:split] + ",size(coalesce(collect(null),[])) AS forced" + query[split:]
+        expected = outcome(control)
+        if expected[0] == "ok":
+            expected = ("ok", [row[:-1] for row in expected[1]])
+        assert outcome(query) == expected, (query, xs)
+    wildcard = queries[0]
+    assert outcome(wildcard) == outcome(wildcard.replace("WITH *", "WITH i,x"))

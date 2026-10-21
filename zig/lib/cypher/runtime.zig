@@ -1930,6 +1930,8 @@ const Engine = struct {
                 self.collection_seen = 0;
                 self.collection_count = 0;
                 self.collection_overflow = false;
+                for (self.filter_states) |*consumer| consumer.deinit();
+                @memset(self.filter_states, .{});
             }
             if (std.ascii.eqlIgnoreCase(self.function.name, "sum")) self.sum = .{ .integer = 0 };
             if (std.ascii.eqlIgnoreCase(self.function.name, "avg")) {
@@ -2534,6 +2536,7 @@ const Engine = struct {
             consumer.* = .{ .membership = states[leader].cohort.?.membership };
             states[index].cohort = consumer;
         };
+        for (states) |*state_value| state_value.consumer_row = source.items;
         return .{ .key = copied, .source = source.items, .states = states };
     }
     fn boundedGroupWindow(self: *Engine, projection: ast.Projection) bool {
@@ -2782,10 +2785,13 @@ const Engine = struct {
         original: []const ast.Clause,
         supports: std.AutoHashMapUnmanaged(usize, *AxisDistinctSupport) = .empty,
         dependent: []const []const bool,
+        calls: []const ?AxisCall,
+        sample_count: usize,
+        ordered: bool,
         captures: Names,
         memo: CallMemo,
     };
-    const AxisTrace = struct { reached: []bool, count: Count = Count.init(0) };
+    const AxisTrace = struct { reached: []bool, count: Count = Count.init(0), plan: *const AxisPlan, samples: []Row, sampled: []bool, retained: A };
     fn axisHasSource(value: anytype) bool {
         if (@TypeOf(value) == *const ast.Expr) {
             if (value.execution_list_source != null or value.execution_range_binding) return true;
@@ -2823,7 +2829,138 @@ const Engine = struct {
         while (keys.next()) |name| if (@import("expressions.zig").references(expression, name.*)) return true;
         return false;
     }
-    fn axisPlan(self: *Engine, fold: *StreamFold, index: usize) !?*AxisPlan {
+    /// Expand bound wildcard columns without changing expression evaluation
+    /// or CALL scope. A single scalar seed gives every stage one static schema.
+    fn normalizeScalarPipeline(self: *Engine, initial: Row, clauses: []const ast.Clause) anyerror![]const ast.Clause {
+        var shape = initial;
+        const output = try self.a.dupe(ast.Clause, clauses);
+        const inputs = try self.a.alloc(Row, output.len);
+        for (output, inputs) |*clause, *input| {
+            input.* = shape;
+            switch (clause.operation) {
+                .unwind => {},
+                .project => |*step| if (step.value.wildcard) {
+                    var items: std.ArrayList(ast.Item) = .empty;
+                    for (shape) |entry| {
+                        const expression = try self.a.create(ast.Expr);
+                        expression.* = .{ .span = .{}, .value = .{ .variable = entry.name } };
+                        try items.append(self.a, .{ .expression = expression, .alias = entry.name });
+                    }
+                    try items.appendSlice(self.a, step.value.items);
+                    step.value.items = try items.toOwnedSlice(self.a);
+                    step.value.wildcard = false;
+                },
+                .subquery => |inner| {
+                    if (!scalarReturningCall(inner)) return clauses;
+                    clause.operation.subquery = try self.normalizeScalarPipeline(shape, inner);
+                },
+                else => return clauses,
+            }
+            shape = try self.streamShape(shape, clause.*);
+        }
+        if (output.len == 0 or output[output.len - 1].operation != .project or !output[output.len - 1].operation.project.final) return output;
+        // A CALL's internal forwarding columns are not observable outputs.
+        // Prune only bound variable copies; every potentially failing scalar
+        // expression still executes even when its result is dead.
+        var required: Names = .empty;
+        for (shape) |entry| try required.put(self.a, entry.name, {});
+        var cursor = output.len;
+        while (cursor != 0) {
+            cursor -= 1;
+            switch (output[cursor].operation) {
+                .project => |*step| {
+                    for (step.value.items) |item| if (!axisPure(item.expression)) return output;
+                    if (step.value.predicate) |predicate| {
+                        if (!axisPure(predicate)) return output;
+                        try self.axisReferences(&required, predicate);
+                    }
+                    var before: Names = .empty;
+                    var kept: std.ArrayList(ast.Item) = .empty;
+                    for (step.value.items) |item| {
+                        const name = item.alias orelse try self.expressionName(item.expression);
+                        if (step.final or step.value.distinct or item.expression.value != .variable or required.contains(name)) {
+                            try kept.append(self.a, item);
+                            try self.axisReferences(&before, item.expression);
+                        }
+                    }
+                    var names = required.keyIterator();
+                    while (names.next()) |name| {
+                        const projected = for (step.value.items) |item| {
+                            if (std.mem.eql(u8, name.*, item.alias orelse try self.expressionName(item.expression))) break true;
+                        } else false;
+                        if (!projected) try before.put(self.a, name.*, {});
+                    }
+                    step.value.items = try kept.toOwnedSlice(self.a);
+                    required = before;
+                },
+                .subquery => |inner| {
+                    var shape_after = inputs[cursor];
+                    for (inner) |clause| shape_after = try self.streamShape(shape_after, clause);
+                    for (shape_after) |entry| {
+                        // Even dead returned columns must join against an
+                        // existing outer binding before the CALL can succeed.
+                        if (lookup(inputs[cursor], entry.name) != null) {
+                            try required.put(self.a, entry.name, {});
+                        } else _ = required.remove(entry.name);
+                    }
+                    var captures: Names = .empty;
+                    try self.retainQueryReferences(&captures, inputs[cursor], inner);
+                    var names = captures.keyIterator();
+                    while (names.next()) |name| try required.put(self.a, name.*, {});
+                },
+                else => return output,
+            }
+        }
+        return output;
+    }
+    const AxisCall = struct { names: []const []const u8, dependent: []const bool, captures: Names, sample: usize = 0 };
+    fn axisCall(self: *Engine, initial: Row, incoming: Names, inner: []const ast.Clause) anyerror!?AxisCall {
+        if (!scalarReturningCall(inner)) return null;
+        var shape = initial;
+        var dependent: Names = .empty;
+        var outer_names = incoming.keyIterator();
+        while (outer_names.next()) |name| try dependent.put(self.a, name.*, {});
+        for (inner) |clause| switch (clause.operation) {
+            .project => |step| {
+                const p = step.value;
+                if (p.wildcard) return null;
+                if (p.predicate) |predicate| if (!axisPure(predicate)) return null;
+                var next: Names = .empty;
+                for (p.items) |item| {
+                    if (!axisPure(item.expression)) return null;
+                    if (axisDepends(item.expression, dependent)) try next.put(self.a, item.alias orelse try self.expressionName(item.expression), {});
+                }
+                dependent = next;
+                shape = try self.streamShape(shape, clause);
+            },
+            .subquery => |nested| {
+                const scalar = (try self.axisCall(shape, dependent, nested)) orelse return null;
+                for (scalar.names, scalar.dependent) |name, bit| if (bit) try dependent.put(self.a, name, {});
+                shape = try self.streamShape(shape, clause);
+            },
+            else => return null,
+        };
+        const names = try self.a.alloc([]const u8, shape.len);
+        const bits = try self.a.alloc(bool, shape.len);
+        for (shape, names, bits) |entry, *name, *bit| {
+            // CALL joins must never turn an outer-binding conflict into an
+            // overwrite merely because the probe pruned that outer column.
+            if (lookup(initial, entry.name) != null) return null;
+            name.* = entry.name;
+            bit.* = dependent.contains(entry.name);
+        }
+        var captures: Names = .empty;
+        try self.retainQueryReferences(&captures, initial, inner);
+        return .{ .names = names, .dependent = bits, .captures = captures };
+    }
+    fn axisConsumer(self: *Engine, filter: ast.CollectionFilter, required: *Names) !bool {
+        const empty: ast.Expr = .{ .span = .{}, .value = .{ .literal = .null } };
+        const expression: ast.Expr = .{ .span = .{}, .value = if (filter.kind == .fold) .{ .reduce = .{ .alias = filter.alias, .accumulator = filter.accumulator.?, .initial = filter.initial.?, .input = &empty, .projection = filter.projection.? } } else .{ .comprehension = .{ .alias = filter.alias, .input = &empty, .predicate = filter.predicate, .projection = filter.projection } } };
+        if (!axisPure(&expression)) return false;
+        try self.axisReferences(required, &expression);
+        return true;
+    }
+    fn axisPlan(self: *Engine, fold: *StreamFold, index: usize, initial: Row) !?*AxisPlan {
         const previous = self.a;
         self.a = fold.retained;
         defer self.a = previous;
@@ -2831,28 +2968,44 @@ const Engine = struct {
         var dependencies: Names = .empty;
         const tail = fold.middle[index..];
         const dependent = try a.alloc([]const bool, tail.len);
-        for (tail, dependent) |clause, *flags| switch (clause.operation) {
-            .unwind => |u| {
-                if (!axisPure(u.expression)) return null;
-                try dependencies.put(a, u.alias, {});
-                flags.* = &.{};
-            },
-            .project => |step| {
-                const p = step.value;
-                if (p.wildcard or p.order.len != 0 or p.skip != null or p.limit != null) return null;
-                if (p.predicate) |predicate| if (!axisPure(predicate)) return null;
-                var next: Names = .empty;
-                const bits = try a.alloc(bool, p.items.len);
-                for (p.items, bits) |item, *bit| {
-                    if (aggregates(item.expression) or !axisPure(item.expression)) return null;
-                    bit.* = axisDepends(item.expression, dependencies);
-                    if (bit.*) try next.put(a, item.alias orelse try self.expressionName(item.expression), {});
-                }
-                dependencies = next;
-                flags.* = bits;
-            },
-            else => return null,
-        };
+        const calls = try a.alloc(?AxisCall, tail.len);
+        @memset(calls, null);
+        var sample_count: usize = 0;
+        var shape = initial;
+        for (tail, dependent, calls) |clause, *flags, *call_plan| {
+            switch (clause.operation) {
+                .unwind => |u| {
+                    if (!axisPure(u.expression)) return null;
+                    try dependencies.put(a, u.alias, {});
+                    flags.* = &.{};
+                },
+                .project => |step| {
+                    const p = step.value;
+                    if (p.wildcard or (p.order.len != 0 and !fold.partitioned_order) or p.skip != null or p.limit != null) return null;
+                    for (p.order) |order| if (!axisPure(order.expression)) return null;
+                    if (p.predicate) |predicate| if (!axisPure(predicate)) return null;
+                    var next: Names = .empty;
+                    const bits = try a.alloc(bool, p.items.len);
+                    for (p.items, bits) |item, *bit| {
+                        if (aggregates(item.expression) or !axisPure(item.expression)) return null;
+                        bit.* = axisDepends(item.expression, dependencies);
+                        if (bit.*) try next.put(a, item.alias orelse try self.expressionName(item.expression), {});
+                    }
+                    dependencies = next;
+                    flags.* = bits;
+                },
+                .subquery => |inner| {
+                    var scalar = (try self.axisCall(shape, dependencies, inner)) orelse return null;
+                    scalar.sample = sample_count;
+                    sample_count += 1;
+                    for (scalar.names, scalar.dependent) |name, bit| if (bit) try dependencies.put(a, name, {});
+                    call_plan.* = scalar;
+                    flags.* = &.{};
+                },
+                else => return null,
+            }
+            shape = try self.streamShape(shape, clause);
+        }
         var group_required: Names = .empty;
         for (fold.projection.items) |item| if (!aggregates(item.expression)) {
             if (!axisPure(item.expression) or axisDepends(item.expression, dependencies)) return null;
@@ -2861,11 +3014,12 @@ const Engine = struct {
         var required: Names = .empty;
         for (fold.calls) |expression| {
             const call_value = expression.value.call;
-            if (!std.ascii.eqlIgnoreCase(call_value.name, "count") and !std.ascii.eqlIgnoreCase(call_value.name, "sum") and !std.ascii.eqlIgnoreCase(call_value.name, "avg") and !std.ascii.eqlIgnoreCase(call_value.name, "min") and !std.ascii.eqlIgnoreCase(call_value.name, "max") and !(std.ascii.eqlIgnoreCase(call_value.name, "collect") and call_value.collect_limit != null and call_value.collect_filters.len == 0)) return null;
+            if (!std.ascii.eqlIgnoreCase(call_value.name, "count") and !std.ascii.eqlIgnoreCase(call_value.name, "sum") and !std.ascii.eqlIgnoreCase(call_value.name, "avg") and !std.ascii.eqlIgnoreCase(call_value.name, "min") and !std.ascii.eqlIgnoreCase(call_value.name, "max") and !(std.ascii.eqlIgnoreCase(call_value.name, "collect") and call_value.collect_limit != null)) return null;
             for (call_value.args) |argument| {
                 if (!axisPure(argument)) return null;
                 try self.axisReferences(&required, argument);
             }
+            for (call_value.collect_filters) |filter| if (!try self.axisConsumer(filter, &required)) return null;
         }
         const clauses = try a.dupe(ast.Clause, tail);
         var cursor = clauses.len;
@@ -2885,6 +3039,7 @@ const Engine = struct {
                         if (bit) try required.put(a, item.alias orelse try self.expressionName(item.expression), {});
                     };
                     if (step.value.predicate) |predicate| try self.axisReferences(&required, predicate);
+                    for (step.value.order) |order| try self.axisReferences(&required, order.expression);
                     var before: Names = .empty;
                     var group_before: Names = .empty;
                     for (step.value.items) |item| if (group_required.contains(item.alias orelse try self.expressionName(item.expression))) try self.axisReferences(&group_before, item.expression);
@@ -2905,6 +3060,19 @@ const Engine = struct {
                     step.value.items = try selected.toOwnedSlice(a);
                     required = before;
                 },
+                .subquery => {
+                    const scalar = calls[cursor].?;
+                    var grouping = false;
+                    for (scalar.names) |name| {
+                        _ = required.remove(name);
+                        grouping = group_required.remove(name) or grouping;
+                    }
+                    var captures = scalar.captures.keyIterator();
+                    while (captures.next()) |name| {
+                        try required.put(a, name.*, {});
+                        if (grouping) try group_required.put(a, name.*, {});
+                    }
+                },
                 else => unreachable,
             }
         }
@@ -2918,10 +3086,10 @@ const Engine = struct {
         };
         if (!reusable) return null;
         const plan = try a.create(AxisPlan);
-        plan.* = .{ .clauses = clauses, .original = tail, .dependent = dependent, .captures = required, .memo = .{ .identity_keys = true, .budget = .{ .backing = self.scratch_allocator, .limit = @min(4 << 20, self.limits.memory_bytes / 16) } } };
+        plan.* = .{ .clauses = clauses, .original = tail, .dependent = dependent, .calls = calls, .sample_count = sample_count, .ordered = fold.partitioned_order, .captures = required, .memo = .{ .identity_keys = true, .budget = .{ .backing = self.scratch_allocator, .limit = @min(4 << 20, self.limits.memory_bytes / 16) } } };
         return plan;
     }
-    fn axisSnapshot(self: *Engine, state_value: *StreamingAggregate) !Row {
+    fn axisSnapshot(self: *Engine, state_value: *StreamingAggregate) anyerror!Row {
         if (state_value.mean_scaled != null or state_value.distinct_support != null) return error.CypherAxisMemoDeclined;
         var members: v.Value = .null;
         const function_call = state_value.function;
@@ -2940,6 +3108,21 @@ const Engine = struct {
         if ((try self.values.info(state_value.best)).entities) return error.CypherAxisMemoDeclined;
         const collection = if (std.ascii.eqlIgnoreCase(function_call.name, "collect")) try state_value.finishWindow(self) else v.Value.null;
         if ((try self.values.info(collection)).entities) return error.CypherAxisMemoDeclined;
+        try state_value.ensureFilters();
+        const consumers = try self.a.alloc(v.Value, state_value.filter_states.len);
+        for (consumers, state_value.filter_states) |*encoded, *consumer| {
+            if ((try self.values.info(consumer.fold.accumulator)).entities) return error.CypherAxisMemoDeclined;
+            encoded.* = .{ .map = try self.a.dupe(v.Entry, &.{
+                .{ .name = "count", .value = .{ .integer = @bitCast(consumer.count) } },
+                .{ .name = "failure", .value = .{ .integer = if (consumer.failure) |err| @intFromError(err) else 0 } },
+                .{ .name = "unknown", .value = .{ .boolean = consumer.unknown } },
+                .{ .name = "decided", .value = if (consumer.decided) |answer| .{ .boolean = answer } else .null },
+                .{ .name = "window", .value = if (consumer.window) |window| .{ .map = try self.axisSnapshot(window) } else .null },
+                .{ .name = "embedding", .value = .{ .boolean = consumer.embedding_failure } },
+                .{ .name = "initialized", .value = .{ .boolean = consumer.fold.initialized } },
+                .{ .name = "accumulator", .value = consumer.fold.accumulator },
+            }) };
+        }
         return self.a.dupe(v.Entry, &.{
             .{ .name = "count", .value = .{ .integer = @bitCast(state_value.count) } },
             .{ .name = "sum", .value = state_value.sum },
@@ -2954,9 +3137,10 @@ const Engine = struct {
             .{ .name = "total", .value = .{ .integer = @bitCast(state_value.collection_count) } },
             .{ .name = "overflow", .value = .{ .boolean = state_value.collection_overflow } },
             .{ .name = "source_null", .value = .{ .boolean = state_value.source_null } },
+            .{ .name = "consumers", .value = .{ .list = consumers } },
         });
     }
-    fn axisRestore(self: *Engine, state_value: *StreamingAggregate, row: Row) !void {
+    fn axisRestore(self: *Engine, state_value: *StreamingAggregate, row: Row) anyerror!void {
         state_value.count = @bitCast(row[0].value.integer);
         state_value.sum = row[1].value;
         state_value.mean = row[2].value.number;
@@ -2983,10 +3167,32 @@ const Engine = struct {
             state_value.collection_overflow = row[11].value.boolean;
             state_value.source_null = row[12].value.boolean;
         }
+        try state_value.ensureFilters();
+        for (state_value.filter_states, state_value.function.collect_filters, row[13].value.list) |*consumer, filter, encoded| {
+            const cells = encoded.map;
+            consumer.count = @bitCast(cells[0].value.integer);
+            consumer.failure = if (cells[1].value.integer == 0) null else @errorFromInt(@as(u16, @intCast(cells[1].value.integer)));
+            consumer.unknown = cells[2].value.boolean;
+            consumer.decided = if (cells[3].value == .null) null else cells[3].value.boolean;
+            if (cells[4].value == .map) {
+                const window = try state_value.arena.allocator().create(StreamingAggregate);
+                window.* = .{ .function = .{ .name = "collect", .args = &.{}, .collect_limit = filter.prefix, .collect_suffix = filter.suffix }, .arena = std.heap.ArenaAllocator.init(self.scratch_allocator), .distinct_arena = std.heap.ArenaAllocator.init(self.scratch_allocator) };
+                consumer.window = window;
+                try self.axisRestore(window, cells[4].value.map);
+            }
+            consumer.embedding_failure = cells[5].value.boolean;
+            if (cells[6].value.boolean) try consumer.fold.own(self, cells[7].value);
+        }
     }
     fn computeAxis(self: *Engine, parent: *StreamFold, plan: *AxisPlan, key: Row) anyerror!WeightedRows {
         const columns = self.columns;
+        const stages = self.stages;
+        self.stages = .empty;
+        const retention = self.retain_windows;
         defer self.columns = columns;
+        defer self.stages = stages;
+        defer self.retain_windows = retention;
+        self.retain_windows = false;
         var groups: std.ArrayList(StreamGroup) = .empty;
         defer for (groups.items) |*group| group.deinit();
         var group_index: value_work.Index = .{};
@@ -3000,12 +3206,33 @@ const Engine = struct {
         for (items, parent.calls) |*item, expression| item.* = .{ .expression = expression };
         const projection: ast.Projection = .{ .items = items };
         try groups.append(self.a, try self.newStreamGroup(self.a, &.{}, &.{}, null, projection, parent.calls, parent.membership_leaders));
-        var trace: AxisTrace = .{ .reached = try self.a.alloc(bool, plan.clauses.len) };
+        for (groups.items[0].states) |*state_value| state_value.consumer_row = key;
+        var trace: AxisTrace = .{ .reached = try self.a.alloc(bool, plan.clauses.len), .plan = plan, .samples = try self.a.alloc(Row, plan.sample_count), .sampled = try self.a.alloc(bool, plan.sample_count), .retained = self.a };
         @memset(trace.reached, false);
-        var child: StreamFold = .{ .retained = self.a, .middle = plan.clauses, .projection = projection, .calls = parent.calls, .membership_leaders = parent.membership_leaders, .call_aliases = parent.call_aliases, .top = &top, .groups = &groups, .group_index = &group_index, .stage_counts = counts, .matched = &matched, .distinct = distinct_rows, .has_keys = false, .single_seed = true, .defer_aggregates = true, .record_rows = true, .axis_enabled = false, .axis_trace = &trace };
-        try child.expand(self, key, 0);
+        @memset(trace.samples, &.{});
+        @memset(trace.sampled, false);
+        const applies = try self.a.alloc(ApplyMemo, plan.clauses.len);
+        for (applies) |*apply| apply.* = .{ .memo = .{ .identity_keys = true, .budget = .{ .backing = self.scratch_allocator, .limit = @min(4 << 20, self.limits.memory_bytes / 32) } } };
+        defer for (applies) |*apply| apply.memo.deinit();
+        var child: StreamFold = .{ .applies = applies, .retained = self.a, .middle = plan.clauses, .projection = projection, .calls = parent.calls, .membership_leaders = parent.membership_leaders, .call_aliases = parent.call_aliases, .top = &top, .groups = &groups, .group_index = &group_index, .stage_counts = counts, .matched = &matched, .distinct = distinct_rows, .has_keys = false, .single_seed = true, .defer_aggregates = true, .record_rows = true, .axis_enabled = false, .axis_trace = &trace };
+        if (plan.ordered) {
+            var ordered_rows: []const Row = &.{key};
+            for (plan.clauses, 0..) |clause, stage| {
+                trace.reached[stage] = ordered_rows.len != 0;
+                ordered_rows = if (clause.operation == .project) try self.project(ordered_rows, clause.operation.project.value, false) else try self.run(&.{clause}, ordered_rows, false, true);
+                counts[stage + 1] = ordered_rows.len;
+                if (clause.operation == .project and clause.operation.project.value.distinct) try distinct_rows[stage].rows.appendSlice(self.a, ordered_rows);
+                if (plan.calls[stage]) |scalar| if (ordered_rows.len != 0) {
+                    var sample: std.ArrayList(v.Entry) = .empty;
+                    for (scalar.names, scalar.dependent) |name, bit| if (!bit) try sample.append(self.a, .{ .name = name, .value = lookup(ordered_rows[0], name) orelse return error.CypherInvalidBackendPage });
+                    trace.samples[scalar.sample] = sample.items;
+                };
+            }
+            for (ordered_rows) |row| try child.expand(self, row, plan.clauses.len);
+        } else try child.expand(self, key, 0);
         var rows: std.ArrayList(Row) = .empty;
-        try rows.resize(self.a, parent.calls.len + 1);
+        try rows.resize(self.a, parent.calls.len + 1 + plan.sample_count);
+        @memcpy(rows.items[1 + parent.calls.len ..], trace.samples);
         const reached = try self.a.alloc(v.Value, trace.reached.len);
         for (reached, trace.reached) |*value, yes| value.* = .{ .boolean = yes };
         const stage_values = try self.a.alloc(v.Value, counts.len);
@@ -3037,6 +3264,8 @@ const Engine = struct {
 
     const StreamFold = struct {
         axis_enabled: bool = true,
+        partitioned_order: bool = false,
+        ordered_index: ?usize = null,
         axis_plans: std.AutoHashMapUnmanaged(usize, ?*AxisPlan) = .empty,
         axis_trace: ?*AxisTrace = null,
         axis_packet: ?[]const Row = null,
@@ -3112,7 +3341,7 @@ const Engine = struct {
                 if (!repeated) return false;
             }
             const plan = (if (fold.axis_plans.get(index)) |known| known else blk: {
-                const computed = try engine.axisPlan(fold, index);
+                const computed = try engine.axisPlan(fold, index, row);
                 try fold.axis_plans.put(fold.retained, index, computed);
                 break :blk computed;
             }) orelse return false;
@@ -3146,7 +3375,7 @@ const Engine = struct {
             const summary = packet.?;
             var representative = row;
             var pending: std.ArrayList(AxisPartition) = .empty;
-            var support_offset = 1 + fold.calls.len;
+            var support_offset = 1 + fold.calls.len + plan.sample_count;
             for (fold.middle[index..], plan.dependent, summary.rows[0][0].value.list, summary.rows[0][2].value.list, index..) |clause, flags, reached, domain_length, stage| {
                 const support_rows = summary.rows[support_offset..][0..@intCast(domain_length.integer)];
                 support_offset += support_rows.len;
@@ -3169,6 +3398,11 @@ const Engine = struct {
                             }
                             try pending.append(engine.a, .{ .stage = stage, .key = partition, .rows = support_rows, .dependent = flags });
                         }
+                    },
+                    .subquery => {
+                        const scalar = plan.calls[stage - index].?;
+                        const sample = summary.rows[1 + fold.calls.len + scalar.sample];
+                        for (scalar.names, scalar.dependent) |name, bit| representative = try engine.replace(representative, name, if (bit) .null else lookup(sample, name) orelse .null);
                     },
                     else => unreachable,
                 }
@@ -3204,6 +3438,16 @@ const Engine = struct {
             if (fold.axis_trace) |trace| {
                 for (row) |entry| if ((try engine.values.info(entry.value)).entities) return error.CypherAxisMemoDeclined;
                 if (index < fold.middle.len) trace.reached[index] = true else trace.count = try trace.count.add(engine.a, fold.weight);
+                if (index != 0) if (trace.plan.calls[index - 1]) |scalar| if (!trace.sampled[scalar.sample]) {
+                    var sample: std.ArrayList(v.Entry) = .empty;
+                    for (scalar.names, scalar.dependent) |name, bit| if (!bit) try sample.append(engine.a, .{ .name = name, .value = lookup(row, name) orelse return error.CypherInvalidBackendPage });
+                    trace.samples[scalar.sample] = try engine.cloneRowScoped(sample.items, trace.retained);
+                    trace.sampled[scalar.sample] = true;
+                };
+            }
+            if (fold.ordered_index == index) {
+                if (try fold.memoAxis(engine, row, index)) return;
+                return error.CypherInvalidBackendPage;
             }
             if (index < fold.middle.len) {
                 const clause = fold.middle[index];
@@ -3312,11 +3556,12 @@ const Engine = struct {
                         defer engine.recursion -= 1;
                         if (engine.recursion > engine.limits.recursion_depth) return error.CypherRecursionBudgetExceeded;
                         const columns = engine.columns;
-                        const stages = engine.stages.items.len;
+                        const stages = engine.stages;
+                        engine.stages = .empty;
                         const saved_weight_demand = engine.match_weight_demand;
                         const retention = engine.retain_windows;
                         defer engine.columns = columns;
-                        defer engine.stages.shrinkRetainingCapacity(stages);
+                        defer engine.stages = stages;
                         defer engine.match_weight_demand = saved_weight_demand;
                         defer engine.retain_windows = retention;
                         engine.match_weight_demand = null;
@@ -3331,9 +3576,10 @@ const Engine = struct {
                         defer engine.recursion -= 1;
                         if (engine.recursion > engine.limits.recursion_depth) return error.CypherRecursionBudgetExceeded;
                         const columns = engine.columns;
-                        const stages = engine.stages.items.len;
+                        const stages = engine.stages;
+                        engine.stages = .empty;
                         defer engine.columns = columns;
-                        defer engine.stages.shrinkRetainingCapacity(stages);
+                        defer engine.stages = stages;
                         const apply = &fold.applies[index];
                         var key_arena = std.heap.ArenaAllocator.init(engine.scratch_allocator);
                         defer key_arena.deinit();
@@ -4370,6 +4616,108 @@ const Engine = struct {
         };
         return true;
     }
+    fn orderedReductionEnd(clauses: []const ast.Clause) ?usize {
+        var ordered: ?usize = null;
+        for (clauses, 0..) |clause, index| switch (clause.operation) {
+            .unwind => {},
+            .subquery => |inner| if (!scalarReturningCall(inner)) return null,
+            .project => |step| {
+                var grouped = false;
+                for (step.value.items) |item| grouped = grouped or aggregates(item.expression);
+                if (grouped) return if (ordered != null and ordered.? + 1 == index) index else null;
+                if (step.final or step.value.skip != null or step.value.limit != null) return null;
+                if (step.value.order.len != 0) {
+                    if (ordered != null) return null;
+                    ordered = index;
+                }
+            },
+            else => return null,
+        };
+        return null;
+    }
+    /// A unique outer binding retained in every grouping/distinct key makes
+    /// partitions disjoint. A total final key order makes global group discovery
+    /// irrelevant. Only then may one identical inner ordered domain be replayed.
+    fn prepareOrderedFold(self: *Engine, fold: *StreamFold, input: Row) !bool {
+        if (!self.read_only or !fold.single_seed or !fold.has_keys or fold.calls.len == 0 or fold.group_window != null or fold.consumer != null or fold.continuation != null or fold.top.* != null or fold.middle.len < 2 or fold.middle[0].operation != .unwind or fold.projection.wildcard) return false;
+        const outer = fold.middle[0].operation.unwind;
+        if (!axisPure(outer.expression)) return false;
+        var lineage: Names = .empty;
+        try lineage.put(fold.retained, outer.alias, {});
+        for (fold.middle[1..]) |clause| switch (clause.operation) {
+            .unwind => |u| {
+                _ = lineage.remove(u.alias);
+            },
+            .project => |step| {
+                var next: Names = .empty;
+                for (step.value.items) |item| if (item.expression.value == .variable and lineage.contains(item.expression.value.variable)) try next.put(fold.retained, item.alias orelse try self.expressionName(item.expression), {});
+                if (step.value.distinct and next.count() == 0) return false;
+                lineage = next;
+            },
+            .subquery => {},
+            else => return false,
+        };
+        var partition_key = false;
+        for (fold.projection.items) |item| if (!aggregates(item.expression)) {
+            partition_key = partition_key or (item.expression.value == .variable and lineage.contains(item.expression.value.variable));
+            const alias = item.alias orelse try self.expressionName(item.expression);
+            const ranked = for (fold.projection.order) |order| {
+                if (order.expression.value == .variable and std.mem.eql(u8, order.expression.value.variable, alias)) break true;
+                // Projected aliases shadow source names in ORDER BY.
+                const shadowed = for (fold.projection.items) |projected| {
+                    if (@import("expressions.zig").references(order.expression, projected.alias orelse try self.expressionName(projected.expression))) break true;
+                } else false;
+                if (!shadowed and @import("expressions.zig").same(order.expression, item.expression)) break true;
+            } else false;
+            if (!ranked) return false;
+        };
+        if (!partition_key) return false;
+        var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
+        defer scratch.deinit();
+        const scope = EvalScope.enter(self, scratch.allocator());
+        defer scope.leave(self);
+        const source = (self.unwindSource(outer.expression, input) catch |err| {
+            if (StreamingAggregate.consumerFailure(err)) return false;
+            return err;
+        }) orelse return false;
+        switch (source.values) {
+            .range => |sequence| if (sequence.length < 2) return false,
+            .list => |values| {
+                if (values.len < 2) return false;
+                var index: value_work.Index = .{};
+                for (values, 0..) |value, ordinal| {
+                    const info = try self.values.info(value);
+                    if (info.entities) return false;
+                    var candidate = index.head(info.hash);
+                    while (candidate) |position| {
+                        const link = index.links.items[position];
+                        if (try self.values.eql(values[link.index], value)) return false;
+                        candidate = link.next;
+                    }
+                    try index.insert(self.a, info.hash, ordinal);
+                }
+            },
+            .scalar => return false,
+        }
+        const shape = try self.streamShape(input, fold.middle[0]);
+        const plan = (try self.axisPlan(fold, 1, shape)) orelse return false;
+        if (plan.captures.contains(outer.alias)) {
+            plan.memo.deinit();
+            return false;
+        }
+        // Register before admission so every failure path closes the cache.
+        try fold.axis_plans.put(fold.retained, 1, plan);
+        var key: std.ArrayList(v.Entry) = .empty;
+        for (input) |entry| if (plan.captures.contains(entry.name)) try key.append(self.a, entry);
+        const packet = self.computeAxis(fold, plan, key.items) catch |err| {
+            if (StreamingAggregate.consumerFailure(err) or err == error.CypherAxisMemoDeclined) return false;
+            return err;
+        };
+        try plan.memo.put(self, key.items, null, packet);
+        if (try plan.memo.find(self, key.items, null) == null) return false;
+        fold.ordered_index = 1;
+        return true;
+    }
     fn streamMatchProjectionInto(self: *Engine, input: []const Row, input_weights: ?[]const Count, operation: ast.Match, projection: ast.Projection, original_middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span, continuation: @FieldType(StreamFold, "continuation"), consumer: ?*PatternConsumer) anyerror!?[]const Row {
         // The row pipeline nests only within the statement's stack allowance.
         // Longer clause sequences retain the iterative general executor.
@@ -4395,11 +4743,18 @@ const Engine = struct {
                 if (@import("expressions.zig").containsPattern(entry.value)) return null;
             };
         }
-        const middle = if (scalar_seed) original_middle else try self.pruneMiddle(input, operation, try self.elideMiddleOrder(input, operation, original_middle, projection), projection);
+        var middle = if (scalar_seed) original_middle else try self.pruneMiddle(input, operation, try self.elideMiddleOrder(input, operation, original_middle, projection), projection);
+        const ordered = for (middle) |clause| {
+            if (clause.operation == .project and clause.operation.project.value.order.len != 0) break true;
+        } else false;
+        if (ordered and (!scalar_seed or input.len != 1 or middle.len == 0 or middle[middle.len - 1].operation != .project or middle[middle.len - 1].operation.project.value.order.len == 0)) return null;
         var grouped = projection.distinct;
+        var reducers = false;
         for (projection.items) |item| {
+            reducers = reducers or aggregates(item.expression);
             grouped = grouped or aggregates(item.expression);
         }
+        if (scalar_seed and input.len == 1 and reducers) middle = try self.normalizeScalarPipeline(input[0], middle);
         const consumer_goal = if (continuation) |next| next.parent.unorderedGoal(self) else self.windowGoal(projection);
         // Scalar graph expressions can run in recyclable row scopes. A
         // multihop producer with an unbounded observer must still negotiate
@@ -4434,7 +4789,7 @@ const Engine = struct {
             }
             if (clause.operation != .project) return null;
             const p = clause.operation.project.value;
-            if (p.order.len != 0 or p.skip != null or p.limit != null) return null;
+            if ((!ordered and p.order.len != 0) or p.skip != null or p.limit != null) return null;
             for (p.items) |item| if (aggregates(item.expression)) return null;
         }
         // This pipeline contains only reads and row-local expressions. Writes
@@ -4547,7 +4902,7 @@ const Engine = struct {
         for (probes, middle) |*probe, clause| probe.* = .{ .budget = .{ .backing = self.scratch_allocator, .limit = @min(4 << 20, self.limits.memory_bytes / 32) }, .disabled = clause.operation != .match and clause.operation != .subquery };
         defer for (probes) |*probe| probe.deinit();
         const retention: GroupRetention = if (grouped) try self.groupRetention(projection) else .{ .a = self.a };
-        var fold: StreamFold = .{ .single_seed = scalar_seed and input.len == 1 and (input_weights == null or input_weights.?[0].isOne()), .defer_aggregates = scalar_seed and group_window == null, .consumer = consumer, .retention = &retention, .probes = probes, .optional = operation.optional, .applies = applies, .continuation = continuation, .distinct = distinct_stages, .retained = retained, .middle = middle, .projection = projection, .calls = calls.items, .membership_leaders = calls.distinct_leaders.items, .group_window = if (group_window) |*window| window else null, .call_aliases = &calls.index.pointers, .top = &top, .groups = &groups, .group_index = &group_index, .has_keys = has_keys, .stage_counts = stage_counts, .matched = &matched };
+        var fold: StreamFold = .{ .partitioned_order = ordered, .single_seed = scalar_seed and input.len == 1 and (input_weights == null or input_weights.?[0].isOne()), .defer_aggregates = scalar_seed and group_window == null, .consumer = consumer, .retention = &retention, .probes = probes, .optional = operation.optional, .applies = applies, .continuation = continuation, .distinct = distinct_stages, .retained = retained, .middle = middle, .projection = projection, .calls = calls.items, .membership_leaders = calls.distinct_leaders.items, .group_window = if (group_window) |*window| window else null, .call_aliases = &calls.index.pointers, .top = &top, .groups = &groups, .group_index = &group_index, .has_keys = has_keys, .stage_counts = stage_counts, .matched = &matched };
         defer fold.closeAxes();
         var adaptive_probe = adaptive_candidate;
         if (adaptive_probe) for (input) |row| {
@@ -4615,6 +4970,7 @@ const Engine = struct {
         self.stream_predicate = operation.predicate;
         const zero_limit = if (projection.limit) |limit| try self.count(limit) == 0 else false;
         const passes = if (count_endpoints and !zero_limit) try self.reductionPasses(input, operation, projection, middle, calls.items) else try retained.dupe(ReductionPass, &.{.{ .projection = projection }});
+        if (ordered and (passes.len != 1 or !try self.prepareOrderedFold(&fold, input[0]))) return null;
         for (passes, 0..) |pass, pass_index| {
             fold.active_calls = pass.active_calls;
             fold.record_rows = pass_index == 0;
@@ -5679,6 +6035,23 @@ const Engine = struct {
                 },
                 .unwind => |u| {
                     var fused = false;
+                    if (orderedReductionEnd(clauses[clause_index..])) |relative| {
+                        const index = clause_index + relative;
+                        const following = clauses[index];
+                        self.retain_windows = (retain_final and index + 1 == clauses.len) or (!following.operation.project.final and self.weightedTail(clauses[index + 1 ..]));
+                        if (try self.streamMatchProjectionWeighted(bags.rows, bags.weights, .{ .paths = &.{} }, following.operation.project.value, clauses[clause_index..index], .{}, following.span)) |output| {
+                            if (self.pending_window) |window| {
+                                bags = window;
+                                self.pending_window = null;
+                            } else {
+                                const weights = try self.a.alloc(Count, output.len);
+                                @memset(weights, Count.one);
+                                bags = .{ .rows = output, .weights = weights };
+                            }
+                            clause_index = index;
+                            continue;
+                        }
+                    }
                     for (clauses[clause_index + 1 ..], clause_index + 1..) |following, index| {
                         if (following.operation == .unwind or following.operation == .match or (following.operation == .subquery and pureReturningCall(following.operation.subquery))) continue;
                         if (following.operation != .project) break;

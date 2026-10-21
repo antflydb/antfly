@@ -5453,6 +5453,16 @@ test "ordered reduction memos cover multiple outputs floats reversals and overla
     const cases = [_]struct { text: []const u8, expected: []const v.Value, floating: bool = false }{
         .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x WITH i,x+1 AS y,x*2 AS z RETURN i,sum(y),sum(z) ORDER BY i", .expected = &.{ .{ .integer = 500500 }, .{ .integer = 999000 } } },
         .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x RETURN i,avg(x) ORDER BY i", .expected = &.{.{ .number = 499.5 }} },
+        .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x WITH * WHERE x>500 RETURN i,avg(x) ORDER BY i", .expected = &.{.{ .number = 750 }} },
+        .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x RETURN i,avg(x),any(v IN collect(x) WHERE v>500) ORDER BY i", .expected = &.{ .{ .number = 499.5 }, .{ .boolean = true } } },
+        .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x RETURN i,avg(x),head([v IN collect(x) WHERE v>500]) ORDER BY i", .expected = &.{ .{ .number = 499.5 }, .{ .integer = 501 } } },
+        .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x RETURN i,avg(x),reduce(s=0,v IN collect(x)|s+v) ORDER BY i", .expected = &.{ .{ .number = 499.5 }, .{ .integer = 499500 } } },
+        .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x WITH i,x ORDER BY x DESC RETURN i,avg(x),head(collect(x)) ORDER BY i", .expected = &.{ .{ .number = 499.5 }, .{ .integer = 999 } } },
+        .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x CALL {RETURN x*2 AS y} RETURN i,avg(y) ORDER BY i", .expected = &.{.{ .number = 999 }} },
+        .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x CALL {WITH * RETURN x*2 AS y} RETURN i,avg(y) ORDER BY i", .expected = &.{.{ .number = 999 }} },
+
+        .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x CALL {WITH x AS t RETURN t*2 AS y,7 AS z} RETURN i,avg(y),min(z) ORDER BY i", .expected = &.{ .{ .number = 999 }, .{ .integer = 7 } } },
+
         .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x WITH i,x WHERE x>500 RETURN i,avg(x) ORDER BY i", .expected = &.{.{ .number = 750 }} },
         .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x WITH DISTINCT i,x RETURN i,avg(x) ORDER BY i", .expected = &.{.{ .number = 499.5 }} },
         .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x RETURN i,avg(x),head(collect(x)),last(collect(x)) ORDER BY i", .expected = &.{ .{ .number = 499.5 }, .{ .integer = 0 }, .{ .integer = 999 } } },
@@ -5504,7 +5514,8 @@ test "ordered reduction snapshots match independent sequential execution across 
             var diagnostic: c.Diagnostic = .{};
             var fast = try c.compile(a, text, .{}, &diagnostic);
             defer fast.deinit();
-            const control = try std.fmt.allocPrint(a, "{s},sum(0)+size(coalesce(collect(null),[]))", .{text});
+            const split = std.mem.lastIndexOf(u8, text, " ORDER BY i") orelse text.len;
+            const control = try std.fmt.allocPrint(a, "{s},sum(0)+size(coalesce(collect(null),[])){s}", .{ text[0..split], text[split..] });
             defer a.free(control);
             var slow = try c.compile(a, control, .{}, &diagnostic);
             defer slow.deinit();
@@ -5535,6 +5546,14 @@ test "ordered reduction snapshots match independent sequential execution across 
             "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x+1 AS y,x*2 AS z RETURN i,sum(y),avg(z)",
             "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND reverse(xs) AS x RETURN i,sum(x),avg(x),sum(DISTINCT x)",
             "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x RETURN i,CASE WHEN i=2 THEN avg(x) ELSE 7 END",
+            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH * WHERE x IS NOT NULL RETURN i,avg(x),count(*)",
+            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x RETURN i,avg(x),any(v IN collect(x) WHERE v>1),reduce(s=0,v IN collect(x)|s+v),head([v IN collect(x) WHERE v>1])",
+            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x RETURN i,avg(x),any(v IN collect(DISTINCT x) WHERE v>1),reduce(s=0,v IN collect(DISTINCT x)|s+v),last([v IN collect(DISTINCT x) WHERE v>1])",
+            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {RETURN x*2 AS y,7 AS z} RETURN i,avg(y),min(z)",
+            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {CALL {RETURN x AS t} WITH t WHERE t IS NOT NULL RETURN CASE WHEN t>0 THEN t ELSE 7 END AS y} RETURN i,avg(y),head(collect(y))",
+            "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x ORDER BY x DESC RETURN i,sum(x),avg(x),head(collect(x)),last(collect(x)) ORDER BY i",
+            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x ORDER BY x DESC RETURN i,sum(x),avg(x),head(collect(x)),last(collect(x)) ORDER BY i",
+            "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x ORDER BY x DESC RETURN i,avg(x+i) ORDER BY i",
 
             "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH DISTINCT i,x RETURN i,avg(x),count(*)",
             "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x WHERE x IS NOT NULL AND x>0 RETURN i,sum(x),avg(x),head(collect(x)),last(collect(x))",
@@ -5567,6 +5586,10 @@ test "ordered reduction memo owners release every failed allocation" {
 
         "UNWIND [1,2,1] AS i UNWIND [1,2,3] AS x WITH DISTINCT i,x RETURN i,avg(x),head(collect(x)),last(collect(x))",
         "UNWIND [1,2] AS i UNWIND [1,2,3] AS x WITH i,x WHERE x>1 RETURN i,avg(x),collect(DISTINCT x)[0..1],collect(DISTINCT x)[-1..]",
+        "UNWIND [1,2,1] AS i UNWIND [1,2,3] AS x WITH * RETURN i,avg(x),any(v IN collect(DISTINCT x) WHERE v>1),reduce(s=0,v IN collect(DISTINCT x)|s+v),head([v IN collect(x) WHERE v>1])",
+        "UNWIND [1,2] AS i UNWIND [1,2,3] AS x CALL {WITH x AS t RETURN t*2 AS y,7 AS z} RETURN i,avg(y),min(z)",
+        "UNWIND [1,2] AS i UNWIND [1,2,3] AS x CALL {WITH * CALL {RETURN x AS t} RETURN t*2 AS y} RETURN i,avg(y)",
+        "UNWIND [1,2] AS i UNWIND [3,1,2] AS x WITH i,x ORDER BY x DESC RETURN i,avg(x),head(collect(x)) ORDER BY i",
     }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{text});
 }
 
@@ -5590,4 +5613,52 @@ test "partitioned distinct and collection snapshots retain filters and contribut
         var fixture: Fixture = .{};
         try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
     }
+}
+
+test "normalized scalar scopes and ordered certificates preserve barriers and lazy failures" {
+    try check("UNWIND [1,2] AS i UNWIND [1,2] AS x CALL {WITH * CALL {RETURN x AS z} RETURN z*2 AS y} RETURN i,avg(y) ORDER BY i", "[[1,3],[2,3]]");
+    try check("UNWIND [2,1] AS i UNWIND [3,1,2] AS x WITH *,x*2 AS y WHERE y>2 RETURN i,avg(y) ORDER BY i", "[[1,5],[2,5]]");
+    try check("UNWIND [1,2,1] AS i UNWIND [1,2,3] AS x CALL {WITH x AS t WHERE t>1 RETURN t*2 AS y,7 AS z} RETURN i,avg(y),z ORDER BY i", "[[1,5,7],[2,5,7]]");
+    try check("UNWIND [1,2] AS i UNWIND [1] AS x CALL {WITH x WHERE false RETURN 1/0 AS y} RETURN i,avg(y)", "[]");
+    try check("UNWIND [1,2,1] AS i UNWIND [1,2,3] AS x RETURN i,reduce(s=0,v IN collect(x)|s+v),any(v IN collect(x) WHERE v>2),head([v IN collect(x) WHERE v>1]) ORDER BY i", "[[1,12,true,2],[2,6,true,2]]");
+    try check("UNWIND [1,2,1] AS i UNWIND [1,2,3] AS x RETURN i,reduce(s=0,v IN collect(DISTINCT x)|s+v),any(v IN collect(DISTINCT x) WHERE v>2) ORDER BY i", "[[1,6,true],[2,6,true]]");
+    try check("UNWIND [1,2] AS i UNWIND [null] AS x RETURN i,reduce(s=7,v IN collect(x)|s+v),any(v IN collect(x) WHERE v>2),head([v IN collect(x) WHERE v>1]) ORDER BY i", "[[1,7,false,null],[2,7,false,null]]");
+    try check("UNWIND [1,2] AS i UNWIND [1,2] AS x RETURN i,CASE WHEN false THEN reduce(s=1/0,v IN collect(x)|s+v) ELSE 7 END ORDER BY i", "[[1,7],[2,7]]");
+    try check("UNWIND [1,2] AS i UNWIND [1,2] AS x WITH i,x ORDER BY x DESC RETURN i,head(collect(x)),last(collect(x)) ORDER BY i", "[[1,2,1],[2,2,1]]");
+    try check("UNWIND [1,2,1] AS i UNWIND [1,2] AS x WITH i,x ORDER BY x DESC RETURN i,collect(x) ORDER BY i", "[[1,[2,2,1,1]],[2,[2,1]]]");
+    try check("UNWIND [1,1.0,2] AS i UNWIND [1,2] AS x WITH i,x ORDER BY x DESC RETURN i,count(*) ORDER BY i", "[[1,4],[2,2]]");
+    try check("UNWIND [1,2] AS i UNWIND [1,2] AS x WITH i,x ORDER BY x DESC LIMIT 1 RETURN i,count(*) ORDER BY i", "[[1,1]]");
+    try check("UNWIND [1,2] AS i UNWIND [] AS x WITH i,x,1/0 AS bad ORDER BY x RETURN i,avg(x) ORDER BY i", "[]");
+    {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, "UNWIND [1,2] AS i UNWIND [1,2] AS x CALL {WITH * CALL {RETURN 7 AS x} RETURN 1 AS y} RETURN i,avg(y)", .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherVariableConflict, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+    for ([_][]const u8{
+        "UNWIND [1,2] AS i UNWIND [1,2] AS x WITH i,1/0 AS bad,x ORDER BY x RETURN i,avg(x) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND [1,2] AS x CALL {RETURN 1/0 AS y} RETURN i,avg(y)",
+        "UNWIND [1,2] AS i UNWIND [1,2] AS x CALL {WITH *,1/0 AS bad RETURN x AS y} RETURN i,avg(y)",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}
+
+test "ordered domain cache admission does not add depth to captured values" {
+    var cells: [65]v.Value = undefined;
+    cells[0] = .{ .integer = 7 };
+    for (1..cells.len) |index| cells[index] = .{ .list = cells[index - 1 .. index] };
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "UNWIND [1,2] AS i UNWIND $xs AS x WITH i,x ORDER BY x RETURN i,count(*) ORDER BY i", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{.{ .name = "xs", .value = cells[64] }}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    for (result.rows) |row| try std.testing.expectEqual(@as(i64, 1), row[1].integer);
 }

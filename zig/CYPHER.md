@@ -1946,6 +1946,34 @@ every original COLLECT argument continues to evaluate. SINGLE caps true
 multiplicity at two, including promoted weighted bags; empty inputs and unknown
 answers retain ordinary Cypher semantics.
 
+Repeated scalar UNWIND domains can reuse exact sequential reducer snapshots
+across fresh groups. A bounded statement-local cache keys complete captured
+bindings by allocation identity and representation. SUM/AVG retain their original
+floating transitions; DISTINCT support is shared without merging group membership.
+Bounded collection snapshots include consumer decisions, three-valued predicate
+state, prefix/suffix windows and sequential REDUCE accumulators. Deferred consumer
+errors and uninitialized accumulators preserve lazy evaluation. Continued groups
+and repeated DISTINCT partitions return to ordinary sequential membership and
+transition processing.
+
+For scalar reduction pipelines, bound WITH wildcards become explicit columns
+before capture analysis. Scalar returning CALL bodies participate through lexical
+capture and output-dependency analysis, including nested calls and local WITH
+scopes. Internal variable forwarding can be pruned, while potentially failing
+expressions and binding conflicts remain observable. Independent returned values
+come from reached execution samples; dependent branches are never evaluated
+against placeholder values. Full collections, effects and unsupported bodies
+retain their existing execution paths.
+
+An intermediate ORDER BY can share one sorted inner domain only after proving a
+unique outer source, unchanged partition lineage in every DISTINCT and grouping
+key, identical captured inner inputs, and final ordering by every grouping key.
+The complete bounded snapshot must be admitted before any outer group is
+published. Repeated outer keys, cross-partition DISTINCT, correlated ordering,
+global intermediate windows, and unproved final ordering preserve the global
+sort. The cache admits at most the smaller of 4 MiB and one sixteenth of the query
+memory budget; admission failure falls back before publishing partial state.
+
 Ordinary REDUCE expressions share the collection fold's bounded accumulator
 ownership and per-transition scratch lifetime. Each ownership transfer preserves
 immutable DAG sharing and transfers root structural metadata into an accumulator
