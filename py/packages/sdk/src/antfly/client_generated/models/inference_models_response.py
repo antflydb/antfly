@@ -7,6 +7,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.inference_models_response_object import InferenceModelsResponseObject
+from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.inference_backend_runtimes import InferenceBackendRuntimes
@@ -44,6 +45,8 @@ class InferenceModelsResponse:
         readers (InferenceModelsResponseReaders): Available reader/OCR models from models_dir/readers/
         transcribers (InferenceModelsResponseTranscribers): Available transcriber/speech-to-text models from
             models_dir/transcribers/
+        public_inference_enabled (bool | Unset): Whether public inference execution is enabled on this deployment.
+            Internal database inference is independent. Omitted by standalone inference runtimes without deployment policy.
     """
 
     object_: InferenceModelsResponseObject
@@ -59,6 +62,7 @@ class InferenceModelsResponse:
     readers: InferenceModelsResponseReaders
     transcribers: InferenceModelsResponseTranscribers
     allow_downloads: bool = True
+    public_inference_enabled: bool | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -91,6 +95,8 @@ class InferenceModelsResponse:
 
         transcribers = self.transcribers.to_dict()
 
+        public_inference_enabled = self.public_inference_enabled
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -110,6 +116,8 @@ class InferenceModelsResponse:
                 "transcribers": transcribers,
             }
         )
+        if public_inference_enabled is not UNSET:
+            field_dict["public_inference_enabled"] = public_inference_enabled
 
         return field_dict
 
@@ -159,6 +167,8 @@ class InferenceModelsResponse:
 
         transcribers = InferenceModelsResponseTranscribers.from_dict(d.pop("transcribers"))
 
+        public_inference_enabled = d.pop("public_inference_enabled", UNSET)
+
         inference_models_response = cls(
             object_=object_,
             data=data,
@@ -173,6 +183,7 @@ class InferenceModelsResponse:
             rewriters=rewriters,
             readers=readers,
             transcribers=transcribers,
+            public_inference_enabled=public_inference_enabled,
         )
 
         inference_models_response.additional_properties = d

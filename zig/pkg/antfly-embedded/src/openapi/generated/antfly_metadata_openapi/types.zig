@@ -2721,6 +2721,12 @@ pub const ComposedTableSource = struct {
 pub const ConnectedModel = struct {
     /// Model identifier as reported by the provider.
     name: []const u8,
+    /// Canonical public gateway identity when available.
+    id: ?[]const u8 = null,
+    /// Availability observation independent of capability support.
+    availability: ?[]const u8 = null,
+    /// Whether metadata is configured, live, or cached.
+    freshness: ?[]const u8 = null,
     /// Human-readable model name when the provider reports one.
     display_name: ?[]const u8 = null,
     /// Embedding output dimension when known.
@@ -2731,6 +2737,9 @@ pub const ConnectedModel = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "name", "name", false },
+        .{ "id", "id", true },
+        .{ "availability", "availability", true },
+        .{ "freshness", "freshness", true },
         .{ "display_name", "display_name", true },
         .{ "dimensions", "dimensions", true },
         .{ "configured", "configured", true },
@@ -2748,6 +2757,18 @@ pub const ConnectedModel = struct {
         try jw.beginObject();
         try jw.objectField("name");
         try jw.write(self.name);
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.availability) |value| {
+            try jw.objectField("availability");
+            try jw.write(value);
+        }
+        if (self.freshness) |value| {
+            try jw.objectField("freshness");
+            try jw.write(value);
+        }
         if (self.display_name) |value| {
             try jw.objectField("display_name");
             try jw.write(value);
@@ -2775,6 +2796,9 @@ pub const ConnectedModelType = enum {
     reader,
     transcriber,
     extractor,
+    decider,
+    synthesizer,
+    predictor,
     other,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -2788,6 +2812,9 @@ pub const ConnectedModelType = enum {
             .reader => "reader",
             .transcriber => "transcriber",
             .extractor => "extractor",
+            .decider => "decider",
+            .synthesizer => "synthesizer",
+            .predictor => "predictor",
             .other => "other",
         };
         try jw.write(s);
@@ -2808,6 +2835,9 @@ pub const ConnectedModelType = enum {
             .{ "reader", .reader },
             .{ "transcriber", .transcriber },
             .{ "extractor", .extractor },
+            .{ "decider", .decider },
+            .{ "synthesizer", .synthesizer },
+            .{ "predictor", .predictor },
             .{ "other", .other },
         });
         return map.get(s) orelse error.UnexpectedToken;
@@ -5695,7 +5725,7 @@ pub const InferenceCapacityError = struct {
 
 pub const InferenceConnection = struct {
     provider: InferenceProviderType,
-    /// Resolved endpoint URL when applicable.
+    /// Transport endpoint. Omitted from public inference discovery to keep server-owned URLs private.
     url: ?[]const u8 = null,
     /// Cloud region (Bedrock).
     region: ?[]const u8 = null,

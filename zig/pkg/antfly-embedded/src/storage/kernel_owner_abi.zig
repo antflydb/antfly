@@ -268,8 +268,6 @@ pub const LocalQueryExecutionOptions = extern struct {
     /// Presentation only; never used for storage lookup or authorization.
     /// Borrowed through this synchronous call and response serialization.
     response_table_name: BorrowedBytes = .{},
-    graph_owning_table: BorrowedBytes = .{},
-    graph_index_complete_snapshot: u8 = 0,
 };
 
 /// One complete local query against a DB owned by the storage archive. The DB
@@ -1012,6 +1010,7 @@ pub const EntityUpsert = extern struct {
     key: BorrowedBytes = .{},
     doc_json: BorrowedBytes = .{},
     delete: u8 = 0,
+    skip_if_missing: u8 = 0,
 };
 pub const EntityUpsertFn = *const fn (
     ?*anyopaque,
@@ -1025,16 +1024,13 @@ pub const EntityUpsertBatchFn = *const fn (
     u64,
 ) callconv(.c) Status;
 
+pub const EntitySupportsCurationFn = *const fn (?*anyopaque, *u8) callconv(.c) Status;
+
 pub const EntitySinkConfig = extern struct {
     callback_ctx: ?*anyopaque = null,
     upsert_fn: ?EntityUpsertFn = null,
     upsert_batch_fn: ?EntityUpsertBatchFn = null,
-    supports_curation_fn: ?*const fn (?*anyopaque, *u8) callconv(.c) Status = null,
-    pub fn curationCapability(self: EntitySinkConfig, supported: *u8) Status {
-        supported.* = 0;
-        const callback = self.supports_curation_fn orelse return .ok;
-        return callback(self.callback_ctx, supported);
-    }
+    supports_curation_fn: ?EntitySupportsCurationFn = null,
 };
 
 pub const PromotionOwnerFn = *const fn (?*anyopaque, u64) callconv(.c) u8;

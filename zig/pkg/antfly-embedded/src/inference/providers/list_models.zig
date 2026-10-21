@@ -30,9 +30,13 @@ const provider_defaults = @import("antfly_inference_provider_defaults");
 pub const ModelKind = enum {
     embedder,
     generator,
+    chain,
+    synthesizer,
+    predictor,
     reranker,
     chunker,
     classifier,
+    decider,
     rewriter,
     reader,
     transcriber,
@@ -43,9 +47,13 @@ pub const ModelKind = enum {
         return switch (self) {
             .embedder => "embedders",
             .generator => "generators",
+            .chain => "chains",
+            .synthesizer => "synthesizers",
+            .predictor => "predictors",
             .reranker => "rerankers",
             .chunker => "chunkers",
             .classifier => "classifiers",
+            .decider => "deciders",
             .rewriter => "rewriters",
             .reader => "readers",
             .transcriber => "transcribers",
@@ -153,19 +161,21 @@ fn listGemini(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, timeo
 }
 
 fn listVertex(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, timeout_ms: u64) !ListResult {
+    const control = vertex.RequestControl.fromTimeout(timeout_ms, http.config.request_cancellation);
+    try control.check();
     const base = provider_defaults.normalizedBase(ep.url, provider_defaults.vertex_v1beta1_base);
     const project_id = if (ep.project_id.len > 0)
         ep.project_id
     else
-        (try vertex.vertexProjectIdFromConfigAlloc(alloc, if (ep.credentials_path.len > 0) ep.credentials_path else null) orelse return error.MissingVertexCredentials);
+        (try vertex.vertexProjectIdFromConfigAllocWithControl(alloc, if (ep.credentials_path.len > 0) ep.credentials_path else null, control) orelse return error.MissingVertexCredentials);
     defer if (ep.project_id.len == 0) alloc.free(project_id);
     const location = if (ep.location.len > 0) ep.location else provider_defaults.default_google_location;
     const url = try std.fmt.allocPrint(alloc, "{s}/projects/{s}/locations/{s}/publishers/google/models?pageSize=100", .{ base, project_id, location });
     defer alloc.free(url);
-    const auth = try vertex.mintAuthorizationValueAlloc(alloc, if (ep.credentials_path.len > 0) ep.credentials_path else null);
+    const auth = try vertex.mintAuthorizationValueAllocWithControl(alloc, if (ep.credentials_path.len > 0) ep.credentials_path else null, control);
     defer alloc.free(auth);
     const headers = [_][2][]const u8{.{ "Authorization", auth }};
-    const body = try getBodyAlloc(alloc, http, url, &headers, timeout_ms);
+    const body = try getBodyAlloc(alloc, http, url, &headers, (try control.remainingTimeoutMs()) orelse timeout_ms);
     defer alloc.free(body);
     return try parseVertexPublisherModels(alloc, body);
 }
@@ -273,6 +283,7 @@ fn appendPathIfMissing(alloc: std.mem.Allocator, raw: []const u8, suffix: []cons
 const ResultBuilder = struct {
     alloc: std.mem.Allocator,
     models: std.ArrayListUnmanaged(ListedModel) = .empty,
+    roles: std.StringHashMapUnmanaged([std.meta.tags(ModelKind).len]?usize) = .empty,
 
     fn init(alloc: std.mem.Allocator) ResultBuilder {
         return .{ .alloc = alloc };
@@ -281,6 +292,7 @@ const ResultBuilder = struct {
     pub fn deinit(self: *ResultBuilder) void {
         for (self.models.items) |*model| model.deinit(self.alloc);
         self.models.deinit(self.alloc);
+        self.roles.deinit(self.alloc);
     }
 
     fn append(self: *ResultBuilder, name: []const u8, display_name: ?[]const u8, kind: ModelKind, dimensions: ?u32) !void {
@@ -296,8 +308,35 @@ const ResultBuilder = struct {
         });
     }
 
+    fn hasName(self: *const ResultBuilder, name: []const u8) bool {
+        return self.roles.contains(name);
+    }
+
+    fn appendRole(self: *ResultBuilder, name: []const u8, display_name: ?[]const u8, kind: ModelKind, dimensions: ?u32) !void {
+        const entry = try self.roles.getOrPut(self.alloc, name);
+        if (!entry.found_existing) entry.value_ptr.* = @splat(null);
+        const slot = @backingInt(if (kind == .chain) ModelKind.generator else kind);
+        if (entry.value_ptr[slot]) |index| {
+            if (self.models.items[index].dimensions == null) self.models.items[index].dimensions = dimensions;
+            return;
+        }
+        if (kind == .other and entry.found_existing) return;
+        if (kind != .other) if (entry.value_ptr[@backingInt(ModelKind.other)]) |index| {
+            self.models.items[index].kind = kind;
+            self.models.items[index].dimensions = dimensions orelse self.models.items[index].dimensions;
+            entry.value_ptr[@backingInt(ModelKind.other)] = null;
+            entry.value_ptr[slot] = index;
+            return;
+        };
+        try self.append(name, display_name, kind, dimensions);
+        entry.value_ptr[slot] = self.models.items.len - 1;
+    }
+
     fn toOwned(self: *ResultBuilder) !ListResult {
-        return .{ .models = try self.models.toOwnedSlice(self.alloc) };
+        const models = try self.models.toOwnedSlice(self.alloc);
+        self.roles.deinit(self.alloc);
+        self.roles = .empty;
+        return .{ .models = models };
     }
 };
 
@@ -490,22 +529,62 @@ pub fn parseAntflyModels(alloc: std.mem.Allocator, body: []const u8) !ListResult
     var builder = ResultBuilder.init(alloc);
     errdefer builder.deinit();
 
-    const groups = [_]ModelKind{ .embedder, .generator, .reranker, .chunker, .classifier, .rewriter, .reader, .transcriber, .extractor };
-    for (groups) |kind| {
-        const group_value = parsed.value.object.get(kind.groupKey()) orelse continue;
-        if (group_value != .object) continue;
-        var it = group_value.object.iterator();
+    // Native groups and task-qualified OpenAI descriptors are complementary
+    // views of the same catalog. Preserve every known role without letting
+    // an unclassified data entry erase a grouped role or duplicate its ID.
+    for (std.meta.tags(ModelKind)) |kind| {
+        const group = parsed.value.object.get(kind.groupKey()) orelse continue;
+        if (group != .object) continue;
+        var it = group.object.iterator();
         while (it.next()) |entry| {
-            var dimensions: ?u32 = null;
-            if (entry.value_ptr.* == .object) {
-                if (entry.value_ptr.object.get("dimensions")) |dims| {
-                    if (dims == .integer and dims.integer > 0) dimensions = @intCast(dims.integer);
-                }
-            }
-            try builder.append(entry.key_ptr.*, null, kind, dimensions);
+            if (entry.key_ptr.len == 0) continue;
+            try builder.appendRole(entry.key_ptr.*, null, kind, antflyDimensions(entry.value_ptr.*));
         }
     }
+    if (parsed.value.object.get("data")) |data| if (data == .array) {
+        for (data.array.items) |item| {
+            if (item != .object) continue;
+            const id = item.object.get("id") orelse continue;
+            if (id != .string or id.string.len == 0) continue;
+            const display = if (item.object.get("display_name")) |value| if (value == .string) value.string else null else null;
+            const dimensions = antflyDimensions(item);
+            var classified = false;
+            if (item.object.get("tasks")) |tasks| if (tasks == .array) {
+                for (tasks.array.items) |task| if (antflyTaskKind(task)) |kind| {
+                    try builder.appendRole(id.string, display, kind, dimensions);
+                    classified = true;
+                };
+            };
+            if (!classified) if (item.object.get("task")) |task| if (antflyTaskKind(task)) |kind| {
+                try builder.appendRole(id.string, display, kind, dimensions);
+                classified = true;
+            };
+            if (!classified and !builder.hasName(id.string)) try builder.appendRole(id.string, display, .other, dimensions);
+        }
+    };
     return try builder.toOwned();
+}
+
+fn antflyDimensions(value: std.json.Value) ?u32 {
+    if (value != .object) return null;
+    const dimensions = value.object.get("dimensions") orelse blk: {
+        const limits = value.object.get("limits") orelse return null;
+        if (limits != .object) return null;
+        break :blk limits.object.get("dimensions") orelse return null;
+    };
+    return if (dimensions == .integer and dimensions.integer > 0) std.math.cast(u32, dimensions.integer) else null;
+}
+
+fn antflyTaskKind(value: std.json.Value) ?ModelKind {
+    if (value != .string) return null;
+    const Pair = struct { []const u8, ModelKind };
+    for ([_]Pair{
+        .{ "generate", .generator },     .{ "embed", .embedder },         .{ "decide", .decider },
+        .{ "rerank", .reranker },        .{ "chunk", .chunker },          .{ "read", .reader },
+        .{ "transcribe", .transcriber }, .{ "synthesize", .synthesizer }, .{ "predict", .predictor },
+        .{ "extract", .extractor },      .{ "rewrite", .rewriter },
+    }) |pair| if (std.mem.eql(u8, value.string, pair[0])) return pair[1];
+    return null;
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -662,4 +741,26 @@ test "antfly base url normalization" {
         defer alloc.free(normalized);
         try std.testing.expectEqualStrings(case[1], normalized);
     }
+}
+
+fn checkAntflyMergedCatalog(alloc: std.mem.Allocator) !void {
+    var result = try parseAntflyModels(alloc,
+        \\{"generators":{"g":{}},"chains":{"chains/c":{}},
+        \\ "synthesizers":{"voice":{}},"predictors":{"risk":{}},
+        \\ "data":[{"id":"chains/c","task":"generate"},{"id":"voice","tasks":["synthesize"]},
+        \\ {"id":"multi","tasks":["generate","embed","embed"],"limits":{"dimensions":768}},
+        \\ {"id":"later"},{"id":"later","task":"read"},{"id":"unknown","tasks":["future"]},
+        \\ {"id":""},{"id":false},null,{"id":"huge","task":"embed","dimensions":4294967296}]}
+    );
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 9), result.models.len);
+    const expected = [_]ModelKind{ .generator, .chain, .synthesizer, .predictor, .generator, .embedder, .reader, .other, .embedder };
+    for (result.models, expected) |model, kind| try std.testing.expectEqual(kind, model.kind);
+    try std.testing.expectEqual(@as(?u32, 768), result.models[5].dimensions);
+    try std.testing.expectEqual(@as(?u32, null), result.models[8].dimensions);
+}
+
+test "parse antfly merges grouped and task qualified catalogs without losing roles" {
+    try checkAntflyMergedCatalog(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkAntflyMergedCatalog, .{});
 }

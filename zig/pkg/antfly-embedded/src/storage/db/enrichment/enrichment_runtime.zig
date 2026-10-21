@@ -22463,8 +22463,57 @@ fn prepareGraphAssetForRuntime(
         const source = runtime.index_manager.graphArtifactSourceForArtifact(graph_entry.config.name, artifact_name) orelse continue;
 
         const edge_limit = graph_asset_state.effectiveEdgeLimit(graph_entry.max_edges_per_document);
-        const graph_writes = try runtimeGraphWritesWithResolutionsAlloc(runtime.alloc, graph_entry.config.name, request.doc_key, value, source, request.content_type, raw_doc, endpoint_resolutions, graph_asset_state.hard_max_relation_items_per_artifact);
+        var graph_writes = try runtimeGraphWritesWithResolutionsAlloc(runtime.alloc, graph_entry.config.name, request.doc_key, value, source, request.content_type, raw_doc, endpoint_resolutions, graph_asset_state.hard_max_relation_items_per_artifact);
         defer runtimeFreeGraphWrites(runtime.alloc, graph_writes);
+        if (comptime @hasDecl(@typeInfo(@TypeOf(runtime)).pointer.child, "getResolutionAlloc")) {
+            if (source.mention_edge_type.len > 0) for (runtime.index_manager.resolvers.items) |*cfg| {
+                if (!std.mem.eql(u8, cfg.source_artifact, artifact_name)) continue;
+                const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(runtime.alloc, request.doc_key, cfg.resolution_artifact);
+                defer runtime.alloc.free(resolution_key);
+                const resolution = try runtime.getResolutionAlloc(resolution_key) orelse continue;
+                defer runtime.alloc.free(resolution);
+                const mentions = try @import("../graph_mention_projection.zig").writesAlloc(runtime.alloc, graph_entry.config.name, request.doc_key, resolution, value, source.mention_edge_type, cfg, false);
+                defer runtimeFreeGraphWrites(runtime.alloc, mentions);
+                if (source.mapping.source_template.len > 0) {
+                    var doc = try std.json.parseFromSlice(std.json.Value, runtime.alloc, raw_doc, .{});
+                    defer doc.deinit();
+                    const renderer = @import("../graph_restore_materialization.zig").renderGraphArtifactTemplateAlloc;
+                    for (mentions, 0..) |*write, item_index| {
+                        var item: std.json.ObjectMap = .empty;
+                        defer item.deinit(runtime.alloc);
+                        try item.put(runtime.alloc, "id", .{ .string = write.target });
+                        try item.put(runtime.alloc, "target", .{ .string = write.target });
+                        try item.put(runtime.alloc, "source", .{ .string = request.doc_key });
+                        const endpoint = try renderer(runtime.alloc, source.mapping.source_template, request.doc_key, doc.value, .{ .object = item }, item_index, source.artifact_name, "application/json", .null);
+                        errdefer runtime.alloc.free(endpoint);
+                        if (endpoint.len == 0) return error.InvalidGraphEdges;
+                        const edge_id = try renderer(runtime.alloc, source.mapping.edge_id_template, request.doc_key, doc.value, .{ .object = item }, item_index, source.artifact_name, "application/json", .null);
+                        errdefer runtime.alloc.free(edge_id);
+                        if (edge_id.len == 0) return error.InvalidGraphEdges;
+                        const owner = try runtime.alloc.dupe(u8, request.doc_key);
+                        runtime.alloc.free(@constCast(write.source));
+                        write.source = endpoint;
+                        write.edge_id = edge_id;
+                        write.owner_document = owner;
+                    }
+                }
+                const combined_count = std.math.add(usize, graph_writes.len, mentions.len) catch return error.ResourceLimitExceeded;
+                if (combined_count > graph_asset_state.hard_max_relation_items_per_artifact) return error.ResourceLimitExceeded;
+                const combined = try runtime.alloc.alloc(types.GraphEdgeWrite, combined_count);
+                @memcpy(combined[0..graph_writes.len], graph_writes);
+                var initialized: usize = 0;
+                errdefer {
+                    for (combined[graph_writes.len..][0..initialized]) |*write| write.deinit(runtime.alloc);
+                    runtime.alloc.free(combined);
+                }
+                for (mentions, 0..) |write, i| {
+                    combined[graph_writes.len + i] = try write.cloneAlloc(runtime.alloc);
+                    initialized += 1;
+                }
+                runtime.alloc.free(graph_writes);
+                graph_writes = combined;
+            };
+        }
 
         var writes = std.ArrayListUnmanaged(KVPair).empty;
         defer {

@@ -183,6 +183,7 @@ pub const TableApi = struct {
         GraphAnchorFilterRequiresIndex,
         GraphMatchOperationLimitExceeded,
         GraphQueryModeUnsupported,
+        GraphStartIdentityRequired,
         GraphExternalAliasDocumentFilterUnsupported,
         GraphExternalAliasSourceUnsupported,
         GraphReverseVariablePathUnsupported,
@@ -1390,6 +1391,10 @@ fn graphQueryUnsupportedBodyForDiagnostic(
 }
 
 fn graphQueryUnsupportedMessage(reason: []const u8) []const u8 {
+    if (std.mem.eql(u8, reason, "qualified_start_identity_required"))
+        return "incoming traversal on a cross-table resolver graph requires start.identities with an explicit table and key; bare keys name source-table documents";
+    if (std.mem.eql(u8, reason, "deduplicate_nodes_must_be_true"))
+        return "coordinator graph traversal requires deduplicate_nodes=true; use one traversal per seed with include_paths=true to retain seed provenance";
     if (std.mem.eql(u8, reason, "expand_strategy_not_supported"))
         return "expand_strategy is a legacy graph_searches result-merging control; remove it when using graph_queries and consume the named typed graph_results directly";
     if (std.mem.eql(u8, reason, "legacy_graph_searches_not_supported"))
@@ -1433,7 +1438,6 @@ fn canonicalGraphUnsupportedDiagnostic(queries: std.json.ObjectMap) GraphQueryUn
         if (fallback == null) fallback = .{ .operation = operation_name, .feature = mode };
         const params = value.get(mode) orelse continue;
         if (params != .object) continue;
-
         if (std.mem.eql(u8, mode, "traverse") and jsonBool(params.object, "deduplicate_nodes") == false) {
             return .{
                 .operation = operation_name,
@@ -1987,6 +1991,9 @@ pub fn handleTableQueryRequest(
             error.GraphMatchOperationLimitExceeded => {
                 std.log.warn("public table graph MATCH operation limit exceeded table={s}", .{table_name});
                 return .{ .status = 422, .body = try graphMatchOperationLimitExceededBody(alloc, body), .json = true };
+            },
+            error.GraphStartIdentityRequired => {
+                return .{ .status = 422, .body = try graphQueryCapabilityUnsupportedBody(alloc, body, "qualified_start_identity_required"), .json = true };
             },
             error.GraphQueryModeUnsupported => {
                 std.log.warn("public table graph mode lacks exact public execution table={s}", .{table_name});
@@ -5200,17 +5207,18 @@ test "unsupported graph diagnostics identify the rejected operation feature" {
     };
     const cases = [_]Case{
         .{
+            .body = "{\"graph_queries\":{\"incoming\":{\"index\":\"g\",\"traverse\":{\"start\":{\"identities\":[{\"table\":\"entities\",\"key\":\"concept/a\"}]},\"direction\":\"in\",\"deduplicate_nodes\":false}}}}",
+            .operation = "incoming",
+            .feature = "traverse",
+            .reason = "deduplicate_nodes_must_be_true",
+            .message = "coordinator graph traversal requires deduplicate_nodes=true; use one traversal per seed with include_paths=true to retain seed provenance",
+        },
+        .{
             .body = "{\"expand_strategy\":\"union\",\"graph_queries\":{}}",
             .operation = "$request",
             .feature = "expand_strategy",
             .reason = "expand_strategy_not_supported",
             .message = "expand_strategy is a legacy graph_searches result-merging control; remove it when using graph_queries and consume the named typed graph_results directly",
-        },
-        .{
-            .body = "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"direction\":\"in\",\"deduplicate_nodes\":false}}}}",
-            .operation = "walk",
-            .feature = "traverse",
-            .reason = "deduplicate_nodes_must_be_true",
         },
         .{
             .body = "{\"graph_searches\":{\"walk\":{\"type\":\"traverse\",\"params\":{\"deduplicate_nodes\":false}}}}",

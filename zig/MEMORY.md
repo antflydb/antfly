@@ -313,10 +313,10 @@ available and retains its existing lexical/vector pagination contract.
 - [#1244](https://github.com/antflydb/antfly/issues/1244): the private owner ABI
   forwards the actual entity sink's curation capability. Missing capability
   callbacks fail closed. Distributed atomic curation no longer loses support
-  while crossing the owner archive boundary. This changes private owner ABI 82
-  and storage engine linkage v29; rebuild all native runtime units together.
-- [#1245](https://github.com/antflydb/antfly/issues/1245): Lite accepts qualified
-  start identities for complete local snapshot traverse/neighbors and preserves
+  while crossing the owner archive boundary. The merged main implementation supplies private owner ABI 82; the Lite grouped
+  control adds storage engine linkage v29. Rebuild native runtime units together.
+- [#1245](https://github.com/antflydb/antfly/issues/1245): The merged main implementation accepts qualified
+  start identities for Lite traverse/neighbors and preserves
   table identity through admission, visited sets and paths. Use
   `start_nodes.identities: [{key, table}]` on both backends. Bare keys continue
   to name the owning table; they are not a cross-table wildcard. Distributed

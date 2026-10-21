@@ -22,7 +22,8 @@ class InferenceConnection:
     """
     Attributes:
         provider (InferenceProviderType): Inference provider type for a connection.
-        url (str | Unset): Resolved endpoint URL when applicable.
+        url (str | Unset): Transport endpoint. Omitted from public inference discovery to keep server-owned URLs
+            private.
         region (str | Unset): Cloud region (Bedrock).
         project_id (str | Unset): Google Cloud project (Vertex).
         location (str | Unset): Google Cloud location (Vertex).

@@ -399,13 +399,13 @@ pub fn handle(server: anytype, alloc: std.mem.Allocator, op: Operation, table_na
 }
 
 fn executeWithRetry(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name: []const u8, resolver_name: []const u8, key: []const u8, body: []const u8, query: []const u8, request: operation.RequestContext) !@import("public_table_http.zig").OwnedResponse {
-    const entity_request = op == .proposal_create or op == .proposal_accept or op == .proposal_reject or op == .entity_redirects or op == .entity_merge or op == .entity_unmerge or op == .entity_suppress or op == .entity_unsuppress or op == .entity_distinct;
+    const retryable_request = op == .merge or op == .unmerge or op == .suppress or op == .unsuppress or op == .proposal_create or op == .proposal_accept or op == .proposal_reject or op == .entity_redirects or op == .entity_merge or op == .entity_unmerge or op == .entity_suppress or op == .entity_unsuppress or op == .entity_distinct;
     var attempts: u8 = 0;
     while (true) {
         return execute(server, alloc, op, table_name, resolver_name, key, body, query, request) catch |err| {
             // These errors certify that the catalog CAS did not commit. Take
             // a fresh adoption cut, preserving any client expected_revision.
-            if (entity_request and attempts < 2 and (err == error.TableLifecycleConflict or err == error.TableGenerationChanged or err == error.CatalogGenerationChanged)) {
+            if (retryable_request and attempts < 2 and (err == error.TableLifecycleConflict or err == error.TableGenerationChanged or err == error.CatalogGenerationChanged)) {
                 attempts += 1;
                 continue;
             }

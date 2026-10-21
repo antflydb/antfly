@@ -3909,3 +3909,21 @@ test "memory native relationship proposals defer and apply external verdicts und
     try discard(&store, .forget, "", "{\"evidence_ids\":[\"review\"]}", "forget-review", 9);
     try std.testing.expectError(error.MemoryNotFound, store.run(.get, "link", "{}", "", 10));
 }
+
+test "memory candidate discovery preserves canonical distinctions and version boundaries" {
+    var store = Store.init();
+    defer store.deinit();
+    try externalReviewSetup(&store);
+    try discard(&store, .observe, "", "{\"evidence\":[{\"id\":\"e2\",\"source_id\":\"fixture\",\"source_version\":\"2\",\"text\":\"Database concepts and distinct versions\"}],\"entities\":[{\"id\":\"alias\",\"name\":\"Antfly alias\",\"distinct_from\":[\"b\"],\"evidence\":[{\"id\":\"e2\"}]},{\"id\":\"v2\",\"name\":\"Antfly 2\",\"evidence\":[{\"id\":\"e2\"}]}]}", "more", 3);
+    try discard(&store, .curate_entity, "", "{\"action\":\"merge\",\"from\":\"alias\",\"to\":\"a\",\"expected_revision\":4}", "alias", 4);
+    const candidates = try store.run(.entity_candidates, "a", "{}", "", 5);
+    defer std.testing.allocator.free(candidates);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, candidates, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.object.get("items").?.array.items.len);
+    const relationships = try store.run(.entity_candidates, "a", "{\"kind\":\"relationship\"}", "", 5);
+    defer std.testing.allocator.free(relationships);
+    const related = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, relationships, .{});
+    defer related.deinit();
+    try std.testing.expectEqual(@as(usize, 2), related.value.object.get("items").?.array.items.len);
+}

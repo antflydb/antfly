@@ -1082,7 +1082,6 @@ pub const GraphQueryEngine = struct {
     /// See ExecutionScope; defaults keep the historical terminal behavior at
     /// cross-table tagged nodes.
     scope: ExecutionScope = .{},
-    start_identities: []const NodeIdentity = &.{},
 
     /// Execute a graph query. For result_ref node selectors, the caller must
     /// resolve refs to keys and pass them as resolved_keys.
@@ -1092,17 +1091,6 @@ pub const GraphQueryEngine = struct {
         gq: GraphQuery,
         resolved_keys: []const []const u8,
     ) !GraphQueryResult {
-        const previous_starts = self.start_identities;
-        defer self.start_identities = previous_starts;
-        self.start_identities = &.{};
-        if (gq.start_nodes == .identities) {
-            const identities = gq.start_nodes.identities;
-            for (identities) |identity| if (identity.table != null and
-                (!self.scope.expand_cross_table_local or (gq.query_type != .traverse and gq.query_type != .neighbors))) return error.UnsupportedQueryRequest;
-            if (identities.len != resolved_keys.len) return error.InvalidQueryRequest;
-            for (identities, resolved_keys) |identity, key| if (!std.mem.eql(u8, identity.key, key)) return error.InvalidQueryRequest;
-            self.start_identities = identities;
-        }
         const supplied_time = self.ttl_now_ns;
         if (supplied_time == null) self.ttl_now_ns = self.scope.ttl_now_ns orelse graph_index.clock.nowRealtimeNs();
         defer self.ttl_now_ns = supplied_time;
@@ -1115,11 +1103,11 @@ pub const GraphQueryEngine = struct {
         execution_query.params = execution_params;
 
         var result = try switch (execution_query.query_type) {
-            .traverse => self.executeTraverse(graph_index, execution_params, resolved_keys, resolveTargetKeys(gq)),
+            .traverse => self.executeTraverse(graph_index, execution_params, resolved_keys, resolveTargetKeys(gq), gq.start_nodes),
             .neighbors => blk: {
                 var params = execution_params;
                 params.max_depth = 1;
-                break :blk self.executeTraverse(graph_index, params, resolved_keys, resolveTargetKeys(gq));
+                break :blk self.executeTraverse(graph_index, params, resolved_keys, resolveTargetKeys(gq), gq.start_nodes);
             },
             .shortest_path => self.executeShortestPath(graph_index, execution_query, resolved_keys),
             .k_shortest_paths => self.executeKShortestPaths(graph_index, execution_query, resolved_keys),
@@ -2703,8 +2691,16 @@ pub const GraphQueryEngine = struct {
         params: QueryParams,
         start_keys: []const []const u8,
         target_keys: []const []const u8,
+        start_selector: NodeSelector,
     ) !GraphQueryResult {
-        if (self.start_identities.len == 0 and algebraicTraversalConsidered(graph_index, params)) {
+        const identities = switch (start_selector) {
+            .identities => |items| items,
+            else => &.{},
+        };
+        const qualified = for (identities) |identity| {
+            if (identity.table) |table| if (!std.mem.eql(u8, table, self.scope.owning_table)) break true;
+        } else false;
+        if (!qualified and algebraicTraversalConsidered(graph_index, params)) {
             graph_index.noteAlgebraicTraversalAttempt();
             const proof = algebraicTraversalProof(graph_index, params);
             if (proof.safe()) {
@@ -2749,7 +2745,7 @@ pub const GraphQueryEngine = struct {
                 .admit_one = TraverseResultAdmissionContext.admit,
             },
         };
-        const admitted_starts = try self.admittedStartKeysAlloc(start_keys, params.direction);
+        const admitted_starts = if (qualified) null else try self.admittedStartKeysAlloc(start_keys, params.direction);
         defer if (admitted_starts) |mask| self.alloc.free(mask);
 
         var all_results = std.ArrayListUnmanaged(GraphResultNode).empty;
@@ -2764,10 +2760,11 @@ pub const GraphQueryEngine = struct {
             if (params.max_results > 0) {
                 rules.max_results = params.max_results - @as(u32, @intCast(all_results.items.len));
             }
-            rules.start_table = if (self.start_identities.len > 0) self.start_identities[start_index].table else null;
-            if (rules.start_table) |table| if (std.mem.eql(u8, table, self.scope.owning_table)) {
-                rules.start_table = null;
-            };
+            rules.start_table = if (qualified) blk: {
+                if (identities.len != start_keys.len) return error.InvalidQueryRequest;
+                const table = identities[start_index].table orelse break :blk null;
+                break :blk if (std.mem.eql(u8, table, self.scope.owning_table)) null else table;
+            } else null;
             const trav_results = try traversal_mod.traverse(self.alloc, graph_index, key, rules);
             defer traversal_mod.freeOwnedResults(self.alloc, trav_results);
 
@@ -3106,15 +3103,6 @@ pub const GraphQueryEngine = struct {
         direction: graph_mod.EdgeDirection,
     ) !?[]bool {
         const admission = self.node_admission orelse return null;
-        if (self.start_identities.len > 0) {
-            const nodes = try self.alloc.alloc(NodeRef, self.start_identities.len);
-            defer self.alloc.free(nodes);
-            for (self.start_identities, nodes) |identity, *node| {
-                const table = if (identity.table) |name| if (std.mem.eql(u8, name, self.scope.owning_table)) null else name else null;
-                node.* = .{ .key = identity.key, .table = table, .external = table != null };
-            }
-            return try admission.filterAlloc(self.alloc, nodes);
-        }
         // A document-model graph may still contain resolver-produced
         // cross-table targets identified only by edge metadata. Let the graph
         // algorithm classify reverse and bidirectional starts in that case.
@@ -4655,6 +4643,19 @@ test "traverse algebraic semiring path supports bidirectional traversal" {
     try std.testing.expectEqual(@as(u64, 0), algebraic_stats.rejected_count);
     try std.testing.expectEqual(@as(u64, 0), algebraic_stats.fallback_count);
     try std.testing.expectEqual(@as(u64, 2), algebraic_stats.result_node_count);
+
+    // Explicitly naming this table is the same seed namespace, so it must
+    // retain the proven algebraic path rather than force iterative traversal.
+    engine.scope.owning_table = "docs";
+    var qualified = try engine.execute(&ctx.graph, .{
+        .query_type = .traverse,
+        .index_name = "test",
+        .start_nodes = .{ .identities = &.{.{ .table = "docs", .key = "A" }} },
+        .params = .{ .direction = .both, .max_depth = 1, .max_results = 0 },
+    }, start_keys);
+    defer qualified.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), qualified.nodes.len);
+    try std.testing.expectEqual(@as(u64, 2), ctx.graph.algebraicTraversalRuntimeStats().proven_count);
 }
 
 test "algebraic traversal proof gates exact semiring shapes" {
@@ -7222,7 +7223,7 @@ test "graph metric native response adoption lazy all pass temporary rows" {
     try std.testing.expectEqual(@as(usize, 0), counter.live);
 }
 
-test "engine qualified incoming seeds retain namespace across local key collisions and paths" {
+test "qualified incoming traversal isolates equal keys across target tables" {
     const a = std.testing.allocator;
     var sb: [256]u8 = undefined;
     var rb: [256]u8 = undefined;
@@ -7231,19 +7232,17 @@ test "engine qualified incoming seeds retain namespace across local key collisio
         ctx.deinit();
         a.destroy(ctx);
     }
-    try ctx.graph.addEdge("doc", "shared", "about", 1, 0, 0, "{\"target_table\":\"concepts\"}");
-    try ctx.graph.addEdge("wrong", "shared", "about", 1, 0, 0, "{\"target_table\":\"other\"}");
-    try ctx.graph.addEdge("local", "shared", "about", 1, 0, 0, "{}");
-    var engine: GraphQueryEngine = .{ .alloc = a, .scope = .{ .owning_table = "docs", .expand_cross_table_local = true } };
-    const query: GraphQuery = .{ .query_type = .traverse, .index_name = "test", .start_nodes = .{ .identities = &.{.{ .key = "shared", .table = "concepts" }} }, .params = .{ .direction = .in, .max_depth = 1, .include_paths = true } };
-    var result = try engine.execute(&ctx.graph, query, &.{"shared"});
-    defer result.deinit(a);
-    try std.testing.expectEqual(@as(usize, 1), result.nodes.len);
-    try std.testing.expectEqualStrings("doc", result.nodes[0].key);
-    try std.testing.expect(result.nodes[0].table == null);
-    try std.testing.expectEqualStrings("concepts", result.nodes[0].path_tables.?[0].?);
-    try std.testing.expect(result.nodes[0].path_tables.?[1] == null);
-    try std.testing.expect(isCanonicalResultNode(result.nodes[0]));
-    var terminal: GraphQueryEngine = .{ .alloc = a };
-    try std.testing.expectError(error.UnsupportedQueryRequest, terminal.execute(&ctx.graph, query, &.{"shared"}));
+    try ctx.graph.addEdge("doc:a", "concept/shared", "about", 1, 0, 0, "{\"target_table\":\"entities\"}");
+    try ctx.graph.addEdge("doc:b", "concept/shared", "about", 1, 0, 0, "{\"target_table\":\"other_entities\"}");
+    var engine: GraphQueryEngine = .{ .alloc = a, .scope = .{ .owning_table = "docs" } };
+    for ([_][]const u8{ "entities", "other_entities", "missing" }, [_]usize{ 1, 1, 0 }) |table, count| {
+        const selector: NodeSelector = .{ .identities = &.{.{ .table = table, .key = "concept/shared" }} };
+        var result = try engine.execute(&ctx.graph, .{ .query_type = .traverse, .index_name = "g", .start_nodes = selector, .params = .{ .direction = .in, .max_depth = 1, .include_paths = true } }, &.{"concept/shared"});
+        defer result.deinit(a);
+        try std.testing.expectEqual(count, result.nodes.len);
+        if (count != 0) {
+            try std.testing.expectEqualStrings(if (std.mem.eql(u8, table, "entities")) "doc:a" else "doc:b", result.nodes[0].key);
+            try std.testing.expectEqualStrings(table, result.nodes[0].path_tables.?[0].?);
+        }
+    }
 }

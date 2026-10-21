@@ -44,6 +44,7 @@ const batch_api = @import("antfly_local_sources").api_batch;
 const cluster_api_http = @import("cluster_api_http.zig");
 const public_table_http = @import("public_table_http.zig");
 const query_request_diagnostics = @import("query_request_diagnostics.zig");
+const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
 const graph_wire_envelope = @import("antfly_local_sources").api_graph_wire_envelope;
 const linear_merge_api = @import("linear_merge.zig");
 const cluster = @import("cluster.zig");
@@ -4012,6 +4013,7 @@ pub const ApiHttpServer = struct {
     mcp_sessions: mcp.InMemorySessionStore = .{},
     memory_mcp_sessions: mcp.InMemorySessionStore = .{},
     a2a_tasks: a2a.InMemoryTaskStore = .{},
+    inference_sessions: @import("antfly_local_sources").common_provider_registry.gateway.Sessions = .{},
     connections_cache: connections_api.Cache = .{ .alloc = undefined },
     local_resource_manager: resource_manager_mod.ResourceManager,
     shared_resource_manager: ?*resource_manager_mod.ResourceManager,
@@ -4796,6 +4798,7 @@ pub const ApiHttpServer = struct {
             registry.deinit(self.owner_alloc);
             self.owner_alloc.destroy(registry);
         }
+        self.inference_sessions.deinit(self.owner_alloc);
         self.connections_cache.deinit();
         self.query_embedding_cache.deinit(self.inferenceCacheBudget());
         self.sql_plan_cache.deinit(queryEmbeddingCacheIo(self.cfg));
@@ -4957,12 +4960,27 @@ pub const ApiHttpServer = struct {
         include_param: ?[]const u8,
         refresh_param: ?[]const u8,
     ) ![]u8 {
-        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+        return self.listConnectionsJsonAllocWithContext(alloc, types_param, include_param, refresh_param, null);
+    }
+
+    pub fn listConnectionsJsonAllocWithContext(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        types_param: ?[]const u8,
+        include_param: ?[]const u8,
+        refresh_param: ?[]const u8,
+        request_context: ?@import("antfly_inference_execution_context").RequestContext,
+    ) ![]u8 {
+        var arena_impl = std.heap.ArenaAllocator.init(alloc);
         defer arena_impl.deinit();
         const arena = arena_impl.allocator();
 
-        var snapshot_opt = self.source.cachedAdminSnapshot() catch null;
-        if (snapshot_opt == null) snapshot_opt = self.source.adminSnapshot() catch null;
+        if (request_context) |context| try context.check();
+        // Inference inventory has no table/replication status dependency. Do
+        // not put an unrelated metadata snapshot RPC on its request lifetime.
+        const inference_only = if (types_param) |types| std.mem.eql(u8, types, "inference") else false;
+        var snapshot_opt = if (inference_only) null else self.source.cachedAdminSnapshot() catch null;
+        if (!inference_only and snapshot_opt == null) snapshot_opt = self.source.adminSnapshot() catch null;
         defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
 
         const node_config = self.cfg.node_config;
@@ -4976,6 +4994,7 @@ pub const ApiHttpServer = struct {
             .network_io = self.sharedApiNetworkIo(),
             .filesystem_io = self.sharedApiFilesystemIo(),
         }, &self.connections_cache, .{
+            .request_context = request_context,
             .include_models = connections_api.includeHasModels(include_param),
             .probe = connections_api.includeHasStatus(include_param),
             .refresh = if (refresh_param) |value| std.mem.eql(u8, value, "true") else false,
@@ -8219,11 +8238,16 @@ pub const ApiHttpServer = struct {
         return self.rowPolicyProof(alloc, identity, context, table_id, physical_table, database, schema_version, .write);
     }
 
+    pub fn publicInferenceEnabled(self: *const ApiHttpServer) bool {
+        return if (self.cfg.node_config) |config| config.public_inference.enabled else false;
+    }
+
     pub fn authorizeInferenceRequest(
         self: *ApiHttpServer,
         request: AuthenticatedRequest,
         permission: kernel_abi.InferencePermission,
     ) !kernel_abi.AuthorizationDecision {
+        if (permission == .write and !self.publicInferenceEnabled()) return .forbidden;
         if (!self.cfg.auth_enabled and self.cfg.trusted_principal_secret == null and
             request.trusted_principal == null)
             return .allowed;
@@ -14393,6 +14417,7 @@ pub const ApiHttpServer = struct {
             error.GraphAnchorFilterRequiresIndex => return error.GraphAnchorFilterRequiresIndex,
             error.GraphMatchOperationLimitExceeded => return error.GraphMatchOperationLimitExceeded,
             error.GraphQueryModeUnsupported => return error.GraphQueryModeUnsupported,
+            error.GraphStartIdentityRequired => return error.GraphStartIdentityRequired,
             error.GraphExternalAliasDocumentFilterUnsupported => return error.GraphExternalAliasDocumentFilterUnsupported,
             error.GraphExternalAliasSourceUnsupported => return error.GraphExternalAliasSourceUnsupported,
             error.GraphReverseVariablePathUnsupported => return error.GraphReverseVariablePathUnsupported,
@@ -14737,6 +14762,7 @@ pub const ApiHttpServer = struct {
                 error.GraphAnchorFilterRequiresIndex,
                 error.GraphMatchOperationLimitExceeded,
                 error.GraphQueryModeUnsupported,
+                error.GraphStartIdentityRequired,
                 error.GraphExternalAliasDocumentFilterUnsupported,
                 error.GraphExternalAliasSourceUnsupported,
                 error.GraphReverseVariablePathUnsupported,
@@ -14809,6 +14835,7 @@ pub const ApiHttpServer = struct {
             error.GraphAnchorFilterRequiresIndex,
             error.GraphMatchOperationLimitExceeded,
             error.GraphQueryModeUnsupported,
+            error.GraphStartIdentityRequired,
             error.GraphExternalAliasDocumentFilterUnsupported,
             error.GraphExternalAliasSourceUnsupported,
             error.GraphReverseVariablePathUnsupported,
@@ -14926,6 +14953,7 @@ pub const ApiHttpServer = struct {
             error.GraphAnchorFilterRequiresIndex,
             error.GraphMatchOperationLimitExceeded,
             error.GraphQueryModeUnsupported,
+            error.GraphStartIdentityRequired,
             error.GraphExternalAliasDocumentFilterUnsupported,
             error.GraphExternalAliasSourceUnsupported,
             error.GraphReverseVariablePathUnsupported,
@@ -15437,6 +15465,7 @@ pub const ApiHttpServer = struct {
             try ensureRequestDeadline(deadline);
         }
         query_req.req.cancellation = cancellation;
+        if (query_req.req.graph_queries.len > 0) query_req.req.graph_query_diagnostic_sink = graph_query_diagnostic.sink();
         query_req.req.response_table_name = response_label;
         if (query_req.req.remote_snapshot == null and (query_req.req.order_by.len != 0 or query_req.req.search_after.len != 0 or query_req.req.search_before.len != 0)) {
             if (query_req.req.search_after.len != 0 or query_req.req.search_before.len != 0) return error.CatalogGenerationChanged;
@@ -22645,6 +22674,11 @@ pub const ApiHttpServer = struct {
                 try public_table_http.graphMatchOperationLimitExceededBody(self.alloc, body),
                 false,
             ),
+            error.GraphStartIdentityRequired => contextual_operations.jsonWithStatus(
+                422,
+                try public_table_http.graphQueryCapabilityUnsupportedBody(self.alloc, body, "qualified_start_identity_required"),
+                false,
+            ),
             error.GraphQueryModeUnsupported => contextual_operations.jsonWithStatus(
                 422,
                 try public_table_http.graphQueryUnsupportedBody(self.alloc, body),
@@ -28049,6 +28083,14 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: Authorizat
         return .{ .resource_type = resource_type, .resource = try system_catalog_routes.resourceNameAlloc(alloc, route), .permission_type = permission, .owns_resource = true };
     }
 
+    // Public gateway execution uses the same inference authority as physical
+    // connection invocation. Inventory is read-only; sessions require write
+    // authority even for GET event streams or status requests.
+    if (@import("inference_gateway.zig").ownsPath(path)) return .{
+        .resource_type = .inference,
+        .resource = "*",
+        .permission_type = if (@import("inference_gateway.zig").isDiscoveryPath(path)) .read else .write,
+    };
     if (method == .POST and routes.Routes.matchInferenceConnectionInvocation(path) != null) return .{
         .resource_type = .inference,
         .resource = "*",
@@ -28417,8 +28459,11 @@ test "internal service credentials cannot authorize public inference routes" {
         }
     };
     const alloc = std.testing.allocator;
+    var public_config = try common_config.Config.parseFromSlice(alloc, "{\"public_inference\":{\"enabled\":true}}");
+    defer public_config.deinit();
     const secret = "inference-audience-test-secret";
     var server = ApiHttpServer.init(alloc, .{
+        .node_config = &public_config,
         .trusted_principal_secret = secret,
         .trusted_principal_issuer = "cluster-a",
     }, FakeSource.iface(), null, null);
@@ -58674,6 +58719,7 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
         stress_reads: usize = 0,
         incompatible_last_page: bool = false,
         destination_cut_changed: bool = false,
+        destination_cut_failures: u8 = 0,
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
@@ -58727,6 +58773,10 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
             const input = call.resolver_catalog_read;
             if (input.expected_revision) |revision| try std.testing.expectEqual(self.commits, revision);
             if (self.destination_cut_changed and input.mode == .table and std.mem.eql(u8, input.table_name, "entities")) return error.CatalogGenerationChanged;
+            if (input.mode == .table and std.mem.eql(u8, input.table_name, "entities") and self.destination_cut_failures != 0) {
+                self.destination_cut_failures -= 1;
+                return error.CatalogGenerationChanged;
+            }
             const wire = @import("../metadata/resolver_catalog_read.zig");
             if (input.mode == .table and std.mem.eql(u8, input.table_name, "source")) {
                 if (self.observation_failure) |err| return err;
@@ -58821,7 +58871,12 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
         server.source = source.narrowIface();
     }
     try Run.call(&server, .list, "source", "", "", "", 200);
+    // A transient destination-cut race retries from a fresh source cut, while
+    // persistent races above fail closed and explicit curation conflicts do
+    // not retry. Exactly one mutation commits.
+    source.destination_cut_failures = 1;
     try Run.call(&server, .merge, "source", "concepts", "", "{\"from\":\"concept/a\",\"to\":\"concept/b\"}", 202);
+    try std.testing.expectEqual(@as(u8, 0), source.destination_cut_failures);
     try Run.call(&server, .merge, "source", "concepts", "", "{\"from\":\"concept/a\",\"to\":\"concept/b\"}", 202);
     try std.testing.expectEqual(@as(u64, 1), source.commits);
     try Run.call(&server, .suppress, "source", "concepts", "", "{\"keys\":[\"concept/b\"]}", 400);

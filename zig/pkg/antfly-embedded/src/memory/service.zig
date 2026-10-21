@@ -1671,6 +1671,14 @@ const Run = struct {
         if (request.actor.len > 0) receipt.origin = .{ .agent = .{ .id = request.actor, .kind = .agent } };
         receipt.proposal_id = id;
     }
+    fn declaredDistinct(self: *Run, id: []const u8) !std.StringHashMapUnmanaged(void) {
+        var result: std.StringHashMapUnmanaged(void) = .empty;
+        for (try self.identityMembers(id)) |name| {
+            const record = (try self.read(t.EntityRecord, try key(self.a, "entity", name))) orelse continue;
+            for (record.entity.distinct_from) |other| try result.put(self.a, self.identity_index.?.canonical(other), {});
+        }
+        return result;
+    }
     fn entityCandidates(self: *Run, id: []const u8, request: t.EntityCandidateRequest) ![]const u8 {
         if (request.limit == 0 or request.limit > 64) return error.InvalidMemoryRequest;
         const seed = (try self.read(t.EntityRecord, try key(self.a, "entity", id))) orelse return error.MemoryNotFound;
@@ -1678,6 +1686,7 @@ const Run = struct {
         if (!try self.entityVisible(seed)) return error.MemoryNotFound;
         const canonical_seed = (try self.canonical(id)) orelse return error.MemoryEntitySuppressed;
         const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "entity/", try self.decodeCursor("entity/", request.cursor), 64);
+        const seed_distinctions = try self.declaredDistinct(id);
         const seed_view = try self.entityView(id, .{ .limit = 4 });
         var views_complete = seed_view.complete;
         const Candidate = struct { entity: t.EntityRecord, view: t.EntityView, match_score: f64 };
@@ -1688,7 +1697,7 @@ const Run = struct {
             self.authorize(candidate.owner, candidate.entity.visibility) catch continue;
             if (!try self.entityVisible(candidate)) continue;
             const canonical_id = (try self.canonical(candidate.entity.id)) orelse continue;
-            if (eql(u8, canonical_id, canonical_seed) or !eql(u8, candidate.entity.type, seed.entity.type)) continue;
+            if (!eql(u8, canonical_id, candidate.entity.id) or eql(u8, canonical_id, canonical_seed) or !eql(u8, candidate.entity.type, seed.entity.type)) continue;
             if (candidate.entity.visibility != seed.entity.visibility or (candidate.entity.visibility == .private and !eql(u8, candidate.owner, seed.owner))) continue;
             var distinct = false;
             for (seed.entity.distinct_from) |other| if (eql(u8, other, candidate.entity.id)) {
@@ -1697,7 +1706,11 @@ const Run = struct {
             for (candidate.entity.distinct_from) |other| if (eql(u8, other, id)) {
                 distinct = true;
             };
-            if (request.kind == .identity and (distinct or try self.suppression_index.?.pinnedDistinct(self.a, id, candidate.entity.id))) continue;
+            if (request.kind == .identity) {
+                if (distinct or seed_distinctions.contains(canonical_id) or try self.suppression_index.?.pinnedDistinct(self.a, id, candidate.entity.id)) continue;
+                const candidate_distinctions = try self.declaredDistinct(candidate.entity.id);
+                if (candidate_distinctions.contains(canonical_seed)) continue;
+            }
             if (request.kind == .identity and !eql(u8, try nameNumbers(self.a, seed.entity.name), try nameNumbers(self.a, candidate.entity.name))) continue;
             var score = lexical(seed.entity.name, candidate.entity.name);
             for (candidate.entity.aliases) |alias| score = @max(score, lexical(seed.entity.name, alias));
@@ -3179,7 +3192,7 @@ const Run = struct {
         fn add(self: *RecallGraph, node: Node) !?usize {
             const identity = try std.fmt.allocPrint(self.a, "{s}/{s}", .{ @tagName(node.kind), node.id });
             if (self.index.get(identity)) |i| {
-                self.nodes.items[i].seed += node.seed;
+                self.nodes.items[i].seed = @max(self.nodes.items[i].seed, node.seed);
                 return i;
             }
             if (self.nodes.items.len >= self.options.max_nodes) {
@@ -3224,6 +3237,10 @@ const Run = struct {
         for (options.entity_seeds) |id| _ = try self.graphEntity(&graph, id, 0, 1, request.known_at);
         // Flat retrieval seeds are deterministic and bounded. Explicit seeds
         // bypass the global assertion scan and use indexed graph adjacency.
+        if (options.entity_seeds.len == 0 and hits.items.len > 16) {
+            graph.omitted += hits.items.len - 16;
+            graph.complete = false;
+        }
         if (options.entity_seeds.len == 0) for (hits.items[0..@min(hits.items.len, 16)]) |hit| {
             const node = (try graph.add(.{ .kind = .assertion, .id = hit.memory.assertion.id, .depth = 0, .seed = @max(0.001, hit.score), .hit = hit })) orelse break;
             _ = node;
@@ -3244,7 +3261,7 @@ const Run = struct {
                     graph.complete = graph.complete and related.complete;
                     for (related.items) |record| {
                         const hit = (try self.recallHit(record, request, vector, false)) orelse continue;
-                        const target = (try graph.add(.{ .kind = .assertion, .id = hit.memory.assertion.id, .depth = node.depth + 1, .hit = hit })) orelse continue;
+                        const target = (try graph.add(.{ .kind = .assertion, .id = hit.memory.assertion.id, .depth = node.depth + 1, .seed = if (request.query.len > 0) @max(0, hit.score) else 0, .hit = hit })) orelse continue;
                         const weight = if (record.assertion.stability == .provisional) options.provisional_weight else 1.0;
                         try graph.connect(current, target, weight);
                         // Typed entity edges are one conceptual hop, even

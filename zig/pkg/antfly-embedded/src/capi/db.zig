@@ -665,10 +665,6 @@ pub fn runAtStampedGenerationWithOptions(
         if (block_writers) handle.write_mutex.lockUncancelable(handleLockIo());
         defer if (block_writers) handle.write_mutex.unlock(handleLockIo());
         req.identity_read_generation = pinned;
-        if (handle.storage_owner_context == null and handle.storage_owner_path == null and handle.embedded_path != null) {
-            req.graph_owning_table = handle.selected_table_name orelse "docs";
-            req.graph_index_complete_snapshot = true;
-        }
         try stampSearchRequestIdentityGeneration(handle, req);
         if (options.prepare) try handle.prepareSearchRequest(req.*);
         return query.run(handle, req.*) catch |err| {
@@ -694,7 +690,7 @@ pub fn executeLocalSearch(handle: *Handle, req: db_mod.types.SearchRequest) !db_
         const response = try local_query_client.executeJsonAlloc(
             handle.alloc,
             @ptrCast(handle.database()),
-            if (req.graph_owning_table.len > 0) req.graph_owning_table else "docs",
+            "docs",
             request_json,
             .internal,
             antfly.local_query_controls.executionOptions(req),
@@ -5709,6 +5705,8 @@ pub fn searchPublicQueryJson(
         request_json.bytes(),
     ) catch |err| return capi.mapError(err);
     defer owned.deinit(handle.alloc);
+    owned.req.graph_owning_table = table_name;
+    owned.req.graph_index_complete_snapshot = true;
 
     const DbSearchQuery = struct {
         const Result = db_mod.types.SearchResult;
