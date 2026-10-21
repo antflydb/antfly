@@ -2881,9 +2881,14 @@ const Engine = struct {
                     if (step.value.limit) |expr| try self.axisReferences(&required, expr);
                     var before: Names = .empty;
                     var kept: std.ArrayList(ast.Item) = .empty;
+                    const grouped = for (step.value.items) |projected| {
+                        if (aggregates(projected.expression)) break true;
+                    } else false;
                     for (step.value.items) |item| {
                         const name = item.alias orelse try self.expressionName(item.expression);
-                        if (step.final or step.value.distinct or item.expression.value != .variable or required.contains(name)) {
+                        // Local grouping keys determine child multiplicity even
+                        // when their columns are dead after this projection.
+                        if (step.final or step.value.distinct or grouped or item.expression.value != .variable or required.contains(name)) {
                             try kept.append(self.a, item);
                             try self.axisReferences(&before, item.expression);
                         }
@@ -2922,11 +2927,12 @@ const Engine = struct {
         }
         return output;
     }
-    const AxisCall = struct { names: []const []const u8, dependent: []const bool, captures: Names, sample: usize = 0 };
+    const AxisCall = struct { names: []const []const u8, dependent: []const bool, captures: Names, variable_cardinality: bool, sample: usize = 0 };
     fn axisCall(self: *Engine, initial: Row, incoming: Names, inner: []const ast.Clause) anyerror!?AxisCall {
         if (!axisReturningCall(inner)) return null;
         var shape = initial;
         var dependent: Names = .empty;
+        var variable_cardinality = false;
         var outer_names = incoming.keyIterator();
         while (outer_names.next()) |name| try dependent.put(self.a, name.*, {});
         for (inner) |clause| switch (clause.operation) {
@@ -2934,6 +2940,7 @@ const Engine = struct {
                 // Every expanded value varies inside the domain, including a
                 // constant source. It must never become a representative key.
                 try dependent.put(self.a, u.alias, {});
+                variable_cardinality = true;
                 shape = try self.streamShape(shape, clause);
             },
             .project => |step| {
@@ -2941,15 +2948,28 @@ const Engine = struct {
                 if (p.wildcard) return null;
                 if (p.predicate) |predicate| if (!axisPure(predicate)) return null;
                 var next: Names = .empty;
+                var grouped = false;
+                var keys = false;
+                var dependent_keys = false;
                 for (p.items) |item| {
                     if (!axisPure(item.expression)) return null;
-                    if (axisDepends(item.expression, dependent)) try next.put(self.a, item.alias orelse try self.expressionName(item.expression), {});
+                    const reducer = aggregates(item.expression);
+                    const varies = axisDepends(item.expression, dependent);
+                    grouped = grouped or reducer;
+                    keys = keys or !reducer;
+                    dependent_keys = dependent_keys or (!reducer and varies);
+                    // COUNT(*) has no value references, but consumes the row
+                    // domain produced by preceding filters/expansions/CALLs.
+                    if (varies or (reducer and variable_cardinality)) try next.put(self.a, item.alias orelse try self.expressionName(item.expression), {});
                 }
+                if (grouped) variable_cardinality = keys and (variable_cardinality or dependent_keys);
+                if (p.distinct or p.predicate != null or p.skip != null or p.limit != null) variable_cardinality = true;
                 dependent = next;
                 shape = try self.streamShape(shape, clause);
             },
             .subquery => |nested| {
                 const scalar = (try self.axisCall(shape, dependent, nested)) orelse return null;
+                variable_cardinality = variable_cardinality or scalar.variable_cardinality;
                 for (scalar.names, scalar.dependent) |name, bit| if (bit) try dependent.put(self.a, name, {});
                 shape = try self.streamShape(shape, clause);
             },
@@ -2966,7 +2986,7 @@ const Engine = struct {
         }
         var captures: Names = .empty;
         try self.retainQueryReferences(&captures, initial, inner);
-        return .{ .names = names, .dependent = bits, .captures = captures };
+        return .{ .names = names, .dependent = bits, .captures = captures, .variable_cardinality = variable_cardinality };
     }
     fn axisConsumer(self: *Engine, filter: ast.CollectionFilter, required: *Names) !bool {
         const empty: ast.Expr = .{ .span = .{}, .value = .{ .literal = .null } };
@@ -4620,9 +4640,9 @@ const Engine = struct {
             .unwind => |u| if (!axisPure(u.expression)) return false,
             .project => |step| {
                 const p = step.value;
-                for (p.items) |item| if (aggregates(item.expression) or !axisPure(item.expression)) return false;
+                for (p.items) |item| if (!axisPure(item.expression)) return false;
                 if (p.predicate) |expr| if (!axisPure(expr)) return false;
-                for (p.order) |order| if (aggregates(order.expression) or !axisPure(order.expression)) return false;
+                for (p.order) |order| if (!axisPure(order.expression)) return false;
                 if (p.skip) |expr| if (!axisPure(expr)) return false;
                 if (p.limit) |expr| if (!axisPure(expr)) return false;
             },
@@ -4666,11 +4686,53 @@ const Engine = struct {
         };
         return null;
     }
+    /// Prevalidate fallible independent columns across all outer bindings.
+    /// A later partition's pre-sort failure must precede an earlier partition's
+    /// post-sort failure. Any scalar failure declines the whole proof, before
+    /// publishing groups, so ordinary stage execution chooses the original error.
+    fn validateOrderedRepresentatives(self: *Engine, fold: *StreamFold, plan: *const AxisPlan, packet: WeightedRows, input: Row, alias: []const u8, source: ListSource) !void {
+        var needed = false;
+        for (plan.original, plan.dependent) |clause, flags| if (clause.operation == .project) {
+            for (clause.operation.project.value.items, flags) |item, dependent| if (!dependent and item.expression.value != .variable and item.expression.value != .literal) {
+                needed = true;
+            };
+        };
+        if (!needed) return;
+        var arena = std.heap.ArenaAllocator.init(self.scratch_allocator);
+        defer arena.deinit();
+        var cursor = source;
+        while (cursor.next()) |value| {
+            _ = arena.reset(.retain_capacity);
+            const scope = EvalScope.enter(self, arena.allocator());
+            defer scope.leave(self);
+            try self.state();
+            var row = try self.replace(input, alias, value);
+            for (plan.original, plan.dependent, packet.rows[0][0].value.list, 0..) |clause, flags, reached, stage| {
+                if (!reached.boolean) break;
+                switch (clause.operation) {
+                    .unwind => |u| row = try self.replace(row, u.alias, .null),
+                    .project => |step| {
+                        const projected = try self.a.alloc(v.Entry, step.value.items.len);
+                        for (projected, step.value.items, flags) |*entry, item, dependent| entry.* = .{ .name = item.alias orelse try self.expressionName(item.expression), .value = if (dependent) .null else try self.eval(item.expression, row, null) };
+                        row = projected;
+                    },
+                    .subquery => {
+                        const child = plan.calls[stage].?;
+                        const sample = packet.rows[1 + fold.calls.len + child.sample];
+                        for (child.names, child.dependent) |name, dependent| row = try self.replace(row, name, if (dependent) .null else lookup(sample, name) orelse .null);
+                    },
+                    else => unreachable,
+                }
+            }
+        }
+    }
     /// A unique outer binding retained in every grouping/distinct key makes
-    /// partitions disjoint. A total final key order makes global group discovery
-    /// irrelevant. Only then may one identical inner ordered domain be replayed.
+    /// partitions disjoint. Identical ordered domains retain outer source order:
+    /// stable ties preserve the order of equivalent copies across partitions.
+    /// Each partition emits one group, so discovery order and final stable ties
+    /// remain unchanged without requiring a final ordering by every group key.
     fn prepareOrderedFold(self: *Engine, fold: *StreamFold, input: Row) !bool {
-        if (!self.read_only or !fold.single_seed or !fold.has_keys or fold.calls.len == 0 or fold.group_window != null or fold.consumer != null or fold.continuation != null or fold.top.* != null or fold.middle.len < 2 or fold.middle[0].operation != .unwind or fold.projection.wildcard) return false;
+        if (!self.read_only or !fold.single_seed or !fold.has_keys or fold.calls.len == 0 or fold.consumer != null or fold.continuation != null or fold.top.* != null or fold.middle.len < 2 or fold.middle[0].operation != .unwind or fold.projection.wildcard) return false;
         const outer = fold.middle[0].operation.unwind;
         if (!axisPure(outer.expression)) return false;
         var lineage: Names = .empty;
@@ -4691,16 +4753,6 @@ const Engine = struct {
         var partition_key = false;
         for (fold.projection.items) |item| if (!aggregates(item.expression)) {
             partition_key = partition_key or (item.expression.value == .variable and lineage.contains(item.expression.value.variable));
-            const alias = item.alias orelse try self.expressionName(item.expression);
-            const ranked = for (fold.projection.order) |order| {
-                if (order.expression.value == .variable and std.mem.eql(u8, order.expression.value.variable, alias)) break true;
-                // Projected aliases shadow source names in ORDER BY.
-                const shadowed = for (fold.projection.items) |projected| {
-                    if (@import("expressions.zig").references(order.expression, projected.alias orelse try self.expressionName(projected.expression))) break true;
-                } else false;
-                if (!shadowed and @import("expressions.zig").same(order.expression, item.expression)) break true;
-            } else false;
-            if (!ranked) return false;
         };
         if (!partition_key) return false;
         var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
@@ -4744,8 +4796,24 @@ const Engine = struct {
             if (StreamingAggregate.consumerFailure(err) or err == error.CypherAxisMemoDeclined) return false;
             return err;
         };
-        try plan.memo.put(self, key.items, null, packet);
-        if (try plan.memo.find(self, key.items, null) == null) return false;
+        if (fold.group_window != null) for (packet.rows[1..][0..fold.calls.len]) |snapshot| {
+            // An ordered packet is mandatory after admission. Failed COUNT
+            // probes must decline before publishing any group or sort state.
+            if (snapshot[6].value.integer != 0) return false;
+        };
+        self.validateOrderedRepresentatives(fold, plan, packet, input, outer.alias, source) catch |err| {
+            if (StreamingAggregate.consumerFailure(err)) return false;
+            return err;
+        };
+        plan.memo.put(self, key.items, null, packet) catch |err| {
+            if (StreamingAggregate.consumerFailure(err)) return false;
+            return err;
+        };
+        const admitted = plan.memo.find(self, key.items, null) catch |err| {
+            if (StreamingAggregate.consumerFailure(err)) return false;
+            return err;
+        };
+        if (admitted == null) return false;
         fold.ordered_index = 1;
         return true;
     }

@@ -1959,32 +1959,44 @@ transition processing.
 For scalar reduction pipelines, bound WITH wildcards become explicit columns
 before capture analysis. Pure returning CALL bodies participate through lexical
 capture and output-dependency analysis, including nested calls, local WITH
-scopes, expanding UNWIND sources, DISTINCT, ordering and local SKIP/LIMIT
-windows. The complete child domain contributes its original encounter order and
-multiplicity; expanded aliases remain dependent even for constant child sources.
-Internal variable forwarding can be pruned, while potentially failing
-expressions and binding conflicts remain observable. Unused dependent
+scopes, expanding UNWIND sources, local reductions, DISTINCT, ordering and local
+SKIP/LIMIT windows. The complete child domain contributes its original encounter
+order and multiplicity; expanded aliases remain dependent even for constant
+child sources. Internal variable forwarding can be pruned, while potentially
+failing expressions and binding conflicts remain observable. Unused dependent
 expressions still execute inside each complete probe domain, preserving their
 scalar errors. Independent returned values come from reached execution samples;
 dependent branches are never evaluated against placeholder values. Full
 collections, effects and unsupported bodies retain their existing execution
 paths.
 
+Local reducer dependencies track cardinality as well as argument values:
+COUNT(*) consumes preceding filters, expansions and nested child domains even
+without a value argument. An ungrouped child reduction resets cardinality to one
+before applying its predicate or window. Grouping keys retain their effect on
+child multiplicity, including keys whose output columns are later discarded.
+
 An intermediate ORDER BY can share one sorted inner domain only after proving a
 unique outer source, unchanged partition lineage in every DISTINCT and grouping
-key, identical captured inner inputs, and final ordering by every grouping key.
-The proof follows every intermediate projection and sort, preserving stable ties
-through multiple ordering stages. The complete bounded snapshot must be admitted
-before any outer group is published. Repeated outer keys, cross-partition
-DISTINCT, correlated ordering, global intermediate windows, and unproved final
-ordering preserve the global sort. The cache admits at most the smaller of 4 MiB
-and one sixteenth of the query memory budget; admission failure falls back
-before publishing partial state.
+key, and identical captured inner inputs. Each nonempty partition contributes one
+group.
+Stable sorts preserve outer source order between equivalent copies of the same
+inner domain; this preserves group discovery, unordered final windows and stable
+aggregate-order ties without requiring final ordering by every group key. The
+proof follows every intermediate projection and sort. Fallible independent
+columns are prevalidated across outer bindings before replay: any failure
+resumes ordinary stage execution, preserving error precedence across sort
+barriers. The complete bounded snapshot must be admitted before any outer group
+is published. Repeated outer keys, cross-partition DISTINCT, correlated ordering
+and global intermediate windows preserve the global sort. The cache admits at
+most the smaller of 4 MiB and one sixteenth of the query memory budget; admission
+failure falls back before publishing partial state.
 
-Count-only group windows may reuse a successful complete domain before ranking
-its group key. Such a packet certifies argument evaluation for rejected and
-LIMIT 0 groups as well as selected groups. A failed argument probe disables reuse
-and resumes ordinary row/error order; it never hides an error behind eviction.
+Count-only group windows may reuse a successful complete domain, including a
+validated ordered domain, before ranking its group key. Such a packet certifies
+argument evaluation for rejected and LIMIT 0 groups as well as selected groups.
+A failed argument probe disables reuse and resumes ordinary row/error order; it
+never hides an error behind eviction.
 
 Ordinary REDUCE expressions share the collection fold's bounded accumulator
 ownership and per-transition scratch lifetime. Each ownership transfer preserves

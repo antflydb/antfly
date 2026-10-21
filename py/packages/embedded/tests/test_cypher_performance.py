@@ -5964,6 +5964,9 @@ def test_dynamic_substrings_share_validation_and_unicode_offsets(graph_db, paylo
         "expanding_call",
         "limited_call",
         "distinct_call",
+        "aggregate_call",
+        "ordered_no_final",
+        "ordered_by_value",
     ],
 )
 def test_ordered_aggregate_domains_share_exact_reducer_states(graph_db, case):
@@ -5971,6 +5974,12 @@ def test_ordered_aggregate_domains_share_exact_reducer_states(graph_db, case):
     tails = {
         "mapped": ("UNWIND $xs AS x WITH i,x+1 AS y,x*2 AS z RETURN i,sum(y),sum(z)", [500500, 999000]),
         "avg": ("UNWIND $xs AS x RETURN i,avg(x)", [499.5]),
+        "aggregate_call": ("UNWIND $xs AS x CALL {RETURN avg(x) AS y} RETURN i,avg(y)", [499.5]),
+        "ordered_no_final": ("UNWIND $xs AS x WITH i,x ORDER BY x DESC RETURN i,avg(x),head(collect(x))", [499.5, 999]),
+        "ordered_by_value": (
+            "UNWIND $xs AS x WITH i,x ORDER BY x DESC RETURN i,avg(x) AS a,head(collect(x))",
+            [499.5, 999],
+        ),
         "ordered_forward": (
             "UNWIND $xs AS x WITH i,x ORDER BY x DESC WITH i,x RETURN i,avg(x),head(collect(x))",
             [499.5, 999],
@@ -6006,10 +6015,11 @@ def test_ordered_aggregate_domains_share_exact_reducer_states(graph_db, case):
     if case == "float_sum":
         parameters["xs"] = [i / 10 for i in range(1000)]
     tail, expected = tails[case]
+    order = "" if case == "ordered_no_final" else " ORDER BY a" if case == "ordered_by_value" else " ORDER BY i"
     result = graph_db.cypher_json(
         "g",
         {
-            "query": "UNWIND range(1,30) AS i " + tail + " ORDER BY i",
+            "query": "UNWIND range(1,30) AS i " + tail + order,
             "parameters": parameters,
             "limits": {"memory_bytes": 4 << 20, "intermediate_states": 100000},
         },
@@ -6079,6 +6089,15 @@ def test_scalar_domain_reuse_preserves_scopes_consumers_and_order(graph_db, xs):
 
     queries = [
         "UNWIND [1,2,1] AS i UNWIND $xs AS x WITH * WHERE x IS NOT NULL RETURN i,avg(x) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $xs AS x CALL {RETURN avg(x) AS y} RETURN i,avg(y) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $xs AS x CALL {WITH x WHERE x>0 RETURN count(*) AS n} RETURN i,n,count(*) ORDER BY i,n",
+        "UNWIND [1,2] AS i UNWIND $xs AS x CALL {CALL {WITH x WHERE x>0 RETURN 7 AS y} RETURN count(*) AS n} RETURN i,n,count(*) ORDER BY i,n",
+        "UNWIND [1,2] AS i UNWIND $xs AS x CALL {UNWIND [1,2] AS k WITH k,count(*) AS n RETURN n} RETURN i,sum(n) ORDER BY i",
+        "UNWIND [3,1,2] AS i UNWIND $xs AS x WITH i,x ORDER BY x DESC RETURN i,avg(x),head(collect(x))",
+        "UNWIND [3,1,2] AS i UNWIND $xs AS x WITH i,x ORDER BY x DESC RETURN i,avg(x) AS a,head(collect(x)) ORDER BY a",
+        "UNWIND [3,1,2] AS i UNWIND $xs AS x WITH i,x ORDER BY x DESC RETURN i,count(x) ORDER BY i LIMIT 1",
+        "UNWIND [3,1,2] AS i UNWIND $xs AS x WITH i,i*2 AS j,x ORDER BY x DESC RETURN i,j,head(collect(x)) LIMIT 2",
+        "UNWIND [1,2] AS i UNWIND $xs AS x WITH i,x,CASE WHEN i=2 THEN 1/0 ELSE 1 END AS a ORDER BY x WITH i,x,CASE WHEN i=1 THEN true+1 ELSE 1 END AS b RETURN i,avg(x)",
         "UNWIND [1,2] AS i UNWIND $xs AS x WITH i,x ORDER BY x DESC WITH i,x RETURN i,avg(x),head(collect(x)) ORDER BY i",
         "UNWIND [1,2] AS i UNWIND $xs AS x WITH i,x ORDER BY x WITH i,x ORDER BY x DESC RETURN i,avg(x),head(collect(x)) ORDER BY i",
         "UNWIND [1,2] AS i UNWIND $xs AS x CALL {UNWIND [x,x+1] AS y RETURN y} RETURN i,sum(y),avg(y),head(collect(y)) ORDER BY i",
@@ -6107,7 +6126,13 @@ def test_scalar_domain_reuse_preserves_scopes_consumers_and_order(graph_db, xs):
     for query in queries:
         # Force a sequential reducer with an unbounded NULL collection. Keep
         # the original final ordering and every original typed output column.
-        split = query.rfind(" ORDER BY ")
+        returned = query.rfind(" RETURN ")
+        split = min(
+            [
+                len(query),
+                *[p for keyword in (" ORDER BY ", " SKIP ", " LIMIT ") if (p := query.rfind(keyword)) > returned],
+            ]
+        )
         control = query[:split] + ",size(coalesce(collect(null),[])) AS forced" + query[split:]
         expected = outcome(control)
         if expected[0] == "ok":
@@ -6140,5 +6165,25 @@ def test_count_group_windows_reuse_complete_successful_domains(graph_db):
                 "g",
                 {
                     "query": f"UNWIND [1,2] AS i UNWIND [1,2] AS x WITH i,x,1/(x-1) AS bad RETURN i,count(x) ORDER BY i LIMIT {limit}"
+                },
+            )
+
+
+def test_ordered_count_windows_reuse_validated_domains(graph_db):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND range(1,30) AS i UNWIND $xs AS x WITH i,x ORDER BY x DESC RETURN i,count(x) ORDER BY i LIMIT 5",
+            "parameters": {"xs": list(range(1000))},
+            "limits": {"memory_bytes": 4 << 20, "intermediate_states": 100000},
+        },
+    )
+    assert [[int(cell["value"]) for cell in row] for row in result["rows"]] == [[i, 1000] for i in range(1, 6)]
+    for limit in (0, 1):
+        with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
+            graph_db.cypher_json(
+                "g",
+                {
+                    "query": f"UNWIND [3,1,2] AS i UNWIND [1,0] AS x WITH i,x ORDER BY x RETURN i,count(1/x) ORDER BY i LIMIT {limit}"
                 },
             )
