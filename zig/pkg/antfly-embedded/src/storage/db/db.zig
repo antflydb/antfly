@@ -20286,11 +20286,12 @@ pub const DB = struct {
         var guard = try cut.lock(self.alloc, io, self.core.path, control.token());
         var guarded = true;
         defer if (guarded) guard.deinit();
+        var source_proof: ?[32]u8 = null;
         const local_exists = try snapshotPathExists(io, path);
         const local_usable = if (local_exists) validated: {
             // Local files are a cache of the retained generation. Validate
             // under the parent guard before trusting directory existence.
-            cut.validate(self.alloc, io, path, request, origin, control.token()) catch |err| switch (err) {
+            source_proof = cut.validateWithSourceProof(self.alloc, io, path, request, origin, control.token()) catch |err| switch (err) {
                 error.CatalogGenerationChanged => break :validated false,
                 else => return err,
             };
@@ -20327,7 +20328,7 @@ pub const DB = struct {
             try repository.recover(io, path, request, origin, control.token());
             errdefer std.Io.Dir.cwd().deleteTree(io, path) catch {};
             try self.admitQueryCut(io, cache_id, control.token());
-            try cut.validate(self.alloc, io, path, request, origin, control.token());
+            source_proof = try cut.validateWithSourceProof(self.alloc, io, path, request, origin, control.token());
         } else return error.CatalogGenerationChanged;
         var reader = try cut.readLease(self.alloc, io, self.core.path, cache_id, control.token());
         guard.deinit();
@@ -20342,7 +20343,7 @@ pub const DB = struct {
         });
         errdefer readonly.close();
         try control.token().check();
-        readonly.retained_value_scope = @import("../../search/value_membership.zig").Scope.init(self.core.path, request.id, origin, request.expires_ms);
+        readonly.retained_value_scope = @import("../../search/value_membership.zig").Scope.init(self.core.path, request.id, origin, request.expires_ms).withSourceProof(source_proof);
         readonly.retained_query_lease = reader;
         transferred = true;
         return readonly;

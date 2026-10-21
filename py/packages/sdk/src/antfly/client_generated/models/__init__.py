@@ -80,6 +80,8 @@ from .bedrock_embedder_config import BedrockEmbedderConfig
 from .bedrock_embedder_config_provider import BedrockEmbedderConfigProvider
 from .bedrock_embedder_config_request_format import BedrockEmbedderConfigRequestFormat
 from .bool_field_query import BoolFieldQuery
+from .bool_query import BoolQuery
+from .bool_query_body import BoolQueryBody
 from .boolean_query import BooleanQuery
 from .brave_search_config import BraveSearchConfig
 from .brave_search_config_freshness import BraveSearchConfigFreshness
@@ -1101,9 +1103,6 @@ from .lake_catalog_create_request_write_order import LakeCatalogCreateRequestWri
 from .lake_catalog_response import LakeCatalogResponse
 from .lake_catalog_response_metadata import LakeCatalogResponseMetadata
 from .lake_catalog_response_state import LakeCatalogResponseState
-from .lake_read_receipt import LakeReadReceipt
-from .lake_read_requirement import LakeReadRequirement
-from .lake_read_requirement_visibility import LakeReadRequirementVisibility
 from .legacy_graph_document_query import LegacyGraphDocumentQuery
 from .legacy_graph_node_selector import LegacyGraphNodeSelector
 from .legacy_graph_query import LegacyGraphQuery
@@ -1553,6 +1552,7 @@ from .query_evaluation_compute import QueryEvaluationCompute
 from .query_evaluation_order_by_item import QueryEvaluationOrderByItem
 from .query_evaluation_scope import QueryEvaluationScope
 from .query_evaluation_where import QueryEvaluationWhere
+from .query_execution import QueryExecution
 from .query_expression import QueryExpression
 from .query_expression_call import QueryExpressionCall
 from .query_expression_criteria_type_0 import QueryExpressionCriteriaType0
@@ -1575,10 +1575,10 @@ from .query_hits import QueryHits
 from .query_hits_total import QueryHitsTotal
 from .query_hits_total_relation import QueryHitsTotalRelation
 from .query_profile import QueryProfile
-from .query_profile_value_search import QueryProfileValueSearch
-from .query_profile_value_search_plans_item import QueryProfileValueSearchPlansItem
-from .query_profile_value_search_plans_item_operation import QueryProfileValueSearchPlansItemOperation
-from .query_profile_value_search_plans_item_verification import QueryProfileValueSearchPlansItemVerification
+from .query_profile_value_verification import QueryProfileValueVerification
+from .query_profile_value_verification_plans_item import QueryProfileValueVerificationPlansItem
+from .query_profile_value_verification_plans_item_operation import QueryProfileValueVerificationPlansItemOperation
+from .query_profile_value_verification_plans_item_verification import QueryProfileValueVerificationPlansItemVerification
 from .query_request import QueryRequest
 from .query_request_aggregations import QueryRequestAggregations
 from .query_request_embeddings import QueryRequestEmbeddings
@@ -1808,7 +1808,6 @@ from .sql_prepare_request import SQLPrepareRequest
 from .sql_prepared_execution_request import SQLPreparedExecutionRequest
 from .sql_prepared_response import SQLPreparedResponse
 from .sql_request import SQLRequest
-from .sql_request_lake_visibility import SQLRequestLakeVisibility
 from .sql_response import SQLResponse
 from .sql_setting_database_default import SqlSettingDatabaseDefault
 from .sql_setting_mutation_drop import SqlSettingMutationDrop
@@ -1989,7 +1988,7 @@ from .update_password_request import UpdatePasswordRequest
 from .user import User
 from .user_metadata_type_0 import UserMetadataType0
 from .vad_options import VADOptions
-from .value_search_execution import ValueSearchExecution
+from .value_verification import ValueVerification
 from .vector_source_storage_status import VectorSourceStorageStatus
 from .vertex_embedder_config import VertexEmbedderConfig
 from .vertex_embedder_config_provider import VertexEmbedderConfigProvider
@@ -2092,6 +2091,8 @@ __all__ = (
     "BedrockEmbedderConfigRequestFormat",
     "BooleanQuery",
     "BoolFieldQuery",
+    "BoolQuery",
+    "BoolQueryBody",
     "BraveSearchConfig",
     "BraveSearchConfigFreshness",
     "BraveSearchConfigProvider",
@@ -3100,9 +3101,6 @@ __all__ = (
     "LakeCatalogResponse",
     "LakeCatalogResponseMetadata",
     "LakeCatalogResponseState",
-    "LakeReadReceipt",
-    "LakeReadRequirement",
-    "LakeReadRequirementVisibility",
     "LegacyGraphDocumentQuery",
     "LegacyGraphNodeSelector",
     "LegacyGraphQuery",
@@ -3456,6 +3454,7 @@ __all__ = (
     "QueryEvaluationOrderByItem",
     "QueryEvaluationScope",
     "QueryEvaluationWhere",
+    "QueryExecution",
     "QueryExpression",
     "QueryExpressionCall",
     "QueryExpressionCriteriaType0",
@@ -3478,10 +3477,10 @@ __all__ = (
     "QueryHitsTotal",
     "QueryHitsTotalRelation",
     "QueryProfile",
-    "QueryProfileValueSearch",
-    "QueryProfileValueSearchPlansItem",
-    "QueryProfileValueSearchPlansItemOperation",
-    "QueryProfileValueSearchPlansItemVerification",
+    "QueryProfileValueVerification",
+    "QueryProfileValueVerificationPlansItem",
+    "QueryProfileValueVerificationPlansItemOperation",
+    "QueryProfileValueVerificationPlansItemVerification",
     "QueryRequest",
     "QueryRequestAggregations",
     "QueryRequestEmbeddings",
@@ -3713,7 +3712,6 @@ __all__ = (
     "SQLPreparedResponse",
     "SQLPrepareRequest",
     "SQLRequest",
-    "SQLRequestLakeVisibility",
     "SQLResponse",
     "SqlSettingDatabaseDefault",
     "SqlSettingMutationDrop",
@@ -3892,7 +3890,7 @@ __all__ = (
     "User",
     "UserMetadataType0",
     "VADOptions",
-    "ValueSearchExecution",
+    "ValueVerification",
     "VectorSourceStorageStatus",
     "VertexEmbedderConfig",
     "VertexEmbedderConfigProvider",

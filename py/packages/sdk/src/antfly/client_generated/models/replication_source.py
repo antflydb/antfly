@@ -12,6 +12,7 @@ from ..types import UNSET, Unset
 if TYPE_CHECKING:
     from ..models.autocomplete_query import AutocompleteQuery
     from ..models.bool_field_query import BoolFieldQuery
+    from ..models.bool_query import BoolQuery
     from ..models.boolean_query import BooleanQuery
     from ..models.conjunction_query import ConjunctionQuery
     from ..models.contains_query import ContainsQuery
@@ -83,12 +84,12 @@ class ReplicationSource:
             `$unset` ops from `on_update`'s `$set` paths (safe for multi-source).
             Use `$delete_document` op to delete the entire Antfly document.
              Example: [{'op': '$set', 'path': 'active', 'value': False}].
-        publication_filter (AutocompleteQuery | BooleanQuery | BoolFieldQuery | ConjunctionQuery | ContainsQuery |
-            DateRangeStringQuery | DisjunctionQuery | DocIdQuery | EqualsQuery | FuzzyQuery | GeoBoundingBoxQuery |
-            GeoBoundingPolygonQuery | GeoDistanceQuery | GeoShapeQuery | IPRangeQuery | MatchAllQuery | MatchesQuery |
-            MatchNoneQuery | MatchPhraseQuery | MatchQuery | MultiMatchQuery | MultiPhraseQuery | NumericRangeQuery |
-            PhraseQuery | PrefixQuery | QueryStringQuery | RegexpQuery | TermQuery | TermRangeQuery | Unset |
-            WildcardQuery):
+        publication_filter (AutocompleteQuery | BooleanQuery | BoolFieldQuery | BoolQuery | ConjunctionQuery |
+            ContainsQuery | DateRangeStringQuery | DisjunctionQuery | DocIdQuery | EqualsQuery | FuzzyQuery |
+            GeoBoundingBoxQuery | GeoBoundingPolygonQuery | GeoDistanceQuery | GeoShapeQuery | IPRangeQuery | MatchAllQuery
+            | MatchesQuery | MatchNoneQuery | MatchPhraseQuery | MatchQuery | MultiMatchQuery | MultiPhraseQuery |
+            NumericRangeQuery | PhraseQuery | PrefixQuery | QueryStringQuery | RegexpQuery | TermQuery | TermRangeQuery |
+            Unset | WildcardQuery):
         routes (list[ReplicationRoute] | Unset): Conditional routes for fan-out replication. Each route evaluates its
             `where` filter against every CDC row and, on match, writes to the
             specified `target_table`. Multiple routes can match the same row.
@@ -118,6 +119,7 @@ class ReplicationSource:
         AutocompleteQuery
         | BooleanQuery
         | BoolFieldQuery
+        | BoolQuery
         | ConjunctionQuery
         | ContainsQuery
         | DateRangeStringQuery
@@ -156,6 +158,7 @@ class ReplicationSource:
     def to_dict(self) -> dict[str, Any]:
         from ..models.autocomplete_query import AutocompleteQuery
         from ..models.bool_field_query import BoolFieldQuery
+        from ..models.bool_query import BoolQuery
         from ..models.boolean_query import BooleanQuery
         from ..models.conjunction_query import ConjunctionQuery
         from ..models.contains_query import ContainsQuery
@@ -249,6 +252,8 @@ class ReplicationSource:
             publication_filter = self.publication_filter.to_dict()
         elif isinstance(self.publication_filter, DateRangeStringQuery):
             publication_filter = self.publication_filter.to_dict()
+        elif isinstance(self.publication_filter, BoolQuery):
+            publication_filter = self.publication_filter.to_dict()
         elif isinstance(self.publication_filter, BooleanQuery):
             publication_filter = self.publication_filter.to_dict()
         elif isinstance(self.publication_filter, ConjunctionQuery):
@@ -327,6 +332,7 @@ class ReplicationSource:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.autocomplete_query import AutocompleteQuery
         from ..models.bool_field_query import BoolFieldQuery
+        from ..models.bool_query import BoolQuery
         from ..models.boolean_query import BooleanQuery
         from ..models.conjunction_query import ConjunctionQuery
         from ..models.contains_query import ContainsQuery
@@ -397,6 +403,7 @@ class ReplicationSource:
             AutocompleteQuery
             | BooleanQuery
             | BoolFieldQuery
+            | BoolQuery
             | ConjunctionQuery
             | ContainsQuery
             | DateRangeStringQuery
@@ -575,7 +582,7 @@ class ReplicationSource:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_18 = BooleanQuery.from_dict(data)
+                componentsschemas_query_type_18 = BoolQuery.from_dict(data)
 
                 return componentsschemas_query_type_18
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -583,7 +590,7 @@ class ReplicationSource:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_19 = ConjunctionQuery.from_dict(data)
+                componentsschemas_query_type_19 = BooleanQuery.from_dict(data)
 
                 return componentsschemas_query_type_19
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -591,7 +598,7 @@ class ReplicationSource:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_20 = DisjunctionQuery.from_dict(data)
+                componentsschemas_query_type_20 = ConjunctionQuery.from_dict(data)
 
                 return componentsschemas_query_type_20
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -599,7 +606,7 @@ class ReplicationSource:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_21 = MatchAllQuery.from_dict(data)
+                componentsschemas_query_type_21 = DisjunctionQuery.from_dict(data)
 
                 return componentsschemas_query_type_21
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -607,7 +614,7 @@ class ReplicationSource:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_22 = MatchNoneQuery.from_dict(data)
+                componentsschemas_query_type_22 = MatchAllQuery.from_dict(data)
 
                 return componentsschemas_query_type_22
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -615,7 +622,7 @@ class ReplicationSource:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_23 = DocIdQuery.from_dict(data)
+                componentsschemas_query_type_23 = MatchNoneQuery.from_dict(data)
 
                 return componentsschemas_query_type_23
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -623,7 +630,7 @@ class ReplicationSource:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_24 = BoolFieldQuery.from_dict(data)
+                componentsschemas_query_type_24 = DocIdQuery.from_dict(data)
 
                 return componentsschemas_query_type_24
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -631,7 +638,7 @@ class ReplicationSource:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_25 = IPRangeQuery.from_dict(data)
+                componentsschemas_query_type_25 = BoolFieldQuery.from_dict(data)
 
                 return componentsschemas_query_type_25
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -639,7 +646,7 @@ class ReplicationSource:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_26 = GeoBoundingBoxQuery.from_dict(data)
+                componentsschemas_query_type_26 = IPRangeQuery.from_dict(data)
 
                 return componentsschemas_query_type_26
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -647,7 +654,7 @@ class ReplicationSource:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_27 = GeoDistanceQuery.from_dict(data)
+                componentsschemas_query_type_27 = GeoBoundingBoxQuery.from_dict(data)
 
                 return componentsschemas_query_type_27
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -655,16 +662,24 @@ class ReplicationSource:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_28 = GeoBoundingPolygonQuery.from_dict(data)
+                componentsschemas_query_type_28 = GeoDistanceQuery.from_dict(data)
 
                 return componentsschemas_query_type_28
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_query_type_29 = GeoBoundingPolygonQuery.from_dict(data)
+
+                return componentsschemas_query_type_29
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
             if not isinstance(data, dict):
                 raise TypeError()
-            componentsschemas_query_type_29 = GeoShapeQuery.from_dict(data)
+            componentsschemas_query_type_30 = GeoShapeQuery.from_dict(data)
 
-            return componentsschemas_query_type_29
+            return componentsschemas_query_type_30
 
         publication_filter = _parse_publication_filter(d.pop("publication_filter", UNSET))
 
