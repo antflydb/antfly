@@ -896,7 +896,9 @@ def test_logical_verification_reuses_sources_and_retained_predicate_facts(statef
 
     # A warm count must borrow the complete predicate without source work,
     # including when the caller admits less verification than a cold scan needs.
-    warm_count = {k: v for k, v in payload.items() if k != "search_after"}
+    warm_count = {
+        k: v for k, v in payload.items() if k not in ("search_after", "order_by")
+    }
     warm_count["count"] = True
     warm_count["execution"] = {
         "value_verification": {"allow_scan": True, "max_documents": 1, "max_bytes": 1}
