@@ -18042,12 +18042,27 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
             defer parsed.deinit();
             try std.testing.expectEqualStrings("backend", parsed.value.object.get("model").?.string);
         }
+        fn image(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer gateway-test-key", req.header("Authorization").?);
+            if (std.mem.eql(u8, req.path, "/v1/systemone")) {
+                try std.testing.expectEqualStrings("true", req.header("TypeSafe-Danger-Zone-Images").?);
+                try std.testing.expect(std.mem.indexOf(u8, req.body, "Content-Type: image/png\r\n\r\n\x89PNG\r\n\x1a\n") != null);
+            } else {
+                const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
+                defer parsed.deinit();
+                const content = parsed.value.object.get("input").?.array.items[0].object.get("content").?.array.items;
+                try std.testing.expectEqualStrings("Inspect", content[0].object.get("text").?.string);
+                try std.testing.expectEqualStrings("data:image/png;base64,iVBORw0KGgo=", content[1].object.get("image_url").?.string);
+            }
+        }
     };
     var upstream = try httpx.TestServer.start(alloc, io, &.{
         .{ .method = .POST, .path = "/ai/v1/generate", .assert_request = Check.request, .respond = .{ .body = "{\"id\":\"upstream-id\",\"object\":\"chat.completion\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}" } },
         .{ .method = .POST, .path = "/ai/v1/decisions", .assert_request = Check.request, .respond = .{ .body = "{\"model\":\"backend\",\"answers\":[{\"name\":\"answer\",\"type\":\"predicate\",\"decision_method\":\"typed\",\"probability\":0.9}],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}" } },
         .{ .method = .POST, .path = "/ai/v1/read", .assert_request = Check.request, .respond = .{ .body = "{\"object\":\"list\",\"model\":\"backend\",\"data\":[{\"object\":\"read\",\"index\":0,\"text\":\"recognized\"}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":1,\"total_tokens\":1}}" } },
         .{ .method = .POST, .path = "/v1/embeddings", .assert_request = Check.request, .respond = .{ .body = "{\"object\":\"list\",\"model\":\"backend\",\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":[0.1,0.2]}]}" } },
+        .{ .method = .POST, .path = "/v1/decisions", .assert_request = Check.image, .respond = .{ .body = "{\"model\":\"backend\",\"answers\":[{\"name\":\"answer\",\"type\":\"predicate\",\"probability\":0.9}],\"usage\":{\"input_tokens\":2,\"output_tokens\":0,\"total_tokens\":2,\"input_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":0},\"output_tokens_details\":{\"reasoning_tokens\":0}}}" } },
+        .{ .method = .POST, .path = "/v1/systemone", .assert_request = Check.image, .respond = .{ .body = "{\"model\":\"backend\",\"answers\":{\"answer\":{\"type\":\"noul\",\"noul\":0.9}},\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}" } },
     });
     defer upstream.deinit();
     var config = try common_config.Config.parseFromSlice(alloc, "{}");
@@ -18059,6 +18074,10 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
     try config.registry.registerDeciderConfig("triage", .{ .provider = .antfly, .model = "backend" });
     try config.readers.registerConfig("ocr", .{ .provider = .antfly, .model = "backend" });
     try config.registry.registerEmbedderConfig("dense", .{ .provider = .openai, .model = "backend", .url = upstream.baseUrl(), .api_key = "gateway-test-key", .dimensions = 2 });
+    const hosted_url = try std.fmt.allocPrint(alloc, "{s}/v1", .{upstream.baseUrl()});
+    defer alloc.free(hosted_url);
+    try config.registry.registerDeciderConfig("visual-openai", .{ .provider = .openai, .model = "backend", .url = hosted_url, .api_key = "gateway-test-key" });
+    try config.registry.registerDeciderConfig("visual-jev", .{ .provider = .jev, .model = "jev-preview", .url = upstream.baseUrl(), .api_key = "gateway-test-key" });
     // SQL and HTTP names borrow the very same configuration object.
     const sql_decider = try config.registry.getDeciderConfig("deciders/triage");
     try std.testing.expectEqualStrings("backend", sql_decider.model);
@@ -18079,6 +18098,8 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
                 .{ "{\"model\":\"readers/ocr\",\"images\":[\"data:image/png;base64,aGk=\"]}", "recognized" },
                 .{ "{\"model\":\"embedders/dense\",\"input\":\"hi\"}", "embedding" },
                 .{ "{\"model\":\"embedders/dense\",\"input\":\"hi\",\"encoding_format\":\"base64\"}", "zczMPc3MTD4=" },
+                .{ "{\"model\":\"deciders/visual-openai\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}],\"questions\":[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Damaged?\"}]}", "0.9" },
+                .{ "{\"model\":\"deciders/visual-jev\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}],\"questions\":[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Damaged?\"}]}", "0.9" },
             };
             inline for (requests, 0..) |item, i| {
                 var req = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/test");
@@ -18088,7 +18109,7 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
                 defer ctx.deinit();
                 var response = try h.gatewayRequest(&ctx, switch (i) {
                     0 => .generate,
-                    1 => .decide,
+                    1, 5, 6 => .decide,
                     2 => .read,
                     else => .embed,
                 });
@@ -18103,7 +18124,7 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
     var failure: ?anyerror = null;
     try group.concurrent(io, Fiber.run, .{ alloc, io, &handler, &failure });
     defer group.cancel(io);
-    for (0..5) |_| try upstream.handleOne();
+    for (0..7) |_| try upstream.handleOne();
     try group.await(io);
     if (failure) |err| return err;
     try std.testing.expectEqual(@as(usize, 0), api_server.inferenceAdmissionStats().in_flight);

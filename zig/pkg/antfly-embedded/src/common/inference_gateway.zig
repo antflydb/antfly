@@ -217,14 +217,19 @@ pub const View = struct {
     }
 
     pub fn capabilities(self: View, target: Target) Capabilities {
-        // Descriptors are operator declarations about a backend, not proof
-        // that the adapter implements a feature. Callers intersect both.
+        // Chat descriptors are operator declarations about a backend; callers
+        // intersect them with adapter support. Typed decision adapters expose
+        // their input contract directly from the shared runtime.
         var buffer: [1024]u8 = undefined;
         const id = switch (target) {
             .configured => |c| std.fmt.bufPrint(&buffer, "{s}/{s}", .{ if (c.chain) "chains" else c.task.namespace(), c.name }) catch return .{},
             .connection => |c| std.fmt.bufPrint(&buffer, "connections/{s}/models/{s}", .{ c.connection, c.model }) catch return .{},
             .local => return .{},
         };
+        if (target == .configured and target.configured.task == .decide and !target.configured.chain) {
+            const cfg = self.providers.getDeciderConfig(target.configured.name) catch return .{};
+            return .{ .images = if (cfg.resolvedCapabilities().images) .supported else .unsupported, .audio = .unsupported, .streaming = .unsupported, .tools = .unsupported };
+        }
         return self.providers.inference_capabilities.get(id) orelse .{};
     }
 
@@ -745,4 +750,21 @@ test "provider registry gateway session acquisition allocation failures release 
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "provider registry gateway decision discovery reports adapter image support" {
+    const a = std.testing.allocator;
+    var registry = providers.Registry.init(a);
+    defer registry.deinit();
+    try registry.registerDeciderConfig("openai", .{ .provider = .openai, .model = "decision-vision" });
+    try registry.registerDeciderConfig("jev", .{ .provider = .jev, .model = "jev-preview" });
+    try registry.registerDeciderConfig("native", .{ .provider = .antfly, .model = "decision-text" });
+    const view = View{ .providers = &registry };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    for ([_][]const u8{ "openai", "jev", "native" }) |name| {
+        const descriptor = try view.describe(arena.allocator(), .{ .configured = .{ .task = .decide, .name = name } });
+        try std.testing.expectEqual(if (std.mem.eql(u8, name, "native")) Support.unsupported else Support.supported, descriptor.gateway_capabilities.images);
+        try std.testing.expectEqual(Support.unsupported, descriptor.gateway_capabilities.audio);
+    }
 }

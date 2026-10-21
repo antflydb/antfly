@@ -587,7 +587,7 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
         },
         .decide => {
             try only(request, &.{ "model", "input", "questions" });
-            const input = try string(request.object.get("input") orelse return error.InvalidInferenceRequest);
+            const input = try @import("antfly_local_sources").functions_decisions.Input.fromJson(request.object.get("input") orelse return error.InvalidInferenceRequest);
             const questions = request.object.get("questions") orelse return error.InvalidInferenceRequest;
             const result = try executor.decide(a, name, input, questions);
             return ctx.json(result);
@@ -950,10 +950,17 @@ fn inlineTaskAttachments(a: std.mem.Allocator, task: gateway.Task, request: Json
                         }
                         return;
                     };
-                    if (object.get("image_url")) |image| if (image == .object) {
-                        const url = image.object.getPtr("url") orelse return error.InvalidInferenceRequest;
-                        if (try self.take(url.*)) |attachment| url.* = .{ .string = try payloads.dataUri(self.a, attachment) };
-                    };
+                    if (object.get("image_url")) |image| {
+                        if (image == .object) {
+                            const url = image.object.getPtr("url") orelse return error.InvalidInferenceRequest;
+                            if (try self.take(url.*)) |attachment| url.* = .{ .string = try payloads.dataUri(self.a, attachment) };
+                        } else if (object.get("type")) |kind| {
+                            if (kind == .string and std.mem.eql(u8, kind.string, "input_image")) {
+                                const url = object.getPtr("image_url").?;
+                                if (try self.take(url.*)) |attachment| url.* = .{ .string = try payloads.dataUri(self.a, attachment) };
+                            }
+                        }
+                    }
                     inline for (.{ "messages", "content", "input", "documents", "prompts" }) |field| if (object.getPtr(field)) |child| try self.media(child);
                 },
                 else => {},
@@ -964,7 +971,7 @@ fn inlineTaskAttachments(a: std.mem.Allocator, task: gateway.Task, request: Json
     @memset(seen, false);
     var state = State{ .a = a, .attachments = attachments, .seen = seen, .chat = task == .generate };
     switch (task) {
-        .generate, .embed, .rerank => try state.media(&adapted),
+        .generate, .embed, .rerank, .decide => try state.media(&adapted),
         .read => {
             const images = request.object.get("images") orelse return error.InvalidInferenceRequest;
             if (images != .array) return error.InvalidInferenceRequest;
@@ -1706,6 +1713,13 @@ test "httpx inference gateway framed typed adapters inline only media references
     try std.testing.expectEqualStrings("attachment:0", adapted_embed.object.get("input").?.array.items[0].object.get("text").?.string);
     const parts = try tasks.embeddingParts(a, adapted_embed.object.get("input").?);
     try std.testing.expectEqualStrings("image", parts[1].binary.data);
+    const decide = try std.json.parseFromSliceLeaky(Json, a,
+        \\{"model":"deciders/visual","input":[{"role":"user","content":[{"type":"input_text","text":"attachment:0"},{"type":"input_image","image_url":"attachment:0"}]}]}
+    , .{});
+    const adapted_decide = try inlineTaskAttachments(a, .decide, decide, attachments);
+    const decision_parts = adapted_decide.object.get("input").?.array.items[0].object.get("content").?.array.items;
+    try std.testing.expectEqualStrings("attachment:0", decision_parts[0].object.get("text").?.string);
+    try std.testing.expectEqualStrings("data:image/png;base64,aW1hZ2U=", decision_parts[1].object.get("image_url").?.string);
     const audio = try std.json.parseFromSliceLeaky(Json, a, "{\"model\":\"transcribers/speech\",\"audio\":\"attachment:0\"}", .{});
     const adapted_audio = try inlineTaskAttachments(a, .transcribe, audio, &.{.{ .mime_type = "audio/flac", .data = "audio" }});
     try std.testing.expect(!adapted_audio.object.contains("audio"));

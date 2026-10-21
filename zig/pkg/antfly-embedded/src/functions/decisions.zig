@@ -20,12 +20,20 @@ const contract = @import("antfly_decisions");
 const generating = @import("antfly_generating");
 const constrained = @import("antfly_structured");
 pub const Json = std.json.Value;
+pub const Input = @import("decision_input.zig").Input;
+/// Request-arena-owned wire payload; adapters supply transport metadata along
+/// with their body so the shared executor is independent of vendor formats.
+pub const WirePayload = struct {
+    body: []const u8,
+    content_type: []const u8 = "application/json",
+    headers: []const [2][]const u8 = &.{},
+};
 pub const Provider = enum { antfly, jev, openai };
 pub const Kind = enum { choice, multi_choice, score, noul };
 pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability };
-pub const Capabilities = struct { max_questions: usize = 64, max_choices: usize = 64, max_levels: usize, max_input_bytes: usize = 1024 * 1024, full_distribution: bool = true, embedding_similarity: bool = false, generated: bool = false };
+pub const Capabilities = struct { max_questions: usize = 64, max_choices: usize = 64, max_levels: usize, max_input_bytes: usize = 1024 * 1024, images: bool = false, full_distribution: bool = true, embedding_similarity: bool = false, generated: bool = false };
 pub fn capabilities(provider: Provider) Capabilities {
-    return .{ .max_levels = if (provider == .antfly) 64 else 10 };
+    return .{ .max_levels = if (provider == .antfly) 64 else 10, .images = provider != .antfly };
 }
 pub const RateLimit = struct {
     pacing: ?enum { token_bucket, completion } = null,
@@ -98,7 +106,10 @@ pub const DeciderConfig = struct {
     pub fn resolvedCapabilities(self: @This()) Capabilities {
         var caps = capabilities(self.provider);
         caps.generated = self.decision_method == .generated;
-        if (caps.generated) caps.max_levels = 64;
+        if (caps.generated) {
+            caps.max_levels = 64;
+            caps.images = false;
+        }
         if (self.decision_method == .embedding_similarity) {
             caps.embedding_similarity = true;
             caps.full_distribution = false;
@@ -637,10 +648,10 @@ test "decision provider embeddinggemma2 provider wrapper retains the trusted sim
     const questions = try std.json.parseFromSliceLeaky(Json, a, "{\"answer\":{\"type\":\"choice\",\"instructions\":\"Route\",\"criteria\":{\"a\":\"Account\",\"b\":\"Billing\"}}}", .{});
     var mock = Mock{ .response = try std.json.parseFromSliceLeaky(Json, a, "{\"model\":\"embeddinggemma2\",\"answers\":{\"answer\":{\"type\":\"choice\",\"decision_method\":\"embedding_similarity\",\"similarity_metric\":\"cosine\",\"prototype_set_hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"choice\":null,\"status\":\"abstained\",\"abstention_reason\":\"tie\",\"similarities\":{\"a\":0.3,\"b\":0.3},\"margin\":0}},\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}", .{}) };
     const provider = DecisionProvider{ .ptr = &mock, .validate_fn = Mock.validate, .evaluate_batch_fn = Mock.evaluate, .capabilities_fn = Mock.caps };
-    const rows = try provider.evaluateBatch(a, &.{.{ .decider = "routing", .questions = questions, .input = "Reset password" }});
+    const rows = try provider.evaluateBatch(a, &.{.{ .decider = "routing", .questions = questions, .input = .{ .text = "Reset password" } }});
     try std.testing.expect((try selectResult(.ai_choice, rows[0])) == .null);
 }
-pub const Request = struct { decider: []const u8, questions: Json, input: []const u8, source_table: []const u8 = "" };
+pub const Request = struct { decider: []const u8, questions: Json, input: Input, source_table: []const u8 = "" };
 pub const DecisionProvider = struct {
     /// Trusted routing scope borrowed from the bound statement, never public JSON.
     source_table: []const u8 = "",
@@ -664,7 +675,10 @@ pub const DecisionProvider = struct {
         try self.checkpoint();
         for (requests) |request| {
             try self.validate(request.decider, request.questions);
-            _ = try text(.{ .string = request.input });
+            try request.input.validate();
+            const caps = if (self.capabilities_fn) |f| try f(self.ptr, request.decider) else Capabilities{ .max_levels = 64 };
+            if (!caps.images) _ = try request.input.requireText();
+            try request.input.checkLimit(a, caps.max_input_bytes);
         }
         const scoped = if (self.source_table.len > 0) try a.dupe(Request, requests) else null;
         defer if (scoped) |owned| a.free(owned);

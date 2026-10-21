@@ -5237,7 +5237,7 @@ export interface paths {
         put?: never;
         /**
          * Answer named decision questions
-         * @description Execute one text input or an Antfly batch. Embedding similarity supports choice and multi_choice; trained decision models support choice, score and predicate. Answer variants distinguish trained probabilities from raw cosine similarities.
+         * @description Execute text or multimodal evidence through named deciders, or an Antfly text batch. OpenAI and Jev adapters support images; native deciders require text. Embedding similarity supports choice and multi_choice; trained decision models support choice, score and predicate. Answer variants distinguish trained probabilities from raw cosine similarities.
          */
         post: operations["decide"];
         delete?: never;
@@ -23168,6 +23168,31 @@ export interface components {
             object: "chunk.embedding.error";
             code: string;
         };
+        DecisionEvidenceText: {
+            /** @enum {string} */
+            type: "input_text";
+            text: string;
+        };
+        DecisionEvidenceImage: {
+            /** @enum {string} */
+            type: "input_image";
+            /** @description Base64 data URL (image/png, image/jpeg, image/webp, image/gif), or a public HTTP(S) URL for OpenAI. Antfly never fetches image URLs for decision adapters. */
+            image_url: string;
+            /**
+             * @default auto
+             * @enum {string}
+             */
+            detail?: "auto" | "low" | "high";
+        };
+        DecisionEvidenceMessage: {
+            /** @enum {string} */
+            type?: "message";
+            /** @enum {string} */
+            role: "user";
+            content: string | (components["schemas"]["DecisionEvidenceText"] | components["schemas"]["DecisionEvidenceImage"])[];
+        };
+        /** @description Text or ordered user messages containing text and images. Named OpenAI and Jev deciders accept messages. Native trained, embedding, and generated deciders require text. At most 128 images and 1 MiB of serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail auto; OpenAI also accepts public HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user roles are unsupported. */
+        DecisionEvidence: string | components["schemas"]["DecisionEvidenceMessage"][];
         DecisionInput: {
             id?: string;
             input: string;
@@ -23239,7 +23264,7 @@ export interface components {
              */
             dimensions?: 768 | 512 | 256 | 128;
         };
-        /** @description Supply exactly one of input (single text) or inputs (Antfly batch extension). Question names must be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are bounded at 16 MiB. */
+        /** @description Supply exactly one of input (single evidence item) or inputs (text-only Antfly batch extension). Question names must be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are bounded at 16 MiB. */
         InferenceDecideRequest: {
             /**
              * @description Explicit shared-context transport version. Requires batched inputs and contexts; unknown versions are rejected.
@@ -23251,7 +23276,7 @@ export interface components {
             model: string;
             /** @description Pin the exact EmbeddingGemma 2 assets and embedding recipe. */
             model_identity?: string;
-            input?: string;
+            input?: components["schemas"]["DecisionEvidence"];
             inputs?: components["schemas"]["DecisionInput"][];
             long_document?: components["schemas"]["InferenceDecideLongDocument"];
             questions: components["schemas"]["InferenceDecideQuestion"][];

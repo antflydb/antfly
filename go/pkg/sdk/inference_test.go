@@ -1329,3 +1329,30 @@ func TestGeneratedInferenceRequestsPreserveNestedConfiguration(t *testing.T) {
 		})
 	}
 }
+
+func TestInferenceDecidePreservesTextAndMultimodalEvidence(t *testing.T) {
+	for _, input := range []string{
+		`"Inspect this item"`,
+		`[{"role":"user","content":[{"type":"input_text","text":"Inspect"},{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo=","detail":"auto"}]}]`,
+	} {
+		t.Run(input, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, "/ai/v1/decisions", r.URL.Path)
+				var request struct {
+					Input json.RawMessage `json:"input"`
+				}
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+				assert.JSONEq(t, input, string(request.Input))
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"model":"vision","answers":[],"usage":{"input_tokens":2,"output_tokens":0}}`)
+			}))
+			defer server.Close()
+			client, err := NewInferenceClient(server.URL, nil)
+			require.NoError(t, err)
+			var evidence oapi.DecisionEvidence
+			require.NoError(t, json.Unmarshal([]byte(input), &evidence))
+			_, err = client.Decide(context.Background(), oapi.InferenceDecideRequest{Model: "deciders/visual", Input: evidence})
+			require.NoError(t, err)
+		})
+	}
+}

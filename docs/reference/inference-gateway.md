@@ -131,6 +131,45 @@ content and arbitrary provider-specific options are outside this subset.
 Sparse named embedders declare `sparse: true` in the existing embedder config.
 Sparse output cannot request dense dimensions or base64 encoding. Multimodal
 requests retain ordered parts and groups; unsupported modalities fail explicitly.
+
+Named OpenAI and Jev deciders accept the same multimodal `input` on
+`POST /ai/v1/decisions`:
+
+```json
+{
+  "model": "deciders/visual-triage",
+  "input": [{
+    "role": "user",
+    "content": [
+      {"type": "input_text", "text": "Inspect this returned item."},
+      {"type": "input_image", "image_url": "data:image/png;base64,<image bytes>", "detail": "auto"}
+    ]
+  }],
+  "questions": [{"name": "damaged", "type": "predicate", "instructions": "Is the item damaged?"}]
+}
+```
+
+Existing string inputs continue to work. Message order and content order are
+preserved. Inputs allow only user messages, `input_text`, and `input_image`;
+audio, files, tools, and other roles fail validation. Limits are 128 messages,
+128 images, and 1 MiB of serialized evidence per call. Text-only native,
+embedding-similarity, and generated deciders reject message inputs explicitly.
+`gateway_capabilities.images` reports support on named hosted deciders.
+SQL decision functions accept the same message array as a JSONB input, and
+expression decision functions accept it as a JSON input.
+
+OpenAI receives the ordered content parts, including `detail` (`auto`, `low`,
+`high`). It also accepts public HTTP(S) image URLs, WebP, and GIF images.
+Jev requires inline PNG or JPEG data URLs and `detail: "auto"` (or omission).
+Antfly sends Jev images as multipart binary assets with the experimental
+`TypeSafe-Danger-Zone-Images: true` header, following the
+[official TypeSafe SDK](https://github.com/typesafe-ai/typesafe-sdk-js#images).
+Use a Jev model with image support, such as `jev-preview`. Antfly does not fetch
+image URLs for these adapters. Provider credentials, cancellation, quotas, and
+usage accounting follow the normal decision execution path; request media is
+not included in gateway telemetry. Byte estimates reserve request budgets
+before dispatch, and provider-reported usage is charged on completion.
+
 Native Antfly embedding aliases preserve the runtime input contract: legacy
 content-part arrays produce one vector per part, while ordered `{content: [...]}`
 objects produce one vector per object. They retain runtime usage, backend, and
