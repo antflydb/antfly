@@ -1325,10 +1325,9 @@ pub const TextRun = struct {
     ascent: f64 = 0,
     descent: f64 = 0,
     paint_order: usize = 0,
-    /// The originating text-showing operator contains authored whitespace.
-    /// Reconstruction combines this provenance with the local TJ fragment
-    /// shape before treating a positioning adjustment as glyph tracking.
-    text_show_has_explicit_whitespace: bool = false,
+    /// Consistent TJ positioning measured on both sides of authored whitespace.
+    /// Only matching local gaps between glyph fragments count as tracking.
+    text_show_tracking_gap: ?f64 = null,
     paint_phase: usize = 0,
     output_span: ?TextOutputSpan = null,
 
@@ -1368,7 +1367,7 @@ const LayoutTextRun = struct {
     ascent: f64 = 0,
     descent: f64 = 0,
     paint_order: usize = 0,
-    text_show_has_explicit_whitespace: bool = false,
+    text_show_tracking_gap: ?f64 = null,
     output_span: ?TextOutputSpan = null,
 
     pub fn deinit(self: *LayoutTextRun, alloc: Allocator) void {
@@ -3094,16 +3093,53 @@ const ShadingStitchingFunction = struct {
     }
 };
 
-fn markTextShowRunsExplicitWhitespace(runs: anytype) void {
-    var has_explicit_whitespace = false;
-    for (runs) |run| {
-        if (std.mem.indexOfAny(u8, run.text, &std.ascii.whitespace) != null) {
-            has_explicit_whitespace = true;
-            break;
+fn markTextShowRunsTracking(runs: anytype) void {
+    var start: usize = 0;
+    while (start < runs.len) {
+        if (!textIsTrackingFragment(runs[start].text)) {
+            start += 1;
+            continue;
         }
+        var end = start + 1;
+        while (end < runs.len and textIsTrackingFragment(runs[end].text) and
+            textRunsShareLine(runs[end - 1], runs[end])) : (end += 1)
+        {}
+        // A multi-glyph label or numeric cell breaks the tracking group.
+        // Evidence in prose must not propagate into neighboring table cells.
+        markTextShowRunGroupTracking(runs[start..end]);
+        start = end;
     }
-    if (!has_explicit_whitespace) return;
-    for (runs) |*run| run.text_show_has_explicit_whitespace = true;
+}
+
+fn textIsTrackingFragment(text: []const u8) bool {
+    return text.len > 0 and (std.mem.trim(u8, text, &std.ascii.whitespace).len == 0 or
+        textHasSingleTrackingCodepoint(text));
+}
+
+fn markTextShowRunGroupTracking(runs: anytype) void {
+    var tracking_gap: ?f64 = null;
+    for (runs, 0..) |run, i| {
+        if (i == 0 or i + 1 == runs.len) continue;
+        if (std.mem.indexOfAny(u8, run.text, &std.ascii.whitespace) == null) continue;
+        // A label such as "Grades " is not evidence of per-glyph tracking.
+        // Accept an isolated space or one glyph carrying authored whitespace.
+        if (std.mem.trim(u8, run.text, &std.ascii.whitespace).len > 0 and
+            !textHasSingleTrackingCodepoint(run.text)) continue;
+        if (!textHasSingleTrackingCodepoint(runs[i - 1].text) or
+            !textHasSingleTrackingCodepoint(runs[i + 1].text)) continue;
+        const em = @abs(run.font_size) * textRunAxisLength(run) * @abs(run.horizontal_scale);
+        const tolerance = em * 0.01;
+        const before = textRunForwardGap(runs[i - 1], run);
+        const after = textRunForwardGap(run, runs[i + 1]);
+        if (!(before >= 0 and before < em) or !std.math.isFinite(after) or
+            @abs(before - after) > tolerance) continue;
+        if (tracking_gap) |prior| {
+            // Conflicting spacing evidence is ambiguous; retain geometry.
+            if (@abs(prior - before) > tolerance) return;
+        } else tracking_gap = before;
+    }
+    if (tracking_gap == null) return;
+    for (runs) |*run| run.text_show_tracking_gap = tracking_gap;
 }
 
 const PositionedTextOutput = union(enum) {
@@ -3118,10 +3154,10 @@ const PositionedTextOutput = union(enum) {
         };
     }
 
-    fn markTextShowExplicitWhitespace(self: PositionedTextOutput, start: usize) void {
+    fn markTextShowTracking(self: PositionedTextOutput, start: usize) void {
         switch (self) {
-            .layout => |out| markTextShowRunsExplicitWhitespace(out.items[start..]),
-            .analysis, .render => |out| markTextShowRunsExplicitWhitespace(out.items[start..]),
+            .layout => |out| markTextShowRunsTracking(out.items[start..]),
+            .analysis, .render => |out| markTextShowRunsTracking(out.items[start..]),
         }
     }
 
@@ -15422,7 +15458,7 @@ fn applyTextRunOperator(
                 else => {},
             }
         }
-        out.markTextShowExplicitWhitespace(start_len);
+        out.markTextShowTracking(start_len);
         paint_order.* += 1;
         return;
     }
@@ -18074,15 +18110,14 @@ fn reconstructTextFromRunsCancelableAlloc(alloc: Allocator, runs: anytype, cance
                     startsWithAsciiUpper(run.text);
                 // A text-showing operator boundary can split a single word.
                 // Infer separators from geometry, not content-stream chunking.
-                // An explicitly spaced TJ operator may also carry per-glyph
-                // tracking wider than an ordinary space. Suppress that local
-                // false boundary only for adjacent glyph-sized fragments.
-                // Em-sized gaps and larger fragments still delimit words.
+                // Suppress a geometric boundary only when its gap matches
+                // tracking measured around authored whitespace in this TJ.
+                // Unrelated table-cell gaps retain their geometric boundaries.
                 const tracked_glyph_fragments =
                     prior.paint_order == run.paint_order and
-                    prior.text_show_has_explicit_whitespace and
-                    run.text_show_has_explicit_whitespace and
-                    gap < font_scale * @abs(prior.horizontal_scale) and
+                    prior.text_show_tracking_gap != null and
+                    run.text_show_tracking_gap != null and
+                    @abs(gap - prior.text_show_tracking_gap.?) <= font_scale * @abs(prior.horizontal_scale) * 0.01 and
                     textHasSingleTrackingCodepoint(prior.text) and
                     textHasSingleTrackingCodepoint(run.text);
                 if ((!tracked_glyph_fragments and gap > word_gap) or caption_boundary) {
@@ -21980,6 +22015,33 @@ test "reader preserves TJ numeric cell gaps beside authored whitespace" {
             const text = try reader.extractPageTextAlloc(1);
             defer alloc.free(text);
             try std.testing.expectEqualStrings("Item 1 2 3\n1 2 3 4\n", text);
+        }
+    }
+}
+
+test "reader preserves alphabetic TJ cells without propagating prose tracking" {
+    const alloc = std.testing.allocator;
+    for ([_]u32{ 100, 25, 10 }) |horizontal_scale| {
+        for ([_]u32{ 250, 500, 750 }) |gap| {
+            const content = try std.fmt.allocPrint(alloc,
+                \\BT /F1 12 Tf {d} Tz 1 0 0 1 10 90 Tm
+                \\[(Grades ) (A) -{d} (B) -{d} (C)] TJ
+                \\0 -20 Td [(H) -250 (e) -250 (l) -250 (l) -250 (o) -250 ( ) -250 (W) -250 (o) -250 (r) -250 (l) -250 (d) -1500 (Grades ) (A) -{d} (B) -{d} (C)] TJ
+                \\0 -20 Td [(H) -250 (e) -250 (l) -250 (l) -250 (o ) -250 (W) -250 (o) -250 (r) -250 (l) -250 (d)] TJ ET
+                \\
+            , .{ horizontal_scale, gap, gap, gap, gap });
+            defer alloc.free(content);
+            const sample = try buildTextOrderingTestPdfAlloc(alloc, content);
+            defer alloc.free(sample);
+            var reader = try Reader.init(alloc, sample);
+            defer reader.deinit();
+            const expected = "Grades A B C\nHello World Grades A B C\nHello World\n";
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(alloc);
+            try std.testing.expectEqualStrings(expected, analysis.text);
+            const text = try reader.extractPageTextAlloc(1);
+            defer alloc.free(text);
+            try std.testing.expectEqualStrings(expected, text);
         }
     }
 }

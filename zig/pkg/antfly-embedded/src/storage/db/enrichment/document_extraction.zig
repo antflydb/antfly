@@ -1527,11 +1527,15 @@ fn isReliableEmbeddedNumericRow(line: []const u8) bool {
     if (quality.font_corrupted or quality.replacement_corrupted) return false;
     // Rows are usually shorter than the page-level garbled-word minimum.
     // Count alphabetic tokens independently so numeric cells neither signal
-    // fragmentation nor dilute evidence of a broken label. Require several
-    // alphabetic tokens before rejecting isolated single-letter row labels.
+    // fragmentation nor dilute evidence of a broken label. Also require a
+    // sustained run of fragments: interleaved labels such as "Class A Class B"
+    // and letter/value pairs are reliable even with many single-letter tokens.
     var words = std.mem.tokenizeAny(u8, line, &std.ascii.whitespace);
     var alphabetic_words: usize = 0;
     var single_letters: usize = 0;
+    var fragment_run: usize = 0;
+    var run_has_lowercase = false;
+    var has_fragmented_word = false;
     while (words.next()) |raw_word| {
         const word = std.mem.trim(u8, raw_word, ".,!?;:\"'()[]{}");
         if (word.len == 0) continue;
@@ -1542,13 +1546,26 @@ fn isReliableEmbeddedNumericRow(line: []const u8) bool {
                 break;
             }
         }
-        if (!alphabetic) continue;
+        if (!alphabetic) {
+            fragment_run = 0;
+            run_has_lowercase = false;
+            continue;
+        }
         alphabetic_words += 1;
         if (word.len == 1 and std.ascii.isAlphabetic(word[0]) and
             std.mem.indexOfScalar(u8, "Xxv", word[0]) == null)
+        {
             single_letters += 1;
+            fragment_run += 1;
+            run_has_lowercase = run_has_lowercase or std.ascii.isLower(word[0]);
+            // All-uppercase single-letter column headings are not prose.
+            if (fragment_run >= 4 and run_has_lowercase) has_fragmented_word = true;
+        } else {
+            fragment_run = 0;
+            run_has_lowercase = false;
+        }
     }
-    return alphabetic_words < 4 or
+    return !has_fragmented_word or
         @as(f64, @floatFromInt(single_letters)) / @as(f64, @floatFromInt(alphabetic_words)) <= config.max_single_char_word_ratio;
 }
 
@@ -5209,6 +5226,32 @@ test "numeric recovery rejects short fragmented labels without counting numeric 
     const merged = try mergeOcrWithEmbeddedNumericRowsAlloc(alloc, reliable, ocr);
     defer alloc.free(merged);
     try std.testing.expect(std.mem.indexOf(u8, merged, reliable) != null);
+}
+
+test "numeric recovery retains single letter class labels and their balances" {
+    const alloc = std.testing.allocator;
+    const embedded = "Class A Class B 101 201\nClass C Class D 102 202\nClass E Class F 103 203\nClass G Class H 104 204";
+    const ocr = "The report describes the share classes and their balances. It summarizes the results in readable prose without reproducing the individual values.";
+    const recall = try numericTokenRecallAlloc(alloc, embedded, ocr);
+    try std.testing.expectEqual(@as(usize, 8), recall.reference_count);
+    try std.testing.expectEqual(OcrTextChoice.ocr_with_embedded_numeric_rows, try chooseOcrTextForContentAlloc(
+        alloc,
+        embedded,
+        ocr,
+        assessOcrQuality(embedded, .{}),
+        assessOcrQuality(ocr, .{}),
+    ));
+    const merged = try mergeOcrWithEmbeddedNumericRowsAlloc(alloc, embedded, ocr);
+    defer alloc.free(merged);
+    try std.testing.expect(std.mem.indexOf(u8, merged, embedded) != null);
+
+    // Consecutive uppercase columns and letter/value pairs are table structure.
+    const labelled_cells = "A B C D 11 12 13 14\nGrade A 10 B 20 C 30 D 40";
+    const cell_recall = try numericTokenRecallAlloc(alloc, labelled_cells, "");
+    try std.testing.expectEqual(@as(usize, 8), cell_recall.reference_count);
+    const merged_cells = try mergeOcrWithEmbeddedNumericRowsAlloc(alloc, labelled_cells, ocr);
+    defer alloc.free(merged_cells);
+    try std.testing.expect(std.mem.indexOf(u8, merged_cells, labelled_cells) != null);
 }
 
 test "numeric recall limits preserve embedded text without exhausting scratch memory" {
