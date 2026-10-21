@@ -1,0 +1,15 @@
+{
+  "description": "Diagnostic symbolized build after admission fix, before performance changes; source was not separately committed. Timing claims use the pinned ReleaseFast controls, not these stack counts.",
+  "binary_sha256": "746472e0646cfefd767eb990331f0cb1cf02598eee6bd6564aa1ab780b138ff3",
+  "files": {
+    "full": 1000,
+    "delta": 1000,
+    "capture": 100000
+  },
+  "seconds": {
+    "full": 3,
+    "delta": 3,
+    "capture": 2
+  },
+  "driver": "import sys, os, time, tempfile, subprocess, json, hashlib\nfrom pathlib import Path\nsys.path.insert(0, str(Path('zig/pkg/antfly-grep/bench').resolve()))\nfrom registered import Client\nbinary=Path(sys.argv[1]).resolve()\nmode=sys.argv[2]\nout=Path(sys.argv[3]).resolve()\nenv={k:v for k,v in os.environ.items() if not k.startswith(('ANTFLY_GREP_', 'RIPGREP_', 'JG_', 'GIT_CONFIG'))}\nwith tempfile.TemporaryDirectory(dir='.zig-cache',prefix='work-profile-') as d:\n    root=Path(d).resolve(); (root/'src').mkdir()\n    for n in range(1000 if mode!='capture' else 100000):\n        p=root/'src'/f'd{n%64:03}'/f'f{n:06}.txt';p.parent.mkdir(exist_ok=True);p.write_text('STOP original\\n')\n    env.update(HOME=str(root),XDG_CONFIG_HOME=str(root))\n    if mode=='capture':\n        proc=subprocess.Popen([str(binary),'workspace','serve','--workspace-watch','--workspace-max-files=200000','--workspace-memory-limit=1G','src'],cwd=root,env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)\n        sampler=subprocess.Popen(['/usr/bin/sample',str(proc.pid),'2','1','-file',str(out)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n        ready=proc.stdout.readline();proc.stdin.close();proc.wait(timeout=120);sampler.wait(timeout=20)\n        print(ready.decode().strip());sys.exit()\n    client=Client(binary,root,'src',[],env,start_args=['--workspace-watch'])\n    _,rows=client.exchange('register',args=['STOP','--threads=2']);handle=rows[0]['query_handle']\n    _,rows=client.exchange('search',revision=client.ready['revision'],query_handle=handle,delta=True,if_result_token='0'*64)\n    token=next(r['result_token'] for r in rows if r['type']=='result_token')\n    sampler=subprocess.Popen(['/usr/bin/sample',str(client.process.pid),'3','1','-file',str(out)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n    n=0;deadline=time.monotonic()+4\n    while time.monotonic()<deadline:\n        fields={}\n        if mode=='delta':\n            (root/'src'/'d000'/'f000000.txt').write_text(f'STOP {n}\\n')\n            client.exchange('refresh')\n            fields.update(delta=True,if_result_token=token)\n        _,rows=client.exchange('search',revision=client.ready['revision'],query_handle=handle,**fields)\n        token=next(r['result_token'] for r in rows if r['type']=='result_token')\n        n+=1\n    sampler.wait(timeout=15);client.close()\n    print(json.dumps(dict(mode=mode,requests=n,sha256=hashlib.sha256(binary.read_bytes()).hexdigest())))\n"
+}

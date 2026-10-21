@@ -1,0 +1,20 @@
+[
+  {
+    "platform": "macos",
+    "binary_sha256": "42c0e244e64c1e97d6ec8a19d46ae23e06826dc8fd5d9f47537f40f5e89a445b",
+    "archive_sha256": "5669ae61e91aff601654197ea9869eafca537f32907cc8dee046e1cba3d66263",
+    "verified_assets": true
+  },
+  {
+    "platform": "linux",
+    "binary_sha256": "ec45feee63d6f8346c7178e02cdf70711474f6650160920d40be48f1871f5427",
+    "archive_sha256": "c5d6beb804f2230fb6f8384c76303bb28b047e197b89e2af5098d21159c652c9",
+    "verified_assets": true
+  },
+  {
+    "platform": "windows",
+    "binary_sha256": "54709996a97347d8bd2d16d475a43f0ad34db081bff86b5eea0a834de45ee13d",
+    "archive_sha256": "480caac04b2ed1f485715d17f357aa48c2db17f8fc6d42500c1a9ed97682ffed",
+    "verified_assets": true
+  }
+]

@@ -873,6 +873,8 @@ pub const Detail = enum(c_int) {
     unsupported_constrained_schema,
     unsupported_generated_extraction_schema,
     resolver_curation_conflict,
+    value_search_requires_scan,
+    value_search_limit_exceeded,
     invalid_embedding_identity,
 };
 
@@ -1407,6 +1409,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.TemporaryNameServerFailure => status(.retryable, .temporary_name_server_failure),
         error.NameServerFailure => status(.unavailable, .name_server_failure),
         error.QueryCandidateBudgetExceeded => status(.unavailable, .query_candidate_budget_exceeded),
+        error.ValueSearchRequiresScan => status(.unsupported, .value_search_requires_scan),
+        error.ValueSearchLimitExceeded => status(.invalid_argument, .value_search_limit_exceeded),
         error.DecisionLimitExceeded => status(.invalid_argument, .decision_limit_exceeded),
         error.GraphWorkBudgetExceeded => status(.invalid_argument, .graph_work_budget_exceeded),
         error.GraphMinWeightDomainViolation => status(.invalid_argument, .graph_min_weight_domain_violation),
@@ -2276,6 +2280,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .temporary_name_server_failure => "TemporaryNameServerFailure",
         .name_server_failure => "NameServerFailure",
         .query_candidate_budget_exceeded => "QueryCandidateBudgetExceeded",
+        .value_search_requires_scan => "ValueSearchRequiresScan",
+        .value_search_limit_exceeded => "ValueSearchLimitExceeded",
         .decision_limit_exceeded => "DecisionLimitExceeded",
         .query_embedding_input_too_large => "QueryEmbeddingInputTooLarge",
         .query_embedding_overloaded => "QueryEmbeddingOverloaded",
@@ -2947,6 +2953,12 @@ test "merged runtime error details preserve main wire identifiers" {
     try std.testing.expectEqual(@as(c_int, 675), @backingInt(Detail.inference_worker_unavailable));
     try std.testing.expectEqual(@as(c_int, 676), @backingInt(Detail.model_chunk_audio_too_large));
     try std.testing.expectEqual(@as(c_int, 729), @backingInt(Detail.decision_limit_exceeded));
+}
+
+test "logical query work and scan policy failures retain their identities" {
+    for ([_]anyerror{ error.ValueSearchRequiresScan, error.ValueSearchLimitExceeded }) |err| {
+        try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+    }
 }
 
 test "resolver namespace rejection retains its conflict identity across runtime callbacks" {

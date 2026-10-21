@@ -2899,6 +2899,15 @@ fn parseQueryRequestWithDeadlineCore(
     errdefer freeSearchRequest(alloc, &req);
 
     try applyCommonSearchRequestOptions(alloc, request, &req);
+    if (request.value_search_execution) |policy| {
+        req.value_search_execution = .{
+            .allow_scan = policy.allow_scan orelse false,
+            .max_documents = if (policy.max_documents) |n| std.math.cast(u64, n) orelse return error.InvalidQueryRequest else 100_000,
+            .max_bytes = if (policy.max_bytes) |n| std.math.cast(u64, n) orelse return error.InvalidQueryRequest else 64 * 1024 * 1024,
+            .max_regex_work = if (policy.max_regex_work) |n| std.math.cast(u64, n) orelse return error.InvalidQueryRequest else 100_000_000,
+        };
+        if (req.value_search_execution.max_documents == 0 or req.value_search_execution.max_bytes == 0 or req.value_search_execution.max_regex_work == 0) return error.InvalidQueryRequest;
+    }
     req.execution_deadline_ns = execution_deadline_ns;
     try applyPublicHierarchyControls(alloc, effective_body, &req);
     req.distributed_text_stats = try parseDistributedTextStatsAlloc(alloc, effective_body);
@@ -6655,6 +6664,10 @@ fn buildProfileValue(
         const dense_parsed = try std.json.parseFromSlice(std.json.Value, alloc, dense_json, .{});
         try parsed.value.object.put(alloc, "dense_search", dense_parsed.value);
     }
+    if (result.value_search_profile_json) |json| {
+        const logical = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        try parsed.value.object.put(alloc, "value_search", logical.value);
+    }
     if (result.sort_profile) |sort_profile| {
         if (parsed.value != .object) return error.InvalidQueryRequest;
         try parsed.value.object.put(alloc, "sort", try buildSortProfileValue(alloc, req, sort_profile));
@@ -7387,7 +7400,9 @@ fn appendCanonicalPublicQueryAlloc(
         }
     }
 
-    if (isUnambiguousStructuredFilterValue(query)) {
+    if (isUnambiguousStructuredFilterValue(query) and
+        !publicFilterTreeContainsLogicalFieldQuery(query))
+    {
         try appendRawStructuredFilterClausesAlloc(alloc, filter_clauses, query);
         return;
     }
@@ -7690,6 +7705,10 @@ fn publicFilterTreeHasUnsupportedNode(value: std.json.Value) bool {
     if (publicMatchHasUnsupportedOptions(value)) return true;
 
     inline for ([_][]const u8{
+        "equals",
+        "contains",
+        "matches",
+        "autocomplete",
         "match_all",
         "match_none",
         "term",
@@ -7730,7 +7749,23 @@ fn publicMatchHasUnsupportedOptions(value: std.json.Value) bool {
     return false;
 }
 
+// Called only after the public traversal budget has bounded depth and nodes.
+fn publicFilterTreeContainsLogicalFieldQuery(value: std.json.Value) bool {
+    if (value == .array) {
+        for (value.array.items) |item| if (publicFilterTreeContainsLogicalFieldQuery(item)) return true;
+    } else if (value == .object) {
+        inline for (.{ "equals", "contains", "matches", "autocomplete" }) |operator| {
+            if (value.object.contains(operator)) return true;
+        }
+        inline for (.{ "conjuncts", "disjuncts", "bool", "must", "should", "must_not", "filter" }) |branch| {
+            if (value.object.get(branch)) |child| if (publicFilterTreeContainsLogicalFieldQuery(child)) return true;
+        }
+    }
+    return false;
+}
+
 fn publicFilterTreeContainsPublicQuerySyntax(value: std.json.Value) bool {
+    if (publicFilterTreeContainsLogicalFieldQuery(value)) return true;
     if (value == .array) {
         for (value.array.items) |item| {
             if (publicFilterTreeContainsPublicQuerySyntax(item)) return true;
@@ -8083,6 +8118,10 @@ fn validateDirectTextQueryRoot(query: std.json.Value) !void {
     if (query != .object) return;
     var roots: usize = 0;
     inline for ([_][]const u8{
+        "equals",
+        "contains",
+        "matches",
+        "autocomplete",
         "match_all",
         "match_none",
         "query",
@@ -8829,6 +8868,10 @@ fn parseGeneratedBleveQuerySlice(
 
 fn parseGeneratedBleveQueryBoost(query: query_openapi.Query) !f32 {
     return switch (query) {
+        .equals_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .contains_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .matches_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .autocomplete_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
         .match_all_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
         .match_none_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
         .query_string_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
@@ -8862,6 +8905,13 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
     const query_boost = try parseGeneratedBleveQueryBoost(query);
 
     return switch (query) {
+        inline .equals_query, .contains_query, .matches_query, .autocomplete_query => |leaf| blk: {
+            const json = try std.json.Stringify.valueAlloc(alloc, leaf.*, .{});
+            defer alloc.free(json);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+            defer parsed.deinit();
+            break :blk (try public_text_query_mod.parseStatefulDirectTextOperatorQueryAlloc(alloc, parsed.value, 1)) orelse return error.InvalidQueryRequest;
+        },
         .match_all_query => try boostedMatchAllTextQueryAlloc(alloc, query_boost),
         .match_none_query => .{ .match_none = {} },
         .query_string_query => |query_string| try parseQueryStringTextQuery(
@@ -19638,4 +19688,62 @@ test "public graph metric borrowed wire vector document authority supports full 
     }
     try std.testing.expectEqual(db_mod.types.document_authority.Mode.candidates, options.document_authority_mode);
     try std.testing.expectEqual(std.math.maxInt(u64), options.document_authority_group);
+}
+
+test "logical query operators and execution policy survive worker transport" {
+    const a = std.testing.allocator;
+    inline for (.{ "equals", "contains", "matches", "autocomplete" }) |operator| {
+        const body = "{\"query\":{\"" ++ operator ++ "\":\"Hello\",\"field\":\"content\"},\"value_search_execution\":{\"allow_scan\":true,\"max_documents\":51,\"max_bytes\":2048}}";
+        var request = try parsePublicQueryRequest(a, null, "docs", body);
+        defer request.deinit(a);
+        try std.testing.expect(request.req.full_text != null);
+        try std.testing.expectEqual(@as(u64, 51), request.req.value_search_execution.max_documents);
+        try std.testing.expect(request.req.value_search_execution.allow_scan);
+        const wire = try @import("query_execution_contract.zig").encodeQueryRequest(a, request.req);
+        defer a.free(wire);
+        var worker = try parseQueryRequest(a, null, "docs", wire);
+        defer worker.deinit(a);
+        try std.testing.expectEqualDeep(request.req.value_search_execution, worker.req.value_search_execution);
+        try std.testing.expectEqual(std.meta.activeTag(request.req.full_text.?), std.meta.activeTag(worker.req.full_text.?));
+        var out = std.ArrayListUnmanaged(u8).empty;
+        defer out.deinit(a);
+        try @import("query_execution_contract.zig").appendTextQueryValue(a, &out, request.req.full_text.?);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, out.items, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("Hello", parsed.value.object.get(operator).?.string);
+        try std.testing.expectEqualStrings("content", parsed.value.object.get("field").?.string);
+    }
+}
+
+test "logical query preserves value leaves in compound scoring and filter trees" {
+    const a = std.testing.allocator;
+    const body = "{\"query\":{\"disjuncts\":[{\"contains\":\"needle\",\"field\":\"grep.content\",\"case_sensitive\":true}]},\"value_search_execution\":{\"allow_scan\":true,\"max_documents\":100000,\"max_bytes\":67108864,\"max_regex_work\":100000000},\"fields\":[\"grep.content\"],\"order_by\":[{\"field\":\"_id\",\"desc\":false}],\"limit\":1}";
+    var request = try parsePublicQueryRequest(a, null, "docs", body);
+    defer request.deinit(a);
+    try std.testing.expect(request.req.full_text != null);
+    try std.testing.expectEqual(@as(usize, 1), request.req.full_text.?.bool_query.should.len);
+    try std.testing.expect(request.req.full_text.?.bool_query.should[0] == .value);
+    const filtered = "{\"query\":{\"match_all\":{}},\"filter_query\":{\"disjuncts\":[{\"contains\":\"needle\",\"field\":\"grep.content\"}]},\"value_search_execution\":{\"allow_scan\":true}}";
+    var filter_request = try parsePublicQueryRequest(a, null, "docs", filtered);
+    defer filter_request.deinit(a);
+    try std.testing.expect(filter_request.req.filter_text != null);
+}
+
+test "logical query rejects ambiguous leaves unknown options and malformed values" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "{\"query\":{\"contains\":17,\"field\":\"content\"}}",
+        "{\"query\":{\"disjuncts\":[{\"match_all\":{}}],\"contains\":\"x\",\"field\":\"content\"}}",
+        "{\"query\":{\"equals\":\"x\"}}",
+        "{\"query\":{\"contains\":\"x\",\"field\":\"content\",\"match\":\"y\"}}",
+        "{\"query\":{\"autocomplete\":\"x\",\"field\":\"content\",\"case_sensitive\":false}}",
+        "{\"query\":{\"contains\":\"x\",\"field\":\"content\",\"normalizer\":\"custom\"}}",
+        "{\"query\":{\"contains\":\"x\",\"field\":\"content\"},\"value_search_execution\":{\"max_bytes\":0}}",
+    }) |body| {
+        if (parsePublicQueryRequest(a, null, "docs", body)) |accepted| {
+            var owned = accepted;
+            owned.deinit(a);
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
 }

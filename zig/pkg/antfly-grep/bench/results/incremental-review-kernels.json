@@ -1,0 +1,842 @@
+{
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "binary_sha256": "887be987ab9690e29f3c3a7c352b9764e691f7762c9404e00137efd8cfa08975",
+  "source_sha256": "b5e8f0d35afcde84184cf0cde41829945abfc7d3566d0dd15a9f42b196b33d40",
+  "limitations": "In-process fixture kernels; CLI renderer profiling is measured separately. No new JIT implementation inferred from timing.",
+  "cases": {
+    "([a-z]+)([0-9]+)": [
+      {
+        "pattern": "([a-z]+)([0-9]+)",
+        "bytes": 688128,
+        "round": 0,
+        "jit": true,
+        "jit_available": false,
+        "ns": 11189250,
+        "checksum": 270582546432,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "save": 491521,
+          "accept": 98304
+        }
+      },
+      {
+        "pattern": "([a-z]+)([0-9]+)",
+        "bytes": 688128,
+        "round": 0,
+        "jit": false,
+        "jit_available": false,
+        "ns": 11113125,
+        "checksum": 270582546432,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "save": 491521,
+          "accept": 98304
+        }
+      },
+      {
+        "pattern": "([a-z]+)([0-9]+)",
+        "bytes": 688128,
+        "round": 1,
+        "jit": false,
+        "jit_available": false,
+        "ns": 10980792,
+        "checksum": 270582546432,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "save": 491521,
+          "accept": 98304
+        }
+      },
+      {
+        "pattern": "([a-z]+)([0-9]+)",
+        "bytes": 688128,
+        "round": 1,
+        "jit": true,
+        "jit_available": false,
+        "ns": 11092291,
+        "checksum": 270582546432,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "save": 491521,
+          "accept": 98304
+        }
+      },
+      {
+        "pattern": "([a-z]+)([0-9]+)",
+        "bytes": 688128,
+        "round": 2,
+        "jit": true,
+        "jit_available": false,
+        "ns": 11376125,
+        "checksum": 270582546432,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "save": 491521,
+          "accept": 98304
+        }
+      },
+      {
+        "pattern": "([a-z]+)([0-9]+)",
+        "bytes": 688128,
+        "round": 2,
+        "jit": false,
+        "jit_available": false,
+        "ns": 10985167,
+        "checksum": 270582546432,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "save": 491521,
+          "accept": 98304
+        }
+      },
+      {
+        "pattern": "([a-z]+)([0-9]+)",
+        "bytes": 688128,
+        "round": 3,
+        "jit": false,
+        "jit_available": false,
+        "ns": 11191458,
+        "checksum": 270582546432,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "save": 491521,
+          "accept": 98304
+        }
+      },
+      {
+        "pattern": "([a-z]+)([0-9]+)",
+        "bytes": 688128,
+        "round": 3,
+        "jit": true,
+        "jit_available": false,
+        "ns": 11265458,
+        "checksum": 270582546432,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "save": 491521,
+          "accept": 98304
+        }
+      },
+      {
+        "pattern": "([a-z]+)([0-9]+)",
+        "bytes": 688128,
+        "round": 4,
+        "jit": true,
+        "jit_available": false,
+        "ns": 11124000,
+        "checksum": 270582546432,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "save": 491521,
+          "accept": 98304
+        }
+      },
+      {
+        "pattern": "([a-z]+)([0-9]+)",
+        "bytes": 688128,
+        "round": 4,
+        "jit": false,
+        "jit_available": false,
+        "ns": 11218583,
+        "checksum": 270582546432,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "save": 491521,
+          "accept": 98304
+        }
+      },
+      {
+        "pattern": "([a-z]+)([0-9]+)",
+        "bytes": 688128,
+        "round": 5,
+        "jit": false,
+        "jit_available": false,
+        "ns": 10992083,
+        "checksum": 270582546432,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "save": 491521,
+          "accept": 98304
+        }
+      },
+      {
+        "pattern": "([a-z]+)([0-9]+)",
+        "bytes": 688128,
+        "round": 5,
+        "jit": true,
+        "jit_available": false,
+        "ns": 11054209,
+        "checksum": 270582546432,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "save": 491521,
+          "accept": 98304
+        }
+      },
+      {
+        "pattern": "([a-z]+)([0-9]+)",
+        "bytes": 688128,
+        "round": 6,
+        "jit": true,
+        "jit_available": false,
+        "ns": 11299541,
+        "checksum": 270582546432,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "save": 491521,
+          "accept": 98304
+        }
+      },
+      {
+        "pattern": "([a-z]+)([0-9]+)",
+        "bytes": 688128,
+        "round": 6,
+        "jit": false,
+        "jit_available": false,
+        "ns": 11254375,
+        "checksum": 270582546432,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "save": 491521,
+          "accept": 98304
+        }
+      }
+    ],
+    "[a-z]+\\K[0-9]+": [
+      {
+        "pattern": "[a-z]+\\K[0-9]+",
+        "bytes": 688128,
+        "round": 0,
+        "jit": true,
+        "jit_available": false,
+        "ns": 10911792,
+        "checksum": 135291863040,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "accept": 98304,
+          "reset": 98304
+        }
+      },
+      {
+        "pattern": "[a-z]+\\K[0-9]+",
+        "bytes": 688128,
+        "round": 0,
+        "jit": false,
+        "jit_available": false,
+        "ns": 10083333,
+        "checksum": 135291863040,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "accept": 98304,
+          "reset": 98304
+        }
+      },
+      {
+        "pattern": "[a-z]+\\K[0-9]+",
+        "bytes": 688128,
+        "round": 1,
+        "jit": false,
+        "jit_available": false,
+        "ns": 10360750,
+        "checksum": 135291863040,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "accept": 98304,
+          "reset": 98304
+        }
+      },
+      {
+        "pattern": "[a-z]+\\K[0-9]+",
+        "bytes": 688128,
+        "round": 1,
+        "jit": true,
+        "jit_available": false,
+        "ns": 10146000,
+        "checksum": 135291863040,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "accept": 98304,
+          "reset": 98304
+        }
+      },
+      {
+        "pattern": "[a-z]+\\K[0-9]+",
+        "bytes": 688128,
+        "round": 2,
+        "jit": true,
+        "jit_available": false,
+        "ns": 10293917,
+        "checksum": 135291863040,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "accept": 98304,
+          "reset": 98304
+        }
+      },
+      {
+        "pattern": "[a-z]+\\K[0-9]+",
+        "bytes": 688128,
+        "round": 2,
+        "jit": false,
+        "jit_available": false,
+        "ns": 10353833,
+        "checksum": 135291863040,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "accept": 98304,
+          "reset": 98304
+        }
+      },
+      {
+        "pattern": "[a-z]+\\K[0-9]+",
+        "bytes": 688128,
+        "round": 3,
+        "jit": false,
+        "jit_available": false,
+        "ns": 9910542,
+        "checksum": 135291863040,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "accept": 98304,
+          "reset": 98304
+        }
+      },
+      {
+        "pattern": "[a-z]+\\K[0-9]+",
+        "bytes": 688128,
+        "round": 3,
+        "jit": true,
+        "jit_available": false,
+        "ns": 9894625,
+        "checksum": 135291863040,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "accept": 98304,
+          "reset": 98304
+        }
+      },
+      {
+        "pattern": "[a-z]+\\K[0-9]+",
+        "bytes": 688128,
+        "round": 4,
+        "jit": true,
+        "jit_available": false,
+        "ns": 9969333,
+        "checksum": 135291863040,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "accept": 98304,
+          "reset": 98304
+        }
+      },
+      {
+        "pattern": "[a-z]+\\K[0-9]+",
+        "bytes": 688128,
+        "round": 4,
+        "jit": false,
+        "jit_available": false,
+        "ns": 9916250,
+        "checksum": 135291863040,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "accept": 98304,
+          "reset": 98304
+        }
+      },
+      {
+        "pattern": "[a-z]+\\K[0-9]+",
+        "bytes": 688128,
+        "round": 5,
+        "jit": false,
+        "jit_available": false,
+        "ns": 9724000,
+        "checksum": 135291863040,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "accept": 98304,
+          "reset": 98304
+        }
+      },
+      {
+        "pattern": "[a-z]+\\K[0-9]+",
+        "bytes": 688128,
+        "round": 5,
+        "jit": true,
+        "jit_available": false,
+        "ns": 9693292,
+        "checksum": 135291863040,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "accept": 98304,
+          "reset": 98304
+        }
+      },
+      {
+        "pattern": "[a-z]+\\K[0-9]+",
+        "bytes": 688128,
+        "round": 6,
+        "jit": true,
+        "jit_available": false,
+        "ns": 9785875,
+        "checksum": 135291863040,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "accept": 98304,
+          "reset": 98304
+        }
+      },
+      {
+        "pattern": "[a-z]+\\K[0-9]+",
+        "bytes": 688128,
+        "round": 6,
+        "jit": false,
+        "jit_available": false,
+        "ns": 9904708,
+        "checksum": 135291863040,
+        "vm_dispatch": {
+          "repeat_consume": 294913,
+          "accept": 98304,
+          "reset": 98304
+        }
+      }
+    ],
+    "(?:foo|bar)[0-9]+": [
+      {
+        "pattern": "(?:foo|bar)[0-9]+",
+        "bytes": 688128,
+        "round": 0,
+        "jit": true,
+        "jit_available": true,
+        "ns": 26383208,
+        "checksum": 90193264640,
+        "vm_dispatch": {
+          "consume": 884738,
+          "repeat_consume": 65536,
+          "split": 360449,
+          "accept": 65536,
+          "alt_start": 360449,
+          "alt_end": 65536
+        }
+      },
+      {
+        "pattern": "(?:foo|bar)[0-9]+",
+        "bytes": 688128,
+        "round": 0,
+        "jit": false,
+        "jit_available": true,
+        "ns": 27383917,
+        "checksum": 90193264640,
+        "vm_dispatch": {
+          "consume": 884738,
+          "repeat_consume": 65536,
+          "split": 360449,
+          "accept": 65536,
+          "alt_start": 360449,
+          "alt_end": 65536
+        }
+      },
+      {
+        "pattern": "(?:foo|bar)[0-9]+",
+        "bytes": 688128,
+        "round": 1,
+        "jit": false,
+        "jit_available": true,
+        "ns": 27298042,
+        "checksum": 90193264640,
+        "vm_dispatch": {
+          "consume": 884738,
+          "repeat_consume": 65536,
+          "split": 360449,
+          "accept": 65536,
+          "alt_start": 360449,
+          "alt_end": 65536
+        }
+      },
+      {
+        "pattern": "(?:foo|bar)[0-9]+",
+        "bytes": 688128,
+        "round": 1,
+        "jit": true,
+        "jit_available": true,
+        "ns": 26651416,
+        "checksum": 90193264640,
+        "vm_dispatch": {
+          "consume": 884738,
+          "repeat_consume": 65536,
+          "split": 360449,
+          "accept": 65536,
+          "alt_start": 360449,
+          "alt_end": 65536
+        }
+      },
+      {
+        "pattern": "(?:foo|bar)[0-9]+",
+        "bytes": 688128,
+        "round": 2,
+        "jit": true,
+        "jit_available": true,
+        "ns": 26554000,
+        "checksum": 90193264640,
+        "vm_dispatch": {
+          "consume": 884738,
+          "repeat_consume": 65536,
+          "split": 360449,
+          "accept": 65536,
+          "alt_start": 360449,
+          "alt_end": 65536
+        }
+      },
+      {
+        "pattern": "(?:foo|bar)[0-9]+",
+        "bytes": 688128,
+        "round": 2,
+        "jit": false,
+        "jit_available": true,
+        "ns": 26763417,
+        "checksum": 90193264640,
+        "vm_dispatch": {
+          "consume": 884738,
+          "repeat_consume": 65536,
+          "split": 360449,
+          "accept": 65536,
+          "alt_start": 360449,
+          "alt_end": 65536
+        }
+      },
+      {
+        "pattern": "(?:foo|bar)[0-9]+",
+        "bytes": 688128,
+        "round": 3,
+        "jit": false,
+        "jit_available": true,
+        "ns": 26167625,
+        "checksum": 90193264640,
+        "vm_dispatch": {
+          "consume": 884738,
+          "repeat_consume": 65536,
+          "split": 360449,
+          "accept": 65536,
+          "alt_start": 360449,
+          "alt_end": 65536
+        }
+      },
+      {
+        "pattern": "(?:foo|bar)[0-9]+",
+        "bytes": 688128,
+        "round": 3,
+        "jit": true,
+        "jit_available": true,
+        "ns": 25690334,
+        "checksum": 90193264640,
+        "vm_dispatch": {
+          "consume": 884738,
+          "repeat_consume": 65536,
+          "split": 360449,
+          "accept": 65536,
+          "alt_start": 360449,
+          "alt_end": 65536
+        }
+      },
+      {
+        "pattern": "(?:foo|bar)[0-9]+",
+        "bytes": 688128,
+        "round": 4,
+        "jit": true,
+        "jit_available": true,
+        "ns": 26770958,
+        "checksum": 90193264640,
+        "vm_dispatch": {
+          "consume": 884738,
+          "repeat_consume": 65536,
+          "split": 360449,
+          "accept": 65536,
+          "alt_start": 360449,
+          "alt_end": 65536
+        }
+      },
+      {
+        "pattern": "(?:foo|bar)[0-9]+",
+        "bytes": 688128,
+        "round": 4,
+        "jit": false,
+        "jit_available": true,
+        "ns": 27188917,
+        "checksum": 90193264640,
+        "vm_dispatch": {
+          "consume": 884738,
+          "repeat_consume": 65536,
+          "split": 360449,
+          "accept": 65536,
+          "alt_start": 360449,
+          "alt_end": 65536
+        }
+      },
+      {
+        "pattern": "(?:foo|bar)[0-9]+",
+        "bytes": 688128,
+        "round": 5,
+        "jit": false,
+        "jit_available": true,
+        "ns": 36126125,
+        "checksum": 90193264640,
+        "vm_dispatch": {
+          "consume": 884738,
+          "repeat_consume": 65536,
+          "split": 360449,
+          "accept": 65536,
+          "alt_start": 360449,
+          "alt_end": 65536
+        }
+      },
+      {
+        "pattern": "(?:foo|bar)[0-9]+",
+        "bytes": 688128,
+        "round": 5,
+        "jit": true,
+        "jit_available": true,
+        "ns": 29729250,
+        "checksum": 90193264640,
+        "vm_dispatch": {
+          "consume": 884738,
+          "repeat_consume": 65536,
+          "split": 360449,
+          "accept": 65536,
+          "alt_start": 360449,
+          "alt_end": 65536
+        }
+      },
+      {
+        "pattern": "(?:foo|bar)[0-9]+",
+        "bytes": 688128,
+        "round": 6,
+        "jit": true,
+        "jit_available": true,
+        "ns": 27009208,
+        "checksum": 90193264640,
+        "vm_dispatch": {
+          "consume": 884738,
+          "repeat_consume": 65536,
+          "split": 360449,
+          "accept": 65536,
+          "alt_start": 360449,
+          "alt_end": 65536
+        }
+      },
+      {
+        "pattern": "(?:foo|bar)[0-9]+",
+        "bytes": 688128,
+        "round": 6,
+        "jit": false,
+        "jit_available": true,
+        "ns": 27970792,
+        "checksum": 90193264640,
+        "vm_dispatch": {
+          "consume": 884738,
+          "repeat_consume": 65536,
+          "split": 360449,
+          "accept": 65536,
+          "alt_start": 360449,
+          "alt_end": 65536
+        }
+      }
+    ],
+    "foo(?=123)": [
+      {
+        "pattern": "foo(?=123)",
+        "bytes": 688128,
+        "round": 0,
+        "jit": true,
+        "jit_available": true,
+        "ns": 2367584,
+        "checksum": 45095976960,
+        "vm_dispatch": {
+          "consume": 196608,
+          "accept": 65536,
+          "look": 32768
+        }
+      },
+      {
+        "pattern": "foo(?=123)",
+        "bytes": 688128,
+        "round": 0,
+        "jit": false,
+        "jit_available": true,
+        "ns": 2429667,
+        "checksum": 45095976960,
+        "vm_dispatch": {
+          "consume": 196608,
+          "accept": 65536,
+          "look": 32768
+        }
+      },
+      {
+        "pattern": "foo(?=123)",
+        "bytes": 688128,
+        "round": 1,
+        "jit": false,
+        "jit_available": true,
+        "ns": 2435375,
+        "checksum": 45095976960,
+        "vm_dispatch": {
+          "consume": 196608,
+          "accept": 65536,
+          "look": 32768
+        }
+      },
+      {
+        "pattern": "foo(?=123)",
+        "bytes": 688128,
+        "round": 1,
+        "jit": true,
+        "jit_available": true,
+        "ns": 2332292,
+        "checksum": 45095976960,
+        "vm_dispatch": {
+          "consume": 196608,
+          "accept": 65536,
+          "look": 32768
+        }
+      },
+      {
+        "pattern": "foo(?=123)",
+        "bytes": 688128,
+        "round": 2,
+        "jit": true,
+        "jit_available": true,
+        "ns": 2369833,
+        "checksum": 45095976960,
+        "vm_dispatch": {
+          "consume": 196608,
+          "accept": 65536,
+          "look": 32768
+        }
+      },
+      {
+        "pattern": "foo(?=123)",
+        "bytes": 688128,
+        "round": 2,
+        "jit": false,
+        "jit_available": true,
+        "ns": 2486709,
+        "checksum": 45095976960,
+        "vm_dispatch": {
+          "consume": 196608,
+          "accept": 65536,
+          "look": 32768
+        }
+      },
+      {
+        "pattern": "foo(?=123)",
+        "bytes": 688128,
+        "round": 3,
+        "jit": false,
+        "jit_available": true,
+        "ns": 2530250,
+        "checksum": 45095976960,
+        "vm_dispatch": {
+          "consume": 196608,
+          "accept": 65536,
+          "look": 32768
+        }
+      },
+      {
+        "pattern": "foo(?=123)",
+        "bytes": 688128,
+        "round": 3,
+        "jit": true,
+        "jit_available": true,
+        "ns": 2394292,
+        "checksum": 45095976960,
+        "vm_dispatch": {
+          "consume": 196608,
+          "accept": 65536,
+          "look": 32768
+        }
+      },
+      {
+        "pattern": "foo(?=123)",
+        "bytes": 688128,
+        "round": 4,
+        "jit": true,
+        "jit_available": true,
+        "ns": 2377250,
+        "checksum": 45095976960,
+        "vm_dispatch": {
+          "consume": 196608,
+          "accept": 65536,
+          "look": 32768
+        }
+      },
+      {
+        "pattern": "foo(?=123)",
+        "bytes": 688128,
+        "round": 4,
+        "jit": false,
+        "jit_available": true,
+        "ns": 2524625,
+        "checksum": 45095976960,
+        "vm_dispatch": {
+          "consume": 196608,
+          "accept": 65536,
+          "look": 32768
+        }
+      },
+      {
+        "pattern": "foo(?=123)",
+        "bytes": 688128,
+        "round": 5,
+        "jit": false,
+        "jit_available": true,
+        "ns": 3415125,
+        "checksum": 45095976960,
+        "vm_dispatch": {
+          "consume": 196608,
+          "accept": 65536,
+          "look": 32768
+        }
+      },
+      {
+        "pattern": "foo(?=123)",
+        "bytes": 688128,
+        "round": 5,
+        "jit": true,
+        "jit_available": true,
+        "ns": 2807667,
+        "checksum": 45095976960,
+        "vm_dispatch": {
+          "consume": 196608,
+          "accept": 65536,
+          "look": 32768
+        }
+      },
+      {
+        "pattern": "foo(?=123)",
+        "bytes": 688128,
+        "round": 6,
+        "jit": true,
+        "jit_available": true,
+        "ns": 2448500,
+        "checksum": 45095976960,
+        "vm_dispatch": {
+          "consume": 196608,
+          "accept": 65536,
+          "look": 32768
+        }
+      },
+      {
+        "pattern": "foo(?=123)",
+        "bytes": 688128,
+        "round": 6,
+        "jit": false,
+        "jit_available": true,
+        "ns": 2435042,
+        "checksum": 45095976960,
+        "vm_dispatch": {
+          "consume": 196608,
+          "accept": 65536,
+          "look": 32768
+        }
+      }
+    ]
+  }
+}

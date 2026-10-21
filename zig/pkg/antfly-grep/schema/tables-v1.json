@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Antfly grep table configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "endpoint",
+    "tables"
+  ],
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "endpoint": {
+      "type": "string",
+      "format": "uri"
+    },
+    "principals": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "page_size": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000
+    },
+    "max_response_bytes": {
+      "type": "integer",
+      "minimum": 1024,
+      "maximum": 268435456
+    },
+    "tables": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "alias": {
+            "type": "string",
+            "minLength": 1
+          },
+          "document_field": {
+            "type": "string",
+            "default": "grep"
+          },
+          "candidate_index": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "version",
+              "field"
+            ],
+            "properties": {
+              "version": {
+                "const": 1
+              },
+              "field": {
+                "type": "string",
+                "minLength": 1
+              },
+              "version_field": {
+                "type": "string",
+                "minLength": 1,
+                "default": "grep_trigrams_version"
+              }
+            },
+            "description": "Complete raw-content byte trigrams encoded as lowercase hex keyword terms; atomic with the source revision. Opt-in acceleration only."
+          }
+        }
+      }
+    },
+    "max_page_memory": {
+      "type": "integer",
+      "minimum": 4096,
+      "maximum": 1073741824
+    },
+    "prefetch": {
+      "type": "boolean",
+      "default": true,
+      "description": "Overlap one retained-snapshot page with local processing. At most two decoded pages are live; quiet and finite per-file match limits use sequential retrieval."
+    },
+    "value_search_execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Ordinary query execution policy for logical value predicates. Budgets apply per shard request; exhausted budgets are explicit failures.",
+      "properties": {
+        "allow_scan": {
+          "type": "boolean",
+          "default": true
+        },
+        "max_documents": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807,
+          "default": 100000
+        },
+        "max_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807,
+          "default": 67108864
+        },
+        "max_regex_work": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807,
+          "default": 100000000
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,197 @@
+{
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "architecture": "arm64",
+  "cpu_count": 14,
+  "measurement": "paired rounds with alternating binary order; correctness outside timing",
+  "load_average": [
+    13.41552734375,
+    17.63134765625,
+    20.07763671875
+  ],
+  "mib": 32,
+  "rounds": 5,
+  "binaries": {
+    "antfly-grep": {
+      "path": "/private/tmp/antfly-grep-bzip-native/bin/antfly-grep",
+      "size_bytes": 5124808,
+      "sha256": "e84819f02324bf9e3c7be360019ee3cc70a1f96623c1a09a588d8b2f13bad42e",
+      "version": "antfly-grep 0.1.0\nZig 0.17.0 fast\nnative regex, PCRE-style VM/JIT, streaming compression, encoding\ntarget aarch64-macos-none dynamic"
+    },
+    "ripgrep": {
+      "path": "/Users/ajroetker/.codex/packages/app-server-daemon/releases/0.163.0-aarch64-apple-darwin/codex-path/rg",
+      "size_bytes": 4030432,
+      "sha256": "27d09e29c478fddbfc750a2cb5fd06965bad0ea223e776f8667160a0de63c6e4",
+      "version": "ripgrep 15.2.0 (rev e89fff89ac)\n\nfeatures:+pcre2\nsimd(compile):+NEON\nsimd(runtime):+NEON\n\nPCRE2 10.45 is available (JIT is available)"
+    }
+  },
+  "cases": {
+    "stream-bz2": {
+      "antfly-grep": {
+        "seconds": 0.26835804095026106,
+        "cpu_seconds": 0.26544799999999996,
+        "output": {
+          "sha256": "deb8c5081819623054bd0034c41cde63eba4e8e674d3ce89d74ff1c72dffafc3",
+          "bytes": 17,
+          "exit": 0
+        },
+        "mib_per_second": 119.24362535056777,
+        "peak_rss_kib": 10144.0,
+        "runs": [
+          {
+            "seconds": 0.26835804095026106,
+            "peak_rss_kib": 9760.0,
+            "exit": 0,
+            "load_average": [
+              12.35498046875,
+              17.2646484375,
+              19.9189453125
+            ],
+            "user_seconds": 0.261498,
+            "system_seconds": 0.007659999999999999,
+            "minor_faults": 869,
+            "major_faults": 0
+          },
+          {
+            "seconds": 0.275545125012286,
+            "peak_rss_kib": 8864.0,
+            "exit": 0,
+            "load_average": [
+              12.35498046875,
+              17.2646484375,
+              19.9189453125
+            ],
+            "user_seconds": 0.262934,
+            "system_seconds": 0.00795,
+            "minor_faults": 812,
+            "major_faults": 0
+          },
+          {
+            "seconds": 0.2661396670155227,
+            "peak_rss_kib": 10144.0,
+            "exit": 0,
+            "load_average": [
+              12.35498046875,
+              17.2646484375,
+              19.9189453125
+            ],
+            "user_seconds": 0.257691,
+            "system_seconds": 0.006987999999999999,
+            "minor_faults": 890,
+            "major_faults": 0
+          },
+          {
+            "seconds": 0.2688903340604156,
+            "peak_rss_kib": 9216.0,
+            "exit": 0,
+            "load_average": [
+              12.35498046875,
+              17.2646484375,
+              19.9189453125
+            ],
+            "user_seconds": 0.257758,
+            "system_seconds": 0.00769,
+            "minor_faults": 834,
+            "major_faults": 0
+          },
+          {
+            "seconds": 0.26405591692309827,
+            "peak_rss_kib": 9232.0,
+            "exit": 0,
+            "load_average": [
+              12.35498046875,
+              17.2646484375,
+              19.9189453125
+            ],
+            "user_seconds": 0.258617,
+            "system_seconds": 0.006451999999999999,
+            "minor_faults": 836,
+            "major_faults": 0
+          }
+        ]
+      },
+      "ripgrep": {
+        "seconds": 0.16332508402410895,
+        "cpu_seconds": 0.167958,
+        "output": {
+          "sha256": "deb8c5081819623054bd0034c41cde63eba4e8e674d3ce89d74ff1c72dffafc3",
+          "bytes": 17,
+          "exit": 0
+        },
+        "mib_per_second": 195.92817530809677,
+        "peak_rss_kib": 4880.0,
+        "runs": [
+          {
+            "seconds": 0.16332508402410895,
+            "peak_rss_kib": 4880.0,
+            "exit": 0,
+            "load_average": [
+              12.8212890625,
+              17.43798828125,
+              19.9951171875
+            ],
+            "user_seconds": 0.1492,
+            "system_seconds": 0.018758,
+            "minor_faults": 914,
+            "major_faults": 5
+          },
+          {
+            "seconds": 0.1555182080483064,
+            "peak_rss_kib": 4864.0,
+            "exit": 0,
+            "load_average": [
+              12.35498046875,
+              17.2646484375,
+              19.9189453125
+            ],
+            "user_seconds": 0.144982,
+            "system_seconds": 0.016929,
+            "minor_faults": 918,
+            "major_faults": 1
+          },
+          {
+            "seconds": 0.15070566709619015,
+            "peak_rss_kib": 4880.0,
+            "exit": 0,
+            "load_average": [
+              12.35498046875,
+              17.2646484375,
+              19.9189453125
+            ],
+            "user_seconds": 0.13881,
+            "system_seconds": 0.016930999999999998,
+            "minor_faults": 914,
+            "major_faults": 1
+          },
+          {
+            "seconds": 0.2044492500135675,
+            "peak_rss_kib": 4864.0,
+            "exit": 0,
+            "load_average": [
+              12.35498046875,
+              17.2646484375,
+              19.9189453125
+            ],
+            "user_seconds": 0.164414,
+            "system_seconds": 0.020169,
+            "minor_faults": 913,
+            "major_faults": 1
+          },
+          {
+            "seconds": 0.18593999999575317,
+            "peak_rss_kib": 4864.0,
+            "exit": 0,
+            "load_average": [
+              12.35498046875,
+              17.2646484375,
+              19.9189453125
+            ],
+            "user_seconds": 0.158086,
+            "system_seconds": 0.020250999999999998,
+            "minor_faults": 932,
+            "major_faults": 1
+          }
+        ]
+      }
+    }
+  }
+}

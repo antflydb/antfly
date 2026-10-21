@@ -1,0 +1,40 @@
+{
+  "input": "\u00e9\u03a3\n",
+  "flags": [
+    "-P",
+    "--count-matches",
+    ""
+  ],
+  "runtime": "two-CPU ARM64 Linux Docker VM on macOS",
+  "binaries": {
+    "baseline-linux-f63": {
+      "sha256": "520584336bb71351bebc9445282b2fd1647f2bfbcfb56da9d8ce2603a2688888",
+      "version": "antfly-grep 0.1.0-dev\nZig 0.17.0 fast\nnative regex, PCRE-style VM/JIT, streaming compression, encoding\ntarget aarch64-linux-gnu dynamic\n",
+      "exit": 0,
+      "stdout": "5\n",
+      "stderr": ""
+    },
+    "current-linux": {
+      "sha256": "97c4867b2684d4fe2020b31982581d2dc225e9ba7be74334dd033542ec099422",
+      "version": "antfly-grep 0.1.0-dev\nZig 0.17.0 fast\nnative regex, PCRE-style VM/JIT, streaming compression, encoding\ntarget aarch64-linux-musl static\n",
+      "exit": 0,
+      "stdout": "5\n",
+      "stderr": ""
+    },
+    "rg-gnu-jit": {
+      "sha256": "e36d0eb52e70696bdf1781392722e05a21bb91d3b7b762ef5ec20e5df2ec687b",
+      "version": "ripgrep 15.2.0 (rev e89fff89ac)\n\nfeatures:+pcre2\nsimd(compile):+NEON\nsimd(runtime):+NEON\n\nPCRE2 10.45 is available (JIT is available)\n",
+      "exit": 0,
+      "stdout": "5\n",
+      "stderr": ""
+    },
+    "rg-musl-no-jit": {
+      "sha256": "c14cdb389f34e504d69e386cfc67d5c5d9a730a990de03ca6910b2a15e30386a",
+      "version": "ripgrep 15.2.0 (rev e89fff89ac)\n\nfeatures:+pcre2\nsimd(compile):+NEON\nsimd(runtime):+NEON\n\nPCRE2 10.45 is available (JIT is unavailable)\n",
+      "exit": 0,
+      "stdout": "3\n",
+      "stderr": ""
+    }
+  },
+  "limitation": "The musl/no-JIT oracle advances empty Unicode matches differently. This difference predates this change; the GNU/JIT oracle matches the existing compatibility contract."
+}
