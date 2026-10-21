@@ -6067,6 +6067,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("docstore-prepared-transaction-effects-test", "Verify bounded durable prepared effect encoding and original controls")
         .dependOn(&addCuratedTestRunArtifact(b, prepared_effects_tests, &.{"prepared transaction effects"}).step);
+    const prepared_catalog_filters = [_][]const u8{ "prepared transaction effects catalog", "storage.db.range_state." };
+    const prepared_catalog_tests = b.addTest(.{
+        .root_module = prepared_effects_mod,
+        .filters = &prepared_catalog_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("docstore-prepared-catalog-context-test", "Verify canonical prepared catalog hashing and persisted range framing")
+        .dependOn(&addCuratedTestRunArtifact(b, prepared_catalog_tests, &prepared_catalog_filters).step);
     const writer_read_guard_tests = b.addTest(.{
         .root_module = prepared_effects_mod,
         .filters = &.{ "storage.transactions.", "storage.mem_backend." },

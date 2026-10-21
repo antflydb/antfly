@@ -96,6 +96,140 @@ pub const Contract = struct {
     schema_version: ?u32 = null,
     mode: Mode,
 };
+
+/// Canonical v1 catalog context, shared by preparation and cold recovery.
+/// Keep byte framing and missing-as-empty semantics compatible with accepted
+/// frames. The caller pins the namespace/range and the transaction's catalog
+/// view; this digest does not grant route or execution-lifetime authority.
+pub fn catalogDigest(txn: anytype, namespace: @import("doc_identity_namespace.zig").Namespace, byte_range: @import("../byte_range.zig").ByteRange, original: ?control.Port) ![32]u8 {
+    var trace: control.RejectionTrace = .{};
+    const result = catalogDigestInner(txn, namespace, byte_range, trace.bind(original)) catch |cause| return trace.failure orelse cause;
+    if (trace.failure) |cause| return cause;
+    return result;
+}
+fn catalogDigestInner(txn: anytype, namespace: @import("doc_identity_namespace.zig").Namespace, byte_range: @import("../byte_range.zig").ByteRange, owner: ?control.Port) ![32]u8 {
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update("antfly-prepared-catalog-v1");
+    for ([_]u64{ namespace.table_id, namespace.shard_id, namespace.range_id }) |id| {
+        var raw: [8]u8 = undefined;
+        std.mem.writeInt(u64, &raw, id, .little);
+        hash.update(&raw);
+    }
+    // Consume borrowed range bytes before any get can rotate a source buffer.
+    for ([_][]const u8{ byte_range.start, byte_range.end, "\x00\x00__metadata__:indexes", "\x00\x00__metadata__:enrichments", "\x00\x00__metadata__:resolvers" }, 0..) |key, index| {
+        if (owner) |port| try port.checkpoint();
+        const bytes = if (index < 2) key else txn.get(key) catch |cause| if (cause == error.NotFound) "" else return cause;
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, bytes.len, .little);
+        hash.update(&length);
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            if (owner) |port| try port.checkpoint();
+            const end = offset + @min(@as(usize, 4096), bytes.len - offset);
+            hash.update(bytes[offset..end]);
+            offset = end;
+        }
+    }
+    if (owner) |port| try port.checkpoint();
+    var result: [32]u8 = undefined;
+    hash.final(&result);
+    return result;
+}
+
+const CatalogDigestTest = struct {
+    const namespace: @import("doc_identity_namespace.zig").Namespace = .{ .table_id = 0x0102030405060708, .shard_id = 0x1112131415161718, .range_id = 0x2122232425262728 };
+    const byte_range: @import("../byte_range.zig").ByteRange = .{ .start = "\x00a", .end = "\xff\x00" };
+    const Txn = struct {
+        rows: [3]?[]const u8 = .{ "\x00idx", null, "\xffcfg" },
+        calls: usize = 0,
+        rotate: ?[]u8 = null,
+        failure: ?anyerror = null,
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            self.calls += 1;
+            if (self.rotate) |bytes| @memset(bytes, 'x');
+            if (self.failure) |cause| return cause;
+            for ([_][]const u8{ "\x00\x00__metadata__:indexes", "\x00\x00__metadata__:enrichments", "\x00\x00__metadata__:resolvers" }, 0..) |expected, i|
+                if (std.mem.eql(u8, key, expected)) return self.rows[i] orelse error.NotFound;
+            return error.TestUnexpectedResult;
+        }
+    };
+};
+
+test "prepared transaction effects catalog digest preserves independently framed v1 bytes and namespace endianness" {
+    const F = CatalogDigestTest;
+    const fixture = "antfly-prepared-catalog-v1" ++
+        "\x08\x07\x06\x05\x04\x03\x02\x01" ++
+        "\x18\x17\x16\x15\x14\x13\x12\x11" ++
+        "\x28\x27\x26\x25\x24\x23\x22\x21" ++
+        "\x02\x00\x00\x00\x00\x00\x00\x00\x00a" ++
+        "\x02\x00\x00\x00\x00\x00\x00\x00\xff\x00" ++
+        "\x04\x00\x00\x00\x00\x00\x00\x00\x00idx" ++
+        "\x00\x00\x00\x00\x00\x00\x00\x00" ++
+        "\x04\x00\x00\x00\x00\x00\x00\x00\xffcfg";
+    var expected: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(fixture, &expected, .{});
+    var txn: F.Txn = .{};
+    try std.testing.expectEqualDeep(expected, try catalogDigest(&txn, F.namespace, F.byte_range, null));
+    try std.testing.expectEqual(@as(usize, 3), txn.calls);
+}
+
+test "prepared transaction effects catalog digest binds every context field and consumes range before rotating metadata reads" {
+    const F = CatalogDigestTest;
+    var txn: F.Txn = .{};
+    const expected = try catalogDigest(&txn, F.namespace, F.byte_range, null);
+    inline for (.{ "table_id", "shard_id", "range_id" }) |field| {
+        var changed = F.namespace;
+        @field(changed, field) += 1;
+        try std.testing.expect(!std.meta.eql(expected, try catalogDigest(&txn, changed, F.byte_range, null)));
+    }
+    for (0..3) |field| {
+        txn = .{};
+        txn.rows[field] = "replacement";
+        try std.testing.expect(!std.meta.eql(expected, try catalogDigest(&txn, F.namespace, F.byte_range, null)));
+    }
+    txn = .{};
+    txn.rows[1] = "";
+    try std.testing.expectEqualDeep(expected, try catalogDigest(&txn, F.namespace, F.byte_range, null));
+    const left = try catalogDigest(&txn, F.namespace, .{ .start = "ab", .end = "c" }, null);
+    try std.testing.expect(!std.meta.eql(left, try catalogDigest(&txn, F.namespace, .{ .start = "a", .end = "bc" }, null)));
+    var bounds = [_]u8{ 'a', 'z' };
+    txn = .{};
+    const before = try catalogDigest(&txn, F.namespace, .{ .start = bounds[0..1], .end = bounds[1..] }, null);
+    txn.rotate = &bounds;
+    try std.testing.expectEqualDeep(before, try catalogDigest(&txn, F.namespace, .{ .start = bounds[0..1], .end = bounds[1..] }, null));
+}
+
+test "prepared transaction effects catalog digest preserves every original checkpoint and metadata failure" {
+    const F = CatalogDigestTest;
+    const Checks = struct {
+        calls: usize = 0,
+        stop: usize = std.math.maxInt(usize),
+        cause: anyerror = error.NotFound,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == self.stop) return self.cause;
+        }
+        fn run(self: *@This()) ![32]u8 {
+            const bytes: [12289]u8 = @splat(5);
+            var txn: F.Txn = .{ .rows = .{ &bytes, null, "" } };
+            var admission_payload: control.Payload = .{ .ptr = self, .vtable = &.{ .checkpoint = check } };
+            return catalogDigest(&txn, F.namespace, F.byte_range, control.Port.init(&admission_payload));
+        }
+    };
+    var baseline: Checks = .{};
+    _ = try baseline.run();
+    try std.testing.expect(baseline.calls > 8);
+    for ([_]anyerror{ error.NotFound, error.OutOfMemory, error.DeadlineExceeded }) |cause| for (1..baseline.calls + 1) |stop| {
+        var checks: Checks = .{ .stop = stop, .cause = cause };
+        try std.testing.expectError(cause, checks.run());
+    };
+    for ([_]anyerror{ error.OutOfMemory, error.DeadlineExceeded }) |cause| {
+        var txn: F.Txn = .{ .failure = cause };
+        try std.testing.expectError(cause, catalogDigest(&txn, F.namespace, F.byte_range, null));
+    }
+}
+
 pub const Plan = struct { contract: Contract, effects: Effects };
 
 // Layout follows the declared durable fields, little endian integers and float

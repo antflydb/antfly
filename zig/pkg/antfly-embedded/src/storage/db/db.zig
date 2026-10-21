@@ -147182,17 +147182,68 @@ test "db prepared transaction effects required semantic registry permits an unre
     try db.core.store.put(F.point, "after-retirement");
 }
 
+test "db prepared transaction effects required semantic registry fences range changes and permits equivalent full range initialization" {
+    const a = std.testing.allocator;
+    const F = SemanticReadGuardFixture;
+    for (0..2) |bounded| {
+        var directory = try TestDirectory.init("semantic-read-registry-range");
+        defer directory.cleanup();
+        var db = try DB.open(a, directory.path(), F.options);
+        defer db.close();
+        if (bounded == 1) try db.core.updateRange(.{ .start = "a", .end = "z" });
+        try F.seal(&db, false);
+        try F.register(&db);
+        const same = try range_state_mod.encodeRangeAlloc(a, if (bounded == 1) .{ .start = "a", .end = "z" } else .{ .start = "", .end = "" });
+        defer a.free(same);
+        try db.core.store.put(range_state_mod.range_key, same);
+        try db.core.store.put(range_state_mod.range_key, same);
+        if (bounded == 0) {
+            try db.core.store.delete(range_state_mod.range_key);
+            try db.core.store.put(range_state_mod.range_key, same);
+        }
+        const changed = try range_state_mod.encodeRangeAlloc(a, .{ .start = "b", .end = "y" });
+        defer a.free(changed);
+        for (0..5) |path| {
+            if ((path == 1 or path == 3) and bounded == 0) continue;
+            if (path < 2) {
+                var txn = try db.core.store.beginWriteTxn();
+                defer txn.abort();
+                if (path == 0)
+                    try std.testing.expectError(error.IntentConflict, txn.put(range_state_mod.range_key, changed))
+                else
+                    try std.testing.expectError(error.IntentConflict, txn.delete(range_state_mod.range_key));
+                try std.testing.expectError(error.IntentConflict, txn.commit());
+                try std.testing.expectError(error.IntentConflict, txn.commit());
+            } else {
+                var batch = try db.core.store.beginWriteBatch();
+                defer batch.abort();
+                switch (path) {
+                    2 => try std.testing.expectError(error.IntentConflict, batch.asTxn().put(range_state_mod.range_key, changed)),
+                    3 => try std.testing.expectError(error.IntentConflict, batch.asTxn().delete(range_state_mod.range_key)),
+                    4 => try std.testing.expectError(error.IntentConflict, batch.asTxn().appendPut(range_state_mod.range_key, changed)),
+                    else => unreachable,
+                }
+                try std.testing.expectError(error.IntentConflict, batch.commit());
+                try std.testing.expectError(error.IntentConflict, batch.commit());
+            }
+        }
+        try db.core.store.put("\x00\x00__txn_participant_ack__:peer", "ack");
+        try F.resolve(&db, .aborted);
+        try db.core.store.put(range_state_mod.range_key, changed);
+    }
+}
 test "db prepared transaction effects required semantic registry audits imported recovery state before writable or readonly open" {
     const a = std.testing.allocator;
     const F = SemanticReadGuardFixture;
     const guards = @import("../prepared_read_guards.zig");
     const versions = @import("catalog/reader_versions.zig");
-    for (0..14) |damage| {
+    for (0..21) |damage| {
         var directory = try TestDirectory.init("semantic-read-registry-import-audit");
         defer directory.cleanup();
         var db = try DB.open(a, directory.path(), F.options);
         var live = true;
         defer if (live) db.close();
+        if (damage == 19) try db.core.updateRange(.{ .start = "a", .end = "z" });
         try F.seal(&db, false);
         try F.register(&db);
         // Simulate a raw import/restore, which bypasses DocStore enforcement.
@@ -147249,6 +147300,23 @@ test "db prepared transaction effects required semantic registry audits imported
                     try raw.put(selected, original);
                 },
                 13 => try raw.put("\x00\x00__txn_intent_locks__:result", &@as([16]u8, @splat(194))),
+                14 => try raw.put(index_catalog_key, "AIDX\x01\x00\x00\x00\x00\x00\x00\x00"),
+                15 => try raw.put("\x00\x00__metadata__:enrichments", "[] "),
+                16 => {
+                    const selected = "\x00\x00__metadata__:resolvers";
+                    const original = try db.core.store.get(a, selected);
+                    defer a.free(original);
+                    const changed = try std.fmt.allocPrint(a, "{s} ", .{original});
+                    defer a.free(changed);
+                    try raw.put(selected, changed);
+                },
+                17, 20 => {
+                    const encoded = try range_state_mod.encodeRangeAlloc(a, if (damage == 17) .{ .start = "a", .end = "z" } else .{ .start = "z", .end = "a" });
+                    defer a.free(encoded);
+                    try raw.put(range_state_mod.range_key, encoded);
+                },
+                18 => try raw.put(range_state_mod.range_key, "bad"),
+                19 => try raw.delete(range_state_mod.range_key),
                 else => unreachable,
             }
             try raw.commit();
@@ -147259,7 +147327,8 @@ test "db prepared transaction effects required semantic registry audits imported
             0, 1, 2, 7 => error.InvalidTxnRecord,
             3, 8 => error.PreparedTransactionProtocolDisabled,
             4, 10 => error.NotFound,
-            5, 9, 11, 12, 13 => error.PreparedEffectsMismatch,
+            5, 9, 11, 12, 13, 14, 15, 16, 17, 19 => error.PreparedEffectsMismatch,
+            18, 20 => error.InvalidRangeState,
             6 => error.PreparedReadSetChanged,
             else => unreachable,
         };

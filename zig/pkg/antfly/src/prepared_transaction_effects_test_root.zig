@@ -26,6 +26,7 @@ test {
     _ = @import("antfly_local_sources").storage_docstore;
     _ = @import("antfly_local_sources").storage_db_catalog_resolver_catalog;
     _ = @import("antfly_local_sources").storage_db_artifact_inventory;
+    _ = @import("antfly_local_sources").storage_db_range_state;
     _ = @import("antfly_local_sources").storage_db_document_child_range_effects;
     _ = @import("antfly_local_sources").storage_db_document_child_range_manifest;
 }

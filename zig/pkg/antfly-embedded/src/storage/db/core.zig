@@ -2420,33 +2420,8 @@ pub const DBCore = struct {
         const control = trace.bind(original);
         var read = if (control) |owner| try self.store.beginReadTxnWithAdmission(.retain, owner) else try self.store.beginReadTxn();
         defer read.abort();
-        var hash = std.crypto.hash.Blake3.init(.{});
-        hash.update("antfly-prepared-catalog-v1");
-        for ([_]u64{ self.identity_namespace.table_id, self.identity_namespace.shard_id, self.identity_namespace.range_id }) |id| {
-            var raw: [8]u8 = undefined;
-            std.mem.writeInt(u64, &raw, id, .little);
-            hash.update(&raw);
-        }
-        for ([_][]const u8{ self.byteRange().start, self.byteRange().end, "\x00\x00__metadata__:indexes", "\x00\x00__metadata__:enrichments", "\x00\x00__metadata__:resolvers" }, 0..) |key, index| {
-            const bytes = if (index < 2) key else read.get(key) catch |err| blk: {
-                if (trace.failure) |cause| return cause;
-                if (err != error.NotFound) return err;
-                break :blk "";
-            };
-            var length: [8]u8 = undefined;
-            std.mem.writeInt(u64, &length, bytes.len, .little);
-            hash.update(&length);
-            var offset: usize = 0;
-            while (offset < bytes.len) {
-                if (control) |owner| try owner.checkpoint();
-                const end = offset + @min(@as(usize, 4096), bytes.len - offset);
-                hash.update(bytes[offset..end]);
-                offset = end;
-            }
-        }
+        const result = @import("prepared_transaction_effects.zig").catalogDigest(&read, self.identity_namespace, self.byteRange(), control) catch |cause| return trace.failure orelse cause;
         if (trace.failure) |cause| return cause;
-        var result: [32]u8 = undefined;
-        hash.final(&result);
         return result;
     }
 

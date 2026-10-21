@@ -25,6 +25,12 @@ const versions = @import("db/catalog/reader_versions.zig");
 const keys = @import("internal_keys.zig");
 const transactions = @import("transactions.zig");
 const backlog = @import("publication_backlog.zig");
+const range_state = @import("db/range_state.zig");
+fn effectiveRange(raw: ?[]const u8) !@import("byte_range.zig").ByteRange {
+    const selected = if (raw) |bytes| try range_state.decodeRangeBorrowed(bytes) else @import("byte_range.zig").ByteRange{ .start = "", .end = "" };
+    if (selected.end.len != 0 and std.mem.order(u8, selected.start, selected.end) != .lt) return error.InvalidRangeState;
+    return selected;
+}
 pub fn requireFloors(txn: anytype) !void {
     const Floors = struct {
         txn: @TypeOf(txn),
@@ -68,6 +74,7 @@ fn bundleKey(selected: []const u8) bool {
 }
 fn globalKey(selected: []const u8) bool {
     return @import("db/artifact_inventory.zig").isPreparedCatalogKey(selected) or
+        std.mem.eql(u8, selected, range_state.range_key) or
         std.mem.eql(u8, selected, &keys.identity_namespace_key) or
         std.mem.eql(u8, selected, versions.minimum_reader_key) or std.mem.eql(u8, selected, versions.replacement_reader_base_key);
 }
@@ -222,7 +229,16 @@ fn validateRecovery(a: A, store: anytype, defer_payload: bool) !void {
     try capture.auditEmpty(&txn, null);
     if (capture.state.records == 0) return;
     try requireFloors(&txn);
+    const raw_range: ?[]const u8 = txn.get(range_state.range_key) catch |cause| if (cause == error.NotFound) null else return cause;
+    // Range bytes are consumed by catalogDigest before it fetches catalog rows.
+    const namespace = capture.records.items[0].namespace;
+    const current_catalog = try effects.catalogDigest(&txn, .{
+        .table_id = std.mem.readInt(u64, namespace[0..8], .big),
+        .shard_id = std.mem.readInt(u64, namespace[8..16], .big),
+        .range_id = std.mem.readInt(u64, namespace[16..24], .big),
+    }, try effectiveRange(raw_range), null);
     for (capture.records.items) |*record| {
+        if (!std.meta.eql(current_catalog, record.receipt.catalog_digest)) return error.PreparedEffectsMismatch;
         try bundleMatches(&txn, record, null);
         const inspection = try effects.inspect(try txn.get(&transactions.makePreparedEffectsKey(record.receipt.txn_id)), null);
         try transactions.validatePreparedReadGuardInputs(a, store, inspection.contract, null);
@@ -544,6 +560,11 @@ pub const Capture = struct {
             const previous: ?[]const u8 = txn.get(selected) catch |err| if (err == error.NotFound) null else return err;
             if (previous == null and candidate == null) return;
             if (previous) |before| if (candidate) |after| if (std.mem.eql(u8, before, after)) return;
+            if (std.mem.eql(u8, selected, range_state.range_key)) {
+                const before = try effectiveRange(previous);
+                const after = try effectiveRange(candidate);
+                if (std.mem.eql(u8, before.start, after.start) and std.mem.eql(u8, before.end, after.end)) return;
+            }
             return error.IntentConflict;
         }
         if (global or bundle) {
