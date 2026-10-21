@@ -1320,6 +1320,11 @@ pub fn storageContextLiteAdoptAndVerify(
     };
     if (!target_identity.eql(antfly.lite.connection.embeddedRootIdentity()))
         return .identity_namespace_mismatch;
+    // Validate before publishing the durable alias; failed adoption must not
+    // transfer catalog ownership or prevent the embedded client from repair.
+    var definition = @import("antfly_local_sources").storage_lite_restore_staging.embeddedTableDefinition(context.alloc, backend.native_runtime_store.?) catch |err|
+        return storageOwnerStatusFromError(err);
+    defer definition.deinit(context.alloc);
     backend.adoptEmbeddedRootAsNamespace(namespace) catch |err| return storageOwnerStatusFromError(err);
     var db_opts = db_mod.OpenOptions{
         .open_mode = .writer_no_replay,
