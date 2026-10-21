@@ -23,9 +23,8 @@ const http_abi = @import("antfly_runtime_abi").http_abi;
 const native_abi = @import("antfly_runtime_abi").native_abi;
 const antfly_image = @import("antfly_image");
 
-// Version 30 makes execution placement an explicit host-owned context field
-// and appends embedded memory-admission diagnostics to the function table.
-pub const abi_version: u32 = 30;
+// Version 31 adds incremental request reads to the shared HTTP body source.
+pub const abi_version: u32 = 31;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
