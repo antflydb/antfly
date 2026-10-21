@@ -881,7 +881,8 @@ pub const Eval = struct {
     // Path resolution
     // ---------------------------------------------------------------
 
-    fn resolvePath(self: *Eval, path: *const ast.Path) Value {
+    /// Borrow a path value without evaluating an expression or calling helpers.
+    pub fn resolvePath(self: *Eval, path: *const ast.Path) Value {
         // Data references (@index, @key, @root, etc.)
         if (path.data) {
             return self.resolveDataPath(path);
@@ -1025,13 +1026,13 @@ fn nodeStripAfter(node: *const ast.Node) bool {
     };
 }
 
-fn trimLeadingWhitespace(s: []const u8) []const u8 {
+pub fn trimLeadingWhitespace(s: []const u8) []const u8 {
     var start: usize = 0;
     while (start < s.len and std.ascii.isWhitespace(s[start])) start += 1;
     return s[start..];
 }
 
-fn trimTrailingWhitespace(buf: *std.ArrayListUnmanaged(u8)) void {
+pub fn trimTrailingWhitespace(buf: *std.ArrayListUnmanaged(u8)) void {
     while (buf.items.len > 0 and std.ascii.isWhitespace(buf.items[buf.items.len - 1])) {
         _ = buf.pop();
     }
