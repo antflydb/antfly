@@ -631,6 +631,9 @@ def test_native_grep_builtin_substring_and_regex_candidates(
 def test_canonical_execution_rejects_removed_public_controls(stateful_api):
     table = f"canonical_execution_{time.time_ns()}"
     stateful_api.post(f"/tables/{table}", {"num_shards": 1})
+    stateful_api.batch_write(
+        table, inserts={"a": {"content": "needle"}}, sync_level="full_index"
+    )
     url = stateful_api.url + f"/tables/{table}/query"
     base = {"query": {"match_all": {}}, "limit": 1}
     canonical = {
@@ -639,6 +642,7 @@ def test_canonical_execution_rejects_removed_public_controls(stateful_api):
     }
     response = requests.post(url, json=canonical, timeout=60)
     assert response.status_code == 200, response.text
+    assert response.json()["responses"][0]["hits"]["total"]["value"] == 1
     for removed, value in (
         ("lake_read", {}),
         ("lake_visibility", "accepted"),
