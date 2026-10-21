@@ -150,9 +150,12 @@ The inspector uses the runtime's Handlebars parser and path lookup, and combines
 supported literal/substitution output before scanning media directives, using
 the same whitespace-control functions as execution. Numeric substitutions
 preserve the runtime's exact JSON number tokens.
-Document-dependent URL components stay unknown during definition inspection;
-concrete documents supply their values, while independent static fetches are
-still inventoried. The pure `media` formatter
+Document-dependent URL components stay unknown during definition inspection.
+A fully known scheme and authority still contribute their origin requirements,
+even on empty tables; known local paths, credentials and retrieval selections
+also remain dependencies. Open hosts, ports, query keys and filename suffixes
+are not completed with invented values. Concrete documents supply their values,
+while independent static fetches are still inventoried. The pure `media` formatter
 is shared with runtime; remote helpers are never called. Remote helpers use
 `credentials="name"` (or a supported field reference); quoting and argument order
 follow the runtime parser.

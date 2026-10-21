@@ -876,13 +876,17 @@ pub const Inspector = struct {
             const begin = start + prefix.len;
             const end = std.mem.indexOfPos(u8, text, begin, ">>>") orelse {
                 // Unknown substitutions may supply the closing delimiter too.
-                if (definition and std.mem.indexOfScalar(u8, text[begin..], 0) != null) return;
+                if (definition and std.mem.indexOfScalar(u8, text[begin..], 0) != null) {
+                    try self.templateLocator(text[begin..], doc, field, true);
+                    return;
+                }
                 try self.report.add(self.options, .source_unresolved, "media_directive", doc, field, 0);
                 return;
             };
             const reference = text[begin..end];
             if (std.mem.indexOfScalar(u8, reference, 0) != null) {
                 if (definition) {
+                    try self.templateLocator(reference, doc, field, true);
                     pos = end + 3;
                     continue;
                 }
@@ -1049,8 +1053,7 @@ pub const Inspector = struct {
         if (locator_mode and has_helper) {
             if (program.program.body.len != 1) try self.report.add(self.options, .dynamic_loader, "composed_locator", doc, field, 0);
         } else if (locator_mode) {
-            if (!definition or std.mem.indexOfScalar(u8, output.items, 0) == null)
-                try self.locator(output.items, doc, field);
+            try self.templateLocator(output.items, doc, field, definition);
         } else if (input.interpretsTemplateOutput()) {
             // Scan the complete known output, including markers assembled from
             // several literals/references, with no producer or helper execution.
@@ -1058,7 +1061,59 @@ pub const Inspector = struct {
         }
     }
 
+    /// Unknown substitutions can extend the current URI component or introduce
+    /// delimiters. Analyze only the guaranteed prefix; never fill in a value.
+    fn templateLocator(self: *@This(), raw: []const u8, doc: []const u8, field: []const u8, definition: bool) !void {
+        const unknown = if (definition) std.mem.indexOfScalar(u8, raw, 0) else null;
+        const unknown_at = unknown orelse return self.locator(raw, doc, field);
+        const prefix = std.mem.trimStart(u8, raw[0..unknown_at], " \t\r\n");
+        if (prefix.len == 0) return;
+        const scheme_end = std.mem.indexOfScalar(u8, prefix, ':');
+        if (std.mem.indexOfAny(u8, prefix, "/\\")) |slash| {
+            // A slash before a possible scheme delimiter establishes a local
+            // path even when the remaining filename contains colons.
+            if (scheme_end == null or slash < scheme_end.?) {
+                try self.report.add(self.options, .source_local, "filesystem", doc, field, 0);
+                return;
+            }
+        }
+        const colon = scheme_end orelse return;
+        const scheme = std.Uri.parse(prefix[0 .. colon + 1]) catch return;
+        if (std.ascii.eqlIgnoreCase(scheme.scheme, "file") or scheme.scheme.len == 1 or std.ascii.eqlIgnoreCase(scheme.scheme, "data"))
+            return self.locator(prefix[0 .. colon + 1], doc, field);
+        const hierarchical = std.ascii.eqlIgnoreCase(scheme.scheme, "http") or std.ascii.eqlIgnoreCase(scheme.scheme, "https") or
+            std.ascii.eqlIgnoreCase(scheme.scheme, "s3") or std.ascii.eqlIgnoreCase(scheme.scheme, "gs") or std.ascii.eqlIgnoreCase(scheme.scheme, "gcs");
+        if (!hierarchical) return self.locator(prefix[0 .. colon + 1], doc, field);
+        if (!std.mem.startsWith(u8, prefix[colon + 1 ..], "//")) return;
+        const authority = prefix[colon + 3 ..];
+        if (std.mem.indexOfAny(u8, authority, "/?#") == null) {
+            // The host or port is still open, but literal userinfo already
+            // establishes a credential-bearing source even without an origin.
+            if (@import("../../common/credential_safety.zig").urlContainsCredentials(prefix))
+                try self.report.add(self.options, .source_expiring, "temporary_access", doc, field, 0);
+            return;
+        }
+        var known = prefix;
+        const parameter_marker: ?usize = if (std.mem.indexOfScalar(u8, known, '#')) |at| at else std.mem.indexOfScalar(u8, known, '?');
+        if (parameter_marker) |marker| {
+            // A literal '=' closes a key even when its value is unknown. An
+            // unfinished key (e.g. token{{suffix}}) must not become 'token'.
+            const parameters = known[marker + 1 ..];
+            const start = if (std.mem.lastIndexOfAny(u8, parameters, "&;")) |at| at + 1 else 0;
+            if (std.mem.indexOfScalar(u8, parameters[start..], '=') == null)
+                known = known[0 .. marker + 1 + start];
+        } else if (std.mem.lastIndexOfScalar(u8, known, '%')) |percent| {
+            // A substitution may complete a percent escape in the open path.
+            if (known.len - percent < 3) known = known[0..percent];
+        }
+        try self.locatorKnown(known, doc, field, false);
+    }
+
     pub fn locator(self: *@This(), raw: []const u8, doc: []const u8, field: []const u8) !void {
+        return self.locatorKnown(raw, doc, field, true);
+    }
+
+    fn locatorKnown(self: *@This(), raw: []const u8, doc: []const u8, field: []const u8, complete: bool) !void {
         const text = std.mem.trim(u8, raw, " \t\r\n");
         if (text.len == 0) return;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -1098,7 +1153,8 @@ pub const Inspector = struct {
         if (temporary_access) try self.report.add(self.options, .source_expiring, "temporary_access", doc, field, 0);
         if (uri.fragment != null) try self.report.add(self.options, .page_retrieval, "fragment_selection", doc, field, 0);
         const path = try uri.path.toRawMaybeAlloc(a);
-        if (eq(uri.scheme, "zip") or std.mem.endsWith(u8, path, ".zip") or std.mem.endsWith(u8, path, ".tar") or std.mem.endsWith(u8, path, ".tgz") or std.mem.indexOf(u8, path, ".zip/") != null or std.mem.indexOf(u8, path, ".zip!") != null or std.mem.indexOf(u8, path, "!/") != null) try self.report.add(self.options, .archive_retrieval, "archive_member", doc, field, 0);
+        const path_complete = complete or uri.query != null or uri.fragment != null;
+        if (eq(uri.scheme, "zip") or (path_complete and (std.mem.endsWith(u8, path, ".zip") or std.mem.endsWith(u8, path, ".tar") or std.mem.endsWith(u8, path, ".tgz"))) or std.mem.indexOf(u8, path, ".zip/") != null or std.mem.indexOf(u8, path, ".zip!") != null or std.mem.indexOf(u8, path, "!/") != null) try self.report.add(self.options, .archive_retrieval, "archive_member", doc, field, 0);
         if (eq(uri.scheme, "http") or eq(uri.scheme, "https")) {
             if (host.len == 0) {
                 try self.report.add(self.options, .source_unresolved, "missing_host", doc, field, 0);
@@ -2600,4 +2656,151 @@ test "backup preflight immutable source contracts cannot be overridden by capabi
         defer parsed.deinit();
         try std.testing.expectEqualStrings(if (case.valid) "compatible" else "blocked", parsed.value.object.get("compatibility").?.object.get("verdict").?.string);
     }
+}
+
+test "backup preflight retains known template origins for empty tables" {
+    const a = std.testing.allocator;
+    const Case = struct { producer: []const u8, template: []const u8 };
+    for ([_]Case{
+        .{ .producer = "reader", .template = "http://localhost/{{id}}" },
+        .{ .producer = "generator", .template = "<<<dotprompt:media:url http://localhost/{{id}}>>>" },
+    }) |case| {
+        const producer = try std.json.Stringify.valueAlloc(a, .{ .type = case.producer, .config = .{ .provider = "antfly", .model = "mock" } }, .{});
+        defer a.free(producer);
+        try @import("../db/enrichment/config_validation.zig").validatePublicConfig(a, .{ .name = "media", .kind = .asset, .template = case.template, .producer_json = producer });
+        const metadata = try std.json.Stringify.valueAlloc(a, .{ .name = "media", .kind = "asset", .source_template = case.template, .producer_json = producer }, .{});
+        defer a.free(metadata);
+        var report: Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        try inspector.metadataJson(metadata);
+        const caps = try a.alloc(Capability, report.requirements.items.len);
+        defer a.free(caps);
+        for (report.requirements.items, caps) |*r, *cap| cap.* = .{ .requirement_sha256 = &r.sha256, .supported = true, .query_embedding = true, .future_ingestion = true, .model_revision_verified = true, .preprocessing_verified = true, .vector_space_verified = true, .dimensions = r.dimensions };
+        const evidence = try std.json.Stringify.valueAlloc(a, Destination{ .version = 1, .configuration_id = "all-model-evidence", .requirements = caps }, .{});
+        defer a.free(evidence);
+        const json = try report.jsonAlloc(evidence);
+        defer a.free(json);
+        var parsed = try std.json.parseFromSlice(Value, a, json, .{});
+        defer parsed.deinit();
+        const verdict = parsed.value.object.get("compatibility").?.object.get("verdict").?.string;
+        if (!eq(verdict, "blocked")) std.debug.print("producer={s} local_requirements={d} verdict={s}\n", .{ case.producer, count(report, .source_local), verdict });
+        try std.testing.expectEqualStrings("blocked", verdict);
+    }
+}
+
+test "backup preflight partial locators preserve only guaranteed URI components" {
+    const Case = struct {
+        text: []const u8,
+        external: u64 = 0,
+        local: u64 = 0,
+        connection: u64 = 0,
+        embedded: u64 = 0,
+        expiring: u64 = 0,
+        page: u64 = 0,
+        archive: u64 = 0,
+        unresolved: u64 = 0,
+    };
+    const a = std.testing.allocator;
+    for ([_]Case{
+        .{ .text = "https://example.org/\x00", .external = 1 },
+        .{ .text = "http://localhost/\x00", .external = 1, .local = 1 },
+        .{ .text = "https://example.org:\x00/file" },
+        .{ .text = "https://\x00.example.org/file" },
+        .{ .text = "https://example.org\x00/file" },
+        .{ .text = "https:\x00" },
+        .{ .text = "\x00://example.org/file" },
+        .{ .text = "s3://bucket/\x00", .connection = 1 },
+        .{ .text = "file:///private/\x00", .local = 1 },
+        .{ .text = "/private/https:\x00", .local = 1 },
+        .{ .text = "data:text/plain,\x00", .embedded = 1 },
+        .{ .text = "ftp://example.org/\x00", .unresolved = 1 },
+        .{ .text = "https://user:pass@example.org/\x00", .external = 1, .expiring = 1 },
+        .{ .text = "https://user:pass@\x00/file", .expiring = 1 },
+        .{ .text = "https://example.org/file?token=\x00", .external = 1, .expiring = 1 },
+        .{ .text = "https://example.org/file?token\x00name", .external = 1 },
+        .{ .text = "https://example.org/file?keep=1&token\x00name", .external = 1 },
+        .{ .text = "https://example.org/file?page=\x00", .external = 1, .page = 1 },
+        .{ .text = "https://example.org/file?page\x00size", .external = 1 },
+        .{ .text = "https://example.org/file?entry=\x00", .external = 1, .archive = 1 },
+        .{ .text = "https://example.org/file?expires=\x00", .external = 1, .expiring = 1 },
+        .{ .text = "https://example.org/file.zip\x00", .external = 1 },
+        .{ .text = "https://example.org/file.zip/\x00", .external = 1, .archive = 1 },
+        .{ .text = "https://example.org/file.zip?filename=\x00", .external = 1, .archive = 1 },
+        .{ .text = "https://example.org/file%2\x00", .external = 1 },
+        .{ .text = "https://example.org/file%2ezip\x00", .external = 1 },
+        .{ .text = "https://example.org/file.zip#\x00", .external = 1, .page = 1, .archive = 1 },
+        .{ .text = "https://example.org/file?q=token%26key\x00", .external = 1 },
+        .{ .text = "https://example.org/file?x=1#token=\x00", .external = 1, .expiring = 1, .page = 1 },
+        .{ .text = "https://example.org/file#token\x00name", .external = 1, .page = 1 },
+        .{ .text = "https://example.org/file?x=literal?token\x00name", .external = 1 },
+        .{ .text = "https://example.org/file#x=literal#token\x00name", .external = 1, .page = 1 },
+        .{ .text = "https://example.org/file.zip!/\x00", .external = 1, .archive = 1 },
+    }) |case| {
+        var report: Report = .{ .allocator = a };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        try inspector.templateLocator(case.text, "", "body", true);
+        inline for (.{ .{ Kind.source_external, "external" }, .{ Kind.source_local, "local" }, .{ Kind.connection, "connection" }, .{ Kind.embedded, "embedded" }, .{ Kind.source_expiring, "expiring" }, .{ Kind.page_retrieval, "page" }, .{ Kind.archive_retrieval, "archive" }, .{ Kind.source_unresolved, "unresolved" } }) |expected| {
+            const actual = count(report, expected[0]);
+            if (actual != @field(case, expected[1])) std.debug.print("partial locator {s}: unexpected {s}\n", .{ case.text, expected[1] });
+            try std.testing.expectEqual(@field(case, expected[1]), actual);
+        }
+        try std.testing.expectEqual(case.unresolved == 0, report.analysis_complete);
+    }
+}
+
+test "backup preflight known remote template origins need separate destination evidence" {
+    const a = std.testing.allocator;
+    var report: Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    try inspector.metadataJson(
+        \\{"name":"reader","kind":"asset","source_template":"https://example.org/{{id}}","producer":{"type":"reader","config":{"provider":"antfly","model":"mock"}}}
+    );
+    try std.testing.expectEqual(@as(u64, 1), count(report, .source_external));
+    const expected_origin = requirementHash(.source_external, "https://example.org:443");
+    const caps = try a.alloc(Capability, report.requirements.items.len);
+    defer a.free(caps);
+    var used: usize = 0;
+    var origin_cap: Capability = undefined;
+    for (report.requirements.items) |*r| {
+        const cap: Capability = .{ .requirement_sha256 = &r.sha256, .supported = true, .future_ingestion = true, .model_revision_verified = true };
+        if (r.kind == .source_external) {
+            try std.testing.expectEqualStrings(&expected_origin, &r.sha256);
+            origin_cap = cap;
+        } else {
+            caps[used] = cap;
+            used += 1;
+        }
+    }
+    const model_only = try std.json.Stringify.valueAlloc(a, Destination{ .version = 1, .configuration_id = "model-only", .requirements = caps[0..used] }, .{});
+    defer a.free(model_only);
+    const unknown = try report.jsonAlloc(model_only);
+    defer a.free(unknown);
+    try std.testing.expect(std.mem.indexOf(u8, unknown, "\"compatibility\":{\"verdict\":\"unknown\"") != null);
+    caps[used] = origin_cap;
+    const all = try std.json.Stringify.valueAlloc(a, Destination{ .version = 1, .configuration_id = "model-and-origin", .requirements = caps }, .{});
+    defer a.free(all);
+    const compatible = try report.jsonAlloc(all);
+    defer a.free(compatible);
+    try std.testing.expect(std.mem.indexOf(u8, compatible, "\"compatibility\":{\"verdict\":\"compatible\"") != null);
+}
+
+test "backup preflight known media origins survive an unknown closing delimiter" {
+    const a = std.testing.allocator;
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    try inspector.metadataJson(
+        \\{"name":"summary","kind":"asset","source_template":"<<<dotprompt:media:url https://example.org/{{{tail}}}","producer":{"type":"generator","config":{"provider":"antfly","model":"mock"}}}
+    );
+    try std.testing.expectEqual(@as(u64, 1), count(report, .source_external));
+    try inspector.document("doc", "{\"tail\":\"file.pdf>>>\"}", "");
+    try std.testing.expectEqual(@as(u64, 2), count(report, .source_external));
+    try std.testing.expect(report.analysis_complete);
 }
