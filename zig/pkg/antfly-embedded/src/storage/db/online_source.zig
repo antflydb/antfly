@@ -179,7 +179,8 @@ test "relational index system source publication retains full certificate and re
     @memcpy(old[artifact_offset..], &digest(old[0..artifact_offset]));
     const original = try decode(&old);
     try std.testing.expect(original.artifact_catalog == null and certificate.eql(original.published_certificate.?));
-    std.mem.writeInt(u16, bytes[artifact_offset + 72 .. checksum_offset], 16, .little);
+    // Protocols 14 through 16 are valid; the first unsupported one must be rejected.
+    std.mem.writeInt(u16, bytes[artifact_offset + 72 .. checksum_offset], 17, .little);
     @memcpy(bytes[checksum_offset..], &digest(bytes[0..checksum_offset]));
     try std.testing.expectError(error.OnlineSourceCorrupt, decode(&bytes));
     bytes = encode(progress);

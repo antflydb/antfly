@@ -70950,10 +70950,11 @@ test "db field selection plan only enables chunk special field for explicit incl
     try std.testing.expect(!none.special.all_chunks);
     try std.testing.expect(!none.special.all_embeddings);
 
-    const artifacts_none = db_query_projection.buildFieldSelectionPlan(&.{"_artifacts.body_chunks_v1.items.0.value"}, false);
-    try std.testing.expect(!artifacts_none.special.all_artifacts);
-    try std.testing.expect(!artifacts_none.special.all_chunks);
-    try std.testing.expect(!artifacts_none.special.all_embeddings);
+    // A nested artifact selector loads artifacts so the nested path can be projected.
+    const artifacts_nested = db_query_projection.buildFieldSelectionPlan(&.{"_artifacts.body_chunks_v1.items.0.value"}, false);
+    try std.testing.expect(artifacts_nested.special.all_artifacts);
+    try std.testing.expect(!artifacts_nested.special.all_chunks);
+    try std.testing.expect(!artifacts_nested.special.all_embeddings);
 
     const artifacts_plain = db_query_projection.buildFieldSelectionPlan(&.{"_artifacts"}, false);
     try std.testing.expect(artifacts_plain.special.all_artifacts);
@@ -80109,7 +80110,12 @@ test "lite external dense dimension replacement keeps writes available (#1216)" 
     try db.runUntilIdle();
     try std.testing.expect(try db.deleteIndex("img"));
     var pages: usize = 0;
-    while (try db.advanceGeneratedArtifactCleanupPage("img") != .idle) : (pages += 1) try std.testing.expect(pages < 10_000);
+    // Index workers run in this test and can hold the cleanup lease (.busy);
+    // yield so the bound measures cleanup progress, not lock spins.
+    while (try db.advanceGeneratedArtifactCleanupPage("img") != .idle) : (pages += 1) {
+        try std.testing.expect(pages < 10_000);
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
     const repair = try db.admitManagedIndex(.{ .name = "img", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":4,\"external\":true}" });
     // Admission must not block either vector or ordinary writes while its
     // new generation is still rebuilding from retained authored artifacts.
