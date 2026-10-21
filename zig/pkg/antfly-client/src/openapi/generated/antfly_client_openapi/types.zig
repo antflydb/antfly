@@ -2368,6 +2368,33 @@ pub const AuthSubject = struct {
     kind: []const u8,
 };
 
+/// Analyzed bool-prefix search on a logical field. The planner selects declared search-as-you-type root, shingle and prefix representations. Requires a compatible representation; never silently becomes raw prefix search.
+pub const AutocompleteQuery = struct {
+    autocomplete: []const u8,
+    field: []const u8,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("autocomplete");
+        try jw.write(self.autocomplete);
+        try jw.objectField("field");
+        try jw.write(self.field);
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
 pub const BackupAlreadyExistsConflict = struct {
     code: []const u8,
     /// Legacy human-readable error text. Use `code` for branching.
@@ -6023,6 +6050,55 @@ pub const ConstrainedProbabilities = enum {
     }
 };
 
+/// Contiguous substring search on the original logical field value, including whitespace and punctuation. No normalization is applied. Case-sensitive by default; case_sensitive=false uses Unicode simple case folding, not locale-specific or multi-character folding. Missing, null, and non-string values do not match. Arrays use any-element semantics; a match never spans array elements. Indexes select conservative candidates and original values are verified before counting and pagination.
+pub const ContainsQuery = struct {
+    contains: []const u8,
+    /// Logical source field path, not a companion index name.
+    field: []const u8,
+    case_sensitive: ?bool = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "contains", "contains", false },
+        .{ "field", "field", false },
+        .{ "case_sensitive", "case_sensitive", true },
+        .{ "boost", "boost", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("contains");
+        try jw.write(self.contains);
+        try jw.objectField("field");
+        try jw.write(self.field);
+        if (self.case_sensitive) |value| {
+            try jw.objectField("case_sensitive");
+            try jw.write(value);
+        }
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
 /// A content part for multimodal input (text, image URL, or inline media).
 pub const ContentPart = union(enum) {
     media_content_part: *MediaContentPart,
@@ -9133,11 +9209,14 @@ pub const DecisionChoiceProbability = struct {
 pub const DecisionInput = struct {
     id: ?[]const u8 = null,
     input: []const u8,
+    /// Index into request contexts. Requires context_version 1. Effective input is context, newline, then input; the 1 MiB input limit applies after expansion.
+    context_index: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "id", "id", true },
         .{ "input", "input", false },
+        .{ "context_index", "context_index", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -9156,6 +9235,10 @@ pub const DecisionInput = struct {
         }
         try jw.objectField("input");
         try jw.write(self.input);
+        if (self.context_index) |value| {
+            try jw.objectField("context_index");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -9247,6 +9330,8 @@ pub const DecisionRequest = union(enum) {
             if (try parseStructuralVariant(GeneratedDecideRequest, allocator, source, options)) |parsed| return .{ .generated_decide_request = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
+            "context_version",
+            "contexts",
             "model",
             "model_identity",
             "input",
@@ -12642,6 +12727,55 @@ pub const EntitySuppressRequest = struct {
         if (self.wait) |value| {
             try jw.objectField("wait");
             try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Whole string equality on the original logical field value. No normalization is applied. Case-sensitive by default; case_sensitive=false uses Unicode simple case folding, not locale-specific or multi-character folding. Missing, null, and non-string values do not match. Arrays use any-element semantics; a match never spans array elements. Indexes select conservative candidates and original values are verified before counting and pagination.
+pub const EqualsQuery = struct {
+    equals: []const u8,
+    /// Logical source field path, not a companion index name.
+    field: []const u8,
+    case_sensitive: ?bool = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "equals", "equals", false },
+        .{ "field", "field", false },
+        .{ "case_sensitive", "case_sensitive", true },
+        .{ "boost", "boost", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("equals");
+        try jw.write(self.equals);
+        try jw.objectField("field");
+        try jw.write(self.field);
+        if (self.case_sensitive) |value| {
+            try jw.objectField("case_sensitive");
+            try jw.write(value);
+        }
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
         }
         try jw.endObject();
     }
@@ -16055,58 +16189,32 @@ pub const FetchConfig = struct {
     }
 };
 
-/// Public field capability derived from Antfly schema mappings and observed dynamic field metadata.
+/// One public logical field with its supported value operations and nested concrete representations. Queries name field; Antfly resolves compatible representations. Unknown source associations remain explicit diagnostics.
 pub const FieldCapability = struct {
-    /// Mapping or dynamic-template name, when applicable.
-    name: ?[]const u8 = null,
-    /// Concrete query field path when known. Pattern-only dynamic templates may omit this.
+    /// Public source or reserved/computed field accepted by queries. Absent for pattern-only templates and unassociated index representations.
     field: ?[]const u8 = null,
-    /// Dynamic-template path_match pattern, when applicable.
-    path_pattern: ?[]const u8 = null,
-    /// Dynamic-template match pattern, when applicable.
-    field_pattern: ?[]const u8 = null,
-    /// Dynamic-template match_mapping_type, when applicable.
-    match_mapping_type: ?[]const u8 = null,
-    /// Physical emitted field name for schema-derived text fields, when different from the logical path.
-    emitted_name: ?[]const u8 = null,
-    /// Document schema that produced this capability, when applicable.
-    document_schema: ?[]const u8 = null,
-    type: AntflyType,
-    /// Query modes supported by this concrete field variant. These modes are derived from Antfly field types such as `text`, `keyword`, `datetime`, `geopoint`, and `search_as_you_type`; they are not separate schema toggles.
-    query_modes: []const []const u8,
-    /// Whether this concrete field is declared sortable in the effective capability model. A cold declared field is validated on first exact order_by use; clients do not need to poll lifecycle status.
+    /// Field origin. Unassociated entries do not assert a document source path.
+    kind: []const u8,
+    /// Supported original-value operations on field. Availability does not attest index coverage or authorize scans. Case sensitivity, execution policy and work budgets apply. Reserved/computed/template/unassociated entries do not advertise original-document value operations.
+    value_operations: []const []const u8,
+    /// Whether field resolves to one compatible sortable representation. Cold declared fields validate coverage on first exact-sort use; callers do not route through representation names.
     sortable: bool,
-    /// Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic.
-    provenance: []const u8,
-    /// Current missing/null handling policy for this field.
-    missing_null_policy: []const u8,
-    /// Cached operational lifecycle state for exact sort use. Declared or indexed fields are validated on first public exact-sort use; queryable fields have validated native coverage; accelerated fields are queryable and participate in the configured index_sort tuple.
+    /// Conservative cached lifecycle for the representation selected by the query resolver. Ambiguous or unavailable routing is unsupported.
     sort_lifecycle_state: []const u8,
-    /// Analyzer name for text/searchable fields, when applicable.
-    analyzer: ?[]const u8 = null,
-    /// Zero-based position in the table index_sort tuple when this field participates.
-    index_sort_position: ?i64 = null,
-    /// Sort direction in the table index_sort tuple when this field participates.
-    index_sort_order: ?[]const u8 = null,
+    /// True for query-computed score ordering, which requires a score-bearing query. This does not authorize ordering a non-scoring query by _score.
+    sort_requires_scoring: bool,
+    /// Concrete representations with analyzer, type, legacy query modes and readiness diagnostics. Multiple representations never require clients to reproduce Antfly routing.
+    representations: []const FieldRepresentation,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "name", "name", true },
         .{ "field", "field", true },
-        .{ "path_pattern", "path_pattern", true },
-        .{ "field_pattern", "field_pattern", true },
-        .{ "match_mapping_type", "match_mapping_type", true },
-        .{ "emitted_name", "emitted_name", true },
-        .{ "document_schema", "document_schema", true },
-        .{ "type", "type", false },
-        .{ "query_modes", "query_modes", false },
+        .{ "kind", "kind", false },
+        .{ "value_operations", "value_operations", false },
         .{ "sortable", "sortable", false },
-        .{ "provenance", "provenance", false },
-        .{ "missing_null_policy", "missing_null_policy", false },
         .{ "sort_lifecycle_state", "sort_lifecycle_state", false },
-        .{ "analyzer", "analyzer", true },
-        .{ "index_sort_position", "index_sort_position", true },
-        .{ "index_sort_order", "index_sort_order", true },
+        .{ "sort_requires_scoring", "sort_requires_scoring", false },
+        .{ "representations", "representations", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -16119,58 +16227,22 @@ pub const FieldCapability = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        if (self.name) |value| {
-            try jw.objectField("name");
-            try jw.write(value);
-        }
         if (self.field) |value| {
             try jw.objectField("field");
             try jw.write(value);
         }
-        if (self.path_pattern) |value| {
-            try jw.objectField("path_pattern");
-            try jw.write(value);
-        }
-        if (self.field_pattern) |value| {
-            try jw.objectField("field_pattern");
-            try jw.write(value);
-        }
-        if (self.match_mapping_type) |value| {
-            try jw.objectField("match_mapping_type");
-            try jw.write(value);
-        }
-        if (self.emitted_name) |value| {
-            try jw.objectField("emitted_name");
-            try jw.write(value);
-        }
-        if (self.document_schema) |value| {
-            try jw.objectField("document_schema");
-            try jw.write(value);
-        }
-        try jw.objectField("type");
-        try jw.write(self.type);
-        try jw.objectField("query_modes");
-        try jw.write(self.query_modes);
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("value_operations");
+        try jw.write(self.value_operations);
         try jw.objectField("sortable");
         try jw.write(self.sortable);
-        try jw.objectField("provenance");
-        try jw.write(self.provenance);
-        try jw.objectField("missing_null_policy");
-        try jw.write(self.missing_null_policy);
         try jw.objectField("sort_lifecycle_state");
         try jw.write(self.sort_lifecycle_state);
-        if (self.analyzer) |value| {
-            try jw.objectField("analyzer");
-            try jw.write(value);
-        }
-        if (self.index_sort_position) |value| {
-            try jw.objectField("index_sort_position");
-            try jw.write(value);
-        }
-        if (self.index_sort_order) |value| {
-            try jw.objectField("index_sort_order");
-            try jw.write(value);
-        }
+        try jw.objectField("sort_requires_scoring");
+        try jw.write(self.sort_requires_scoring);
+        try jw.objectField("representations");
+        try jw.write(self.representations);
         try jw.endObject();
     }
 };
@@ -16252,6 +16324,129 @@ pub const FieldMappingType = enum {
             .{ "substring", .substring },
         });
         return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Concrete index or reserved-field representation. Diagnostic targets and index-relative query modes are scoped to this representation.
+pub const FieldRepresentation = struct {
+    /// Mapping or dynamic-template name, when applicable.
+    name: ?[]const u8 = null,
+    /// Concrete representation target for diagnostics and advanced index-relative queries. Pattern-only templates may omit this.
+    field: ?[]const u8 = null,
+    /// Dynamic-template path_match pattern, when applicable.
+    path_pattern: ?[]const u8 = null,
+    /// Dynamic-template match pattern, when applicable.
+    field_pattern: ?[]const u8 = null,
+    /// Dynamic-template match_mapping_type, when applicable.
+    match_mapping_type: ?[]const u8 = null,
+    /// Document schema that produced this capability, when applicable.
+    document_schema: ?[]const u8 = null,
+    type: AntflyType,
+    /// Query modes supported by this concrete field variant. These modes are derived from Antfly field types such as `text`, `keyword`, `datetime`, `geopoint`, and `search_as_you_type`; they are not separate schema toggles.
+    query_modes: []const []const u8,
+    /// Whether this concrete field is declared sortable in the effective capability model. A cold declared field is validated on first exact order_by use; clients do not need to poll lifecycle status.
+    sortable: bool,
+    /// Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic.
+    provenance: []const u8,
+    /// Current missing/null handling policy for this field.
+    missing_null_policy: []const u8,
+    /// Cached operational lifecycle state for exact sort use. Declared or indexed fields are validated on first public exact-sort use; queryable fields have validated native coverage; accelerated fields are queryable and participate in the configured index_sort tuple.
+    sort_lifecycle_state: []const u8,
+    /// Analyzer name for text/searchable fields, when applicable.
+    analyzer: ?[]const u8 = null,
+    /// Zero-based position in the table index_sort tuple when this field participates.
+    index_sort_position: ?i64 = null,
+    /// Sort direction in the table index_sort tuple when this field participates.
+    index_sort_order: ?[]const u8 = null,
+    /// Observed or declared doc-value coverage; declaration alone does not establish complete coverage.
+    doc_value_coverage: []const u8,
+    /// Cached execution/readiness state of this representation. Capability inspection does not initiate coverage scans.
+    queryability_state: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", true },
+        .{ "field", "field", true },
+        .{ "path_pattern", "path_pattern", true },
+        .{ "field_pattern", "field_pattern", true },
+        .{ "match_mapping_type", "match_mapping_type", true },
+        .{ "document_schema", "document_schema", true },
+        .{ "type", "type", false },
+        .{ "query_modes", "query_modes", false },
+        .{ "sortable", "sortable", false },
+        .{ "provenance", "provenance", false },
+        .{ "missing_null_policy", "missing_null_policy", false },
+        .{ "sort_lifecycle_state", "sort_lifecycle_state", false },
+        .{ "analyzer", "analyzer", true },
+        .{ "index_sort_position", "index_sort_position", true },
+        .{ "index_sort_order", "index_sort_order", true },
+        .{ "doc_value_coverage", "doc_value_coverage", false },
+        .{ "queryability_state", "queryability_state", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.name) |value| {
+            try jw.objectField("name");
+            try jw.write(value);
+        }
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        }
+        if (self.path_pattern) |value| {
+            try jw.objectField("path_pattern");
+            try jw.write(value);
+        }
+        if (self.field_pattern) |value| {
+            try jw.objectField("field_pattern");
+            try jw.write(value);
+        }
+        if (self.match_mapping_type) |value| {
+            try jw.objectField("match_mapping_type");
+            try jw.write(value);
+        }
+        if (self.document_schema) |value| {
+            try jw.objectField("document_schema");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("query_modes");
+        try jw.write(self.query_modes);
+        try jw.objectField("sortable");
+        try jw.write(self.sortable);
+        try jw.objectField("provenance");
+        try jw.write(self.provenance);
+        try jw.objectField("missing_null_policy");
+        try jw.write(self.missing_null_policy);
+        try jw.objectField("sort_lifecycle_state");
+        try jw.write(self.sort_lifecycle_state);
+        if (self.analyzer) |value| {
+            try jw.objectField("analyzer");
+            try jw.write(value);
+        }
+        if (self.index_sort_position) |value| {
+            try jw.objectField("index_sort_position");
+            try jw.write(value);
+        }
+        if (self.index_sort_order) |value| {
+            try jw.objectField("index_sort_order");
+            try jw.write(value);
+        }
+        try jw.objectField("doc_value_coverage");
+        try jw.write(self.doc_value_coverage);
+        try jw.objectField("queryability_state");
+        try jw.write(self.queryability_state);
+        try jw.endObject();
     }
 };
 
@@ -18040,6 +18235,7 @@ pub const GeoShapeQuery = struct {
 
 /// A stateful global query. Specify a table target or a composed source.
 pub const GlobalStatefulQueryRequest = struct {
+    value_search_execution: ?ValueSearchExecution = null,
     read_requirements: ?ReadRequirements = null,
     lake_read: ?LakeReadRequirement = null,
     /// Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409.
@@ -18127,6 +18323,7 @@ pub const GlobalStatefulQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "value_search_execution", "value_search_execution", true },
         .{ "read_requirements", "read_requirements", true },
         .{ "lake_read", "lake_read", true },
         .{ "remote_snapshot", "remote_snapshot", true },
@@ -18185,6 +18382,10 @@ pub const GlobalStatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.value_search_execution) |value| {
+            try jw.objectField("value_search_execution");
+            try jw.write(value);
+        }
         if (self.read_requirements) |value| {
             try jw.objectField("read_requirements");
             try jw.write(value);
@@ -26292,6 +26493,10 @@ pub const InferenceDecideQuestion = union(enum) {
 
 /// Supply exactly one of input (single text) or inputs (Antfly batch extension). Question names must be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are bounded at 16 MiB.
 pub const InferenceDecideRequest = struct {
+    /// Explicit shared-context transport version. Requires batched inputs and contexts; unknown versions are rejected.
+    context_version: ?i64 = null,
+    /// Shared immutable context strings referenced by context_index. Requires context_version 1. Total expanded input bytes are limited to 16 MiB.
+    contexts: ?[]const []const u8 = null,
     model: []const u8,
     /// Pin the exact EmbeddingGemma 2 assets and embedding recipe.
     model_identity: ?[]const u8 = null,
@@ -26303,6 +26508,8 @@ pub const InferenceDecideRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "context_version", "context_version", true },
+        .{ "contexts", "contexts", true },
         .{ "model", "model", false },
         .{ "model_identity", "model_identity", true },
         .{ "input", "input", true },
@@ -26322,6 +26529,14 @@ pub const InferenceDecideRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.context_version) |value| {
+            try jw.objectField("context_version");
+            try jw.write(value);
+        }
+        if (self.contexts) |value| {
+            try jw.objectField("contexts");
+            try jw.write(value);
+        }
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.model_identity) |value| {
@@ -32013,6 +32228,55 @@ pub const MatchQuery = struct {
     }
 };
 
+/// Unanchored native Unicode regular expression search on the original logical field value. Anchors refer to each complete value; indexed-term regexp semantics are unchanged. No normalization is applied. Case-sensitive by default; case_sensitive=false uses Unicode simple case folding, not locale-specific or multi-character folding. Missing, null, and non-string values do not match. Arrays use any-element semantics; a match never spans array elements. Indexes select conservative candidates and original values are verified before counting and pagination.
+pub const MatchesQuery = struct {
+    matches: []const u8,
+    /// Logical source field path, not a companion index name.
+    field: []const u8,
+    case_sensitive: ?bool = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "matches", "matches", false },
+        .{ "field", "field", false },
+        .{ "case_sensitive", "case_sensitive", true },
+        .{ "boost", "boost", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("matches");
+        try jw.write(self.matches);
+        try jw.objectField("field");
+        try jw.write(self.field);
+        if (self.case_sensitive) |value| {
+            try jw.objectField("case_sensitive");
+            try jw.write(value);
+        }
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
 /// Semantic chunk policy. Execution batch size and queue depth are deliberately separate.
 pub const MediaChunkPolicy = struct {
     /// Explicit byte ceiling per text chunk, independently of the target tokenizer budget.
@@ -35913,11 +36177,15 @@ pub const Query = union(enum) {
     term_range_query: *TermRangeQuery,
     fuzzy_query: *FuzzyQuery,
     match_phrase_query: *MatchPhraseQuery,
+    contains_query: *ContainsQuery,
     disjunction_query: *DisjunctionQuery,
+    equals_query: *EqualsQuery,
     geo_distance_query: *GeoDistanceQuery,
     match_query: *MatchQuery,
+    matches_query: *MatchesQuery,
     multi_phrase_query: *MultiPhraseQuery,
     phrase_query: *PhraseQuery,
+    autocomplete_query: *AutocompleteQuery,
     bool_field_query: *BoolFieldQuery,
     conjunction_query: *ConjunctionQuery,
     doc_id_query: *DocIdQuery,
@@ -36013,10 +36281,22 @@ pub const Query = union(enum) {
             if (try parseStructuralVariant(MatchPhraseQuery, allocator, source, options)) |parsed| return .{ .match_phrase_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
+            "contains",
+            "case_sensitive",
+        })) {
+            if (try parseStructuralVariant(ContainsQuery, allocator, source, options)) |parsed| return .{ .contains_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
             "disjuncts",
             "min",
         })) {
             if (try parseStructuralVariant(DisjunctionQuery, allocator, source, options)) |parsed| return .{ .disjunction_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "equals",
+            "case_sensitive",
+        })) {
+            if (try parseStructuralVariant(EqualsQuery, allocator, source, options)) |parsed| return .{ .equals_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "location",
@@ -36031,6 +36311,12 @@ pub const Query = union(enum) {
             if (try parseStructuralVariant(MatchQuery, allocator, source, options)) |parsed| return .{ .match_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
+            "matches",
+            "case_sensitive",
+        })) {
+            if (try parseStructuralVariant(MatchesQuery, allocator, source, options)) |parsed| return .{ .matches_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
             "terms",
             "fuzziness",
         })) {
@@ -36041,6 +36327,11 @@ pub const Query = union(enum) {
             "fuzziness",
         })) {
             if (try parseStructuralVariant(PhraseQuery, allocator, source, options)) |parsed| return .{ .phrase_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "autocomplete",
+        })) {
+            if (try parseStructuralVariant(AutocompleteQuery, allocator, source, options)) |parsed| return .{ .autocomplete_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "bool",
@@ -36124,11 +36415,15 @@ pub const Query = union(enum) {
             .term_range_query => |v| try jw.write(v.*),
             .fuzzy_query => |v| try jw.write(v.*),
             .match_phrase_query => |v| try jw.write(v.*),
+            .contains_query => |v| try jw.write(v.*),
             .disjunction_query => |v| try jw.write(v.*),
+            .equals_query => |v| try jw.write(v.*),
             .geo_distance_query => |v| try jw.write(v.*),
             .match_query => |v| try jw.write(v.*),
+            .matches_query => |v| try jw.write(v.*),
             .multi_phrase_query => |v| try jw.write(v.*),
             .phrase_query => |v| try jw.write(v.*),
+            .autocomplete_query => |v| try jw.write(v.*),
             .bool_field_query => |v| try jw.write(v.*),
             .conjunction_query => |v| try jw.write(v.*),
             .doc_id_query => |v| try jw.write(v.*),
@@ -36480,7 +36775,7 @@ pub const QueryConflictError = union(enum) {
     }
 };
 
-/// A stable failure envelope for query embedding, reranking, and decision dependencies.
+/// A stable failure envelope for query execution policy and embedding, reranking, and decision dependencies.
 pub const QueryDependencyError = struct {
     code: []const u8,
     /// Legacy alias of code. Use code for programmatic handling.
@@ -36956,6 +37251,8 @@ pub const QueryHitsTotal = struct {
 
 /// Detailed execution profiling for a query. Present in the response when the request sets `profile: true`.
 pub const QueryProfile = struct {
+    /// Actual logical value verification work, summed across participating shards; plans describe selected physical fields and scan fallback reasons. Budgets remain per shard.
+    value_search: ?std.json.Value = null,
     /// Shard-level execution statistics.
     shards: ?ShardsProfile = null,
     /// Join execution statistics (present when query used a join).
@@ -36971,6 +37268,7 @@ pub const QueryProfile = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "value_search", "value_search", true },
         .{ "shards", "shards", true },
         .{ "join", "join", true },
         .{ "reranker", "reranker", true },
@@ -36989,6 +37287,10 @@ pub const QueryProfile = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.value_search) |value| {
+            try jw.objectField("value_search");
+            try jw.write(value);
+        }
         if (self.shards) |value| {
             try jw.objectField("shards");
             try jw.write(value);
@@ -37018,6 +37320,7 @@ pub const QueryProfile = struct {
 };
 
 pub const QueryRequest = struct {
+    value_search_execution: ?ValueSearchExecution = null,
     read_requirements: ?ReadRequirements = null,
     lake_read: ?LakeReadRequirement = null,
     /// Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409.
@@ -37096,6 +37399,7 @@ pub const QueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "value_search_execution", "value_search_execution", true },
         .{ "read_requirements", "read_requirements", true },
         .{ "lake_read", "lake_read", true },
         .{ "remote_snapshot", "remote_snapshot", true },
@@ -37149,6 +37453,10 @@ pub const QueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.value_search_execution) |value| {
+            try jw.objectField("value_search_execution");
+            try jw.write(value);
+        }
         if (self.read_requirements) |value| {
             try jw.objectField("read_requirements");
             try jw.write(value);
@@ -46216,6 +46524,7 @@ pub const StatefulGraphResult = union(enum) {
 
 /// Stateful Antfly query request. Canonical clients use graph_queries; deprecated graph_searches is retained only at the stateful public transport boundary for the v0.2 transition window.
 pub const StatefulQueryRequest = struct {
+    value_search_execution: ?ValueSearchExecution = null,
     read_requirements: ?ReadRequirements = null,
     lake_read: ?LakeReadRequirement = null,
     /// Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409.
@@ -46298,6 +46607,7 @@ pub const StatefulQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "value_search_execution", "value_search_execution", true },
         .{ "read_requirements", "read_requirements", true },
         .{ "lake_read", "lake_read", true },
         .{ "remote_snapshot", "remote_snapshot", true },
@@ -46353,6 +46663,10 @@ pub const StatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.value_search_execution) |value| {
+            try jw.objectField("value_search_execution");
+            try jw.write(value);
+        }
         if (self.read_requirements) |value| {
             try jw.objectField("read_requirements");
             try jw.write(value);
@@ -46861,7 +47175,7 @@ pub const Table = struct {
     migration: ?TableMigration = null,
     /// PostgreSQL CDC replication sources configured for this table.
     replication_sources: ?[]const ReplicationSource = null,
-    /// Effective runtime field capabilities for this table. Clients can use this to discover concrete field variants and their supported query modes, such as full_text, exact, range, geo, and autocomplete. Public exact field sort is supported only for `_id` or scalar fields marked sortable whose sort lifecycle is queryable or accelerated.
+    /// Effective logical-field capabilities for this table. Queries use each entry's field; concrete types, analyzers and index-relative query modes are nested under representations. Declared sortable fields validate coverage on first use. Computed _score ordering requires a score-bearing query.
     field_capabilities: ?[]const FieldCapability = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -47878,7 +48192,7 @@ pub const TableStatus = struct {
     migration: ?TableMigration = null,
     /// PostgreSQL CDC replication sources configured for this table.
     replication_sources: ?[]const ReplicationSource = null,
-    /// Effective runtime field capabilities for this table. Clients can use this to discover concrete field variants and their supported query modes, such as full_text, exact, range, geo, and autocomplete. Public exact field sort is supported only for `_id` or scalar fields marked sortable whose sort lifecycle is queryable or accelerated.
+    /// Effective logical-field capabilities for this table. Queries use each entry's field; concrete types, analyzers and index-relative query modes are nested under representations. Declared sortable fields validate coverage on first use. Computed _score ordering requires a score-bearing query.
     field_capabilities: ?[]const FieldCapability = null,
     /// Immutable physical table identity, preserved by catalog renames.
     table_id: ?[]const u8 = null,
@@ -50181,6 +50495,53 @@ pub const VADOptions = struct {
         }
         if (self.max_segment_duration_ms) |value| {
             try jw.objectField("max_segment_duration_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Execution policy for logical string-value operations. Limits apply to verification work per shard request, including repeated leaf evaluations. Exhaustion fails explicitly; it never returns a successful partial result.
+pub const ValueSearchExecution = struct {
+    /// Permit logical value verification without an indexed candidate constraint.
+    allow_scan: ?bool = null,
+    max_documents: ?i64 = null,
+    max_bytes: ?i64 = null,
+    /// Bound on the sum of original string bytes multiplied by compiled regex states. Charged before regex evaluation; sensitive literals bypass this work.
+    max_regex_work: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "allow_scan", "allow_scan", true },
+        .{ "max_documents", "max_documents", true },
+        .{ "max_bytes", "max_bytes", true },
+        .{ "max_regex_work", "max_regex_work", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.allow_scan) |value| {
+            try jw.objectField("allow_scan");
+            try jw.write(value);
+        }
+        if (self.max_documents) |value| {
+            try jw.objectField("max_documents");
+            try jw.write(value);
+        }
+        if (self.max_bytes) |value| {
+            try jw.objectField("max_bytes");
+            try jw.write(value);
+        }
+        if (self.max_regex_work) |value| {
+            try jw.objectField("max_regex_work");
             try jw.write(value);
         }
         try jw.endObject();

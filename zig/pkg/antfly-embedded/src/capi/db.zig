@@ -10070,4 +10070,9 @@ test "capi native memory explains ordinary row provenance across trace expiry so
     try std.testing.expect(std.mem.indexOf(u8, historical, "APPROVED_V1") != null);
     try std.testing.expect(std.mem.indexOf(u8, historical, "CHANGED_V2") == null);
     try std.testing.expect(std.mem.indexOf(u8, historical, "\"status\":\"changed\"") != null);
+    // The external reference predates memory import and has no storage hint or
+    // content digest. The retained version must still resolve after reopening.
+    const ordinary_history = try nativeMemoryTestCall(id, alloc, "alice", .explain, memory.types.provenance.ExplainRequest{ .resource = business_ref, .known_at = pinned_source.recorded_at }, "", "");
+    try std.testing.expect(std.mem.indexOf(u8, ordinary_history, "APPROVED_V1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ordinary_history, "CHANGED_V2") == null);
 }

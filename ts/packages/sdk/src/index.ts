@@ -528,6 +528,8 @@ import { Client } from "./sdk.js";
 export default Client;
 
 export { ChatGPTConnectionError } from "./client.js";
+export type { MemoryNumbers, MemoryPaths, MemorySchemas } from "./memory.js";
+export { parseMemoryJSON, stringifyMemoryJSON } from "./memory.js";
 export * from "./models.js";
 export type {
   CatalogTablespaceBindingRequest,

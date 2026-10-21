@@ -28,6 +28,14 @@ pub const Resource = struct {
     id: []const u8,
     revision: u64,
     digest: ?[]const u8 = null,
+    /// Table IDs carry incarnation identity; names and storage hints are routing metadata.
+    pub const Identity = struct { database: []const u8, table_id: u64, kind: Kind, id: []const u8, revision: u64 };
+    pub fn identity(self: Resource) Identity {
+        return .{ .database = self.database, .table_id = self.table_id, .kind = self.kind, .id = self.id, .revision = self.revision };
+    }
+    pub fn sameVersion(self: Resource, other: Resource) bool {
+        return self.table_id == other.table_id and self.kind == other.kind and self.revision == other.revision and std.mem.eql(u8, self.database, other.database) and std.mem.eql(u8, self.id, other.id);
+    }
     pub fn external(self: Resource) bool {
         return self.kind == .record or self.kind == .relationship or self.kind == .trace;
     }

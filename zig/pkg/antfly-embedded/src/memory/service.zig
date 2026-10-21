@@ -237,6 +237,7 @@ pub const Service = struct {
         if (mutates(action)) {
             try run.recordDecision(op);
             try run.put(receipt_key, op);
+            try run.recordOperationVersions(op);
             if (op.phase == .pending and (action == .observe or action == .configure)) try run.put(try key(a, "pending", op.id), .{ .id = op.id });
             try run.put("control", run.state);
             try self.context.finish();
@@ -339,29 +340,35 @@ const Run = struct {
     fn reasonBindings(self: *Run, record: t.StoredAssertion) !ReasonBindings {
         return (try self.read(ReasonBindings, try self.reasonKey(record.assertion.id, record.revision))) orelse ReasonBindings{};
     }
+    const RecordView = enum { visible, retained };
     fn decisionVisible(self: *Run, path: []const u8, depth: u8) anyerror!bool {
+        return self.decisionAvailable(path, depth, .visible);
+    }
+    fn decisionAvailable(self: *Run, path: []const u8, depth: u8, comptime view: RecordView) anyerror!bool {
         if (depth >= max_dependency_depth) return error.MemoryWorkLimit;
-        const cache_key = try self.viewKey("decision", path, 0, null, null, depth);
+        const cache_key = try self.viewKey(if (view == .visible) "decision" else "decision-retention", path, 0, null, null, depth);
         if (self.views.get(cache_key)) |result| return result;
         try self.supportStep();
-        const result = try self.decisionVisibleInner(path, depth);
+        const result = try self.decisionAvailableInner(path, depth, view);
         try self.views.put(self.a, cache_key, result);
         return result;
     }
-    fn decisionVisibleInner(self: *Run, path: []const u8, depth: u8) anyerror!bool {
+    fn decisionAvailableInner(self: *Run, path: []const u8, depth: u8, comptime view: RecordView) anyerror!bool {
         const decision = (try self.read(DecisionProvenance, path)) orelse return false;
         if (try self.read(bool, try key(self.a, "forgotten-assertion", decision.assertion_id)) != null) return false;
-        if (!try self.generationVisible("assertion", decision.assertion_id)) return false;
-        for (decision.evidence_ids) |id| if (!try self.supportVisible(&.{.{ .id = id }}, &.{}, 0)) return false;
-        if (decision.incoming_reason) |parent| if (!try self.decisionVisible(parent, depth + 1)) return false;
+        if (view == .visible) {
+            if (!try self.generationVisible("assertion", decision.assertion_id)) return false;
+        } else if (!try self.generationRetained("assertion", decision.assertion_id)) return false;
+        for (decision.evidence_ids) |id| if (!try self.reasonSupport(&.{.{ .id = id }}, view)) return false;
+        if (decision.incoming_reason) |parent| if (!try self.decisionAvailable(parent, depth + 1, view)) return false;
         for (decision.inputs) |input| {
             try self.supportStep();
             const record = (try self.read(t.StoredAssertion, try historyKey(self.a, input.id, input.revision))) orelse return false;
             self.authorize(record.owner, record.assertion.visibility) catch return false;
-            if (!try self.retained(record, 0) or !try self.identityVisible(record.assertion)) return false;
-            if (input.reasons.assertion) |parent| if (!try self.decisionVisible(parent, depth + 1)) return false;
-            if (input.reasons.disposition) |parent| if (!try self.decisionVisible(parent, depth + 1)) return false;
-            if (input.correction_evidence.len > 0 and !try self.supportVisible(input.correction_evidence, &.{}, 0)) return false;
+            if (!try self.retained(record, 0) or (view == .visible and !try self.identityVisible(record.assertion))) return false;
+            if (input.reasons.assertion) |parent| if (!try self.decisionAvailable(parent, depth + 1, view)) return false;
+            if (input.reasons.disposition) |parent| if (!try self.decisionAvailable(parent, depth + 1, view)) return false;
+            if (input.correction_evidence.len > 0 and !try self.reasonSupport(input.correction_evidence, view)) return false;
         }
         return true;
     }
@@ -401,18 +408,30 @@ const Run = struct {
         try self.put(path, DecisionProvenance{ .principal = self.service.context.principal, .recorded_at = self.service.context.now_ms, .config_generation = self.state.config.generation, .assertion_id = claim.id, .evidence_ids = ids, .inputs = inputs.items, .incoming_reason = incoming_reason });
         return path;
     }
+    fn reasonSupport(self: *Run, refs: []const t.EvidenceRef, comptime view: RecordView) !bool {
+        return if (view == .visible) self.supportVisible(refs, &.{}, 0) else self.retainedSupport(refs, &.{}, 0);
+    }
     fn publicRecord(self: *Run, value: t.StoredAssertion) !t.StoredAssertion {
+        return self.projectRecord(value, .visible);
+    }
+    fn retainedRecord(self: *Run, value: t.StoredAssertion) !t.StoredAssertion {
+        const previous = self.retention_maintenance;
+        self.retention_maintenance = true;
+        defer self.retention_maintenance = previous;
+        return self.projectRecord(value, .retained);
+    }
+    fn projectRecord(self: *Run, value: t.StoredAssertion, comptime view: RecordView) !t.StoredAssertion {
         var record = value;
         const reasons = try self.reasonBindings(record);
-        if (reasons.assertion) |path| if (!try self.decisionVisible(path, 0)) {
+        if (reasons.assertion) |path| if (!try self.decisionAvailable(path, 0, view)) {
             record.assertion.reconciliation_reason = null;
         };
-        if (reasons.disposition) |path| if (!try self.decisionVisible(path, 0)) {
+        if (reasons.disposition) |path| if (!try self.decisionAvailable(path, 0, view)) {
             record.reason = null;
             if (record.explicit_disposition) |*baseline| baseline.reason = null;
         };
         if (record.explicit_disposition) |baseline| if (baseline.provenance) |provenance| {
-            if (provenance.forgotten or (provenance.evidence.len > 0 and !try self.supportVisible(provenance.evidence, &.{}, 0))) {
+            if (provenance.forgotten or (provenance.evidence.len > 0 and !try self.reasonSupport(provenance.evidence, view))) {
                 var redacted = baseline;
                 var attribution = provenance;
                 attribution.forgotten = true;
@@ -525,7 +544,7 @@ const Run = struct {
         self.support_work += 1;
     }
     fn viewKey(self: *Run, kind: []const u8, id: []const u8, revision: u64, known: ?i64, valid: ?i64, depth: u8) ![]const u8 {
-        return hash(self.a, .{ kind, id, revision, known, valid, depth, self.state.config.generation, self.service.context.principal, self.service.context.admin });
+        return hash(self.a, .{ kind, id, revision, known, valid, depth, self.state.config.generation, self.service.context.principal, self.service.context.admin, self.retention_maintenance });
     }
     fn retained(self: *Run, record: t.StoredAssertion, depth: u8) anyerror!bool {
         if (depth >= max_dependency_depth) return error.MemoryWorkLimit;
@@ -704,7 +723,7 @@ const Run = struct {
                 source.text = snapshot.json;
                 if (source.source_id.len == 0) source.source_id = try hash(self.a, .{ reference.database, reference.namespace, reference.table_id, reference.kind, reference.id });
                 if (source.source_version.len == 0) source.source_version = try std.fmt.allocPrint(self.a, "{d}", .{reference.revision});
-                try self.put(try std.fmt.allocPrint(self.a, "resource-evidence/{s}/{s}", .{ try hash(self.a, reference), try hash(self.a, source.id) }), .{ .evidence_id = source.id });
+                try self.put(try std.fmt.allocPrint(self.a, "resource-evidence/{s}/{s}", .{ try hash(self.a, reference.identity()), try hash(self.a, source.id) }), .{ .evidence_id = source.id });
                 try self.put(try key(self.a, "resource-watch", source.id), .{ .evidence_id = source.id, .last_state = snapshot.state });
                 self.state.next_resource_check_at = self.service.context.now_ms +| resource_check_interval_ms;
             }
@@ -959,10 +978,12 @@ const Run = struct {
     }
     fn reconcileModel(self: *Run, incoming: t.StoredAssertion) !void {
         if (incoming.lifecycle != .active or incoming.stale or !try self.evidenceVisible(incoming)) return;
-        var record = try self.publicRecord(incoming);
+        var record = try self.retainedRecord(incoming);
+        var visible = try self.publicRecord(incoming);
         var reasons = try self.reasonBindings(incoming);
         const previous_links = record.assertion.supersedes;
-        const decision = (try self.decideClaim(&record.assertion, record.owner, reasons.assertion)) orelse return;
+        const decision = (try self.decideClaim(&visible.assertion, record.owner, reasons.assertion)) orelse return;
+        record.assertion = visible.assertion;
         // Apply only the new verdict; retain already accepted relationship links.
         try self.applySupersessions(record.assertion, record.owner, decision);
         var links: std.ArrayList([]const u8) = .empty;
@@ -1296,7 +1317,7 @@ const Run = struct {
         }
         // Identity is explicit. Names/aliases are discoverable candidates and
         // never constitute authority to merge two canonical IDs.
-        try self.put(path, t.EntityRecord{ .entity = value, .owner = self.service.context.principal, .revision = self.state.revision });
+        try self.put(path, t.EntityRecord{ .entity = value, .owner = self.service.context.principal, .revision = self.state.revision, .recorded_at = self.service.context.now_ms });
     }
     fn putAssertion(self: *Run, value: t.StoredAssertion) !void {
         return self.putAssertionWithReasons(value, null);
@@ -1307,7 +1328,7 @@ const Run = struct {
             break :inherit try self.reasonBindings(previous);
         };
         try self.put(try self.reasonKey(value.assertion.id, value.revision), reasons);
-        var record = try self.publicRecord(value);
+        var record = try self.retainedRecord(value);
         record.recorded_at = self.service.context.now_ms;
         try self.put(try key(self.a, "assertion", record.assertion.id), record);
         try self.put(try historyKey(self.a, record.assertion.id, self.state.revision), record);
@@ -1872,7 +1893,7 @@ const Run = struct {
             const record = (try self.read(t.StoredAssertion, row.key)) orelse return;
             if (!try self.retained(record, 0)) {
                 if (std.mem.startsWith(u8, row.key, "assertion/")) try self.retireAssertion(record.assertion.id) else try self.remove(row.key);
-            } else try self.put(row.key, try self.publicRecord(record));
+            } else try self.put(row.key, try self.retainedRecord(record));
         }
     }
 
@@ -1885,6 +1906,19 @@ const Run = struct {
     fn recordTarget(self: *Run, decision: prov.Resource, target: prov.Resource) !void {
         try self.put(try std.fmt.allocPrint(self.a, "audit-target/{s}/{s}/{s}/{d:0>20}", .{ try hash(self.a, decision.id), @tagName(target.kind), try hash(self.a, target.id), target.revision }), target);
         try self.put(try std.fmt.allocPrint(self.a, "audit-event/{s}/{s}/{d:0>20}", .{ @tagName(target.kind), try hash(self.a, target.id), decision.revision }), decision);
+    }
+    const OperationVersion = struct { record: t.OperationStatus, recorded_at: i64, decision: ?prov.Resource = null };
+    fn operationVersionKey(self: *Run, id: []const u8, revision: u64) ![]const u8 {
+        return std.fmt.allocPrint(self.a, "operation-history/{s}/{d:0>20}", .{ try hash(self.a, id), revision });
+    }
+    fn recordOperationVersions(self: *Run, receipt: t.Operation) !void {
+        const decision = try self.read(prov.Decision, try key(self.a, "audit", receipt.id));
+        const changes = try self.a.dupe(Change, self.changes.items);
+        for (changes) |change| if (change.json) |json| {
+            if (!std.mem.startsWith(u8, change.key, "operation/")) continue;
+            const record = try parse(t.Operation, self.a, json);
+            try self.put(try self.operationVersionKey(record.id, self.state.revision), OperationVersion{ .record = publicOperation(record), .recorded_at = self.service.context.now_ms, .decision = if (decision) |value| value.resource else null });
+        };
     }
     fn recordDecision(self: *Run, operation: t.Operation) !void {
         // Polling and physical cursor movement are not new knowledge decisions.
@@ -1975,6 +2009,10 @@ const Run = struct {
             var ref = pending.resource;
             var links: std.ArrayList(prov.Link) = .empty;
             var record = self.explanationRecord(&ref, request, &links) catch |err| switch (err) {
+                error.MemoryNotKnownAt => {
+                    if (position == 0) return error.MemoryNotFound;
+                    continue;
+                },
                 error.Forbidden, error.MemoryNotFound, error.MemoryForgotten, error.MemoryEntityRequired => {
                     if (position == 0) return err;
                     missing = true;
@@ -1992,6 +2030,7 @@ const Run = struct {
                 var target = link.target;
                 var ignored: std.ArrayList(prov.Link) = .empty;
                 _ = self.explanationRecord(&target, request, &ignored) catch |err| switch (err) {
+                    error.MemoryNotKnownAt => continue,
                     error.MemoryResourceChanged => {
                         missing = true;
                         try public_links.append(self.a, .{ .relation = link.relation, .target = target, .status = .changed });
@@ -2058,35 +2097,68 @@ const Run = struct {
         try links.appendSlice(self.a, captured.items);
         return record;
     }
+    fn requireKnownAt(self: *Run, ref: prov.Resource, recorded_at: ?i64, request: prov.ExplainRequest) !void {
+        const known = request.known_at orelse return;
+        const observed = recorded_at orelse historical: {
+            if (ref.kind == .decision) {
+                if (try self.read(prov.Decision, try key(self.a, "audit", ref.id))) |decision| break :historical decision.recorded_at;
+            }
+            if (try self.read(prov.Resource, try self.auditIndex(ref))) |decision_ref| {
+                if (try self.read(prov.Decision, try key(self.a, "audit", decision_ref.id))) |decision| break :historical decision.recorded_at;
+            }
+            self.explanation_incomplete_history = true;
+            return error.MemoryNotKnownAt;
+        };
+        if (observed > known) return error.MemoryNotKnownAt;
+    }
+    fn capturedSource(self: *Run, ref: prov.Resource, request: prov.ExplainRequest) !?t.StoredEvidence {
+        const prefix = try std.fmt.allocPrint(self.a, "resource-evidence/{s}/", .{try hash(self.a, ref.identity())});
+        const snapshots = try self.service.backend.scan(self.service.backend.ptr, self.a, prefix, null, request.max_nodes);
+        for (snapshots.rows) |row| {
+            const binding = try parse(struct { evidence_id: []const u8 }, self.a, row.json);
+            const source = (try self.evidence(binding.evidence_id)) orelse continue;
+            self.authorize(source.owner, source.evidence.visibility) catch continue;
+            const actual = source.evidence.resource orelse return error.MemoryCorruptState;
+            if (!ref.sameVersion(actual)) continue;
+            if (ref.digest) |expected| {
+                if (actual.digest == null or !std.ascii.eqlIgnoreCase(expected, actual.digest.?)) continue;
+            }
+            if (request.known_at) |known| if (source.recorded_at > known) continue;
+            if (!try self.evidenceRetained(source)) continue;
+            return source;
+        }
+        if (snapshots.next != null) self.explanation_truncated = true;
+        return null;
+    }
     fn loadExplanationRecord(self: *Run, ref: *prov.Resource, request: prov.ExplainRequest, links: *std.ArrayList(prov.Link)) anyerror!std.json.Value {
         if (ref.external()) {
             const snapshot = try self.resourceSnapshot(ref.*);
             if (snapshot.state == .denied) return error.Forbidden;
             if (snapshot.state == .missing) return error.MemoryNotFound;
-            if (snapshot.state == .current and snapshot.payload_truncated) {
+            if (snapshot.state == .current and snapshot.payload_truncated and request.known_at == null) {
                 self.explanation_truncated = true;
                 self.explanation_incomplete_history = true;
                 return parse(std.json.Value, self.a, try self.encode(.{ .snapshot_json = @as(?[]const u8, null), .revision = ref.revision, .digest = ref.digest, .source_state = snapshot.state, .payload_truncated = true }));
             }
             var json = snapshot.json;
             if (snapshot.state == .changed) {
-                // The engine may no longer retain the old ordinary row. Use
-                // only an authorized exact snapshot admitted in this space;
-                // never replace it with the row's current contents.
-                const prefix = try std.fmt.allocPrint(self.a, "resource-evidence/{s}/", .{try hash(self.a, ref.*)});
-                const snapshots = try self.service.backend.scan(self.service.backend.ptr, self.a, prefix, null, request.max_nodes);
-                for (snapshots.rows) |row| {
-                    const binding = try parse(struct { evidence_id: []const u8 }, self.a, row.json);
-                    const source = (try self.evidence(binding.evidence_id)) orelse continue;
-                    self.authorize(source.owner, source.evidence.visibility) catch continue;
-                    if (!try self.evidenceRetained(source)) continue;
-                    json = source.evidence.text;
-                    break;
-                }
-                if (json.len == 0) {
-                    if (snapshots.next != null) self.explanation_truncated = true;
+                // Look up immutable identity, not mutable routing/display hints.
+                const source = (try self.capturedSource(ref.*, request)) orelse {
+                    if (request.known_at != null) {
+                        self.explanation_incomplete_history = true;
+                        return error.MemoryNotKnownAt;
+                    }
                     return error.MemoryResourceChanged;
-                }
+                };
+                json = source.evidence.text;
+            } else if (request.known_at != null) {
+                // Ordinary-row versions do not attest when Antfly memory learned
+                // about them. An admitted snapshot supplies that knowledge time.
+                const source = (try self.capturedSource(ref.*, request)) orelse {
+                    self.explanation_incomplete_history = true;
+                    return error.MemoryNotKnownAt;
+                };
+                json = source.evidence.text;
             }
             const DeclaredEnvelope = struct { provenance: ?prov.Envelope = null };
             const declaration: DeclaredEnvelope = std.json.parseFromSliceLeaky(DeclaredEnvelope, self.a, json, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
@@ -2123,7 +2195,7 @@ const Run = struct {
             .assertion => {
                 const record = (if (ref.revision > 0) try self.read(t.StoredAssertion, try historyKey(self.a, ref.id, ref.revision)) else if (request.known_at) |known| try self.asOf(ref.id, known) else try self.assertion(ref.id)) orelse return error.MemoryNotFound;
                 try self.authorize(record.owner, record.assertion.visibility);
-                if (request.known_at) |known| if (record.recorded_at > known) return error.MemoryNotFound;
+                try self.requireKnownAt(ref.*, record.recorded_at, request);
                 if (!try self.retained(record, 0)) return error.MemoryForgotten;
                 ref.revision = record.revision;
                 value = try parse(std.json.Value, self.a, try self.encode(try self.publicRecord(record)));
@@ -2144,6 +2216,7 @@ const Run = struct {
                 try self.authorize(record.owner, record.evidence.visibility);
                 if (!try self.evidenceRetained(record) or (ref.revision > 0 and ref.revision != record.revision)) return error.MemoryForgotten;
                 ref.revision = record.revision;
+                try self.requireKnownAt(ref.*, record.recorded_at, request);
                 value = try parse(std.json.Value, self.a, try self.encode(record));
                 if (record.evidence.resource) |source| try links.append(self.a, .{ .relation = .supported_by, .target = source });
             },
@@ -2153,12 +2226,14 @@ const Run = struct {
                 if (!try self.entityRetained(record)) return error.MemoryForgotten;
                 if (ref.revision > 0 and ref.revision != record.revision) return error.MemoryNotFound;
                 ref.revision = record.revision;
+                try self.requireKnownAt(ref.*, record.recorded_at, request);
                 value = try parse(std.json.Value, self.a, try self.encode(record));
                 for (record.entity.evidence) |citation| if (try self.evidence(citation.id)) |source| try links.append(self.a, .{ .relation = .supported_by, .target = try self.resourceRef(.evidence, citation.id, source.revision) });
             },
             .decision => {
                 var record = (try self.read(prov.Decision, try key(self.a, "audit", ref.id))) orelse return error.MemoryNotFound;
                 if (ref.revision != record.resource.revision) return error.MemoryNotFound;
+                try self.requireKnownAt(ref.*, record.recorded_at, request);
                 // Decision metadata may survive payload retention, but access
                 // still follows the operation's owner and current table grant.
                 if (!self.explanation_decisions.contains(try hash(self.a, ref.*))) try self.authorize(record.initiator.id, .private);
@@ -2182,20 +2257,28 @@ const Run = struct {
                 }
             },
             .operation => {
-                const record = (try self.read(t.Operation, try key(self.a, "operation", ref.id))) orelse return error.MemoryNotFound;
+                const snapshot = try self.read(OperationVersion, try self.operationVersionKey(ref.id, ref.revision));
+                const record = if (snapshot) |version| version.record else publicOperation((try self.read(t.Operation, try key(self.a, "operation", ref.id))) orelse return error.MemoryNotFound);
                 try self.authorize(record.owner, .private);
-                if (ref.revision > 0 and ref.revision != record.revision) return error.MemoryNotFound;
-                ref.revision = record.revision;
-                value = try parse(std.json.Value, self.a, try self.encode(publicOperation(record)));
-                try links.append(self.a, .{ .relation = .applied_to, .target = try self.resourceRef(.decision, record.id, record.revision) });
+                if (snapshot == null and ref.revision != record.revision) return error.MemoryNotFound;
+                try self.requireKnownAt(ref.*, if (snapshot) |version| version.recorded_at else null, request);
+                if (snapshot == null) self.explanation_incomplete_history = true;
+                value = try parse(std.json.Value, self.a, try self.encode(record));
+                const decision_ref = if (snapshot) |version| version.decision else if (try self.read(prov.Decision, try key(self.a, "audit", record.id))) |decision| decision.resource else null;
+                if (decision_ref) |decision| {
+                    try self.explanation_decisions.put(self.a, try hash(self.a, decision), {});
+                    try links.append(self.a, .{ .relation = .applied_to, .target = decision });
+                }
             },
             .configuration => {
                 if ((std.fmt.parseInt(u64, ref.id, 10) catch return error.InvalidResourceReference) != ref.revision) return error.InvalidResourceReference;
                 const record = (try self.read(t.Config, try configKey(self.a, ref.revision))) orelse return error.MemoryNotFound;
+                try self.requireKnownAt(ref.*, null, request);
                 value = try parse(std.json.Value, self.a, try self.encode(record));
             },
             .table => {
                 if (!eql(u8, ref.id, own_table)) return error.InvalidResourceReference;
+                try self.requireKnownAt(ref.*, self.state.created_at, request);
                 value = try parse(std.json.Value, self.a, try self.encode(.{ .owner = self.state.owner, .created_at = self.state.created_at, .space = self.state.space, .revision = ref.revision, .serving_revision = self.state.revision }));
             },
             .outcome => {
@@ -2203,6 +2286,7 @@ const Run = struct {
                 try self.authorize(record.owner, .private);
                 if (ref.revision > 0 and ref.revision != record.revision) return error.MemoryNotFound;
                 ref.revision = record.revision;
+                try self.requireKnownAt(ref.*, record.recorded_at, request);
                 value = try parse(std.json.Value, self.a, try self.encode(record));
                 for (record.outcome.used_memory_ids) |used| if (try self.asOf(used, record.recorded_at)) |parent| try links.append(self.a, .{ .relation = .used, .target = try self.resourceRef(.assertion, used, parent.revision) });
             },
@@ -2213,6 +2297,10 @@ const Run = struct {
             const events = try self.service.backend.scan(self.service.backend.ptr, self.a, prefix, null, request.max_nodes);
             for (events.rows) |event| {
                 const decision = try parse(prov.Resource, self.a, event.json);
+                self.requireKnownAt(decision, null, request) catch |err| {
+                    if (err == error.MemoryNotKnownAt) continue;
+                    return err;
+                };
                 try self.explanation_decisions.put(self.a, try hash(self.a, decision), {});
                 try links.append(self.a, .{ .relation = .generated_by, .target = decision });
             }

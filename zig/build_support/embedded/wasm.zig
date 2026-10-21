@@ -120,8 +120,10 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     wasm_vectorindex_mod.addImport("antfly_platform", wasm_platform_mod);
     wasm_vectorindex_mod.addImport("antfly_hash", wasm_hash_mod);
     const fst_mod = b.createModule(.{ .root_source_file = b.path("lib/fst/src/mod.zig"), .target = wasm_target, .optimize = optimize });
+    const grapheme_mod = b.createModule(.{ .root_source_file = b.path("lib/tokenizer/src/grapheme.zig"), .target = wasm_target, .optimize = optimize });
     const regex_mod = b.createModule(.{ .root_source_file = b.path("lib/regex/src/mod.zig"), .target = wasm_target, .optimize = optimize });
     regex_mod.addImport("antfly_fst", fst_mod);
+    regex_mod.addImport("antfly_grapheme", grapheme_mod);
     regex_mod.addImport("antfly_platform", wasm_platform_mod);
     const sql_regex_mod = @import("../../lib/sql_regex/build.zig").createModule(b, wasm_target, optimize, b.path("lib/sql_regex"));
     regex_mod.addImport("antfly_capture_regex", sql_regex_mod.import_table.get("antfly_capture_regex").?);
@@ -354,6 +356,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .target = wasm_target,
         .optimize = optimize,
     });
+    wasm_inference_tokenizer_mod.addImport("antfly_grapheme", grapheme_mod);
     wasm_inference_tokenizer_mod.addImport("sentencepiece_proto", wasm_sentencepiece_proto_mod);
     wasm_inference_tokenizer_mod.addImport("antfly_platform", wasm_platform_mod);
     const wasm_inference_hf_tokenizer_mod = b.createModule(.{

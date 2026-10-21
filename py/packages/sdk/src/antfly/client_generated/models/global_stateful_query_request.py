@@ -12,14 +12,17 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.analyses import Analyses
+    from ..models.autocomplete_query import AutocompleteQuery
     from ..models.bool_field_query import BoolFieldQuery
     from ..models.boolean_query import BooleanQuery
     from ..models.catalog_table_target import CatalogTableTarget
     from ..models.composed_query_source import ComposedQuerySource
     from ..models.conjunction_query import ConjunctionQuery
+    from ..models.contains_query import ContainsQuery
     from ..models.date_range_string_query import DateRangeStringQuery
     from ..models.disjunction_query import DisjunctionQuery
     from ..models.doc_id_query import DocIdQuery
+    from ..models.equals_query import EqualsQuery
     from ..models.fuzzy_query import FuzzyQuery
     from ..models.geo_bounding_box_query import GeoBoundingBoxQuery
     from ..models.geo_bounding_polygon_query import GeoBoundingPolygonQuery
@@ -35,6 +38,7 @@ if TYPE_CHECKING:
     from ..models.match_none_query import MatchNoneQuery
     from ..models.match_phrase_query import MatchPhraseQuery
     from ..models.match_query import MatchQuery
+    from ..models.matches_query import MatchesQuery
     from ..models.merge_config import MergeConfig
     from ..models.multi_match_query import MultiMatchQuery
     from ..models.multi_phrase_query import MultiPhraseQuery
@@ -57,6 +61,7 @@ if TYPE_CHECKING:
     from ..models.stateful_query_request_graph_searches import StatefulQueryRequestGraphSearches
     from ..models.term_query import TermQuery
     from ..models.term_range_query import TermRangeQuery
+    from ..models.value_search_execution import ValueSearchExecution
     from ..models.wildcard_query import WildcardQuery
 
 
@@ -68,6 +73,10 @@ class GlobalStatefulQueryRequest:
     """A stateful global query. Specify a table target or a composed source.
 
     Attributes:
+        value_search_execution (ValueSearchExecution | Unset): Execution policy for logical string-value operations.
+            Limits apply to
+            verification work per shard request, including repeated leaf evaluations.
+            Exhaustion fails explicitly; it never returns a successful partial result.
         read_requirements (ReadRequirements | Unset): Freshness requirements for writable Iceberg reads. Search supports
             accepted and published (default accepted); SQL supports accepted and committed (default committed). Unsupported
             visibility modes fail explicitly. Cannot be combined with legacy lake_read or lake_visibility. A pinned
@@ -96,11 +105,12 @@ class GlobalStatefulQueryRequest:
             path; text clauses are resolved through the text index before scoring.
              Example: {'bool': {'must': [{'match': {'field': 'body', 'text': 'computer'}}], 'filter': [{'term': {'path':
             '/tenant', 'value': 'acme'}}], 'must_not': [{'exists': {'path': '/deleted_at'}}]}}.
-        full_text_search (BooleanQuery | BoolFieldQuery | ConjunctionQuery | DateRangeStringQuery | DisjunctionQuery |
-            DocIdQuery | FuzzyQuery | GeoBoundingBoxQuery | GeoBoundingPolygonQuery | GeoDistanceQuery | GeoShapeQuery |
-            IPRangeQuery | MatchAllQuery | MatchNoneQuery | MatchPhraseQuery | MatchQuery | MultiMatchQuery |
-            MultiPhraseQuery | NumericRangeQuery | PhraseQuery | PrefixQuery | QueryStringQuery | RegexpQuery | TermQuery |
-            TermRangeQuery | Unset | WildcardQuery):
+        full_text_search (AutocompleteQuery | BooleanQuery | BoolFieldQuery | ConjunctionQuery | ContainsQuery |
+            DateRangeStringQuery | DisjunctionQuery | DocIdQuery | EqualsQuery | FuzzyQuery | GeoBoundingBoxQuery |
+            GeoBoundingPolygonQuery | GeoDistanceQuery | GeoShapeQuery | IPRangeQuery | MatchAllQuery | MatchesQuery |
+            MatchNoneQuery | MatchPhraseQuery | MatchQuery | MultiMatchQuery | MultiPhraseQuery | NumericRangeQuery |
+            PhraseQuery | PrefixQuery | QueryStringQuery | RegexpQuery | TermQuery | TermRangeQuery | Unset |
+            WildcardQuery):
         full_text_index (str | Unset): Full-text index used by `full_text_search` and by scoring text clauses in
             `query`.
             Use this to query a named document- or artifact-backed full-text index. The selected
@@ -162,16 +172,18 @@ class GlobalStatefulQueryRequest:
             - Multi-tenant filtering: `"tenant:acme:"`
             - User-specific data: `"user:123:"`
             - Document type filtering: `"article:"`
-        filter_query (BooleanQuery | BoolFieldQuery | ConjunctionQuery | DateRangeStringQuery | DisjunctionQuery |
-            DocIdQuery | FuzzyQuery | GeoBoundingBoxQuery | GeoBoundingPolygonQuery | GeoDistanceQuery | GeoShapeQuery |
-            IPRangeQuery | MatchAllQuery | MatchNoneQuery | MatchPhraseQuery | MatchQuery | MultiMatchQuery |
-            MultiPhraseQuery | NumericRangeQuery | PhraseQuery | PrefixQuery | QueryStringQuery | RegexpQuery | TermQuery |
-            TermRangeQuery | Unset | WildcardQuery):
-        exclusion_query (BooleanQuery | BoolFieldQuery | ConjunctionQuery | DateRangeStringQuery | DisjunctionQuery |
-            DocIdQuery | FuzzyQuery | GeoBoundingBoxQuery | GeoBoundingPolygonQuery | GeoDistanceQuery | GeoShapeQuery |
-            IPRangeQuery | MatchAllQuery | MatchNoneQuery | MatchPhraseQuery | MatchQuery | MultiMatchQuery |
-            MultiPhraseQuery | NumericRangeQuery | PhraseQuery | PrefixQuery | QueryStringQuery | RegexpQuery | TermQuery |
-            TermRangeQuery | Unset | WildcardQuery):
+        filter_query (AutocompleteQuery | BooleanQuery | BoolFieldQuery | ConjunctionQuery | ContainsQuery |
+            DateRangeStringQuery | DisjunctionQuery | DocIdQuery | EqualsQuery | FuzzyQuery | GeoBoundingBoxQuery |
+            GeoBoundingPolygonQuery | GeoDistanceQuery | GeoShapeQuery | IPRangeQuery | MatchAllQuery | MatchesQuery |
+            MatchNoneQuery | MatchPhraseQuery | MatchQuery | MultiMatchQuery | MultiPhraseQuery | NumericRangeQuery |
+            PhraseQuery | PrefixQuery | QueryStringQuery | RegexpQuery | TermQuery | TermRangeQuery | Unset |
+            WildcardQuery):
+        exclusion_query (AutocompleteQuery | BooleanQuery | BoolFieldQuery | ConjunctionQuery | ContainsQuery |
+            DateRangeStringQuery | DisjunctionQuery | DocIdQuery | EqualsQuery | FuzzyQuery | GeoBoundingBoxQuery |
+            GeoBoundingPolygonQuery | GeoDistanceQuery | GeoShapeQuery | IPRangeQuery | MatchAllQuery | MatchesQuery |
+            MatchNoneQuery | MatchPhraseQuery | MatchQuery | MultiMatchQuery | MultiPhraseQuery | NumericRangeQuery |
+            PhraseQuery | PrefixQuery | QueryStringQuery | RegexpQuery | TermQuery | TermRangeQuery | Unset |
+            WildcardQuery):
         aggregations (QueryRequestAggregations | Unset): Aggregation requests for computing metrics and bucketing
             results.
             Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration.
@@ -408,6 +420,7 @@ class GlobalStatefulQueryRequest:
             table incarnation changes invalidate it. Leaf search_after/search_before tuples are unsupported.
     """
 
+    value_search_execution: ValueSearchExecution | Unset = UNSET
     read_requirements: ReadRequirements | Unset = UNSET
     lake_read: LakeReadRequirement | Unset = UNSET
     remote_snapshot: str | Unset = UNSET
@@ -416,12 +429,15 @@ class GlobalStatefulQueryRequest:
     table: str | Unset = UNSET
     query: QueryRequestQuery | Unset = UNSET
     full_text_search: (
-        BooleanQuery
+        AutocompleteQuery
+        | BooleanQuery
         | BoolFieldQuery
         | ConjunctionQuery
+        | ContainsQuery
         | DateRangeStringQuery
         | DisjunctionQuery
         | DocIdQuery
+        | EqualsQuery
         | FuzzyQuery
         | GeoBoundingBoxQuery
         | GeoBoundingPolygonQuery
@@ -429,6 +445,7 @@ class GlobalStatefulQueryRequest:
         | GeoShapeQuery
         | IPRangeQuery
         | MatchAllQuery
+        | MatchesQuery
         | MatchNoneQuery
         | MatchPhraseQuery
         | MatchQuery
@@ -450,12 +467,15 @@ class GlobalStatefulQueryRequest:
     indexes: list[str] | Unset = UNSET
     filter_prefix: str | Unset = UNSET
     filter_query: (
-        BooleanQuery
+        AutocompleteQuery
+        | BooleanQuery
         | BoolFieldQuery
         | ConjunctionQuery
+        | ContainsQuery
         | DateRangeStringQuery
         | DisjunctionQuery
         | DocIdQuery
+        | EqualsQuery
         | FuzzyQuery
         | GeoBoundingBoxQuery
         | GeoBoundingPolygonQuery
@@ -463,6 +483,7 @@ class GlobalStatefulQueryRequest:
         | GeoShapeQuery
         | IPRangeQuery
         | MatchAllQuery
+        | MatchesQuery
         | MatchNoneQuery
         | MatchPhraseQuery
         | MatchQuery
@@ -479,12 +500,15 @@ class GlobalStatefulQueryRequest:
         | WildcardQuery
     ) = UNSET
     exclusion_query: (
-        BooleanQuery
+        AutocompleteQuery
+        | BooleanQuery
         | BoolFieldQuery
         | ConjunctionQuery
+        | ContainsQuery
         | DateRangeStringQuery
         | DisjunctionQuery
         | DocIdQuery
+        | EqualsQuery
         | FuzzyQuery
         | GeoBoundingBoxQuery
         | GeoBoundingPolygonQuery
@@ -492,6 +516,7 @@ class GlobalStatefulQueryRequest:
         | GeoShapeQuery
         | IPRangeQuery
         | MatchAllQuery
+        | MatchesQuery
         | MatchNoneQuery
         | MatchPhraseQuery
         | MatchQuery
@@ -541,12 +566,15 @@ class GlobalStatefulQueryRequest:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.autocomplete_query import AutocompleteQuery
         from ..models.bool_field_query import BoolFieldQuery
         from ..models.boolean_query import BooleanQuery
         from ..models.conjunction_query import ConjunctionQuery
+        from ..models.contains_query import ContainsQuery
         from ..models.date_range_string_query import DateRangeStringQuery
         from ..models.disjunction_query import DisjunctionQuery
         from ..models.doc_id_query import DocIdQuery
+        from ..models.equals_query import EqualsQuery
         from ..models.fuzzy_query import FuzzyQuery
         from ..models.geo_bounding_box_query import GeoBoundingBoxQuery
         from ..models.geo_bounding_polygon_query import GeoBoundingPolygonQuery
@@ -556,6 +584,7 @@ class GlobalStatefulQueryRequest:
         from ..models.match_none_query import MatchNoneQuery
         from ..models.match_phrase_query import MatchPhraseQuery
         from ..models.match_query import MatchQuery
+        from ..models.matches_query import MatchesQuery
         from ..models.multi_match_query import MultiMatchQuery
         from ..models.multi_phrase_query import MultiPhraseQuery
         from ..models.numeric_range_query import NumericRangeQuery
@@ -566,6 +595,10 @@ class GlobalStatefulQueryRequest:
         from ..models.term_query import TermQuery
         from ..models.term_range_query import TermRangeQuery
         from ..models.wildcard_query import WildcardQuery
+
+        value_search_execution: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.value_search_execution, Unset):
+            value_search_execution = self.value_search_execution.to_dict()
 
         read_requirements: dict[str, Any] | Unset = UNSET
         if not isinstance(self.read_requirements, Unset):
@@ -594,6 +627,14 @@ class GlobalStatefulQueryRequest:
         full_text_search: dict[str, Any] | Unset
         if isinstance(self.full_text_search, Unset):
             full_text_search = UNSET
+        elif isinstance(self.full_text_search, EqualsQuery):
+            full_text_search = self.full_text_search.to_dict()
+        elif isinstance(self.full_text_search, ContainsQuery):
+            full_text_search = self.full_text_search.to_dict()
+        elif isinstance(self.full_text_search, MatchesQuery):
+            full_text_search = self.full_text_search.to_dict()
+        elif isinstance(self.full_text_search, AutocompleteQuery):
+            full_text_search = self.full_text_search.to_dict()
         elif isinstance(self.full_text_search, TermQuery):
             full_text_search = self.full_text_search.to_dict()
         elif isinstance(self.full_text_search, MatchQuery):
@@ -662,6 +703,14 @@ class GlobalStatefulQueryRequest:
         filter_query: dict[str, Any] | Unset
         if isinstance(self.filter_query, Unset):
             filter_query = UNSET
+        elif isinstance(self.filter_query, EqualsQuery):
+            filter_query = self.filter_query.to_dict()
+        elif isinstance(self.filter_query, ContainsQuery):
+            filter_query = self.filter_query.to_dict()
+        elif isinstance(self.filter_query, MatchesQuery):
+            filter_query = self.filter_query.to_dict()
+        elif isinstance(self.filter_query, AutocompleteQuery):
+            filter_query = self.filter_query.to_dict()
         elif isinstance(self.filter_query, TermQuery):
             filter_query = self.filter_query.to_dict()
         elif isinstance(self.filter_query, MatchQuery):
@@ -718,6 +767,14 @@ class GlobalStatefulQueryRequest:
         exclusion_query: dict[str, Any] | Unset
         if isinstance(self.exclusion_query, Unset):
             exclusion_query = UNSET
+        elif isinstance(self.exclusion_query, EqualsQuery):
+            exclusion_query = self.exclusion_query.to_dict()
+        elif isinstance(self.exclusion_query, ContainsQuery):
+            exclusion_query = self.exclusion_query.to_dict()
+        elif isinstance(self.exclusion_query, MatchesQuery):
+            exclusion_query = self.exclusion_query.to_dict()
+        elif isinstance(self.exclusion_query, AutocompleteQuery):
+            exclusion_query = self.exclusion_query.to_dict()
         elif isinstance(self.exclusion_query, TermQuery):
             exclusion_query = self.exclusion_query.to_dict()
         elif isinstance(self.exclusion_query, MatchQuery):
@@ -881,6 +938,8 @@ class GlobalStatefulQueryRequest:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if value_search_execution is not UNSET:
+            field_dict["value_search_execution"] = value_search_execution
         if read_requirements is not UNSET:
             field_dict["read_requirements"] = read_requirements
         if lake_read is not UNSET:
@@ -979,14 +1038,17 @@ class GlobalStatefulQueryRequest:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.analyses import Analyses
+        from ..models.autocomplete_query import AutocompleteQuery
         from ..models.bool_field_query import BoolFieldQuery
         from ..models.boolean_query import BooleanQuery
         from ..models.catalog_table_target import CatalogTableTarget
         from ..models.composed_query_source import ComposedQuerySource
         from ..models.conjunction_query import ConjunctionQuery
+        from ..models.contains_query import ContainsQuery
         from ..models.date_range_string_query import DateRangeStringQuery
         from ..models.disjunction_query import DisjunctionQuery
         from ..models.doc_id_query import DocIdQuery
+        from ..models.equals_query import EqualsQuery
         from ..models.fuzzy_query import FuzzyQuery
         from ..models.geo_bounding_box_query import GeoBoundingBoxQuery
         from ..models.geo_bounding_polygon_query import GeoBoundingPolygonQuery
@@ -1002,6 +1064,7 @@ class GlobalStatefulQueryRequest:
         from ..models.match_none_query import MatchNoneQuery
         from ..models.match_phrase_query import MatchPhraseQuery
         from ..models.match_query import MatchQuery
+        from ..models.matches_query import MatchesQuery
         from ..models.merge_config import MergeConfig
         from ..models.multi_match_query import MultiMatchQuery
         from ..models.multi_phrase_query import MultiPhraseQuery
@@ -1024,9 +1087,17 @@ class GlobalStatefulQueryRequest:
         from ..models.stateful_query_request_graph_searches import StatefulQueryRequestGraphSearches
         from ..models.term_query import TermQuery
         from ..models.term_range_query import TermRangeQuery
+        from ..models.value_search_execution import ValueSearchExecution
         from ..models.wildcard_query import WildcardQuery
 
         d = dict(src_dict)
+        _value_search_execution = d.pop("value_search_execution", UNSET)
+        value_search_execution: ValueSearchExecution | Unset
+        if isinstance(_value_search_execution, Unset):
+            value_search_execution = UNSET
+        else:
+            value_search_execution = ValueSearchExecution.from_dict(_value_search_execution)
+
         _read_requirements = d.pop("read_requirements", UNSET)
         read_requirements: ReadRequirements | Unset
         if isinstance(_read_requirements, Unset):
@@ -1069,12 +1140,15 @@ class GlobalStatefulQueryRequest:
         def _parse_full_text_search(
             data: object,
         ) -> (
-            BooleanQuery
+            AutocompleteQuery
+            | BooleanQuery
             | BoolFieldQuery
             | ConjunctionQuery
+            | ContainsQuery
             | DateRangeStringQuery
             | DisjunctionQuery
             | DocIdQuery
+            | EqualsQuery
             | FuzzyQuery
             | GeoBoundingBoxQuery
             | GeoBoundingPolygonQuery
@@ -1082,6 +1156,7 @@ class GlobalStatefulQueryRequest:
             | GeoShapeQuery
             | IPRangeQuery
             | MatchAllQuery
+            | MatchesQuery
             | MatchNoneQuery
             | MatchPhraseQuery
             | MatchQuery
@@ -1102,7 +1177,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_0 = TermQuery.from_dict(data)
+                componentsschemas_query_type_0 = EqualsQuery.from_dict(data)
 
                 return componentsschemas_query_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1110,7 +1185,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_1 = MatchQuery.from_dict(data)
+                componentsschemas_query_type_1 = ContainsQuery.from_dict(data)
 
                 return componentsschemas_query_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1118,7 +1193,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_2 = MultiMatchQuery.from_dict(data)
+                componentsschemas_query_type_2 = MatchesQuery.from_dict(data)
 
                 return componentsschemas_query_type_2
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1126,7 +1201,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_3 = MatchPhraseQuery.from_dict(data)
+                componentsschemas_query_type_3 = AutocompleteQuery.from_dict(data)
 
                 return componentsschemas_query_type_3
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1134,7 +1209,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_4 = PhraseQuery.from_dict(data)
+                componentsschemas_query_type_4 = TermQuery.from_dict(data)
 
                 return componentsschemas_query_type_4
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1142,7 +1217,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_5 = MultiPhraseQuery.from_dict(data)
+                componentsschemas_query_type_5 = MatchQuery.from_dict(data)
 
                 return componentsschemas_query_type_5
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1150,7 +1225,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_6 = FuzzyQuery.from_dict(data)
+                componentsschemas_query_type_6 = MultiMatchQuery.from_dict(data)
 
                 return componentsschemas_query_type_6
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1158,7 +1233,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_7 = PrefixQuery.from_dict(data)
+                componentsschemas_query_type_7 = MatchPhraseQuery.from_dict(data)
 
                 return componentsschemas_query_type_7
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1166,7 +1241,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_8 = RegexpQuery.from_dict(data)
+                componentsschemas_query_type_8 = PhraseQuery.from_dict(data)
 
                 return componentsschemas_query_type_8
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1174,7 +1249,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_9 = WildcardQuery.from_dict(data)
+                componentsschemas_query_type_9 = MultiPhraseQuery.from_dict(data)
 
                 return componentsschemas_query_type_9
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1182,7 +1257,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_10 = QueryStringQuery.from_dict(data)
+                componentsschemas_query_type_10 = FuzzyQuery.from_dict(data)
 
                 return componentsschemas_query_type_10
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1190,7 +1265,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_11 = NumericRangeQuery.from_dict(data)
+                componentsschemas_query_type_11 = PrefixQuery.from_dict(data)
 
                 return componentsschemas_query_type_11
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1198,7 +1273,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_12 = TermRangeQuery.from_dict(data)
+                componentsschemas_query_type_12 = RegexpQuery.from_dict(data)
 
                 return componentsschemas_query_type_12
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1206,7 +1281,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_13 = DateRangeStringQuery.from_dict(data)
+                componentsschemas_query_type_13 = WildcardQuery.from_dict(data)
 
                 return componentsschemas_query_type_13
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1214,7 +1289,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_14 = BooleanQuery.from_dict(data)
+                componentsschemas_query_type_14 = QueryStringQuery.from_dict(data)
 
                 return componentsschemas_query_type_14
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1222,7 +1297,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_15 = ConjunctionQuery.from_dict(data)
+                componentsschemas_query_type_15 = NumericRangeQuery.from_dict(data)
 
                 return componentsschemas_query_type_15
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1230,7 +1305,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_16 = DisjunctionQuery.from_dict(data)
+                componentsschemas_query_type_16 = TermRangeQuery.from_dict(data)
 
                 return componentsschemas_query_type_16
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1238,7 +1313,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_17 = MatchAllQuery.from_dict(data)
+                componentsschemas_query_type_17 = DateRangeStringQuery.from_dict(data)
 
                 return componentsschemas_query_type_17
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1246,7 +1321,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_18 = MatchNoneQuery.from_dict(data)
+                componentsschemas_query_type_18 = BooleanQuery.from_dict(data)
 
                 return componentsschemas_query_type_18
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1254,7 +1329,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_19 = DocIdQuery.from_dict(data)
+                componentsschemas_query_type_19 = ConjunctionQuery.from_dict(data)
 
                 return componentsschemas_query_type_19
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1262,7 +1337,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_20 = BoolFieldQuery.from_dict(data)
+                componentsschemas_query_type_20 = DisjunctionQuery.from_dict(data)
 
                 return componentsschemas_query_type_20
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1270,7 +1345,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_21 = IPRangeQuery.from_dict(data)
+                componentsschemas_query_type_21 = MatchAllQuery.from_dict(data)
 
                 return componentsschemas_query_type_21
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1278,7 +1353,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_22 = GeoBoundingBoxQuery.from_dict(data)
+                componentsschemas_query_type_22 = MatchNoneQuery.from_dict(data)
 
                 return componentsschemas_query_type_22
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1286,7 +1361,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_23 = GeoDistanceQuery.from_dict(data)
+                componentsschemas_query_type_23 = DocIdQuery.from_dict(data)
 
                 return componentsschemas_query_type_23
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1294,16 +1369,48 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_24 = GeoBoundingPolygonQuery.from_dict(data)
+                componentsschemas_query_type_24 = BoolFieldQuery.from_dict(data)
 
                 return componentsschemas_query_type_24
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_query_type_25 = IPRangeQuery.from_dict(data)
+
+                return componentsschemas_query_type_25
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_query_type_26 = GeoBoundingBoxQuery.from_dict(data)
+
+                return componentsschemas_query_type_26
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_query_type_27 = GeoDistanceQuery.from_dict(data)
+
+                return componentsschemas_query_type_27
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_query_type_28 = GeoBoundingPolygonQuery.from_dict(data)
+
+                return componentsschemas_query_type_28
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
             if not isinstance(data, dict):
                 raise TypeError()
-            componentsschemas_query_type_25 = GeoShapeQuery.from_dict(data)
+            componentsschemas_query_type_29 = GeoShapeQuery.from_dict(data)
 
-            return componentsschemas_query_type_25
+            return componentsschemas_query_type_29
 
         full_text_search = _parse_full_text_search(d.pop("full_text_search", UNSET))
 
@@ -1320,12 +1427,15 @@ class GlobalStatefulQueryRequest:
         def _parse_filter_query(
             data: object,
         ) -> (
-            BooleanQuery
+            AutocompleteQuery
+            | BooleanQuery
             | BoolFieldQuery
             | ConjunctionQuery
+            | ContainsQuery
             | DateRangeStringQuery
             | DisjunctionQuery
             | DocIdQuery
+            | EqualsQuery
             | FuzzyQuery
             | GeoBoundingBoxQuery
             | GeoBoundingPolygonQuery
@@ -1333,6 +1443,7 @@ class GlobalStatefulQueryRequest:
             | GeoShapeQuery
             | IPRangeQuery
             | MatchAllQuery
+            | MatchesQuery
             | MatchNoneQuery
             | MatchPhraseQuery
             | MatchQuery
@@ -1353,7 +1464,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_0 = TermQuery.from_dict(data)
+                componentsschemas_query_type_0 = EqualsQuery.from_dict(data)
 
                 return componentsschemas_query_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1361,7 +1472,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_1 = MatchQuery.from_dict(data)
+                componentsschemas_query_type_1 = ContainsQuery.from_dict(data)
 
                 return componentsschemas_query_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1369,7 +1480,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_2 = MultiMatchQuery.from_dict(data)
+                componentsschemas_query_type_2 = MatchesQuery.from_dict(data)
 
                 return componentsschemas_query_type_2
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1377,7 +1488,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_3 = MatchPhraseQuery.from_dict(data)
+                componentsschemas_query_type_3 = AutocompleteQuery.from_dict(data)
 
                 return componentsschemas_query_type_3
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1385,7 +1496,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_4 = PhraseQuery.from_dict(data)
+                componentsschemas_query_type_4 = TermQuery.from_dict(data)
 
                 return componentsschemas_query_type_4
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1393,7 +1504,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_5 = MultiPhraseQuery.from_dict(data)
+                componentsschemas_query_type_5 = MatchQuery.from_dict(data)
 
                 return componentsschemas_query_type_5
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1401,7 +1512,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_6 = FuzzyQuery.from_dict(data)
+                componentsschemas_query_type_6 = MultiMatchQuery.from_dict(data)
 
                 return componentsschemas_query_type_6
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1409,7 +1520,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_7 = PrefixQuery.from_dict(data)
+                componentsschemas_query_type_7 = MatchPhraseQuery.from_dict(data)
 
                 return componentsschemas_query_type_7
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1417,7 +1528,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_8 = RegexpQuery.from_dict(data)
+                componentsschemas_query_type_8 = PhraseQuery.from_dict(data)
 
                 return componentsschemas_query_type_8
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1425,7 +1536,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_9 = WildcardQuery.from_dict(data)
+                componentsschemas_query_type_9 = MultiPhraseQuery.from_dict(data)
 
                 return componentsschemas_query_type_9
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1433,7 +1544,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_10 = QueryStringQuery.from_dict(data)
+                componentsschemas_query_type_10 = FuzzyQuery.from_dict(data)
 
                 return componentsschemas_query_type_10
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1441,7 +1552,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_11 = NumericRangeQuery.from_dict(data)
+                componentsschemas_query_type_11 = PrefixQuery.from_dict(data)
 
                 return componentsschemas_query_type_11
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1449,7 +1560,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_12 = TermRangeQuery.from_dict(data)
+                componentsschemas_query_type_12 = RegexpQuery.from_dict(data)
 
                 return componentsschemas_query_type_12
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1457,7 +1568,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_13 = DateRangeStringQuery.from_dict(data)
+                componentsschemas_query_type_13 = WildcardQuery.from_dict(data)
 
                 return componentsschemas_query_type_13
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1465,7 +1576,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_14 = BooleanQuery.from_dict(data)
+                componentsschemas_query_type_14 = QueryStringQuery.from_dict(data)
 
                 return componentsschemas_query_type_14
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1473,7 +1584,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_15 = ConjunctionQuery.from_dict(data)
+                componentsschemas_query_type_15 = NumericRangeQuery.from_dict(data)
 
                 return componentsschemas_query_type_15
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1481,7 +1592,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_16 = DisjunctionQuery.from_dict(data)
+                componentsschemas_query_type_16 = TermRangeQuery.from_dict(data)
 
                 return componentsschemas_query_type_16
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1489,7 +1600,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_17 = MatchAllQuery.from_dict(data)
+                componentsschemas_query_type_17 = DateRangeStringQuery.from_dict(data)
 
                 return componentsschemas_query_type_17
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1497,7 +1608,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_18 = MatchNoneQuery.from_dict(data)
+                componentsschemas_query_type_18 = BooleanQuery.from_dict(data)
 
                 return componentsschemas_query_type_18
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1505,7 +1616,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_19 = DocIdQuery.from_dict(data)
+                componentsschemas_query_type_19 = ConjunctionQuery.from_dict(data)
 
                 return componentsschemas_query_type_19
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1513,7 +1624,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_20 = BoolFieldQuery.from_dict(data)
+                componentsschemas_query_type_20 = DisjunctionQuery.from_dict(data)
 
                 return componentsschemas_query_type_20
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1521,7 +1632,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_21 = IPRangeQuery.from_dict(data)
+                componentsschemas_query_type_21 = MatchAllQuery.from_dict(data)
 
                 return componentsschemas_query_type_21
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1529,7 +1640,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_22 = GeoBoundingBoxQuery.from_dict(data)
+                componentsschemas_query_type_22 = MatchNoneQuery.from_dict(data)
 
                 return componentsschemas_query_type_22
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1537,7 +1648,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_23 = GeoDistanceQuery.from_dict(data)
+                componentsschemas_query_type_23 = DocIdQuery.from_dict(data)
 
                 return componentsschemas_query_type_23
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1545,28 +1656,63 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_24 = GeoBoundingPolygonQuery.from_dict(data)
+                componentsschemas_query_type_24 = BoolFieldQuery.from_dict(data)
 
                 return componentsschemas_query_type_24
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_query_type_25 = IPRangeQuery.from_dict(data)
+
+                return componentsschemas_query_type_25
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_query_type_26 = GeoBoundingBoxQuery.from_dict(data)
+
+                return componentsschemas_query_type_26
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_query_type_27 = GeoDistanceQuery.from_dict(data)
+
+                return componentsschemas_query_type_27
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_query_type_28 = GeoBoundingPolygonQuery.from_dict(data)
+
+                return componentsschemas_query_type_28
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
             if not isinstance(data, dict):
                 raise TypeError()
-            componentsschemas_query_type_25 = GeoShapeQuery.from_dict(data)
+            componentsschemas_query_type_29 = GeoShapeQuery.from_dict(data)
 
-            return componentsschemas_query_type_25
+            return componentsschemas_query_type_29
 
         filter_query = _parse_filter_query(d.pop("filter_query", UNSET))
 
         def _parse_exclusion_query(
             data: object,
         ) -> (
-            BooleanQuery
+            AutocompleteQuery
+            | BooleanQuery
             | BoolFieldQuery
             | ConjunctionQuery
+            | ContainsQuery
             | DateRangeStringQuery
             | DisjunctionQuery
             | DocIdQuery
+            | EqualsQuery
             | FuzzyQuery
             | GeoBoundingBoxQuery
             | GeoBoundingPolygonQuery
@@ -1574,6 +1720,7 @@ class GlobalStatefulQueryRequest:
             | GeoShapeQuery
             | IPRangeQuery
             | MatchAllQuery
+            | MatchesQuery
             | MatchNoneQuery
             | MatchPhraseQuery
             | MatchQuery
@@ -1594,7 +1741,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_0 = TermQuery.from_dict(data)
+                componentsschemas_query_type_0 = EqualsQuery.from_dict(data)
 
                 return componentsschemas_query_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1602,7 +1749,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_1 = MatchQuery.from_dict(data)
+                componentsschemas_query_type_1 = ContainsQuery.from_dict(data)
 
                 return componentsschemas_query_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1610,7 +1757,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_2 = MultiMatchQuery.from_dict(data)
+                componentsschemas_query_type_2 = MatchesQuery.from_dict(data)
 
                 return componentsschemas_query_type_2
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1618,7 +1765,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_3 = MatchPhraseQuery.from_dict(data)
+                componentsschemas_query_type_3 = AutocompleteQuery.from_dict(data)
 
                 return componentsschemas_query_type_3
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1626,7 +1773,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_4 = PhraseQuery.from_dict(data)
+                componentsschemas_query_type_4 = TermQuery.from_dict(data)
 
                 return componentsschemas_query_type_4
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1634,7 +1781,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_5 = MultiPhraseQuery.from_dict(data)
+                componentsschemas_query_type_5 = MatchQuery.from_dict(data)
 
                 return componentsschemas_query_type_5
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1642,7 +1789,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_6 = FuzzyQuery.from_dict(data)
+                componentsschemas_query_type_6 = MultiMatchQuery.from_dict(data)
 
                 return componentsschemas_query_type_6
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1650,7 +1797,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_7 = PrefixQuery.from_dict(data)
+                componentsschemas_query_type_7 = MatchPhraseQuery.from_dict(data)
 
                 return componentsschemas_query_type_7
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1658,7 +1805,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_8 = RegexpQuery.from_dict(data)
+                componentsschemas_query_type_8 = PhraseQuery.from_dict(data)
 
                 return componentsschemas_query_type_8
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1666,7 +1813,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_9 = WildcardQuery.from_dict(data)
+                componentsschemas_query_type_9 = MultiPhraseQuery.from_dict(data)
 
                 return componentsschemas_query_type_9
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1674,7 +1821,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_10 = QueryStringQuery.from_dict(data)
+                componentsschemas_query_type_10 = FuzzyQuery.from_dict(data)
 
                 return componentsschemas_query_type_10
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1682,7 +1829,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_11 = NumericRangeQuery.from_dict(data)
+                componentsschemas_query_type_11 = PrefixQuery.from_dict(data)
 
                 return componentsschemas_query_type_11
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1690,7 +1837,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_12 = TermRangeQuery.from_dict(data)
+                componentsschemas_query_type_12 = RegexpQuery.from_dict(data)
 
                 return componentsschemas_query_type_12
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1698,7 +1845,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_13 = DateRangeStringQuery.from_dict(data)
+                componentsschemas_query_type_13 = WildcardQuery.from_dict(data)
 
                 return componentsschemas_query_type_13
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1706,7 +1853,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_14 = BooleanQuery.from_dict(data)
+                componentsschemas_query_type_14 = QueryStringQuery.from_dict(data)
 
                 return componentsschemas_query_type_14
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1714,7 +1861,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_15 = ConjunctionQuery.from_dict(data)
+                componentsschemas_query_type_15 = NumericRangeQuery.from_dict(data)
 
                 return componentsschemas_query_type_15
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1722,7 +1869,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_16 = DisjunctionQuery.from_dict(data)
+                componentsschemas_query_type_16 = TermRangeQuery.from_dict(data)
 
                 return componentsschemas_query_type_16
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1730,7 +1877,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_17 = MatchAllQuery.from_dict(data)
+                componentsschemas_query_type_17 = DateRangeStringQuery.from_dict(data)
 
                 return componentsschemas_query_type_17
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1738,7 +1885,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_18 = MatchNoneQuery.from_dict(data)
+                componentsschemas_query_type_18 = BooleanQuery.from_dict(data)
 
                 return componentsschemas_query_type_18
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1746,7 +1893,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_19 = DocIdQuery.from_dict(data)
+                componentsschemas_query_type_19 = ConjunctionQuery.from_dict(data)
 
                 return componentsschemas_query_type_19
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1754,7 +1901,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_20 = BoolFieldQuery.from_dict(data)
+                componentsschemas_query_type_20 = DisjunctionQuery.from_dict(data)
 
                 return componentsschemas_query_type_20
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1762,7 +1909,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_21 = IPRangeQuery.from_dict(data)
+                componentsschemas_query_type_21 = MatchAllQuery.from_dict(data)
 
                 return componentsschemas_query_type_21
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1770,7 +1917,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_22 = GeoBoundingBoxQuery.from_dict(data)
+                componentsschemas_query_type_22 = MatchNoneQuery.from_dict(data)
 
                 return componentsschemas_query_type_22
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1778,7 +1925,7 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_23 = GeoDistanceQuery.from_dict(data)
+                componentsschemas_query_type_23 = DocIdQuery.from_dict(data)
 
                 return componentsschemas_query_type_23
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -1786,16 +1933,48 @@ class GlobalStatefulQueryRequest:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_24 = GeoBoundingPolygonQuery.from_dict(data)
+                componentsschemas_query_type_24 = BoolFieldQuery.from_dict(data)
 
                 return componentsschemas_query_type_24
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_query_type_25 = IPRangeQuery.from_dict(data)
+
+                return componentsschemas_query_type_25
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_query_type_26 = GeoBoundingBoxQuery.from_dict(data)
+
+                return componentsschemas_query_type_26
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_query_type_27 = GeoDistanceQuery.from_dict(data)
+
+                return componentsschemas_query_type_27
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_query_type_28 = GeoBoundingPolygonQuery.from_dict(data)
+
+                return componentsschemas_query_type_28
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
             if not isinstance(data, dict):
                 raise TypeError()
-            componentsschemas_query_type_25 = GeoShapeQuery.from_dict(data)
+            componentsschemas_query_type_29 = GeoShapeQuery.from_dict(data)
 
-            return componentsschemas_query_type_25
+            return componentsschemas_query_type_29
 
         exclusion_query = _parse_exclusion_query(d.pop("exclusion_query", UNSET))
 
@@ -1954,6 +2133,7 @@ class GlobalStatefulQueryRequest:
         source_cursor = d.pop("source_cursor", UNSET)
 
         global_stateful_query_request = cls(
+            value_search_execution=value_search_execution,
             read_requirements=read_requirements,
             lake_read=lake_read,
             remote_snapshot=remote_snapshot,

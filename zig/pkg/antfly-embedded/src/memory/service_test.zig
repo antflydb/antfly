@@ -23,6 +23,7 @@ const Store = struct {
     revision: u64 = 0,
     resource_state: m.types.provenance.ResourceState = .current,
     resource_revision: u64 = 7,
+    resource_digest: ?[32]u8 = null,
     resource_json: []const u8 = "{\"message\":\"Approved deployment\"}",
     resource_reads: usize = 0,
     reads: usize = 0,
@@ -47,7 +48,9 @@ const Store = struct {
         self.resource_reads += 1;
         if ((reference.table_id != 0 and reference.table_id != 7) or !std.mem.eql(u8, reference.database, "default") or !std.mem.eql(u8, reference.namespace, "public")) return .{ .state = .denied };
         if (self.resource_state != .current) return .{ .state = self.resource_state };
-        return m.types.provenance.snapshot(a, reference, 7, self.resource_revision, self.resource_json, null);
+        var snapshot = try m.types.provenance.snapshot(a, reference, 7, self.resource_revision, self.resource_json, self.resource_digest);
+        snapshot.storage_name = "physical-business";
+        return snapshot;
     }
     fn get(ptr: *anyopaque, a: A, key: []const u8) !?m.Row {
         const self: *Store = @ptrCast(@alignCast(ptr));
@@ -2518,4 +2521,142 @@ test "memory bounds oversized ordinary snapshots and never admits a partial sour
     const evidence: m.types.Evidence = .{ .id = "oversized", .resource_selector = .{ .table = "business", .id = "oversized" } };
     try std.testing.expectError(error.MemoryInputTooLarge, store.service("alice", true, 3).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{evidence} }, .{}), "oversized"));
     try std.testing.expectEqual(before, store.revision);
+}
+
+test "memory cleanup preserves correction rationale across a temporary source denial" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try discard(&store, .create, "", "{}", "create", 1);
+    const evidence: m.types.Evidence = .{ .id = "business", .resource_selector = .{ .table = "business", .id = "approval" } };
+    const claim: m.types.Assertion = .{ .id = "claim", .subject = "deployment", .predicate = "approved", .value = "yes", .statement = "Approved", .evidence = &.{.{ .id = "business" }} };
+    try discard(&store, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{evidence}, .assertions = &.{claim} }, .{}), "observe", 2);
+    const initial = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try store.service("alice", true, 3).execute(a, .get, "claim", "{}", ""), .{});
+    try discard(&store, .correct, "", try std.json.Stringify.valueAlloc(a, m.types.Correction{ .id = "claim", .expected_revision = initial.revision, .lifecycle = .active, .reason = "KEEP_HUMAN_CORRECTION", .evidence = &.{.{ .id = "business" }} }, .{}), "correct", 4);
+    const before = try store.service("alice", true, 5).execute(a, .get, "claim", "{}", "");
+    try std.testing.expect(std.mem.indexOf(u8, before, "KEEP_HUMAN_CORRECTION") != null);
+    store.resource_state = .denied;
+    try discard(&store, .forget, "", "{\"source_ids\":[\"unrelated\"]}", "forget", 6);
+    for (0..16) |i| try discard(&store, .advance, "", "{}", try std.fmt.allocPrint(a, "cleanup-{d}", .{i}), 40000);
+    store.resource_state = .current;
+    const after = try store.service("alice", true, 40001).execute(a, .get, "claim", "{}", "");
+    try std.testing.expect(std.mem.indexOf(u8, after, "KEEP_HUMAN_CORRECTION") != null);
+}
+
+test "memory known_at excludes subsequent entity curation decisions" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try discard(&store, .create, "", "{}", "create", 1);
+    const e: m.types.Evidence = .{ .id = "e", .source_id = "human", .source_version = "1", .text = "Alice and Bob" };
+    const entities = [_]m.types.Entity{ .{ .id = "alice", .name = "Alice", .evidence = &.{.{ .id = "e" }} }, .{ .id = "bob", .name = "Bob", .evidence = &.{.{ .id = "e" }} } };
+    try discard(&store, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{e}, .entities = &entities }, .{}), "observe", 2);
+    const ref: m.types.provenance.Resource = .{ .table = "memory_", .table_id = 0, .kind = .entity, .id = "alice", .revision = 3 };
+    try discard(&store, .curate_entity, "", try std.json.Stringify.valueAlloc(a, m.types.EntityCorrection{ .action = .merge, .from = "alice", .to = "bob", .expected_revision = 3, .reason = "FUTURE_MERGE_AT_10" }, .{}), "merge", 10);
+    const raw = try store.service("alice", true, 11).execute(a, .explain, "", try std.json.Stringify.valueAlloc(a, m.types.provenance.ExplainRequest{ .resource = ref, .known_at = 3 }, .{}), "");
+    try std.testing.expect(std.mem.indexOf(u8, raw, "FUTURE_MERGE_AT_10") == null);
+}
+
+test "memory historical ordinary reference resolves captured snapshots without optional routing hints" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try discard(&store, .create, "", "{}", "create", 1);
+    const evidence: m.types.Evidence = .{ .id = "e", .resource_selector = .{ .table = "business", .id = "approval" } };
+    try discard(&store, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{evidence} }, .{}), "observe", 2);
+    store.resource_revision = 8;
+    const original: m.types.provenance.Resource = .{ .table = "business", .table_id = 7, .kind = .record, .id = "approval", .revision = 7 };
+    _ = try store.service("alice", true, 3).execute(a, .explain, "", try std.json.Stringify.valueAlloc(a, m.types.provenance.ExplainRequest{ .resource = original }, .{}), "");
+}
+
+test "memory known_at gates every native resource and ordinary snapshots" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try discard(&store, .create, "", "{}", "create", 1);
+    const e: m.types.Evidence = .{ .id = "e", .resource_selector = .{ .table = "business", .id = "approval" } };
+    const person: m.types.Entity = .{ .id = "person", .name = "Person", .evidence = &.{.{ .id = "e" }} };
+    const claim: m.types.Assertion = .{ .id = "claim", .subject = "person", .predicate = "approved", .value = "yes", .statement = "Approved", .evidence = &.{.{ .id = "e" }} };
+    const receipt = try std.json.parseFromSliceLeaky(m.types.Operation, a, try store.service("alice", true, 10).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{e}, .entities = &.{person}, .assertions = &.{claim} }, .{}), "observe"), .{});
+    try discard(&store, .outcome, "", "{\"id\":\"feedback\",\"task_id\":\"release\",\"success\":true,\"used_memory_ids\":[\"claim\"]}", "feedback", 20);
+    try discard(&store, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = @as(u64, 4), .config = m.types.Config{ .policy_version = "v2" } }, .{}), "configure", 30);
+    const Case = struct { kind: m.types.provenance.Kind, id: []const u8, revision: u64, known: i64 };
+    for ([_]Case{
+        .{ .kind = .assertion, .id = "claim", .revision = 3, .known = 9 },
+        .{ .kind = .entity, .id = "person", .revision = 3, .known = 9 },
+        .{ .kind = .evidence, .id = "e", .revision = 3, .known = 9 },
+        .{ .kind = .decision, .id = receipt.id, .revision = 3, .known = 9 },
+        .{ .kind = .operation, .id = receipt.id, .revision = 3, .known = 9 },
+        .{ .kind = .configuration, .id = "2", .revision = 2, .known = 29 },
+        .{ .kind = .table, .id = "memory_", .revision = 2, .known = 0 },
+        .{ .kind = .outcome, .id = "feedback", .revision = 4, .known = 19 },
+    }) |item| {
+        const ref: m.types.provenance.Resource = .{ .table = "memory_", .table_id = 0, .kind = item.kind, .id = item.id, .revision = item.revision };
+        try std.testing.expectError(error.MemoryNotFound, store.service("alice", true, 40).execute(a, .explain, "", try std.json.Stringify.valueAlloc(a, m.types.provenance.ExplainRequest{ .resource = ref, .known_at = item.known }, .{}), ""));
+    }
+    const external: m.types.provenance.Resource = .{ .table = "business", .table_id = 7, .kind = .record, .id = "approval", .revision = 7 };
+    try std.testing.expectError(error.MemoryNotFound, store.service("alice", true, 40).execute(a, .explain, "", try std.json.Stringify.valueAlloc(a, m.types.provenance.ExplainRequest{ .resource = external, .known_at = 9 }, .{}), ""));
+    _ = try store.service("alice", true, 40).execute(a, .explain, "", try std.json.Stringify.valueAlloc(a, m.types.provenance.ExplainRequest{ .resource = external, .known_at = 10 }, .{}), "");
+}
+
+test "memory operation explanation pins immutable versions while live managed receipts advance" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const id = try managedSetup(&store);
+    _ = try modelService(&store, 10).execute(a, .advance, id, "{}", "process");
+    const live = try std.json.parseFromSliceLeaky(m.types.Operation, a, try modelService(&store, 11).execute(a, .operation, id, "{}", ""), .{});
+    try std.testing.expectEqual(m.types.Stage.succeeded, live.phase);
+    const ref: m.types.provenance.Resource = .{ .table = "memory_", .table_id = 0, .kind = .operation, .id = id, .revision = 3 };
+    const raw = try modelService(&store, 11).execute(a, .explain, "", try std.json.Stringify.valueAlloc(a, m.types.provenance.ExplainRequest{ .resource = ref, .known_at = 3 }, .{}), "");
+    const explanation = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
+    const root = explanation.object.get("nodes").?.array.items[0].object.get("record").?;
+    try std.testing.expectEqualStrings("pending", root.object.get("phase").?.string);
+    const applied = try modelService(&store, 12).execute(a, .explain, "", try std.json.Stringify.valueAlloc(a, m.types.provenance.ExplainRequest{ .resource = .{ .table = "memory_", .table_id = 0, .kind = .operation, .id = id, .revision = 4 }, .known_at = 11 }, .{}), "");
+    const final = try std.json.parseFromSliceLeaky(std.json.Value, a, applied, .{});
+    try std.testing.expectEqualStrings("succeeded", final.object.get("nodes").?.array.items[0].object.get("record").?.object.get("phase").?.string);
+}
+
+test "memory snapshot identity ignores routing names but enforces optional content digests" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    store.resource_digest = @splat(0xab);
+    try discard(&store, .create, "", "{}", "create", 1);
+    const e: m.types.Evidence = .{ .id = "e", .resource_selector = .{ .table = "business", .id = "approval" } };
+    try discard(&store, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{e} }, .{}), "observe", 2);
+    store.resource_revision = 8;
+    var ref: m.types.provenance.Resource = .{ .table = "renamed_business", .table_id = 7, .kind = .record, .id = "approval", .revision = 7 };
+    _ = try store.service("alice", true, 4).execute(a, .explain, "", try std.json.Stringify.valueAlloc(a, m.types.provenance.ExplainRequest{ .resource = ref }, .{}), "");
+    ref.digest = "ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB";
+    _ = try store.service("alice", true, 4).execute(a, .explain, "", try std.json.Stringify.valueAlloc(a, m.types.provenance.ExplainRequest{ .resource = ref }, .{}), "");
+    ref.digest = "0000000000000000000000000000000000000000000000000000000000000000";
+    try std.testing.expectError(error.MemoryResourceChanged, store.service("alice", true, 4).execute(a, .explain, "", try std.json.Stringify.valueAlloc(a, m.types.provenance.ExplainRequest{ .resource = ref }, .{}), ""));
+}
+
+test "memory physical cleanup preserves model reason lineage across temporary source denial" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    _ = try decisionService(&store, 1).execute(a, .create, "", try std.json.Stringify.valueAlloc(a, decisionConfig(), .{}), "create");
+    const old: m.types.Evidence = .{ .id = "old-e", .resource_selector = .{ .table = "business", .id = "approval" } };
+    const current: m.types.Evidence = .{ .id = "new-e", .source_id = "human", .source_version = "1", .text = "Human approved" };
+    try discard(&store, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{ old, current } }, .{}), "sources", 2);
+    const prior: m.types.Assertion = .{ .id = "old", .subject = "production", .predicate = "credential", .value = "old", .statement = "REASON_LINEAGE_OLD", .valid_from = 100, .evidence = &.{.{ .id = "old-e" }} };
+    _ = try decisionService(&store, 3).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{prior} }, .{}), "old");
+    var incoming = prior;
+    incoming.id = "new";
+    incoming.value = "new";
+    incoming.statement = "New";
+    incoming.valid_from = 200;
+    incoming.evidence = &.{.{ .id = "new-e" }};
+    _ = try decisionService(&store, 4).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{incoming} }, .{}), "new");
+    store.resource_state = .denied;
+    try discard(&store, .forget, "", "{\"source_ids\":[\"unrelated\"]}", "forget", 5);
+    for (0..16) |i| try discard(&store, .advance, "", "{}", try std.fmt.allocPrint(a, "model-cleanup-{d}", .{i}), 40000);
+    const denied = try store.service("alice", true, 40001).execute(a, .get, "new", "{}", "");
+    try std.testing.expect(std.mem.indexOf(u8, denied, "REASON_LINEAGE_OLD") == null);
+    store.resource_state = .current;
+    const restored = try store.service("alice", true, 40002).execute(a, .get, "new", "{}", "");
+    try std.testing.expect(std.mem.indexOf(u8, restored, "REASON_LINEAGE_OLD") != null);
 }

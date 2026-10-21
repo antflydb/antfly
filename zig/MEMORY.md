@@ -1119,3 +1119,41 @@ can hide a memory without destroying outcome feedback, so unsuppressing restores
 that feedback. Assertion admission checks the same retained, authorized entity
 references for subjects and typed objects, including durable forgetting fences
 after physical entity cleanup.
+
+### Retention, temporal closure, and integer transport
+
+Persistent writes use a retention projection distinct from the caller's read
+projection. Cleanup scrubs rationale and correction provenance only when their
+support is irreversibly retired. Temporary entity suppression, source version
+changes, or a worker's denied source read can redact a response without erasing
+the durable record. The same distinction applies recursively to model decision
+inputs and correction evidence. View caches include the retention mode.
+
+`known_at` is enforced throughout explanation traversal, including evidence,
+entities, decisions, operation snapshots, configurations, table creation and
+outcomes. Future decisions and their edges are omitted. Legacy artifacts whose
+observation time cannot be established are reported as incomplete history rather
+than presented as known facts. Ordinary rows require a retained admitted snapshot
+to establish when memory knew their exact version; a source-declared timestamp
+is not an Antfly knowledge timestamp.
+
+Operation status endpoints remain live receipts. Explanation references select
+immutable operation snapshots published in the same transaction as each receipt
+update. Their reference revision identifies that publication; the receipt's own
+revision remains its accepted revision. Each snapshot links the decision that
+published it, so later completion cannot rewrite an earlier explanation.
+
+Captured ordinary snapshots are indexed by database, immutable table incarnation,
+resource kind, row ID and revision. Logical names and storage routing hints do
+not participate in that identity. Reads still authorize the current resource,
+and a supplied digest must match the captured digest. Optional digest spelling
+and routing metadata therefore cannot hide an otherwise valid historical snapshot.
+
+The TypeScript HTTP and embedded memory clients preserve safe integers as
+`number` and decode larger JSON integers as `bigint`. Requests serialize `bigint`
+as exact numeric JSON and reject already-rounded unsafe `number` values. The HTTP
+SDK exposes typed `memoryApi` routes and `MemorySchemas` with `number | bigint`
+numeric fields; its ordinary `api` routes retain their existing numeric types.
+Use `stringifyMemoryJSON` when serializing a decoded HTTP memory value outside
+the client. This keeps the native wire contract identical for Go, Python, Rust,
+HTTP, MCP and embedded callers.

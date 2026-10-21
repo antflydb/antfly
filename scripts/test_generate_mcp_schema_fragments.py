@@ -24,6 +24,29 @@ from scripts import generate_mcp_schema_fragments as generator
 
 
 class McpSchemaFragmentTests(unittest.TestCase):
+    def test_raw_query_preserves_value_search_budgets_and_retained_cursors(
+        self,
+    ) -> None:
+        with generator.SPEC.open(encoding="utf-8") as handle:
+            schemas = yaml.safe_load(handle)["components"]["schemas"]
+        validator = Draft202012Validator(
+            generator.compact_query_request_schema(schemas)
+        )
+        query = {
+            "query": {"contains": "needle", "field": "grep.content"},
+            "value_search_execution": {
+                "allow_scan": True,
+                "max_documents": 32,
+                "max_bytes": 4096,
+            },
+            "order_by": [{"field": "_id"}],
+            "search_after": ["doc-a"],
+            "remote_snapshot": "a" * 64,
+        }
+        self.assertEqual([], list(validator.iter_errors(query)))
+        query["value_search_execution"]["max_documents"] = 0
+        self.assertTrue(list(validator.iter_errors(query)))
+
     def test_mcp_result_budget_schema_matches_runtime_zero_or_minimum(self) -> None:
         config_spec = generator.ROOT / "specs/openapi/antfly/config.yaml"
         with config_spec.open(encoding="utf-8") as handle:
@@ -153,6 +176,7 @@ class McpSchemaFragmentTests(unittest.TestCase):
             "search_after",
             "lake_read",
             "read_requirements",
+            "remote_snapshot",
         }
         self.assertEqual(
             set(query_schema["properties"]),
@@ -176,6 +200,8 @@ class McpSchemaFragmentTests(unittest.TestCase):
             "search_after": ["hn1/revision/artifact/1/0/fingerprint", "artifact:unit"],
         }
         self.assertEqual([], list(validator.iter_errors(valid)))
+        resumed = {**valid, "remote_snapshot": "a" * 64}
+        self.assertEqual([], list(validator.iter_errors(resumed)))
         with_read_requirement = copy.deepcopy(valid)
         with_read_requirement["read_requirements"] = {
             "visibility": "accepted",
@@ -202,7 +228,7 @@ class McpSchemaFragmentTests(unittest.TestCase):
             ("analyses", {"pca": True}),
             ("highlight", {}),
             ("evaluate", {"compute": {"x": {"literal": 1}}}),
-            ("remote_snapshot", "a" * 64),
+            ("value_search_execution", {"allow_scan": True}),
             ("limit", 101),
             ("search_after", ["position-only"]),
             ("order_by", [{"field": "_hierarchy.position", "desc": True}]),

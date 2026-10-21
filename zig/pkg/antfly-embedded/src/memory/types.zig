@@ -342,7 +342,7 @@ pub const RecallResult = struct {
     retrieval: enum { lexical, lexical_vector },
 };
 pub const RecordPage = struct { items: []const StoredAssertion, next_cursor: ?[]const u8, complete: bool, revision: u64 };
-pub const EntityRecord = struct { entity: Entity, owner: []const u8, revision: u64 = 0 };
+pub const EntityRecord = struct { entity: Entity, owner: []const u8, revision: u64 = 0, recorded_at: ?i64 = null };
 pub const EntityPage = struct { items: []const EntityRecord, next_cursor: ?[]const u8, complete: bool };
 pub const SpaceInfo = struct {
     table_id: u64 = 0,

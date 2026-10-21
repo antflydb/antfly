@@ -1,0 +1,301 @@
+{
+  "fixture_only": true,
+  "files": 128,
+  "threads": 8,
+  "provider_lanes": 2,
+  "candidate_concurrency": 2,
+  "fixture_delay_ms": 20,
+  "host": {
+    "platform": "macOS-27.0.1-arm64-arm-64bit",
+    "cpu_count": 14
+  },
+  "fixture_source_sha256": "f3d7122e10adf50988ccb081c00fac298e12b1fc649323afd3f5a76687d48ca9",
+  "limitations": "Synthetic constant-score fixture with bounded provider lanes; warm filesystem, no cache, no model relevance or billed-token savings established",
+  "binaries": {
+    "antfly-grep": {
+      "sha256": "a7e29f4dccfd2d980b6eeaa96c1de37730f44e9c2f59dd5eb344aa2dd1b336f4",
+      "version": "antfly-grep 0.1.0-dev\nZig 0.17.0 fast\nnative regex, PCRE-style VM/JIT, streaming compression, encoding\ntarget aarch64-macos-none dynamic"
+    },
+    "baseline": {
+      "sha256": "b042bbae3320252e14b55ac92c14164568ad3f35adae35faea862706bf093633",
+      "version": "antfly-grep 0.1.0-dev\nZig 0.17.0 fast\nnative regex, PCRE-style VM/JIT, streaming compression, encoding\ntarget aarch64-macos-none dynamic"
+    }
+  },
+  "cases": {
+    "antfly-grep": {
+      "runs": [
+        {
+          "seconds": 0.50103125,
+          "peak_rss_kib": 6720.0,
+          "exit": 0,
+          "load_average": [
+            6.61328125,
+            7.54833984375,
+            11.25927734375
+          ],
+          "user_seconds": 0.006188,
+          "system_seconds": 0.023125999999999997,
+          "minor_faults": 736,
+          "major_faults": 0,
+          "requests": 16,
+          "request_bytes": 17280,
+          "inputs": 128
+        },
+        {
+          "seconds": 0.4958559170000001,
+          "peak_rss_kib": 6608.0,
+          "exit": 0,
+          "load_average": [
+            6.48388671875,
+            7.505859375,
+            11.22216796875
+          ],
+          "user_seconds": 0.006107,
+          "system_seconds": 0.024238,
+          "minor_faults": 741,
+          "major_faults": 0,
+          "requests": 16,
+          "request_bytes": 17280,
+          "inputs": 128
+        },
+        {
+          "seconds": 0.5043028330000001,
+          "peak_rss_kib": 6656.0,
+          "exit": 0,
+          "load_average": [
+            6.48388671875,
+            7.505859375,
+            11.22216796875
+          ],
+          "user_seconds": 0.005908999999999999,
+          "system_seconds": 0.022531,
+          "minor_faults": 696,
+          "major_faults": 20,
+          "requests": 16,
+          "request_bytes": 17280,
+          "inputs": 128
+        },
+        {
+          "seconds": 0.4829723330000002,
+          "peak_rss_kib": 6656.0,
+          "exit": 0,
+          "load_average": [
+            6.48388671875,
+            7.505859375,
+            11.22216796875
+          ],
+          "user_seconds": 0.005705,
+          "system_seconds": 0.020449,
+          "minor_faults": 737,
+          "major_faults": 0,
+          "requests": 16,
+          "request_bytes": 17280,
+          "inputs": 128
+        },
+        {
+          "seconds": 0.47961083299999974,
+          "peak_rss_kib": 6672.0,
+          "exit": 0,
+          "load_average": [
+            6.48388671875,
+            7.505859375,
+            11.22216796875
+          ],
+          "user_seconds": 0.006018,
+          "system_seconds": 0.023746999999999997,
+          "minor_faults": 739,
+          "major_faults": 0,
+          "requests": 16,
+          "request_bytes": 17280,
+          "inputs": 128
+        }
+      ],
+      "qualification_summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 478997583,
+            "human": "0.478998s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 128,
+            "searches_with_match": 128,
+            "bytes_searched": 1216,
+            "bytes_printed": 221184,
+            "matched_lines": 128,
+            "matches": 128
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "source_cache_hits": 0,
+          "source_parses": 128,
+          "files": 128,
+          "bytes": 1216,
+          "matches": 128,
+          "reading_leads": 0,
+          "occurrences": 128,
+          "occurrences_exact": true,
+          "files_with_matches": 128,
+          "regions_considered": 128,
+          "regions_evaluated": 128,
+          "errors": 0,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": true
+        },
+        "requests": 16,
+        "input_tokens": 160,
+        "output_tokens": 32,
+        "request_bytes": 17280,
+        "request_inputs": 128,
+        "peak_request_bytes": 1082,
+        "cache_hits": 0
+      },
+      "median_seconds": 0.4958559170000001,
+      "median_requests": 16
+    },
+    "baseline": {
+      "runs": [
+        {
+          "seconds": 0.4986792499999999,
+          "peak_rss_kib": 6432.0,
+          "exit": 0,
+          "load_average": [
+            6.61328125,
+            7.54833984375,
+            11.25927734375
+          ],
+          "user_seconds": 0.005983,
+          "system_seconds": 0.030965999999999997,
+          "minor_faults": 719,
+          "major_faults": 0,
+          "requests": 16,
+          "request_bytes": 17280,
+          "inputs": 128
+        },
+        {
+          "seconds": 0.5037039999999999,
+          "peak_rss_kib": 6432.0,
+          "exit": 0,
+          "load_average": [
+            6.48388671875,
+            7.505859375,
+            11.22216796875
+          ],
+          "user_seconds": 0.006292,
+          "system_seconds": 0.029956999999999998,
+          "minor_faults": 720,
+          "major_faults": 0,
+          "requests": 16,
+          "request_bytes": 17280,
+          "inputs": 128
+        },
+        {
+          "seconds": 0.4848500000000002,
+          "peak_rss_kib": 6464.0,
+          "exit": 0,
+          "load_average": [
+            6.48388671875,
+            7.505859375,
+            11.22216796875
+          ],
+          "user_seconds": 0.005863,
+          "system_seconds": 0.028536,
+          "minor_faults": 702,
+          "major_faults": 0,
+          "requests": 16,
+          "request_bytes": 17280,
+          "inputs": 128
+        },
+        {
+          "seconds": 0.4990685420000007,
+          "peak_rss_kib": 6496.0,
+          "exit": 0,
+          "load_average": [
+            6.48388671875,
+            7.505859375,
+            11.22216796875
+          ],
+          "user_seconds": 0.006057,
+          "system_seconds": 0.032173,
+          "minor_faults": 710,
+          "major_faults": 0,
+          "requests": 16,
+          "request_bytes": 17280,
+          "inputs": 128
+        },
+        {
+          "seconds": 0.4700894169999996,
+          "peak_rss_kib": 6448.0,
+          "exit": 0,
+          "load_average": [
+            6.48388671875,
+            7.505859375,
+            11.22216796875
+          ],
+          "user_seconds": 0.006155,
+          "system_seconds": 0.030327999999999997,
+          "minor_faults": 701,
+          "major_faults": 0,
+          "requests": 16,
+          "request_bytes": 17280,
+          "inputs": 128
+        }
+      ],
+      "qualification_summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 494798792,
+            "human": "0.494799s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 128,
+            "searches_with_match": 128,
+            "bytes_searched": 1216,
+            "bytes_printed": 221184,
+            "matched_lines": 128,
+            "matches": 128
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "source_cache_hits": 0,
+          "source_parses": 128,
+          "files": 128,
+          "bytes": 1216,
+          "matches": 128,
+          "reading_leads": 0,
+          "occurrences": 128,
+          "occurrences_exact": true,
+          "files_with_matches": 128,
+          "regions_considered": 128,
+          "regions_evaluated": 128,
+          "errors": 0,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": true
+        },
+        "requests": 16,
+        "input_tokens": 160,
+        "output_tokens": 32,
+        "cache_hits": 0
+      },
+      "median_seconds": 0.4986792499999999,
+      "median_requests": 16
+    }
+  }
+}

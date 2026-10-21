@@ -5622,6 +5622,9 @@ components:
                 type: string
               revision:
                 type: integer
+              recorded_at:
+                type: integer
+                nullable: true
             required:
             - entity
             - owner

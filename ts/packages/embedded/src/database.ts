@@ -22,8 +22,10 @@ import {
   type DecodedBuffer,
   type JsonInput,
   jsonSlice,
+  memoryJsonSlice,
   newBufferOut,
   parseJson,
+  parseMemoryJson,
   type SliceArg,
   sliceOf,
   stringSlice,
@@ -419,8 +421,12 @@ export class Database implements AsyncDisposable {
   }
   /** Execute native memory policy using the shared action/body envelope. */
   async memory(space: string, request: JsonInput): Promise<unknown> {
-    return parseJson(
-      await this.#invokeBuffer(this.#native.dbMemoryJson, stringSlice(space), jsonSlice(request))
+    return parseMemoryJson(
+      await this.#invokeBuffer(
+        this.#native.dbMemoryJson,
+        stringSlice(space),
+        memoryJsonSlice(request)
+      )
     );
   }
 

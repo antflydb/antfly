@@ -424,3 +424,15 @@ Inline media uses `{type: "media", mime_type, data}` with base64 data; immutable
 HTTP/S3 objects use a version-pinned `ChunkSourceReference`. See the
 [shared contract](../../../docs/plans/model-aware-media-chunking.md) for source
 security, rendering policies, limits and native database integration.
+
+## Native memory integer precision
+
+Use `client.memory` or the typed `client.memoryApi` for `/memory/v1` endpoints.
+Safe JSON integers remain JavaScript numbers; larger native resource IDs,
+revisions, and timestamps decode as `bigint` and are sent back as exact numeric
+JSON. Use bigint literals for full-width inputs, such as `9007199254740993n`.
+Unsafe integer numbers are rejected because their original value is already lost.
+`MemorySchemas` exposes the corresponding `number | bigint` numeric types.
+`parseMemoryJSON` and `stringifyMemoryJSON` provide the same codec for external
+persistence or logging. The ordinary `client.api` surface retains its existing
+number types; native memory endpoints live on `client.memoryApi`.
