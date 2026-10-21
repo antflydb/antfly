@@ -131850,8 +131850,10 @@ const StoredLogicalSources = struct {
     view: ?schema_registry_mod.SchemaView,
     txn: docstore_mod.DocStore.Txn,
     repair_requested: bool = false,
+    profile: ?@import("../logical_source.zig").ReadProfile = null,
     fn close(raw: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.profile) |*profile| profile.report();
         self.txn.abort();
         if (self.view) |*v| v.release();
         const a = self.a;
@@ -131870,7 +131872,7 @@ const StoredLogicalSources = struct {
         // Empty roots deliberately load complete bodies from this same cut.
         // Authentication here authorizes omitted ranges, not primary reads;
         // skipped metadata must not masquerade as missing authority to repair.
-        const rows = try @import("../logical_source.zig").load(alloc, a, &scope, keys[0..ids.len], ids, roots, roots.len != 0 and self.db.core.store.valuesAreAuthenticated());
+        const rows = try @import("../logical_source.zig").loadProfiled(alloc, a, &scope, keys[0..ids.len], ids, roots, roots.len != 0 and self.db.core.store.valuesAreAuthenticated(), if (self.profile) |*p| p else null);
         if (!self.repair_requested and !openModeRequiresReadOnlyBackends(self.db.open_mode)) {
             for (rows) |row| if (row.repair_authority) {
                 self.repair_requested = true;
@@ -131895,7 +131897,7 @@ fn openStoredLogicalSourcesCallback(ctx: ?*anyopaque, a: Allocator) anyerror!?db
     };
     const owner = try a.create(StoredLogicalSources);
     errdefer a.destroy(owner);
-    owner.* = .{ .a = a, .db = db, .view = view, .txn = try db.core.store.beginReadTxn() };
+    owner.* = .{ .a = a, .db = db, .view = view, .txn = try db.core.store.beginReadTxn(), .profile = if (getenv("ANTFLY_BENCH_LOGICAL_SOURCE_PHASES")) |flag| if (std.mem.eql(u8, flag, "1")) .{} else null else null };
     return .{ .ctx = owner, .load = StoredLogicalSources.load, .close = StoredLogicalSources.close };
 }
 

@@ -50,6 +50,11 @@ def main():
         action="store_true",
         help="adapt benchmark requests/responses only for a frozen baseline predating execution.value_verification",
     )
+    parser.add_argument(
+        "--source-phases",
+        action="store_true",
+        help="capture opt-in source-provider phase probes; keep instrumented results separate from ordinary latency trials",
+    )
     parser.add_argument("--clients", default="1,4")
     parser.add_argument(
         "--suite",
@@ -84,6 +89,7 @@ def main():
         "host": platform.platform(),
         "logical_cpus": os.cpu_count(),
         "file_cache_advice_requested": args.advise_file_cache,
+        "source_phase_probes_requested": args.source_phases,
         "baseline_legacy_value_wire": args.baseline_legacy_value_wire,
         "driver_sha256": digest(__file__),
         "fixture_sha256": digest(root / "zig/e2e/antfly/test_grep_indexed.py"),
@@ -152,6 +158,9 @@ def main():
                     "ANTFLY_LOGICAL_CLIENTS": args.clients,
                     "ANTFLY_BENCH_LEGACY_VALUE_WIRE": "1"
                     if args.baseline_legacy_value_wire and label == "baseline"
+                    else "0",
+                    "ANTFLY_BENCH_LOGICAL_SOURCE_PHASES": "1"
+                    if args.source_phases
                     else "0",
                     "ANTFLY_LOGICAL_EVICT_FILE_CACHE": "1"
                     if args.advise_file_cache

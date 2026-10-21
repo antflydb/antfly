@@ -18705,6 +18705,8 @@ const ValueExecution = struct {
     tuning_started: bool = false,
     source_epoch: usize = 0,
     original_average_bytes: u64 = 0,
+    key_lookup_ns: u64 = 0,
+    provider_ns: u64 = 0,
     literal_groups: std.ArrayListUnmanaged(LiteralGroup) = .empty,
     cohorts: std.ArrayListUnmanaged(Cohort) = .empty,
     active_cohort: ?usize = null,
@@ -18799,6 +18801,9 @@ const ValueExecution = struct {
         return output[0..n];
     }
     fn deinit(self: *@This()) void {
+        if (self.req.profile) if (getenv("ANTFLY_BENCH_LOGICAL_SOURCE_PHASES")) |flag| if (std.mem.eql(u8, flag, "1")) {
+            std.log.info("antfly_bench_logical_source_lookup key_lookup_us={d} provider_us={d}", .{ self.key_lookup_ns / 1000, self.provider_ns / 1000 });
+        };
         self.publishTuning();
         if (self.projected_reader) |reader| reader.close(reader.ctx);
         self.clearGroups();
@@ -19329,8 +19334,8 @@ const ValueSourceWindow = struct {
         if (lo == self.values.len or self.ids[lo] != local) return null;
         return .{ .bytes = self.values[lo].bytes, .key = self.keys[lo], .original_bytes = self.values[lo].original_bytes, .projected = self.values[lo].projected };
     }
-    fn fill(self: *@This(), producer: *ValueProducer, initial_key: []const u8, started_ns: u64, local: u32, count: u32, offset: u32, iterator: anytype, sequential: u32, deleted: ?*const roaring.RoaringBitmap, known: *const roaring.RoaringBitmap, coverage: ?*const roaring.RoaringBitmap, control: query_mod.ExecutionControl) anyerror!void {
-        self.fillOnce(producer, initial_key, started_ns, local, count, offset, iterator, sequential, deleted, known, coverage, control) catch |err| {
+    fn fill(self: *@This(), producer: *ValueProducer, segment: *const index_mod.SegmentEntry, initial_key: []const u8, started_ns: u64, local: u32, count: u32, offset: u32, iterator: anytype, sequential: u32, deleted: ?*const roaring.RoaringBitmap, known: *const roaring.RoaringBitmap, coverage: ?*const roaring.RoaringBitmap, control: query_mod.ExecutionControl) anyerror!void {
+        self.fillOnce(producer, segment, initial_key, started_ns, local, count, offset, iterator, sequential, deleted, known, coverage, control) catch |err| {
             if (err != error.OutOfMemory) return err;
             const attempted = if (self.count == 0) self.rows else @min(self.rows, self.count);
             self.reset(true);
@@ -19340,7 +19345,7 @@ const ValueSourceWindow = struct {
                 const work = producer.owner.req.value_search_work orelse &producer.owner.local_work;
                 _ = work.batch_refusals.fetchAdd(1, .monotonic);
             }
-            if (self.rows < 2) self.enabled = false else try self.fill(producer, initial_key, started_ns, local, count, offset, iterator, sequential, deleted, known, coverage, control);
+            if (self.rows < 2) self.enabled = false else try self.fill(producer, segment, initial_key, started_ns, local, count, offset, iterator, sequential, deleted, known, coverage, control);
         };
     }
     fn load(self: *@This(), owner: *ValueExecution) ![]LogicalSourceRow {
@@ -19351,7 +19356,7 @@ const ValueSourceWindow = struct {
         for (raw, rows) |bytes, *row| row.* = .{ .bytes = bytes, .original_bytes = if (bytes) |value| value.len else 0 };
         return rows;
     }
-    fn fillOnce(self: *@This(), producer: *ValueProducer, initial_key: []const u8, started_ns: u64, local: u32, count: u32, offset: u32, iterator: anytype, sequential: u32, deleted: ?*const roaring.RoaringBitmap, known: *const roaring.RoaringBitmap, coverage: ?*const roaring.RoaringBitmap, control: query_mod.ExecutionControl) anyerror!void {
+    fn fillOnce(self: *@This(), producer: *ValueProducer, segment: *const index_mod.SegmentEntry, initial_key: []const u8, started_ns: u64, local: u32, count: u32, offset: u32, iterator: anytype, sequential: u32, deleted: ?*const roaring.RoaringBitmap, known: *const roaring.RoaringBitmap, coverage: ?*const roaring.RoaringBitmap, control: query_mod.ExecutionControl) anyerror!void {
         const owner = producer.owner;
         if (owner.load_many == null) {
             self.enabled = false;
@@ -19395,13 +19400,14 @@ const ValueSourceWindow = struct {
         var probe = iterator;
         var next_seq = sequential;
         var next: ?u32 = local;
+        const keys_start = if (owner.req.profile) platform_time.monotonicNs() else 0;
         while (next) |id| {
             if (self.count == maximum) break;
             if (id >= count) return error.InvalidArgument;
             try control.check();
             const global = offset + id;
             if (!(if (deleted) |d| d.contains(id) else false) and !known.contains(id) and !producer.visited.contains(global) and !(if (coverage) |c| c.contains(global) else false)) {
-                const key = if (id == local) try self.arena.allocator().dupe(u8, initial_key) else (try owner.snapshot.storedIdScoped(self.arena.allocator(), global)) orelse return error.StoredDocMissing;
+                const key = if (id == local) try self.arena.allocator().dupe(u8, initial_key) else (try segment.reader.storedIdScoped(self.arena.allocator(), id)) orelse return error.StoredDocMissing;
                 if (work.sources.get(owner.load_ctx, key) == null) {
                     self.ids[self.count] = id;
                     self.keys[self.count] = key;
@@ -19416,14 +19422,21 @@ const ValueSourceWindow = struct {
                 break :blk id_next;
             };
         }
+        if (owner.req.profile) owner.key_lookup_ns +|= platform_time.monotonicNs() - keys_start;
         if (self.count < 2) return;
         // Reserve the shared document allowance before speculative I/O, so
         // concurrent components cannot each read the same remaining budget.
         try value_query.Work.charge(&work.documents, self.count, owner.req.value_search_execution.max_documents);
-        self.values = self.load(owner) catch |err| {
-            _ = work.documents.fetchSub(self.count, .monotonic);
-            return err;
-        };
+        {
+            const provider_start = if (owner.req.profile) platform_time.monotonicNs() else 0;
+            defer if (owner.req.profile) {
+                owner.provider_ns +|= platform_time.monotonicNs() - provider_start;
+            };
+            self.values = self.load(owner) catch |err| {
+                _ = work.documents.fetchSub(self.count, .monotonic);
+                return err;
+            };
+        }
         if (self.values.len != self.count) return error.InvalidArgument;
         var source_bytes: u64 = 0;
         var payload_bytes: u64 = 0;
@@ -19491,6 +19504,7 @@ const ValueProducer = struct {
         const resolved = owner.snapshot.resolveDocId(offset) orelse return error.InvalidArgument;
         var lease = try owner.snapshot.leaseSegment(resolved.seg_idx);
         defer lease.deinit();
+        lease.entry.noteAccess();
         // Lossless keyword membership uses only the literal term. Ordinary term
         // filters may expand synonyms, which cannot establish raw equality.
         if (self.exact_keyword) {
@@ -19594,14 +19608,15 @@ const ValueProducer = struct {
             // A buffered row performs no provider I/O and supplies no tuner
             // sample. Avoid a clock syscall on every row of a filled window.
             const scalar_start = if (buffered == null) platform_time.monotonicNs() else 0;
-            const id = if (buffered) |row| row.key else (try owner.snapshot.storedIdScoped(scratch.allocator(), global)) orelse return error.StoredDocMissing;
+            const id = if (buffered) |row| row.key else (try lease.entry.reader.storedIdScoped(scratch.allocator(), local)) orelse return error.StoredDocMissing;
+            if (owner.req.profile and buffered == null) owner.key_lookup_ns +|= platform_time.monotonicNs() - scalar_start;
             var matched = false;
             if (work.sources.get(owner.load_ctx, id)) |doc| {
                 matched = try owner.matchSource(self, global, doc);
             } else {
                 const already_buffered = buffered != null;
                 if (buffered == null) {
-                    try source_window.fill(self, id, scalar_start, local, count, offset, iterator, sequential, if (deleted) |*d| d else null, &facts.known, coverage, control);
+                    try source_window.fill(self, lease.entry, id, scalar_start, local, count, offset, iterator, sequential, if (deleted) |*d| d else null, &facts.known, coverage, control);
                     buffered = source_window.get(local);
                 }
                 // Both scalar and batch loaders share the admitted provider.
@@ -19611,6 +19626,10 @@ const ValueProducer = struct {
                     try value_query.Work.charge(&work.documents, 1, owner.req.value_search_execution.max_documents);
                     const epoch = owner.source_epoch;
                     const loaded = loaded: {
+                        const provider_start = if (owner.req.profile) platform_time.monotonicNs() else 0;
+                        defer if (owner.req.profile) {
+                            owner.provider_ns +|= platform_time.monotonicNs() - provider_start;
+                        };
                         if (owner.shouldProject()) if (try owner.projectedSources(scratch.allocator(), &.{id})) |rows| {
                             if (rows.len != 1) return error.InvalidArgument;
                             projected_source = rows[0].projected;

@@ -2133,6 +2133,41 @@ pub const DocNumProducer = struct {
     materialized: ?*const fn (*anyopaque) ?*const roaring.RoaringBitmap = null,
 };
 
+/// A consumer that only reads membership can retain the producer's immutable
+/// pin. Mutation-oriented filter APIs continue to return independent bitmaps.
+/// Handles move by value; only their final owner calls deinit.
+pub const SegmentMembership = union(enum) {
+    owned: roaring.RoaringBitmap,
+    borrowed: roaring.BorrowedBitmap,
+
+    pub fn execute(a: Allocator, filter: Filter, seg: *const index_mod.SegmentEntry, offset: u32) !SegmentMembership {
+        if (filter == .doc_num) if (filter.doc_num.producer) |producer| {
+            if (filter.doc_num.bitmap != null or filter.doc_num.doc_nums.len != 0) return error.InvalidArgument;
+            if (producer.borrow) |borrow| if (try borrow(producer.ptr, offset, seg.reader.doc_count)) |pin| return .{ .borrowed = pin };
+        };
+        return .{ .owned = try filter.executeWithOffset(a, seg, offset) };
+    }
+    pub fn bitmap(self: *const @This()) *const roaring.RoaringBitmap {
+        return switch (self.*) {
+            .owned => |*value| value,
+            .borrowed => |value| value.bitmap,
+        };
+    }
+    pub fn cardinality(self: *const @This()) usize {
+        return switch (self.*) {
+            .owned => |*value| value.cardinality(),
+            .borrowed => |value| value.cached_cardinality orelse value.bitmap.cardinality(),
+        };
+    }
+    pub fn deinit(self: *@This()) void {
+        switch (self.*) {
+            .owned => |*value| value.deinit(),
+            .borrowed => |*value| value.deinit(),
+        }
+        self.* = undefined;
+    }
+};
+
 /// Global numeric document filter: matches documents by snapshot-global doc ID.
 pub const DocNumFilter = struct {
     doc_nums: []const u32,

@@ -2205,6 +2205,34 @@ def test_native_grep_nested_authority_keeps_retained_revisions(stateful_api, tmp
     assert current.json()["responses"][0]["hits"]["total"]["value"] == 1, current.text
 
 
+def logical_phase_offsets(server):
+    if os.environ.get("ANTFLY_BENCH_LOGICAL_SOURCE_PHASES") != "1":
+        return {}
+    paths = (getattr(server, "log_path", None), getattr(server, "data_log_path", None))
+    return {path: path.stat().st_size for path in paths if path is not None}
+
+
+def logical_phase_records(offsets):
+    import re
+
+    records = []
+    for path, offset in offsets.items():
+        with path.open("rb") as stream:
+            stream.seek(offset)
+            lines = stream.read().decode("utf-8", errors="replace").splitlines()
+        for line in lines:
+            match = re.search(
+                r"antfly_bench_(logical_sources|logical_source_lookup) (.*)", line
+            )
+            if match:
+                values = {
+                    key: int(value)
+                    for key, value in re.findall(r"(\w+)=(\d+)", match[2])
+                }
+                records.append({"phase": match[1], **values})
+    return records
+
+
 def test_logical_retained_source_hint_profile(stateful_api):
     """Opt-in repeated reader calibration with distinct, uncached predicates."""
     import hashlib
@@ -2245,6 +2273,7 @@ def test_logical_retained_source_hint_profile(stateful_api):
     read_process = logical_process_reader(stateful_api._server.proc.pid)
     runs = []
     for word in words:
+        phase_offsets = logical_phase_offsets(stateful_api._server)
         before = read_process()
         start = time.perf_counter_ns()
         response = requests.post(
@@ -2279,6 +2308,7 @@ def test_logical_retained_source_hint_profile(stateful_api):
                 "process_before": before,
                 "process_after": after,
                 "profile": profile,
+                "source_phase_probes": logical_phase_records(phase_offsets),
             }
         )
     with Path(os.environ["ANTFLY_BIN"]).open("rb") as binary:

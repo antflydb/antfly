@@ -21,6 +21,34 @@ const A = std.mem.Allocator;
 const projection = @import("document_projection.zig");
 const revision = @import("document_mutation_revision.zig");
 const ranges_mod = @import("value_ranges.zig");
+/// Opt-in benchmark accounting. No document bytes, keys or capabilities are
+/// emitted. A null profile adds no clocks or counter updates to normal reads.
+pub const ReadProfile = struct {
+    const Counter = std.atomic.Value(u64);
+    calls: Counter = .init(0),
+    total_ns: Counter = .init(0),
+    revision_ns: Counter = .init(0),
+    directory_read_ns: Counter = .init(0),
+    directory_plan_ns: Counter = .init(0),
+    range_read_ns: Counter = .init(0),
+    reconstruct_ns: Counter = .init(0),
+    fallback_ns: Counter = .init(0),
+    fn clock(self: ?*@This()) u64 {
+        return if (self != null) @import("antfly_platform").time.monotonicNs() else 0;
+    }
+    fn add(self: ?*@This(), comptime field: []const u8, started: u64) void {
+        if (self) |profile| _ = @field(profile, field).fetchAdd(@import("antfly_platform").time.monotonicNs() - started, .monotonic);
+    }
+    pub fn report(self: *const @This()) void {
+        std.log.info("antfly_bench_logical_sources calls={d} total_us={d} revision_us={d} directory_read_us={d} directory_plan_us={d} range_read_us={d} reconstruct_us={d} fallback_us={d}", .{
+            self.calls.load(.monotonic),                    self.total_ns.load(.monotonic) / 1000,
+            self.revision_ns.load(.monotonic) / 1000,       self.directory_read_ns.load(.monotonic) / 1000,
+            self.directory_plan_ns.load(.monotonic) / 1000, self.range_read_ns.load(.monotonic) / 1000,
+            self.reconstruct_ns.load(.monotonic) / 1000,    self.fallback_ns.load(.monotonic) / 1000,
+        });
+    }
+};
+
 pub const Row = struct {
     bytes: ?[]u8,
     // Logical work is charged on original size, never on projected payload.
@@ -57,6 +85,13 @@ fn many(scope: anytype, keys: []const []const u8, output: []?[]const u8) !void {
 /// bounded opaque objects retain their entire subtree and element boundaries.
 /// Output is caller-owned. Temporary directories/range reads use the scope owner.
 pub fn load(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids: []const []const u8, roots: []const []const u8, authenticated: bool) ![]Row {
+    return loadProfiled(a, scratch, scope, physical, ids, roots, authenticated, null);
+}
+
+pub fn loadProfiled(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids: []const []const u8, roots: []const []const u8, authenticated: bool, profile: ?*ReadProfile) ![]Row {
+    const started = ReadProfile.clock(profile);
+    defer ReadProfile.add(profile, "total_ns", started);
+    if (profile) |p| _ = p.calls.fetchAdd(1, .monotonic);
     if (physical.len > 64 or physical.len != ids.len or roots.len > 64) return error.InvalidBatch;
     const result = try a.alloc(Row, ids.len);
     @memset(result, .{ .bytes = null, .original_bytes = 0 });
@@ -69,7 +104,10 @@ pub fn load(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids:
     var repair: [64]bool = @splat(false);
     var timestamps: [64]u64 = undefined;
     // Without storage authentication a directory is not authority to omit bytes.
+    var phase = ReadProfile.clock(profile);
     if (authenticated and roots.len != 0) try revision.loadWindow(scope, scratch, physical, ids, proofs[0..ids.len], timestamps[0..ids.len]);
+    ReadProfile.add(profile, "revision_ns", phase);
+    phase = ReadProfile.clock(profile);
     var directory_keys: [64]projection.Key = undefined;
     var keys: [64][]const u8 = undefined;
     var raw: [64]?[]const u8 = @splat(null);
@@ -83,6 +121,8 @@ pub fn load(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids:
         count += 1;
     };
     if (count != 0) try many(scope, keys[0..count], raw[0..count]);
+    ReadProfile.add(profile, "directory_read_ns", phase);
+    phase = ReadProfile.clock(profile);
     const Prepared = struct {
         index: usize,
         directory: projection.Directory,
@@ -152,7 +192,11 @@ pub fn load(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids:
             return std.mem.order(u8, left.key, right.key) == .lt;
         }
     }.less);
+    ReadProfile.add(profile, "directory_plan_ns", phase);
+    phase = ReadProfile.clock(profile);
     if (request_count != 0) try scope.getRangesMany(requests[0..request_count]);
+    ReadProfile.add(profile, "range_read_ns", phase);
+    phase = ReadProfile.clock(profile);
     for (prepared[0..prepared_count], 0..) |item, n| {
         const values = for (prepared[0..n]) |prior| {
             if (std.mem.eql(u8, physical[prior.index], physical[item.index])) break prior.values;
@@ -178,6 +222,8 @@ pub fn load(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids:
         try writer.object(&out.writer, 0, item.directory.root_count);
         result[item.index] = .{ .bytes = try out.toOwnedSlice(), .original_bytes = proofs[item.index].?.bytes, .projected = true, .repair_authority = repair[item.index] };
     }
+    ReadProfile.add(profile, "reconstruct_ns", phase);
+    phase = ReadProfile.clock(profile);
     count = 0;
     for (result, 0..) |row, i| if (!row.projected) {
         keys[count] = physical[i];
@@ -188,6 +234,7 @@ pub fn load(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids:
     for (indices[0..count], raw[0..count]) |i, value| {
         result[i] = .{ .bytes = if (value) |v| try a.dupe(u8, v) else null, .original_bytes = if (value) |v| v.len else 0, .repair_authority = repair[i] or (authenticated and proofs[i] == null and (if (value) |v| v.len >= projection.minimum_bytes else false)) };
     }
+    ReadProfile.add(profile, "fallback_ns", phase);
     return result;
 }
 
@@ -272,7 +319,9 @@ test "logical value stored ranges bind revisions preserve arrays and reject corr
     };
     var mock: Mock = .{ .physical = physical, .body = body, .rev_key = &rev_key, .content_key = &content_key, .directory_key = &directory_key, .content = &content, .mutation = &mutation, .directory = directory };
     const wanted = &[_][]const u8{"nested"};
-    const rows = try load(temp, temp, &mock, &.{ physical, physical }, &.{ "doc", "doc" }, wanted, true);
+    var profile: ReadProfile = .{};
+    const rows = try loadProfiled(temp, temp, &mock, &.{ physical, physical }, &.{ "doc", "doc" }, wanted, true, &profile);
+    try std.testing.expectEqual(@as(u64, 1), profile.calls.load(.monotonic));
     try std.testing.expect(rows[0].projected and rows[1].projected);
     try std.testing.expectEqualStrings(rows[0].bytes.?, rows[1].bytes.?);
     try std.testing.expectEqual(@as(u64, body.len), rows[0].original_bytes);

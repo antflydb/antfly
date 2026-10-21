@@ -948,6 +948,49 @@ fn executeFilterQuery(
     request: SearchRequest,
     boost: f32,
 ) !SearchResult {
+    if (request.tie_rank == null and request.sort == null and request.aggregations.len == 0 and !requestHasDocNumConstraints(request)) {
+        // Count each leased segment directly and seek only its requested page.
+        // Complete producer facts never become a copied/rebased global bitmap.
+        var scored = std.ArrayListUnmanaged(scorer_mod.ScoredHit).empty;
+        defer scored.deinit(alloc);
+        const keep = @min(snap.liveDocCount(), request.k +| request.offset);
+        var total: usize = 0;
+        var offset: u32 = 0;
+        for (snap.segments, 0..) |_, index| {
+            try request.control.check();
+            var lease = try snap.leaseSegment(index);
+            defer lease.deinit();
+            const segment = lease.entry;
+            const end = try std.math.add(u32, offset, segment.reader.doc_count);
+            var matches = try query_mod.SegmentMembership.execute(alloc, filter.withControl(request.control), segment, offset);
+            defer matches.deinit();
+            // Capture deletions once; no deletion lock is held while output
+            // allocation, producer work or cancellation callbacks can run.
+            var deleted = try segment.cloneDeleted(alloc);
+            defer if (deleted) |*d| d.deinit();
+            const removed = if (deleted) |*d| matches.bitmap().intersectionCardinality(d) else 0;
+            total = try std.math.add(usize, total, matches.cardinality() - removed);
+            var iterator = matches.bitmap().iterator();
+            var scan_page = scored.items.len < keep;
+            if (request.search_after) |cursor| {
+                if (boost == cursor.score) {
+                    if (cursor.doc_id >= end -| 1) scan_page = false else if (cursor.doc_id >= offset) iterator.seek(cursor.doc_id - offset + 1);
+                } else scan_page = scan_page and boost < cursor.score;
+            }
+            var visited: usize = 0;
+            while (scan_page and scored.items.len < keep) {
+                const local = iterator.next() orelse break;
+                if (visited % 256 == 0) try request.control.check();
+                visited += 1;
+                if (deleted) |*d| if (d.contains(local)) continue;
+                try scored.append(alloc, .{ .doc_id = try std.math.add(u32, offset, local), .score = boost });
+            }
+            offset = end;
+        }
+        var bounded = request;
+        bounded.search_after = null;
+        return buildResult(alloc, snap, scored.items, std.math.cast(u32, total) orelse return error.CountOverflow, .exact, bounded);
+    }
     if (request.tie_rank == null and request.sort == null and request.aggregations.len == 0) {
         // Expansion queries have constant scores. Keep exact membership in a
         // bitmap and retain only the requested page prefix, rather than one
@@ -997,17 +1040,15 @@ fn executeFilterQuery(
             var lease = try snap.leaseSegment(i);
             defer lease.deinit();
             const segment = lease.entry;
-            var matches = try filter.withControl(request.control).executeWithOffset(alloc, segment, offset);
+            var matches = try query_mod.SegmentMembership.execute(alloc, filter.withControl(request.control), segment, offset);
             defer matches.deinit();
-            {
-                segment.shared.lockDeletionShared();
-                defer segment.shared.unlockDeletionShared();
-                if (segment.shared.deleted) |deleted| matches.andNotWith(&deleted);
-            }
-            var iterator = matches.iterator();
+            var deleted = try segment.cloneDeleted(alloc);
+            defer if (deleted) |*d| d.deinit();
+            var iterator = matches.bitmap().iterator();
             var visited: usize = 0;
             while (iterator.next()) |doc| : (visited += 1) {
                 if (visited % 256 == 0) try request.control.check();
+                if (deleted) |*d| if (d.contains(doc)) continue;
                 try collector.collect(try std.math.add(u32, offset, doc), boost);
             }
             offset = try std.math.add(u32, offset, segment.reader.doc_count);
@@ -1861,6 +1902,27 @@ const FastTopK = struct {
     segment_count: u32 = 0,
     pending: [64]scorer_mod.ScoredHit = undefined,
     pending_count: usize = 0,
+    include_local: ?roaring.BorrowedBitmap = null,
+    exclude_local: ?roaring.BorrowedBitmap = null,
+    pins_checked: bool = false,
+
+    fn releasePins(self: *FastTopK) void {
+        if (self.include_local) |*pin| pin.deinit();
+        if (self.exclude_local) |*pin| pin.deinit();
+        self.include_local = null;
+        self.exclude_local = null;
+        self.pins_checked = false;
+    }
+    fn pinProducers(self: *FastTopK) !void {
+        if (self.pins_checked) return;
+        if (complete(self.producers.include) == null) if (self.producers.include) |producer| {
+            if (producer.borrow) |borrow| self.include_local = try borrow(producer.ptr, self.segment_offset, self.segment_count);
+        };
+        if (complete(self.producers.exclude) == null) if (self.producers.exclude) |producer| {
+            if (producer.borrow) |borrow| self.exclude_local = try borrow(producer.ptr, self.segment_offset, self.segment_count);
+        };
+        self.pins_checked = true;
+    }
 
     fn complete(producer: ?query_mod.DocNumProducer) ?*const roaring.RoaringBitmap {
         const value = producer orelse return null;
@@ -1887,24 +1949,28 @@ const FastTopK = struct {
 
     fn beginSegment(self: *FastTopK, offset: u32, count: u32) !void {
         try self.flushPending();
+        self.releasePins();
         self.segment_offset = offset;
         self.segment_count = count;
     }
     fn flushPending(self: *FastTopK) !void {
         if (self.pending_count == 0) return;
-        var candidates = roaring.RoaringBitmap.init(self.alloc);
-        defer candidates.deinit();
-        for (self.pending[0..self.pending_count]) |hit| try candidates.add(hit.doc_id - self.segment_offset);
-        // Complete global membership is immutable for the request. Borrow it
-        // directly instead of copying a full segment bitmap for every batch.
+        try self.pinProducers();
         const include_global = complete(self.producers.include);
         const exclude_global = complete(self.producers.exclude);
-        var include = if (include_global == null) if (self.producers.include) |producer| try producer.produce(producer.ptr, self.alloc, self.segment_offset, self.segment_count, &candidates) else null else null;
+        const need_include = self.producers.include != null and include_global == null and self.include_local == null;
+        const need_exclude = self.producers.exclude != null and exclude_global == null and self.exclude_local == null;
+        var candidates = roaring.RoaringBitmap.init(self.alloc);
+        defer candidates.deinit();
+        if (need_include or need_exclude) for (self.pending[0..self.pending_count]) |hit| try candidates.add(hit.doc_id - self.segment_offset);
+        var include = if (need_include) try self.producers.include.?.produce(self.producers.include.?.ptr, self.alloc, self.segment_offset, self.segment_count, &candidates) else null;
         defer if (include) |*bitmap| bitmap.deinit();
-        var exclude = if (exclude_global == null) if (self.producers.exclude) |producer| try producer.produce(producer.ptr, self.alloc, self.segment_offset, self.segment_count, &candidates) else null else null;
+        var exclude = if (need_exclude) try self.producers.exclude.?.produce(self.producers.exclude.?.ptr, self.alloc, self.segment_offset, self.segment_count, &candidates) else null;
         defer if (exclude) |*bitmap| bitmap.deinit();
         for (self.pending[0..self.pending_count]) |hit| {
             const local_id = hit.doc_id - self.segment_offset;
+            if (self.include_local) |pin| if (!pin.bitmap.contains(local_id)) continue;
+            if (self.exclude_local) |pin| if (pin.bitmap.contains(local_id)) continue;
             if (include_global) |bitmap| if (!bitmap.contains(hit.doc_id)) continue;
             if (exclude_global) |bitmap| if (bitmap.contains(hit.doc_id)) continue;
             if (include) |*bitmap| if (!bitmap.contains(local_id)) continue;
@@ -1915,6 +1981,7 @@ const FastTopK = struct {
     }
 
     pub fn deinit(self: *FastTopK) void {
+        self.releasePins();
         self.hits.deinit(self.alloc);
     }
 
@@ -10917,4 +10984,126 @@ test "external lake global frontier patterns stream mixed scores and cursor page
         try std.testing.expectEqual(@as(u32, 640), constant.total_hits);
         try std.testing.expectEqual(@as(usize, 7), constant.hits.len);
     }
+}
+
+test "logical value borrowed pages seek across segments without copying retained membership" {
+    const a = std.testing.allocator;
+    const count = 16384;
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    for (0..2) |part| {
+        var segment = segment_mod.SegmentWriter.init(a);
+        defer segment.deinit();
+        for (0..count) |i| {
+            var id: [32]u8 = undefined;
+            try segment.addStoredDoc(try std.fmt.bufPrint(&id, "doc-{d}", .{part * count + i}), "{}");
+        }
+        const bytes = try segment.build();
+        defer a.free(bytes);
+        try writer.addSegment(bytes);
+    }
+    try std.testing.expect(try writer.deleteById("doc-1"));
+    const State = struct {
+        bitmap: roaring.RoaringBitmap,
+        borrows: usize = 0,
+        releases: usize = 0,
+        produced: usize = 0,
+        missing: bool = false,
+        fail_at: usize = std.math.maxInt(usize),
+        fn borrow(raw: *anyopaque, _: u32, _: u32) anyerror!?roaring.BorrowedBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.borrows += 1;
+            if (self.borrows == self.fail_at) return error.TestReadFailure;
+            if (self.missing) return null;
+            return .{ .bitmap = &self.bitmap, .cached_cardinality = self.bitmap.cardinality(), .context = .{ self, self }, .release = release };
+        }
+        fn release(context: [2]*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context[0]));
+            self.releases += 1;
+        }
+        fn produce(raw: *anyopaque, alloc: Allocator, _: u32, _: u32, _: ?*const roaring.RoaringBitmap) anyerror!roaring.RoaringBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.produced += 1;
+            return self.bitmap.cloneExact(alloc);
+        }
+    };
+    var state = State{ .bitmap = roaring.RoaringBitmap.init(a) };
+    defer state.bitmap.deinit();
+    try state.bitmap.addRange(0, count);
+    const query: SearchQuery = .{ .doc_num = .{ .ids = &.{}, .producer = .{ .ptr = &state, .produce = State.produce, .borrow = State.borrow } } };
+    for ([_]?u32{ null, count - 2, count - 1, 2 * count - 1 }) |after| {
+        var buffer: [2048]u8 = undefined;
+        var bounded = std.heap.FixedBufferAllocator.init(&buffer);
+        var result = try execute(bounded.allocator(), writer.snapshot(), .{
+            .query = query,
+            .k = 1,
+            .include_stored = false,
+            .search_after = if (after) |doc| .{ .doc_id = doc, .score = 1 } else null,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 2 * count - 1), result.total_hits);
+        const expected = if (after) |doc| doc + 1 else 0;
+        try std.testing.expectEqual(@as(usize, if (expected == 2 * count) 0 else 1), result.hits.len);
+        if (result.hits.len != 0) try std.testing.expectEqual(expected, result.hits[0].doc_id);
+    }
+    try std.testing.expectEqual(@as(usize, 0), state.produced);
+    try std.testing.expectEqual(state.borrows, state.releases);
+    try std.testing.expectEqual(@as(usize, count), state.bitmap.cardinality());
+    state.missing = true;
+    var fallback = try execute(a, writer.snapshot(), .{ .query = query, .k = 1, .include_stored = false });
+    defer fallback.deinit();
+    try std.testing.expectEqual(@as(u32, 2 * count - 1), fallback.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), state.produced);
+    state.missing = false;
+    state.fail_at = state.borrows + 2;
+    const before = state.releases;
+    try std.testing.expectError(error.TestReadFailure, execute(a, writer.snapshot(), .{ .query = query, .k = 1, .include_stored = false }));
+    try std.testing.expectEqual(before + 1, state.releases);
+}
+
+test "logical value borrowed ranked producer gates retain one pin per segment" {
+    const a = std.testing.allocator;
+    const State = struct {
+        bitmap: roaring.RoaringBitmap,
+        borrows: usize = 0,
+        releases: usize = 0,
+        fn borrow(raw: *anyopaque, _: u32, _: u32) anyerror!?roaring.BorrowedBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.borrows += 1;
+            return .{ .bitmap = &self.bitmap, .context = .{ self, self }, .release = release };
+        }
+        fn release(context: [2]*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context[0]));
+            self.releases += 1;
+        }
+        fn produce(_: *anyopaque, _: Allocator, _: u32, _: u32, _: ?*const roaring.RoaringBitmap) anyerror!roaring.RoaringBitmap {
+            return error.UnexpectedMaterialization;
+        }
+        fn producer(self: *@This()) query_mod.DocNumProducer {
+            return .{ .ptr = self, .produce = produce, .borrow = borrow };
+        }
+    };
+    var include = State{ .bitmap = roaring.RoaringBitmap.init(a) };
+    defer include.bitmap.deinit();
+    var exclude = State{ .bitmap = roaring.RoaringBitmap.init(a) };
+    defer exclude.bitmap.deinit();
+    for (0..256) |i| try include.bitmap.add(@intCast(i * 2));
+    for (0..128) |i| try exclude.bitmap.add(@intCast(i * 4));
+    var collector = FastTopK{ .alloc = a, .k = 2, .producers = .{ .include = include.producer(), .exclude = exclude.producer() } };
+    {
+        defer collector.deinit();
+        for ([_]u32{ 100000, 200000 }) |offset| {
+            try collector.beginSegment(offset, 512);
+            for (0..512) |i| try collector.collect(offset + @as(u32, @intCast(i)), 1);
+        }
+        const hits = try collector.finish();
+        defer a.free(hits);
+        try std.testing.expectEqual(@as(u32, 256), collector.total_count);
+        try std.testing.expectEqual(@as(u32, 100002), hits[0].doc_id);
+        try std.testing.expectEqual(@as(u32, 100006), hits[1].doc_id);
+        try std.testing.expectEqual(@as(usize, 2), include.borrows);
+        try std.testing.expectEqual(@as(usize, 2), exclude.borrows);
+    }
+    try std.testing.expectEqual(include.borrows, include.releases);
+    try std.testing.expectEqual(exclude.borrows, exclude.releases);
 }
