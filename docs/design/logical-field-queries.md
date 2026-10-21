@@ -515,3 +515,23 @@ owned-token analysis, so compare complete build CPU rather than treating phase
 movement as eliminated work. Server qualification uses the existing scalable and
 concurrent HTTP fixtures. Neither a process restart nor fixture-file cache advice establishes
 device-cold behavior or performance on independent Linux hardware.
+
+The [substring/startup qualification](../../zig/pkg/antfly-grep/bench/results/substring-bootstrap-validation.json)
+pins the production implementation at `34091b088b` after merging main
+`dd49f55102`, with a baseline built after that same merge. Both optimized servers
+pass all 18 HTTP integration/upgrade cases; the Linux server now passes within
+1 GiB, superseding the preceding expanded-substring fixture's 4 GiB qualification.
+The component benchmark verifies identical complete postings across 81 rotated
+trials per platform and separates construction allocation/time from whole-server
+batch-write CPU and teardown. The portable `introducer-test-build` target installs
+the implementation test owner after import binding, allowing identical tests to
+run on native Linux without executing foreign binaries during cross-compilation.
+
+Streaming cuts tracked component allocation from roughly 101–219 MiB to 2–23 MiB
+on the three 180 KiB corpora. Throughput is mixed: the distinct-word Linux case
+takes about 26% longer. In the paired macOS server comparison, nested-source
+verification changes from 9.15 to 8.27 ms and its largest observed window from
+776 to 219 KiB; small/full-selected and concurrent cases have higher medians.
+The report retains those regressions, all raw trials, ingestion CPU and sampled
+process memory. Necessary postings, verification, and provider I/O remain real
+costs. The bounded design does not promise zero work or uniform throughput gains.

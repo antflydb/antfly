@@ -5969,7 +5969,7 @@ class CliTests(unittest.TestCase):
             command = [
                 sys.executable,
                 "-c",
-                "import os, resource, sys; limit=int(sys.argv[1]); resource.setrlimit(resource.RLIMIT_NOFILE, (limit, limit)); os.execv(sys.argv[2], sys.argv[2:])",
+                "import os, resource, sys; limit=int(sys.argv[1]); hard=resource.getrlimit(resource.RLIMIT_NOFILE)[1]; resource.setrlimit(resource.RLIMIT_NOFILE, (limit, hard)); os.execv(sys.argv[2], sys.argv[2:])",
                 str(descriptor_limit),
                 *command,
             ]
@@ -6123,8 +6123,20 @@ class CliTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "darwin", "kqueue admission is macOS specific")
     def test_workspace_witness_limit_uses_explicit_conservative_source_reads(self):
+        import resource
+
+        descriptor_limit = 8192
+        hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+        if hard != resource.RLIM_INFINITY and hard < descriptor_limit:
+            self.skipTest(
+                "witness admission requires an inherited limit of at least 8192"
+            )
+        # Admit more sources than the 4096-witness budget without requesting
+        # a hard-limit change; 8192 provides sufficient descriptor headroom.
         paths = [self.write(f"src/f{i:04}.txt", "before\n") for i in range(4352)]
-        with self.workspace("--workspace-watch", "src", descriptor_limit=16384) as (
+        with self.workspace(
+            "--workspace-watch", "src", descriptor_limit=descriptor_limit
+        ) as (
             ready,
             request,
         ):

@@ -4037,3 +4037,77 @@ that fixture at 1 GiB. Those failures are retained separately from the successfu
 The Linux runs execute native ARM64 instructions in a VM on the same shared
 Apple host. File-cache advice is limited to isolated fixture files; process
 restarts and advice do not establish device-cold or independent-hardware results.
+
+### Bounded substring indexing and source startup
+
+Substring index construction consumes the exact built-in word/lowercase/shingle/
+suffix pipeline through a borrowed-token stream. Two sequential source passes
+preserve unigram/bigram order using a fixed normalized window. Each distinct term
+is interned once, the first two positions stay inline, and larger vectors and the
+dictionary use reclaimable, quota-preserving scratch. Scratch is released after
+the posting builder copies its inputs. Inputs below 128 bytes retain the small
+owned-token path. Other analyzers and highlight analysis keep their existing
+owned-token behavior. No analyzer generation, disk cache, or index migration is
+introduced.
+
+Logical original-value verification now bootstraps with two full documents,
+seeds its size estimate from the first required payload, and skips clock reads
+for rows already buffered. Projection admission, snapshot ownership, work budgets
+and adaptive-window limits retain their existing contracts.
+
+The [substring/startup report](bench/results/substring-bootstrap-validation.json)
+records production code at `34091b088b`, following the merge of main
+`dd49f55102`. Its component benchmark rotates the old owned accumulator, current
+owned control and borrowed stream over nine trials on three 180 KiB corpora.
+All variants must produce identical complete postings digests, including field
+norms, frequencies and positions. Construction timings exclude digest validation
+and teardown; whole-server batch-write measurements separately include cleanup
+and background work. These component results do not measure local CLI search.
+
+| Corpus | macOS construction, old → stream | Linux VM construction, old → stream | Peak tracked allocation, old → stream |
+|---|---:|---:|---:|
+| Repetitive | 9.87 → 6.13 ms | 11.58 → 6.81 ms | 218–219 → 2 MiB |
+| Source-like | 10.68 → 8.05 ms | 11.82 → 10.44 ms | 101 → 6 MiB |
+| Distinct long word | 12.98 → 10.31 ms | 14.85 → 18.76 ms | 108 → 23 MiB |
+
+The distinct-word Linux case trades about 26% more construction time for about
+79% less tracked allocation. The report preserves every trial and the owned
+control rather than treating all inputs as a throughput win. Instrumented peak
+allocation is distinct from sampled process RSS. Both optimized servers now pass
+all 18 HTTP integration/upgrade cases, with Linux constrained to 1 GiB; this
+supersedes the preceding 4 GiB correctness qualification for the expanded
+substring fixture.
+
+The same-main macOS server comparison alternates baseline/candidate order over
+two rounds and retains 18 fresh-verification trials per corpus:
+
+| Verification workload | Baseline → candidate HTTP median | Largest observed read window, baseline → candidate |
+|---|---:|---:|
+| Tiny | 6.94 → 7.20 ms | 17.5 → 17.4 KiB |
+| Fully selected 4 KiB value | 9.92 → 10.37 ms | 717 → 598 KiB |
+| Dominant selected 16 KiB value | 5.93 → 6.03 ms | 428 → 720 KiB |
+| Unused escaped arrays | 6.94 → 7.04 ms | 479 → 109 KiB |
+| Nested content and regions | 9.15 → 8.27 ms | 776 → 219 KiB |
+
+The bootstrap replaces 16 original reads with two before useful projection;
+the 1,024-document nested/unused-array cases now use 1,022 stored projections
+rather than 1,008. Nested parse time falls, while small/full-selected latency and
+some window sizes rise. One/four-client request medians change from 5.74/9.37
+to 5.85/10.36 ms; cold-process results and ingestion CPU are also mixed. This
+qualification establishes lower expanded-token allocation and bounded initial
+reads, not a universal server speedup. All timings, first-byte samples, work
+counters, ingestion batches and memory observations remain in the report.
+
+To reproduce the component benchmark, build the implementation test owner and
+run it with strict selection (from `zig/`):
+
+```sh
+zig build introducer-test-build -Doptimize=ReleaseFast
+ANTFLY_BENCH_SUBSTRING_STREAM=1 zig-out/bin/antfly-introducer-tests \
+  --suite-filter introducer.substring
+```
+
+For native ARM64 Linux, add `-Dtarget=aarch64-linux-musl -Dmetal=false
+-Dsystem-blas=false`, then run the resulting executable on Linux. The build-only
+target installs the implementation test partition after its imports finalize;
+installing only the consumer test binary would omit named-dependency tests.

@@ -1259,11 +1259,30 @@ def test_logical_scalable_work_profile(stateful_api):
         else:
             documents = {f"{i:06}": {"title": title, **extra} for i in range(count)}
         corpus = json.dumps(documents, sort_keys=True, separators=(",", ":")).encode()
+        ingestion_initial = read_process()
+        ingestion_started = time.perf_counter_ns()
+        ingestion_batches = []
         for offset in range(0, count, 128):
             keys = list(documents)[offset : offset + 128]
+            before = read_process()
+            started = time.perf_counter_ns()
             stateful_api.batch_write(
                 table, inserts={k: documents[k] for k in keys}, sync_level="full_index"
             )
+            elapsed = time.perf_counter_ns() - started
+            after = read_process()
+            ingestion_batches.append(
+                {
+                    "offset": offset,
+                    "documents": len(keys),
+                    "http_ms": elapsed / 1000000,
+                    "cpu_ms": (after["cpu_ns"] - before["cpu_ns"]) / 1000000,
+                    "process_before": before,
+                    "process_after": after,
+                }
+            )
+        ingestion_elapsed = time.perf_counter_ns() - ingestion_started
+        ingestion_final = read_process()
         query = {
             "query": {
                 "bool": {
@@ -1452,6 +1471,16 @@ def test_logical_scalable_work_profile(stateful_api):
                 "name": name,
                 "documents": count,
                 "corpus_sha256": hashlib.sha256(corpus).hexdigest(),
+                "ingestion": {
+                    "metrics_version": 1,
+                    "scope": "End-to-end full_index batch writes; process CPU includes background work. RSS samples are batch endpoints, not an allocation or peak-memory bound.",
+                    "http_ms": ingestion_elapsed / 1000000,
+                    "cpu_ms": (ingestion_final["cpu_ns"] - ingestion_initial["cpu_ns"])
+                    / 1000000,
+                    "process_initial": ingestion_initial,
+                    "process_final": ingestion_final,
+                    "batches": ingestion_batches,
+                },
                 "idle_samples": idle_samples,
                 "idle_cpu_ms_per_second": idle_cpu_ms_per_second,
                 "warmup": warmup,

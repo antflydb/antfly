@@ -2138,6 +2138,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .mode = .simple,
         },
     });
+    @import("../../../build_support/antfly/test_partitions.zig").installLocalArtifact(b, introducer_tests, "introducer-test-build", "Build portable introducer tests and allocation benchmarks without running them", "antfly-introducer-tests");
     const run_introducer_tests = addFilteredTestRunArtifact(b, introducer_tests);
     // The aggregate owns unit work; corpus-scale storage benchmarks retain
     // their release-scale owner. Keep focused introducer coverage unchanged.
