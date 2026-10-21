@@ -1,0 +1,31 @@
+{
+  "complete": true,
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "load_average": [
+    10.8076171875,
+    11.033203125,
+    10.81884765625
+  ],
+  "binary_sha256": "03dede6a8868ce15f4c0d74fa2ceaef18177fa4a5c13e676fd68f3e51d9cc9ed",
+  "subject_sha256": "57dde5a2b0d30451b267e23c55b1620d1ca3a87ac6281645d4f6399891393360",
+  "subject_bytes": 559709137,
+  "subject_files": 10122,
+  "seconds_requested": 1,
+  "version": "antfly-grep 0.1.0\nZig 0.17.0 fast\nnative regex, PCRE-style VM/JIT, streaming compression, encoding\ntarget aarch64-macos-none dynamic",
+  "command": [
+    "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/feat-native-antfly-grep/zig/zig-out/bin/antfly-grep",
+    "-l",
+    "--color=never",
+    "-e",
+    "TODO|FIXME|retry",
+    "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/feat-native-antfly-grep"
+  ],
+  "exit": 0,
+  "elapsed_seconds": 1.3587807499999998,
+  "sampler_exit": 0,
+  "sampler_diagnostic": "Sampling process 10564 for 1 second with 1 millisecond of run time between samples\nSampling completed, processing symbols...\nSample analysis of process 10564 written to file zig/.zig-cache/profiles/monorepo-sample.sample.txt\n",
+  "stderr": "",
+  "stack_file": "macos-arm64-cli-monorepo-sample.sample.txt",
+  "stack_sha256": "69ff976dc097c966d372adbc8cc6def1ee01fd290e7f5cba51844b5b2c231081",
+  "original_stack_file": "monorepo-sample.sample.txt"
+}

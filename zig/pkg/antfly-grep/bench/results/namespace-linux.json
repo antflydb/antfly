@@ -1,0 +1,355 @@
+{
+  "host": "Linux-7.0.14-linuxkit-aarch64-with-glibc2.41",
+  "measurement": "Paired wide-repository namespace refresh qualification, with forced rescans.\n\nWarm shared filesystem; independent native Linux hardware is not available.\nWatch and metadata admission are explicit. Every mutation compares its revision\nwith a forced full observation outside the timing interval.\n",
+  "directories": 5000,
+  "rounds": 7,
+  "binaries": {
+    "current": "2eaa1308e9025f5c6f82063ef5387c4c008040ce5cfd536db3b0629683a36aba",
+    "baseline": "3c4c2d24786060822b31d7b961c04840fc603417c57b000e85aa595105130d3a"
+  },
+  "trials": [
+    {
+      "load_average": [
+        0.79736328125,
+        0.3037109375,
+        0.14990234375
+      ],
+      "stable": {
+        "baseline": {
+          "seconds": 0.0800845839548856,
+          "watch_fallback": true,
+          "source_bytes_read": 12656,
+          "refresh_entries_visited": 5000,
+          "discovery_reused": false,
+          "sources_opened": 904,
+          "namespace_paths_checked": 0
+        },
+        "current": {
+          "seconds": 0.0003550840774551034,
+          "watch_fallback": false,
+          "source_bytes_read": 0,
+          "refresh_entries_visited": 0,
+          "discovery_reused": true,
+          "sources_opened": 0,
+          "namespace_paths_checked": 0
+        }
+      },
+      "edit": {
+        "baseline": {
+          "seconds": 0.07941616699099541,
+          "watch_fallback": true,
+          "source_bytes_read": 12657,
+          "refresh_entries_visited": 5000,
+          "discovery_reused": false,
+          "sources_opened": 904,
+          "namespace_paths_checked": 0
+        },
+        "current": {
+          "seconds": 0.00012779200915247202,
+          "watch_fallback": false,
+          "source_bytes_read": 15,
+          "refresh_entries_visited": 1,
+          "discovery_reused": true,
+          "sources_opened": 1,
+          "namespace_paths_checked": 0
+        }
+      }
+    },
+    {
+      "load_average": [
+        0.79736328125,
+        0.3037109375,
+        0.14990234375
+      ],
+      "stable": {
+        "current": {
+          "seconds": 7.445900700986385e-05,
+          "watch_fallback": false,
+          "source_bytes_read": 0,
+          "refresh_entries_visited": 0,
+          "discovery_reused": true,
+          "sources_opened": 0,
+          "namespace_paths_checked": 0
+        },
+        "baseline": {
+          "seconds": 0.07823416602332145,
+          "watch_fallback": true,
+          "source_bytes_read": 12657,
+          "refresh_entries_visited": 5000,
+          "discovery_reused": false,
+          "sources_opened": 904,
+          "namespace_paths_checked": 0
+        }
+      },
+      "edit": {
+        "current": {
+          "seconds": 0.0006647079717367887,
+          "watch_fallback": false,
+          "source_bytes_read": 15,
+          "refresh_entries_visited": 1,
+          "discovery_reused": true,
+          "sources_opened": 1,
+          "namespace_paths_checked": 0
+        },
+        "baseline": {
+          "seconds": 0.08094908308703452,
+          "watch_fallback": true,
+          "source_bytes_read": 12657,
+          "refresh_entries_visited": 5000,
+          "discovery_reused": false,
+          "sources_opened": 904,
+          "namespace_paths_checked": 0
+        }
+      }
+    },
+    {
+      "load_average": [
+        0.79736328125,
+        0.3037109375,
+        0.14990234375
+      ],
+      "stable": {
+        "baseline": {
+          "seconds": 0.08683033299166709,
+          "watch_fallback": true,
+          "source_bytes_read": 12657,
+          "refresh_entries_visited": 5000,
+          "discovery_reused": false,
+          "sources_opened": 904,
+          "namespace_paths_checked": 0
+        },
+        "current": {
+          "seconds": 8.704198990017176e-05,
+          "watch_fallback": false,
+          "source_bytes_read": 0,
+          "refresh_entries_visited": 0,
+          "discovery_reused": true,
+          "sources_opened": 0,
+          "namespace_paths_checked": 0
+        }
+      },
+      "edit": {
+        "baseline": {
+          "seconds": 0.08729612501338124,
+          "watch_fallback": true,
+          "source_bytes_read": 12657,
+          "refresh_entries_visited": 5000,
+          "discovery_reused": false,
+          "sources_opened": 904,
+          "namespace_paths_checked": 0
+        },
+        "current": {
+          "seconds": 0.0008364580571651459,
+          "watch_fallback": false,
+          "source_bytes_read": 15,
+          "refresh_entries_visited": 1,
+          "discovery_reused": true,
+          "sources_opened": 1,
+          "namespace_paths_checked": 0
+        }
+      }
+    },
+    {
+      "load_average": [
+        0.79736328125,
+        0.3037109375,
+        0.14990234375
+      ],
+      "stable": {
+        "current": {
+          "seconds": 0.00010941701475530863,
+          "watch_fallback": false,
+          "source_bytes_read": 0,
+          "refresh_entries_visited": 0,
+          "discovery_reused": true,
+          "sources_opened": 0,
+          "namespace_paths_checked": 0
+        },
+        "baseline": {
+          "seconds": 0.08339979196898639,
+          "watch_fallback": true,
+          "source_bytes_read": 12657,
+          "refresh_entries_visited": 5000,
+          "discovery_reused": false,
+          "sources_opened": 904,
+          "namespace_paths_checked": 0
+        }
+      },
+      "edit": {
+        "current": {
+          "seconds": 0.0007093331078067422,
+          "watch_fallback": false,
+          "source_bytes_read": 15,
+          "refresh_entries_visited": 1,
+          "discovery_reused": true,
+          "sources_opened": 1,
+          "namespace_paths_checked": 0
+        },
+        "baseline": {
+          "seconds": 0.07983987510669976,
+          "watch_fallback": true,
+          "source_bytes_read": 12657,
+          "refresh_entries_visited": 5000,
+          "discovery_reused": false,
+          "sources_opened": 904,
+          "namespace_paths_checked": 0
+        }
+      }
+    },
+    {
+      "load_average": [
+        1.05419921875,
+        0.365234375,
+        0.1708984375
+      ],
+      "stable": {
+        "baseline": {
+          "seconds": 0.0815616250038147,
+          "watch_fallback": true,
+          "source_bytes_read": 12657,
+          "refresh_entries_visited": 5000,
+          "discovery_reused": false,
+          "sources_opened": 904,
+          "namespace_paths_checked": 0
+        },
+        "current": {
+          "seconds": 7.087492849677801e-05,
+          "watch_fallback": false,
+          "source_bytes_read": 0,
+          "refresh_entries_visited": 0,
+          "discovery_reused": true,
+          "sources_opened": 0,
+          "namespace_paths_checked": 0
+        }
+      },
+      "edit": {
+        "baseline": {
+          "seconds": 0.08161329198628664,
+          "watch_fallback": true,
+          "source_bytes_read": 12657,
+          "refresh_entries_visited": 5000,
+          "discovery_reused": false,
+          "sources_opened": 904,
+          "namespace_paths_checked": 0
+        },
+        "current": {
+          "seconds": 0.00013099994976073503,
+          "watch_fallback": false,
+          "source_bytes_read": 15,
+          "refresh_entries_visited": 1,
+          "discovery_reused": true,
+          "sources_opened": 1,
+          "namespace_paths_checked": 0
+        }
+      }
+    },
+    {
+      "load_average": [
+        1.05419921875,
+        0.365234375,
+        0.1708984375
+      ],
+      "stable": {
+        "current": {
+          "seconds": 8.283404167741537e-05,
+          "watch_fallback": false,
+          "source_bytes_read": 0,
+          "refresh_entries_visited": 0,
+          "discovery_reused": true,
+          "sources_opened": 0,
+          "namespace_paths_checked": 0
+        },
+        "baseline": {
+          "seconds": 0.07906029094010592,
+          "watch_fallback": true,
+          "source_bytes_read": 12657,
+          "refresh_entries_visited": 5000,
+          "discovery_reused": false,
+          "sources_opened": 904,
+          "namespace_paths_checked": 0
+        }
+      },
+      "edit": {
+        "current": {
+          "seconds": 0.00010304199531674385,
+          "watch_fallback": false,
+          "source_bytes_read": 15,
+          "refresh_entries_visited": 1,
+          "discovery_reused": true,
+          "sources_opened": 1,
+          "namespace_paths_checked": 0
+        },
+        "baseline": {
+          "seconds": 0.08127325004898012,
+          "watch_fallback": true,
+          "source_bytes_read": 12657,
+          "refresh_entries_visited": 5000,
+          "discovery_reused": false,
+          "sources_opened": 904,
+          "namespace_paths_checked": 0
+        }
+      }
+    },
+    {
+      "load_average": [
+        1.05419921875,
+        0.365234375,
+        0.1708984375
+      ],
+      "stable": {
+        "baseline": {
+          "seconds": 0.08252262498717755,
+          "watch_fallback": true,
+          "source_bytes_read": 12657,
+          "refresh_entries_visited": 5000,
+          "discovery_reused": false,
+          "sources_opened": 904,
+          "namespace_paths_checked": 0
+        },
+        "current": {
+          "seconds": 8.895806968212128e-05,
+          "watch_fallback": false,
+          "source_bytes_read": 0,
+          "refresh_entries_visited": 0,
+          "discovery_reused": true,
+          "sources_opened": 0,
+          "namespace_paths_checked": 0
+        }
+      },
+      "edit": {
+        "baseline": {
+          "seconds": 0.08249483397230506,
+          "watch_fallback": true,
+          "source_bytes_read": 12657,
+          "refresh_entries_visited": 5000,
+          "discovery_reused": false,
+          "sources_opened": 904,
+          "namespace_paths_checked": 0
+        },
+        "current": {
+          "seconds": 0.000160665949806571,
+          "watch_fallback": false,
+          "source_bytes_read": 15,
+          "refresh_entries_visited": 1,
+          "discovery_reused": true,
+          "sources_opened": 1,
+          "namespace_paths_checked": 0
+        }
+      }
+    }
+  ],
+  "median_seconds": {
+    "stable": {
+      "current": 8.704198990017176e-05,
+      "baseline": 0.0815616250038147
+    },
+    "edit": {
+      "current": 0.000160665949806571,
+      "baseline": 0.08127325004898012
+    }
+  },
+  "qualified_program_commit": "8f1a78f67926f2858be56ceb070c2f7ddcffc0ad",
+  "qualified_consumer_commit": "95126ee24aabc6d1c0d11a84c2a12c5eac8afa95",
+  "baseline_program_commit": "687cf045a27bc07087988cb95f2ed9db0466263f",
+  "qualification_limits": "Shared warm macOS host. Linux is a two-CPU ARM64 Docker VM, with namespace fixtures on tmpfs; not independent native Linux hardware or cold storage. Windows is cross-compiled only. Default v2 has no general performance-win claim."
+}

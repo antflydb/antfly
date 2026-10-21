@@ -202,6 +202,11 @@ components:
           type: string
           minLength: 1
           maxLength: 1048576
+        context_index:
+          x-go-type-skip-optional-pointer: false
+          type: integer
+          minimum: 0
+          description: Index into request contexts. Requires context_version 1. Effective input is context, newline, then input; the 1 MiB input limit applies after expansion.
     DecideLongDocument:
       type: object
       additionalProperties: false
@@ -326,6 +331,18 @@ components:
       - model
       - questions
       properties:
+        context_version:
+          type: integer
+          enum: [1]
+          description: Explicit shared-context transport version. Requires batched inputs and contexts; unknown versions are rejected.
+        contexts:
+          type: array
+          maxItems: 128
+          items:
+            type: string
+            minLength: 1
+            maxLength: 1048576
+          description: Shared immutable context strings referenced by context_index. Requires context_version 1. Total expanded input bytes are limited to 16 MiB.
         model: *id001
         model_identity:
           type: string

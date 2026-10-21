@@ -100,6 +100,7 @@ pub const Connection = struct {
 
         var socket = try Socket.connectHost(host, port, io);
         errdefer socket.close();
+        socket.setNoDelay(true) catch {};
         socket.setKeepAlive(true) catch {};
 
         const now = milliTimestamp(io);
@@ -170,6 +171,7 @@ pub const TlsConnection = struct {
         // Resolve and connect the TCP socket.
         entry.socket = try Socket.connectHost(host, port, io);
         errdefer entry.socket.close();
+        entry.socket.setNoDelay(true) catch {};
 
         // Initialize the TLS session.  The session stores internal pointers to
         // entry.socket (via SocketIoReader/Writer), so the entry must already
@@ -691,4 +693,22 @@ test "TlsPool cleanup on empty pool" {
     // Should not panic on an empty pool.
     tls_pool.cleanup();
     try std.testing.expectEqual(@as(usize, 0), tls_pool.totalCount());
+}
+
+test "H1 pooled connections disable Nagle across reuse" {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const io = std.testing.io;
+    var listener = try socket_mod.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var pool = ConnectionPool.init(std.testing.allocator, io, {});
+    defer pool.deinit();
+    const first = try pool.getConnection("127.0.0.1", listener.getLocalAddress().getPort());
+    var value: c_int = 0;
+    var size: std.posix.socklen_t = @sizeOf(c_int);
+    try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(std.posix.system.getsockopt(first.socket.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, @ptrCast(&value), &size)));
+    try std.testing.expect(value != 0);
+    pool.releaseConnection(first);
+    const reused = try pool.getConnection("127.0.0.1", listener.getLocalAddress().getPort());
+    defer pool.releaseConnection(reused);
+    try std.testing.expectEqual(first, reused);
 }

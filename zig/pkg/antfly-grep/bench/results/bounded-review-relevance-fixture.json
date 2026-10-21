@@ -1,0 +1,153 @@
+{
+  "evaluation": "fixture_pipeline",
+  "manifest_sha256": "3778f527da11fa7e406a3d00679f89ae0102e7845e550b98bc7f5b2ed75bc1fb",
+  "binary_sha256": "abaca853e733c85c56286043ff302fb1558e89b246c31e29b6d8dae07456ca85",
+  "model": "fixture",
+  "ranking": "CLI file order, then source-line order",
+  "token_accounting": "Provider-reported CLI counters; zero may mean omitted usage. Fixture replies omit token usage.",
+  "source_snapshots": {
+    "document.zig": {
+      "path": "zig/pkg/antfly-grep/src/document.zig",
+      "sha256": "6a5b5ecdd25c713d857fe65186458dfc100cd5cb2da0f35d90a3bf5752d7bc47"
+    },
+    "budget.zig": {
+      "path": "zig/pkg/antfly-grep/src/budget.zig",
+      "sha256": "18c74ee9b3c918b7ea1a75b9355ab006c217a097a2d7b744aac6aa9b9573a0c0"
+    },
+    "http_date.zig": {
+      "path": "zig/pkg/antfly-grep/src/http_date.zig",
+      "sha256": "8389e3fb2aedc54cb7a8f235e29d28cefd3d3a86137e67748f9555ce0bbf57ea"
+    }
+  },
+  "token_prices_usd_per_million": {
+    "input": null,
+    "output": null
+  },
+  "questions": [
+    {
+      "fixture_request_bytes": 523422,
+      "fixture_target_evaluations": 304,
+      "id": "repository-1",
+      "precision": 1.0,
+      "recall": 1.0,
+      "ndcg": 1.0,
+      "true_positive": 1,
+      "returned": 1,
+      "expected": 1,
+      "complete": true,
+      "elapsed_seconds": 0.509954917,
+      "files": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "ndcg": 1.0,
+        "true_positive": 1,
+        "returned": 1,
+        "expected": 1
+      },
+      "requests": 45,
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "estimated_cost_usd": null
+    },
+    {
+      "fixture_request_bytes": 523827,
+      "fixture_target_evaluations": 304,
+      "id": "repository-2",
+      "precision": 1.0,
+      "recall": 1.0,
+      "ndcg": 1.0,
+      "true_positive": 1,
+      "returned": 1,
+      "expected": 1,
+      "complete": true,
+      "elapsed_seconds": 0.508917166,
+      "files": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "ndcg": 1.0,
+        "true_positive": 1,
+        "returned": 1,
+        "expected": 1
+      },
+      "requests": 45,
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "estimated_cost_usd": null
+    },
+    {
+      "fixture_request_bytes": 523962,
+      "fixture_target_evaluations": 304,
+      "id": "repository-3",
+      "precision": 1.0,
+      "recall": 1.0,
+      "ndcg": 1.0,
+      "true_positive": 2,
+      "returned": 2,
+      "expected": 2,
+      "complete": true,
+      "elapsed_seconds": 0.3959698330000001,
+      "files": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "ndcg": 1.0,
+        "true_positive": 1,
+        "returned": 1,
+        "expected": 1
+      },
+      "requests": 45,
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "estimated_cost_usd": null
+    },
+    {
+      "fixture_request_bytes": 523197,
+      "fixture_target_evaluations": 304,
+      "id": "repository-4",
+      "precision": 1.0,
+      "recall": 1.0,
+      "ndcg": 1.0,
+      "true_positive": 4,
+      "returned": 4,
+      "expected": 4,
+      "complete": true,
+      "elapsed_seconds": 0.475251667,
+      "files": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "ndcg": 1.0,
+        "true_positive": 1,
+        "returned": 1,
+        "expected": 1
+      },
+      "requests": 45,
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "estimated_cost_usd": null
+    },
+    {
+      "fixture_request_bytes": 522927,
+      "fixture_target_evaluations": 304,
+      "id": "repository-no-source",
+      "precision": 1,
+      "recall": 1,
+      "ndcg": 1,
+      "true_positive": 0,
+      "returned": 0,
+      "expected": 0,
+      "complete": true,
+      "elapsed_seconds": 0.45070291699999987,
+      "files": {
+        "precision": 1,
+        "recall": 1,
+        "ndcg": 1,
+        "true_positive": 0,
+        "returned": 0,
+        "expected": 0
+      },
+      "requests": 45,
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "estimated_cost_usd": null
+    }
+  ]
+}

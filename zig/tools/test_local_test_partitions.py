@@ -147,12 +147,12 @@ pub fn build(b: *std.Build) void {
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text)
 
-    def build(self, *args, succeeds=True, build_options=()):
+    def build(self, *args, succeeds=True, build_options=(), step="test"):
         result = subprocess.run(
             [
                 "zig",
                 "build",
-                "test",
+                step,
                 "--cache-dir",
                 str(self.root / ".zig-cache"),
                 "-j2",
@@ -168,6 +168,36 @@ pub fn build(b: *std.Build) void {
         output = result.stdout + result.stderr
         self.assertEqual(result.returncode == 0, succeeds, output)
         return output
+
+    def test_portable_install_retains_local_tests_after_binding_and_repeated_finalize(
+        self,
+    ):
+        build = self.root / "build.zig"
+        build.write_text(
+            build.read_text().replace(
+                "    const wrapped =",
+                '    @import("build_support/antfly/test_partitions.zig").installLocalArtifact(b, tests, "portable-tests", "Install local owner", "local-tests");\n'
+                "    const wrapped =",
+            )
+        )
+        output = self.build(step="portable-tests")
+        self.assertNotIn("local owned...", output)
+        result = subprocess.run(
+            [
+                str(self.root / "zig-out/bin/local-tests"),
+                "--test-filter",
+                "local owned",
+                "--require-no-skips",
+            ],
+            cwd=self.root,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("local owned...", output)
+        self.assertNotIn("server owned...", output)
 
     def test_long_run_allows_ready_sibling_compilation(self):
         self.write("probe.zig", "export fn probe() u32 { return 42; }\n")

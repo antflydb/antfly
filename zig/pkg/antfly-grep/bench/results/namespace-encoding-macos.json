@@ -1,0 +1,105 @@
+{
+  "measurement": "Isolate native v2/v3 encoding with a buffered raw-byte consumer.\n\nValidate complete decoded results before timing. Timed requests drain every\nframe and validate summaries/termination, but decode only control records.\nProducer CPU includes workers; raw-drain elapsed is not editor/client latency.\nUse enough requests to amortize 10 ms process CPU counter quantization.\n",
+  "host": "macOS-27.0.1-arm64-arm-64bit",
+  "driver_sha256": "b363b0fea98e6eed34b6824c47a12784e7336655ccacd2ba8563a7c5c7162503",
+  "binaries": {
+    "baseline": "6a09a4c44056ecf6507332d05da889de7451d2c574a7814a8fa717e02704fbdc",
+    "candidate": "d1cae565836898beb6ed9d836e007af980c22829ccd65bd0f2a40983a7c78927"
+  },
+  "requests_per_control": 64,
+  "lines": 20000,
+  "trials": [
+    {
+      "baseline_v2": {
+        "seconds_per_request": 0.010313544265624999,
+        "producer_cpu_per_request": 0.008125,
+        "wire_bytes_per_request": 6084765.21875
+      },
+      "candidate_v2": {
+        "seconds_per_request": 0.010411174484375,
+        "producer_cpu_per_request": 0.008125,
+        "wire_bytes_per_request": 6084765.390625
+      },
+      "baseline_v3": {
+        "seconds_per_request": 0.007560301421874999,
+        "producer_cpu_per_request": 0.0071874999999999994,
+        "wire_bytes_per_request": 4065870.0
+      },
+      "candidate_v3": {
+        "seconds_per_request": 0.007498187500000003,
+        "producer_cpu_per_request": 0.00703125,
+        "wire_bytes_per_request": 4065870.0
+      }
+    },
+    {
+      "candidate_v2": {
+        "seconds_per_request": 0.010471801421874996,
+        "producer_cpu_per_request": 0.00828125,
+        "wire_bytes_per_request": 6084765.34375
+      },
+      "baseline_v3": {
+        "seconds_per_request": 0.007647541015624995,
+        "producer_cpu_per_request": 0.0071874999999999994,
+        "wire_bytes_per_request": 4065870.03125
+      },
+      "candidate_v3": {
+        "seconds_per_request": 0.007674839843750003,
+        "producer_cpu_per_request": 0.0071874999999999994,
+        "wire_bytes_per_request": 4065870.0625
+      },
+      "baseline_v2": {
+        "seconds_per_request": 0.010829623703125,
+        "producer_cpu_per_request": 0.00828125,
+        "wire_bytes_per_request": 6084765.546875
+      }
+    },
+    {
+      "baseline_v3": {
+        "seconds_per_request": 0.007664701812499994,
+        "producer_cpu_per_request": 0.0071874999999999994,
+        "wire_bytes_per_request": 4065870.03125
+      },
+      "candidate_v3": {
+        "seconds_per_request": 0.007535835281249986,
+        "producer_cpu_per_request": 0.0071874999999999994,
+        "wire_bytes_per_request": 4065870.0
+      },
+      "baseline_v2": {
+        "seconds_per_request": 0.010147988281249992,
+        "producer_cpu_per_request": 0.00796875,
+        "wire_bytes_per_request": 6084764.640625
+      },
+      "candidate_v2": {
+        "seconds_per_request": 0.010233065749999992,
+        "producer_cpu_per_request": 0.00796875,
+        "wire_bytes_per_request": 6084765.09375
+      }
+    }
+  ],
+  "median": {
+    "baseline_v2": {
+      "seconds_per_request": 0.010313544265624999,
+      "producer_cpu_per_request": 0.008125,
+      "wire_bytes_per_request": 6084765.21875
+    },
+    "candidate_v2": {
+      "seconds_per_request": 0.010411174484375,
+      "producer_cpu_per_request": 0.008125,
+      "wire_bytes_per_request": 6084765.34375
+    },
+    "baseline_v3": {
+      "seconds_per_request": 0.007647541015624995,
+      "producer_cpu_per_request": 0.0071874999999999994,
+      "wire_bytes_per_request": 4065870.03125
+    },
+    "candidate_v3": {
+      "seconds_per_request": 0.007535835281249986,
+      "producer_cpu_per_request": 0.0071874999999999994,
+      "wire_bytes_per_request": 4065870.0
+    }
+  },
+  "qualified_program_commit": "8f1a78f67926f2858be56ceb070c2f7ddcffc0ad",
+  "qualified_consumer_commit": "95126ee24aabc6d1c0d11a84c2a12c5eac8afa95",
+  "baseline_program_commit": "687cf045a27bc07087988cb95f2ed9db0466263f",
+  "qualification_limits": "Shared warm macOS host. Linux is a two-CPU ARM64 Docker VM, with namespace fixtures on tmpfs; not independent native Linux hardware or cold storage. Windows is cross-compiled only. Default v2 has no general performance-win claim."
+}

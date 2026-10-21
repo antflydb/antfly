@@ -25,6 +25,17 @@ ROOT = Path(__file__).resolve().parent.parent
 ASSETS = json.loads(
     Path(__file__).with_name("embedded_asset_licenses.json").read_text()
 )
+# Reviewed format data with a separately preserved permissive license. This is
+# deliberately an exact asset list; fonts and first-party data remain Apache.
+REVIEWED_DATA_LICENSES = {
+    "zig/lib/compress/src/brotli/brotli_dictionary.bin": "MIT",
+    "zig/lib/syntax/src/grammars/go.bin": "MIT",
+    "zig/lib/syntax/src/grammars/go_corpus.bin": "MIT",
+    "zig/lib/syntax/src/grammars/python.bin": "MIT",
+    "zig/lib/syntax/src/grammars/python_corpus.bin": "MIT",
+    "zig/lib/syntax/src/grammars/rust.bin": "MIT",
+    "zig/lib/syntax/src/grammars/rust_corpus.bin": "MIT",
+}
 FONT_EXTENSIONS = {".ttf", ".ttc", ".otf", ".woff", ".woff2"}
 
 
@@ -57,10 +68,22 @@ def check_asset_records(root: Path = ROOT) -> list[str]:
             or hashlib.sha256(data).hexdigest() != record["sha256"]
         ):
             errors.append(f"embedded asset identity differs: {name}")
-        if record["license"] != "Apache-2.0":
+        expected_license = REVIEWED_DATA_LICENSES.get(name, "Apache-2.0")
+        if record["license"] != expected_license:
             errors.append(
-                f"embedded asset must retain its reviewed Apache license: {name}"
+                f"embedded asset must retain its reviewed {expected_license} license: {name}"
             )
+        if name in REVIEWED_DATA_LICENSES:
+            for key in ("license_text", "source"):
+                if not record.get(key):
+                    errors.append(f"missing format data {key}: {name}")
+            if (
+                record.get("license_text")
+                and not (root / record["license_text"]).is_file()
+            ):
+                errors.append(
+                    f"missing format data license file: {record['license_text']}"
+                )
         if is_font(path):
             for key in ("notice", "license_text", "source"):
                 if not record.get(key):
