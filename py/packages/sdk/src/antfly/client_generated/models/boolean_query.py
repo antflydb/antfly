@@ -263,6 +263,14 @@ class BooleanQuery:
         from ..models.term_range_query import TermRangeQuery
         from ..models.wildcard_query import WildcardQuery
 
+        if set(src_dict) - {
+            "must",
+            "should",
+            "must_not",
+            "filter",
+            "boost",
+        }:
+            raise ValueError("Unexpected properties for BooleanQuery")
         d = dict(src_dict)
         _must = d.pop("must", UNSET)
         must: ConjunctionQuery | Unset

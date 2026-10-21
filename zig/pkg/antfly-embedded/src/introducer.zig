@@ -910,6 +910,20 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
     };
 }
 
+/// Spill at physical-field boundaries as well as row boundaries. A document
+/// may have many analyzed companions, each larger than the entire run target.
+/// Waiting for its last field defeats the working-set bound on small nodes.
+fn spillPendingFields(alloc: Allocator, builders: *FieldPostingsBuilders, options: BuildTextOptions, count: u32, spool: *?*PostingRun) !void {
+    if (options.postings_run_io == null or builders.pending_bytes < options.postings_run_target_bytes) return;
+    for (builders.pending.items) |name| {
+        const builder = builders.getPtr(name).?;
+        if (options.profile) |p| p.postings_spill_checks +|= 1;
+        try builder.spill(alloc, options, count, spool);
+        builder.queued = false;
+    }
+    builders.pending.clearRetainingCapacity();
+}
+
 fn writeTextSegmentWithScratch(
     alloc: Allocator,
     docs: []const TextDocument,
@@ -1010,6 +1024,10 @@ fn writeTextSegmentWithScratch(
 
         if (!hasDuplicateTextFieldNames(text_doc.text_fields)) {
             for (text_doc.text_fields) |tf| {
+                // Unique contributions do not share token ownership. Release
+                // copied term keys between physical representations, rather
+                // than retaining every representation until the row finishes.
+                _ = doc_arena_state.reset(.{ .retain_with_limit = options.doc_scratch_retained_bytes });
                 try addSingleTextFieldToBuilders(
                     alloc,
                     doc_alloc,
@@ -1025,6 +1043,8 @@ fn writeTextSegmentWithScratch(
                     profile_timings,
                     &scratch,
                 );
+                scratch.hits.clearRetainingCapacity();
+                try spillPendingFields(alloc, &field_builders, options, @intCast(doc_idx + 1), &postings_spool);
             }
         } else {
             var field_maps = std.StringHashMapUnmanaged(FieldAcc).empty;
@@ -1100,15 +1120,7 @@ fn writeTextSegmentWithScratch(
         if (profile_timings) {
             if (profile) |p| p.typed_collect_ns +|= platform_time.monotonicNs() - typed_collect_start_ns;
         }
-        if (options.postings_run_io != null and field_builders.pending_bytes >= options.postings_run_target_bytes) {
-            for (field_builders.pending.items) |name| {
-                const builder = field_builders.getPtr(name).?;
-                if (profile) |p| p.postings_spill_checks +|= 1;
-                try builder.spill(alloc, options, @intCast(doc_idx + 1), &postings_spool);
-                builder.queued = false;
-            }
-            field_builders.pending.clearRetainingCapacity();
-        }
+        try spillPendingFields(alloc, &field_builders, options, @intCast(doc_idx + 1), &postings_spool);
         if (postings_spool) |spool| try spool.compact();
         if (profile_working_set) {
             if (profile) |p| {
@@ -4601,4 +4613,55 @@ test "introducer.substring stream admits only nonempty field contributions" {
     try accumulateAnalyzedField(a, &fields, "source", &analysis_mod.substring_analyzer, "", null, false);
     try std.testing.expectEqual(before, fields.get("source").?.token_offset);
     try std.testing.expectEqual(@as(u32, 1), fields.count());
+}
+
+test "bounded postings spill between large companion fields under small node allowance" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(directory);
+    const text = try a.alloc(u8, 180 * 1024);
+    defer a.free(text);
+    var random = std.Random.DefaultPrng.init(0x51ff1c);
+    for (text) |*byte| byte.* = 'a' + random.random().uintLessThan(u8, 26);
+    const fields = [_]TextField{
+        .{ .field_name = "content", .text = text },
+        .{ .field_name = "content._substring", .text = text, .analyzer = &analysis_mod.substring_analyzer },
+        .{ .field_name = "second._substring", .text = text, .analyzer = &analysis_mod.substring_analyzer },
+        .{ .field_name = "third._substring", .text = text, .analyzer = &analysis_mod.substring_analyzer },
+    };
+    const docs = [_]TextDocument{
+        .{ .id = "a", .stored_data = "{}", .text_fields = &fields, .typed_fields = &.{} },
+        .{ .id = "b", .stored_data = "{}", .text_fields = &fields, .typed_fields = &.{} },
+    };
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.full_text_build_working_set)] = .{
+        .soft_limit_bytes = 96 * 1024 * 1024,
+        .hard_limit_bytes = 128 * 1024 * 1024,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var output = segment_mod.MemorySegmentSink.init(a);
+    defer output.deinit();
+    var sink = output.sink();
+    var profile: BuildTextProfile = .{};
+    writeSegmentFromTextWithAnalysisOptions(textBuildScratchAllocator(), &docs, &analysis_mod.default_analyzer, .{}, .{
+        .resource_manager = &manager,
+        .postings_run_io = std.testing.io,
+        .postings_run_directory = directory,
+        .profile = &profile,
+        .profile_timings = false,
+        .profile_working_set = false,
+    }, &sink) catch |err| {
+        std.debug.print("COMPANION_FAILURE fields={d} hits={d} runs={d} peak={d} err={s}\n", .{ profile.text_field_count, profile.term_hit_count, profile.postings_run_count, manager.sliceStats(.full_text_build_working_set).peak_bytes, @errorName(err) });
+        return err;
+    };
+    const stats = manager.sliceStats(.full_text_build_working_set);
+    try std.testing.expectEqual(@as(u64, 0), stats.used_bytes);
+    try std.testing.expect(stats.peak_bytes <= 128 * 1024 * 1024);
+    try std.testing.expect(profile.postings_run_count >= 6);
+    var reader = try segment_mod.SegmentReader.init(a, output.out.items);
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(u32, 2), reader.doc_count);
+    std.debug.print("COMPANION_SPILL source_bytes={d} fields={d} peak_bytes={d} runs={d}\n", .{ text.len, fields.len, stats.peak_bytes, profile.postings_run_count });
 }

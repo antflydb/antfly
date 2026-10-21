@@ -83,6 +83,15 @@ class TermRangeQuery:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        if set(src_dict) - {
+            "min",
+            "max",
+            "inclusive_min",
+            "inclusive_max",
+            "field",
+            "boost",
+        }:
+            raise ValueError("Unexpected properties for TermRangeQuery")
         d = dict(src_dict)
 
         def _parse_min_(data: object) -> None | str | Unset:

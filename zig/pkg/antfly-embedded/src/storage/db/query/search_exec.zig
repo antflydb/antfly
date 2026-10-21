@@ -18701,12 +18701,38 @@ const ValueExecution = struct {
     projection_attempted: bool = false,
     stored_read_policy: @import("../../../search/value_source.zig").StoredReadPolicy = .{},
     source_tuner: SourceReadTuner = .{},
+    tuning_key: ?u64 = null,
+    tuning_started: bool = false,
     source_epoch: usize = 0,
     original_average_bytes: u64 = 0,
     literal_groups: std.ArrayListUnmanaged(LiteralGroup) = .empty,
     cohorts: std.ArrayListUnmanaged(Cohort) = .empty,
     active_cohort: ?usize = null,
     literals_checked: bool = false,
+    fn beginTuning(self: *@This(), projected: bool) void {
+        if (self.tuning_started and !projected) return;
+        self.publishTuning();
+        self.tuning_started = true;
+        self.tuning_key = null;
+        const scope = self.req.value_search_scope orelse return;
+        // Hints contain timing/size classes only, never source or membership.
+        // A provider change or a projected reader gets independent feedback.
+        var hash = std.hash.Wyhash.init(if (projected) 1 else 0);
+        hash.update(&scope.source_identity);
+        if (self.req.index_name) |index| hash.update(index);
+        const provider = if (projected) if (self.open_projected) |open| @intFromPtr(open) else 0 else if (self.load_many) |load| @intFromPtr(load) else if (self.load) |load| @intFromPtr(load) else 0;
+        hash.update(std.mem.asBytes(&provider));
+        const key = hash.final();
+        self.tuning_key = key;
+        if (source_read_hints.get(key, @import("../native_query_cut.zig").nowMs())) |hint| {
+            const max_rows = self.source_tuner.max_rows;
+            self.source_tuner = hint;
+            self.source_tuner.max_rows = max_rows;
+        }
+    }
+    fn publishTuning(self: *@This()) void {
+        if (self.tuning_key) |key| source_read_hints.put(key, self.source_tuner, @import("../native_query_cut.zig").nowMs());
+    }
     fn observeOriginal(self: *@This(), rows: usize, bytes: u64) void {
         if (rows == 0) return;
         const mean = bytes / rows;
@@ -18734,7 +18760,10 @@ const ValueExecution = struct {
             // Different source representations have different read costs.
             // Restart learning without charging one-time snapshot setup to a
             // steady-state arm, retaining any allocator-imposed row ceiling.
+            self.publishTuning();
+            self.tuning_key = null;
             self.source_tuner = .{ .max_rows = self.source_tuner.max_rows, .bootstrapped = true };
+            self.beginTuning(true);
             self.source_epoch += 1;
         }
         const reader = self.projected_reader.?;
@@ -18770,6 +18799,7 @@ const ValueExecution = struct {
         return output[0..n];
     }
     fn deinit(self: *@This()) void {
+        self.publishTuning();
         if (self.projected_reader) |reader| reader.close(reader.ctx);
         self.clearGroups();
         for (self.producers.items) |producer| {
@@ -19112,6 +19142,80 @@ const SourceReadTuner = struct {
     }
 };
 
+/// Fixed-size, memory-only provider hints. A hit seeds cost selection; all byte
+/// caps, refusal fallback and periodic probes still apply. New executions do not
+/// inherit elapsed time or work counters. Source representation switches use a
+/// different key. No allocator or provider call runs under this lock.
+const SourceReadHints = struct {
+    const Entry = struct { key: u64, expires_ms: u64, tuner: SourceReadTuner };
+    entries: [64]?Entry = @splat(null),
+    next: usize = 0,
+    mutex: std.atomic.Mutex = .unlocked,
+    fn get(self: *@This(), key: u64, now: u64) ?SourceReadTuner {
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.entries) |entry| if (entry) |value| {
+            if (value.key == key and value.expires_ms > now) {
+                var tuner = value.tuner;
+                // Keep one mean-cost observation per sampled arm. A new query
+                // adapts quickly instead of inheriting a whole prior epoch.
+                for (&tuner.rows, &tuner.ns) |*rows, *ns| if (rows.* != 0) {
+                    ns.* /= rows.*;
+                    rows.* = 1;
+                };
+                tuner.calls = 0;
+                tuner.bootstrapped = false;
+                tuner.average_bytes = 0;
+                tuner.max_rows = 64;
+                return tuner;
+            }
+        };
+        return null;
+    }
+    fn put(self: *@This(), key: u64, tuner: SourceReadTuner, now: u64) void {
+        if (tuner.exploring) return;
+        const best = tuner.best();
+        if (tuner.observations[best] < 3 or tuner.rows[best] < 64) return;
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        var index = self.next;
+        for (self.entries, 0..) |entry, i| if (entry) |value| {
+            if (value.key == key) {
+                index = i;
+                break;
+            }
+        };
+        var saved = tuner;
+        saved.choice = best;
+        self.entries[index] = .{ .key = key, .expires_ms = now +| 60000, .tuner = saved };
+        self.next = (index + 1) % self.entries.len;
+    }
+};
+var source_read_hints: SourceReadHints = .{};
+
+test "logical value provider hints amortize calibration and preserve caps expiry and isolation" {
+    var cache: SourceReadHints = .{};
+    var trained: SourceReadTuner = .{};
+    for (0..256) |_| {
+        const rows = trained.desired();
+        trained.observe(if (rows == 1) .scalar else .batch, rows, rows * 1024, 1000 + rows * 10);
+    }
+    cache.put(7, trained, 100);
+    var warm = cache.get(7, 101).?;
+    try std.testing.expect(!warm.exploring);
+    try std.testing.expectEqual(@as(usize, 2), warm.desired());
+    warm.observe(.batch, 2, 2048, 1000000);
+    try std.testing.expectEqual(@as(usize, 64), warm.desired());
+    warm.max_rows = 4;
+    try std.testing.expectEqual(@as(usize, 4), warm.desired());
+    try std.testing.expect(cache.get(8, 101) == null);
+    try std.testing.expect(cache.get(7, 60100) == null);
+    var cold: SourceReadTuner = .{};
+    cold.observe(.batch, 2, 2048, 1000);
+    cache.put(8, cold, 101);
+    try std.testing.expect(cache.get(8, 102) == null);
+}
+
 test "logical value source bootstrap bounds initial originals without changing steady state" {
     var tuner: SourceReadTuner = .{};
     try std.testing.expectEqual(@as(usize, 2), tuner.desired());
@@ -19431,6 +19535,7 @@ const ValueProducer = struct {
         defer if (indexed) |*bitmap| bitmap.deinit();
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
+        owner.beginTuning(false);
         var source_window: ValueSourceWindow = .{ .rows = owner.source_tuner.desired(), .budget = .{ .backing = @import("../../../sql/memory_budget.zig").reclaimingAllocator(a), .limit = ValueSourceWindow.limit } };
         source_window.arena = .init(source_window.budget.allocator());
         defer source_window.arena.deinit();

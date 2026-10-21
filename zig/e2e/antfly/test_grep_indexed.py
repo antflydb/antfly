@@ -950,6 +950,72 @@ def test_logical_verification_reuses_sources_and_retained_predicate_facts(statef
     assert fresh["profile"]["value_verification"]["documents"] == 20
 
 
+@pytest.mark.parametrize("num_shards", [1, 3])
+def test_logical_retained_boolean_counts_need_no_source_work(stateful_api, num_shards):
+    table = f"logical_boolean_count_{num_shards}_{time.time_ns()}"
+    stateful_api.post(f"/tables/{table}", {"num_shards": num_shards})
+    stateful_api.batch_write(
+        table,
+        inserts={f"{i:03}": {"title": "needle alpha beta"} for i in range(20)},
+        sync_level="full_index",
+    )
+    leaves = [
+        {"contains": term, "field": "title"}
+        for term in ("needle", "alpha", "beta", "absent")
+    ]
+    url = stateful_api.url + f"/tables/{table}/query"
+    warm = requests.post(
+        url,
+        json={
+            "query": {"bool": {"should": leaves}},
+            "execution": {"value_verification": {"allow_scan": True}},
+            "profile": True,
+            "limit": 1,
+            "order_by": [{"field": "_id", "desc": False}],
+        },
+        timeout=60,
+    )
+    assert warm.status_code == 200, warm.text
+    snapshot = warm.json()["responses"][0]["remote_snapshot"]
+    cases = [
+        ({"must": leaves[:2]}, 20),
+        ({"should": leaves[2:]}, 20),
+        ({"should": [leaves[0], leaves[1], leaves[3]], "minimum_should_match": 2}, 20),
+        ({"must": leaves[:1], "must_not": leaves[1:2]}, 0),
+        (
+            {
+                "must": [leaves[0]],
+                "filter": {"bool": {"should": [leaves[1], leaves[3]]}},
+                "must_not": [leaves[3]],
+            },
+            20,
+        ),
+    ]
+    for expression, expected in cases:
+        counted = requests.post(
+            url,
+            json={
+                "query": {"bool": expression},
+                "count": True,
+                "remote_snapshot": snapshot,
+                "profile": True,
+                "execution": {
+                    "value_verification": {
+                        "allow_scan": True,
+                        "max_documents": 1,
+                        "max_bytes": 1,
+                    }
+                },
+            },
+            timeout=60,
+        )
+        assert counted.status_code == 200, counted.text
+        result = counted.json()["responses"][0]
+        assert result["hits"]["total"]["value"] == expected, result
+        assert result["profile"]["value_verification"]["documents"] == 0, result
+        assert result["profile"]["value_verification"]["bytes"] == 0, result
+
+
 def test_logical_verification_work_profile(stateful_api):
     """Optional comparable artifact: run this case against either server binary."""
     import hashlib

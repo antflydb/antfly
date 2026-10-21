@@ -87,6 +87,16 @@ class DateRangeStringQuery:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        if set(src_dict) - {
+            "start",
+            "end",
+            "inclusive_start",
+            "inclusive_end",
+            "field",
+            "boost",
+            "datetime_parser",
+        }:
+            raise ValueError("Unexpected properties for DateRangeStringQuery")
         d = dict(src_dict)
         _start = d.pop("start", UNSET)
         start: datetime.datetime | Unset

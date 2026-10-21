@@ -32,6 +32,8 @@ const Allocator = std.mem.Allocator;
 /// not additional references; exactly one caller releases each acquired lease.
 pub const BorrowedBitmap = struct {
     bitmap: *const RoaringBitmap,
+    /// Computed by the immutable owner at publication, never by lookup.
+    cached_cardinality: ?usize = null,
     context: [2]*anyopaque,
     release: *const fn ([2]*anyopaque) void,
     pub fn deinit(self: *@This()) void {
@@ -770,6 +772,25 @@ pub const RoaringBitmap = struct {
         return self.keys.items.len == 0;
     }
 
+    pub fn maximum(self: *const RoaringBitmap) ?u32 {
+        var index = self.keys.items.len;
+        while (index != 0) {
+            index -= 1;
+            const high = @as(u32, self.keys.items[index]) << 16;
+            switch (self.containers.items[index]) {
+                .array => |values| if (values.items.len != 0) return high | values.items[values.items.len - 1],
+                .bitmap => |values| {
+                    var word = values.len;
+                    while (word != 0) {
+                        word -= 1;
+                        if (values[word] != 0) return high | @as(u32, @intCast(word * 64 + 63 - @clz(values[word])));
+                    }
+                },
+            }
+        }
+        return null;
+    }
+
     /// Borrowed, bounded traversal of the complement in [lower, upper).
     /// Sparse containers skip runs of members; dense containers skip words.
     /// The bitmap must remain immutable for the iterator's lifetime.
@@ -780,6 +801,42 @@ pub const RoaringBitmap = struct {
 
     pub fn iterator(self: *const RoaringBitmap) Iterator {
         return Iterator.init(self);
+    }
+
+    /// Nonzero aligned words in ascending order. Sparse containers coalesce
+    /// adjacent members without expanding to dense storage. The owner must
+    /// remain immutable for the iterator's lifetime.
+    pub const Word = struct { base: u32, bits: u64 };
+    pub const WordIterator = struct {
+        bitmap: *const RoaringBitmap,
+        container: usize = 0,
+        position: usize = 0,
+        pub fn next(self: *@This()) ?Word {
+            while (self.container < self.bitmap.keys.items.len) {
+                const high = @as(u32, self.bitmap.keys.items[self.container]) << 16;
+                switch (self.bitmap.containers.items[self.container]) {
+                    .array => |values| if (self.position < values.items.len) {
+                        const low = values.items[self.position] & ~@as(u16, 63);
+                        var bits: u64 = 0;
+                        while (self.position < values.items.len and values.items[self.position] & ~@as(u16, 63) == low) : (self.position += 1) {
+                            bits |= @as(u64, 1) << @as(u6, @truncate(values.items[self.position]));
+                        }
+                        return .{ .base = high | low, .bits = bits };
+                    },
+                    .bitmap => |words| while (self.position < words.len) {
+                        const index = self.position;
+                        self.position += 1;
+                        if (words[index] != 0) return .{ .base = high | @as(u32, @intCast(index * 64)), .bits = words[index] };
+                    },
+                }
+                self.container += 1;
+                self.position = 0;
+            }
+            return null;
+        }
+    };
+    pub fn wordIterator(self: *const RoaringBitmap) WordIterator {
+        return .{ .bitmap = self };
     }
 
     pub fn clone(self: *const RoaringBitmap, alloc: Allocator) !RoaringBitmap {
@@ -833,6 +890,12 @@ pub const RoaringBitmap = struct {
 
     /// Count an intersection directly in compressed containers, without a copy.
     pub fn intersectionCardinality(self: *const RoaringBitmap, other: *const RoaringBitmap) usize {
+        return self.intersectionCardinalityExcluding(other, null);
+    }
+
+    /// Count live intersection members in one container merge. Dense operands
+    /// retain word-popcount execution, including a dense deletion mask.
+    pub fn intersectionCardinalityExcluding(self: *const RoaringBitmap, other: *const RoaringBitmap, excluded: ?*const RoaringBitmap) usize {
         var left: usize = 0;
         var right: usize = 0;
         var count: usize = 0;
@@ -849,16 +912,29 @@ pub const RoaringBitmap = struct {
             }
             const a = &self.containers.items[left];
             const b = &other.containers.items[right];
+            const removed: ?*const Container = if (excluded) |mask| blk: {
+                const at = arraySearchPos(mask.keys.items, lk);
+                break :blk if (at < mask.keys.items.len and mask.keys.items[at] == lk) &mask.containers.items[at] else null;
+            } else null;
             switch (a.*) {
                 .array => |values| for (values.items) |v| {
-                    if (b.contains(v)) count += 1;
+                    if (b.contains(v) and !(if (removed) |d| d.contains(v) else false)) count += 1;
                 },
                 .bitmap => |words| switch (b.*) {
                     .array => |values| for (values.items) |v| {
-                        if (a.contains(v)) count += 1;
+                        if (a.contains(v) and !(if (removed) |d| d.contains(v) else false)) count += 1;
                     },
-                    .bitmap => |other_words| for (words, other_words) |x, y| {
-                        count += @popCount(x & y);
+                    .bitmap => |other_words| {
+                        if (removed != null and removed.?.* == .bitmap) {
+                            for (words, other_words, removed.?.bitmap) |x, y, d| count += @popCount(x & y & ~d);
+                        } else {
+                            var live: usize = 0;
+                            for (words, other_words) |x, y| live += @popCount(x & y);
+                            if (removed) |d| for (d.array.items) |v| {
+                                if (a.contains(v) and b.contains(v)) live -= 1;
+                            };
+                            count += live;
+                        }
                     },
                 },
             }
@@ -2633,4 +2709,52 @@ test "logical value immutable intersection cardinality covers sparse and dense c
     var empty = RoaringBitmap.init(a);
     defer empty.deinit();
     try std.testing.expectEqual(@as(usize, 0), left.intersectionCardinality(&empty));
+}
+
+test "word iterator preserves sparse dense and terminal membership" {
+    var bitmap = RoaringBitmap.init(std.testing.allocator);
+    defer bitmap.deinit();
+    try bitmap.addRange(31, 100000);
+    try bitmap.add(0xffff_ffff);
+    var it = bitmap.wordIterator();
+    var total: usize = 0;
+    var previous: ?u32 = null;
+    while (it.next()) |word| {
+        if (previous) |base| try std.testing.expect(base < word.base);
+        try std.testing.expectEqual(@as(u32, 0), word.base % 64);
+        try std.testing.expectEqual(bitmap.wordMask(word.base), word.bits);
+        total += @popCount(word.bits);
+        previous = word.base;
+    }
+    try std.testing.expectEqual(bitmap.cardinality(), total);
+}
+
+test "logical value intersection counts exclude sparse dense and empty masks" {
+    const a = std.testing.allocator;
+    var left = RoaringBitmap.init(a);
+    defer left.deinit();
+    var right = RoaringBitmap.init(a);
+    defer right.deinit();
+    try left.addRange(500, 120000);
+    try right.addRange(70000, 150000);
+    try left.add(0xffff_ffff);
+    try right.add(0xffff_ffff);
+    for (0..3) |mode| {
+        var mask = RoaringBitmap.init(a);
+        defer mask.deinit();
+        if (mode == 1) {
+            try mask.addRange(80000, 100000);
+        } else if (mode == 2) {
+            try mask.add(99999);
+            try mask.add(0xffff_ffff);
+        }
+        var expected = try left.intersectionClone(a, &right);
+        defer expected.deinit();
+        expected.andNotWith(&mask);
+        try std.testing.expectEqual(expected.cardinality(), left.intersectionCardinalityExcluding(&right, &mask));
+        try std.testing.expectEqual(expected.cardinality(), right.intersectionCardinalityExcluding(&left, &mask));
+    }
+    try std.testing.expectEqual(@as(?u32, 0xffff_ffff), left.maximum());
+    left.andNotWith(&left);
+    try std.testing.expectEqual(@as(?u32, null), left.maximum());
 }

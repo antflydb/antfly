@@ -39,6 +39,10 @@ class BoolQuery:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.bool_query_body import BoolQueryBody
 
+        if set(src_dict) - {
+            "bool",
+        }:
+            raise ValueError("Unexpected properties for BoolQuery")
         d = dict(src_dict)
         bool_ = BoolQueryBody.from_dict(d.pop("bool"))
 

@@ -1246,6 +1246,15 @@ class BoolQueryBody:
         from ..models.term_range_query import TermRangeQuery
         from ..models.wildcard_query import WildcardQuery
 
+        if set(src_dict) - {
+            "must",
+            "should",
+            "must_not",
+            "filter",
+            "minimum_should_match",
+            "boost",
+        }:
+            raise ValueError("Unexpected properties for BoolQueryBody")
         d = dict(src_dict)
 
         def _parse_must(

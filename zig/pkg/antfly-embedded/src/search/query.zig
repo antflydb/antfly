@@ -2310,6 +2310,215 @@ pub fn countFilterIntersection(
     return total;
 }
 
+/// A bounded postfix program over immutable word streams. Dense words use
+/// bitwise operations; sparse inputs skip absent words. Optional cache misses,
+/// oversized expressions and unsupported leaves use the ordinary executor.
+const BorrowedCount = struct {
+    const Op = union(enum) { input: usize, all, none, intersect, subtract, threshold: struct { count: usize, required: u32 } };
+    ops: [128]Op = undefined,
+    op_count: usize = 0,
+    pins: [64]roaring.BorrowedBitmap = undefined,
+    pin_count: usize = 0,
+    controls: [32]ExecutionControl = undefined,
+    control_count: usize = 0,
+    universe: bool = false,
+    fn deinit(self: *@This()) void {
+        for (self.pins[0..self.pin_count]) |*pin| pin.deinit();
+    }
+    fn append(self: *@This(), op: Op) !void {
+        if (self.op_count == self.ops.len) return error.BorrowedCountUnavailable;
+        self.ops[self.op_count] = op;
+        self.op_count += 1;
+    }
+    fn compile(self: *@This(), filter: Filter, offset: u32, count: u32, depth: usize) anyerror!void {
+        if (depth == 32) return error.BorrowedCountUnavailable;
+        switch (filter) {
+            .match_all => {
+                self.universe = true;
+                try self.append(.all);
+            },
+            .match_none => try self.append(.none),
+            .doc_num => |f| {
+                const producer = f.producer orelse return error.BorrowedCountUnavailable;
+                if (f.bitmap != null or f.doc_nums.len != 0) return error.InvalidArgument;
+                const borrow = producer.borrow orelse return error.BorrowedCountUnavailable;
+                if (self.pin_count == self.pins.len) return error.BorrowedCountUnavailable;
+                const pin = try borrow(producer.ptr, offset, count) orelse return error.BorrowedCountUnavailable;
+                self.pins[self.pin_count] = pin;
+                self.pin_count += 1;
+                try self.append(.{ .input = self.pin_count - 1 });
+            },
+            .bool_filter => |f| {
+                try f.control.check();
+                if (self.control_count == self.controls.len) return error.BorrowedCountUnavailable;
+                self.controls[self.control_count] = f.control;
+                self.control_count += 1;
+                var positive = false;
+                for (f.must, 0..) |child, i| {
+                    if (child == .match_all and (positive or i + 1 < f.must.len)) continue;
+                    try self.compile(child.withControl(f.control), offset, count, depth + 1);
+                    if (positive) try self.append(.intersect);
+                    positive = true;
+                }
+                if (f.should.len != 0) {
+                    const required = if (f.min_should_match == 0 and !positive) 1 else f.min_should_match;
+                    if (required != 0) {
+                        if (required > f.should.len) {
+                            try self.append(.none);
+                        } else {
+                            for (f.should) |child| try self.compile(child.withControl(f.control), offset, count, depth + 1);
+                            try self.append(.{ .threshold = .{ .count = f.should.len, .required = required } });
+                        }
+                        if (positive) try self.append(.intersect);
+                        positive = true;
+                    }
+                }
+                // Match the ordinary executor's empty-positive semantics.
+                if (!positive) {
+                    try self.append(.none);
+                    return;
+                }
+                for (f.must_not) |child| {
+                    try self.compile(child.withControl(f.control), offset, count, depth + 1);
+                    try self.append(.subtract);
+                }
+            },
+            else => return error.BorrowedCountUnavailable,
+        }
+    }
+    fn evaluate(self: *const @This(), inputs: []const u64) u64 {
+        var stack: [128]u64 = undefined;
+        var length: usize = 0;
+        for (self.ops[0..self.op_count]) |op| switch (op) {
+            .input => |i| {
+                stack[length] = inputs[i];
+                length += 1;
+            },
+            .all => {
+                stack[length] = ~@as(u64, 0);
+                length += 1;
+            },
+            .none => {
+                stack[length] = 0;
+                length += 1;
+            },
+            .intersect, .subtract => {
+                length -= 1;
+                stack[length - 1] &= if (op == .subtract) ~stack[length] else stack[length];
+            },
+            .threshold => |threshold| {
+                const start = length - threshold.count;
+                var bits: u64 = 0;
+                if (threshold.required == 1) {
+                    for (stack[start..length]) |value| bits |= value;
+                } else {
+                    // Bit-sliced counters evaluate 64 document thresholds at
+                    // once, without per-document hash maps or counter arrays.
+                    var planes: [8]u64 = @splat(0);
+                    for (stack[start..length]) |value| {
+                        var carry = value;
+                        for (&planes) |*plane| {
+                            const next = plane.* & carry;
+                            plane.* ^= carry;
+                            carry = next;
+                        }
+                    }
+                    var equal: u64 = ~@as(u64, 0);
+                    var greater: u64 = 0;
+                    var index: usize = planes.len;
+                    while (index != 0) {
+                        index -= 1;
+                        if (threshold.required & (@as(u32, 1) << @intCast(index)) == 0) {
+                            greater |= equal & planes[index];
+                            equal &= ~planes[index];
+                        } else equal &= planes[index];
+                    }
+                    bits = greater | equal;
+                }
+                stack[start] = bits;
+                length = start + 1;
+            },
+        };
+        std.debug.assert(length == 1);
+        return stack[0];
+    }
+    fn cardinality(self: *const @This(), count: u32, deleted: ?*const roaring.RoaringBitmap) !usize {
+        for (self.controls[0..self.control_count]) |control| try control.check();
+        // The common binary operations use compressed container kernels. The
+        // general word program remains for nested and threshold expressions.
+        if (self.op_count == 3 and self.ops[0] == .input and self.ops[1] == .input) {
+            const left = self.pins[self.ops[0].input].bitmap;
+            const right = self.pins[self.ops[1].input].bitmap;
+            const op = self.ops[2];
+            const conjunction = op == .intersect or (op == .threshold and op.threshold.required == 2);
+            const disjunction = op == .threshold and op.threshold.required == 1;
+            if ((conjunction or disjunction or op == .subtract) and (left.maximum() orelse 0) < count and (right.maximum() orelse 0) < count) {
+                // Producer contracts are segment-local; no range rebasing is
+                // necessary on this complete immutable membership path.
+                const left_count = self.pins[self.ops[0].input].cached_cardinality;
+                if (left == right) {
+                    if (op == .subtract) return 0;
+                    return (left_count orelse left.cardinality()) - (if (deleted) |d| left.intersectionCardinality(d) else 0);
+                }
+                const intersection = left.intersectionCardinalityExcluding(right, deleted);
+                if (conjunction) return intersection;
+                const left_live = (left_count orelse left.cardinality()) - (if (deleted) |d| left.intersectionCardinality(d) else 0);
+                if (op == .subtract) return left_live - intersection;
+                const right_live = (self.pins[self.ops[1].input].cached_cardinality orelse right.cardinality()) - (if (deleted) |d| right.intersectionCardinality(d) else 0);
+                return left_live - intersection + right_live;
+            }
+        }
+        var iterators: [64]roaring.RoaringBitmap.WordIterator = undefined;
+        var current: [64]?roaring.RoaringBitmap.Word = @splat(null);
+        for (self.pins[0..self.pin_count], 0..) |pin, i| {
+            iterators[i] = pin.bitmap.wordIterator();
+            current[i] = iterators[i].next();
+        }
+        var deleted_iterator = if (deleted) |d| d.wordIterator() else null;
+        var deleted_word = if (deleted_iterator) |*it| it.next() else null;
+        var universe_base: u64 = 0;
+        var total: usize = 0;
+        var steps: usize = 0;
+        while (true) {
+            var next: u64 = if (self.universe) universe_base else count;
+            for (current[0..self.pin_count]) |word| if (word) |value| {
+                next = @min(next, value.base);
+            };
+            if (next >= count) break;
+            if (steps % 256 == 0) for (self.controls[0..self.control_count]) |control| try control.check();
+            steps += 1;
+            var inputs: [64]u64 = @splat(0);
+            for (current[0..self.pin_count], 0..) |word, i| if (word) |value| {
+                if (value.base == next) {
+                    inputs[i] = value.bits;
+                    current[i] = iterators[i].next();
+                }
+            };
+            var bits = self.evaluate(inputs[0..self.pin_count]);
+            while (deleted_word != null and deleted_word.?.base < next) deleted_word = deleted_iterator.?.next();
+            if (deleted_word) |word| if (word.base == next) {
+                bits &= ~word.bits;
+            };
+            if (count - next < 64) bits &= (@as(u64, 1) << @intCast(count - next)) - 1;
+            total += @popCount(bits);
+            universe_base = next + 64;
+        }
+        return total;
+    }
+};
+
+fn countBorrowedBoolean(seg: *index_mod.SegmentEntry, filter: Filter, offset: u32) !?usize {
+    var program: BorrowedCount = .{};
+    defer program.deinit();
+    program.compile(filter, offset, seg.reader.doc_count, 0) catch |err| switch (err) {
+        error.BorrowedCountUnavailable => return null,
+        else => return err,
+    };
+    seg.shared.lockDeletionShared();
+    defer seg.shared.unlockDeletionShared();
+    return try program.cardinality(seg.reader.doc_count, if (seg.shared.deleted) |*d| d else null);
+}
+
 /// Count a filter across all segments without materializing matching document IDs.
 ///
 /// The filter implementation still builds its per-segment bitmap, which is also
@@ -2326,6 +2535,11 @@ pub fn countFilter(
     for (snap.segments, 0..) |_, segment_idx| {
         var seg = &snap.segments[segment_idx];
         const next_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch return error.CountOverflow;
+        if (filter == .bool_filter) if (try countBorrowedBoolean(seg, filter, doc_offset)) |count| {
+            total = std.math.add(usize, total, count) catch return error.CountOverflow;
+            doc_offset = next_offset;
+            continue;
+        };
         if (filter == .doc_num and filter.doc_num.producer != null) {
             if (filter.doc_num.bitmap != null or filter.doc_num.doc_nums.len != 0) return error.InvalidArgument;
             const producer = filter.doc_num.producer.?;
@@ -2334,7 +2548,7 @@ pub fn countFilter(
                 defer held.deinit();
                 seg.shared.lockDeletionShared();
                 defer seg.shared.unlockDeletionShared();
-                var count = held.bitmap.cardinality();
+                var count = held.cached_cardinality orelse held.bitmap.cardinality();
                 if (seg.shared.deleted) |*deleted| count -= held.bitmap.intersectionCardinality(deleted);
                 total = std.math.add(usize, total, count) catch return error.CountOverflow;
                 doc_offset = next_offset;
@@ -4444,4 +4658,99 @@ test "logical value borrowed counts allocate nothing and respect deletions and e
     state.cancel = true;
     try testing.expectError(error.Canceled, countFilter(no_alloc.allocator(), writer.snapshot(), filter));
     try testing.expectEqual(@as(usize, 2), state.releases);
+}
+
+test "logical value borrowed boolean words agree with owned execution without allocations" {
+    const a = testing.allocator;
+    var docs: [127]TestTermDocument = @splat(.{ .terms = &.{} });
+    const bytes = try buildTestSegmentWithTerms(a, &docs);
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const State = struct {
+        bitmap: roaring.RoaringBitmap,
+        releases: usize = 0,
+        missing: bool = false,
+        fn borrow(raw: *anyopaque, _: u32, _: u32) anyerror!?roaring.BorrowedBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.missing) return null;
+            return .{ .bitmap = &self.bitmap, .context = .{ self, self }, .release = release };
+        }
+        fn release(context: [2]*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context[0]));
+            self.releases += 1;
+        }
+        fn produce(raw: *anyopaque, alloc: Allocator, _: u32, _: u32, _: ?*const roaring.RoaringBitmap) anyerror!roaring.RoaringBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.bitmap.cloneExact(alloc);
+        }
+        fn filter(self: *@This()) Filter {
+            return .{ .doc_num = .{ .doc_nums = &.{}, .producer = .{ .ptr = self, .produce = produce, .borrow = borrow } } };
+        }
+    };
+    var states: [3]State = undefined;
+    for (&states) |*state| state.* = .{ .bitmap = roaring.RoaringBitmap.init(a) };
+    defer for (&states) |*state| state.bitmap.deinit();
+    for (0..docs.len) |i| {
+        if (i % 2 == 0) try states[0].bitmap.add(@intCast(i));
+        if (i % 3 == 0) try states[1].bitmap.add(@intCast(i));
+        if (i % 5 == 0) try states[2].bitmap.add(@intCast(i));
+    }
+    try testing.expect(try writer.deleteById("6"));
+    const leaves = [_]Filter{ states[0].filter(), states[1].filter(), states[2].filter() };
+    var empty: [0]u8 = .{};
+    var no_alloc = std.heap.FixedBufferAllocator.init(&empty);
+    for (0..5) |minimum| {
+        for ([_]bool{ false, true }) |with_must| {
+            const inner: Filter = .{ .bool_filter = .{ .must = if (with_must) leaves[0..1] else &.{}, .should = &leaves, .must_not = leaves[2..], .min_should_match = @intCast(minimum) } };
+            const filter: Filter = .{ .bool_filter = .{ .must = &.{.match_all}, .should = &.{inner}, .must_not = &.{}, .min_should_match = 1 } };
+            var owned = try filter.executeWithOffset(a, &writer.snapshot().segments[0], 0);
+            defer owned.deinit();
+            if (writer.snapshot().segments[0].shared.deleted) |*deleted| owned.andNotWith(deleted);
+            try testing.expectEqual(owned.cardinality(), try countFilter(no_alloc.allocator(), writer.snapshot(), filter));
+        }
+    }
+    // A miss releases every already acquired pin and uses the owned executor.
+    states[1].missing = true;
+    const before = states[0].releases;
+    const filter: Filter = .{ .bool_filter = .{ .must = leaves[0..2], .should = &.{}, .must_not = &.{} } };
+    try testing.expectEqual(@as(usize, 21), try countFilter(a, writer.snapshot(), filter));
+    try testing.expectEqual(before + 1, states[0].releases);
+}
+
+test "logical value borrowed boolean dense threshold and sparse high words" {
+    const a = testing.allocator;
+    var first = roaring.RoaringBitmap.init(a);
+    defer first.deinit();
+    var second = roaring.RoaringBitmap.init(a);
+    defer second.deinit();
+    var deleted = roaring.RoaringBitmap.init(a);
+    defer deleted.deinit();
+    try first.addRange(1000, 90000);
+    try second.addRange(40000, 130000);
+    try deleted.addRange(50000, 55000);
+    try first.add(0xffff_fffe);
+    const Release = struct {
+        fn call(_: [2]*anyopaque) void {}
+    };
+    var program: BorrowedCount = .{};
+    program.pin_count = 2;
+    program.pins[0] = .{ .bitmap = &first, .context = .{ &first, &first }, .release = Release.call };
+    program.pins[1] = .{ .bitmap = &second, .context = .{ &second, &second }, .release = Release.call };
+    defer program.deinit();
+    try program.append(.{ .input = 0 });
+    try program.append(.{ .input = 1 });
+    try program.append(.{ .threshold = .{ .count = 2, .required = 2 } });
+    try testing.expectEqual(@as(usize, 45000), try program.cardinality(140003, &deleted));
+    program.ops[2] = .{ .threshold = .{ .count = 2, .required = 1 } };
+    try testing.expectEqual(@as(usize, 124000), try program.cardinality(140003, &deleted));
+    try testing.expectEqual(@as(usize, 129001), try program.cardinality(std.math.maxInt(u32), null));
+    try first.remove(0xffff_fffe);
+    program.ops[2] = .intersect;
+    try testing.expectEqual(@as(usize, 45000), try program.cardinality(140003, &deleted));
+    program.ops[2] = .subtract;
+    try testing.expectEqual(@as(usize, 39000), try program.cardinality(140003, &deleted));
+    program.ops[2] = .{ .threshold = .{ .count = 2, .required = 1 } };
+    try testing.expectEqual(@as(usize, 124000), try program.cardinality(140003, &deleted));
 }
