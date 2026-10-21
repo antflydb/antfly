@@ -146,8 +146,8 @@ replayed; deadlines, transforms, page identities, and output caps stay in force.
 Text reconstruction preserves authored spaces within a tracked `TJ` operation
 instead of inferring a word boundary between every adjusted glyph. This applies
 only to adjacent single-codepoint fragments with sub-em gaps in an explicitly
-spaced operation; larger geometric gaps and independent operations retain their
-existing separation rules.
+spaced operation. Numeric glyphs, larger geometric gaps, and independent
+operations retain their existing separation rules so table values stay separate.
 
 The macOS compatibility renderer uses the native planner's admitted integer
 canvas. Its drawing transform is computed in logical page coordinates, then
@@ -165,7 +165,9 @@ with deterministic offsets to avoid repeatedly sampling the same position in
 repeated prose. A spaced heading alone should not condemn readable body text;
 a clean prefix should not hide corruption later in the page. Numeric recovery
 rejects broken-prose rows rather than appending their split digits to a better
-OCR transcription. Reliable numeric rows retain their labels, signed values,
+OCR transcription. Row fragmentation uses alphabetic tokens, with a four-token
+evidence minimum, so numeric cells do not dilute broken labels or count as
+fragmented prose. Reliable numeric rows retain their labels, signed values,
 and duplicate occurrences. These policies do not depend on a particular OCR
 model, and their existing thresholds and work limits remain in force.
 

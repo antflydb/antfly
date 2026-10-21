@@ -18026,12 +18026,15 @@ fn endsWithColon(text: []const u8) bool {
     return text.len > 0 and text[text.len - 1] == ':';
 }
 
-fn textHasSingleNonWhitespaceCodepoint(text: []const u8) bool {
+fn textHasSingleTrackingCodepoint(text: []const u8) bool {
     var view = std.unicode.Utf8View.init(text) catch return false;
     var iterator = view.iterator();
     var found = false;
     while (iterator.nextCodepoint()) |codepoint| {
         if (codepoint <= 0x7f and std.ascii.isWhitespace(@intCast(codepoint))) continue;
+        // Numeric cells may share a TJ with an explicitly spaced label.
+        // Preserve their geometric boundaries instead of joining values.
+        if (codepoint >= '0' and codepoint <= '9') return false;
         if (found) return false;
         found = true;
     }
@@ -18080,8 +18083,8 @@ fn reconstructTextFromRunsCancelableAlloc(alloc: Allocator, runs: anytype, cance
                     prior.text_show_has_explicit_whitespace and
                     run.text_show_has_explicit_whitespace and
                     gap < font_scale * @abs(prior.horizontal_scale) and
-                    textHasSingleNonWhitespaceCodepoint(prior.text) and
-                    textHasSingleNonWhitespaceCodepoint(run.text);
+                    textHasSingleTrackingCodepoint(prior.text) and
+                    textHasSingleTrackingCodepoint(run.text);
                 if ((!tracked_glyph_fragments and gap > word_gap) or caption_boundary) {
                     try out.append(alloc, ' ');
                 }
@@ -21952,6 +21955,33 @@ test "reader distinguishes TJ glyph tracking from geometric word gaps" {
     const text = try reader.extractPageTextAlloc(1);
     defer alloc.free(text);
     try std.testing.expectEqualStrings("Hello World\nNo Space\nHello World Next\nItem A B\n", text);
+}
+
+test "reader preserves TJ numeric cell gaps beside authored whitespace" {
+    const alloc = std.testing.allocator;
+    for ([_]u32{ 100, 25, 10 }) |horizontal_scale| {
+        for ([_]u32{ 250, 500, 750 }) |gap| {
+            const content = try std.fmt.allocPrint(alloc,
+                \\BT /F1 12 Tf {d} Tz 1 0 0 1 10 90 Tm
+                \\[(Item ) (1) -{d} (2) -{d} (3)] TJ
+                \\0 -20 Td [(1) -{d} (2) ( ) (3) -{d} (4)] TJ ET
+                \\
+            , .{ horizontal_scale, gap, gap, gap, gap });
+            defer alloc.free(content);
+            const sample = try buildTextOrderingTestPdfAlloc(alloc, content);
+            defer alloc.free(sample);
+            var reader = try Reader.init(alloc, sample);
+            defer reader.deinit();
+
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(alloc);
+            try std.testing.expectEqualStrings("Item 1 2 3\n1 2 3 4\n", analysis.text);
+
+            const text = try reader.extractPageTextAlloc(1);
+            defer alloc.free(text);
+            try std.testing.expectEqualStrings("Item 1 2 3\n1 2 3 4\n", text);
+        }
+    }
 }
 
 test "reader clamps reconstructed spans after trimming line whitespace" {

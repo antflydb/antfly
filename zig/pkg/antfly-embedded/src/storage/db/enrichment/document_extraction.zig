@@ -1525,20 +1525,31 @@ fn isReliableEmbeddedNumericRow(line: []const u8) bool {
     const config = OcrQualityConfig{ .min_content_chars = 0 };
     const quality = assessOcrQuality(line, config);
     if (quality.font_corrupted or quality.replacement_corrupted) return false;
-    if (!quality.garbled) return true;
-    // Single-digit table cells are legitimate. Broken alphabetic words are
-    // not reliable row context, and their split digits are not trusted values.
+    // Rows are usually shorter than the page-level garbled-word minimum.
+    // Count alphabetic tokens independently so numeric cells neither signal
+    // fragmentation nor dilute evidence of a broken label. Require several
+    // alphabetic tokens before rejecting isolated single-letter row labels.
     var words = std.mem.tokenizeAny(u8, line, &std.ascii.whitespace);
-    var word_count: usize = 0;
+    var alphabetic_words: usize = 0;
     var single_letters: usize = 0;
-    while (words.next()) |word| {
-        word_count += 1;
+    while (words.next()) |raw_word| {
+        const word = std.mem.trim(u8, raw_word, ".,!?;:\"'()[]{}");
+        if (word.len == 0) continue;
+        var alphabetic = true;
+        for (word) |byte| {
+            if (!std.ascii.isAlphabetic(byte)) {
+                alphabetic = false;
+                break;
+            }
+        }
+        if (!alphabetic) continue;
+        alphabetic_words += 1;
         if (word.len == 1 and std.ascii.isAlphabetic(word[0]) and
             std.mem.indexOfScalar(u8, "Xxv", word[0]) == null)
             single_letters += 1;
     }
-    return word_count == 0 or
-        @as(f64, @floatFromInt(single_letters)) / @as(f64, @floatFromInt(word_count)) <= config.max_single_char_word_ratio;
+    return alphabetic_words < 4 or
+        @as(f64, @floatFromInt(single_letters)) / @as(f64, @floatFromInt(alphabetic_words)) <= config.max_single_char_word_ratio;
 }
 
 fn mergeOcrWithEmbeddedNumericRowsWithLimitsAlloc(
@@ -5137,6 +5148,7 @@ test "OCR text selection preserves dense embedded numeric tables" {
     try std.testing.expect(std.mem.startsWith(u8, merged, missing_cells));
     try std.testing.expect(std.mem.indexOf(u8, merged, "Q1 101 81 20") != null);
     try std.testing.expect(std.mem.indexOf(u8, merged, "Q4 140 100 40") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "numeric accuracy") != null);
 }
 
 test "numeric recovery rejects broken prose but preserves readable rows and single-digit cells" {
@@ -5164,6 +5176,39 @@ test "numeric recovery rejects broken prose but preserves readable rows and sing
     try std.testing.expect(std.mem.indexOf(u8, merged, "Account Charges Credits\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, merged, digit_cells) != null);
     try std.testing.expect(std.mem.indexOf(u8, merged, amounts) != null);
+}
+
+test "numeric recovery rejects short fragmented labels without counting numeric cells as prose" {
+    const alloc = std.testing.allocator;
+    const ocr = "Total 120. Total 120. Total 120. Total 120. These totals are verified and preserved in the transcription.";
+    const broken_rows = [_][]const u8{
+        "T o t a l 1 2 0",
+        "T o t a l, 1 2 0",
+        "T o t a l 1 2 0 1 2 0 1 2 0 1 2 0 1 2 0 1 2 0",
+    };
+    for (broken_rows) |broken| {
+        const embedded = try std.fmt.allocPrint(alloc, "{s}\n{s}\n{s}\n{s}", .{ broken, broken, broken, broken });
+        defer alloc.free(embedded);
+        const recall = try numericTokenRecallAlloc(alloc, embedded, ocr);
+        try std.testing.expectEqual(@as(usize, 0), recall.reference_count);
+        try std.testing.expectEqual(OcrTextChoice.ocr, try chooseOcrTextForContentAlloc(
+            alloc,
+            embedded,
+            ocr,
+            assessOcrQuality(embedded, .{}),
+            assessOcrQuality(ocr, .{}),
+        ));
+        const merged = try mergeOcrWithEmbeddedNumericRowsAlloc(alloc, embedded, ocr);
+        defer alloc.free(merged);
+        try std.testing.expectEqualStrings(ocr, merged);
+    }
+
+    const reliable = "A 1 2 3\nA B C 4 5 6\nFees -12 -12 $500\nAccount Charges Credits 7 8 9";
+    const recall = try numericTokenRecallAlloc(alloc, reliable, "");
+    try std.testing.expectEqual(@as(usize, 12), recall.reference_count);
+    const merged = try mergeOcrWithEmbeddedNumericRowsAlloc(alloc, reliable, ocr);
+    defer alloc.free(merged);
+    try std.testing.expect(std.mem.indexOf(u8, merged, reliable) != null);
 }
 
 test "numeric recall limits preserve embedded text without exhausting scratch memory" {
