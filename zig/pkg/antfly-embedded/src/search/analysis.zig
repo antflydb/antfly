@@ -1533,10 +1533,117 @@ fn step5(buf: []u8, len: usize) usize {
 // Analyzer
 // ============================================================================
 
+/// Borrowed-token stream contract for incremental indexing. Terms remain valid
+/// only until next(); consumers own retention. Keep producer dispatch here so
+/// additional bounded pipelines do not change postings consumers.
+pub const TokenStream = union(enum) {
+    substring: SubstringStream,
+    pub fn next(self: *@This()) ?Token {
+        return switch (self.*) {
+            .substring => |*producer| producer.next(),
+        };
+    }
+};
+
+/// Allocation-free producer for the built-in substring pipeline. Terms borrow
+/// the producer's fixed window until next(); consumers retain only distinct
+/// terms and postings. Two source passes preserve the materialized pipeline's
+/// unigram-then-bigram order, positions, offsets and field-length normalization.
+pub const SubstringStream = struct {
+    const Words = struct {
+        text: []const u8,
+        cursor: usize = 0,
+        position: u32 = 0,
+        fn next(self: *@This()) ?Token {
+            while (self.cursor < self.text.len and !isAlphanumeric(self.text[self.cursor]))
+                self.cursor = @min(self.text.len, self.cursor + utf8ByteLen(self.text[self.cursor]));
+            if (self.cursor == self.text.len) return null;
+            const start = self.cursor;
+            while (self.cursor < self.text.len and isAlphanumeric(self.text[self.cursor]))
+                self.cursor = @min(self.text.len, self.cursor + utf8ByteLen(self.text[self.cursor]));
+            const token = Token{ .term = self.text[start..self.cursor], .position = self.position, .start_byte = @intCast(start), .end_byte = @intCast(self.cursor) };
+            self.position += 1;
+            return token;
+        }
+    };
+    words: Words,
+    first: ?Token = null,
+    second: ?Token = null,
+    pairs: bool = false,
+    finished: bool = false,
+    start: usize = 0,
+    // Overlapping terms borrow one normalized sliding window. Refill only
+    // when a term needs bytes beyond it, amortizing copying/lowercasing over
+    // source bytes instead of repeating it for every overlapping suffix.
+    window: [2 * substring_max_query_length]u8 = undefined,
+    window_start: usize = 0,
+    window_len: usize = 0,
+
+    pub fn init(text: []const u8) SubstringStream {
+        return .{ .words = .{ .text = text } };
+    }
+    pub fn next(self: *@This()) ?Token {
+        if (self.finished) return null;
+        while (true) {
+            if (self.first) |first| {
+                const second = self.second;
+                const total = first.term.len + (if (second) |v| v.term.len else 0);
+                while (self.start < total) {
+                    const start = self.start;
+                    self.start += 1;
+                    const byte = if (start < first.term.len) first.term[start] else second.?.term[start - first.term.len];
+                    if (isUtf8Continuation(byte)) continue;
+                    if (total - start < substring_min_query_length) break;
+                    const required = @min(total - start, substring_max_query_length + 1);
+                    if (self.window_len == 0 or start + required > self.window_start + self.window_len) {
+                        self.window_start = start;
+                        self.window_len = @min(total - start, self.window.len);
+                        const head = if (start < first.term.len) @min(self.window_len, first.term.len - start) else 0;
+                        if (head != 0) @memcpy(self.window[0..head], first.term[start..][0..head]);
+                        if (head < self.window_len) {
+                            const offset = if (start >= first.term.len) start - first.term.len else 0;
+                            @memcpy(self.window[head..self.window_len], second.?.term[offset..][0 .. self.window_len - head]);
+                        }
+                        _ = std.ascii.lowerString(self.window[0..self.window_len], self.window[0..self.window_len]);
+                    }
+                    const window_offset = start - self.window_start;
+                    const suffix = self.window[window_offset..self.window_len];
+                    const len = utf8BoundaryAtOrBefore(suffix, @min(suffix.len, substring_max_query_length));
+                    if (len < substring_min_query_length) continue;
+                    return .{ .term = suffix[0..len], .position = first.position, .start_byte = first.start_byte + @as(u32, @intCast(start)), .end_byte = if (second) |v| v.end_byte else first.end_byte };
+                }
+            }
+            self.start = 0;
+            self.window_len = 0;
+            if (!self.pairs) {
+                self.first = self.words.next();
+                if (self.first != null) continue;
+                self.pairs = true;
+                self.words = .{ .text = self.words.text };
+                self.second = self.words.next();
+            }
+            self.first = self.second;
+            self.second = self.words.next();
+            if (self.first == null or self.second == null) {
+                self.finished = true;
+                return null;
+            }
+        }
+    }
+};
+
 pub const Analyzer = struct {
     char_filters: []const CharFilter = &.{},
     tokenizer: Tokenizer,
     filters: []const TokenFilter,
+
+    /// Recognize the complete pipeline, not its name or a partial prefix.
+    /// Custom analyzers retain the ordinary owned-token implementation.
+    pub fn tokenStream(self: *const Analyzer, text: []const u8) ?TokenStream {
+        if (self.char_filters.len != 0 or self.tokenizer != .unicode_words or self.filters.len != substring_analyzer.filters.len) return null;
+        for (self.filters, substring_analyzer.filters) |left, right| if (!std.meta.eql(left, right)) return null;
+        return .{ .substring = SubstringStream.init(text) };
+    }
 
     /// Analyze text into tokens. Caller owns the returned slice and all token terms.
     pub fn analyze(self: *const Analyzer, alloc: Allocator, text: []const u8) ![]Token {
@@ -2479,4 +2586,49 @@ test "logical query named autocomplete roots retain complete short and long word
     try std.testing.expectEqual(@as(usize, 2), tokens.len);
     try std.testing.expectEqualStrings("x", tokens[0].term);
     try std.testing.expectEqualStrings("abcdefghijklmnopqrstuvwxyzzebra", tokens[1].term);
+}
+
+test "logical query substring stream agrees with owned token pipeline" {
+    const a = std.testing.allocator;
+    const cases = [_][]const u8{ "", "!", "a", "ab", "A_B c-d", "CAFÉ 東京 café", "abcdefghijklmnopqrstuvwxyz0123456789 abc", "1234567890123456789012345678901é x", "a a a", "🦀Straße\tİstanbul", "abcdefghijklmnopqrstuvwxyéééééééé" };
+    for (cases) |text| {
+        const tokens = try substring_analyzer.analyze(a, text);
+        defer {
+            for (tokens) |token| a.free(@constCast(token.term));
+            a.free(tokens);
+        }
+        var stream = substring_analyzer.tokenStream(text).?;
+        for (tokens) |expected| {
+            const actual = stream.next() orelse return error.MissingToken;
+            try std.testing.expectEqualStrings(expected.term, actual.term);
+            try std.testing.expectEqual(expected.position, actual.position);
+            try std.testing.expectEqual(expected.start_byte, actual.start_byte);
+            try std.testing.expectEqual(expected.end_byte, actual.end_byte);
+        }
+        try std.testing.expect(stream.next() == null);
+        try std.testing.expect(stream.next() == null);
+    }
+    // Generated valid UTF-8 exercises caps straddling both shingle and codepoint
+    // boundaries. Compare ordered emissions, not just the set of terms.
+    var rng = std.Random.DefaultPrng.init(0x51ff1c);
+    const alphabet = [_][]const u8{ "A", "z", "7", "é", "東", "🦀", " ", "_", "-" };
+    for (0..128) |_| {
+        var input: std.ArrayList(u8) = .empty;
+        defer input.deinit(a);
+        for (0..96) |_| try input.appendSlice(a, alphabet[rng.random().uintLessThan(usize, alphabet.len)]);
+        const tokens = try substring_analyzer.analyze(a, input.items);
+        defer {
+            for (tokens) |token| a.free(@constCast(token.term));
+            a.free(tokens);
+        }
+        var stream = substring_analyzer.tokenStream(input.items).?;
+        for (tokens) |expected| {
+            const actual = stream.next() orelse return error.MissingToken;
+            try std.testing.expectEqualDeep(expected, actual);
+        }
+        try std.testing.expect(stream.next() == null);
+    }
+    try std.testing.expect(default_analyzer.tokenStream("abc") == null);
+    const custom = Analyzer{ .tokenizer = .unicode_words, .filters = &.{ .lowercase, .{ .suffix = .{ .min = 1, .max = 32 } } } };
+    try std.testing.expect(custom.tokenStream("abc") == null);
 }

@@ -18734,7 +18734,7 @@ const ValueExecution = struct {
             // Different source representations have different read costs.
             // Restart learning without charging one-time snapshot setup to a
             // steady-state arm, retaining any allocator-imposed row ceiling.
-            self.source_tuner = .{ .max_rows = self.source_tuner.max_rows };
+            self.source_tuner = .{ .max_rows = self.source_tuner.max_rows, .bootstrapped = true };
             self.source_epoch += 1;
         }
         const reader = self.projected_reader.?;
@@ -19020,7 +19020,9 @@ const SourceReadTuner = struct {
     calls: usize = 0,
     probe: usize = 0,
     max_rows: usize = 64,
-    average_bytes: u64 = 1,
+    average_bytes: u64 = 0,
+    bootstrapped: bool = false,
+    const bootstrap_rows = 2;
     fn allowedRows(self: *const @This()) usize {
         const byte_rows = @max(1, (256 * 1024) / @max(1, self.average_bytes));
         var allowed: usize = 1;
@@ -19034,7 +19036,7 @@ const SourceReadTuner = struct {
         return allowed;
     }
     fn desired(self: *const @This()) usize {
-        return @min(sizes[self.choice], self.allowedRows());
+        return @min(if (self.bootstrapped) sizes[self.choice] else bootstrap_rows, self.allowedRows());
     }
     fn best(self: *const @This()) usize {
         var result: usize = 0;
@@ -19049,11 +19051,17 @@ const SourceReadTuner = struct {
         }
         return result;
     }
+    fn observePayload(self: *@This(), rows: usize, bytes: u64) void {
+        if (rows == 0) return;
+        const average = @max(1, bytes / rows);
+        self.average_bytes = if (self.average_bytes == 0) average else (self.average_bytes *| 3 +| average) / 4;
+    }
     fn observe(self: *@This(), mode: enum { scalar, batch }, rows: usize, bytes: u64, elapsed_ns: u64) void {
         if (rows == 0) return;
         const requested = self.desired();
-        const average = @max(1, bytes / rows);
-        self.average_bytes = (self.average_bytes *| 3 +| average) / 4;
+        const bootstrap = !self.bootstrapped;
+        self.bootstrapped = true;
+        self.observePayload(rows, bytes);
         // A truncated batch is not a sample of a full arm. Scalar fallbacks
         // always train scalar, independently of the requested window size.
         if (mode == .batch and rows != requested) return;
@@ -19067,6 +19075,8 @@ const SourceReadTuner = struct {
         }
         self.rows[effective] += rows;
         self.ns[effective] +|= elapsed_ns;
+        // Bootstrap is a required source sample, not a completed exploration arm.
+        if (bootstrap) return;
         // Falling back must not complete exploration of an untested arm.
         if (sizes[effective] != requested) return;
         self.calls += 1;
@@ -19086,6 +19096,32 @@ const SourceReadTuner = struct {
         }
     }
 };
+
+test "logical value source bootstrap bounds initial originals without changing steady state" {
+    var tuner: SourceReadTuner = .{};
+    try std.testing.expectEqual(@as(usize, 2), tuner.desired());
+    tuner.observe(.batch, 2, 2 * 64 * 1024, 1000);
+    try std.testing.expect(tuner.bootstrapped);
+    try std.testing.expectEqual(@as(usize, 4), tuner.desired());
+    try std.testing.expectEqual(@as(usize, 0), tuner.choice);
+    try std.testing.expectEqual(@as(usize, 2), tuner.rows[2]);
+    var scalar: SourceReadTuner = .{ .max_rows = 1 };
+    try std.testing.expectEqual(@as(usize, 1), scalar.desired());
+    scalar.observe(.scalar, 1, 1024, 1000);
+    try std.testing.expect(scalar.bootstrapped);
+    try std.testing.expectEqual(@as(usize, 1), scalar.desired());
+}
+
+test "logical value representation changes seed payload bounds without timing setup" {
+    var tuner: SourceReadTuner = .{ .bootstrapped = true };
+    tuner.observePayload(2, 2 * 1024 * 1024);
+    try std.testing.expectEqual(@as(usize, 1), tuner.desired());
+    for (tuner.rows) |rows| try std.testing.expectEqual(@as(usize, 0), rows);
+    for (tuner.ns) |ns| try std.testing.expectEqual(@as(u64, 0), ns);
+    try std.testing.expectEqual(@as(u64, 1024 * 1024), tuner.average_bytes);
+    tuner.observePayload(0, 0);
+    try std.testing.expectEqual(@as(u64, 1024 * 1024), tuner.average_bytes);
+}
 
 test "logical value source tuner learns scalar or batch cost and respects byte bounds" {
     for ([_]bool{ false, true }) |batch_wins| {
@@ -19119,7 +19155,7 @@ test "logical value source tuner learns scalar or batch cost and respects byte b
 }
 
 test "logical value tuner distinguishes scalar fallback and truncated batches" {
-    var tuner: SourceReadTuner = .{};
+    var tuner: SourceReadTuner = .{ .bootstrapped = true };
     tuner.observe(.scalar, 1, 128, 1000);
     try std.testing.expectEqual(@as(usize, 1), tuner.rows[1]);
     try std.testing.expectEqual(@as(usize, 0), tuner.rows[0]);
@@ -19264,8 +19300,14 @@ const ValueSourceWindow = struct {
         }
         try value_query.Work.charge(&work.bytes, source_bytes, owner.req.value_search_execution.max_bytes);
         owner.observeOriginal(self.count, source_bytes);
-        if (self.adaptive and owner.source_epoch == epoch) {
-            owner.source_tuner.observe(.batch, self.count, payload_bytes, platform_time.monotonicNs() - started_ns);
+        if (self.adaptive) {
+            if (owner.source_epoch == epoch) {
+                owner.source_tuner.observe(.batch, self.count, payload_bytes, platform_time.monotonicNs() - started_ns);
+            } else {
+                // New representations still supply a required payload sample;
+                // exclude only snapshot setup from steady-state timing arms.
+                owner.source_tuner.observePayload(self.count, payload_bytes);
+            }
         }
         if (owner.req.profile) {
             _ = work.source_batches.fetchAdd(1, .monotonic);
@@ -19396,8 +19438,10 @@ const ValueProducer = struct {
             }
             const work = owner.req.value_search_work orelse &owner.local_work;
             _ = scratch.reset(.retain_capacity);
-            const scalar_start = platform_time.monotonicNs();
             var buffered = source_window.get(local);
+            // A buffered row performs no provider I/O and supplies no tuner
+            // sample. Avoid a clock syscall on every row of a filled window.
+            const scalar_start = if (buffered == null) platform_time.monotonicNs() else 0;
             const id = if (buffered) |row| row.key else (try owner.snapshot.storedIdScoped(scratch.allocator(), global)) orelse return error.StoredDocMissing;
             var matched = false;
             if (work.sources.get(owner.load_ctx, id)) |doc| {
@@ -19429,7 +19473,10 @@ const ValueProducer = struct {
                     const elapsed = platform_time.monotonicNs() - scalar_start;
                     owner.observeOriginal(1, original_bytes);
                     if (owner.req.profile and projected_source) _ = work.stored_field_sources.fetchAdd(1, .monotonic);
-                    if (source_window.enabled and source_window.adaptive and owner.source_epoch == epoch) owner.source_tuner.observe(.scalar, 1, if (loaded) |bytes| bytes.len else 0, elapsed);
+                    if (source_window.enabled and source_window.adaptive) {
+                        const payload = if (loaded) |bytes| bytes.len else 0;
+                        if (owner.source_epoch == epoch) owner.source_tuner.observe(.scalar, 1, payload, elapsed) else owner.source_tuner.observePayload(1, payload);
+                    }
                     if (owner.req.profile) {
                         _ = work.source_scalar_reads.fetchAdd(1, .monotonic);
                     }
@@ -34419,7 +34466,8 @@ test "logical value batched reads preserve candidates budgets and scalar fallbac
         const query = try textQueryToSearchQueryWithValues(arena.allocator(), .{ .value = .{ .kind = .contains, .field = "content", .text = "needle" } }, .{}, null, &execution);
         try std.testing.expectEqual(@as(u32, 2), try search_mod.countMatches(a, writer.snapshot(), query));
         try std.testing.expectEqual(@as(u64, 3), execution.local_work.documents.load(.monotonic));
-        try std.testing.expectEqual(if (refuse) @as(usize, 3) else @as(usize, 0), loader.scalar);
+        // Two bootstrap rows leave one required scalar tail read.
+        try std.testing.expectEqual(if (refuse) @as(usize, 3) else @as(usize, 1), loader.scalar);
         try std.testing.expectEqual(@as(usize, 1), loader.batches);
         // Reusing the producer must not issue any additional read window.
         try std.testing.expectEqual(@as(u32, 2), try search_mod.countMatches(a, writer.snapshot(), query));
@@ -34508,4 +34556,65 @@ test "logical value unproductive projection retains its pinned reader during bac
 test {
     _ = value_query.membership;
     _ = @import("../../logical_source.zig");
+}
+
+test "logical value bootstrap reads only two originals before pinning projections" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    const padding = try temp.alloc(u8, 32 * 1024);
+    @memset(padding, 'x');
+    const body = try std.fmt.allocPrint(temp, "{{\"content\":\"needle\",\"unused\":\"{s}\"}}", .{padding});
+    var docs: [32]mapper_mod.MapperDoc = undefined;
+    for (&docs, 0..) |*doc, i| doc.* = .{ .key = try std.fmt.allocPrint(temp, "doc-{d:0>3}", .{i}), .value = body };
+    const segment = (try mapper_mod.buildTextSegmentFromDocuments(a, &docs, .{}, null)).?;
+    defer a.free(segment);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(segment);
+    const Loader = struct {
+        body: []const u8,
+        full: usize = 0,
+        projected: usize = 0,
+        opens: usize = 0,
+        first_batch: usize = 0,
+        fn load(raw: ?*anyopaque, alloc: Allocator, _: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.full += 1;
+            return try alloc.dupe(u8, self.body);
+        }
+        fn many(raw: ?*anyopaque, alloc: Allocator, ids: []const []const u8) anyerror![]?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.first_batch == 0) self.first_batch = ids.len;
+            const result = try alloc.alloc(?[]u8, ids.len);
+            for (ids, result) |id, *row| row.* = try load(raw, alloc, id);
+            return result;
+        }
+        fn open(raw: ?*anyopaque, _: Allocator) anyerror!?LogicalSourceReader {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.opens += 1;
+            return .{ .ctx = raw.?, .load = ranges, .close = close };
+        }
+        fn close(_: *anyopaque) void {}
+        fn ranges(raw: *anyopaque, alloc: Allocator, ids: []const []const u8, paths: []const []const u8) anyerror![]LogicalSourceRow {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 1), paths.len);
+            try std.testing.expectEqualStrings("content", paths[0]);
+            const rows = try alloc.alloc(LogicalSourceRow, ids.len);
+            for (rows) |*row| row.* = .{ .bytes = try alloc.dupe(u8, "{\"content\":\"needle\"}"), .original_bytes = self.body.len, .projected = true };
+            self.projected += rows.len;
+            return rows;
+        }
+    };
+    var loader: Loader = .{ .body = body };
+    var execution: ValueExecution = .{ .a = a, .snapshot = writer.snapshot(), .req = .{ .value_search_execution = .{ .allow_scan = true, .max_documents = docs.len, .max_bytes = docs.len * body.len } }, .load_ctx = &loader, .load = Loader.load, .load_many = Loader.many, .open_projected = Loader.open };
+    defer execution.deinit();
+    const query = try textQueryToSearchQueryWithValues(temp, .{ .value = .{ .kind = .contains, .field = "content", .text = "needle" } }, .{}, null, &execution);
+    try std.testing.expectEqual(@as(u32, docs.len), try search_mod.countMatches(a, writer.snapshot(), query));
+    try std.testing.expectEqual(@as(usize, 2), loader.first_batch);
+    try std.testing.expectEqual(@as(usize, 2), loader.full);
+    try std.testing.expectEqual(@as(usize, docs.len - 2), loader.projected);
+    try std.testing.expectEqual(@as(usize, 1), loader.opens);
+    try std.testing.expectEqual(@as(u64, docs.len * body.len), execution.local_work.bytes.load(.monotonic));
 }

@@ -467,3 +467,51 @@ expanded substring-index fixture exceeds smaller automatic build budgets; the
 preserved baseline exhibits the same 1 GiB limitation. The timed query matrix
 uses 1 GiB. The shared-host VM and fixture-only file advice remain distinct from
 independent physical Linux, device-cold storage and Windows runtime qualification.
+
+### Bounded substring token production and source bootstrap
+
+The substring indexing pipeline can produce many more tokens than source words.
+Index construction consumes its `unicode_words → lowercase → shingle(1..2,
+separator=none) → suffix(2..32)` pipeline through a borrowed-token producer.
+The producer recognizes the complete configured pipeline rather than an analyzer
+name. Other pipelines retain the owned-token implementation. Highlight analysis
+continues to use its source-offset-aware path.
+
+The producer preserves ordered unigram-then-bigram emissions with two sequential
+passes over the source. It retains a fixed normalized window, borrows each term
+until the next emission, and interns each distinct term once. Frequencies,
+positions, repeated-field position offsets, and field norms remain identical to
+the materialized pipeline. The document accumulator holds the first two positions
+inline; dictionary storage and larger vectors grow through a reclaimable allocator
+that preserves the existing quota chain. Their scoped owner releases them after
+the posting builder copies terms and positions. Keys stay document-arena owned.
+This avoids retained arena growth capacities without introducing a second term
+map or allocating a heap vector for every rare term. Inputs below 128 bytes keep
+the existing owned-token path and small unique-token fast path. Streaming removes
+the expanded token array and duplicate term allocations, not necessary postings.
+Allocation failure aborts the document without publishing partial postings. Ordered-token differentials include generated Unicode/cap
+boundaries, and postings differentials include repeated field contributions.
+
+Logical source verification first reads a two-document bootstrap window to
+establish source sizes before the normal adaptive reader explores its batch
+sizes. This bounds initial complete-body reads without probing optional metadata
+for every small document. Opening a projected reader retains the established
+bootstrap and restarts only steady-state cost learning. The first required payload
+sample seeds the byte estimate directly rather than blending with a placeholder;
+representation changes also seed payload size while excluding one-time snapshot
+setup from timing arms. A buffered row has no
+provider read and supplies no I/O sample, so it does not read the monotonic clock.
+Original-byte/document budgets, pinned-reader fallback, and memory ceilings are
+unchanged. Fixed-window/scalar benchmark controls continue to bypass adaptation.
+
+Performance comparisons must pin baseline and candidate after the same main
+merge, alternate run order, retain raw samples, and separate server verification
+from local CLI matching. The allocation/throughput benchmark is an opt-in native
+introducer test; it rotates the pre-stream owned accumulator, the new owned
+control and the new stream across repetitive, source-like and distinct-term
+corpora. Complete postings digests verify norms, frequencies and positions.
+Streaming production time is charged with `term_accum_ns`; `analyzer_ns` measures
+owned-token analysis, so compare complete build CPU rather than treating phase
+movement as eliminated work. Server qualification uses the existing scalable and
+concurrent HTTP fixtures. Neither a process restart nor fixture-file cache advice establishes
+device-cold behavior or performance on independent Linux hardware.

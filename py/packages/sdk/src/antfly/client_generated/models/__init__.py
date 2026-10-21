@@ -373,9 +373,9 @@ from .entity_curation_result_results_item_absorbed_item_disposition import (
 from .entity_curation_result_results_item_curation import EntityCurationResultResultsItemCuration
 from .entity_distinct_request import EntityDistinctRequest
 from .entity_merge_request import EntityMergeRequest
-from .equals_query import EqualsQuery
 from .entity_suppress_request import EntitySuppressRequest
 from .entity_suppress_request_absorbed import EntitySuppressRequestAbsorbed
+from .equals_query import EqualsQuery
 from .error import Error
 from .eval_config import EvalConfig
 from .eval_options import EvalOptions
@@ -2052,9 +2052,9 @@ __all__ = (
     "EntityCurationResultResultsItemCuration",
     "EntityDistinctRequest",
     "EntityMergeRequest",
-    "EqualsQuery",
     "EntitySuppressRequest",
     "EntitySuppressRequestAbsorbed",
+    "EqualsQuery",
     "Error",
     "EvalConfig",
     "EvalOptions",

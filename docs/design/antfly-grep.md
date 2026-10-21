@@ -100,3 +100,11 @@ original-byte evaluation budgets. The source epoch is pinned for the query,
 selected hashes are checked, arrays remain intact, and projected JSON cannot be
 cached as a complete document. `stored_field_sources` makes this path observable.
 The implementation adds no public scan endpoint or new document schema.
+
+Substring-ingestion memory and indexed-source startup are specified in
+[logical field queries](logical-field-queries.md#bounded-substring-token-production-and-source-bootstrap).
+The indexing producer preserves the existing analyzer/posting contract while
+avoiding materialized suffix arrays. Source verification starts with a bounded
+two-document sample and avoids per-row timing for buffered data. These changes
+require ordered analyzer and postings differentials, allocation-failure coverage,
+and paired HTTP profiles; they do not imply a local CLI speedup over ripgrep.
