@@ -141,10 +141,13 @@ entities to the next stage, that boundary checks live authority, the original
 memory control revision, and the entire admitted generation input closure,
 including uncited context. Revocation, source drift or concurrent memory mutation
 stops the pipeline before a subsequent provider can receive stale input.
-After generation, reconciliation,
-or embedding releases its lease, the service revalidates the ordinary resources
-in that invocation’s input closure, including uncited generation context, shared
-parents and candidate explanation dependencies. Captures include cached source
+Every generation, reconciliation and embedding completion uses the same native
+fence: live destination authority, the original memory control revision, then the
+ordinary resources in that invocation’s input closure. This also protects plaintext evidence,
+assertions and explanation artifacts cached before a lease release: concurrent
+forgetting or reconfiguration stops batch ingestion, reconciliation and reindexing
+before another provider receives stale memory. The resource closure includes
+uncited generation context, shared parents and candidate explanation dependencies. Captures include cached source
 reads and rebuild visibility memoization within the invocation. Lease epochs force
 inputs not checked since an intervening inference to be revalidated before reuse.
 Before committing
@@ -1168,8 +1171,14 @@ scan at most 16 watched sources per quantum, and revisit sources every 30 second
 foreground reads recheck source state immediately.
 
 Explanations contain recorded justification only, never a model-generated
-reconstruction. Node, depth and encoded-byte limits produce explicit truncation. Ordinary source
-snapshots retained during traversal are limited to 64 KiB; larger rows report
+reconstruction. Node, depth and encoded-byte limits produce explicit truncation.
+Explanation rendering measures each node through an allocation-free JSON counter, maintains
+an additive size for the retained prefix, and emits the final graph once into an
+exactly sized buffer. Removing nodes never retains discarded graph encodings;
+serialization work is linear in visited payload bytes plus the final response.
+Deadline/cancellation checks accompany node sizing and truncation. Graph lookup
+and authorization remain bounded independently by the node/depth/work limits.
+Ordinary source snapshots retained during traversal are limited to 64 KiB; larger rows report
 truncated payload and incomplete history. Transports release temporary row buffers
 after each lookup. Admission rejects an oversized source instead of storing a partial
 evidence snapshot.

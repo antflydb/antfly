@@ -547,6 +547,12 @@ const Run = struct {
         while (reads.next()) |input| try self.validateResource(input.*);
     }
     fn inferenceCompleted(self: *Run, inputs: ResourceSet) !void {
+        // Every model boundary restores live authority and the original memory
+        // snapshot before another model may consume cached memory content.
+        try self.service.context.finish();
+        const expected = self.state_row orelse return error.MemorySpaceNotFound;
+        const latest = (try self.service.backend.get(self.service.backend.ptr, self.a, "control")) orelse return error.MemorySpaceNotFound;
+        if (latest.version != expected.version or !eql(u8, latest.json, expected.json)) return error.MemoryRevisionConflict;
         self.inferred = true;
         self.inference_epoch += 1;
         var reads = inputs.keyIterator();
@@ -1761,13 +1767,6 @@ const Run = struct {
             resources: ResourceSet,
             fn complete(ptr: *anyopaque) !void {
                 const invocation: *@This() = @ptrCast(@alignCast(ptr));
-                try invocation.run.service.context.finish();
-                // Forgetting, configuration and other memory mutations may
-                // commit while an embedded lease is released. Stop stale work
-                // before its next provider call, rather than waiting for CAS.
-                const expected = invocation.run.state_row orelse return error.MemorySpaceNotFound;
-                const latest = (try invocation.run.service.backend.get(invocation.run.service.backend.ptr, invocation.run.a, "control")) orelse return error.MemorySpaceNotFound;
-                if (latest.version != expected.version or !eql(u8, latest.json, expected.json)) return error.MemoryRevisionConflict;
                 try invocation.run.inferenceCompleted(invocation.resources);
             }
         };
@@ -2240,7 +2239,7 @@ const Run = struct {
                 try public_links.append(self.a, .{ .relation = link.relation, .target = target, .status = if (bounded) .truncated else if (target.external() and (try self.resourceSnapshot(target)).state == .changed) .changed else .available });
                 if (bounded) truncated = true else if (!already_seen) try queue.append(self.a, .{ .resource = target, .depth = pending.depth + 1 });
             }
-            const payload_truncated = (try self.encode(record)).len > request.max_bytes / 2;
+            const payload_truncated = try encodedSize(record) > request.max_bytes / 2;
             if (payload_truncated) {
                 record = .null;
                 truncated = true;
@@ -2252,26 +2251,60 @@ const Run = struct {
             try nodes.append(self.a, .{ .resource = ref, .record = record, .payload_truncated = payload_truncated or source_truncated, .links = public_links.items });
         }
         truncated = truncated or position < queue.items.len or self.explanation_truncated;
+        return self.renderExplanation(&nodes, request.max_bytes, truncated, missing);
+    }
+    // Measure each node once without allocating JSON. Trimming updates an
+    // additive wire-size total, then emits the retained graph into one exact
+    // buffer. Discarded suffixes never accumulate serialized graph copies.
+    fn renderExplanation(self: *Run, nodes: *std.ArrayList(prov.ExplanationNode), max_bytes: usize, was_truncated: bool, missing: bool) ![]const u8 {
+        var sizes: [256]usize = undefined;
+        std.debug.assert(nodes.items.len <= sizes.len);
+        var node_bytes: usize = 0;
+        for (nodes.items, 0..) |node, i| {
+            try self.service.context.check();
+            sizes[i] = try encodedSize(node);
+            node_bytes += sizes[i];
+        }
+        var result: prov.Explanation = .{ .nodes = &.{}, .complete = !was_truncated and !missing and !self.explanation_incomplete_history, .truncated = was_truncated, .missing_evidence = missing, .incomplete_history = self.explanation_incomplete_history };
+        var envelope_bytes = try encodedSize(result);
         while (true) {
-            const rendered = try self.encode(prov.Explanation{ .nodes = nodes.items, .complete = !truncated and !missing and !self.explanation_incomplete_history, .truncated = truncated, .missing_evidence = missing, .incomplete_history = self.explanation_incomplete_history });
-            if (rendered.len <= request.max_bytes) return rendered;
-            truncated = true;
+            try self.service.context.check();
+            const total = envelope_bytes + node_bytes + (nodes.items.len -| 1);
+            if (total <= max_bytes) {
+                result.nodes = nodes.items;
+                const output = try self.a.alloc(u8, total);
+                var writer: std.Io.Writer = .fixed(output);
+                try std.json.Stringify.value(result, .{}, &writer);
+                std.debug.assert(writer.end == total);
+                return output;
+            }
+            if (!result.truncated) {
+                result.truncated = true;
+                result.complete = false;
+                envelope_bytes = try encodedSize(result);
+                continue;
+            }
             if (nodes.items.len > 1) {
+                node_bytes -= sizes[nodes.items.len - 1];
                 _ = nodes.pop();
                 continue;
             }
             if (nodes.items.len == 1) {
-                if (nodes.items[0].record != .null) {
-                    nodes.items[0].record = .null;
-                    nodes.items[0].payload_truncated = true;
+                const root = &nodes.items[0];
+                if (root.record != .null) {
+                    root.record = .null;
+                    root.payload_truncated = true;
+                } else if (root.links.len > 0) {
+                    root.links = &.{};
+                } else {
+                    _ = nodes.pop();
+                    node_bytes = 0;
                     continue;
                 }
-                if (nodes.items[0].links.len > 0) {
-                    nodes.items[0].links = &.{};
-                    continue;
-                }
-                _ = nodes.pop();
+                node_bytes = try encodedSize(root.*);
+                continue;
             }
+            return error.InvalidMemoryRequest;
         }
     }
     fn explanationRecord(self: *Run, ref: *prov.Resource, request: prov.ExplainRequest, links: *std.ArrayList(prov.Link)) anyerror!std.json.Value {
@@ -2822,4 +2855,10 @@ fn cosine(left: []const f32, right: []const f32) !f64 {
         rn += @as(f64, r) * r;
     }
     return if (ln == 0 or rn == 0) 0 else @max(0, dot / @sqrt(ln * rn));
+}
+
+fn encodedSize(value: anytype) !usize {
+    var size: std.Io.Writer.Discarding = .init(&.{});
+    try std.json.Stringify.value(value, .{}, &size.writer);
+    return @intCast(size.fullCount());
 }

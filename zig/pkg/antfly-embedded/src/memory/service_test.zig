@@ -3410,3 +3410,136 @@ test "memory generation stops between providers when evidence is concurrently fo
     try std.testing.expectEqual(@as(u8, 0), status.attempts);
     try std.testing.expectEqual(m.types.Stage.pending, status.phase);
 }
+
+test "memory embedding batches and reindex stop after concurrent evidence erasure" {
+    const Model = struct {
+        fn embed(ptr: *anyopaque, a: A, model: m.types.Model, text: []const u8) ![]const f32 {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.decisions += 1;
+            if (store.decisions == 1) try discard(store, .forget, "", "{\"evidence_ids\":[\"e1\"]}", "concurrent-forget", 4);
+            return fakeEmbed(ptr, a, model, text);
+        }
+    };
+    for ([_]bool{ false, true }) |reindex| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        var svc = modelService(&store, 1);
+        const config: m.types.Config = .{ .features = .{ .semantic_recall = !reindex }, .models = .{ .embedder = if (reindex) null else fake_model } };
+        _ = try svc.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+        _ = try svc.execute(a, .observe, "", source, "source");
+        var claims: [2]m.types.Assertion = undefined;
+        for (&claims, 0..) |*claim, i| claim.* = .{ .id = try std.fmt.allocPrint(a, "claim{d}", .{i}), .subject = "s", .predicate = "p", .value = "v", .statement = "Private source statement", .evidence = &.{.{ .id = "e1" }} };
+        const body = try std.json.Stringify.valueAlloc(a, .{ .assertions = claims }, .{});
+        if (reindex) {
+            _ = try svc.execute(a, .assertions, "", body, "batch");
+            const next: m.types.Config = .{ .features = .{ .semantic_recall = true }, .models = .{ .embedder = fake_model } };
+            const configured = try svc.execute(a, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = @as(u64, 4), .config = next }, .{}), "reindex");
+            const pending = try std.json.parseFromSliceLeaky(m.types.Operation, a, configured, .{});
+            svc.backend.embed = Model.embed;
+            try std.testing.expectError(error.MemoryRevisionConflict, svc.execute(a, .advance, pending.id, "{}", "advance"));
+            const status = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .operation, pending.id, "{}", ""), .{});
+            try std.testing.expectEqual(@as(u8, 0), status.attempts);
+            const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+            try std.testing.expect(!state.config.features.semantic_recall);
+        } else {
+            svc.backend.embed = Model.embed;
+            try std.testing.expectError(error.MemoryRevisionConflict, svc.execute(a, .assertions, "", body, "batch"));
+        }
+        try std.testing.expectEqual(@as(usize, 1), store.decisions);
+        try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "vector/", null, 256)).rows.len);
+    }
+}
+
+test "memory embedding and reconciliation boundaries stop on live authority revocation" {
+    const Model = struct {
+        fn finish(ptr: *anyopaque) !void {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            if (store.failures > 0) return error.Forbidden;
+        }
+        fn embed(ptr: *anyopaque, a: A, model: m.types.Model, text: []const u8) ![]const f32 {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.decisions += 1;
+            store.failures = 1;
+            return fakeEmbed(ptr, a, model, text);
+        }
+        fn decide(ptr: *anyopaque, a: A, config: m.types.Config, claim: m.types.Assertion, prior: []const m.types.StoredAssertion) !m.types.ReconciliationDecision {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.decisions += 1;
+            store.failures = 1;
+            return reviewDecide(ptr, a, config, claim, prior);
+        }
+    };
+    for ([_]bool{ false, true }) |deciding| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        var svc = modelService(&store, 1);
+        svc.backend.decide = reviewDecide;
+        const config: m.types.Config = .{ .features = .{ .semantic_recall = !deciding, .reconciliation = if (deciding) .model else .explicit }, .models = .{ .embedder = if (deciding) null else fake_model, .decider = if (deciding) fake_model else null }, .predicates = &.{.{ .name = "deploys_with", .cardinality = .one }} };
+        _ = try svc.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+        _ = try svc.execute(a, .observe, "", source, "source");
+        _ = try svc.execute(a, .assertions, "", helm, "prior");
+        const revision = store.revision;
+        svc.context.final_check_ptr = &store;
+        svc.context.final_check_fn = Model.finish;
+        svc.backend.embed = Model.embed;
+        svc.backend.decide = Model.decide;
+        var claims: [2]m.types.Assertion = undefined;
+        for (&claims, 0..) |*claim, i| claim.* = .{ .id = try std.fmt.allocPrint(a, "claim{d}", .{i}), .subject = "production", .predicate = "deploys_with", .value = "Terraform", .statement = "Production uses Terraform", .valid_from = 300, .evidence = &.{.{ .id = "e1" }} };
+        try std.testing.expectError(error.Forbidden, svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = claims }, .{}), "batch"));
+        try std.testing.expectEqual(@as(usize, 1), store.decisions);
+        try std.testing.expectEqual(revision, store.revision);
+    }
+}
+
+test "memory explanation truncation allocates linearly within a fixed memory ceiling" {
+    const Counter = struct {
+        live: usize = 0,
+        peak: usize = 0,
+        fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (len > 64 * 1024 * 1024 -| self.live) return null;
+            const memory = std.testing.allocator.rawAlloc(len, alignment, ret_addr) orelse return null;
+            self.live += len;
+            self.peak = @max(self.peak, self.live);
+            return memory;
+        }
+        fn free(ptr: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.live -= buf.len;
+            std.testing.allocator.rawFree(buf, alignment, ret_addr);
+        }
+        fn allocator(self: *@This()) A {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    try discard(&store, .configure, "", "{\"expected_revision\":3,\"config\":{\"max_input_bytes\":4194304}}", "budget", 3);
+    const text = try a.alloc(u8, 16384);
+    @memset(text, 'x');
+    var claims: [128]m.types.Assertion = undefined;
+    var ids: [128][]const u8 = undefined;
+    for (&claims, &ids, 0..) |*claim, *id, i| {
+        id.* = try std.fmt.allocPrint(a, "leaf{d}", .{i});
+        claim.* = .{ .id = id.*, .subject = "s", .predicate = "p", .value = id.*, .statement = text, .evidence = &.{.{ .id = "e1" }} };
+    }
+    _ = try store.service("alice", true, 4).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = claims }, .{}), "leaves");
+    const root: m.types.Assertion = .{ .id = "root", .subject = "s", .predicate = "p", .value = "root", .statement = "Root assertion", .evidence = &.{.{ .id = "e1" }}, .depends_on = &ids };
+    _ = try store.service("alice", true, 5).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{root} }, .{}), "root");
+    var full_counter: Counter = .{};
+    const full = try store.service("alice", true, 6).execute(full_counter.allocator(), .explain, "root", "{\"max_nodes\":256,\"max_depth\":1,\"max_bytes\":4194304}", "");
+    defer full_counter.allocator().free(full);
+    var bounded_counter: Counter = .{};
+    const bounded = try store.service("alice", true, 6).execute(bounded_counter.allocator(), .explain, "root", "{\"max_nodes\":256,\"max_depth\":1,\"max_bytes\":131072}", "");
+    defer bounded_counter.allocator().free(bounded);
+    const graph = try std.json.parseFromSliceLeaky(m.types.provenance.Explanation, a, bounded, .{});
+    try std.testing.expect(bounded.len <= 131072);
+    try std.testing.expect(graph.truncated and !graph.complete);
+    try std.testing.expect(graph.nodes.len > 1);
+    try std.testing.expect(full.len > bounded.len);
+    try std.testing.expect(bounded_counter.peak <= full_counter.peak + 1024 * 1024);
+}
