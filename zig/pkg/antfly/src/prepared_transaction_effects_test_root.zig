@@ -24,6 +24,8 @@ test {
     _ = @import("antfly_local_sources").storage_db_relational_index_records;
     _ = @import("antfly_local_sources").storage_db_doc_identity;
     _ = @import("antfly_local_sources").storage_docstore;
+    _ = @import("antfly_local_sources").storage_db_catalog_resolver_catalog;
+    _ = @import("antfly_local_sources").storage_db_artifact_inventory;
     _ = @import("antfly_local_sources").storage_db_document_child_range_effects;
     _ = @import("antfly_local_sources").storage_db_document_child_range_manifest;
 }

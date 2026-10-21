@@ -84,7 +84,9 @@ const builtin = @import("builtin");
 // Fence merged logical-query layouts and failure/guard contracts.
 // Read transcripts distinguish an empty upper bound from clearing the bound.
 // Reject prior native observations before interpreting their bound operations.
-pub const abi_version: u32 = 55;
+// Accepted seals retain and account bound observations through recovery.
+// Reject owners which can silently drop that durable preparation state.
+pub const abi_version: u32 = 56;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

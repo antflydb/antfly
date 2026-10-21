@@ -25,6 +25,7 @@ pub const transaction_batch_prefix = "\x00\x00__txn_ha_batch_outbox__:";
 // Immutable generated effects retained between final preparation and resolution.
 pub const preparation_requirement_prefix = "\x00\x00__txn_preparation_requirement_v1__:";
 pub const prepared_effects_prefix = "\x00\x00__txn_prepared_effects_v1__:";
+pub const prepared_observations_prefix = "\x00\x00__txn_prepared_observations_v1__:";
 pub const transaction_credit_prefix = "\x00\x00__txn_ha_batch_credit_v1__:";
 const transaction_credit_initialized = "\x00\x00__metadata__:ha_txn_batch_credit_v1";
 
@@ -55,7 +56,7 @@ pub fn isObligation(key: []const u8) bool {
     // Conservatively include malformed v2 keys: corruption must not escape
     // accounting simply because recovery cannot decode its kind or identity.
     return replay_credit.isObligation(key) or std.mem.startsWith(u8, key, preparation_requirement_prefix) or
-        std.mem.startsWith(u8, key, prepared_effects_prefix) or
+        std.mem.startsWith(u8, key, prepared_effects_prefix) or std.mem.startsWith(u8, key, prepared_observations_prefix) or
         std.mem.startsWith(u8, key, transaction_credit_prefix) or
         std.mem.startsWith(u8, key, transaction_batch_prefix) or
         std.mem.startsWith(u8, key, outbox.replication_outbox_v2_prefix) or
@@ -115,7 +116,7 @@ fn hasObligations(txn: anytype) !bool {
     }
     if (try cursor.seekAtOrAfter(outbox.replication_outbox_v2_prefix)) |entry|
         if (std.mem.startsWith(u8, entry.key, outbox.replication_outbox_v2_prefix)) return true;
-    for ([_][]const u8{ transaction_credit_prefix, transaction_batch_prefix, prepared_effects_prefix, preparation_requirement_prefix, replay_credit.grant_prefix, replay_credit.claim_prefix, replay_credit.owner_prefix }) |prefix| {
+    for ([_][]const u8{ transaction_credit_prefix, transaction_batch_prefix, prepared_effects_prefix, prepared_observations_prefix, preparation_requirement_prefix, replay_credit.grant_prefix, replay_credit.claim_prefix, replay_credit.owner_prefix }) |prefix| {
         if (try cursor.seekAtOrAfter(prefix)) |entry| if (std.mem.startsWith(u8, entry.key, prefix)) return true;
     }
     return false;

@@ -6103,6 +6103,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("docstore-required-prepare-db-test", "Verify durable required preparation through DB intent, resolution and recovery paths")
         .dependOn(&addCuratedTestRunArtifact(b, required_prepare_db_tests, &.{ "db prepared transaction effects required", "ordered artifact inventory DB authored acceptance survives projection and reopen" }).step);
+    const observation_catalog_filters = [_][]const u8{ "storage.db.catalog.resolver_catalog.", "storage.db.artifact_inventory." };
+    const observation_catalog_tests = b.addTest(.{
+        .root_module = prepared_effects_mod,
+        .filters = &observation_catalog_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("docstore-read-observation-catalog-test", "Verify reader floors and prepared catalog observation leases")
+        .dependOn(&addCuratedTestRunArtifact(b, observation_catalog_tests, &observation_catalog_filters).step);
     const counter_materialization_filters = [_][]const u8{
         "db inline dense coverage counters rebase with range ownership",
         "db dense artifact counter bootstrap combines snapshot with concurrent write delta",

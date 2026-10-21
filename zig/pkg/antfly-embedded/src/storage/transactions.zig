@@ -96,6 +96,7 @@ const resolved_index_prefix = "\x00\x00__txn_resolved_index_v1__:";
 const resolved_participants_prefix = "\x00\x00__txn_resolved_participants__:";
 const publication_backlog = @import("publication_backlog.zig");
 const prepared_effects = @import("db/prepared_transaction_effects.zig");
+const prepared_reads = @import("db/prepared_read_set.zig");
 const hot_standby_batch_outbox_prefix = publication_backlog.transaction_batch_prefix;
 const hot_standby_replay_outbox_prefix = "\x00\x00__txn_ha_replay_outbox__:";
 
@@ -107,6 +108,10 @@ pub const TxnId = [16]u8;
 
 pub fn makePreparedEffectsKey(txn_id: TxnId) [publication_backlog.prepared_effects_prefix.len + 16]u8 {
     return publication_backlog.prepared_effects_prefix.* ++ txn_id;
+}
+
+pub fn makePreparedReadObservationsKey(txn_id: TxnId) [publication_backlog.prepared_observations_prefix.len + 16]u8 {
+    return publication_backlog.prepared_observations_prefix.* ++ txn_id;
 }
 
 pub fn makePreparationRequirementKey(txn_id: TxnId) [publication_backlog.preparation_requirement_prefix.len + 16]u8 {
@@ -706,11 +711,11 @@ pub const TxnManager = struct {
         const record_key = makeRecordKey(txn_id);
         for (extra_batch.writes) |write| {
             if (control) |owner| try owner.checkpoint();
-            if (std.mem.eql(u8, write.key, &key) or std.mem.eql(u8, write.key, &effect_key) or std.mem.eql(u8, write.key, &record_key)) return error.InvalidPreparationRequirement;
+            if (std.mem.eql(u8, write.key, &key) or std.mem.eql(u8, write.key, &effect_key) or std.mem.eql(u8, write.key, &record_key) or std.mem.startsWith(u8, write.key, publication_backlog.prepared_observations_prefix)) return error.InvalidPreparationRequirement;
         }
         for (extra_batch.deletes) |deleted| {
             if (control) |owner| try owner.checkpoint();
-            if (std.mem.eql(u8, deleted, &key) or std.mem.eql(u8, deleted, &effect_key) or std.mem.eql(u8, deleted, &record_key)) return error.InvalidPreparationRequirement;
+            if (std.mem.eql(u8, deleted, &key) or std.mem.eql(u8, deleted, &effect_key) or std.mem.eql(u8, deleted, &record_key) or std.mem.startsWith(u8, deleted, publication_backlog.prepared_observations_prefix)) return error.InvalidPreparationRequirement;
         }
         if (existing != null) {
             const accepted = previous orelse return error.PreparationContractConflict;
@@ -768,7 +773,7 @@ pub const TxnManager = struct {
         if (!std.meta.eql(binding, expected)) return error.PreparationContractConflict;
         const required = decision.requirement orelse return error.PreparationContractConflict;
         const key = makePreparedEffectsKey(txn_id);
-        const raw = self.getAllocWithAdmission(self.alloc, &key, control) catch |err| {
+        const raw = self.getBoundedPreparedBytes(self.alloc, &key, prepared_effects.max_frame_bytes, error.InvalidPreparedEffects, control) catch |err| {
             if (trace.failure) |cause| return cause;
             return if (err == error.NotFound) error.PreparedEffectsRequired else err;
         };
@@ -1209,6 +1214,7 @@ pub const TxnManager = struct {
             return TxnError.DecisionConflict;
         }
         const prepared_key = makePreparedEffectsKey(txn_id);
+        const observations_key = makePreparedReadObservationsKey(txn_id);
         const requirement_key = makePreparationRequirementKey(txn_id);
         // Abort can retire opaque/corrupt prepared bytes. Commit must never
         // silently fall back to legacy reconstruction when a sealed plan exists.
@@ -1298,7 +1304,10 @@ pub const TxnManager = struct {
             defer completion_deletes.deinit(self.alloc);
             try completion_deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
             try completion_deletes.appendSlice(self.alloc, indexed_deletes.items);
-            if (status == .aborted and try self.hasPreparedEffects(txn_id)) try completion_deletes.append(self.alloc, &prepared_key);
+            if (status == .aborted) {
+                if (try self.keyExistsWithAdmission(&observations_key, control)) try completion_deletes.append(self.alloc, &observations_key);
+                if (try self.hasPreparedEffects(txn_id)) try completion_deletes.append(self.alloc, &prepared_key);
+            }
             if (status == .aborted and try self.hasPreparationRequirement(txn_id)) try completion_deletes.append(self.alloc, &requirement_key);
             if (completion_writes.items.len != 0 or completion_deletes.items.len != 0) {
                 try self.applyResolutionResourceBatch(completion_writes.items, completion_deletes.items, null, null, null, control, if (status == .aborted) .{ .id = txn_id, .status = status } else null);
@@ -1361,6 +1370,7 @@ pub const TxnManager = struct {
             try completion_deletes.append(self.alloc, &stale_admission_key);
             try completion_deletes.append(self.alloc, &schema_lease_key);
             try completion_deletes.append(self.alloc, &prepared_key);
+            try completion_deletes.append(self.alloc, &observations_key);
             try completion_deletes.append(self.alloc, &requirement_key);
             try completion_deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
             try completion_deletes.appendSlice(self.alloc, indexed_deletes.items);
@@ -1430,6 +1440,7 @@ pub const TxnManager = struct {
         try deletes.append(self.alloc, &intent_keys_key);
         try deletes.append(self.alloc, &schema_lease_key);
         try deletes.append(self.alloc, &prepared_key);
+        try deletes.append(self.alloc, &observations_key);
         try deletes.append(self.alloc, &requirement_key);
         const publication_credit_key = publication_backlog.transactionCreditKey(txn_id);
         const publication_batch_key = makeTransactionReplicationBatchOutboxKey(txn_id);
@@ -1543,7 +1554,7 @@ pub const TxnManager = struct {
         var cursor = try scan.openCursor();
         defer cursor.close();
         cursor.setKeysOnly();
-        for ([_][]const u8{ publication_backlog.prepared_effects_prefix, publication_backlog.preparation_requirement_prefix }) |prefix| {
+        for ([_][]const u8{ publication_backlog.prepared_effects_prefix, publication_backlog.prepared_observations_prefix, publication_backlog.preparation_requirement_prefix }) |prefix| {
             if (try cursor.seekAtOrAfter(prefix)) |entry|
                 if (std.mem.startsWith(u8, entry.key, prefix)) return true;
         }
@@ -1673,7 +1684,7 @@ pub const TxnManager = struct {
 
     pub fn sealBoundPreparedEffectsWithExtraBatch(self: *TxnManager, txn_id: TxnId, frame: []const u8, catalog_digest: [32]u8, mode: prepared_effects.Mode, binding: ?prepared_effects.Binding, extra_batch: MutationExtraBatch, original: ?read_control.Port) !void {
         var trace: MutationAdmissionTrace = .{};
-        self.sealPreparedEffectsInner(txn_id, frame, catalog_digest, mode, binding, extra_batch, null, trace.bind(original)) catch |err| return trace.failure orelse err;
+        self.sealPreparedEffectsInner(txn_id, frame, catalog_digest, mode, binding, extra_batch, null, null, trace.bind(original)) catch |err| return trace.failure orelse err;
         if (trace.failure) |cause| return cause;
     }
 
@@ -1682,27 +1693,106 @@ pub const TxnManager = struct {
     /// funds HA replay retention, not derived-log or executable recovery work.
     pub fn sealPreparedEffectsAndReplayPlan(self: *TxnManager, txn_id: TxnId, frame: []const u8, catalog_digest: [32]u8, mode: prepared_effects.Mode, binding: ?prepared_effects.Binding, request: @import("db/derived/derived_types.zig").DerivedBatch, extra_batch: MutationExtraBatch, original: ?read_control.Port) !void {
         var trace: MutationAdmissionTrace = .{};
-        self.sealPreparedEffectsInner(txn_id, frame, catalog_digest, mode, binding, extra_batch, request, trace.bind(original)) catch |err| return trace.failure orelse err;
+        self.sealPreparedEffectsInner(txn_id, frame, catalog_digest, mode, binding, extra_batch, request, null, trace.bind(original)) catch |err| return trace.failure orelse err;
         if (trace.failure) |cause| return cause;
     }
 
-    fn sealPreparedEffectsInner(self: *TxnManager, txn_id: TxnId, frame: []const u8, catalog_digest: [32]u8, mode: prepared_effects.Mode, binding: ?prepared_effects.Binding, extra_batch: MutationExtraBatch, request: ?@import("db/derived/derived_types.zig").DerivedBatch, control: ?read_control.Port) !void {
+    pub const ReadObservationSeal = struct {
+        namespace: [24]u8,
+        frame: []const u8,
+        replay_request: ?@import("db/derived/derived_types.zig").DerivedBatch = null,
+    };
+
+    /// Caller retains apply/catalog/route ownership and validates the observed
+    /// reads. This atomically retains the observations, effect frame, optional
+    /// replay grant and receipt. It does not install writer exclusion or vote.
+    pub fn sealPreparedEffectsWithReadObservations(self: *TxnManager, txn_id: TxnId, frame: []const u8, catalog_digest: [32]u8, mode: prepared_effects.Mode, binding: prepared_effects.Binding, observations: ReadObservationSeal, extra_batch: MutationExtraBatch, original: ?read_control.Port) !void {
+        var trace: MutationAdmissionTrace = .{};
+        self.sealPreparedEffectsInner(txn_id, frame, catalog_digest, mode, binding, extra_batch, observations.replay_request, observations, trace.bind(original)) catch |err| return trace.failure orelse err;
+        if (trace.failure) |cause| return cause;
+    }
+
+    fn requireReadObservationReader(self: *TxnManager, control: ?read_control.Port) !void {
+        if (control) |owner| try owner.checkpoint();
+        if (!self.store.capabilities().accounted_prepared_observations) return error.Unsupported;
+        const catalog = @import("db/catalog/resolver_catalog.zig");
+        var read = if (control) |owner| try self.store.beginProbeWithAdmission(.retain, owner) else try self.store.beginProbe();
+        defer read.abort();
+        const Floors = struct {
+            txn: *backend_erased.ProbeTxn,
+            pub fn get(self_: *@This(), key: []const u8) ![]const u8 {
+                const raw = try self_.txn.get(key);
+                if (raw.len == 0 or raw.len > 10) return error.InvalidPreparedTransactionProtocol;
+                return raw;
+            }
+        };
+        var floors: Floors = .{ .txn = &read };
+        const minimum = try catalog.readMinimumReaderVersion(&floors, catalog.supported_reader_version);
+        const authoritative = try catalog.readAuthoritativeReaderVersion(&floors, catalog.supported_reader_version);
+        if (minimum < catalog.read_observations_reader_version or authoritative < catalog.read_observations_reader_version) return error.PreparedTransactionProtocolDisabled;
+        if (control) |owner| try owner.checkpoint();
+    }
+
+    fn sameSealedBytes(left: []const u8, right: []const u8, control: ?read_control.Port) !bool {
+        if (left.len != right.len) return false;
+        var offset: usize = 0;
+        while (offset < left.len) {
+            if (control) |owner| try owner.checkpoint();
+            const end = offset + @min(@as(usize, 4096), left.len - offset);
+            if (!std.mem.eql(u8, left[offset..end], right[offset..end])) return false;
+            offset = end;
+        }
+        return true;
+    }
+
+    /// Recover observations only for this owner's still accepted effect seal.
+    /// The caller supplies its authoritative namespace/participant binding and
+    /// retains the same apply fence as all other transaction metadata reads.
+    pub fn loadPreparedReadObservations(self: *TxnManager, alloc: Allocator, txn_id: TxnId, namespace: [24]u8, binding: prepared_effects.Binding, original: ?read_control.Port) !?prepared_reads.Owned {
+        var trace: MutationAdmissionTrace = .{};
+        const control = trace.bind(original);
+        const key = makePreparedReadObservationsKey(txn_id);
+        const raw = self.getBoundedPreparedBytes(alloc, &key, prepared_reads.Durable.max_frame_bytes, error.InvalidTxnRecord, control) catch |err| {
+            if (trace.failure) |cause| return cause;
+            return if (err == error.NotFound) null else err;
+        };
+        defer alloc.free(raw);
+        self.requireReadObservationReader(control) catch |err| return trace.failure orelse err;
+        _ = self.getBoundPreparedSealReceipt(txn_id, binding, control) catch |err| return trace.failure orelse err;
+        const effect_key = makePreparedEffectsKey(txn_id);
+        const effects_raw = self.getBoundedPreparedBytes(alloc, &effect_key, prepared_effects.max_frame_bytes, error.InvalidPreparedEffects, control) catch |err| return trace.failure orelse err;
+        defer alloc.free(effects_raw);
+        const inspection = prepared_effects.inspect(effects_raw, control) catch |err| return trace.failure orelse err;
+        return prepared_reads.Durable.decode(alloc, raw, .{ .contract = inspection.contract, .participant = binding, .namespace = namespace, .frame_digest = inspection.fingerprint }, control) catch |err| return trace.failure orelse err;
+    }
+
+    fn sealPreparedEffectsInner(self: *TxnManager, txn_id: TxnId, frame: []const u8, catalog_digest: [32]u8, mode: prepared_effects.Mode, binding: ?prepared_effects.Binding, extra_batch: MutationExtraBatch, request: ?@import("db/derived/derived_types.zig").DerivedBatch, observations: ?ReadObservationSeal, control: ?read_control.Port) !void {
         const key = makePreparedEffectsKey(txn_id);
+        const observation_key = makePreparedReadObservationsKey(txn_id);
         const requirement_key = makePreparationRequirementKey(txn_id);
         const record_key = makeRecordKey(txn_id);
         for (extra_batch.writes) |write| {
             if (control) |owner| try owner.checkpoint();
-            if (std.mem.eql(u8, write.key, &key) or std.mem.eql(u8, write.key, &requirement_key) or std.mem.eql(u8, write.key, &record_key)) return error.InvalidPreparationRequirement;
+            if (std.mem.eql(u8, write.key, &key) or std.mem.eql(u8, write.key, &requirement_key) or std.mem.eql(u8, write.key, &record_key) or std.mem.startsWith(u8, write.key, publication_backlog.prepared_observations_prefix)) return error.InvalidPreparationRequirement;
         }
         for (extra_batch.deletes) |deleted| {
             if (control) |owner| try owner.checkpoint();
-            if (std.mem.eql(u8, deleted, &key) or std.mem.eql(u8, deleted, &requirement_key) or std.mem.eql(u8, deleted, &record_key)) return error.InvalidPreparationRequirement;
+            if (std.mem.eql(u8, deleted, &key) or std.mem.eql(u8, deleted, &requirement_key) or std.mem.eql(u8, deleted, &record_key) or std.mem.startsWith(u8, deleted, publication_backlog.prepared_observations_prefix)) return error.InvalidPreparationRequirement;
         }
         const record = try self.loadTransactionRecordWithAdmission(txn_id, control);
         if (record.status != .pending) return TxnError.DecisionConflict;
         if (!std.meta.eql(record.preparation_binding, binding)) return error.PreparationContractConflict;
         if (try self.loadPreparationRequirementInner(txn_id, control)) |required| if (required.mode != mode) return error.PreparationContractConflict;
         const inspection = try prepared_effects.inspect(frame, control);
+        if (observations) |selected| {
+            try self.requireReadObservationReader(control);
+            if (record.preparation_requirement == null) return error.PreparationContractConflict;
+            const participant = binding orelse return error.PreparationContractConflict;
+            var decoded = try prepared_reads.Durable.decode(self.alloc, selected.frame, .{ .contract = inspection.contract, .participant = participant, .namespace = selected.namespace, .frame_digest = inspection.fingerprint }, control);
+            decoded.deinit();
+        }
+        const old_observations = self.getBoundedPreparedBytes(self.alloc, &observation_key, prepared_reads.Durable.max_frame_bytes, error.InvalidTxnRecord, control) catch |err| if (err == error.NotFound) null else return err;
+        defer if (old_observations) |bytes| self.alloc.free(bytes);
         var replay_plan: ?@import("prepared_replay_plan.zig").Plan = null;
         defer if (replay_plan) |*plan| plan.deinit();
         {
@@ -1743,6 +1833,10 @@ pub const TxnManager = struct {
         };
         defer if (previous) |bytes| self.alloc.free(bytes);
         if (previous) |bytes| {
+            if (observations) |selected| {
+                const accepted = old_observations orelse return error.PreparedEffectsConflict;
+                if (!try sameSealedBytes(accepted, selected.frame, control)) return error.PreparedEffectsConflict;
+            }
             // Lost response retry: preserve the first accepted immutable result,
             // revision and grant. A regenerated/different result cannot replace it.
             if (bytes.len != frame.len) return error.PreparedEffectsConflict;
@@ -1756,9 +1850,11 @@ pub const TxnManager = struct {
             try self.applyPreparedSealBatch(extra_batch.writes, extra_batch.deletes, reservation, control);
             return;
         }
+        if (old_observations != null) return error.InvalidTxnRecord;
         var writes: std.ArrayListUnmanaged(docstore.KVPair) = .empty;
         defer writes.deinit(self.alloc);
         try writes.append(self.alloc, .{ .key = &key, .value = frame });
+        if (observations) |selected| try writes.append(self.alloc, .{ .key = &observation_key, .value = selected.frame });
         try writes.appendSlice(self.alloc, extra_batch.writes);
         try self.applyPreparedSealBatch(writes.items, extra_batch.deletes, reservation, control);
     }
@@ -3372,6 +3468,7 @@ pub const TxnManager = struct {
         const hot_standby_replay_key = makeTransactionReplicationReplayOutboxKey(txn_id);
         const publication_credit_key = publication_backlog.transactionCreditKey(txn_id);
         const prepared_key = makePreparedEffectsKey(txn_id);
+        const observations_key = makePreparedReadObservationsKey(txn_id);
         const requirement_key = makePreparationRequirementKey(txn_id);
         const intent_keys_key = makeSidecarKey(intent_keys_prefix, txn_id);
         const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
@@ -3379,7 +3476,7 @@ pub const TxnManager = struct {
         defer deletes.deinit(self.alloc);
         const admission_key = makeSidecarKey(intent_admission_prefix, txn_id);
         try deletes.append(self.alloc, &admission_key);
-        try deletes.appendSlice(self.alloc, &.{ &record_key, &participant_key, &resolved_key, &hot_standby_batch_key, &hot_standby_replay_key, &publication_credit_key, &intent_keys_key, &schema_lease_key, &prepared_key, &requirement_key });
+        try deletes.appendSlice(self.alloc, &.{ &record_key, &participant_key, &resolved_key, &hot_standby_batch_key, &hot_standby_replay_key, &publication_credit_key, &intent_keys_key, &schema_lease_key, &prepared_key, &observations_key, &requirement_key });
         try deletes.appendSlice(self.alloc, extra_batch.deletes);
         const member_prefix = makeSidecarKey(participant_index_prefix, txn_id);
         const resolution_prefix = makeSidecarKey(resolved_index_prefix, txn_id);
@@ -3443,6 +3540,26 @@ pub const TxnManager = struct {
         defer txn.abort();
         const value = try txn.get(key);
         return try backend_scan.dupeWithAdmission(alloc, value, control);
+    }
+
+    fn getBoundedPreparedBytes(self: *TxnManager, alloc: Allocator, key: []const u8, limit: usize, malformed: anyerror, control: ?read_control.Port) ![]u8 {
+        var txn = if (control) |owner| try self.store.beginProbeWithAdmission(.retain, owner) else try self.store.beginProbe();
+        defer txn.abort();
+        const value = try txn.get(key);
+        if (control) |owner| try owner.checkpoint();
+        if (value.len > limit) return malformed;
+        return backend_scan.dupeWithAdmission(alloc, value, control);
+    }
+
+    fn keyExistsWithAdmission(self: *TxnManager, key: []const u8, control: ?read_control.Port) !bool {
+        var txn = if (control) |owner| try self.store.beginProbeWithAdmission(.retain, owner) else try self.store.beginProbe();
+        defer txn.abort();
+        _ = txn.get(key) catch |err| {
+            if (control) |owner| try owner.checkpoint();
+            return if (err == error.NotFound) false else err;
+        };
+        if (control) |owner| try owner.checkpoint();
+        return true;
     }
 
     fn keyExists(self: *TxnManager, key: []const u8) !bool {
@@ -8300,5 +8417,273 @@ test "prepared transaction effects assembled auxiliary mutations require preowne
             defer read.abort();
             try std.testing.expectEqual(F.credit.Phase.prepared, (try F.credit.load(&read, F.id)).?.phase);
         }
+    };
+}
+
+const PreparedObservationSealFixture = struct {
+    native: lsm_backend.Backend = undefined,
+    store: DocStore = undefined,
+    manager: TxnManager = undefined,
+    const id: TxnId = @splat(171);
+    const catalog: [32]u8 = @splat(5);
+    const namespace: [24]u8 = @splat(3);
+    const binding: prepared_effects.Binding = .{ .group_id = 11, .topology_epoch = 7, .participant_digest = @splat(13), .route_digest = @splat(17) };
+    fn init(self: *@This()) !void {
+        const a = std.testing.allocator;
+        self.native = lsm_backend.Backend.init(a, .{});
+        errdefer self.native.close();
+        self.store = try DocStore.openRuntime(a, try self.native.runtimeStore(a, .{}));
+        errdefer self.store.close();
+        try @import("artifact_footprint.zig").initializeEmpty(&self.store);
+        try @import("artifact_replay_inventory.zig").initialize(&self.store);
+        try self.floor(14);
+        self.manager = try TxnManager.init(a, &self.store);
+        errdefer self.manager.deinit();
+        try self.manager.initTransactionRequiringPreparedEffectsWithBinding(id, 1, 1, &.{}, false, true, .{ .mode = .deferred }, binding, .{}, null);
+        try self.manager.writeIntents(id, &.{.{ .key = "row", .value = "{}" }}, &.{});
+        try self.store.put("read-input", "input");
+    }
+    fn floor(self: *@This(), version: u32) !void {
+        const catalog_module = @import("db/catalog/resolver_catalog.zig");
+        try self.store.put(catalog_module.minimum_reader_key, try catalog_module.readerVersionBytes(version));
+        try self.store.put(catalog_module.replacement_reader_base_key, try catalog_module.readerVersionBytes(version));
+    }
+    fn deinit(self: *@This()) void {
+        self.manager.deinit();
+        self.store.close();
+        self.native.close();
+    }
+    fn frame(self: *@This()) ![]u8 {
+        return prepared_effects.encode(std.testing.allocator, .{ .contract = try self.manager.preparedEffectsContract(id, catalog, .deferred, null), .effects = .{} }, null);
+    }
+    fn observations(frame_: []const u8, value: []const u8) ![]u8 {
+        const a = std.testing.allocator;
+        const inspection = try prepared_effects.inspect(frame_, null);
+        var reads = prepared_reads.Owned.init(a, null);
+        defer reads.deinit();
+        try reads.recordPoint("read-input", value);
+        try reads.finish();
+        return prepared_reads.Durable.encode(a, &reads, .{ .contract = inspection.contract, .participant = binding, .namespace = namespace, .frame_digest = inspection.fingerprint }, null);
+    }
+    fn seal(self: *@This(), effect: []const u8, observations_: []const u8, replay: bool, control: ?read_control.Port) !void {
+        return self.manager.sealPreparedEffectsWithReadObservations(id, effect, catalog, .deferred, binding, .{ .namespace = namespace, .frame = observations_, .replay_request = if (replay) .{ .documents = &.{.{ .key = "row" }} } else null }, .{ .writes = &.{.{ .key = "observation-seal-receipt", .value = "accepted" }} }, control);
+    }
+    fn debt(self: *@This()) !publication_backlog.State {
+        var read = try self.store.beginReadTxn();
+        defer read.abort();
+        return (try publication_backlog.load(&read)) orelse .{};
+    }
+    fn noSeal(self: *@This()) !void {
+        try std.testing.expect(!try self.manager.hasPreparedEffects(id));
+        try std.testing.expectError(error.NotFound, self.store.get(std.testing.allocator, &makePreparedReadObservationsKey(id)));
+        try std.testing.expectError(error.NotFound, self.store.get(std.testing.allocator, "observation-seal-receipt"));
+        var read = try self.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect((try @import("prepared_replay_credit.zig").load(&read, id)) == null);
+    }
+};
+
+test "prepared transaction effects observation seal atomically retains frame observations replay credit receipt and immutable retries" {
+    const a = std.testing.allocator;
+    const F = PreparedObservationSealFixture;
+    var f: F = .{};
+    try f.init();
+    defer f.deinit();
+    const effect = try f.frame();
+    defer a.free(effect);
+    const observations = try F.observations(effect, "input");
+    defer a.free(observations);
+    const before = try f.debt();
+    try f.seal(effect, observations, true, null);
+    const after = try f.debt();
+    try std.testing.expect(after.bytes >= before.bytes + effect.len + observations.len);
+    const key = makePreparedReadObservationsKey(F.id);
+    const raw = try f.store.get(a, &key);
+    defer a.free(raw);
+    try std.testing.expectEqualSlices(u8, observations, raw);
+    var read = try f.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expect((try @import("prepared_replay_credit.zig").load(&read, F.id)) != null);
+    try std.testing.expect(try @import("db/artifact_inventory.zig").hasPreparedCatalogLease(&read));
+    try f.seal(effect, observations, true, null);
+    try std.testing.expectEqualDeep(after, try f.debt());
+    const changed = try F.observations(effect, "different observed source");
+    defer a.free(changed);
+    try std.testing.expectError(error.PreparedEffectsConflict, f.seal(effect, changed, true, null));
+    try std.testing.expectError(error.InvalidPreparationRequirement, f.manager.sealBoundPreparedEffectsWithExtraBatch(F.id, effect, F.catalog, .deferred, F.binding, .{ .deletes = &.{&key} }, null));
+    var loaded = (try f.manager.loadPreparedReadObservations(a, F.id, F.namespace, F.binding, null)).?;
+    defer loaded.deinit();
+    try std.testing.expect(loaded.sealed and loaded.control == null);
+    try loaded.validate(&f.store, null);
+    var foreign_namespace = F.namespace;
+    foreign_namespace[0] ^= 1;
+    try std.testing.expectError(error.PreparedEffectsMismatch, f.manager.loadPreparedReadObservations(a, F.id, foreign_namespace, F.binding, null));
+    var foreign_route = F.binding;
+    foreign_route.route_digest[0] ^= 1;
+    try std.testing.expectError(error.PreparationContractConflict, f.manager.loadPreparedReadObservations(a, F.id, F.namespace, foreign_route, null));
+    try std.testing.expectEqualDeep(after, try f.debt());
+}
+
+test "prepared transaction effects observation seal rejects old floors retrofit missing frames orphans and quota without partial grants" {
+    const a = std.testing.allocator;
+    const F = PreparedObservationSealFixture;
+    for (0..4) |scenario| {
+        var f: F = .{};
+        try f.init();
+        defer f.deinit();
+        const effect = try f.frame();
+        defer a.free(effect);
+        const observations = try F.observations(effect, "input");
+        defer a.free(observations);
+        const key = makePreparedReadObservationsKey(F.id);
+        if (scenario == 0) {
+            try f.floor(13);
+            try std.testing.expectError(error.PreparedTransactionProtocolDisabled, f.seal(effect, observations, true, null));
+            try f.noSeal();
+        } else if (scenario == 1) {
+            try f.manager.sealBoundPreparedEffectsWithExtraBatch(F.id, effect, F.catalog, .deferred, F.binding, .{}, null);
+            try std.testing.expectError(error.PreparedEffectsConflict, f.seal(effect, observations, true, null));
+            try std.testing.expectError(error.NotFound, f.store.get(a, &key));
+        } else if (scenario == 2) {
+            try f.store.put(&key, "orphan");
+            try std.testing.expect(try f.manager.hasPreparationMetadata());
+            try std.testing.expectError(error.InvalidTxnRecord, f.seal(effect, observations, true, null));
+            try std.testing.expect(!try f.manager.hasPreparedEffects(F.id));
+        } else {
+            const full = (publication_backlog.State{ .records = publication_backlog.default_max_records, .bytes = publication_backlog.default_max_bytes }).encode();
+            try f.store.put(publication_backlog.state_key, &full);
+            try std.testing.expectError(error.Backpressured, f.seal(effect, observations, true, null));
+            try f.noSeal();
+            try std.testing.expectEqualDeep(try publication_backlog.State.decode(&full), try f.debt());
+        }
+    }
+}
+
+test "prepared transaction effects observation resolution retires committed aborted and corrupt observations with their credits" {
+    const a = std.testing.allocator;
+    const F = PreparedObservationSealFixture;
+    for ([_]TxnStatus{ .committed, .aborted }) |status| {
+        var f: F = .{};
+        try f.init();
+        defer f.deinit();
+        const effect = try f.frame();
+        defer a.free(effect);
+        const observations = try F.observations(effect, "input");
+        defer a.free(observations);
+        try f.seal(effect, observations, status == .aborted, null);
+        const key = makePreparedReadObservationsKey(F.id);
+        if (status == .aborted) try f.store.put(&key, "corrupt observation bytes must not block abort");
+        var accepted = (try f.manager.loadPreparedEffects(a, F.id, null)).?;
+        defer accepted.deinit();
+        _ = try f.manager.resolveIntentsWithPreparedEffects(F.id, status, 2, .{}, if (status == .committed) &accepted.fingerprint else null, null);
+        try std.testing.expectError(error.NotFound, f.store.get(a, &key));
+        try std.testing.expectEqual(@as(u64, 0), (try f.debt()).bytes);
+        const revision = f.store.query_generation_revision.load(.acquire);
+        _ = try f.manager.resolveIntentsWithPreparedEffects(F.id, status, 2, .{}, null, null);
+        try std.testing.expectEqual(revision, f.store.query_generation_revision.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 0), (try f.debt()).bytes);
+    }
+}
+
+test "prepared transaction effects observation seal failures and original refusals publish none of the atomic bundle" {
+    const F = PreparedObservationSealFixture;
+    const Checks = struct {
+        calls: usize = 0,
+        stop: usize = std.math.maxInt(usize),
+        cause: anyerror = error.DeadlineExceeded,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == self.stop) return self.cause;
+        }
+        fn run(alloc: Allocator, checks: ?*@This()) !void {
+            const a = std.testing.allocator;
+            var f: F = .{};
+            try f.init();
+            defer f.deinit();
+            const effect = try f.frame();
+            defer a.free(effect);
+            const observations = try F.observations(effect, "input");
+            defer a.free(observations);
+            const before = try f.debt();
+            var payload: read_control.Payload = .{ .ptr = checks orelse undefined, .vtable = &.{ .checkpoint = check } };
+            f.manager.alloc = alloc;
+            const outcome = f.seal(effect, observations, true, if (checks != null) read_control.Port.init(&payload) else null);
+            f.manager.alloc = a;
+            outcome catch |err| {
+                try f.noSeal();
+                try std.testing.expectEqualDeep(before, try f.debt());
+                return err;
+            };
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Checks.run, .{@as(?*Checks, null)});
+    var baseline: Checks = .{};
+    try Checks.run(std.testing.allocator, &baseline);
+    for ([_]anyerror{ error.NotFound, error.OutOfMemory, error.DeadlineExceeded }) |cause| for (1..baseline.calls + 1) |stop| {
+        var checks: Checks = .{ .stop = stop, .cause = cause };
+        try std.testing.expectError(cause, Checks.run(std.testing.allocator, &checks));
+    };
+}
+
+test "prepared transaction effects observation seals reject raw backends without owner quota accounting" {
+    const a = std.testing.allocator;
+    const F = PreparedObservationSealFixture;
+    var native = mem_backend.Backend.init(a, .{});
+    defer native.close();
+    var runtime = try native.runtimeStore(a, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(a, &runtime);
+    defer manager.deinit();
+    const id: TxnId = @splat(173);
+    try std.testing.expect(!runtime.capabilities().accounted_prepared_observations);
+    try manager.initTransactionRequiringPreparedEffectsWithBinding(id, 1, 1, &.{}, false, true, .{ .mode = .deferred }, F.binding, .{}, null);
+    try manager.writeIntents(id, &.{.{ .key = "row", .value = "{}" }}, &.{});
+    const frame = try prepared_effects.encode(a, .{ .contract = try manager.preparedEffectsContract(id, F.catalog, .deferred, null), .effects = .{} }, null);
+    defer a.free(frame);
+    const observations = try F.observations(frame, "input");
+    defer a.free(observations);
+    try std.testing.expectError(error.Unsupported, manager.sealPreparedEffectsWithReadObservations(id, frame, F.catalog, .deferred, F.binding, .{ .namespace = F.namespace, .frame = observations }, .{}, null));
+    try std.testing.expect(!try manager.hasPreparedEffects(id));
+    try std.testing.expectError(error.NotFound, manager.getAlloc(a, &makePreparedReadObservationsKey(id)));
+}
+
+test "prepared transaction effects observation recovery unwinds allocations and every original rejection without changing the accepted bundle" {
+    const a = std.testing.allocator;
+    const F = PreparedObservationSealFixture;
+    const Checks = struct {
+        calls: usize = 0,
+        stop: usize = std.math.maxInt(usize),
+        cause: anyerror = error.NotFound,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == self.stop) return self.cause;
+        }
+        fn run(alloc: Allocator, f: *F, checks: ?*@This()) !void {
+            var payload: read_control.Payload = .{ .ptr = checks orelse undefined, .vtable = &.{ .checkpoint = check } };
+            var owned = (try f.manager.loadPreparedReadObservations(alloc, F.id, F.namespace, F.binding, if (checks != null) read_control.Port.init(&payload) else null)).?;
+            defer owned.deinit();
+            try owned.validate(&f.store, null);
+        }
+    };
+    var f: F = .{};
+    try f.init();
+    defer f.deinit();
+    const effect = try f.frame();
+    defer a.free(effect);
+    const observations = try F.observations(effect, "input");
+    defer a.free(observations);
+    // With no temporary replacement fence, the minimum is authoritative.
+    try f.store.delete(@import("db/catalog/reader_versions.zig").replacement_reader_base_key);
+    try f.seal(effect, observations, false, null);
+    const before = try f.debt();
+    try std.testing.checkAllAllocationFailures(a, Checks.run, .{ &f, @as(?*Checks, null) });
+    var baseline: Checks = .{};
+    try Checks.run(a, &f, &baseline);
+    for ([_]anyerror{ error.NotFound, error.OutOfMemory, error.DeadlineExceeded }) |cause| for (1..baseline.calls + 1) |stop| {
+        var checks: Checks = .{ .stop = stop, .cause = cause };
+        try std.testing.expectError(cause, Checks.run(a, &f, &checks));
+        try std.testing.expectEqualDeep(before, try f.debt());
     };
 }

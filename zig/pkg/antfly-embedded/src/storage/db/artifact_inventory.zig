@@ -28,12 +28,15 @@ pub const local_key = "\x00\x00__metadata__:artifact_inventory";
 /// publication, including malformed/orphan frames awaiting abort or repair.
 /// Call under the DB apply fence or the catalog writer transaction.
 pub fn hasPreparedCatalogLease(txn: anytype) !bool {
-    const prefix = @import("../publication_backlog.zig").prepared_effects_prefix;
+    const backlog = @import("../publication_backlog.zig");
     var cursor = try txn.openCursor();
     defer cursor.close();
     cursor.setKeysOnly();
-    const entry = (try cursor.seekAtOrAfter(prefix)) orelse return false;
-    return std.mem.startsWith(u8, entry.key, prefix);
+    for ([_][]const u8{ backlog.prepared_effects_prefix, backlog.prepared_observations_prefix }) |prefix| {
+        if (try cursor.seekAtOrAfter(prefix)) |entry|
+            if (std.mem.startsWith(u8, entry.key, prefix)) return true;
+    }
+    return false;
 }
 
 pub fn requireNoPreparedCatalogLease(txn: anytype) !void {

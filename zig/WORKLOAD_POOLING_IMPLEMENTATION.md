@@ -21928,3 +21928,60 @@ and the broader fair/default/session/whole-node/tenant/remote rollout remain ope
 Strong defaults stay off, full goal stays active. No public-consumer/provider-
 image/full-storage-archive requalification; full Linux qualification remains
 waived. Canonical worktree/branch/PR retained, normal hooks, no push.
+
+### Atomic observation/effect seal retention (2026-10-21)
+
+TxnManager.sealPreparedEffectsWithReadObservations now atomically retains the
+bound ATRO envelope, exact effect frame, optional replay reservation and caller
+receipt. It validates the observation binding against the inspected effect and
+record participant contract. A lost-response retry preserves the first accepted
+observation bytes and all existing credits; a previously accepted legacy frame
+cannot be retrofitted with observations. Extra batches cannot overwrite/delete
+observation sidecars. DBCore's separate opt-in helper validates current reads
+under the caller's apply fence before encoding/admission, using its physical
+namespace and current catalog. This is optimistic validation, not exclusion.
+
+The new transaction-owned observation prefix participates in publication-
+backlog size/record admission and bounded obligation detection. Resolution and
+record removal retire its bytes with effects/requirements/credits, including
+abort of malformed observations. Already-resolved retries inspect presence and
+perform no new writer commit; tests check unchanged query-generation revision.
+Observation orphans also fence catalog mutation and protocol activation.
+Recovery loads require an accepted bound effect seal, match the caller's
+namespace/route, cap metadata before copying, and preserve all original causes.
+
+Reader14 fences the new durable metadata/accounting (prepared12 and replay13
+remain distinct). The canonical reader rule treats a missing temporary
+replacement fence as the permanent minimum; an actual old authoritative fence
+still refuses admission. Decimal sidecars are bounded before parsing/copying.
+An explicit accounted_prepared_observations capability defaults false and is
+advertised only by the DocStore owner with atomic backlog accounting. Raw
+backends fail closed even without a requested replay reservation. Native56/
+storage-owner114 fence this added capability and preparation behavior; public
+API59/failure67/detail IDs and descriptorv29 are unchanged. ATROv1 is unchanged.
+
+Six transaction regressions plus a DB stale-read/atomic-admission/native-reopen
+case and reader14 catalog regression cover immutable retries, exact accounting,
+quota/floor/raw-owner refusals, malformed/orphan cleanup, foreign namespace/route
+recovery, exhaustive seal/load allocator failures and every original NotFound/
+OOM/deadline checkpoint. New docstore-read-observation-catalog-test explicitly
+imports and selects the 22 catalog/inventory primitives. Final authoritative
+receipt atomic-read-observation-seal-v5: all four native commands exit0, 5491
+source inputs unchanged, 79/79 build steps, 201 fresh executions (effects81,
+required DB47, catalog22, error/failure contracts43/1/7), no skips/failures/leaks.
+Intermediate builds caught a fixture fingerprint argument, missing reader14
+byte serializer, permanent-floor fallback, missing unit imports and probe type;
+all are resolved in v5. Existing strong default and PREPARE drivers stay off.
+
+This installs atomic retention/accounting, NOT read/write exclusion or vote
+authority. Generic trusted TxnManager admission requires caller validation and
+apply/catalog/route ownership; normal HTTP/SQL/distributed drivers remain
+unwired. Next enforce semantic point/prefix/range conflicts and actor-bound
+retirement across every writer, preserving publisher/ACK/control progress.
+Complete live core/cache/policy/table-catalog/opaque route capture, pure assembly
+before vote, minimum executable recovery RAM/CPU/I/O/dependencies and separate
+derived-log quota, DB/execution lifetimes, raw writer/import/restore/restart/peer
+eligibility and the wider fair/default/session/whole-node/tenant/remote rollout
+remain open. Full goal remains active. No public-consumer/provider-image/full-
+archive requalification; full Linux qualification remains waived. Single
+canonical worktree/branch/PR, normal hooks, no push.

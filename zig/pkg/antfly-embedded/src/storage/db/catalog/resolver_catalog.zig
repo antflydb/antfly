@@ -75,6 +75,7 @@ pub const generated_producers_reader_version = reader_versions.generated_produce
 pub const grouped_sources_reader_version = reader_versions.grouped_sources_reader_version;
 pub const namespace_curation_reader_version = reader_versions.namespace_curation_reader_version;
 pub const prepared_transaction_reader_version = reader_versions.prepared_transaction_reader_version;
+pub const read_observations_reader_version = reader_versions.read_observations_reader_version;
 pub const supported_reader_version = reader_versions.supported_reader_version;
 pub const curation_provenance_reader_version = reader_versions.curation_provenance_reader_version;
 pub const scoped_curation_reader_version = reader_versions.scoped_curation_reader_version;
@@ -94,6 +95,7 @@ pub fn readerVersionBytes(version: u32) ![]const u8 {
         11 => "11",
         12 => "12",
         13 => "13",
+        14 => "14",
         else => error.UnsupportedDatabaseReaderVersion,
     };
 }
@@ -1117,4 +1119,17 @@ test "resolver curation state requires the current receipt decoder" {
     const scoped = try std.json.Stringify.valueAlloc(a, .{.{ .curation_json = try std.json.Stringify.valueAlloc(a, curation.State{ .receipt_scope = @splat('a') }, .{}) }}, .{});
     try std.testing.expectEqual(scoped_curation_reader_version, try catalogReaderVersion(a, scoped));
     try std.testing.expectEqualStrings("11", try readerVersionBytes(scoped_curation_reader_version));
+}
+
+test "resolver read observation reader floors reject earlier database readers" {
+    try std.testing.expectEqualStrings("14", try readerVersionBytes(read_observations_reader_version));
+    const Floor = struct {
+        pub fn get(_: *@This(), _: []const u8) ![]const u8 {
+            return "14";
+        }
+    };
+    var floor: Floor = .{};
+    try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, readMinimumReaderVersion(&floor, 13));
+    try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, readAuthoritativeReaderVersion(&floor, 13));
+    try std.testing.expectEqual(@as(u32, 14), try readAuthoritativeReaderVersion(&floor, supported_reader_version));
 }

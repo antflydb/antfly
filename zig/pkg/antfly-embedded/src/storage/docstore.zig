@@ -1548,7 +1548,9 @@ pub const DocStore = struct {
     }
 
     fn backendCapabilities(self: *DocStore) backend_types.Capabilities {
-        return self.runtime_store.capabilities();
+        var capabilities = self.runtime_store.capabilities();
+        capabilities.accounted_prepared_observations = true;
+        return capabilities;
     }
 
     pub fn backendStore(self: *DocStore) BackendStore {

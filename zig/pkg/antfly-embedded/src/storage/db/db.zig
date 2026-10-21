@@ -146612,3 +146612,77 @@ test "db prepared transaction effects required durable read observations replay 
     try db.core.store.put("capture/point", "new");
     try std.testing.expectError(error.PreparedReadSetChanged, recovered.validate(db.core.store, null));
 }
+
+test "db prepared transaction effects required observation seal validates before atomic admission and recovers after native reopen" {
+    const a = std.testing.allocator;
+    const reads = @import("prepared_read_set.zig");
+    const effects = @import("prepared_transaction_effects.zig");
+    const versions = @import("catalog/reader_versions.zig");
+    const id: transactions_mod.TxnId = @splat(172);
+    const binding: effects.Binding = .{ .group_id = 11, .topology_epoch = 7, .participant_digest = @splat(13), .route_digest = @splat(17) };
+    var directory = try TestDirectory.init("atomic-read-observation-seal-reopen");
+    defer directory.cleanup();
+    const options: OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .start_independent_maintenance = false };
+    var db = try DB.open(a, directory.path(), options);
+    var db_open = true;
+    defer if (db_open) db.close();
+    try db.enablePreparedTransactionProtocol();
+    {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        try db.core.index_manager.aggregateAuthoritativeReaderVersion(db.core.store, versions.read_observations_reader_version);
+        _ = try db.core.beginTransactionRequiringPreparedEffectsWithBinding(id, 1, 1, &.{}, false, true, .{ .mode = .deferred }, binding, .{}, null);
+    }
+    try db.core.store.put("read-input", "before");
+    var observed = reads.Owned.init(a, null);
+    defer observed.deinit();
+    const value = try reads.observe(db.core.store, &observed).get(a, "read-input");
+    a.free(value);
+    try observed.finish();
+    const frame = blk: {
+        var manager = try db.core.initTxnManager();
+        defer manager.deinit();
+        try manager.writeIntents(id, &.{.{ .key = "row", .value = "{}" }}, &.{});
+        const catalog = try db.core.preparedEffectsCatalogDigest(null);
+        break :blk try effects.encode(a, .{ .contract = try manager.preparedEffectsContract(id, catalog, .deferred, null), .effects = .{} }, null);
+    };
+    defer a.free(frame);
+    try db.core.store.put("read-input", "changed");
+    {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        try std.testing.expectError(error.PreparedReadSetChanged, db.core.sealPreparedTransactionEffectsWithReadObservations(id, frame, .deferred, binding, &observed, null, null));
+    }
+    try std.testing.expectError(error.NotFound, db.core.store.get(a, &transactions_mod.makePreparedEffectsKey(id)));
+    try std.testing.expectError(error.NotFound, db.core.store.get(a, &transactions_mod.makePreparedReadObservationsKey(id)));
+    try db.core.store.put("read-input", "before");
+    {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        try db.core.sealPreparedTransactionEffectsWithReadObservations(id, frame, .deferred, binding, &observed, null, null);
+    }
+    db.close();
+    db_open = false;
+    db = try DB.open(a, directory.path(), options);
+    db_open = true;
+    var namespace: [24]u8 = undefined;
+    doc_identity.encodeNamespace(&namespace, db.core.identity_namespace);
+    {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        var manager = try db.core.initTxnManager();
+        defer manager.deinit();
+        var recovered = (try manager.loadPreparedReadObservations(a, id, namespace, binding, null)).?;
+        defer recovered.deinit();
+        try recovered.validate(db.core.store, null);
+        try db.core.store.put("read-input", "later");
+        try std.testing.expectError(error.PreparedReadSetChanged, recovered.validate(db.core.store, null));
+        // Exclusion is not installed yet; abort must retire the observation
+        // bytes even when their optimistic predicates no longer hold.
+        try manager.resolveIntents(id, .aborted, 2);
+    }
+    try std.testing.expectError(error.NotFound, db.core.store.get(a, &transactions_mod.makePreparedReadObservationsKey(id)));
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqual(@as(u64, 0), (try @import("../publication_backlog.zig").load(&read)).?.bytes);
+}

@@ -2471,6 +2471,23 @@ pub const DBCore = struct {
         try manager.sealPreparedEffects(txn_id, frame, catalog, mode, control);
     }
 
+    /// Caller holds apply ownership and retained controls. Observation validation
+    /// is optimistic until semantic writer exclusion is installed; this API is
+    /// intentionally separate from the normal PREPARE/vote drivers.
+    pub fn sealPreparedTransactionEffectsWithReadObservations(self: *DBCore, txn_id: transactions_mod.TxnId, frame: []const u8, mode: @import("prepared_transaction_effects.zig").Mode, binding: @import("prepared_transaction_effects.zig").Binding, observations: *const @import("prepared_read_set.zig").Owned, replay_request: ?@import("derived/derived_types.zig").DerivedBatch, control: ?@import("../../common/read_admission.zig").Port) !void {
+        try self.requirePreparedTransactionProtocol(control);
+        const catalog = try self.preparedEffectsCatalogDigest(control);
+        try observations.validate(self.store, control);
+        const inspection = try @import("prepared_transaction_effects.zig").inspect(frame, control);
+        var namespace: [24]u8 = undefined;
+        @import("doc_identity.zig").encodeNamespace(&namespace, self.identity_namespace);
+        const raw = try @import("prepared_read_set.zig").Durable.encode(self.alloc, observations, .{ .contract = inspection.contract, .participant = binding, .namespace = namespace, .frame_digest = inspection.fingerprint }, control);
+        defer self.alloc.free(raw);
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        try manager.sealPreparedEffectsWithReadObservations(txn_id, frame, catalog, mode, binding, .{ .namespace = namespace, .frame = raw, .replay_request = replay_request }, .{}, control);
+    }
+
     pub fn resolveTransactionIntentsWithAcceptedEffects(self: *DBCore, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, commit_version: u64, extra_batch: transactions_mod.ResolutionExtraBatch, accepted: ?*const transactions_mod.PreparedEffects, control: ?@import("../../common/read_admission.zig").Port) !transactions_mod.ResolutionOutcome {
         var manager = try self.initTxnManager();
         defer manager.deinit();

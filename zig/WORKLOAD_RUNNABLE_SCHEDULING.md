@@ -6545,3 +6545,24 @@ restart/peer eligibility, normal required PREPARE and the broader fair/default/
 session/whole-node/tenant/remote rollout remain incomplete. Strong defaults off;
 full goal active. No push or new branch/worktree/PR. Full Linux qualification
 remains waived; public-consumer/provider-image/full-archive checks not rerun.
+
+### Atomic observation seal retention (2026-10-21)
+
+Bound observation envelopes now commit with accepted effects, optional replay
+credit and receipts. Retention has backlog quota accounting, immutable retry
+semantics, bounded recovery loads and atomic resolution cleanup. A separate
+DBCore helper rejects changed reads before admission; normal vote drivers stay
+unwired. Reader14, explicit owner accounting capability and Native56/owner114
+fence unsupported/older owners. The canonical permanent reader floor works
+without a temporary replacement fence; raw backends fail closed.
+
+atomic-read-observation-seal-v5 passes all four native commands: 201 fresh cases
+(effects81, DB47, catalog22, contracts43/1/7), 79/79 steps, 5491 unchanged source
+hashes, no skips/failures/leaks. See WORKLOAD_POOLING_IMPLEMENTATION.md's matching
+entry for full scope, intermediate corrections and evidence. This is retention/
+accounting, not writer exclusion or PREPARE authority. Semantic point/range
+conflicts and actor-bound retirement with control progress, complete live
+dependency capture/pure assembly, executable recovery and derived-log funding,
+lifetimes, import/restore/raw-writer/restart/peer eligibility and the wider fair/
+default/session/tenant/remote rollout remain incomplete. Strong defaults off;
+full goal active; full Linux qualification waived; no push.

@@ -24,7 +24,9 @@ const failure_abi = @import("runtime_failure_abi");
 // Fence merged logical-query layouts and failure/guard contracts.
 // Read transcripts distinguish an empty upper bound from clearing the bound.
 // Reject prior native observations before interpreting their bound operations.
-pub const abi_version: u32 = 113;
+// Accepted seals retain and account bound observations through recovery.
+// Reject owners which can silently drop that durable preparation state.
+pub const abi_version: u32 = 114;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
