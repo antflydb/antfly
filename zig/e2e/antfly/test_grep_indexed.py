@@ -2349,7 +2349,12 @@ def test_logical_retained_page_profile(stateful_api):
         pytest.skip("Set ANTFLY_LOGICAL_PAGES_REPORT to measure retained pages")
     count = 16384
     documents = {
-        f"{i:06}": {"title": "needle", "unused": "payload"} for i in range(count)
+        f"{i:06}": {
+            "title": "needle" if i % 16 == 0 else "other",
+            "dense": "needle",
+            "unused": "payload",
+        }
+        for i in range(count)
     }
     table = f"logical_pages_{time.time_ns()}"
     stateful_api.create_table(table)
@@ -2362,7 +2367,7 @@ def test_logical_retained_page_profile(stateful_api):
         )
     url = stateful_api.url + f"/tables/{table}/query"
     base = {
-        "query": {"contains": "needle", "field": "title"},
+        "query": {"contains": "needle", "field": "dense"},
         "execution": {"value_verification": {"allow_scan": True}},
         "order_by": [{"field": "_id", "desc": False}],
         "fields": [],
@@ -2372,45 +2377,73 @@ def test_logical_retained_page_profile(stateful_api):
     )
     assert warm.status_code == 200, warm.text
     snapshot = warm.json()["responses"][0]["remote_snapshot"]
-    complete_body = {**base, "remote_snapshot": snapshot, "count": True, "limit": 0}
-    complete_body.pop("order_by")
-    complete = requests.post(url, json=qualification_query(complete_body), timeout=90)
-    assert complete.status_code == 200, complete.text
-    assert complete.json()["responses"][0]["hits"]["total"]["value"] == count, (
-        complete.text
-    )
     assert stateful_api._server is not None
     read_process = logical_process_reader(stateful_api._server.proc.pid)
-    runs = []
-    for _ in range(3):
-        for offset in (0, count // 2, count - 64):
-            body = {**base, "remote_snapshot": snapshot, "profile": True, "limit": 64}
-            if offset:
-                body["search_after"] = [f"{offset - 1:06}"]
-            phase_offsets = logical_phase_offsets(stateful_api._server)
-            before = read_process()
-            started = time.perf_counter_ns()
-            response = requests.post(url, json=qualification_query(body), timeout=90)
-            elapsed = (time.perf_counter_ns() - started) / 1_000_000
-            after = read_process()
-            assert response.status_code == 200, response.text
-            result = response.json()["responses"][0]
-            assert [hit["_id"] for hit in result["hits"]["hits"]] == keys[
-                offset : offset + 64
-            ], result
-            profile = qualification_verification(result)
-            assert profile["documents"] == 0, profile
-            runs.append(
-                {
-                    "offset": offset,
-                    "http_ms": elapsed,
-                    "cpu_ms": (after["cpu_ns"] - before["cpu_ns"]) / 1_000_000,
-                    "process_before": before,
-                    "process_after": after,
-                    "profile": profile,
-                    "source_phase_probes": logical_phase_records(phase_offsets),
+    records = []
+    for label, field, selected in (
+        ("dense", "dense", keys),
+        ("sparse", "title", keys[::16]),
+    ):
+        query_base = {**base, "query": {"contains": "needle", "field": field}}
+        complete_body = {
+            **query_base,
+            "remote_snapshot": snapshot,
+            "count": True,
+            "limit": 0,
+        }
+        complete_body.pop("order_by")
+        complete = requests.post(
+            url, json=qualification_query(complete_body), timeout=90
+        )
+        assert complete.status_code == 200, complete.text
+        assert complete.json()["responses"][0]["hits"]["total"]["value"] == len(
+            selected
+        ), complete.text
+        runs = []
+        for _ in range(3):
+            for offset in (0, len(selected) // 2, len(selected) - 64):
+                body = {
+                    **query_base,
+                    "remote_snapshot": snapshot,
+                    "profile": True,
+                    "limit": 64,
                 }
-            )
+                if offset:
+                    body["search_after"] = [selected[offset - 1]]
+                phase_offsets = logical_phase_offsets(stateful_api._server)
+                before = read_process()
+                started = time.perf_counter_ns()
+                response = requests.post(
+                    url, json=qualification_query(body), timeout=90
+                )
+                elapsed = (time.perf_counter_ns() - started) / 1_000_000
+                after = read_process()
+                assert response.status_code == 200, response.text
+                result = response.json()["responses"][0]
+                assert [hit["_id"] for hit in result["hits"]["hits"]] == selected[
+                    offset : offset + 64
+                ], result
+                profile = qualification_verification(result)
+                assert profile["documents"] == 0, profile
+                runs.append(
+                    {
+                        "offset": offset,
+                        "http_ms": elapsed,
+                        "cpu_ms": (after["cpu_ns"] - before["cpu_ns"]) / 1_000_000,
+                        "process_before": before,
+                        "process_after": after,
+                        "profile": profile,
+                        "source_phase_probes": logical_phase_records(phase_offsets),
+                    }
+                )
+        records.append(
+            {
+                "name": "retained_pages_" + label,
+                "documents": count,
+                "matches": len(selected),
+                "runs": runs,
+            }
+        )
     with Path(os.environ["ANTFLY_BIN"]).open("rb") as stream:
         binary_sha = hashlib.file_digest(stream, "sha256").hexdigest()
     destination = Path(report)
@@ -2422,16 +2455,10 @@ def test_logical_retained_page_profile(stateful_api):
                 "platform": platform.platform(),
                 "binary_sha256": binary_sha,
                 "scope": "Warm retained complete membership, public ID ordering, three page positions. Every measured request must verify zero source documents. Phase-instrumented trials are separate from ordinary latency qualification.",
-                "records": [
-                    {
-                        "name": "retained_pages",
-                        "documents": count,
-                        "corpus_sha256": hashlib.sha256(
-                            json.dumps(documents, sort_keys=True).encode()
-                        ).hexdigest(),
-                        "runs": runs,
-                    }
-                ],
+                "corpus_sha256": hashlib.sha256(
+                    json.dumps(documents, sort_keys=True).encode()
+                ).hexdigest(),
+                "records": records,
             },
             separators=(",", ":"),
         )

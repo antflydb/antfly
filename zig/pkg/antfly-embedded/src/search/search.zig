@@ -970,7 +970,7 @@ fn executeFilterQuery(
             defer if (deleted) |*d| d.deinit();
             const removed = if (deleted) |*d| matches.bitmap().intersectionCardinality(d) else 0;
             total = try std.math.add(usize, total, matches.cardinality() - removed);
-            var iterator = matches.bitmap().iterator();
+            var iterator = matches.bitmap().liveIterator(if (deleted) |*d| d else null, segment.reader.doc_count);
             var scan_page = scored.items.len < keep;
             if (request.search_after) |cursor| {
                 if (boost == cursor.score) {
@@ -979,10 +979,9 @@ fn executeFilterQuery(
             }
             var visited: usize = 0;
             while (scan_page and scored.items.len < keep) {
-                const local = iterator.next() orelse break;
+                const local = try iterator.nextWithControl(request.control) orelse break;
                 if (visited % 256 == 0) try request.control.check();
                 visited += 1;
-                if (deleted) |*d| if (d.contains(local)) continue;
                 try scored.append(alloc, .{ .doc_id = try std.math.add(u32, offset, local), .score = boost });
             }
             offset = end;
@@ -1044,11 +1043,10 @@ fn executeFilterQuery(
             defer matches.deinit();
             var deleted = try segment.cloneDeleted(alloc);
             defer if (deleted) |*d| d.deinit();
-            var iterator = matches.bitmap().iterator();
+            var iterator = matches.bitmap().liveIterator(if (deleted) |*d| d else null, segment.reader.doc_count);
             var visited: usize = 0;
-            while (iterator.next()) |doc| : (visited += 1) {
+            while (try iterator.nextWithControl(request.control)) |doc| : (visited += 1) {
                 if (visited % 256 == 0) try request.control.check();
-                if (deleted) |*d| if (d.contains(doc)) continue;
                 try collector.collect(try std.math.add(u32, offset, doc), boost);
             }
             offset = try std.math.add(u32, offset, segment.reader.doc_count);

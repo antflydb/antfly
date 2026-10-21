@@ -772,7 +772,10 @@ their ownership contract. Constant-score collection counts a leased segment and
 seeks only the requested prefix; ranked producer gates retain include/exclude
 pins for one segment. Native sorted candidates retain a directory of local
 memberships and captured tombstone masks, with global containment and iteration
-without rebasing into a copied corpus bitmap. Each failure path releases pins,
+without rebasing into a copied corpus bitmap. Enumeration subtracts captured
+tombstones word by word, seeks across unrelated sparse mask ranges, and checks
+cancellation while skipping fully deleted words. Dense deletion runs therefore
+do not require visiting every deleted document. Each failure path releases pins,
 captured masks and initialized directory entries. General Boolean/scoring shapes
 continue to use owned execution when no complete borrowed view is available.
 A single exact doc-number query has a constant score; native page selection can

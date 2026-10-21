@@ -7974,24 +7974,14 @@ const SortedSegmentDocMembership = struct {
         fn contains(self: *const @This(), doc: u32) bool {
             return doc < self.count and self.matches.bitmap().contains(doc) and !(if (self.deleted) |*d| d.contains(doc) else false);
         }
-        const LocalIterator = struct {
-            segment: *const Segment,
-            raw: roaring.Iterator,
-            fn next(self: *@This()) ?u32 {
-                while (self.raw.next()) |doc| {
-                    if (doc >= self.segment.count) return null;
-                    if (self.segment.deleted) |*d| if (d.contains(doc)) continue;
-                    return doc;
-                }
-                return null;
-            }
-        };
+        const LocalIterator = roaring.RoaringBitmap.LiveIterator;
         fn iterator(self: *const @This()) LocalIterator {
-            return .{ .segment = self, .raw = self.matches.bitmap().iterator() };
+            return self.matches.bitmap().liveIterator(if (self.deleted) |*d| d else null, self.count);
         }
     };
     segments: []Segment,
     candidate_count: usize = 0,
+    control: query_mod.ExecutionControl = .{},
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.segments) |*segment| segment.deinit();
@@ -8019,11 +8009,11 @@ const SortedSegmentDocMembership = struct {
         membership: *const SortedSegmentDocMembership,
         index: usize = 0,
         current: ?Segment.LocalIterator = null,
-        fn next(self: *@This()) ?u32 {
+        fn next(self: *@This()) anyerror!?u32 {
             while (self.index < self.membership.segments.len) {
                 const segment = &self.membership.segments[self.index];
                 if (self.current == null) self.current = segment.iterator();
-                if (self.current.?.next()) |doc| return segment.base + doc;
+                if (try self.current.?.nextWithControl(self.membership.control)) |doc| return segment.base + doc;
                 self.current = null;
                 self.index += 1;
             }
@@ -8039,6 +8029,7 @@ fn buildSortedSegmentDocMembershipAlloc(
     alloc: Allocator,
     snapshot: *const index_mod.IndexSnapshot,
     filter: query_mod.Filter,
+    control: query_mod.ExecutionControl,
 ) !SortedSegmentDocMembership {
     const bitmaps = try alloc.alloc(SortedSegmentDocMembership.Segment, snapshot.segments.len);
     var initialized: usize = 0;
@@ -8050,6 +8041,7 @@ fn buildSortedSegmentDocMembershipAlloc(
     var doc_base: u32 = 0;
     var candidate_count: usize = 0;
     for (snapshot.segments, 0..) |_, i| {
+        try control.check();
         var segment_lease = try snapshot.leaseSegment(i);
         defer segment_lease.deinit();
         const segment = segment_lease.entry;
@@ -8063,7 +8055,7 @@ fn buildSortedSegmentDocMembershipAlloc(
         doc_base = end;
     }
 
-    return .{ .segments = bitmaps, .candidate_count = candidate_count };
+    return .{ .segments = bitmaps, .candidate_count = candidate_count, .control = control };
 }
 
 fn sortedSegmentDocMembershipDocNumsAlloc(
@@ -8079,7 +8071,7 @@ fn sortedSegmentDocMembershipDocNumsAlloc(
         defer doc_base += segment.reader.doc_count;
         if (segment_index >= membership.segments.len) continue;
         var iter = membership.segments[segment_index].iterator();
-        while (iter.next()) |local_doc_id| {
+        while (try iter.nextWithControl(membership.control)) |local_doc_id| {
             if (local_doc_id >= segment.reader.doc_count) continue;
             try out.append(alloc, doc_base + local_doc_id);
         }
@@ -11602,7 +11594,7 @@ fn sortAndPageTextDocValueFilterAlloc(
     executor: SearchTextQueryExecutor,
     plan: SortExecutionPlan,
 ) !types.SearchResult {
-    var membership = try buildSortedSegmentDocMembershipAlloc(alloc, snapshot, filter);
+    var membership = try buildSortedSegmentDocMembershipAlloc(alloc, snapshot, filter, .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns });
     defer membership.deinit(alloc);
     return try sortAndPageTextDocValueCandidatesAlloc(alloc, req, snapshot, &.{}, &membership, executor, plan);
 }
@@ -11766,7 +11758,7 @@ fn sortAndPageTextDocValueCandidatesAlloc(
                 },
                 else => return err,
             }) orelse break
-        else if (iterator) |*it| it.next() orelse break else if (position < doc_nums.len) doc_nums[position] else break;
+        else if (iterator) |*it| try it.next() orelse break else if (position < doc_nums.len) doc_nums[position] else break;
         if (ordered) |stream| ordered_probes = if (stream.scanned_count) |count| @intCast(count(stream.ptr)) else ordered_probes + 1;
         if (ordered) |stream| if (collect_sort_profile) {
             profile.ordered_scanned_count = if (stream.scanned_count) |count| count(stream.ptr) else profile.ordered_scanned_count + 1;
@@ -11922,7 +11914,7 @@ fn visibleTextCandidateCountAfterCursorAlloc(
     var position: usize = 0;
     while (true) {
         const i = position;
-        const doc_num = if (iterator) |*it| it.next() orelse break else if (position < doc_nums.len) doc_nums[position] else break;
+        const doc_num = if (iterator) |*it| try it.next() orelse break else if (position < doc_nums.len) doc_nums[position] else break;
         position += 1;
         if (i % 1024 == 0) try checkSearchRequestDeadline(req);
         identity_scratch.reset();
@@ -11978,7 +11970,7 @@ fn visibleTextCandidateCount(
     var position: usize = 0;
     while (true) {
         const i = position;
-        const doc_num = if (iterator) |*it| it.next() orelse break else if (position < doc_nums.len) doc_nums[position] else break;
+        const doc_num = if (iterator) |*it| try it.next() orelse break else if (position < doc_nums.len) doc_nums[position] else break;
         position += 1;
         if (i % 1024 == 0) try checkSearchRequestDeadline(req);
         identity_scratch.reset();
@@ -12243,7 +12235,7 @@ pub fn searchTextQuery(
             else => return err,
         };
         if (membership_filter) |filter| {
-            var membership = try buildSortedSegmentDocMembershipAlloc(alloc, snapshot, filter.withControl(.{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns }));
+            var membership = try buildSortedSegmentDocMembershipAlloc(alloc, snapshot, filter.withControl(.{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns }), .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns });
             defer membership.deinit(alloc);
 
             const cost_decision = sortedSegmentSelectiveCandidateDocValuesDecision(effective_req, membership.candidate_count, snapshot);
@@ -34915,22 +34907,22 @@ test "logical value borrowed sorted candidates retain local pins masks and globa
     {
         var buffer: [1024]u8 = undefined;
         var bounded = std.heap.FixedBufferAllocator.init(&buffer);
-        var membership = try buildSortedSegmentDocMembershipAlloc(bounded.allocator(), writer.snapshot(), filter);
+        var membership = try buildSortedSegmentDocMembershipAlloc(bounded.allocator(), writer.snapshot(), filter, .{});
         defer membership.deinit(bounded.allocator());
         try std.testing.expectEqual(@as(usize, 5), membership.cardinality());
         var iterator = membership.iterator();
         for ([_]u32{ 0, 3, 4, 5, 7 }) |doc| {
             try std.testing.expect(membership.contains(doc));
-            try std.testing.expectEqual(doc, iterator.next().?);
+            try std.testing.expectEqual(doc, (try iterator.next()).?);
         }
-        try std.testing.expect(iterator.next() == null);
+        try std.testing.expect(try iterator.next() == null);
         for ([_]u32{ 1, 2, 6, 8, std.math.maxInt(u32) }) |doc| try std.testing.expect(!membership.contains(doc));
         try std.testing.expectEqual(@as(usize, 2), state.active);
     }
     try std.testing.expectEqual(@as(usize, 0), state.active);
     const Check = struct {
         fn run(alloc: Allocator, snapshot: *const index_mod.IndexSnapshot, leaf: query_mod.Filter) !void {
-            var membership = try buildSortedSegmentDocMembershipAlloc(alloc, snapshot, leaf);
+            var membership = try buildSortedSegmentDocMembershipAlloc(alloc, snapshot, leaf, .{});
             defer membership.deinit(alloc);
             try std.testing.expectEqual(@as(usize, 5), membership.cardinality());
         }
@@ -34938,6 +34930,6 @@ test "logical value borrowed sorted candidates retain local pins masks and globa
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{ writer.snapshot(), filter });
     try std.testing.expectEqual(@as(usize, 0), state.active);
     state.fail_second = true;
-    try std.testing.expectError(error.TestReadFailure, buildSortedSegmentDocMembershipAlloc(a, writer.snapshot(), filter));
+    try std.testing.expectError(error.TestReadFailure, buildSortedSegmentDocMembershipAlloc(a, writer.snapshot(), filter, .{}));
     try std.testing.expectEqual(@as(usize, 0), state.active);
 }
