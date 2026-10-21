@@ -52,10 +52,7 @@ fn parseDenseJsonResponseAlloc(alloc: std.mem.Allocator, body: []const u8, expec
     defer parsed.deinit();
     // Validate in the typed vector decode, before acquiring output ownership.
     // A second Value parse would allocate a JSON node for every vector element.
-    if (expected_identity) |expected| {
-        const actual = parsed.value.model_identity orelse return error.InvalidEmbeddingIdentity;
-        if (!std.mem.eql(u8, actual, expected)) return error.EmbeddingIdentityMismatch;
-    }
+    try validateResponseIdentity(expected_identity, parsed.value.model_identity);
     if (parsed.value.data.len == 0) return error.EmptyResponse;
 
     const vectors = try alloc.alloc([]const f32, parsed.value.data.len);
@@ -73,6 +70,45 @@ fn parseDenseJsonResponseAlloc(alloc: std.mem.Allocator, body: []const u8, expec
         .dimension = parsed.value.data[0].embedding.len,
         .allocator = alloc,
     };
+}
+
+fn validateResponseIdentity(expected_identity: ?[]const u8, actual_identity: ?[]const u8) !void {
+    if (expected_identity) |expected| {
+        const actual = actual_identity orelse return error.InvalidEmbeddingIdentity;
+        if (!std.mem.eql(u8, actual, expected)) return error.EmbeddingIdentityMismatch;
+    }
+}
+
+fn parseSparseJsonResponseAlloc(alloc: std.mem.Allocator, body: []const u8, expected_identity: ?[]const u8) !inference.SparseEmbedResult {
+    const Vector = struct { indices: []const i32, values: []const f32 };
+    const Response = struct {
+        data: []const struct { embedding: Vector },
+        model_identity: ?[]const u8 = null,
+    };
+    var parsed = std.json.parseFromSlice(Response, alloc, body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidEmbeddingResponse,
+    };
+    defer parsed.deinit();
+    try validateResponseIdentity(expected_identity, parsed.value.model_identity);
+    const indices = try alloc.alloc([]const i32, parsed.value.data.len);
+    errdefer alloc.free(indices);
+    const values = try alloc.alloc([]const f32, parsed.value.data.len);
+    errdefer alloc.free(values);
+    var initialized: usize = 0;
+    errdefer for (0..initialized) |i| {
+        alloc.free(indices[i]);
+        alloc.free(values[i]);
+    };
+    for (parsed.value.data, 0..) |item, i| {
+        const copied_indices = try alloc.dupe(i32, item.embedding.indices);
+        errdefer alloc.free(copied_indices);
+        const copied_values = try alloc.dupe(f32, item.embedding.values);
+        indices[i] = copied_indices;
+        values[i] = copied_values;
+        initialized += 1;
+    }
+    return .{ .indices = indices, .values = values, .allocator = alloc };
 }
 
 fn jsonStringEncodedSize(value: []const u8) !usize {
@@ -670,10 +706,12 @@ pub const Provider = struct {
         for (inputs) |input| try input_array.append(.{ .string = input });
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, EmbedWireRequest{
             .model = model,
+            .model_identity = self.model_identity,
             .input = .{ .array = input_array },
         });
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, self.controlledJsonRequest(json_body, null));
+        const options = self.controlledJsonRequest(json_body, null);
+        var resp = try self.http.post(url, if (self.model_identity != null) self.numericRequestOptions(options) else options);
         defer resp.deinit();
 
         if (!resp.ok()) {
@@ -684,34 +722,7 @@ pub const Provider = struct {
 
         const body = resp.body orelse return error.EmptyResponse;
 
-        const JsonSparseVector = struct {
-            indices: []const i32,
-            values: []const f32,
-        };
-        const JsonEmbeddingObject = struct {
-            embedding: JsonSparseVector,
-        };
-        const JsonSparseResponse = struct {
-            data: []const JsonEmbeddingObject,
-        };
-        var parsed = try std.json.parseFromSlice(JsonSparseResponse, alloc, body, .{ .ignore_unknown_fields = true });
-        defer parsed.deinit();
-
-        const indices = try alloc.alloc([]const i32, parsed.value.data.len);
-        errdefer alloc.free(indices);
-        const values = try alloc.alloc([]const f32, parsed.value.data.len);
-        errdefer alloc.free(values);
-
-        for (parsed.value.data, 0..) |item, i| {
-            const vector = item.embedding;
-            indices[i] = try alloc.dupe(i32, vector.indices);
-            values[i] = try alloc.dupe(f32, vector.values);
-        }
-        return .{
-            .indices = indices,
-            .values = values,
-            .allocator = alloc,
-        };
+        return try parseSparseJsonResponseAlloc(alloc, body, self.model_identity);
     }
 
     pub fn embedParts(self: *Provider, alloc: std.mem.Allocator, model: []const u8, parts: []const template_mod.ContentPart) !inference.EmbedResult {
@@ -1461,7 +1472,30 @@ test "antfly generate round trip" {
     try std.testing.expectEqualStrings("Hi from Antfly!", result_content orelse "NO CONTENT");
 }
 
+const sparse_response_fixture = "{\"data\":[{\"embedding\":{\"indices\":[7,42],\"values\":[1.5,0.5]}}]}";
+
 test "antfly sparse embed round trip" {
+    try testSparseEmbedRoundTrip(null, sparse_response_fixture, null);
+}
+
+test "antfly sparse embeddings enforce pinned identities on both sides of HTTP" {
+    try testSparseEmbedRoundTrip("pinned", "{\"model_identity\":\"pinned\",\"data\":[{\"embedding\":{\"indices\":[7,42],\"values\":[1.5,0.5]}}]}", null);
+    try testSparseEmbedRoundTrip("changed", "{\"model_identity\":\"pinned\",\"data\":[{\"embedding\":{\"indices\":[7,42],\"values\":[1.5,0.5]}}]}", error.EmbeddingIdentityMismatch);
+    try testSparseEmbedRoundTrip("pinned", sparse_response_fixture, error.InvalidEmbeddingIdentity);
+    try testSparseEmbedRoundTrip("pinned", "{\"model_identity\":7,\"data\":[{\"embedding\":{\"indices\":[7,42],\"values\":[1.5,0.5]}}]}", error.InvalidEmbeddingResponse);
+}
+
+test "antfly sparse response cleanup is allocation-failure safe" {
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var result = try parseSparseJsonResponseAlloc(alloc, "{\"data\":[{\"embedding\":{\"indices\":[1,2],\"values\":[1,2]}},{\"embedding\":{\"indices\":[3,4],\"values\":[3,4]}}]}", null);
+            result.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+fn testSparseEmbedRoundTrip(comptime pin: ?[]const u8, comptime body: []const u8, comptime expected_error: ?anyerror) !void {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -1475,6 +1509,10 @@ test "antfly sparse embed round trip" {
             try std.testing.expectEqualStrings("sparse-model", obj.get("model").?.string);
             try std.testing.expectEqualStrings("alpha body", obj.get("input").?.array.items[0].string);
             try std.testing.expectEqualStrings("float", obj.get("encoding_format").?.string);
+            if (pin) |expected| {
+                try std.testing.expectEqualStrings(expected, obj.get("model_identity").?.string);
+                try std.testing.expectEqualStrings("application/json", req.header("Accept").?);
+            } else try std.testing.expect(!obj.contains("model_identity"));
             try std.testing.expect(!obj.contains("task_type"));
             try std.testing.expect(!obj.contains("instruction"));
         }
@@ -1483,9 +1521,7 @@ test "antfly sparse embed round trip" {
     var ts = try httpx.TestServer.start(alloc, io, &.{
         .{ .method = .POST, .path = "/embed", .assert_request = Assert.request, .respond = .{
             .content_type = "application/json",
-            .body =
-            \\{"object":"list","data":[{"object":"embedding","index":0,"embedding":{"indices":[7,42],"values":[1.5,0.5]}}],"model":"sparse-model","usage":{"prompt_tokens":1,"total_tokens":1}}
-            ,
+            .body = body,
         } },
     });
     defer ts.deinit();
@@ -1502,6 +1538,7 @@ test "antfly sparse embed round trip" {
 
             var provider = Provider.init(a, &client, base);
             defer provider.deinit();
+            provider.model_identity = pin;
 
             var result = provider.embedSparse(a, "sparse-model", &.{"alpha body"}) catch |err| {
                 err_out.* = err;
@@ -1530,6 +1567,11 @@ test "antfly sparse embed round trip" {
     try ts.handleOne();
     group.await(io) catch {};
 
+    if (expected_error) |expected| {
+        try std.testing.expectEqual(expected, result_err);
+        try std.testing.expect(!ok);
+        return;
+    }
     if (result_err != error.None) return result_err;
     try std.testing.expect(ok);
 }
