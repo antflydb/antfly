@@ -370,6 +370,7 @@ comptime {
     _ = @import("index_manager_vopr.zig");
     _ = @import("antfly_local_sources").storage_lite_allocator_v4;
     _ = @import("antfly_local_sources").storage_lite_backend;
+    _ = @import("antfly_local_sources").storage_lite_backup_preflight;
     _ = @import("antfly_local_sources").storage_lite_benchmark;
     _ = @import("antfly_local_sources").storage_lite_bridge;
     _ = @import("antfly_local_sources").storage_lite_conformance_test;
