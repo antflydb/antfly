@@ -590,11 +590,12 @@ pub const ModelManifest = struct {
         return false;
     }
 
-    /// Explicit reader profile, independent of the install directory's name.
+    /// Explicit runtime profile, independent of enabled public tasks and the
+    /// install directory's name. The integrated decoder remains a generator.
     pub fn isLightOnOcr3(self: *const ModelManifest) bool {
         return self.model_type == .generator and
             std.mem.eql(u8, self.config_model_arch, "qwen3_5") and
-            self.hasCapability("lightonocr3") and self.hasTask("read");
+            self.hasCapability("lightonocr3");
     }
 
     pub fn hasTask(self: *const ModelManifest, task: []const u8) bool {
@@ -8376,6 +8377,10 @@ test "LightOnOCR3 reader identity requires explicit metadata and the Qwen3.5 arc
     try parseModelManifestJson(&manifest, allocator, @import("../readers/lightonocr3.zig").manifest_json);
     try std.testing.expect(manifest.isLightOnOcr3());
     try std.testing.expect(manifest.hasInput("image"));
+    for (manifest.tasks) |task| allocator.free(task);
+    allocator.free(manifest.tasks);
+    manifest.tasks = &.{};
+    try std.testing.expect(manifest.isLightOnOcr3());
     manifest.model_type = .reranker;
     try std.testing.expect(!manifest.isLightOnOcr3());
 }

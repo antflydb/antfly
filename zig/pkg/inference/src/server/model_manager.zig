@@ -9657,16 +9657,17 @@ fn estimateModelArtifactBytes(man: manifest_mod.ModelManifest) !usize {
 /// A multimodal projector is opened, mapped, and consumed by an individual
 /// generation request; it is not part of the decoder session's retained
 /// residency. Charge its mapped artifact to the request that owns that mapping.
+/// Integrated vision weights are already resident, but their request scratch
+/// must still be reserved even when there is no separate projector artifact.
 pub fn projectorRunAdmissionAmounts(
     man: manifest_mod.ModelManifest,
     backend: runtime.kv.pool.BackendKind,
     media: generation.NativeGenerationMediaAdmission,
 ) !runtime.tier.memory.AdmissionAmounts {
-    const path = man.gguf_projector_path orelse return .{};
-    const bytes = std.math.cast(
+    const bytes = if (man.gguf_projector_path) |path| std.math.cast(
         usize,
         try c_file.fileSize(man.allocator, path),
-    ) orelse return error.ResourceLimitExceeded;
+    ) orelse return error.ResourceLimitExceeded else 0;
     return switch (backend) {
         .native => .{
             .host_weight_bytes = bytes,
@@ -12412,6 +12413,47 @@ test "projector residency follows its request-scoped lifecycle" {
     try std.testing.expectEqual(projector_bytes, metal_request.backend_weight_bytes);
     try std.testing.expectEqual(@as(usize, 32), metal_request.host_scratch_bytes);
     try std.testing.expectEqual(@as(usize, 64), metal_request.backend_scratch_bytes);
+}
+
+test "LightOnOCR3 integrated vision scratch is admitted without charging resident weights again" {
+    const allocator = std.testing.allocator;
+    const memory = runtime.tier.memory;
+    const cfg = try @import("../models/gpt.zig").parseConfig(allocator, @embedFile("../models/testdata/lightonocr3/config.json"));
+    const estimate = try @import("../architectures/qwen3vl_projector.zig").estimateAdmission(
+        &.{@embedFile("../models/testdata/lightonocr3/invoice.png")},
+        cfg,
+        .{},
+    );
+    try std.testing.expect(estimate.host_scratch_bytes > 0 and estimate.backend_scratch_bytes > 0);
+    var man = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .generator,
+        .safetensors_path = try allocator.dupe(u8, "model.safetensors"),
+    };
+    defer man.deinit();
+    const media = generation.NativeGenerationMediaAdmission{
+        .host_scratch_bytes = estimate.host_scratch_bytes,
+        .backend_scratch_bytes = estimate.backend_scratch_bytes,
+    };
+    const scratch = try std.math.add(usize, media.host_scratch_bytes, media.backend_scratch_bytes);
+    inline for (.{ runtime.kv.pool.BackendKind.native, .metal, .cuda }) |backend| {
+        const amounts = try projectorRunAdmissionAmounts(man, backend, media);
+        try std.testing.expectEqual(@as(usize, 0), amounts.host_weight_bytes);
+        try std.testing.expectEqual(@as(usize, 0), amounts.backend_weight_bytes);
+        try std.testing.expectEqual(if (backend == .native) scratch else media.host_scratch_bytes, amounts.host_scratch_bytes);
+        try std.testing.expectEqual(if (backend == .native) @as(usize, 0) else media.backend_scratch_bytes, amounts.backend_scratch_bytes);
+        const backend_class: memory.BackendClass = if (backend == .native) .cpu else .gpu;
+        var controller = memory.AdmissionController{};
+        defer controller.deinit();
+        // A one-byte-short operator cap must reject the actual image work;
+        // the exact envelope admits it and releases every byte afterwards.
+        try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquire(backend_class, .{ .scratch_limit_bytes = scratch - 1 }, amounts, false));
+        try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
+        var lease = try controller.tryAcquire(backend_class, .{ .scratch_limit_bytes = scratch }, amounts, false);
+        try std.testing.expectEqualDeep(amounts, controller.snapshot());
+        lease.release();
+        try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
+    }
 }
 
 test "onnx admission separates encoded staging from completed residency" {

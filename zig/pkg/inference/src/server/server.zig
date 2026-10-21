@@ -36701,7 +36701,7 @@ fn normalizeReadPrompt(prompt: ?[]const u8) ?[]const u8 {
 }
 
 fn isGenerativeReadModel(manifest: *const manifest_mod.ModelManifest) bool {
-    return manifest.isLightOnOcr3() or (manifest.model_type == .generator and
+    return (manifest.isLightOnOcr3() and manifest.hasTask("read")) or (manifest.model_type == .generator and
         manifest.isQwen3VlGgufBundle() and !manifest.isQwen3VlReranker());
 }
 
@@ -38124,9 +38124,17 @@ test "LightOnOCR3 read routing preserves image-only and grounding prompts" {
     manifest.tasks[0] = try allocator.dupe(u8, "read");
     try std.testing.expect(isGenerativeReadModel(&manifest));
     try std.testing.expect(manifestMatchesModelListingTask("readers", "generator", &manifest));
+    try std.testing.expect(!manifestMatchesModelListingTask("generators", "generator", &manifest));
     try std.testing.expectEqualStrings("", try resolveGenerativeReadPrompt(&manifest, null));
     try std.testing.expectEqualStrings("grounding", try resolveGenerativeReadPrompt(&manifest, "grounding"));
     try std.testing.expectError(error.InvalidLightOnOcrPrompt, resolveGenerativeReadPrompt(&manifest, "<OCR>"));
+    const generate_task = try allocator.dupe(u8, "generate");
+    allocator.free(manifest.tasks[0]);
+    manifest.tasks[0] = generate_task;
+    try std.testing.expect(manifest.isLightOnOcr3());
+    try std.testing.expect(!isGenerativeReadModel(&manifest));
+    try std.testing.expect(!manifestMatchesModelListingTask("readers", "generator", &manifest));
+    try std.testing.expect(manifestMatchesModelListingTask("generators", "generator", &manifest));
 }
 
 test "LightOnOCR3 HTTP read rejects untrained prompts before loading weights" {

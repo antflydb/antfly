@@ -1961,7 +1961,16 @@ fn synthesizePulledModelManifestJsonInternal(
     }
     if (qualified_boundary_decide) try appendUniqueOwnedString(allocator, &tasks, "decide");
 
-    const manifest_type = manifestTypeFromTasks(tasks.items, manifest.model_type);
+    // A read-only LightOnOCR installation still loads the integrated decoder.
+    // Tasks select public routes; they must not replace its runtime identity.
+    const lighton_profile = manifest.isLightOnOcr3();
+    if (lighton_profile) {
+        for (tasks.items) |task| {
+            if (!std.mem.eql(u8, task, "generate") and !std.mem.eql(u8, task, "read"))
+                return error.InvalidModelManifest;
+        }
+    }
+    const manifest_type = if (lighton_profile) .generator else manifestTypeFromTasks(tasks.items, manifest.model_type);
 
     var inputs = std.ArrayListUnmanaged([]const u8).empty;
     defer {
@@ -2952,13 +2961,27 @@ test "LightOnOCR3 pulled manifest preserves OCR identity when tasks are overridd
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = @embedFile("../models/testdata/lightonocr3/config.json") });
-    try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = lightonocr3.manifest_json });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "" });
     const model_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(model_dir);
-    const json = try synthesizePulledModelManifestJson(allocator, model_dir, "generate,read", null);
-    defer allocator.free(json);
-    try std.testing.expect(std.mem.indexOf(u8, json, "lightonocr3") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"generator\"") != null);
+    for ([_]struct { csv: []const u8, read: bool, generate: bool }{
+        .{ .csv = "generate,read", .read = true, .generate = true },
+        .{ .csv = "read", .read = true, .generate = false },
+        .{ .csv = "generate", .read = false, .generate = true },
+    }) |case| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = lightonocr3.manifest_json });
+        const json = try synthesizePulledModelManifestJson(allocator, model_dir, case.csv, null);
+        defer allocator.free(json);
+        try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = json });
+        var installed = try manifest_mod.loadFromDir(allocator, model_dir);
+        defer installed.deinit();
+        try std.testing.expect(installed.isLightOnOcr3());
+        try std.testing.expectEqual(manifest_mod.ModelType.generator, installed.model_type);
+        try std.testing.expectEqual(case.read, installed.hasTask("read"));
+        try std.testing.expectEqual(case.generate, installed.hasTask("generate"));
+        try std.testing.expectEqual(@import("../models/compatibility.zig").Level.compatible, @import("../models/compatibility.zig").assess(&installed, "qwen3_5").level);
+    }
+    try std.testing.expectError(error.InvalidModelManifest, synthesizePulledModelManifestJson(allocator, model_dir, "embed", null));
     try std.testing.expectEqualStrings(lightonocr3.pinned_ref, resolveFriendlyRef("LightOnOCR3-0.8B").?);
     try std.testing.expectEqualStrings(lightonocr3.pinned_ref_4b, resolveFriendlyRef("LightOnOCR3-4B").?);
 }
