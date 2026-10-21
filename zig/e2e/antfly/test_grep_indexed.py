@@ -628,6 +628,34 @@ def test_native_grep_builtin_substring_and_regex_candidates(
     assert all("grep_scan" not in q for q in seen)
 
 
+def test_canonical_execution_rejects_removed_public_controls(stateful_api):
+    table = f"canonical_execution_{time.time_ns()}"
+    stateful_api.post(f"/tables/{table}", {"num_shards": 1})
+    url = stateful_api.url + f"/tables/{table}/query"
+    base = {"query": {"match_all": {}}, "limit": 1}
+    canonical = {
+        **base,
+        "execution": {"value_verification": {"max_documents": 1}},
+    }
+    response = requests.post(url, json=canonical, timeout=60)
+    assert response.status_code == 200, response.text
+    for removed, value in (
+        ("lake_read", {}),
+        ("lake_visibility", "accepted"),
+        ("value_search_execution", {}),
+        ("execution", {"max_documents": 1}),
+    ):
+        response = requests.post(url, json={**base, removed: value}, timeout=60)
+        assert response.status_code == 400, (removed, response.text)
+    for removed in ("lake_visibility", "lake_read"):
+        response = requests.post(
+            stateful_api.url + "/sql",
+            json={"statement": "SELECT 1", removed: "accepted"},
+            timeout=60,
+        )
+        assert response.status_code == 400, (removed, response.text)
+
+
 def test_logical_keyword_and_autocomplete_use_source_fields(stateful_api):
     table = f"logical_fields_{time.time_ns()}"
     stateful_api.post(
