@@ -3941,6 +3941,14 @@ as provider time. Representation changes restart learning without attributing
 one-time snapshot setup to an arm. Read windows retain at most 512 KiB of arena
 capacity between batches, within the existing live-allocation/request limits.
 
+Required full-source parsing also supplies selected-string byte counts. A small
+query-local estimate avoids opening a projection reader when those values fill
+most of the original, and keeps observing full reads as document shapes change.
+Unproductive metadata probes back off for 32–1,024 rows. After a reader is pinned,
+backoff, small sources and root-wide predicates use complete bodies from that
+same snapshot. Deliberately skipped metadata does not trigger repair. This adds
+no persisted cache and no second source scan.
+
 `bench/logical_sources.py` preserves pinned artifacts, raw samples and alternating
 baseline/candidate order. `--controls` includes full-original reads, scalar reads
 and fixed 16/32/64-row windows. The concurrent fixture records a cold-process

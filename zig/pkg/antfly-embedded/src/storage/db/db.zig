@@ -131736,7 +131736,10 @@ const StoredLogicalSources = struct {
         for (ids, keys[0..ids.len]) |id, *key| key.* = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self.db, a, id, self.view);
         var scope = try self.txn.openReadScope(a);
         defer scope.close();
-        const rows = try @import("../logical_source.zig").load(alloc, a, &scope, keys[0..ids.len], ids, roots, self.db.core.store.valuesAreAuthenticated());
+        // Empty roots deliberately load complete bodies from this same cut.
+        // Authentication here authorizes omitted ranges, not primary reads;
+        // skipped metadata must not masquerade as missing authority to repair.
+        const rows = try @import("../logical_source.zig").load(alloc, a, &scope, keys[0..ids.len], ids, roots, roots.len != 0 and self.db.core.store.valuesAreAuthenticated());
         if (!self.repair_requested and !openModeRequiresReadOnlyBackends(self.db.open_mode)) {
             for (rows) |row| if (row.repair_authority) {
                 self.repair_requested = true;

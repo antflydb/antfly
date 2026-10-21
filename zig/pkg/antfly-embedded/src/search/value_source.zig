@@ -19,6 +19,55 @@
 //! cannot match strings become null, preserving matcher behavior.
 const std = @import("std");
 const A = std.mem.Allocator;
+
+/// Query-local admission for optional stored-field reads. Required full-source
+/// parsing supplies a lower bound on the selected bytes without another scan.
+/// A dominant value cannot benefit from the directory's half-source threshold.
+/// Keep observing full reads so heterogeneous inputs can become eligible again.
+pub const StoredReadPolicy = struct {
+    selected_fraction: ?u16 = null,
+    skipped_rows: u16 = 0,
+    backoff_rows: u16 = 0,
+
+    pub fn mayBenefit(self: *const @This()) bool {
+        return if (self.selected_fraction) |fraction| fraction < 512 else true;
+    }
+
+    pub fn forgetCoverage(self: *@This()) void {
+        self.selected_fraction = null;
+    }
+
+    pub fn observeSource(self: *@This(), original: u64, selected: u64) void {
+        if (original == 0) return;
+        const was_dominant = !self.mayBenefit();
+        const fraction: u16 = @intCast(@min(@as(u128, selected) * 1024 / original, 1024));
+        self.selected_fraction = if (self.selected_fraction) |prior| @intCast((@as(u32, prior) * 3 + fraction) / 4) else fraction;
+        if (was_dominant and self.mayBenefit()) {
+            self.skipped_rows = 0;
+            self.backoff_rows = 0;
+        }
+    }
+
+    pub fn admit(self: *@This(), rows: usize) bool {
+        if (rows == 0 or !self.mayBenefit()) return false;
+        if (self.skipped_rows != 0) {
+            self.skipped_rows -|= @intCast(@min(rows, std.math.maxInt(u16)));
+            return false;
+        }
+        return true;
+    }
+
+    pub fn observeProbe(self: *@This(), rows: usize, projected: usize) void {
+        if (rows == 0) return;
+        if (projected != 0) {
+            self.backoff_rows = 0;
+            self.skipped_rows = 0;
+        } else {
+            self.backoff_rows = if (self.backoff_rows == 0) 32 else @min(self.backoff_rows * 2, 1024);
+            self.skipped_rows = self.backoff_rows;
+        }
+    }
+};
 pub fn parse(a: A, bytes: []const u8, plan: ?*Plan) !struct { value: std.json.Value, projected: bool } {
     if (bytes.len >= 1024) if (plan) |compiled| {
         if (compiled.parse(a, bytes)) |value| return .{ .value = value, .projected = true } else |err| switch (err) {
@@ -37,6 +86,7 @@ pub const Plan = struct {
     nodes: std.ArrayListUnmanaged(Node) = .empty,
     keys: @import("antfly-json").ObjectKeyWorkspace(void),
     unused: @import("antfly-json").ValueScanner,
+    selected_string_bytes: u64 = 0,
     pub fn init(a: A, fields: []const []const u8) !Plan {
         if (@import("antfly_platform").env.getenv("ANTFLY_BENCH_VALUE_SOURCE_FULL_DOM")) |knob| {
             if (std.mem.eql(u8, knob, "1")) return error.ProjectionDisabled;
@@ -76,6 +126,7 @@ pub const Plan = struct {
     /// `a` is a document scratch arena. Strings borrow input when unescaped;
     /// selected escaped strings and path structure live in that same arena.
     pub fn parse(self: *Plan, a: A, bytes: []const u8) !std.json.Value {
+        self.selected_string_bytes = 0;
         var scanner = std.json.Scanner.initCompleteInput(@import("../sql/memory_budget.zig").reclaimingAllocator(a), bytes);
         defer scanner.deinit();
         // Failed traversals can leave active duplicate-key frames. Reset them
@@ -133,9 +184,9 @@ pub const Plan = struct {
             },
             .string => {
                 if (selected) |index| if (self.nodes.items[index].terminal) {
-                    if (@import("antfly-json").value_strings.borrow(scanner)) |bytes| return .{ .string = bytes };
+                    if (@import("antfly-json").value_strings.borrow(scanner)) |bytes| return self.selectedString(bytes);
                     return switch (try scanner.nextAllocMax(a, .alloc_if_needed, max_len)) {
-                        .string, .allocated_string => |s| .{ .string = s },
+                        .string, .allocated_string => |s| self.selectedString(s),
                         else => error.UnexpectedToken,
                     };
                 };
@@ -149,7 +200,52 @@ pub const Plan = struct {
             else => return error.UnexpectedToken,
         }
     }
+    fn selectedString(self: *Plan, bytes: []const u8) std.json.Value {
+        self.selected_string_bytes +|= bytes.len;
+        return .{ .string = bytes };
+    }
 };
+
+test "logical value stored read admission learns dominance and bounds unsuccessful probes" {
+    var policy: StoredReadPolicy = .{};
+    try std.testing.expect(policy.admit(1));
+    policy.observeSource(16384, 16300);
+    for (0..4096) |_| {
+        try std.testing.expect(!policy.admit(64));
+        policy.observeSource(16384, 16300);
+    }
+    // Continuous required reads discover a changed shape without metadata I/O.
+    for (0..4) |_| policy.observeSource(65536, 6);
+    try std.testing.expect(policy.admit(64));
+    for (0..20) |_| {
+        policy.observeProbe(64, 0);
+        try std.testing.expect(policy.backoff_rows <= 1024);
+        var skipped: usize = 0;
+        while (!policy.admit(64)) skipped += 64;
+        try std.testing.expect(skipped >= policy.backoff_rows);
+        try std.testing.expect(skipped < @as(usize, policy.backoff_rows) + 64);
+    }
+    policy.observeProbe(64, 1);
+    try std.testing.expectEqual(@as(u16, 0), policy.backoff_rows);
+    try std.testing.expect(policy.admit(1));
+    try std.testing.expect(!policy.admit(0));
+    policy.observeSource(std.math.maxInt(u64), std.math.maxInt(u64));
+    try std.testing.expect(policy.selected_fraction.? <= 1024);
+    policy.forgetCoverage();
+    try std.testing.expect(policy.mayBenefit());
+}
+
+test "logical value source selected byte feedback is decoded deduplicated and reset" {
+    const a = std.testing.allocator;
+    var plan = try Plan.init(a, &.{ "wanted", "wanted", "nested.value" });
+    defer plan.deinit();
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    _ = try plan.parse(scratch.allocator(), "{\"wanted\":[\"a\\u0062\",\"cd\"],\"nested\":[{\"value\":\"ef\"}],\"unused\":\"not counted\"}");
+    try std.testing.expectEqual(@as(u64, 6), plan.selected_string_bytes);
+    _ = try plan.parse(scratch.allocator(), "{\"wanted\":\"x\"}");
+    try std.testing.expectEqual(@as(u64, 1), plan.selected_string_bytes);
+}
 
 test "logical value source projection preserves nested arrays escapes and boundaries" {
     const a = std.testing.allocator;

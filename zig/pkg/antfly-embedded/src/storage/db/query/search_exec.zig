@@ -18699,6 +18699,7 @@ const ValueExecution = struct {
     projected_unavailable: bool = false,
     projection: ?@import("../../../search/value_source.zig").Plan = null,
     projection_attempted: bool = false,
+    stored_read_policy: @import("../../../search/value_source.zig").StoredReadPolicy = .{},
     source_tuner: SourceReadTuner = .{},
     source_epoch: usize = 0,
     original_average_bytes: u64 = 0,
@@ -18712,15 +18713,18 @@ const ValueExecution = struct {
         self.original_average_bytes = if (self.original_average_bytes == 0) mean else (self.original_average_bytes *| 3 +| mean) / 4;
     }
     fn shouldProject(self: *const @This()) bool {
-        return self.open_projected != null and !self.projected_unavailable and self.original_average_bytes >= @import("../../document_projection.zig").minimum_bytes;
+        if (self.projected_reader != null) return true;
+        return self.open_projected != null and !self.projected_unavailable and self.original_average_bytes >= @import("../../document_projection.zig").minimum_bytes and self.stored_read_policy.mayBenefit();
     }
     fn projectedSources(self: *@This(), a: Allocator, ids: []const []const u8) !?[]LogicalSourceRow {
         var fields: [64][]const u8 = undefined;
         const selected = self.paths(&fields);
-        if (selected.len == 0) {
+        if (selected.len == 0 and self.projected_reader == null) {
             self.projected_unavailable = true;
             return null;
         }
+        const probe = selected.len != 0 and self.stored_read_policy.admit(ids.len);
+        if (!probe and self.projected_reader == null) return null;
         if (self.projected_reader == null) {
             self.projected_reader = try self.open_projected.?(self.load_ctx, @import("../../../sql/memory_budget.zig").reclaimingAllocator(self.a));
             if (self.projected_reader == null) {
@@ -18734,7 +18738,17 @@ const ValueExecution = struct {
             self.source_epoch += 1;
         }
         const reader = self.projected_reader.?;
-        return try reader.load(reader.ctx, a, ids, selected);
+        // Once pinned, fallback must retain this reader's exact snapshot.
+        // Empty paths request complete bodies without authority inspection.
+        const rows = try reader.load(reader.ctx, a, ids, if (probe) selected else &.{});
+        if (probe) {
+            var projected: usize = 0;
+            for (rows) |row| if (row.projected) {
+                projected += 1;
+            };
+            self.stored_read_policy.observeProbe(rows.len, projected);
+        }
+        return rows;
     }
     // Immutable logical predicate paths, never synthesized physical names.
     // Empty/root-wide predicates require complete original bytes.
@@ -18773,6 +18787,7 @@ const ValueExecution = struct {
         if (self.projection) |*plan| plan.deinit();
         self.projection = null;
         self.projection_attempted = false;
+        self.stored_read_policy = .{};
         for (self.literal_groups.items) |*group| group.set.deinit();
         self.literal_groups.deinit(self.a);
         self.literal_groups = .empty;
@@ -18800,6 +18815,13 @@ const ValueExecution = struct {
             }
         }
         const parsed = try @import("../../../search/value_source.zig").parse(a, bytes, if (self.projection) |*plan| plan else null);
+        if (!stored_projection and bytes.len >= @import("../../document_projection.zig").minimum_bytes) {
+            if (parsed.projected) {
+                self.stored_read_policy.observeSource(bytes.len, self.projection.?.selected_string_bytes);
+            } else {
+                self.stored_read_policy.forgetCoverage();
+            }
+        }
         if (self.req.profile and (parsed.projected or stored_projection)) _ = work.projected_sources.fetchAdd(1, .monotonic);
         return parsed.value;
     }
@@ -34420,6 +34442,66 @@ test "logical value batched reads preserve candidates budgets and scalar fallbac
             try std.testing.expectEqual(@as(usize, 0), execution.local_work.sources.budget.live);
         }
     }
+}
+
+test "logical value unproductive projection retains its pinned reader during backoff" {
+    const a = std.testing.allocator;
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    const Loader = struct {
+        opens: usize = 0,
+        metadata: usize = 0,
+        complete: usize = 0,
+        closes: usize = 0,
+        live_value: []const u8 = "before",
+        captured: []const u8 = "",
+        fn open(raw: ?*anyopaque, _: Allocator) anyerror!?LogicalSourceReader {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.opens += 1;
+            self.captured = self.live_value;
+            return .{ .ctx = self, .load = read, .close = close };
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closes += 1;
+        }
+        fn read(raw: *anyopaque, alloc: Allocator, ids: []const []const u8, paths: []const []const u8) anyerror![]LogicalSourceRow {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (paths.len == 0) self.complete += 1 else self.metadata += 1;
+            const rows = try alloc.alloc(LogicalSourceRow, ids.len);
+            for (rows) |*row| row.* = .{ .bytes = try alloc.dupe(u8, self.captured), .original_bytes = 32768 };
+            return rows;
+        }
+    };
+    var loader: Loader = .{};
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var execution: ValueExecution = .{ .a = a, .snapshot = writer.snapshot(), .req = .{ .value_search_execution = .{ .allow_scan = true } }, .load_ctx = &loader, .load = testUnexpectedLoadStoredCallback, .open_projected = Loader.open, .original_average_bytes = 32768 };
+    var closed = false;
+    defer if (!closed) execution.deinit();
+    _ = try textQueryToSearchQueryWithValues(arena.allocator(), .{ .value = .{ .kind = .contains, .field = "content", .text = "needle" } }, .{}, null, &execution);
+    const first = (try execution.projectedSources(arena.allocator(), &.{"a"})).?;
+    try std.testing.expectEqualStrings("before", first[0].bytes.?);
+    loader.live_value = "after";
+    const second = (try execution.projectedSources(arena.allocator(), &.{"b"})).?;
+    try std.testing.expectEqualStrings("before", second[0].bytes.?);
+    execution.stored_read_policy.observeSource(32768, 32700);
+    try std.testing.expect(execution.shouldProject());
+    const third = (try execution.projectedSources(arena.allocator(), &.{"c"})).?;
+    try std.testing.expectEqualStrings("before", third[0].bytes.?);
+    execution.original_average_bytes = 1;
+    try std.testing.expect(execution.shouldProject());
+    const fourth = (try execution.projectedSources(arena.allocator(), &.{"d"})).?;
+    try std.testing.expectEqualStrings("before", fourth[0].bytes.?);
+    _ = try textQueryToSearchQueryWithValues(arena.allocator(), .{ .value = .{ .kind = .contains, .field = "", .text = "needle" } }, .{}, null, &execution);
+    const fifth = (try execution.projectedSources(arena.allocator(), &.{"e"})).?;
+    try std.testing.expectEqualStrings("before", fifth[0].bytes.?);
+    try std.testing.expectEqual(@as(usize, 1), loader.opens);
+    try std.testing.expectEqual(@as(usize, 1), loader.metadata);
+    try std.testing.expectEqual(@as(usize, 4), loader.complete);
+    execution.deinit();
+    closed = true;
+    try std.testing.expectEqual(@as(usize, 1), loader.closes);
 }
 
 // Keep private fact tests reachable under a focused value-search filter.
