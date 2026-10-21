@@ -3798,6 +3798,13 @@ const LoadFlight = struct {
         }
     }
 
+    /// Observational count, excluding the terminal cancellation sentinel.
+    /// Read once: composite waiters can depart without taking load_lock.
+    fn activeWaiterCount(self: *const LoadFlight) usize {
+        const count = self.waiters.load(.acquire);
+        return if (count == abandoned) 0 else count;
+    }
+
     fn unadoptedWaiterRefs(self: *const LoadFlight) usize {
         std.debug.assert(self.refs >= @intFromBool(self.task_ref_pending));
         return self.refs - @intFromBool(self.task_ref_pending);
@@ -3853,6 +3860,84 @@ test "manager load flight remains active until its final waiter leaves" {
     flight.releaseWaiter(true);
     try std.testing.expectError(error.Cancelled, load_control.control().check());
     try std.testing.expect(!flight.tryAddWaiter());
+}
+
+test "runtime snapshots normalize cancelled primary and composite load waiters" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    defer manager.deinit();
+    const primary = try allocator.create(LoadFlight);
+    primary.* = .{
+        .runtime_id = 1,
+        .model_dir = try allocator.dupe(u8, "/models/owner/primary"),
+        .io = std.testing.io,
+    };
+    try manager.in_flight_loads.put(allocator, try allocator.dupe(u8, "primary"), primary);
+    defer manager.releaseLoadFlight("primary", primary);
+    const composite = try allocator.create(CompositeAssetsLoadFlight);
+    composite.* = .{
+        .runtime_id = 2,
+        .model_dir = try allocator.dupe(u8, "/models/owner/composite"),
+        .io = std.testing.io,
+        .refs = 2,
+        .load_state = .{ .io = std.testing.io },
+    };
+    const composite_key: ComponentPlanKey = @splat(0);
+    try manager.in_flight_composite_assets.put(allocator, composite_key, composite);
+    defer manager.releaseCompositeAssetsLoadFlight(composite_key, composite);
+    const Cancelled = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    const control = InferenceExecutionControl{ .check_fn = Cancelled.check };
+
+    // Two callers share each manager-owned load. Cancelling one must leave
+    // the other counted and keep the shared task joinable.
+    try std.testing.expect(primary.tryAddWaiter());
+    primary.refs += 1;
+    try std.testing.expect(composite.load_state.tryAddWaiter());
+    composite.refs += 1;
+    try std.testing.expectError(error.Cancelled, manager.waitForLoadFlight("primary", primary, control));
+    try std.testing.expectError(error.Cancelled, manager.waitForCompositeAssetsLoadFlight(composite_key, composite, control));
+    {
+        var snapshot = try manager.runtimeSnapshot(allocator, null);
+        defer snapshot.deinit();
+        try std.testing.expectEqual(@as(usize, 2), snapshot.entries.len);
+        for (snapshot.entries) |entry| try std.testing.expectEqual(@as(usize, 1), entry.active_handles);
+    }
+
+    // The final callers leave while their load tasks still own the flights.
+    // Poll repeatedly through that real cancellation window, including the
+    // signed count conversion used by the model-instance API.
+    try std.testing.expectError(error.Cancelled, manager.waitForLoadFlight("primary", primary, control));
+    try std.testing.expectError(error.Cancelled, manager.waitForCompositeAssetsLoadFlight(composite_key, composite, control));
+    for (0..3) |_| {
+        var snapshot = try manager.runtimeSnapshot(allocator, null);
+        defer snapshot.deinit();
+        try std.testing.expectEqual(@as(usize, 2), snapshot.entries.len);
+        for (snapshot.entries) |entry| {
+            const api_active_handles: i64 = @intCast(entry.active_handles);
+            try std.testing.expectEqual(@as(i64, 0), api_active_handles);
+            try std.testing.expectEqual(RuntimeState.loading, entry.state);
+            try std.testing.expect(!entry.unloadable);
+            try std.testing.expectEqual(UnloadRuntimeResult.loading, manager.unloadRuntime(entry.runtime_id));
+        }
+    }
+    try std.testing.expect(!primary.tryAddWaiter());
+    try std.testing.expect(!composite.load_state.tryAddWaiter());
+    // Observation must not change cancellation or task ownership.
+    try std.testing.expectEqual(@as(usize, 1), primary.refs);
+    try std.testing.expectEqual(@as(usize, 1), composite.refs);
+    var primary_control = LoadFlightControl{ .flight = primary };
+    var composite_control = LoadFlightControl{ .flight = &composite.load_state };
+    try std.testing.expectError(error.Cancelled, primary_control.control().check());
+    try std.testing.expectError(error.Cancelled, composite_control.control().check());
+    manager.finishLoadFlight(primary, null, error.Cancelled);
+    manager.finishCompositeAssetsLoadFlight(composite, null, error.Cancelled);
+    var completed = try manager.runtimeSnapshot(allocator, null);
+    defer completed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), completed.entries.len);
 }
 
 test "runtime identifiers round trip and exact loading unload is rejected" {
@@ -6692,10 +6777,7 @@ pub const ModelManager = struct {
                 .runtime_kind = .primary,
                 .model_type = null,
                 .task_mask = 0,
-                .active_handles = if (flight.waiters.load(.acquire) == LoadFlight.abandoned)
-                    0
-                else
-                    flight.waiters.load(.acquire),
+                .active_handles = flight.activeWaiterCount(),
                 .startup_managed = false,
                 .backend = null,
                 .residency_mode = .backend_managed,
@@ -6718,7 +6800,7 @@ pub const ModelManager = struct {
                 .runtime_kind = .composite,
                 .model_type = flight.model_type,
                 .task_mask = 0,
-                .active_handles = flight.load_state.waiters.load(.acquire),
+                .active_handles = flight.load_state.activeWaiterCount(),
                 .startup_managed = false,
                 .backend = null,
                 .residency_mode = .backend_managed,
