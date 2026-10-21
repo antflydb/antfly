@@ -44,6 +44,7 @@ const batch_api = @import("antfly_local_sources").api_batch;
 const cluster_api_http = @import("cluster_api_http.zig");
 const public_table_http = @import("public_table_http.zig");
 const query_request_diagnostics = @import("query_request_diagnostics.zig");
+const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
 const graph_wire_envelope = @import("antfly_local_sources").api_graph_wire_envelope;
 const linear_merge_api = @import("linear_merge.zig");
 const cluster = @import("cluster.zig");
@@ -15223,6 +15224,7 @@ pub const ApiHttpServer = struct {
             try ensureRequestDeadline(deadline);
         }
         query_req.req.cancellation = cancellation;
+        if (query_req.req.graph_queries.len > 0) query_req.req.graph_query_diagnostic_sink = graph_query_diagnostic.sink();
         query_req.req.response_table_name = response_label;
         if (query_req.req.remote_snapshot == null and (query_req.req.order_by.len != 0 or query_req.req.search_after.len != 0 or query_req.req.search_before.len != 0)) {
             if (query_req.req.search_after.len != 0 or query_req.req.search_before.len != 0) return error.CatalogGenerationChanged;

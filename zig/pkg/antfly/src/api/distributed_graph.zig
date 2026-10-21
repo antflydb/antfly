@@ -11287,7 +11287,7 @@ pub fn validateIncomingStartIdentities(a: std.mem.Allocator, catalog: table_cata
         var lookup = (try indexes_api.lookupSingleIndexConfig(a, table.indexes_json, named.query.index_name)) orelse continue;
         defer lookup.deinit();
         if (!graphConfigHasForeignResolver(lookup.config, table_name, req.response_table_name)) continue;
-        graph_query_diagnostic.record(named.name, graph_query_diagnostic.feature(named.query), .qualified_start_identity_required);
+        graph_query_diagnostic.recordForRequest(req, named.name, graph_query_diagnostic.feature(named.query), .qualified_start_identity_required);
         return error.GraphStartIdentityRequired;
     }
 }

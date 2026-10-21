@@ -5852,6 +5852,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     integration_test_step.dependOn(&run_maintenance_worker_tests.step);
 
     const graph_metric_fan_in_filters = [_][]const u8{
+        "graph capability diagnostic forwards into its owning request across bindings",
         "incoming resolver qualification recognizes the owning logical table",
         "local graph metric reads reject invalid freshness without leaking",
         "query parser accepts direct graph metric reads",
