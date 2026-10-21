@@ -1923,6 +1923,14 @@ const Engine = struct {
             try self.list_domains.put(self.distinct_arena.allocator(), domain, {});
             self.list_domain = null;
             self.count = 0;
+            if (std.ascii.eqlIgnoreCase(self.function.name, "collect")) {
+                self.collected.clearRetainingCapacity();
+                self.tail.deinit();
+                self.tail = .{};
+                self.collection_seen = 0;
+                self.collection_count = 0;
+                self.collection_overflow = false;
+            }
             if (std.ascii.eqlIgnoreCase(self.function.name, "sum")) self.sum = .{ .integer = 0 };
             if (std.ascii.eqlIgnoreCase(self.function.name, "avg")) {
                 self.mean = 0;
@@ -2609,10 +2617,12 @@ const Engine = struct {
     const DistinctRows = struct {
         rows: std.ArrayList(Row) = .empty,
         index: value_work.Index = .{},
+        factored: ?*AxisDistinctPartitions = null,
         fn contains(self: *@This(), engine: *Engine, row: Row) !bool {
             return self.containsHashed(engine, row, try engine.rowHash(row));
         }
         fn containsHashed(self: *@This(), engine: *Engine, row: Row, hash: u64) !bool {
+            if (self.factored) |domains| if (try domains.contains(engine, row)) return true;
             var candidate = self.index.head(hash);
             while (candidate) |position| {
                 const link = self.index.links.items[position];
@@ -2717,11 +2727,60 @@ const Engine = struct {
             else => true,
         };
     }
+    /// A DISTINCT stage owns partition keys once, while immutable dependent
+    /// support and its hash index are shared by every disjoint partition.
+    /// Ordinary emissions consult this same membership before retaining rows.
+    const AxisDistinctSupport = struct {
+        rows: []const Row,
+        index: value_work.Index = .{},
+        fn contains(self: *@This(), engine: *Engine, row: Row) !bool {
+            var candidate = self.index.head(try engine.rowHash(row));
+            while (candidate) |position| {
+                const link = self.index.links.items[position];
+                if (try engine.rowEqual(self.rows[link.index], row)) return true;
+                candidate = link.next;
+            }
+            return false;
+        }
+    };
+    const AxisDistinctPartitions = struct {
+        const Partition = struct { key: Row, support: *AxisDistinctSupport };
+        dependent: []const bool,
+        partitions: std.ArrayList(Partition) = .empty,
+        index: value_work.Index = .{},
+        fn select(engine: *Engine, row: Row, dependent: []const bool, selected: bool) !Row {
+            var output: std.ArrayList(v.Entry) = .empty;
+            for (row, dependent) |entry, bit| if (bit == selected) try output.append(engine.a, entry);
+            return output.items;
+        }
+        fn find(self: *@This(), engine: *Engine, key: Row) !?*AxisDistinctSupport {
+            var candidate = self.index.head(try engine.rowHash(key));
+            while (candidate) |position| {
+                const link = self.index.links.items[position];
+                const partition = self.partitions.items[link.index];
+                if (try engine.rowEqual(partition.key, key)) return partition.support;
+                candidate = link.next;
+            }
+            return null;
+        }
+        fn contains(self: *@This(), engine: *Engine, row: Row) !bool {
+            const key = try select(engine, row, self.dependent, false);
+            const support = (try self.find(engine, key)) orelse return false;
+            return support.contains(engine, try select(engine, row, self.dependent, true));
+        }
+        fn put(self: *@This(), engine: *Engine, retained: A, key: Row, support: *AxisDistinctSupport) !void {
+            const owned = try engine.cloneRowScoped(key, retained);
+            try self.index.insert(retained, try engine.rowHash(key), self.partitions.items.len);
+            try self.partitions.append(retained, .{ .key = owned, .support = support });
+        }
+    };
     /// A bounded, ordered reduction memo. Entries contain exact transition
     /// states, not algebraically regrouped SUM/AVG results. DISTINCT support
     /// stays shared until a group receives another contribution domain.
     const AxisPlan = struct {
         clauses: []const ast.Clause,
+        original: []const ast.Clause,
+        supports: std.AutoHashMapUnmanaged(usize, *AxisDistinctSupport) = .empty,
         dependent: []const []const bool,
         captures: Names,
         memo: CallMemo,
@@ -2780,7 +2839,8 @@ const Engine = struct {
             },
             .project => |step| {
                 const p = step.value;
-                if (p.wildcard or p.distinct or p.predicate != null or p.order.len != 0 or p.skip != null or p.limit != null) return null;
+                if (p.wildcard or p.order.len != 0 or p.skip != null or p.limit != null) return null;
+                if (p.predicate) |predicate| if (!axisPure(predicate)) return null;
                 var next: Names = .empty;
                 const bits = try a.alloc(bool, p.items.len);
                 for (p.items, bits) |item, *bit| {
@@ -2801,7 +2861,7 @@ const Engine = struct {
         var required: Names = .empty;
         for (fold.calls) |expression| {
             const call_value = expression.value.call;
-            if (!std.ascii.eqlIgnoreCase(call_value.name, "count") and !std.ascii.eqlIgnoreCase(call_value.name, "sum") and !std.ascii.eqlIgnoreCase(call_value.name, "avg") and !std.ascii.eqlIgnoreCase(call_value.name, "min") and !std.ascii.eqlIgnoreCase(call_value.name, "max")) return null;
+            if (!std.ascii.eqlIgnoreCase(call_value.name, "count") and !std.ascii.eqlIgnoreCase(call_value.name, "sum") and !std.ascii.eqlIgnoreCase(call_value.name, "avg") and !std.ascii.eqlIgnoreCase(call_value.name, "min") and !std.ascii.eqlIgnoreCase(call_value.name, "max") and !(std.ascii.eqlIgnoreCase(call_value.name, "collect") and call_value.collect_limit != null and call_value.collect_filters.len == 0)) return null;
             for (call_value.args) |argument| {
                 if (!axisPure(argument)) return null;
                 try self.axisReferences(&required, argument);
@@ -2819,6 +2879,12 @@ const Engine = struct {
                 },
                 .project => |*step| {
                     var selected: std.ArrayList(ast.Item) = .empty;
+                    // A DISTINCT stage observes every dependent output, even
+                    // when later reducers do not reference that column.
+                    if (step.value.distinct) for (step.value.items, dependent[cursor]) |item, bit| {
+                        if (bit) try required.put(a, item.alias orelse try self.expressionName(item.expression), {});
+                    };
+                    if (step.value.predicate) |predicate| try self.axisReferences(&required, predicate);
                     var before: Names = .empty;
                     var group_before: Names = .empty;
                     for (step.value.items) |item| if (group_required.contains(item.alias orelse try self.expressionName(item.expression))) try self.axisReferences(&group_before, item.expression);
@@ -2827,6 +2893,15 @@ const Engine = struct {
                         try selected.append(a, item);
                         try self.axisReferences(&before, item.expression);
                     };
+                    // WHERE sees both projected aliases and the input scope.
+                    // Names absent from the projection still capture input.
+                    var needed = required.keyIterator();
+                    while (needed.next()) |name| {
+                        const projected = for (step.value.items) |item| {
+                            if (std.mem.eql(u8, name.*, item.alias orelse try self.expressionName(item.expression))) break true;
+                        } else false;
+                        if (!projected) try before.put(a, name.*, {});
+                    }
                     step.value.items = try selected.toOwnedSlice(a);
                     required = before;
                 },
@@ -2843,7 +2918,7 @@ const Engine = struct {
         };
         if (!reusable) return null;
         const plan = try a.create(AxisPlan);
-        plan.* = .{ .clauses = clauses, .dependent = dependent, .captures = required, .memo = .{ .identity_keys = true, .budget = .{ .backing = self.scratch_allocator, .limit = @min(4 << 20, self.limits.memory_bytes / 32) } } };
+        plan.* = .{ .clauses = clauses, .original = tail, .dependent = dependent, .captures = required, .memo = .{ .identity_keys = true, .budget = .{ .backing = self.scratch_allocator, .limit = @min(4 << 20, self.limits.memory_bytes / 16) } } };
         return plan;
     }
     fn axisSnapshot(self: *Engine, state_value: *StreamingAggregate) !Row {
@@ -2863,6 +2938,8 @@ const Engine = struct {
             if ((try self.values.info(members)).entities) return error.CypherAxisMemoDeclined;
         }
         if ((try self.values.info(state_value.best)).entities) return error.CypherAxisMemoDeclined;
+        const collection = if (std.ascii.eqlIgnoreCase(function_call.name, "collect")) try state_value.finishWindow(self) else v.Value.null;
+        if ((try self.values.info(collection)).entities) return error.CypherAxisMemoDeclined;
         return self.a.dupe(v.Entry, &.{
             .{ .name = "count", .value = .{ .integer = @bitCast(state_value.count) } },
             .{ .name = "sum", .value = state_value.sum },
@@ -2872,6 +2949,11 @@ const Engine = struct {
             .{ .name = "members", .value = members },
             .{ .name = "failure", .value = .{ .integer = if (state_value.failure) |err| @intFromError(err) else 0 } },
             .{ .name = "sign", .value = .{ .integer = @backingInt(state_value.sum_sign) } },
+            .{ .name = "collection", .value = collection },
+            .{ .name = "seen", .value = .{ .integer = @bitCast(@as(u64, state_value.collection_seen)) } },
+            .{ .name = "total", .value = .{ .integer = @bitCast(state_value.collection_count) } },
+            .{ .name = "overflow", .value = .{ .boolean = state_value.collection_overflow } },
+            .{ .name = "source_null", .value = .{ .boolean = state_value.source_null } },
         });
     }
     fn axisRestore(self: *Engine, state_value: *StreamingAggregate, row: Row) !void {
@@ -2890,6 +2972,17 @@ const Engine = struct {
         }
         state_value.failure = if (row[6].value.integer == 0) null else @errorFromInt(@as(u16, @intCast(row[6].value.integer)));
         state_value.sum_sign = @fromBackingInt(@intCast(row[7].value.integer));
+        if (row[8].value == .list) {
+            const cells = row[8].value.list;
+            const prefix = @min(state_value.function.collect_limit.?, cells.len);
+            try state_value.collected.appendSlice(state_value.arena.allocator(), cells[0..prefix]);
+            const suffix = @min(state_value.function.collect_suffix, cells.len);
+            for (cells[cells.len - suffix ..]) |cell| try state_value.tail.append(self, state_value.distinct_arena.allocator(), cell, Count.one, state_value.function.collect_suffix);
+            state_value.collection_seen = @intCast(@as(u64, @bitCast(row[9].value.integer)));
+            state_value.collection_count = @bitCast(row[10].value.integer);
+            state_value.collection_overflow = row[11].value.boolean;
+            state_value.source_null = row[12].value.boolean;
+        }
     }
     fn computeAxis(self: *Engine, parent: *StreamFold, plan: *AxisPlan, key: Row) anyerror!WeightedRows {
         const columns = self.columns;
@@ -2911,22 +3004,37 @@ const Engine = struct {
         @memset(trace.reached, false);
         var child: StreamFold = .{ .retained = self.a, .middle = plan.clauses, .projection = projection, .calls = parent.calls, .membership_leaders = parent.membership_leaders, .call_aliases = parent.call_aliases, .top = &top, .groups = &groups, .group_index = &group_index, .stage_counts = counts, .matched = &matched, .distinct = distinct_rows, .has_keys = false, .single_seed = true, .defer_aggregates = true, .record_rows = true, .axis_enabled = false, .axis_trace = &trace };
         try child.expand(self, key, 0);
-        const rows = try self.a.alloc(Row, parent.calls.len + 1);
-        const weights = try self.a.alloc(Count, rows.len);
-        @memset(weights, Count.one);
-        weights[0] = trace.count;
+        var rows: std.ArrayList(Row) = .empty;
+        try rows.resize(self.a, parent.calls.len + 1);
         const reached = try self.a.alloc(v.Value, trace.reached.len);
         for (reached, trace.reached) |*value, yes| value.* = .{ .boolean = yes };
         const stage_values = try self.a.alloc(v.Value, counts.len);
         for (stage_values, counts) |*value, stage_count| value.* = .{ .integer = @bitCast(@as(u64, stage_count)) };
-        rows[0] = try self.a.dupe(v.Entry, &.{ .{ .name = "reached", .value = .{ .list = reached } }, .{ .name = "counts", .value = .{ .list = stage_values } } });
-        for (rows[1..], groups.items[0].states) |*row, *state_value| row.* = try self.axisSnapshot(state_value);
-        // Clone before reducer arenas close. These are temporary snapshots;
-        // the bounded memo subsequently owns and promotes successful entries.
+        const domains = try self.a.alloc(v.Value, distinct_rows.len);
+        @memset(domains, .{ .integer = 0 });
+        for (distinct_rows, plan.original, plan.dependent, domains) |set, clause, flags, *length| {
+            if (clause.operation != .project or !clause.operation.project.value.distinct) continue;
+            length.* = .{ .integer = @intCast(set.rows.items.len) };
+            for (set.rows.items) |row| {
+                var selected: std.ArrayList(v.Entry) = .empty;
+                for (clause.operation.project.value.items, flags) |item, bit| if (bit) {
+                    const name = item.alias orelse try self.expressionName(item.expression);
+                    try selected.append(self.a, .{ .name = name, .value = lookup(row, name) orelse return error.CypherInvalidBackendPage });
+                };
+                try rows.append(self.a, selected.items);
+            }
+        }
+        rows.items[0] = try self.a.dupe(v.Entry, &.{ .{ .name = "reached", .value = .{ .list = reached } }, .{ .name = "counts", .value = .{ .list = stage_values } }, .{ .name = "domains", .value = .{ .list = domains } } });
+        for (rows.items[1..][0..parent.calls.len], groups.items[0].states) |*row, *state_value| row.* = try self.axisSnapshot(state_value);
+        // Clone before reducer arenas close, preserving shared support vectors.
         var copies: v.CloneContext = .{ .a = self.a, .scratch = self.a };
-        for (rows) |*row| row.* = try cloneRowContext(row.*, &copies);
-        return .{ .rows = rows, .weights = weights };
+        for (rows.items) |*row| row.* = try cloneRowContext(row.*, &copies);
+        const weights = try self.a.alloc(Count, rows.items.len);
+        @memset(weights, Count.one);
+        weights[0] = trace.count;
+        return .{ .rows = rows.items, .weights = weights };
     }
+
     const StreamFold = struct {
         axis_enabled: bool = true,
         axis_plans: std.AutoHashMapUnmanaged(usize, ?*AxisPlan) = .empty,
@@ -2974,6 +3082,27 @@ const Engine = struct {
             if (!fold.record_rows) return;
             for (summary.rows[0][1].value.list[1..], index..) |stage_count, offset| fold.stage_counts[offset + 1] +|= @intCast(@as(u64, @bitCast(stage_count.integer)));
         }
+        const AxisPartition = struct { stage: usize, key: Row, rows: []const Row, dependent: []const bool };
+        fn commitAxisPartitions(fold: *@This(), engine: *Engine, plan: *AxisPlan, pending: []const AxisPartition) !void {
+            for (pending) |partition| {
+                if (partition.rows.len == 0) continue;
+                const identity = @intFromPtr(partition.rows.ptr);
+                const support = plan.supports.get(identity) orelse blk: {
+                    const created = try fold.retained.create(AxisDistinctSupport);
+                    created.* = .{ .rows = partition.rows };
+                    for (created.rows, 0..) |row, ordinal| try created.index.insert(fold.retained, try engine.rowHash(row), ordinal);
+                    try plan.supports.put(fold.retained, identity, created);
+                    break :blk created;
+                };
+                const set = &fold.distinct[partition.stage];
+                if (set.factored == null) {
+                    const domains = try fold.retained.create(AxisDistinctPartitions);
+                    domains.* = .{ .dependent = try fold.retained.dupe(bool, partition.dependent) };
+                    set.factored = domains;
+                }
+                try set.factored.?.put(engine, fold.retained, partition.key, support);
+            }
+        }
         fn memoAxis(fold: *@This(), engine: *Engine, row: Row, index: usize) anyerror!bool {
             if (!fold.axis_enabled or !fold.has_keys or !engine.read_only or !fold.defer_aggregates or !fold.weight.isOne() or fold.consumer != null or fold.continuation != null or fold.group_window != null or fold.top.* != null or fold.active_calls != null or fold.calls.len == 0 or fold.projection.wildcard) return false;
             if (fold.single_seed) {
@@ -3016,7 +3145,11 @@ const Engine = struct {
             }
             const summary = packet.?;
             var representative = row;
-            for (fold.middle[index..], plan.dependent, summary.rows[0][0].value.list) |clause, flags, reached| {
+            var pending: std.ArrayList(AxisPartition) = .empty;
+            var support_offset = 1 + fold.calls.len;
+            for (fold.middle[index..], plan.dependent, summary.rows[0][0].value.list, summary.rows[0][2].value.list, index..) |clause, flags, reached, domain_length, stage| {
+                const support_rows = summary.rows[support_offset..][0..@intCast(domain_length.integer)];
+                support_offset += support_rows.len;
                 if (!reached.boolean) break;
                 switch (clause.operation) {
                     .unwind => |u| representative = try engine.replace(representative, u.alias, .null),
@@ -3024,16 +3157,29 @@ const Engine = struct {
                         const projected = try engine.a.alloc(v.Entry, step.value.items.len);
                         for (projected, step.value.items, flags) |*entry, item, dependent| entry.* = .{ .name = item.alias orelse try engine.expressionName(item.expression), .value = if (dependent) .null else try engine.eval(item.expression, representative, null) };
                         representative = projected;
+                        if (step.value.distinct) {
+                            const set = &fold.distinct[stage];
+                            // Mixed domains and repeated partitions enter the
+                            // ordinary fold, whose membership includes prior
+                            // shared supports. Never replay a DISTINCT twice.
+                            if (set.rows.items.len != 0) return false;
+                            const partition = try AxisDistinctPartitions.select(engine, projected, flags, false);
+                            if (set.factored) |domains| {
+                                if (!std.mem.eql(bool, flags, domains.dependent) or try domains.find(engine, partition) != null) return false;
+                            }
+                            try pending.append(engine.a, .{ .stage = stage, .key = partition, .rows = support_rows, .dependent = flags });
+                        }
                     },
                     else => unreachable,
                 }
             }
             if (summary.weights[0].cap(1) == 0) {
+                try fold.commitAxisPartitions(engine, plan, pending.items);
                 fold.recordAxisStages(summary, index);
                 return true;
             }
             const previous_packet = fold.axis_packet;
-            fold.axis_packet = summary.rows[1..];
+            fold.axis_packet = summary.rows[1..][0..fold.calls.len];
             defer fold.axis_packet = previous_packet;
             const previous_weight = fold.weight;
             fold.weight = summary.weights[0];
@@ -3044,6 +3190,7 @@ const Engine = struct {
                 fold.matched.* = matched;
                 return false;
             };
+            try fold.commitAxisPartitions(engine, plan, pending.items);
             fold.recordAxisStages(summary, index);
             return true;
         }
@@ -3534,7 +3681,10 @@ const Engine = struct {
         }
         fn generation(fold: *@This()) usize {
             var matched: usize = @intFromBool(fold.optional and fold.had_match);
-            for (fold.distinct) |set| matched +|= set.rows.items.len;
+            for (fold.distinct) |set| {
+                matched +|= set.rows.items.len;
+                if (set.factored) |domains| matched +|= domains.partitions.items.len;
+            }
             if (fold.continuation) |next| return matched + next.parent.generation();
             return matched + if (fold.distinct_goal != null) fold.groups.items.len else @as(usize, 0);
         }
@@ -5535,7 +5685,7 @@ const Engine = struct {
                         const projection = following.operation.project.value;
                         var reduction = false;
                         for (projection.items) |item| reduction = reduction or aggregates(item.expression);
-                        if (!following.operation.project.final and !reduction and projection.limit == null and projection.order.len == 0 and !projection.distinct) continue;
+                        if (!following.operation.project.final and !reduction and projection.limit == null and projection.order.len == 0) continue;
                         self.retain_windows = (retain_final and index + 1 == clauses.len) or (!following.operation.project.final and self.weightedTail(clauses[index + 1 ..]));
                         if (try self.streamMatchProjectionWeighted(bags.rows, bags.weights, .{ .paths = &.{} }, projection, clauses[clause_index..index], .{}, following.span)) |output| {
                             if (self.pending_window) |window| {
@@ -5794,7 +5944,7 @@ const Engine = struct {
                     const projection = next.operation.project.value;
                     var reduction = false;
                     for (projection.items) |item| reduction = reduction or aggregates(item.expression);
-                    if (!next.operation.project.final and !reduction and projection.limit == null and projection.order.len == 0 and !projection.distinct) continue;
+                    if (!next.operation.project.final and !reduction and projection.limit == null and projection.order.len == 0) continue;
                     if (try self.streamMatchProjection(rows, .{ .paths = &.{} }, projection, clauses[clause_index..index], .{}, next.span)) |streamed| {
                         if (index + 1 < clauses.len) return self.runNext(clauses[index + 1 ..], streamed, preserve_rows);
                         return streamed;

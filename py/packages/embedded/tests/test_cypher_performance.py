@@ -5940,12 +5940,17 @@ def test_dynamic_substrings_share_validation_and_unicode_offsets(graph_db, paylo
     assert [row[0]["value"] for row in result["rows"]] == list(payload[100000:100100])
 
 
-@pytest.mark.parametrize("case", ["mapped", "avg", "float_sum", "reversed", "overlap"])
+@pytest.mark.parametrize(
+    "case", ["mapped", "avg", "float_sum", "reversed", "overlap", "filtered", "distinct_stage", "bounded"]
+)
 def test_ordered_aggregate_domains_share_exact_reducer_states(graph_db, case):
     parameters = {"xs": list(range(1000)), "lists": [list(range(500)), list(range(250, 750))]}
     tails = {
         "mapped": ("UNWIND $xs AS x WITH i,x+1 AS y,x*2 AS z RETURN i,sum(y),sum(z)", [500500, 999000]),
         "avg": ("UNWIND $xs AS x RETURN i,avg(x)", [499.5]),
+        "filtered": ("UNWIND $xs AS x WITH i,x WHERE x>500 RETURN i,avg(x)", [750.0]),
+        "distinct_stage": ("UNWIND $xs AS x WITH DISTINCT i,x RETURN i,avg(x)", [499.5]),
+        "bounded": ("UNWIND $xs AS x RETURN i,avg(x),head(collect(x)),last(collect(x))", [499.5, 0, 999]),
         "float_sum": ("UNWIND $xs AS x RETURN i,sum(x)", [49950.0]),
         "reversed": ("UNWIND reverse($xs) AS x RETURN i,sum(x)", [499500]),
         "overlap": (
@@ -5964,10 +5969,16 @@ def test_ordered_aggregate_domains_share_exact_reducer_states(graph_db, case):
             "limits": {"memory_bytes": 4 << 20, "intermediate_states": 100000},
         },
     )
-    convert = float if case in ("avg", "float_sum") else int
-    assert [[int(row[0]["value"]), *[convert(cell["value"]) for cell in row[1:]]] for row in result["rows"]] == [
-        [i, *expected] for i in range(1, 31)
-    ]
+    assert [
+        [
+            int(row[0]["value"]),
+            *[
+                (float if isinstance(value, float) else int)(cell["value"])
+                for cell, value in zip(row[1:], expected, strict=True)
+            ],
+        ]
+        for row in result["rows"]
+    ] == [[i, *expected] for i in range(1, 31)]
 
 
 def test_ordered_memo_partitions_preserve_collisions_and_reached_errors(graph_db):
@@ -5977,9 +5988,9 @@ def test_ordered_memo_partitions_preserve_collisions_and_reached_errors(graph_db
     )
     parameters = {"lists": [[1.0, 2.0], [2, 3], [1, 4]]}
     actual = graph_db.cypher_json("g", {"query": query, "parameters": parameters})
-    # The zero-retention COLLECT prevents ordered-domain memoization in the
-    # reference without retaining an input-sized auxiliary result.
-    control = query.replace(" ORDER BY i", ",sum(0)+size(collect(null)[0..0]) AS forced ORDER BY i")
+    # COALESCE keeps the reference COLLECT unbounded and excludes memoization.
+    # Its NULL inputs retain no cells, so reference memory stays bounded.
+    control = query.replace(" ORDER BY i", ",sum(0)+size(coalesce(collect(null),[])) AS forced ORDER BY i")
     expected = graph_db.cypher_json("g", {"query": control, "parameters": parameters})
     assert actual["rows"] == [row[:-1] for row in expected["rows"]]
     with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
@@ -5987,3 +5998,20 @@ def test_ordered_memo_partitions_preserve_collisions_and_reached_errors(graph_db
             "g",
             {"query": "UNWIND [1,2] AS i UNWIND [1] AS x WITH i,1/0 AS bad,x AS y UNWIND [] AS z RETURN i,avg(y)"},
         )
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "WITH DISTINCT i,x RETURN i,avg(x),head(collect(x)),last(collect(x))",
+        "WITH i,x AS y WHERE x IS NOT NULL RETURN i,avg(y),collect(y)[0..2],collect(y)[-2..]",
+        "WITH DISTINCT i,x WITH DISTINCT i,x RETURN i,count(*),collect(DISTINCT x)[0..2],collect(DISTINCT x)[-2..]",
+    ],
+)
+def test_partition_membership_and_bounded_collection_continuations_match_reference(graph_db, tail):
+    query = "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x " + tail
+    control = query + ",size(coalesce(collect(null),[])) AS reference"
+    parameters = {"lists": [[None, 1, 2, 1.0], [2, 3, 4], [], [4, 5]]}
+    actual = graph_db.cypher_json("g", {"query": query, "parameters": parameters})
+    expected = graph_db.cypher_json("g", {"query": control, "parameters": parameters})
+    assert actual["rows"] == [row[:-1] for row in expected["rows"]]

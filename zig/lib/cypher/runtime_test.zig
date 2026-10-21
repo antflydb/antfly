@@ -5379,7 +5379,7 @@ test "shared mapped and distinct summaries match sequential reducers over genera
             var diagnostic: c.Diagnostic = .{};
             var fast = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
             defer fast.deinit();
-            const control = try std.fmt.allocPrint(std.testing.allocator, "{s},sum(0)+size(collect(null)[0..0])", .{text});
+            const control = try std.fmt.allocPrint(std.testing.allocator, "{s},sum(0)+size(coalesce(collect(null),[]))", .{text});
             defer std.testing.allocator.free(control);
             var slow = try c.compile(std.testing.allocator, control, .{}, &diagnostic);
             defer slow.deinit();
@@ -5453,6 +5453,10 @@ test "ordered reduction memos cover multiple outputs floats reversals and overla
     const cases = [_]struct { text: []const u8, expected: []const v.Value, floating: bool = false }{
         .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x WITH i,x+1 AS y,x*2 AS z RETURN i,sum(y),sum(z) ORDER BY i", .expected = &.{ .{ .integer = 500500 }, .{ .integer = 999000 } } },
         .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x RETURN i,avg(x) ORDER BY i", .expected = &.{.{ .number = 499.5 }} },
+        .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x WITH i,x WHERE x>500 RETURN i,avg(x) ORDER BY i", .expected = &.{.{ .number = 750 }} },
+        .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x WITH DISTINCT i,x RETURN i,avg(x) ORDER BY i", .expected = &.{.{ .number = 499.5 }} },
+        .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x RETURN i,avg(x),head(collect(x)),last(collect(x)) ORDER BY i", .expected = &.{ .{ .number = 499.5 }, .{ .integer = 0 }, .{ .integer = 999 } } },
+
         .{ .text = "UNWIND range(1,30) AS i UNWIND reverse($xs) AS x RETURN i,sum(x) ORDER BY i", .expected = &.{.{ .integer = 499500 }} },
         .{ .text = "UNWIND range(1,30) AS i UNWIND $lists AS xs UNWIND xs AS x RETURN i,sum(DISTINCT x),count(DISTINCT x) ORDER BY i", .expected = &.{ .{ .integer = 280875 }, .{ .integer = 750 } } },
         .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x RETURN i,sum(x) ORDER BY i", .expected = &.{.{ .number = 49950 }}, .floating = true },
@@ -5500,7 +5504,7 @@ test "ordered reduction snapshots match independent sequential execution across 
             var diagnostic: c.Diagnostic = .{};
             var fast = try c.compile(a, text, .{}, &diagnostic);
             defer fast.deinit();
-            const control = try std.fmt.allocPrint(a, "{s},sum(0)+size(collect(null)[0..0])", .{text});
+            const control = try std.fmt.allocPrint(a, "{s},sum(0)+size(coalesce(collect(null),[]))", .{text});
             defer a.free(control);
             var slow = try c.compile(a, control, .{}, &diagnostic);
             defer slow.deinit();
@@ -5531,6 +5535,13 @@ test "ordered reduction snapshots match independent sequential execution across 
             "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x+1 AS y,x*2 AS z RETURN i,sum(y),avg(z)",
             "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND reverse(xs) AS x RETURN i,sum(x),avg(x),sum(DISTINCT x)",
             "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x RETURN i,CASE WHEN i=2 THEN avg(x) ELSE 7 END",
+
+            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH DISTINCT i,x RETURN i,avg(x),count(*)",
+            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x WHERE x IS NOT NULL AND x>0 RETURN i,sum(x),avg(x),head(collect(x)),last(collect(x))",
+            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH DISTINCT i,x,x*2 AS y WITH i,x,y WHERE x>0 RETURN i,avg(x),head(collect(y)),last(collect(y))",
+            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x RETURN i,avg(x),collect(DISTINCT x)[0..2],collect(DISTINCT x)[-2..]",
+            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH DISTINCT i,x WITH DISTINCT i,x RETURN i,count(*),collect(x)[0..2],collect(x)[-2..]",
+            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x AS y WHERE x IS NOT NULL RETURN i,avg(y),head(collect(y))",
         }) |text| try Compare.run(text, parameters);
     }
 }
@@ -5553,5 +5564,30 @@ test "ordered reduction memo owners release every failed allocation" {
     for ([_][]const u8{
         "UNWIND [1,2] AS i UNWIND [1,2,3] AS x WITH i,x+1 AS y,x*2 AS z RETURN i,sum(y),avg(z)",
         "UNWIND [1,2] AS i UNWIND [[1,2],[2,3]] AS xs UNWIND xs AS x RETURN i,sum(DISTINCT x),avg(DISTINCT x),count(DISTINCT x)",
+
+        "UNWIND [1,2,1] AS i UNWIND [1,2,3] AS x WITH DISTINCT i,x RETURN i,avg(x),head(collect(x)),last(collect(x))",
+        "UNWIND [1,2] AS i UNWIND [1,2,3] AS x WITH i,x WHERE x>1 RETURN i,avg(x),collect(DISTINCT x)[0..1],collect(DISTINCT x)[-1..]",
     }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{text});
+}
+
+test "partitioned distinct and collection snapshots retain filters and contribution order" {
+    try check("UNWIND [[1,2],[2,3],[3,4]] AS xs UNWIND [1,2] AS i UNWIND xs AS x WITH DISTINCT i,x RETURN i,avg(x),count(*) ORDER BY i", "[[1,2.5,4],[2,2.5,4]]");
+    try check("UNWIND [[1,2],[3,4],[1,2]] AS xs UNWIND [1,2] AS i UNWIND xs AS x WITH i,x WHERE x<3 WITH DISTINCT i,x RETURN i,count(*) ORDER BY i", "[[1,2],[2,2]]");
+    try check("UNWIND [1,2,1] AS i UNWIND [[1,2],[2,3]] AS xs UNWIND xs AS x WITH DISTINCT i,x RETURN i,count(*),collect(x) ORDER BY i", "[[1,3,[1,2,3]],[2,3,[1,2,3]]]");
+    try check("UNWIND [1,2,1] AS i UNWIND [1,2,2,3] AS x WITH DISTINCT i,x WITH DISTINCT i,x RETURN i,avg(x),head(collect(x)),last(collect(x)) ORDER BY i", "[[1,2,1,3],[2,2,1,3]]");
+    try check("UNWIND [1,2,1] AS i UNWIND [1,2,3] AS x RETURN i,collect(x)[0..2],collect(x)[-2..] ORDER BY i", "[[1,[1,2],[2,3]],[2,[1,2],[2,3]]]");
+    try check("UNWIND [1,2,1] AS i UNWIND [1,2,3] AS x RETURN i,collect(DISTINCT x)[0..2],collect(DISTINCT x)[-2..] ORDER BY i", "[[1,[1,2],[2,3]],[2,[1,2],[2,3]]]");
+    try check("UNWIND [1,2] AS i UNWIND [1,2] AS x WITH DISTINCT i UNWIND [] AS y RETURN i,count(*)", "[]");
+    try check("UNWIND [1,2,1] AS i UNWIND [1,2] AS x WITH i,x WHERE i=1 RETURN i,avg(x)", "[[1,1.5]]");
+    try check("UNWIND [1,2] AS k UNWIND [10,20] AS i UNWIND [1,2,3] AS x WITH i,x WHERE x>k RETURN i,avg(x),head(collect(x)) ORDER BY i", "[[10,2.6666666666666665,2],[20,2.6666666666666665,2]]");
+    for ([_][]const u8{
+        "UNWIND [1,2] AS i UNWIND [1] AS x WITH i,x,1/0 AS bad WHERE false RETURN i,avg(x)",
+        "UNWIND [1,2] AS i UNWIND [1] AS x WITH DISTINCT i,x,1/0 AS bad UNWIND [] AS y RETURN i,avg(x)",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
 }
