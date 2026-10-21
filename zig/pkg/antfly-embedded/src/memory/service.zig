@@ -192,7 +192,7 @@ pub const Service = struct {
             .evidence => {
                 const source = (try run.evidence(id)) orelse return error.MemoryNotFound;
                 try run.authorize(source.owner, source.evidence.visibility);
-                if (source.forgotten or run.isExpired(source) or try run.read(bool, "forgotten-all") != null or try run.read(bool, try key(a, "forgotten-source", source.evidence.source_id)) != null) return error.MemoryNotFound;
+                if (!try run.evidenceRetained(source)) return error.MemoryNotFound;
                 output = try run.encode(source);
             },
             .get => {
@@ -405,6 +405,16 @@ const Run = struct {
     fn evidence(self: *Run, id: []const u8) !?t.StoredEvidence {
         return self.read(t.StoredEvidence, try key(self.a, "evidence", id));
     }
+    // One retention gate for evidence reads, support traversal and admission.
+    // Fences take effect immediately, independently of the physical scrub cursor.
+    // Authorization stays with the caller so denied private evidence cannot be
+    // distinguished from an otherwise unavailable support branch.
+    fn evidenceRetained(self: *Run, source: t.StoredEvidence) !bool {
+        return !source.forgotten and !self.isExpired(source) and
+            try self.read(bool, "forgotten-all") == null and
+            try self.read(bool, try key(self.a, "forgotten-source", source.evidence.source_id)) == null and
+            try self.read(bool, try key(self.a, "forgotten-evidence", source.evidence.id)) == null;
+    }
     fn isExpired(self: *Run, source: t.StoredEvidence) bool {
         if (source.evidence.expires_at) |expiry| if (expiry <= self.service.context.now_ms) return true;
         if (self.state.config.retention_ms) |retention| if (@as(i128, source.recorded_at) + retention <= self.service.context.now_ms) return true;
@@ -463,7 +473,7 @@ const Run = struct {
         for (refs) |ref| {
             try self.supportStep();
             const source = (try self.evidence(ref.id)) orelse return false;
-            if (source.forgotten or self.isExpired(source) or try self.read(bool, try key(self.a, "forgotten-source", source.evidence.source_id)) != null) return false;
+            if (!try self.evidenceRetained(source)) return false;
             self.authorize(source.owner, source.evidence.visibility) catch return false;
         }
         for (parents) |id| {
@@ -530,8 +540,7 @@ const Run = struct {
         for (refs) |ref| {
             try self.supportStep();
             const source = (try self.evidence(ref.id)) orelse return false;
-            if (source.forgotten or self.isExpired(source)) return false;
-            if (try self.read(bool, try key(self.a, "forgotten-source", source.evidence.source_id)) != null) return false;
+            if (!try self.evidenceRetained(source)) return false;
             self.authorize(source.owner, source.evidence.visibility) catch return false;
         }
         for (dependencies) |dependency| {
@@ -597,16 +606,13 @@ const Run = struct {
             };
             if (source.managed) {
                 if (self.state.config.processing == .external or !(self.state.config.features.assertion_distillation or self.state.config.features.entity_extraction or self.state.config.features.summaries)) return error.MemoryManagedProcessingDisabled;
-                // A source is either client-produced or managed in this
-                // request; never infer a second authoritative claim stream.
-                for (request.assertions) |claim| for (claim.evidence) |ref| if (eql(u8, ref.id, source.id)) return error.MemoryProducerConflict;
                 try inputs.append(self.a, source.id);
             } else if (self.state.config.features.entity_extraction or self.state.config.features.summaries) try inputs.append(self.a, source.id);
         }
         for (request.context_evidence_ids) |id| {
             const source = (try self.evidence(id)) orelse return error.MemoryEvidenceRequired;
             try self.authorize(source.owner, source.evidence.visibility);
-            if (source.forgotten or self.isExpired(source)) return error.MemoryForgotten;
+            if (!try self.evidenceRetained(source)) return error.MemoryForgotten;
             for (request.evidence) |current| if (eql(u8, current.id, id)) return error.InvalidMemoryRequest;
         }
         op.context_inputs = request.context_evidence_ids;
@@ -667,7 +673,7 @@ const Run = struct {
         }
         return levels;
     }
-    fn validateAssertion(self: *Run, claim: t.Assertion) anyerror!void {
+    fn validateAssertion(self: *Run, claim: t.Assertion, generated: bool) anyerror!void {
         try t.validateId(claim.id);
         try t.validateId(claim.subject);
         try t.validateId(claim.predicate);
@@ -680,7 +686,10 @@ const Run = struct {
             try self.supportStep();
             const source = (try self.evidence(ref.id)) orelse return error.MemoryEvidenceRequired;
             try self.authorize(source.owner, source.evidence.visibility);
-            if (source.forgotten or self.isExpired(source)) return error.MemoryForgotten;
+            if (!try self.evidenceRetained(source)) return error.MemoryForgotten;
+            // Every admitted branch owns a producer path. An external claim
+            // cannot borrow managed evidence through an alternative branch.
+            if (!generated and source.evidence.managed) return error.MemoryProducerConflict;
             if (claim.visibility == .team and source.evidence.visibility == .private) return error.MemoryVisibilityConflict;
             if (ref.span) |span| {
                 if (span.start >= span.end or span.end > source.evidence.text.len or !std.unicode.utf8ValidateSlice(source.evidence.text[span.start..span.end])) return error.InvalidMemorySpan;
@@ -712,7 +721,7 @@ const Run = struct {
             branch.evidence = support.evidence;
             branch.depends_on = support.depends_on;
             branch.support_sets = &.{};
-            try self.validateAssertion(branch);
+            try self.validateAssertion(branch, generated);
         }
         if (claim.embedding) |vector| {
             if (!self.state.config.features.semantic_recall) return error.MemoryCapabilityUnavailable;
@@ -729,11 +738,7 @@ const Run = struct {
             if (!generated and std.mem.startsWith(u8, claim.producer, "managed:")) return error.MemoryProducerConflict;
             if (generated) claim.producer = try std.fmt.allocPrint(self.a, "managed:{d}", .{self.state.config.generation});
             const input_hash = try hash(self.a, claim);
-            try self.validateAssertion(claim);
-            if (!generated) for (claim.evidence) |ref| {
-                const source = (try self.evidence(ref.id)).?;
-                if (source.evidence.managed) return error.MemoryProducerConflict;
-            };
+            try self.validateAssertion(claim, generated);
             if (try self.assertion(claim.id)) |old| {
                 try self.authorize(old.owner, .private);
                 if (old.input_hash.len > 0) {
@@ -752,7 +757,7 @@ const Run = struct {
                 claim.embedding = try self.service.backend.embed.?(self.service.backend.ptr, self.a, self.state.config.models.embedder.?, claim.statement);
                 claim.embedding_model = self.state.config.models.embedder;
             }
-            try self.validateAssertion(claim);
+            try self.validateAssertion(claim, generated);
             const model_decision = if (self.state.config.features.reconciliation == .model) try self.decideClaim(&claim, self.service.context.principal, null) else null;
             if (claim.embedding) |embedding| try self.putVector(self.state.config, claim, embedding);
             claim.embedding = null;
@@ -775,6 +780,7 @@ const Run = struct {
             if (eql(u8, previous, claim.id)) return error.MemoryInvalidSupersession;
             var old = (try self.assertion(previous)) orelse return error.MemoryNotFound;
             try self.authorize(old.owner, old.assertion.visibility);
+            if (!try self.retained(old, 0)) return error.MemoryForgotten;
             if (claim.visibility == .private and !eql(u8, old.owner, owner)) return error.MemoryVisibilityConflict;
             if (!try self.sameCanonicalGroup(claim, old.assertion) or claim.modality != .actual or claim.role == .hypothesized or claim.stability != .settled) return error.MemoryInvalidSupersession;
             old.lifecycle = .superseded;
@@ -1270,6 +1276,7 @@ const Run = struct {
     fn correct(self: *Run, request: t.Correction) !void {
         var record = (try self.assertion(request.id)) orelse return error.MemoryNotFound;
         try self.authorize(record.owner, .private);
+        if (!try self.retained(record, 0)) return error.MemoryForgotten;
         if (record.revision != request.expected_revision) return error.MemoryRevisionConflict;
         if (request.reason.len == 0 or request.reason.len > t.max_text_bytes) return error.InvalidMemoryRequest;
         if (request.evidence.len > t.max_items) return error.MemoryInputTooLarge;
@@ -1383,7 +1390,7 @@ const Run = struct {
                 return;
             };
             try self.authorize(source.owner, source.evidence.visibility);
-            if (source.forgotten or self.isExpired(source) or try self.read(bool, "forgotten-all") != null or try self.read(bool, try key(self.a, "forgotten-source", source.evidence.source_id)) != null) {
+            if (!try self.evidenceRetained(source)) {
                 pending.phase = .cancelled;
                 pending.error_code = "MemoryForgotten";
                 try self.put(path, pending);
@@ -1395,7 +1402,7 @@ const Run = struct {
         for (pending.context_inputs) |input| {
             var source = (try self.evidence(input)) orelse return self.processingFailure(path, &pending, receipt, error.MemoryForgotten);
             try self.authorize(source.owner, source.evidence.visibility);
-            if (source.forgotten or self.isExpired(source) or try self.read(bool, "forgotten-all") != null or try self.read(bool, try key(self.a, "forgotten-source", source.evidence.source_id)) != null) return self.processingFailure(path, &pending, receipt, error.MemoryForgotten);
+            if (!try self.evidenceRetained(source)) return self.processingFailure(path, &pending, receipt, error.MemoryForgotten);
             source.context_only = true;
             try sources.append(self.a, source);
         }
@@ -1586,7 +1593,7 @@ const Run = struct {
                     if (expires) |time| if (time > self.service.context.now_ms and (self.state.next_expiry_at == null or time < self.state.next_expiry_at.?)) {
                         self.state.next_expiry_at = time;
                     };
-                    if (try self.read(bool, "forgotten-all") != null or try self.read(bool, try key(self.a, "forgotten-source", source.evidence.source_id)) != null or self.isExpired(source)) {
+                    if (!try self.evidenceRetained(source)) {
                         try self.remove(row.key);
                         try self.put(try key(self.a, "forgotten-evidence", source.evidence.id), true);
                     }

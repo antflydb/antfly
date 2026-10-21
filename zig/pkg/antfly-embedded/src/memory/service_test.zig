@@ -1846,3 +1846,118 @@ test "memory scheduling advances its cursor before execution deadline failures" 
     try std.testing.expectEqual(m.types.Stage.pending, receipt.phase);
     try std.testing.expectEqual(@as(u8, 0), receipt.attempts);
 }
+
+// Admission must share the read/retention gate, even while payloads remain
+// physically present and a bounded scrub has advanced beyond their key range.
+test "memory forgotten evidence rejects new support context and lifecycle writes atomically" {
+    for ([_][]const u8{ "{\"source_ids\":[\"runbook\"]}", "{\"all\":true}" }) |forget_body| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        try setup(&store);
+        try discard(&store, .observe, "",
+            \\{"evidence":[{"id":"safe","source_id":"safe","source_version":"1","text":"Safe evidence"}]}
+        , "safe", 3);
+        try discard(&store, .assertions, "", helm, "old", 4);
+        const original = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try store.service("alice", true, 5).execute(a, .get, "helm", "{}", ""), .{});
+        try discard(&store, .forget, "", forget_body, "forget", 6);
+        const revision = store.revision;
+        const svc = store.service("alice", true, 7);
+        try std.testing.expectError(error.MemoryForgotten, svc.execute(a, .assertions, "", terraform, "primary"));
+        try std.testing.expectError(error.MemoryForgotten, svc.execute(a, .assertions, "",
+            \\{"assertions":[{"id":"alternate","subject":"production","predicate":"deploys_with","value":"Terraform","statement":"Forgotten alternative","evidence":[{"id":"safe"}],"support_sets":[{"evidence":[{"id":"e1"}]}]}]}
+        , "alternate"));
+        try std.testing.expectError(error.MemoryForgotten, svc.execute(a, .observe, "",
+            \\{"evidence":[{"id":"fresh","source_id":"fresh","source_version":"1","text":"Fresh evidence"}],"context_evidence_ids":["e1"]}
+        , "context"));
+        try std.testing.expectError(error.MemoryForgotten, svc.execute(a, .correct, "", try std.json.Stringify.valueAlloc(a, m.types.Correction{ .id = "helm", .expected_revision = original.revision, .lifecycle = .active, .reason = "Revive forgotten payload" }, .{}), "correct"));
+        try std.testing.expectError(error.MemoryForgotten, svc.execute(a, .assertions, "",
+            \\{"assertions":[{"id":"replacement","subject":"production","predicate":"deploys_with","value":"Terraform","statement":"Fresh replacement","valid_from":300,"evidence":[{"id":"safe"}],"supersedes":["helm"]}]}
+        , "supersede"));
+        try std.testing.expectEqual(revision, store.revision);
+        try std.testing.expectEqual(@as(usize, 1), (try Store.scan(&store, a, "assertion/", null, 256)).rows.len);
+        try std.testing.expectEqual(@as(usize, 2), (try Store.scan(&store, a, "evidence/", null, 256)).rows.len);
+        if (std.mem.indexOf(u8, forget_body, "source_ids") != null) {
+            // Source fences do not prohibit unrelated new evidence and claims.
+            _ = try svc.execute(a, .assertions, "",
+                \\{"assertions":[{"id":"unrelated","subject":"other","predicate":"fact","value":"Safe","statement":"Safe fact","evidence":[{"id":"safe"}]}]}
+            , "unrelated");
+        }
+    }
+}
+
+test "memory source scrub cannot leave newly admitted payload behind its cursor" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    try discard(&store, .observe, "",
+        \\{"evidence":[{"id":"safe","source_id":"safe","source_version":"1","text":"Safe"}]}
+    , "safe", 3);
+    var claims: std.ArrayList(m.types.Assertion) = .empty;
+    for (0..80) |i| try claims.append(a, .{ .id = try std.fmt.allocPrint(a, "padding-{d}", .{i}), .subject = "padding", .predicate = "padding", .value = "Safe", .statement = "Safe", .evidence = &.{.{ .id = "safe" }} });
+    try discard(&store, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = claims.items }, .{}), "padding", 4);
+    try discard(&store, .forget, "", "{\"source_ids\":[\"runbook\"]}", "forget", 5);
+    for (0..10) |i| {
+        try discard(&store, .advance, "", "{}", try std.fmt.allocPrint(a, "before-{d}", .{i}), 6);
+        const cleanup = try std.json.parseFromSliceLeaky(struct { cursor: ?[]const u8 = null }, a, store.values.get("cleanup") orelse return error.UnexpectedCleanupComplete, .{});
+        if (cleanup.cursor) |cursor| if (std.mem.startsWith(u8, cursor, "dependency/")) break;
+    }
+    const position = try std.json.parseFromSliceLeaky(struct { cursor: ?[]const u8 = null }, a, store.values.get("cleanup").?, .{});
+    try std.testing.expect(std.mem.startsWith(u8, position.cursor.?, "dependency/"));
+    try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "dependency/work/", null, 256)).rows.len);
+    const revision = store.revision;
+    try std.testing.expectError(error.MemoryForgotten, store.service("alice", true, 7).execute(a, .assertions, "", helm, "late-forgotten-claim"));
+    try std.testing.expectEqual(revision, store.revision);
+    for (0..30) |i| try discard(&store, .advance, "", "{}", try std.fmt.allocPrint(a, "after-{d}", .{i}), 8);
+    try std.testing.expect(store.values.get("cleanup") == null);
+    const rows = try Store.scan(&store, a, "assertion/", null, 256);
+    try std.testing.expectEqual(@as(usize, 80), rows.rows.len);
+    for (rows.rows) |row| {
+        const record = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, row.json, .{});
+        try std.testing.expect(!std.mem.eql(u8, record.assertion.id, "helm"));
+    }
+    try std.testing.expectEqual(@as(usize, 1), (try Store.scan(&store, a, "evidence/", null, 256)).rows.len);
+}
+
+test "memory external producer ownership covers every support branch and ingestion path" {
+    for ([_]m.Action{ .observe, .assertions }) |action| {
+        for ([_]bool{ false, true }) |alternate| {
+            var store = Store.init();
+            defer store.deinit();
+            const a = store.arena.allocator();
+            const config: m.types.Config = .{ .processing = .hybrid, .features = .{ .assertion_distillation = true }, .models = .{ .generator = fake_model } };
+            _ = try modelService(&store, 1).execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+            const sources: []const m.types.Evidence = &.{
+                .{ .id = "external", .source_id = "client", .source_version = "1", .text = "Production uses Helm" },
+                .{ .id = "e1", .source_id = "managed", .source_version = "1", .text = "Production uses Helm", .managed = true },
+            };
+            var operation_id: ?[]const u8 = null;
+            if (action == .assertions) {
+                const accepted = try modelService(&store, 2).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = sources }, .{}), "observe");
+                operation_id = (try std.json.parseFromSliceLeaky(m.types.Operation, a, accepted, .{})).id;
+            }
+            const claim: m.types.Assertion = .{ .id = "client-claim", .subject = "production", .predicate = "deploys_with", .value = "Helm", .statement = "Production uses Helm", .evidence = if (alternate) &.{.{ .id = "external" }} else &.{.{ .id = "e1" }}, .support_sets = if (alternate) &.{.{ .evidence = &.{.{ .id = "e1" }} }} else &.{} };
+            const body = if (action == .observe) try std.json.Stringify.valueAlloc(a, .{ .evidence = sources, .assertions = &.{claim} }, .{}) else try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{claim} }, .{});
+            const revision = store.revision;
+            try std.testing.expectError(error.MemoryProducerConflict, modelService(&store, 3).execute(a, action, "", body, "claim"));
+            try std.testing.expectEqual(revision, store.revision);
+            try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "assertion/", null, 256)).rows.len);
+            if (operation_id) |id| {
+                // The rejected client path does not interfere with the admitted
+                // managed operation, or with independent external assertions.
+                _ = try modelService(&store, 4).execute(a, .advance, id, "{}", "advance");
+                _ = try modelService(&store, 5).execute(a, .get, "managed", "{}", "");
+                var external = claim;
+                external.id = "external-only";
+                external.evidence = &.{.{ .id = "external" }};
+                external.support_sets = &.{};
+                _ = try modelService(&store, 6).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{external} }, .{}), "external-only");
+            } else {
+                try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "evidence/", null, 256)).rows.len);
+                try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "pending/", null, 256)).rows.len);
+                try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "producer/", null, 256)).rows.len);
+            }
+        }
+    }
+}

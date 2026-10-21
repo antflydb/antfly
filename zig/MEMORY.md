@@ -252,6 +252,14 @@ and enqueue descendants. Physical cleanup scrubs affected history and projection
 Retraction, dispute, supersession, and explicit artifact invalidation preserve
 retained audit history. Forgetting and expiry fence every time-qualified read
 immediately, even before retirement reaches deep descendants.
+Evidence admission, reads, support traversal, managed execution and physical cleanup
+use one retention gate covering expiry and global, source and evidence fences.
+New assertions validate every support branch against this gate; observation context
+must pass it as well. Corrections and explicit supersessions require the existing
+assertion to remain retained, so they cannot rewrite forgotten payloads behind an
+in-progress scrub cursor. Rejected admissions publish no evidence, assertions,
+producer ownership, receipts or revision changes. These checks preserve bounded,
+resumable cleanup without restarting its scan for every concurrent ingestion.
 Dependency admission and all read/retention traversals share a maximum of 32
 assertion levels, counting the new root. Every proposed support branch reserves
 that root level while validating its parents, including alternative branches hidden
@@ -670,6 +678,11 @@ These are roles, not four distinct model processes. One admitted model can satis
 - **Hybrid:** accept both, with explicit producer/source ownership and idempotency rules determining which inputs receive managed distillation.
 
 Hybrid mode must identify a producer path per source/event or admitted source class. It must not independently extract the same evidence after a client already supplied its assertions unless an explicit parallel-evaluation policy keeps outputs separate. Source/evidence links allow later reprocessing without duplicate authoritative claims.
+The shared assertion admission path enforces source ownership on primary evidence
+and every alternative support set. Client-produced assertions cannot cite managed
+evidence in any branch, whether submitted with new observations or through the
+assertions endpoint. The managed executor supplies its internal producer context
+to the same validator; a client-supplied producer label cannot select that path.
 
 Codex initially uses external or hybrid mode: its authenticated model client supplies claims, while Antfly handles enabled indexing/entity processing and deliberately migrated reconciliation. Existing Codex settling, forgetting, source-note ownership, and access rules remain explicit compatibility requirements.
 
