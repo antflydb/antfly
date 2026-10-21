@@ -447,6 +447,8 @@ def test_runtime_entity_curation_preserves_future_promotion(
     request, monkeypatch, action, raft
 ):
     """Curation before any destination row exists must retain a usable sink."""
+    import json
+
     from helpers import wait_until
 
     if raft:
@@ -520,8 +522,10 @@ def test_runtime_entity_curation_preserves_future_promotion(
             ids = {hit["_id"] for hit in hits}
             return expected <= ids and "concept/alpha" not in ids
 
-        assert wait_until(promoted, timeout_s=60), api.get(
-            f"/tables/{source}/resolvers/concepts"
+        assert wait_until(promoted, timeout_s=60), (
+            json.dumps(api.get(f"/tables/{source}/resolvers/concepts"), sort_keys=True)
+            + "\n"
+            + api.debug_logs()[-16000:]
         )
     assert (
         "promotion catch-up failed: EntityCurationUnavailable"

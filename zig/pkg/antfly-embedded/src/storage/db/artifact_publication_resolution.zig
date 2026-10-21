@@ -285,7 +285,10 @@ pub fn prepareResolution(alloc: std.mem.Allocator, command: publication.Command,
         if (mutation.value) |raw| {
             var result = resolver_lib.parseResolution(owned, raw) catch return error.InvalidBatchRequest;
             defer result.deinit();
-            if (result.config_generation != command.producer_generation) return error.InvalidBatchRequest;
+            // The producer identity tracks the definition generation. Curation
+            // advances the effective resolution generation without changing that
+            // identity; the catalog digest fences both in this transaction.
+            if (result.config_generation != config.effectiveGeneration()) return error.InvalidBatchRequest;
             for (result.entities) |entity| if (!std.mem.eql(u8, entity.doc_ref.table, config.table)) return error.InvalidBatchRequest;
         }
         changed[i] = try owned.dupe(u8, mutation.key);
@@ -472,6 +475,20 @@ test "ordered resolver preparation binds output to exact source and configured g
     mutation.value = "{\"config_generation\":6,\"entities\":[]}";
     command.publication_digest = command.digest();
     try std.testing.expectError(error.InvalidBatchRequest, prepareResolution(alloc, command, .{ .resolvers = encoded }));
+    // A merge/suppression changes the effective output generation while
+    // preserving the producer definition's generation and receipt identity.
+    var curated_config = config;
+    curated_config.resolution_generation = 9;
+    curated_config.merge_generation = 8;
+    const curated = try catalog.serializeCatalog(alloc, &.{curated_config});
+    defer alloc.free(curated);
+    mutation.value = "{\"config_generation\":9,\"entities\":[]}";
+    command.publication_digest = command.digest();
+    var curated_prepared = try prepareResolution(alloc, command, .{ .resolvers = curated });
+    defer curated_prepared.deinit();
+    mutation.value = "{\"config_generation\":7,\"entities\":[]}";
+    command.publication_digest = command.digest();
+    try std.testing.expectError(error.InvalidBatchRequest, prepareResolution(alloc, command, .{ .resolvers = curated }));
     mutation.value = null;
     command.producer_generation = 8;
     command.publication_digest = command.digest();
