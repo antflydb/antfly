@@ -514,6 +514,7 @@ def free_port() -> int:
 def verify_nested_gateway(binary: Path, root: Path, inner_url: str) -> None:
     """Native operations must survive named remote aliases and chains."""
     config = {
+        "public_inference": {"enabled": True},
         "inference": {
             "api_url": inner_url,
             "api_key": "mock-server-key",
@@ -760,6 +761,7 @@ def main() -> None:
             root = Path(temporary)
             upstream_url = f"http://127.0.0.1:{upstream.server_port}"
             config = {
+                "public_inference": {"enabled": True},
                 "inference": {
                     "api_url": upstream_url,
                     "api_key": "mock-server-key",

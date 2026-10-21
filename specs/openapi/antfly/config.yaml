@@ -292,8 +292,8 @@ components:
           properties:
             enabled:
               type: boolean
-              default: true
-              description: Allow public inference execution, including named targets, direct connection invocation, batches, and sessions. Managed Cloud should set false until explicitly enabled. Discovery remains available and reports this policy.
+              default: false
+              description: Allow public inference execution, including named targets, direct connection invocation, batches, and sessions. Disabled by default for this release; deployments must explicitly opt in. Discovery remains available and reports this policy.
         inference:
           $ref: "../inference/config.yaml#/components/schemas/RuntimeConfig"
         tls:

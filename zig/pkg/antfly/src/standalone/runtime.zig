@@ -9576,7 +9576,10 @@ test "standalone inference middleware reuses public API authentication" {
     var user = try manager.createUser("admin", "admin", &.{});
     defer user.deinit(alloc);
 
+    var public_config = try antfly.common.config.Config.parseFromSlice(alloc, "{\"public_inference\":{\"enabled\":true}}");
+    defer public_config.deinit();
     var api_server = antfly.public_api.http_server.ApiHttpServer.init(alloc, .{
+        .node_config = &public_config,
         .auth_enabled = true,
         .user_manager = &manager,
     }, .{ .ptr = undefined, .vtable = undefined }, null, null);

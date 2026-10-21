@@ -12623,6 +12623,7 @@ test "httpx inference connection uses the configured shared admission owner" {
         \\}
     );
     defer node_config.deinit();
+    node_config.public_inference.enabled = true;
     var api_server = ApiHttpServer.init(alloc, .{
         .inference_max_concurrent_requests = 99,
         .inference_request_admission_source = .{
@@ -12711,9 +12712,12 @@ test "local inference connection admission is owned exactly once by its target" 
     };
 
     const alloc = std.testing.allocator;
+    var public_config = try common_config.Config.parseFromSlice(alloc, "{\"public_inference\":{\"enabled\":true}}");
+    defer public_config.deinit();
     var source = AuthStatusSource{};
     var shared: SharedTarget = .{};
     var api_server = ApiHttpServer.init(alloc, .{
+        .node_config = &public_config,
         .inference_request_admission_source = .{
             .ptr = &shared,
             .try_acquire_fn = SharedTarget.tryAcquire,
@@ -12763,6 +12767,8 @@ test "httpx inference connection requires inference write permission" {
     };
 
     const alloc = std.testing.allocator;
+    var public_config = try common_config.Config.parseFromSlice(alloc, "{\"public_inference\":{\"enabled\":true}}");
+    defer public_config.deinit();
     var auth = try initTestAuthManager(alloc);
     try bindTestAuthManager(alloc, &auth);
     defer auth.manager.deinit();
@@ -12779,6 +12785,7 @@ test "httpx inference connection requires inference write permission" {
     var source = AuthStatusSource{};
     var target = Target{};
     var api_server = ApiHttpServer.init(alloc, .{
+        .node_config = &public_config,
         .auth_enabled = true,
         .user_manager = &auth.manager,
         .local_inference_connection_target = .{
@@ -12850,9 +12857,12 @@ test "httpx inference connection propagates failures after stream commit" {
     };
 
     const alloc = std.testing.allocator;
+    var public_config = try common_config.Config.parseFromSlice(alloc, "{\"public_inference\":{\"enabled\":true}}");
+    defer public_config.deinit();
     var source = AuthStatusSource{};
     var target_context: u8 = 0;
     var api_server = ApiHttpServer.init(alloc, .{
+        .node_config = &public_config,
         .local_inference_connection_target = .{
             .capabilities = inference_connection_abi.Capability.streaming_response,
             .context = &target_context,
@@ -17984,6 +17994,7 @@ test "httpx inference gateway remote-only discovery and explicit qualification" 
         \\{"inference":{"api_url":"http://127.0.0.1:9"},"generators":{"support":{"provider":"openai","model":"backend-model","api_key":"never-expose","url":"https://example.com/v1"}}}
     );
     defer config.deinit();
+    config.public_inference.enabled = true;
     var api_server = ApiHttpServer.init(alloc, .{ .node_config = &config }, source.iface(), null, null);
     defer api_server.deinit();
     var handler = AntflyApiHandler{ .api_server = &api_server };
@@ -18042,6 +18053,7 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
     defer upstream.deinit();
     var config = try common_config.Config.parseFromSlice(alloc, "{}");
     defer config.deinit();
+    config.public_inference.enabled = true;
     config.inference.api_url = try alloc.dupe(u8, upstream.baseUrl());
     config.inference.api_key = try alloc.dupe(u8, "gateway-test-key");
     try config.registry.registerGeneratorConfig("support", .{ .provider = .antfly, .model = "backend", .url = "" });
@@ -18110,6 +18122,7 @@ test "httpx inference gateway streams upstream tool deltas and never synthesizes
     defer upstream.deinit();
     var config = try common_config.Config.parseFromSlice(alloc, "{}");
     defer config.deinit();
+    config.public_inference.enabled = true;
     try config.registry.registerGeneratorConfig("stream", .{ .provider = .openai, .model = "backend", .url = upstream.baseUrl(), .api_key = "test" });
     try config.registry.inference_capabilities.put(alloc, try alloc.dupe(u8, "generators/stream"), .{ .streaming = .supported, .tools = .supported });
     try config.registry.registerChain("stream-chain", &.{ .{ .generator_name = "stream", .condition = .on_error }, .{ .generator_name = "stream" } });
@@ -18209,6 +18222,7 @@ test "httpx inference gateway named local chat leaves admission with the runtime
     const a = std.testing.allocator;
     var config = try common_config.Config.parseFromSlice(a, "{}");
     defer config.deinit();
+    config.public_inference.enabled = true;
     try config.registry.registerGeneratorConfig("local-chat", .{ .provider = .antfly, .model = "backend", .url = "" });
     try config.registry.inference_capabilities.put(a, try a.dupe(u8, "generators/local-chat"), .{ .streaming = .supported });
     var source = AuthStatusSource{};
@@ -18266,6 +18280,7 @@ test "httpx inference gateway authorization covers inventory execution and sessi
     defer alloc.free(authorization);
     var config = try common_config.Config.parseFromSlice(alloc, "{}");
     defer config.deinit();
+    config.public_inference.enabled = true;
     var source = AuthStatusSource{};
     var target = Target{};
     var api_server = ApiHttpServer.init(alloc, .{
@@ -18326,9 +18341,11 @@ test "httpx inference gateway batches buffer in-process targets without a socket
         }
     };
     const alloc = std.testing.allocator;
+    var public_config = try common_config.Config.parseFromSlice(alloc, "{\"public_inference\":{\"enabled\":true}}");
+    defer public_config.deinit();
     var source = AuthStatusSource{};
     var target = Target{};
-    var api_server = ApiHttpServer.init(alloc, .{ .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke } }, source.iface(), null, null);
+    var api_server = ApiHttpServer.init(alloc, .{ .node_config = &public_config, .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke } }, source.iface(), null, null);
     defer api_server.deinit();
     var handler = AntflyApiHandler{ .api_server = &api_server };
     var request = try httpx.Request.init(alloc, .POST, "http://localhost/ai/v1/generate/batch");
@@ -18379,9 +18396,11 @@ test "httpx inference gateway session owner reserves before upstream creation an
         }
     };
     const a = std.testing.allocator;
+    var public_config = try common_config.Config.parseFromSlice(a, "{\"public_inference\":{\"enabled\":true}}");
+    defer public_config.deinit();
     var source = AuthStatusSource{};
     var target = Target{};
-    var server = ApiHttpServer.init(a, .{ .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke } }, source.iface(), null, null);
+    var server = ApiHttpServer.init(a, .{ .node_config = &public_config, .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke } }, source.iface(), null, null);
     defer server.deinit();
     server.inference_sessions.capacity = 0;
     var handler = AntflyApiHandler{ .api_server = &server };
@@ -18453,9 +18472,11 @@ test "httpx inference gateway session stream preserves transport and emits befor
         }
     };
     const a = std.testing.allocator;
+    var public_config = try common_config.Config.parseFromSlice(a, "{\"public_inference\":{\"enabled\":true}}");
+    defer public_config.deinit();
     var state: State = .{};
     var source = AuthStatusSource{};
-    var server = ApiHttpServer.init(a, .{ .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &state, .invoke = State.invoke } }, source.iface(), null, null);
+    var server = ApiHttpServer.init(a, .{ .node_config = &public_config, .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &state, .invoke = State.invoke } }, source.iface(), null, null);
     defer server.deinit();
     const now = @import("antfly_platform").time.monotonicNs();
     try server.inference_sessions.put(a, "public-session", .{ .principal = "anonymous", .connection = common_config.local_inference_connection_id, .backend_id = "backend", .expires_ns = now + std.time.ns_per_hour }, now);
@@ -18489,9 +18510,11 @@ test "httpx inference gateway batch isolates malformed successful responses and 
         }
     };
     const alloc = std.testing.allocator;
+    var public_config = try common_config.Config.parseFromSlice(alloc, "{\"public_inference\":{\"enabled\":true}}");
+    defer public_config.deinit();
     var source = AuthStatusSource{};
     var target = Target{};
-    var api_server = ApiHttpServer.init(alloc, .{ .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke } }, source.iface(), null, null);
+    var api_server = ApiHttpServer.init(alloc, .{ .node_config = &public_config, .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke } }, source.iface(), null, null);
     defer api_server.deinit();
     var handler = AntflyApiHandler{ .api_server = &api_server };
     var request = try httpx.Request.init(alloc, .POST, "http://localhost/ai/v1/generate/batch");
@@ -18533,7 +18556,7 @@ test "resolver curation HTTP destination checks ignore opaque control metadata" 
 
 test "httpx inference gateway deployment disable fences public routes but preserves internal invocation" {
     const a = std.testing.allocator;
-    var config = try common_config.Config.parseFromSlice(a, "{\"public_inference\":{\"enabled\":false}}");
+    var config = try common_config.Config.parseFromSlice(a, "{}");
     defer config.deinit();
     const Target = struct {
         calls: usize = 0,
@@ -18552,6 +18575,10 @@ test "httpx inference gateway deployment disable fences public routes but preser
         .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke },
     }, source.iface(), null, null);
     defer server.deinit();
+    try std.testing.expect(!server.publicInferenceEnabled());
+    server.cfg.node_config = null;
+    try std.testing.expect(!server.publicInferenceEnabled());
+    server.cfg.node_config = &config;
     var handler = AntflyApiHandler{ .api_server = &server };
     // The deployment policy applies even without auth. It precedes request
     // parsing, admission, session allocation, and any physical provider call.

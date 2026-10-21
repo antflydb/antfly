@@ -94,7 +94,7 @@ pub const Config = struct {
     shard_allocation: ShardAllocationConfig = .{},
 
     pub const PublicInferenceConfig = struct {
-        enabled: bool = true,
+        enabled: bool = false,
     };
 
     pub const RequestAdmissionConfig = struct {
@@ -799,9 +799,9 @@ pub const Config = struct {
         };
         if (root.contains("public_inference")) try validateObjectMemberFields(root, "public_inference", &.{"enabled"});
         const public_inference_enabled = if (root.get("public_inference")) |policy|
-            try optionalBoolField(policy.object, "enabled") orelse true
+            try optionalBoolField(policy.object, "enabled") orelse false
         else
-            true;
+            false;
         var canonical_inference_max_concurrent_requests: ?u32 = null;
         if (root.get("admission")) |admission_value| {
             try validateObjectMemberFields(root, "admission", &.{ "query", "write", "inference" });
@@ -4031,16 +4031,16 @@ test "external lake cursor retention and capacity policy reject unbounded admiss
     }) |bytes| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, bytes));
 }
 
-test "provider registry gateway public inference policy defaults on and validates explicit disable" {
+test "provider registry gateway public inference policy defaults off and requires explicit opt-in" {
     const a = std.testing.allocator;
-    for ([_][]const u8{ "{}", "{\"public_inference\":{}}", "{\"public_inference\":{\"enabled\":true}}" }) |body| {
+    for ([_][]const u8{ "{}", "{\"public_inference\":{}}", "{\"public_inference\":{\"enabled\":false}}" }) |body| {
         var config = try Config.parseFromSlice(a, body);
         defer config.deinit();
-        try std.testing.expect(config.public_inference.enabled);
+        try std.testing.expect(!config.public_inference.enabled);
     }
-    var config = try Config.parseFromSlice(a, "{\"public_inference\":{\"enabled\":false}}");
+    var config = try Config.parseFromSlice(a, "{\"public_inference\":{\"enabled\":true}}");
     defer config.deinit();
-    try std.testing.expect(!config.public_inference.enabled);
+    try std.testing.expect(config.public_inference.enabled);
     for ([_][]const u8{
         "{\"public_inference\":false}",
         "{\"public_inference\":{\"enabled\":\"false\"}}",

@@ -14,6 +14,8 @@ resolve within the endpoint's task namespace. A collision with a raw local model
 returns an ambiguity error. Existing raw model IDs remain valid.
 
 ```yaml
+public_inference:
+  enabled: true
 inference:
   api_url: http://inference.internal:8080
   api_key: '${secret:inference.api_key}'
@@ -284,14 +286,16 @@ endpoint/session handling.
 
 ### Public execution policy
 
-Managed Cloud deployments should provision `public_inference.enabled: false` until the tenant explicitly enables public inference. Self-hosted deployments retain the default of `true`:
+Public inference on database API nodes is **disabled by default for this release**, in both managed Cloud and self-hosted deployments. Enable it explicitly to use the public gateway, direct connection invocation, or public inference routes:
 
 ```yaml
 public_inference:
-  enabled: false
+  enabled: true
 ```
 
-The server rejects public named execution, batches, every session operation (including GET event streams), and direct connection invocation with HTTP 403. The linked local inference API also denies public writes. Administrator credentials do not bypass deployment policy. Existing inference RBAC and admission limits still apply when enabled.
+**Upgrade migration:** deployments already using public inference or direct connection invocation must add the setting above before upgrading. Existing provider configurations and credentials alone do not enable public access. Internal indexing and query inference do not require opting in.
+
+When disabled, the server rejects public named execution, batches, every session operation (including GET event streams), and direct connection invocation with HTTP 403. The linked local inference API also denies public writes. Administrator credentials do not bypass deployment policy. Existing inference RBAC and admission limits still apply when enabled.
 
 Gateway model discovery remains authorized by `inference:read`, returns `public_inference_enabled: false` with an empty catalog, and avoids upstream probing while disabled. Antfarm displays an enablement message. Internal provider calls used by indexing, extraction, and SQL/query execution remain available; this is independent of inference admission and provider configuration.
 

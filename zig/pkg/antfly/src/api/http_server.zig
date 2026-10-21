@@ -8018,7 +8018,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn publicInferenceEnabled(self: *const ApiHttpServer) bool {
-        return if (self.cfg.node_config) |config| config.public_inference.enabled else true;
+        return if (self.cfg.node_config) |config| config.public_inference.enabled else false;
     }
 
     pub fn authorizeInferenceRequest(
@@ -27995,8 +27995,11 @@ test "internal service credentials cannot authorize public inference routes" {
         }
     };
     const alloc = std.testing.allocator;
+    var public_config = try common_config.Config.parseFromSlice(alloc, "{\"public_inference\":{\"enabled\":true}}");
+    defer public_config.deinit();
     const secret = "inference-audience-test-secret";
     var server = ApiHttpServer.init(alloc, .{
+        .node_config = &public_config,
         .trusted_principal_secret = secret,
         .trusted_principal_issuer = "cluster-a",
     }, FakeSource.iface(), null, null);
