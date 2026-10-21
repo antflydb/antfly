@@ -34247,6 +34247,10 @@ components:
         model:
           type: string
           description: Configured provider model when applicable.
+        model_identity:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+          description: Pinned immutable embedding asset and recipe identity.
         models:
           type: array
           items:

@@ -9246,16 +9246,16 @@ pub const AntflyApiHandler = struct {
         return self.proposeCuration(ctx, table_name);
     }
 
-    pub fn listCurationProposals(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, params: anytype) !httpx.Response {
-        // The shared resolver path parses the original query, including pages.
-        _ = params;
+    pub fn listCurationProposals(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, _: metadata_server_openapi.server.ListCurationProposalsParams) !httpx.Response {
+        // The shared resolver adapter validates and forwards the raw query for
+        // both public routes, including proposal filters and pagination.
         return self.resolverRequest(ctx, .proposals, table_name, "", "");
     }
 
-    pub fn namespaceListCurationProposals(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, params: anytype) !httpx.Response {
+    pub fn namespaceListCurationProposals(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, _: metadata_server_openapi.server.NamespaceListCurationProposalsParams) !httpx.Response {
         _ = database_name;
         _ = namespace_name;
-        return self.listCurationProposals(ctx, table_name, params);
+        return self.resolverRequest(ctx, .proposals, table_name, "", "");
     }
 
     pub fn getCurationProposal(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, proposal_id: []const u8) !httpx.Response {
