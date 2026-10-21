@@ -21306,3 +21306,32 @@ required PREPARE negotiation and original broader scheduling/default-policy
 scope remain incomplete. Strong provider defaults stay off. External HA-cluster,
 public source consumer and full provider/storage archive qualification were not
 rerun here. Full Linux qualification remains waived.
+
+
+### Detached mutation bytes before prepared resolution publication
+
+Prepared committed resolution now captures the complete assembled explicit
+writes, deletes and replay bytes into one owned allocation before acquiring the
+local backend writer. The checked allocation bound includes descriptor alignment;
+copying polls the original control in bounded chunks and unwinds on failure.
+Order, duplicate writes and binary keys are preserved. Ordinary transaction
+resolution retains its existing path.
+
+Accepted DB resolution charges this allocation and manager scratch to the
+existing relational preparation working-set budget. Quota refusal leaves the
+transaction pending, its frame present and its document unpublished; both
+refusal and successful publication release their preparation budget.
+
+`owned-mutation-batch-v2.json` records 129 passing executions and 88/88 build
+steps, with zero skips, failures or leaks. New cases cover input mutation/free
+independence, an unaligned exactly bounded allocator, allocation/checkpoint
+cleanup, quota refusal and funded publication. No ABI, reader or durable format
+changes are introduced.
+
+This owner is created before the local writer, not before the global vote. It
+does not own catalog/schema/route/read witnesses or native commit participants,
+and is not an executable recovery bundle. Moving full preparation before the
+vote, separate derived-log funding, minimum recovery resources, normal required
+PREPARE negotiation and broader scheduler/default-policy work remain incomplete.
+Strong provider defaults stay off. Public consumer/provider archive and external
+HA qualification were not rerun; full Linux qualification remains waived.

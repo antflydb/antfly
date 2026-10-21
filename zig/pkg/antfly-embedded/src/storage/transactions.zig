@@ -1519,7 +1519,7 @@ pub const TxnManager = struct {
         try deletes.appendSlice(self.alloc, indexed_deletes.items);
 
         const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-        try self.applyResolutionResourceBatch(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null, control, .{ .id = txn_id, .status = status });
+        try self.applyResolutionResourceBatch(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null, control, .{ .id = txn_id, .status = status, .prepared = consumed != null });
 
         if (self.trace_writer) |tw| {
             tw.traceEvent(&.{
@@ -3518,8 +3518,26 @@ pub const TxnManager = struct {
         return self.applyResolutionResourceBatch(writes, deletes, replay, reservation, participant, control, null);
     }
 
-    fn applyResolutionResourceBatch(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant, control: ?read_control.Port, transition: ?struct { id: TxnId, status: TxnStatus }) !void {
+    fn applyResolutionResourceBatch(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant, control: ?read_control.Port, transition: ?struct { id: TxnId, status: TxnStatus, prepared: bool = false }) !void {
         if (control) |owner| try owner.checkpoint();
+        const mutation_batch = @import("transaction_batch_admission.zig");
+        // Prepared data is detached before acquiring the writer. Its byte owner
+        // can eventually move before the global decision without borrowing any
+        // temporary extraction, stack timestamp or encoded-replay buffers.
+        var owned: ?mutation_batch.OwnedBatch = if (transition) |decision|
+            if (decision.status == .committed and decision.prepared)
+                try mutation_batch.OwnedBatch.capture(self.alloc, writes, deletes, if (replay) |entry| .{ .sequence = entry.sequence, .payload = entry.payload } else null, control)
+            else
+                null
+        else
+            null;
+        defer if (owned) |*plan| plan.deinit();
+        const physical_writes = if (owned) |plan| plan.writes else writes;
+        const physical_deletes = if (owned) |plan| plan.deletes else deletes;
+        const physical_replay: ?ReplayAppend = if (owned) |plan|
+            if (plan.replay) |entry| .{ .sequence = entry.sequence, .payload = entry.payload } else null
+        else
+            replay;
         var batch = if (control) |owner| try self.store.beginBatchWithAdmission(owner) else try self.store.beginBatch();
         errdefer batch.abort();
         if (transition) |decision| {
@@ -3543,8 +3561,8 @@ pub const TxnManager = struct {
                     // Preserve an exact HA obligation even when a synchronous
                     // publisher is temporarily absent. Outbox deletion is its
                     // separate acknowledgement; local replay consumption is not.
-                    const entry = replay orelse return error.PreparedEffectsRequired;
-                    var physical_plan = try @import("prepared_replay_plan.zig").deriveFromMutations(self.alloc, writes, deletes, entry.payload, control);
+                    const entry = physical_replay orelse return error.PreparedEffectsRequired;
+                    var physical_plan = try @import("prepared_replay_plan.zig").deriveFromMutations(self.alloc, physical_writes, physical_deletes, entry.payload, control);
                     defer physical_plan.deinit();
                     try @import("prepared_replay_credit.zig").validateMutationPlan(&batch, decision.id, physical_plan, control);
                     const key = makeTransactionReplicationReplayOutboxKey(decision.id);
@@ -3555,7 +3573,7 @@ pub const TxnManager = struct {
         }
         if (participant) |observer| try batch.setCommitParticipant(observer);
         if (reservation) |change| try retained_effects.replaceReservation(&batch, change.previous, change.next);
-        try @import("transaction_batch_admission.zig").apply(&batch, writes, deletes, replay, control);
+        try mutation_batch.apply(&batch, physical_writes, physical_deletes, physical_replay, control);
     }
 
     fn traceResolveDecisionConflict(self: *TxnManager, txn_id: TxnId, previous: TxnStatus, requested: TxnStatus, timestamp: u64) void {

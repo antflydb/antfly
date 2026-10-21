@@ -145101,3 +145101,55 @@ test "db prepared transaction effects required funded replay commit retains HA d
     defer a.free(row);
     try std.testing.expectEqualStrings("{\"body\":\"newer\"}", row);
 }
+
+test "db prepared transaction effects required detached mutation quota refuses before writer publication" {
+    const a = std.testing.allocator;
+    for ([_]u64{ 4096, 256 * 1024 }) |limit| {
+        var resource_options = resource_manager_mod.Options{ .identity_allocator = a };
+        resource_options.budgets[@backingInt(resource_manager_mod.Slice.relational_preparation_working_set)] = .{ .hard_limit_bytes = limit };
+        var resources = resource_manager_mod.ResourceManager.init(resource_options);
+        defer resources.deinit(a);
+        var directory = try TestDirectory.init("owned-prepared-mutation-quota");
+        defer directory.cleanup();
+        var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .resource_manager = &resources });
+        defer db.close();
+        const id: types.TxnId = @splat(0xf6);
+        var manager = try db.core.initTxnManager();
+        defer manager.deinit();
+        try manager.initTransactionRequiringPreparedEffects(id, 1, 1, &.{}, false, false, .{ .mode = .deferred }, .{}, null);
+        try manager.writeIntents(id, &.{.{ .key = "row", .value = "{}" }}, &.{});
+        const catalog = try db.core.preparedEffectsCatalogDigest(null);
+        const contract = try manager.preparedEffectsContract(id, catalog, .deferred, null);
+        const frame = try @import("prepared_transaction_effects.zig").encode(a, .{ .contract = contract, .effects = .{} }, null);
+        defer a.free(frame);
+        try manager.sealPreparedEffects(id, frame, catalog, .deferred, null);
+        var accepted = (try manager.loadPreparedEffects(a, id, null)).?;
+        defer accepted.deinit();
+        const physical = try internal_keys.documentKeyAlloc(a, "row");
+        defer a.free(physical);
+        const body: [16384]u8 = @splat('x');
+        const value = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\"}}", .{body});
+        defer a.free(value);
+        const payload = try change_journal_mod.encodeRecord(a, .{ .sequence = 1, .changed_doc_keys = &.{"row"} });
+        defer a.free(payload);
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        const outcome = db.core.resolveTransactionIntentsWithAcceptedEffects(id, .committed, 2, .{
+            .writes = &.{.{ .key = physical, .value = value }},
+            .skip_all_intent_application = true,
+            .replay = .{ .sequence = 1, .payload = payload },
+        }, &accepted, null);
+        if (limit == 4096) {
+            try std.testing.expectError(error.ResourceBudgetExceeded, outcome);
+            try std.testing.expect(try manager.hasPreparedEffects(id));
+            try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try manager.getTransactionStatus(id));
+            try std.testing.expectError(error.NotFound, db.core.store.get(a, physical));
+        } else {
+            try std.testing.expect((try outcome).applied);
+            const actual = try db.core.store.get(a, physical);
+            defer a.free(actual);
+            try std.testing.expectEqualSlices(u8, value, actual);
+        }
+        try std.testing.expectEqual(@as(u64, 0), resources.sliceStats(.relational_preparation_working_set).used_bytes);
+    }
+}

@@ -2476,8 +2476,28 @@ pub const DBCore = struct {
         defer manager.deinit();
         if (accepted) |plan| {
             if (status != .committed) return error.PreparedEffectsMismatch;
-            if (!std.mem.eql(u8, &plan.decoded.plan.contract.catalog_digest, &try self.preparedEffectsCatalogDigest(control))) return error.PreparedGenerationChanged;
-            return try manager.resolvePreparedIntents(txn_id, commit_version, plan, extra_batch, control);
+            var trace: transactions_mod.MutationAdmissionTrace = .{};
+            const original = trace.bind(control);
+            const catalog = self.preparedEffectsCatalogDigest(original) catch |err| return trace.failure orelse err;
+            if (trace.failure) |cause| return cause;
+            if (!std.mem.eql(u8, &plan.decoded.plan.contract.catalog_digest, &catalog)) return error.PreparedGenerationChanged;
+            var budget: ?resource_manager_mod.BudgetedAllocator = if (self.index_manager.resource_manager) |resources|
+                resource_manager_mod.BudgetedAllocator.init(resources, .relational_preparation_working_set, self.alloc, 1)
+            else
+                null;
+            defer if (budget) |*owner| {
+                std.debug.assert(owner.live_bytes == 0);
+                owner.deinit();
+            };
+            if (budget) |*owner| manager.alloc = owner.allocator();
+            defer manager.alloc = self.alloc;
+            const outcome = manager.resolvePreparedIntents(txn_id, commit_version, plan, extra_batch, original) catch |err| {
+                if (trace.failure) |cause| return cause;
+                if (err == error.OutOfMemory) if (budget) |*owner| if (owner.denied()) return error.ResourceBudgetExceeded;
+                return err;
+            };
+            if (trace.failure) |cause| return cause;
+            return outcome;
         }
         return try manager.resolveIntentsWithExtraBatch(txn_id, status, commit_version, extra_batch);
     }
