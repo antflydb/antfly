@@ -2141,8 +2141,29 @@ pub const SegmentMembership = union(enum) {
     borrowed: roaring.BorrowedBitmap,
 
     pub fn execute(a: Allocator, filter: Filter, seg: *const index_mod.SegmentEntry, offset: u32) !SegmentMembership {
-        if (filter == .doc_num) if (filter.doc_num.producer) |producer| {
-            if (filter.doc_num.bitmap != null or filter.doc_num.doc_nums.len != 0) return error.InvalidArgument;
+        var effective = filter;
+        // Lowering may wrap a single leaf in required match-all clauses.
+        // Preserve controls while peeling only proven identity operations.
+        for (0..32) |_| {
+            if (effective != .bool_filter) break;
+            const boolean = effective.bool_filter;
+            try boolean.control.check();
+            if (boolean.should.len != 0 or boolean.must_not.len != 0) break;
+            var child: ?Filter = null;
+            var multiple = false;
+            for (boolean.must) |required| {
+                if (required == .match_all) continue;
+                if (child != null) {
+                    multiple = true;
+                    break;
+                }
+                child = required;
+            }
+            if (multiple or child == null) break;
+            effective = child.?;
+        }
+        if (effective == .doc_num) if (effective.doc_num.producer) |producer| {
+            if (effective.doc_num.bitmap != null or effective.doc_num.doc_nums.len != 0) return error.InvalidArgument;
             if (producer.borrow) |borrow| if (try borrow(producer.ptr, offset, seg.reader.doc_count)) |pin| return .{ .borrowed = pin };
         };
         return .{ .owned = try filter.executeWithOffset(a, seg, offset) };

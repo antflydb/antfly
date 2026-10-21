@@ -750,3 +750,61 @@ constants, the input, or its complement and reuse the publication-time
 cardinality, with compressed deletion intersections when needed. General nested
 negations retain sparse word execution. Regressions cover the maximum u32
 document domain, clipped final words and deletion IDs outside the domain.
+
+### Spill and page ownership follow-up
+
+Postings spill uses the configured fixed target for non-default targets. The
+native default retains an 8 MiB trigger on nodes whose full-text/aggregate hard
+limit is at most 128 MiB. Larger envelopes may grow the trigger to at most
+64 MiB, using one quarter of current pending bytes plus advisory admission
+headroom. Allocations still use the resource manager; this estimate grants no
+memory and concurrent pressure can cause normal admission refusal. When spilling
+is required, the queued fields are ordered by retained size and the largest
+fields spill until pending payload falls below half the target. Small companion
+fields remain queued. A spill never splits a repeated physical field's document
+posting. The private run's lazy 512 KiB, four-way page cache accommodates sixteen
+interleaved dictionary/postings cursors with constant lookup work. Compaction and
+in-place patches invalidate cached physical pages.
+
+Read-only result consumers use `SegmentMembership`: either an independently
+owned bitmap or a complete immutable producer lease. Mutating filter APIs retain
+their ownership contract. Constant-score collection counts a leased segment and
+seeks only the requested prefix; ranked producer gates retain include/exclude
+pins for one segment. Native sorted candidates retain a directory of local
+memberships and captured tombstone masks, with global containment and iteration
+without rebasing into a copied corpus bitmap. Each failure path releases pins,
+captured masks and initialized directory entries. General Boolean/scoring shapes
+continue to use owned execution when no complete borrowed view is available.
+A single exact doc-number query has a constant score; native page selection can
+recover that score without evaluating the producer a second time.
+
+Source windows already hold their segment lease. Identity reads use that leased
+reader directly, instead of resolving and leasing the same segment per row.
+`ANTFLY_BENCH_LOGICAL_SOURCE_PHASES=1` enables diagnostic source-phase probes:
+key lookup, provider work, revision lookup, directory reads/planning, selected
+ranges, reconstruction and full-body fallback. They log aggregate timings and
+membership borrow/copy counts without document identifiers, bytes or capabilities.
+Instrumented trials remain separate from normal latency qualification. Public
+query semantics, verification controls and freshness options are unchanged.
+
+### Remaining source-certificate ownership
+
+Reuse across writes still requires implementation of the segment/source binding
+certificates described above. A maintained implementation must register complete
+source identities at a publication fence, invalidate affected registrations from
+both transaction and batch source-mutation paths (including unindexed updates),
+and capture immutable certificates with the retained cut. The existing
+`document_mutation_revision` staging boundary is a candidate for mutation
+notification; global `query_generation_revision` remains the conservative fence.
+Registration from an old retained cut cannot attest current source state unless
+the live owner revalidates the captured source revision under the same fences.
+
+Certificate ownership must have bounded admission, owner-lifetime nonces and
+explicit retirement. Exhausted registration capacity, excessive invalidation
+fan-out, missing source coverage, repair, schema changes and unsupported storage
+modes fall back to the whole-generation proof. Restart and compaction cannot
+inherit a certificate merely because segment IDs or analyzed terms match.
+Validation needs concurrent unindexed updates, registration/publication races,
+failed and ambiguous commits, deletion/recreation, repair, compaction, restart,
+expiry and allocation-failure cases. This follow-up does not advertise that
+cross-write reuse is implemented or that complete requests have zero cost.
