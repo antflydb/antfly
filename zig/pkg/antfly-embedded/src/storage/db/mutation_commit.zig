@@ -308,6 +308,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             if (!opts.bypass_replication_write_gate) try self.enforceReplicationWriteGate();
             if (!opts.bypass_replication_write_gate) try preflightReplicationBatchSyncCommitWithAdmission(self, initial_controls, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
+            const prepared_catalog_revision = S.ownerField(self, "core").*.store.resolver_catalog_revision.read();
             const total_start_ns = monotonicTimeNs();
             var schedule_replication_recovery_on_exit = false;
             defer {
@@ -1317,7 +1318,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (opts.transaction_resolution == null) {
                 try S.ownerField(self, "core").*.checkOrdinaryWriteConflicts(effective_ops.writes, effective_ops.deletes);
             }
-            try self.validateTransformReadSnapshot(transform_snapshot);
+            try self.validateTransformReadSnapshotWithAdmission(transform_snapshot, publication_control);
             // Catches a concurrent commit to one of this batch's own write keys
             // between the pre-lock precompute read and this lock acquisition --
             // the race the catalog-generation check above cannot see, since it
@@ -3140,6 +3141,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 publication_control,
             ) else null;
             defer if (prepared_physical) |*plan| plan.deinit();
+            if (prepared_physical) |*plan| try plan.retainDependencies(preparation_alloc, S.ownerField(self, "core").*, .{
+                .schema_namespace = schema_namespace,
+                .catalog_revision = prepared_catalog_revision orelse return error.PreparedGenerationChanged,
+                .schema_view = if (apply_schema_view) |view| view else request_schema_view,
+                .require_current_schema = request_schema_binding == null,
+                .write_plan = write_plan_snapshot,
+                .relational_indexes = relational_index_snapshot,
+                .policy_lease = opts.row_policy_lease,
+                .generated_reads = generated_precompute_snapshot.entries,
+                .transform_reads = transform_snapshot.entries,
+            }, publication_control);
             const commit_writes = if (prepared_physical) |plan| plan.bytes.writes else store_writes.items;
             const commit_deletes = if (prepared_physical) |plan| plan.bytes.deletes else delete_keys.items;
             const commit_replay: ?docstore_mod.DocStore.ReplayAppend = if (prepared_physical) |plan|
@@ -3169,6 +3181,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // boundary, after all fallible precommit funding is complete.
             if (publication_control) |control| try control.checkpoint();
             if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+            if (prepared_physical) |*plan| try plan.validateDependencies(S.ownerField(self, "core").*, publication_control);
             const transaction_applied = if (opts.transaction_resolution) |resolution| blk: {
                 const outcome = try S.ownerField(self, "core").*.resolveTransactionIntentsWithAcceptedEffects(
                     resolution.txn_id,

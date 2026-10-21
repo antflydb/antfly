@@ -266,6 +266,7 @@ pub const storage_db_apply_receipts = @import("storage/db/apply_receipts.zig");
 pub const storage_db_apply_rw_lock = @import("storage/db/apply_rw_lock.zig");
 pub const storage_db_artifact_activation_boundary = @import("storage/db/artifact_activation_boundary.zig");
 pub const storage_db_artifact_asset_publication = @import("storage/db/artifact_asset_publication.zig");
+pub const storage_db_prepared_mutation_dependencies = @import("storage/db/prepared_mutation_dependencies.zig");
 pub const storage_db_artifact_authored_acceptance = @import("storage/db/artifact_authored_acceptance.zig");
 pub const storage_db_artifact_catalog_view = @import("storage/db/artifact_catalog_view.zig");
 pub const storage_db_artifact_chunk_cursor = @import("storage/db/artifact_chunk_cursor.zig");

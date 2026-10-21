@@ -148,7 +148,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub const GeneratedWriteReadSnapshot = struct {
             pub const revisions = @import("../document_mutation_revision.zig");
-            pub const Entry = struct { key: revisions.Key, revision: u64 };
+            pub const Entry = @import("prepared_mutation_dependencies.zig").GeneratedRead;
             entries: []Entry = &.{},
             pub fn deinit(self: *@This(), alloc: Allocator) void {
                 alloc.free(self.entries);
@@ -167,11 +167,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         };
 
         pub const TransformReadSnapshot = struct {
-            pub const Entry = struct {
-                key: []const u8,
-                value: ?[]u8,
-                expected_version: u64,
-            };
+            pub const Entry = @import("prepared_mutation_dependencies.zig").TransformRead;
 
             entries: []Entry = &.{},
             positions: std.StringHashMapUnmanaged(usize) = .empty,
@@ -252,7 +248,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             if (keys.items.len == 0) return result;
 
-            // Read values and version timestamps from the same MVCC snapshot. This
+            // Read values, version timestamps and mutation revisions from one MVCC snapshot. This
             // replaces two point transactions per transform and allows transform
             // parsing/expansion to proceed without holding the DB-wide apply lock.
             var read_txn = try S.ownerField(self, "core").*.store.beginReadTxn();
@@ -330,6 +326,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .key = key,
                     .value = value,
                     .expected_version = expected_version,
+                    .revision = if (@import("../document_mutation_revision.zig").keyForPhysical(store_key)) |revision_key|
+                        .{ .key = revision_key, .revision = try @import("../document_mutation_revision.zig").load(&read_txn, revision_key) }
+                    else
+                        null,
                 };
                 initialized += 1;
                 result.positions.putAssumeCapacity(key, index);
@@ -768,17 +768,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn validateTransformReadSnapshot(self: anytype, read_snapshot: TransformReadSnapshot) !void {
-            if (read_snapshot.entries.len == 0) return;
-            const predicates = try S.ownerField(self, "alloc").*.alloc(transactions_mod.VersionPredicate, read_snapshot.entries.len);
-            defer S.ownerField(self, "alloc").*.free(predicates);
-            for (read_snapshot.entries, predicates) |entry, *predicate| predicate.* = .{
-                .key = entry.key,
-                .expected_version = entry.expected_version,
-            };
-            S.ownerField(self, "core").*.checkVersionPredicates(predicates, null) catch |err| switch (err) {
-                error.VersionConflict => return error.PreparedReadSetChanged,
-                else => return err,
-            };
+            return validateTransformReadSnapshotWithAdmission(self, read_snapshot, null);
+        }
+
+        pub fn validateTransformReadSnapshotWithAdmission(self: anytype, read_snapshot: TransformReadSnapshot, original: ?@import("../../common/read_admission.zig").Port) !void {
+            return @import("prepared_mutation_dependencies.zig").validateExplicitReads(S.ownerField(self, "core").*, &.{}, read_snapshot.entries, original);
         }
 
         pub fn attachPreparedUpsertDocumentProjections(

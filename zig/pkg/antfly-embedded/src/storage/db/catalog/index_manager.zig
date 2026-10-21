@@ -6487,6 +6487,11 @@ pub const IndexManager = struct {
     pub const WritePlanSnapshotView = struct {
         epoch: *WritePlanSnapshotEpoch,
 
+        pub fn clone(self: @This()) @This() {
+            self.epoch.retain();
+            return self;
+        }
+
         pub fn plan(self: @This()) *const WritePlanSnapshot {
             return &self.epoch.value;
         }

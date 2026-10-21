@@ -1090,3 +1090,54 @@ Strong defaults remain off. No ABI/reader/durable format changes are introduced
 here; main's integrated floors remain preparation 12, replay retention 13 and
 remote-initialization topology 38. Public consumer/provider/storage archive and
 external HA qualification were not rerun; full Linux qualification remains waived.
+
+
+### Retained preparation dependencies and transform ABA protection
+
+The physical mutation owner now retains the schema view actually used by
+preparation, existing extraction-plan and relational-index views, and a clone of
+the original policy admission with unchanged expiry. It owns generated revision
+entries, transform keys/timestamps/revisions and route boundary bytes. It records
+core/store identity, root and schema namespace generations, identity namespace,
+portable-import revision, the resolver catalog revision observed before
+preparation, and extraction-plan generation. Validation runs under the caller's
+apply/publication fence at capture and immediately before local publication.
+Historical admitted schemas remain usable without becoming active again.
+
+Immutable metadata is shared through retained references. Incoming witness keys
+and arrays use the existing preparation allocator. Assembly which used no
+immutable extraction snapshot records its generation without constructing a
+whole catalog snapshot under the apply lock. The dependencies retire with the
+physical/native owner after local commit, before remote or visibility waits;
+all error paths release their references, leases and allocations.
+
+Transform input capture now reads the document mutation revision from the same
+MVCC snapshot as input JSON and timestamp. Ordinary and retained-plan validation
+use the shared admitted read validator. This rejects delete/reinsert ABA even
+when timestamp predicates still match, including absent-to-present-to-absent
+changes. The revision probe retires before timestamp checks; validation no
+longer constructs a predicate descriptor array proportional to the entire
+transform batch. Original rejection identities remain intact.
+
+Five new DB cases cover reference counts and policy expiry, current versus
+historical schema lifetime, input retirement and generated ABA, root/catalog/
+import/range invalidation, snapshot-free generation checks, every ownership
+allocation and original NotFound/OutOfMemory/deadline rejection, present/absent
+transform ABA, and a concurrent default write transform. That concurrent test
+parks an increment derived from count 1, deletes/reinserts count 100 at the same
+timestamp, and verifies bounded retry publishes 101. Existing native authored
+acceptance, transaction resolution and reopen cases also pass.
+`owned-preparation-dependencies-v8.json` and its log record 82 executions and
+70/70 build steps, zero skips, failures or leaks.
+
+These are retained existing semantic inputs and explicit read witnesses, not a
+complete read certificate or durable route/read conflict authority. The catalog
+revision covers same-store catalog writes; it is not a clock for all group or
+backend metadata. General group/backend read coverage, live DB/execution-owner
+lifetime, complete predecision capture, minimum executable recovery resources,
+separate derived-log quota, migration eligibility, normal required PREPARE
+negotiation and broader scheduler/default/session scope remain incomplete.
+The caller must keep the DB/gate/allocator alive. Strong defaults remain off.
+No ABI/RPC/durable format changes are introduced here. Public consumer/provider/
+storage archive and external HA qualification were not rerun; full Linux
+qualification remains waived.

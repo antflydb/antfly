@@ -312,6 +312,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const validateResolvedKeyOwnership = commit.validateResolvedKeyOwnership;
         pub const validateRestoreStagingReplicationEffects = commit.validateRestoreStagingReplicationEffects;
         pub const validateTransformReadSnapshot = preparation.validateTransformReadSnapshot;
+        pub const validateTransformReadSnapshotWithAdmission = preparation.validateTransformReadSnapshotWithAdmission;
         pub const waitForResolvedTransactionSync = commit.waitForResolvedTransactionSync;
         pub const accountDenseCoverage = materialization.accountDenseCoverage;
         pub const accountSparseCoverage = materialization.accountSparseCoverage;
@@ -873,6 +874,7 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const validateResolvedKeyOwnership = Implementation.validateResolvedKeyOwnership;
             pub const validateRestoreStagingReplicationEffects = Implementation.validateRestoreStagingReplicationEffects;
             pub const validateTransformReadSnapshot = Implementation.validateTransformReadSnapshot;
+            pub const validateTransformReadSnapshotWithAdmission = Implementation.validateTransformReadSnapshotWithAdmission;
             pub const waitForResolvedTransactionSync = Implementation.waitForResolvedTransactionSync;
             pub const drainDocumentArtifactChildRangeOutboxWithRoot = Implementation.drainDocumentArtifactChildRangeOutboxWithRoot;
             pub const ensureDurableReplicationStartupBarrierWithAdmission = Implementation.ensureDurableReplicationStartupBarrierWithAdmission;
@@ -1062,6 +1064,7 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const validateResolvedKeyOwnership = Implementation.validateResolvedKeyOwnership;
             pub const validateRestoreStagingReplicationEffects = Implementation.validateRestoreStagingReplicationEffects;
             pub const validateTransformReadSnapshot = Implementation.validateTransformReadSnapshot;
+            pub const validateTransformReadSnapshotWithAdmission = Implementation.validateTransformReadSnapshotWithAdmission;
             pub const waitForResolvedTransactionSync = Implementation.waitForResolvedTransactionSync;
 
             // Recovery leaves resident retry scheduling to the serving owner.

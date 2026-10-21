@@ -9818,6 +9818,7 @@ pub const DB = struct {
     pub const validateGeneratedWriteReadSnapshot = local_mutation.validateGeneratedWriteReadSnapshot;
 
     pub const validateTransformReadSnapshot = local_mutation.validateTransformReadSnapshot;
+    pub const validateTransformReadSnapshotWithAdmission = local_mutation.validateTransformReadSnapshotWithAdmission;
 
     pub const deinitOwnedGraphEdgeWrite = local_mutation.deinitOwnedGraphEdgeWrite;
 
@@ -145152,4 +145153,296 @@ test "db prepared transaction effects required detached mutation quota refuses b
         }
         try std.testing.expectEqual(@as(u64, 0), resources.sliceStats(.relational_preparation_working_set).used_bytes);
     }
+}
+
+const PreparedDependencyTest = struct {
+    const deps = @import("prepared_mutation_dependencies.zig");
+    fn source(db: *DB, lease: ?*const row_policy_gate_mod.Gate.Lease, generated: []const deps.GeneratedRead, transforms: []const deps.TransformRead) !deps.Sources {
+        var view = db.core.acquireSchemaView();
+        errdefer if (view) |*owned| owned.release();
+        var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+        errdefer plan.release();
+        return .{
+            .schema_namespace = db.core.schemaNamespaceGeneration(),
+            .catalog_revision = db.core.store.resolver_catalog_revision.read() orelse return error.PreparedGenerationChanged,
+            .schema_view = view,
+            .require_current_schema = true,
+            .write_plan = plan,
+            .relational_indexes = db.core.relational_indexes.acquire(),
+            .policy_lease = lease,
+            .generated_reads = generated,
+            .transform_reads = transforms,
+        };
+    }
+    fn release(source_views: *deps.Sources) void {
+        if (source_views.relational_indexes) |*view| view.deinit();
+        if (source_views.write_plan) |*view| view.release();
+        if (source_views.schema_view) |*view| view.release();
+        source_views.* = undefined;
+    }
+    fn capture(db: *DB, generated: []const deps.GeneratedRead, transforms: []const deps.TransformRead) !deps.Owned {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        var views = try source(db, null, generated, transforms);
+        defer release(&views);
+        return deps.Owned.capture(std.testing.allocator, db.core, views, null);
+    }
+    fn validate(db: *DB, owned: *const deps.Owned) !void {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        try owned.validate(db.core, null);
+    }
+};
+
+test "db prepared transaction effects required owned dependencies retain schema catalog and original policy authority" {
+    const a = std.testing.allocator;
+    const H = PreparedDependencyTest;
+    var directory = try TestDirectory.init("prepared-owned-dependency-epochs");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.setSchemaJson(a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"body":{"type":"string"}},"additionalProperties":false}}}}
+    );
+    const gate = &db.local_execution.row_policy_gate;
+    {
+        var lease = try gate.enterRaw();
+        defer if (!lease.released) lease.release();
+        lease.expires_at_seconds = std.math.maxInt(i64);
+        lease.expires_at_monotonic_ns = std.math.maxInt(u64);
+        var views = try H.source(&db, &lease, &.{}, &.{});
+        defer H.release(&views);
+        const schema_refs = views.schema_view.?.epoch.ref_count.load(.acquire);
+        const plan_refs = views.write_plan.?.epoch.ref_count.load(.acquire);
+        const policy_refs = gate.readers.load(.acquire);
+        {
+            var owned = try H.deps.Owned.capture(a, db.core, views, null);
+            defer owned.deinit();
+            try std.testing.expectEqual(schema_refs + 1, views.schema_view.?.epoch.ref_count.load(.acquire));
+            try std.testing.expectEqual(plan_refs + 1, views.write_plan.?.epoch.ref_count.load(.acquire));
+            try std.testing.expectEqual(policy_refs + 1, gate.readers.load(.acquire));
+            try std.testing.expectEqual(lease.expires_at_seconds, owned.policy_lease.?.expires_at_seconds);
+            try std.testing.expectEqual(lease.expires_at_monotonic_ns, owned.policy_lease.?.expires_at_monotonic_ns);
+            lease.release();
+            try H.validate(&db, &owned);
+            owned.policy_lease.?.expires_at_seconds = 0;
+            try std.testing.expectError(error.RowPolicyAuthenticationRequired, H.validate(&db, &owned));
+        }
+        try std.testing.expectEqual(@as(usize, 0), gate.readers.load(.acquire));
+        try std.testing.expectEqual(schema_refs, views.schema_view.?.epoch.ref_count.load(.acquire));
+        try std.testing.expectEqual(plan_refs, views.write_plan.?.epoch.ref_count.load(.acquire));
+    }
+    var owned = try H.capture(&db, &.{}, &.{});
+    defer owned.deinit();
+    const generation = owned.write_plan.?.generation();
+    try db.setSchemaJson(a,
+        \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"body":{"type":"string"}},"additionalProperties":false}}}}
+    );
+    try std.testing.expectEqual(@as(u32, 1), owned.schema_view.?.version());
+    try std.testing.expectEqual(generation, owned.write_plan.?.generation());
+    try std.testing.expectError(error.PreparedGenerationChanged, H.validate(&db, &owned));
+    // An already admitted historical schema remains usable. It must retain its
+    // old epoch without requiring that epoch to become the active schema again.
+    var historical_source = try H.source(&db, null, &.{}, &.{});
+    defer H.release(&historical_source);
+    historical_source.schema_view.?.release();
+    historical_source.schema_view = owned.schema_view.?.clone();
+    historical_source.require_current_schema = false;
+    var historical = try H.deps.Owned.capture(a, db.core, historical_source, null);
+    defer historical.deinit();
+    try H.validate(&db, &historical);
+    try std.testing.expectEqual(@as(u32, 1), historical.schema_view.?.version());
+}
+
+test "db prepared transaction effects required owned dependencies preserve explicit reads after input retirement and reject ABA" {
+    const a = std.testing.allocator;
+    const H = PreparedDependencyTest;
+    var directory = try TestDirectory.init("prepared-owned-read-dependencies");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"one\"}" }}, .timestamp_ns = 17 });
+    var generated = try db.captureGeneratedWriteReadSnapshot(a, &.{.{ .key = "doc", .value = "{}" }});
+    var generated_live = true;
+    defer if (generated_live) generated.deinit(a);
+    const transform_key = try a.dupe(u8, "doc");
+    var key_live = true;
+    defer if (key_live) a.free(transform_key);
+    var owned = try H.capture(&db, generated.entries, &.{.{ .key = transform_key, .value = null, .expected_version = 17 }});
+    defer owned.deinit();
+    @memset(transform_key, 'x');
+    a.free(transform_key);
+    key_live = false;
+    generated.deinit(a);
+    generated_live = false;
+    try std.testing.expectEqualStrings("doc", owned.transform_reads[0].key);
+    try H.validate(&db, &owned);
+    // Preserve the timestamp: only the durable document mutation revision can
+    // distinguish this delete/reinsert from the original source.
+    try db.batch(.{ .deletes = &.{"doc"}, .timestamp_ns = 17 });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"one\"}" }}, .timestamp_ns = 17 });
+    try std.testing.expectError(error.PreparedReadSetChanged, H.validate(&db, &owned));
+    var transform_only = try H.capture(&db, &.{}, &.{.{ .key = "doc", .value = null, .expected_version = 17 }});
+    defer transform_only.deinit();
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"two\"}" }}, .timestamp_ns = 18 });
+    try std.testing.expectError(error.PreparedReadSetChanged, H.validate(&db, &transform_only));
+}
+
+test "db prepared transaction effects required owned dependencies reject changed owners catalogs imports and unwind every original rejection" {
+    const a = std.testing.allocator;
+    const H = PreparedDependencyTest;
+    const Controls = struct {
+        calls: usize = 0,
+        stop: usize = std.math.maxInt(usize),
+        cause: anyerror = error.NotFound,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == self.stop) return self.cause;
+        }
+        fn run(alloc: Allocator, db: *DB, source: H.deps.Sources, checks: ?*@This()) !void {
+            var payload: @import("../../common/read_admission.zig").Payload = .{ .ptr = checks orelse undefined, .vtable = &.{ .checkpoint = check } };
+            var owned = try H.deps.Owned.capture(alloc, db.core, source, if (checks != null) @import("../../common/read_admission.zig").Port.init(&payload) else null);
+            defer owned.deinit();
+        }
+    };
+    var directory = try TestDirectory.init("prepared-owned-dependency-refusals");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.core.updateRange(.{ .start = "a", .end = "z" });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .timestamp_ns = 17 });
+    var generated = try db.captureGeneratedWriteReadSnapshot(a, &.{.{ .key = "doc", .value = "{}" }});
+    defer generated.deinit(a);
+    var lease = try db.local_execution.row_policy_gate.enterRaw();
+    defer lease.release();
+    var source = try H.source(&db, &lease, generated.entries, &.{.{ .key = "doc", .value = null, .expected_version = 17 }});
+    defer H.release(&source);
+    const refs = db.local_execution.row_policy_gate.readers.load(.acquire);
+    try std.testing.checkAllAllocationFailures(a, Controls.run, .{ &db, source, @as(?*Controls, null) });
+    var baseline: Controls = .{};
+    try Controls.run(a, &db, source, &baseline);
+    for ([_]anyerror{ error.NotFound, error.OutOfMemory, error.DeadlineExceeded }) |cause| for (1..baseline.calls + 1) |stop| {
+        var controls: Controls = .{ .stop = stop, .cause = cause };
+        try std.testing.expectError(cause, Controls.run(a, &db, source, &controls));
+        try std.testing.expectEqual(refs, db.local_execution.row_policy_gate.readers.load(.acquire));
+    };
+    var owned = try H.deps.Owned.capture(a, db.core, source, null);
+    defer owned.deinit();
+    const root = db.core.root_generation;
+    db.core.root_generation +%= 1;
+    try std.testing.expectError(error.PreparedGenerationChanged, H.validate(&db, &owned));
+    db.core.root_generation = root;
+    const identity = db.core.identity_namespace;
+    db.core.identity_namespace.range_id +%= 1;
+    try std.testing.expectError(error.PreparedGenerationChanged, H.validate(&db, &owned));
+    db.core.identity_namespace = identity;
+    db.core.store.resolver_catalog_revision.beginWrite();
+    try std.testing.expectError(error.PreparedGenerationChanged, H.validate(&db, &owned));
+    db.core.store.resolver_catalog_revision.endWrite();
+    try std.testing.expectError(error.PreparedGenerationChanged, H.validate(&db, &owned));
+    var routed = try H.capture(&db, &.{}, &.{});
+    defer routed.deinit();
+    const prior_range = db.core.byteRange();
+    const original_start = try a.dupe(u8, prior_range.start);
+    defer a.free(original_start);
+    const original_end = try a.dupe(u8, prior_range.end);
+    defer a.free(original_end);
+    try db.core.updateRange(.{ .start = "b", .end = "y" });
+    try std.testing.expectEqualStrings(original_start, routed.range_start);
+    try std.testing.expectEqualStrings(original_end, routed.range_end);
+    try std.testing.expectError(error.PreparedGenerationChanged, H.validate(&db, &routed));
+    try db.core.updateRange(.{ .start = original_start, .end = original_end });
+    var current_source = try H.source(&db, null, &.{}, &.{});
+    defer H.release(&current_source);
+    var snapshot_free_source = current_source;
+    snapshot_free_source.write_plan = null;
+    const catalog_refs = current_source.write_plan.?.epoch.ref_count.load(.acquire);
+    var epoch_only = try H.deps.Owned.capture(a, db.core, snapshot_free_source, null);
+    defer epoch_only.deinit();
+    try std.testing.expect(epoch_only.write_plan == null);
+    try std.testing.expectEqual(catalog_refs, current_source.write_plan.?.epoch.ref_count.load(.acquire));
+    db.core.index_manager.invalidateWritePlanSnapshot();
+    try std.testing.expectError(error.PreparedGenerationChanged, H.validate(&db, &epoch_only));
+    var imported = try H.capture(&db, &.{}, &.{});
+    defer imported.deinit();
+    try db.core.store.beginPortableImportPublication(std.testing.io);
+    try std.testing.expectError(error.PreparedGenerationChanged, H.validate(&db, &imported));
+    db.core.store.finishPortableImportPublication();
+    try std.testing.expectError(error.PreparedGenerationChanged, H.validate(&db, &imported));
+}
+
+test "db prepared transaction effects required transform revision rejects present and absent ABA in ordinary and owned validation" {
+    const a = std.testing.allocator;
+    const H = PreparedDependencyTest;
+    for ([_]bool{ false, true }) |present| {
+        var directory = try TestDirectory.init("prepared-transform-revision-aba");
+        defer directory.cleanup();
+        var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        if (present) try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .timestamp_ns = 17 });
+        var snapshot = try db.captureTransformReadSnapshot(a, types.BatchWrite, &.{}, &.{}, &.{.{ .key = "doc", .upsert = true }});
+        defer snapshot.deinit(a);
+        try std.testing.expect(snapshot.entries[0].revision != null);
+        var owned = try H.capture(&db, &.{}, snapshot.entries);
+        defer owned.deinit();
+        if (present) try db.batch(.{ .deletes = &.{"doc"}, .timestamp_ns = 17 });
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .timestamp_ns = 17 });
+        if (!present) try db.batch(.{ .deletes = &.{"doc"}, .timestamp_ns = 17 });
+        // Timestamp predicates alone accept the ABA. Both mutation-revision
+        // validation paths must reject the stale transform input.
+        try db.core.checkVersionPredicates(&.{.{ .key = "doc", .expected_version = snapshot.entries[0].expected_version }}, null);
+        try std.testing.expectError(error.PreparedReadSetChanged, db.validateTransformReadSnapshot(snapshot));
+        try std.testing.expectError(error.PreparedReadSetChanged, H.validate(&db, &owned));
+    }
+}
+
+test "db prepared transaction effects required ordinary transform retries concurrent same timestamp ABA before publication" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("ordinary-transform-concurrent-aba");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"count\":1}" }}, .timestamp_ns = 17 });
+    var hook: PortableRuntimeBatchPrelockTestHook = .{};
+    test_portable_runtime_batch_prelock_hook = &hook;
+    defer test_portable_runtime_batch_prelock_hook = null;
+    const Worker = struct {
+        db: *DB,
+        err: ?anyerror = null,
+        fn run(self: *@This()) void {
+            // Keep the ordinary write sync level: generated-enrichment read
+            // fences must not be the reason this transform detects the ABA.
+            self.db.batch(.{
+                .transforms = &.{.{ .key = "doc", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }} }},
+                .timestamp_ns = 99,
+            }) catch |err| {
+                self.err = err;
+            };
+        }
+    };
+    var worker: Worker = .{ .db = &db };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var joined = false;
+    defer if (!joined) {
+        hook.release.store(true, .release);
+        thread.join();
+    };
+    const deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
+    while (!hook.entered.load(.acquire) and monotonicTimeNs() < deadline) @import("antfly_platform").time.yieldNow();
+    try std.testing.expect(hook.entered.load(.acquire));
+    test_portable_runtime_batch_prelock_hook = null;
+    try db.batch(.{ .deletes = &.{"doc"}, .timestamp_ns = 17 });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"count\":100}" }}, .timestamp_ns = 17 });
+    hook.release.store(true, .release);
+    thread.join();
+    joined = true;
+    try std.testing.expectEqual(@as(?anyerror, null), worker.err);
+    const row = (try db.get(a, "doc")).?;
+    defer a.free(row);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, row, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 101), parsed.value.object.get("count").?.integer);
+    try std.testing.expectEqual(@as(u64, 99), try db.getTimestamp(a, "doc"));
 }

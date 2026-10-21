@@ -208,11 +208,13 @@ pub const Prepared = struct {
 
 /// Complete explicit physical bytes and their native authored-vector observer
 /// share a lifetime. Movable until participant() is attached to a writer; no
-/// pointer into this struct is retained during preparation. Schema/read/policy
-/// witnesses and backend-generated effects still belong to the caller.
+/// pointer into this struct is retained during preparation. Optional dependencies
+/// own immutable views, policy admission and explicit read witnesses. General
+/// group/backend read certification and backend-generated effects remain separate.
 pub const OwnedPhysicalPlan = struct {
     bytes: mutation_bytes.OwnedBatch,
     acceptance: Prepared,
+    dependencies: ?@import("prepared_mutation_dependencies.zig").Owned = null,
 
     pub fn init(alloc: std.mem.Allocator, root: u128, authored: anytype, writes: []const @import("../docstore.zig").KVPair, deletes: []const []const u8, replay: ?mutation_bytes.Replay, control: ?admission.Port) !OwnedPhysicalPlan {
         var bytes = try mutation_bytes.OwnedBatch.capture(alloc, writes, deletes, replay, control);
@@ -225,7 +227,18 @@ pub const OwnedPhysicalPlan = struct {
         return if (self.acceptance.vectors.len != 0) self.acceptance.participant() else null;
     }
 
+    pub fn retainDependencies(self: *OwnedPhysicalPlan, alloc: std.mem.Allocator, core: anytype, source: @import("prepared_mutation_dependencies.zig").Sources, control: ?admission.Port) !void {
+        if (self.dependencies != null) return error.InvalidArgument;
+        self.dependencies = try @import("prepared_mutation_dependencies.zig").Owned.capture(alloc, core, source, control);
+    }
+
+    pub fn validateDependencies(self: *const OwnedPhysicalPlan, core: anytype, control: ?admission.Port) !void {
+        const owned = if (self.dependencies) |*value| value else return error.PreparedEffectsRequired;
+        try owned.validate(core, control);
+    }
+
     pub fn deinit(self: *OwnedPhysicalPlan) void {
+        if (self.dependencies) |*owned| owned.deinit();
         self.acceptance.deinit();
         self.bytes.deinit();
         self.* = undefined;
