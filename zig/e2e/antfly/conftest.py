@@ -58,7 +58,7 @@ from urllib.parse import quote, unquote, urlparse
 
 import pytest
 import requests
-from helpers import create_index_payload, start_http_server
+from helpers import create_index_with_retry, start_http_server
 from port_reservations import LoopbackPortReservations, find_free_port
 
 pytest_plugins = ("e2e_scheduler",)
@@ -150,11 +150,23 @@ AUTH_BOOTSTRAP_PASSWORD = "e2e-bootstrap-password"
 ANTFLY_PUBLIC_API_ROOT = "/db/v1"
 ANTFLY_INTERNAL_API_ROOT = "/internal/v1"
 INFERENCE_PUBLIC_API_ROOT = "/ai/v1"
-CLIPCLAP_MODEL = "antflydb/clipclap"
-CLIPCLAP_GGUF_FILES = (
-    "clipclap-clip.Q4_K.gguf",
-    "clipclap-clap.Q4_K.gguf",
-    "antfly_inference_variants.json",
+EMBEDDINGGEMMA2_MODEL = "google/embeddinggemma-2:bf16-safetensors-bundle-v1"
+EMBEDDINGGEMMA2_FILES = (
+    "model.safetensors",
+    "config.json",
+    "tokenizer.json",
+    "tokenizer.model",
+    "tokenizer_config.json",
+    "chat_template.jinja",
+    "preprocessor_config.json",
+    "processor_config.json",
+    "modules.json",
+    "sentence_bert_config.json",
+    "config_sentence_transformers.json",
+    "1_Pooling/config.json",
+    "2_Normalize/config.json",
+    "model_manifest.json",
+    ".antfly-download-complete.json",
 )
 ALLOW_REAL_MODEL_DOWNLOAD_ENV = "ANTFLY_E2E_ALLOW_REAL_MODEL_DOWNLOAD"
 FAILURE_LOG_TAIL_LIMIT = 20_000
@@ -379,13 +391,15 @@ def wait_for_listener(url: str, timeout: float = 5.0) -> bool:
 
 def _start_stateful_server_with_retry(
     binary: str, port: int
-) -> PublicAntflyServer | StandaloneAntflyServer:
+) -> PublicAntflyServer | StandaloneAntflyServer | StatefulAntflyServer:
     if Path(binary).name != "antfly":
         return PublicAntflyServer(binary, "127.0.0.1", port)
 
     last_error: RuntimeError | None = None
     for _ in range(3):
         try:
+            if os.environ.get("ANTFLY_E2E_STATEFUL_RAFT") == "1":
+                return StatefulAntflyServer(binary, "127.0.0.1", port)
             return StandaloneAntflyServer(binary, "127.0.0.1", port)
         except RuntimeError as exc:
             last_error = exc
@@ -1429,9 +1443,20 @@ def require_standalone_storage_headroom(root: Path) -> None:
 
 
 class StandaloneAntflyServer:
-    def __init__(self, binary: str, host: str, port: int, *, pgwire: bool = False):
+    def __init__(
+        self,
+        binary: str,
+        host: str,
+        port: int,
+        *,
+        pgwire: bool = False,
+        storage_engine: str | None = None,
+        inference_host_budget_mb: int | None = None,
+    ):
         self.binary = binary
         self.host = host
+        self.storage_engine = storage_engine
+        self.inference_host_budget_mb = inference_host_budget_mb
         with ExitStack() as setup:
             self.port_reservations = LoopbackPortReservations(host)
             setup.callback(self.port_reservations.close)
@@ -1469,6 +1494,14 @@ class StandaloneAntflyServer:
             root=self.root,
             pgwire_port=self.pgwire_port,
         )
+        if self.inference_host_budget_mb is not None:
+            command.extend(
+                ["--inference-host-budget-mb", str(self.inference_host_budget_mb)]
+            )
+        if self.storage_engine is not None:
+            command.extend(["--storage-engine", self.storage_engine])
+            if self.storage_engine == "lite":
+                command.extend(["--storage-path", str(self.root / "db.aflite")])
         if self.pgwire_port is not None:
             command.extend(["--auth", "true"])
         self.proc = self.port_reservations.handoff_to(
@@ -2304,11 +2337,19 @@ class PacingSensitiveOpenAiEmbeddingServer:
 
 
 class InferenceEmbeddingServer:
-    def __init__(self, host: str = "127.0.0.1", response_delay_s: float = 0.0):
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        response_delay_s: float | None = 0.0,
+        model_identity: str | int | None = None,
+    ):
         port = find_free_port()
         self.base_url = f"http://{host}:{port}"
         self.url = inference_public_api_url(self.base_url)
         self.response_delay_s = response_delay_s
+        self.model_identity = model_identity
+        self.received_model_identities: list[str | None] = []
+        self.received_corpus_model_identities: list[str | None] = []
         self._embedding_request_active = threading.Event()
         self._delay_enabled = threading.Event()
         self._delay_released = threading.Event()
@@ -2389,6 +2430,17 @@ class InferenceEmbeddingServer:
                     f"{INFERENCE_PUBLIC_API_ROOT}/embed",
                     f"{INFERENCE_PUBLIC_API_ROOT}/embeddings",
                 ):
+                    outer.received_model_identities.append(
+                        payload.get("model_identity")
+                    )
+                    if (
+                        outer.model_identity is not None
+                        and self.headers.get("Accept") != "application/json"
+                    ):
+                        self.send_error(
+                            400, "pinned embeddings require identity-bearing JSON"
+                        )
+                        return
                     # Match the inference API's optional, non-nullable strings.
                     # Permissive fixtures previously hid invalid database requests.
                     for field in ("task_type", "instruction"):
@@ -2400,6 +2452,10 @@ class InferenceEmbeddingServer:
                         "antfly embedding dimension probe"
                         in json.dumps(payload.get("input", ""))
                     )
+                    if not is_dimension_probe:
+                        outer.received_corpus_model_identities.append(
+                            payload.get("model_identity")
+                        )
                     with outer._transient_embedding_lock:
                         transient = (
                             outer._transient_embedding_model is not None
@@ -2481,6 +2537,11 @@ class InferenceEmbeddingServer:
                             "object": "list",
                             "data": data,
                             "model": model or "antfly-embed-v1",
+                            **(
+                                {"model_identity": outer.model_identity}
+                                if outer.model_identity is not None
+                                else {}
+                            ),
                             "usage": {
                                 "prompt_tokens": max(1, len(values)),
                                 "total_tokens": max(1, len(values)),
@@ -2571,13 +2632,16 @@ def _models_dir() -> Path:
     )
 
 
-def _clipclap_model_dir() -> Path:
-    return _models_dir() / CLIPCLAP_MODEL
+def _embeddinggemma2_model_dir() -> Path:
+    # Match registry.modelInstallDirAlloc: explicit variants have separate installs.
+    repo, variant = EMBEDDINGGEMMA2_MODEL.split(":", 1)
+    suffix = hashlib.sha256(variant.encode()).hexdigest()[:16]
+    return _models_dir() / f"{repo}--antfly-{suffix}"
 
 
-def _clipclap_gguf_available(model_dir: Path) -> bool:
-    return model_dir.exists() and all(
-        (model_dir / name).exists() for name in CLIPCLAP_GGUF_FILES
+def _embeddinggemma2_available(model_dir: Path) -> bool:
+    return not (model_dir / ".antfly-download-in-progress").exists() and all(
+        (model_dir / name).is_file() for name in EMBEDDINGGEMMA2_FILES
     )
 
 
@@ -2674,10 +2738,7 @@ def serverless_api(serverless_runtime):
             return self.get(f"/tables/{table_name}/indexes/{index_name}")
 
         def create_index(self, table_name: str, index_name: str, payload: dict) -> dict:
-            created = self.post(
-                f"/tables/{table_name}/indexes/{index_name}",
-                create_index_payload(payload, index_name),
-            )
+            created = create_index_with_retry(self, table_name, index_name, payload)
             deadline = time.monotonic() + 10.0
             while True:
                 try:
@@ -2918,13 +2979,13 @@ def inference_embedder():
 
 
 @pytest.fixture(scope="session")
-def clipclap_model_available():
-    model_dir = _clipclap_model_dir()
-    if _clipclap_gguf_available(model_dir):
+def embeddinggemma2_model_available():
+    model_dir = _embeddinggemma2_model_dir()
+    if _embeddinggemma2_available(model_dir):
         return model_dir
     if not _env_truthy(ALLOW_REAL_MODEL_DOWNLOAD_ENV):
         pytest.skip(
-            f"ClipClap GGUF files are not present at {model_dir}; set {ALLOW_REAL_MODEL_DOWNLOAD_ENV}=1 to download them"
+            f"EmbeddingGemma2 bundle files are not present at {model_dir}; set {ALLOW_REAL_MODEL_DOWNLOAD_ENV}=1 to download them"
         )
 
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
@@ -2936,7 +2997,7 @@ def clipclap_model_available():
             binary,
             "inference",
             "pull",
-            "hf:antflydb/clipclap:gguf:Q4_K",
+            f"hf:{EMBEDDINGGEMMA2_MODEL}",
             "--tasks",
             "embed",
         ],
@@ -2947,14 +3008,14 @@ def clipclap_model_available():
         raise RuntimeError(
             f"antfly inference pull finished but did not create {model_dir}"
         )
-    if not _clipclap_gguf_available(model_dir):
-        raise RuntimeError(f"ClipClap GGUF files are missing from {model_dir}")
+    if not _embeddinggemma2_available(model_dir):
+        raise RuntimeError(f"EmbeddingGemma2 bundle files are missing from {model_dir}")
     return model_dir
 
 
 @pytest.fixture(scope="function")
-def real_clipclap_backup_api(request, clipclap_model_available):
-    _ = clipclap_model_available
+def real_embeddinggemma2_backup_api(request, embeddinggemma2_model_available):
+    _ = embeddinggemma2_model_available
     return request.getfixturevalue("backup_api")
 
 
@@ -3578,10 +3639,7 @@ def stateful_api(request: pytest.FixtureRequest):
             return self.get(f"/tables/{table_name}/indexes/{index_name}")
 
         def create_index(self, table_name: str, index_name: str, payload: dict) -> dict:
-            created = self.post(
-                f"/tables/{table_name}/indexes/{index_name}",
-                create_index_payload(payload, index_name),
-            )
+            created = create_index_with_retry(self, table_name, index_name, payload)
             deadline = time.monotonic() + 10.0
             while True:
                 try:
@@ -3641,8 +3699,15 @@ def _reusable_backup_runtime():
 
 @pytest.fixture(scope="function")
 def backup_api(request: pytest.FixtureRequest):
+    # A parametrized budget needs its own process; it must not silently reuse
+    # the module server's more generous default inference envelope.
+    inference_host_budget_mb = getattr(request, "param", None)
+    if inference_host_budget_mb is not None:
+        assert (
+            isinstance(inference_host_budget_mb, int) and inference_host_budget_mb > 0
+        )
     reusable_runtime: ReusableAntflyRuntime | None = None
-    if _uses_reusable_antfly_process(request):
+    if inference_host_budget_mb is None and _uses_reusable_antfly_process(request):
         reusable_runtime = request.getfixturevalue("_reusable_backup_runtime")
         server = reusable_runtime.server
         binary = server.binary
@@ -3653,8 +3718,18 @@ def backup_api(request: pytest.FixtureRequest):
         if not Path(binary).exists():
             pytest.skip(f"Public API binary not found: {binary}")
         if Path(binary).name == "antfly":
-            server = StandaloneAntflyServer(binary, "127.0.0.1", find_free_port())
+            if inference_host_budget_mb is None:
+                server = StandaloneAntflyServer(binary, "127.0.0.1", find_free_port())
+            else:
+                server = StandaloneAntflyServer(
+                    binary,
+                    "127.0.0.1",
+                    find_free_port(),
+                    inference_host_budget_mb=inference_host_budget_mb,
+                )
         else:
+            if inference_host_budget_mb is not None:
+                pytest.skip("an inference budget requires the native standalone binary")
             server = PublicAntflyServer(binary, "127.0.0.1", find_free_port())
 
     base = antfly_public_api_url(server.url, binary=binary)
@@ -3860,10 +3935,7 @@ def backup_api(request: pytest.FixtureRequest):
             return self.get(f"/tables/{table_name}/indexes/{index_name}")
 
         def create_index(self, table_name: str, index_name: str, payload: dict) -> dict:
-            created = self.post(
-                f"/tables/{table_name}/indexes/{index_name}",
-                create_index_payload(payload, index_name),
-            )
+            created = create_index_with_retry(self, table_name, index_name, payload)
             deadline = time.monotonic() + 10.0
             while True:
                 try:

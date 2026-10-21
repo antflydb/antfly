@@ -297,6 +297,7 @@ pub fn enrichInventoryFilesWithFootersAlloc(
     errdefer deinitDeletedRowGroups(alloc, deleted_row_groups);
 
     var out = external_source.Inventory{
+        .row_identity_version = inventory.row_identity_version,
         .format = inventory.format,
         .source_id = source_id,
         .source_uri = source_uri,
@@ -352,6 +353,7 @@ pub fn enrichInventoryFileWithFooterAlloc(
     errdefer deinitDeletedRowGroups(alloc, deleted_row_groups);
 
     var out = external_source.Inventory{
+        .row_identity_version = inventory.row_identity_version,
         .format = inventory.format,
         .source_id = source_id,
         .source_uri = source_uri,
@@ -575,6 +577,8 @@ fn cloneColumnChunkAlloc(alloc: Allocator, chunk: external_source.ColumnChunk) !
         .logical_type = logical_type,
         .decimal_precision = chunk.decimal_precision,
         .decimal_scale = chunk.decimal_scale,
+        .stats_null_count = chunk.stats_null_count,
+        .stats_distinct_count = chunk.stats_distinct_count,
         .stats_min_i64 = chunk.stats_min_i64,
         .stats_max_i64 = chunk.stats_max_i64,
         .stats_min_bytes = stats_min_bytes,
@@ -622,6 +626,7 @@ fn parseFileMetadata(alloc: Allocator, reader: *Reader, file_len: u64) !ParsedFo
 
     var total_rows: u64 = 0;
     for (got_row_groups) |group| {
+        group.validate(file_len) catch return error.InvalidParquetMetadata;
         total_rows = std.math.add(u64, total_rows, group.row_count) catch return error.InvalidParquetMetadata;
     }
     if (total_rows != got_row_count) return error.InvalidParquetMetadata;
@@ -684,9 +689,9 @@ fn parseSchemaColumnsAlloc(alloc: Allocator, reader: *Reader, field_type: Compac
     try reader.admitAllocation(SchemaColumn, list.len);
     try reader.admitAllocation([]const u8, list.len);
     const elements = try alloc.alloc(SchemaElement, list.len);
-    errdefer alloc.free(elements);
+    defer alloc.free(elements);
     var initialized: usize = 0;
-    errdefer {
+    defer {
         for (elements[0..initialized]) |*element| element.deinit(alloc);
     }
     for (elements) |*element| {
@@ -706,8 +711,6 @@ fn parseSchemaColumnsAlloc(alloc: Allocator, reader: *Reader, field_type: Compac
     try collectSchemaColumnsAlloc(alloc, reader, elements, &cursor, elements[0].child_count, false, &path, &columns, 0);
     if (cursor != elements.len) return error.InvalidParquetMetadata;
 
-    for (elements) |*element| element.deinit(alloc);
-    alloc.free(elements);
     return try columns.toOwnedSlice(alloc);
 }
 
@@ -949,7 +952,7 @@ fn parseRowGroup(
         .total_byte_len = total_byte_len,
         .column_chunks = got_chunks,
     };
-    group.validate(file_len) catch return error.InvalidParquetMetadata;
+    group.validateRanges(file_len) catch return error.InvalidParquetMetadata;
     column_chunks = null;
     return group;
 }
@@ -1010,6 +1013,8 @@ fn parseColumnChunk(alloc: Allocator, reader: *Reader, file_len: u64) !external_
         .compression_codec = meta.compression_codec,
         .encoding = meta.encoding,
         .physical_type = meta.physical_type,
+        .stats_null_count = meta.stats_null_count,
+        .stats_distinct_count = meta.stats_distinct_count,
         .stats_min_i64 = meta.stats_min_i64,
         .stats_max_i64 = meta.stats_max_i64,
         .stats_min_bytes = meta.stats_min_bytes,
@@ -1026,7 +1031,7 @@ fn parseColumnChunk(alloc: Allocator, reader: *Reader, file_len: u64) !external_
         .column_index_offset = column_index_offset,
         .column_index_length = column_index_length,
     };
-    chunk.validate(file_len) catch return error.InvalidParquetMetadata;
+    chunk.validateRanges(file_len) catch return error.InvalidParquetMetadata;
     meta.disown();
     return chunk;
 }
@@ -1042,6 +1047,8 @@ const ColumnMetadata = struct {
     dictionary_page_offset: ?u64 = null,
     bloom_filter_offset: ?u64 = null,
     bloom_filter_length: ?u32 = null,
+    stats_null_count: ?u64 = null,
+    stats_distinct_count: ?u64 = null,
     stats_min_i64: ?i64 = null,
     stats_max_i64: ?i64 = null,
     stats_min_bytes: ?[]u8 = null,
@@ -1125,6 +1132,8 @@ fn parseColumnMetadata(alloc: Allocator, reader: *Reader) !ColumnMetadata {
         .bloom_filter_length = bloom_length,
         .data_page_offset = data_page_offset,
         .dictionary_page_offset = dictionary_page_offset,
+        .stats_null_count = raw_statistics.null_count,
+        .stats_distinct_count = raw_statistics.distinct_count,
         .stats_min_i64 = stats.min_i64,
         .stats_max_i64 = stats.max_i64,
         .stats_min_bytes = stats.min_bytes,
@@ -1137,6 +1146,8 @@ fn parseColumnMetadata(alloc: Allocator, reader: *Reader) !ColumnMetadata {
 }
 
 const RawColumnStatistics = struct {
+    null_count: ?u64 = null,
+    distinct_count: ?u64 = null,
     min: ?[]u8 = null,
     max: ?[]u8 = null,
 
@@ -1175,6 +1186,8 @@ fn parseColumnStatisticsAlloc(alloc: Allocator, reader: *Reader, field_type: Com
                 if (stats.min) |value| alloc.free(value);
                 stats.min = try reader.readBinaryAlloc(alloc);
             },
+            3 => stats.null_count = try reader.readRequiredU64(field.type),
+            4 => stats.distinct_count = try reader.readRequiredU64(field.type),
             else => try reader.skip(field.type),
         }
     }
@@ -1199,7 +1212,7 @@ fn decodeColumnStatsAlloc(alloc: Allocator, raw: RawColumnStatistics, physical_t
         return .{ .min_i64 = min_i64, .max_i64 = max_i64 };
     }
     if (std.ascii.eqlIgnoreCase(physical_type, "byte_array") or std.ascii.eqlIgnoreCase(physical_type, "fixed_len_byte_array")) {
-        if (std.mem.order(u8, min, max) == .gt) return error.InvalidParquetMetadata;
+        // Signed DECIMAL order is known only after applying schema annotations.
         const min_bytes = try alloc.dupe(u8, min);
         errdefer alloc.free(min_bytes);
         const max_bytes = try alloc.dupe(u8, max);
@@ -1284,7 +1297,7 @@ fn parseFirstEncodingAlloc(alloc: Allocator, reader: *Reader, field_type: Compac
     for (0..list.len) |_| {
         const value = try reader.readI32();
         // This is a set, not a page order. RLE may describe definition levels.
-        if (value == 2 or value == 8) data_encoding = value else if (value == 0 and data_encoding == null) data_encoding = value;
+        if (value == 2 or value == 8) data_encoding = value else if ((value == 5 or value == 6 or value == 7 or value == 9) and data_encoding != 2 and data_encoding != 8) data_encoding = value else if (value == 0 and data_encoding == null) data_encoding = value;
     }
     return try alloc.dupe(u8, encodingName(data_encoding orelse -1));
 }
@@ -2263,4 +2276,13 @@ test "external lake standard Bloom headers reject unsupported algorithms and tru
         const partial = parseBloomHeader(header[0..end]) catch null;
         try std.testing.expectEqual(null, partial);
     }
+}
+
+test "lake SQL Parquet statistics retain null and distinct counts for metadata-only costing" {
+    const bytes = [_]u8{ 0x36, 20, 0x16, 14, 0 };
+    var reader: Reader = .{ .bytes = &bytes, .budget = try bounded_decode.Budget.init(bytes.len, .{}), .remaining_skip_operations = 100, .max_nesting_depth = 10 };
+    var statistics = try parseColumnStatisticsAlloc(std.testing.allocator, &reader, .struct_);
+    defer statistics.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u64, 10), statistics.null_count);
+    try std.testing.expectEqual(@as(?u64, 7), statistics.distinct_count);
 }

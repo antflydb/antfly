@@ -61,7 +61,12 @@ const SourceBoundary = callback_abi.Boundary(struct {
 
 pub const Source = union(enum) {
     contiguous: []const u8,
-    ranges: struct {
+    ranges: Ranges,
+
+    // Native callback contracts include immediate field type names. Anonymous
+    // payload names contain compilation-local IDs and cannot identify the same
+    // source representation in independently compiled runtime archives.
+    pub const Ranges = struct {
         ptr: *anyopaque,
         length: u64,
         read_into: *const fn (*anyopaque, u64, []u8) anyerror!void,
@@ -90,7 +95,7 @@ pub const Source = union(enum) {
         acquire_use: ?*const fn (*anyopaque) bool = null,
         release_use: ?*const fn (*anyopaque) void = null,
         enable_idle_expiry: ?*const fn (*anyopaque) void = null,
-    },
+    };
 
     pub fn checkReadContext(self: Source) !void {
         if (self == .ranges) if (self.ranges.check_read_context) |check|

@@ -3,13 +3,19 @@
 
 pub const types = @import("types.zig");
 
+pub const AutocompleteQuery = types.AutocompleteQuery;
 pub const BoolFieldQuery = types.BoolFieldQuery;
+pub const BoolQuery = types.BoolQuery;
+pub const BoolQueryBody = types.BoolQueryBody;
+pub const BoolQueryClause = types.BoolQueryClause;
 pub const BooleanQuery = types.BooleanQuery;
 pub const Boost = types.Boost;
 pub const ConjunctionQuery = types.ConjunctionQuery;
+pub const ContainsQuery = types.ContainsQuery;
 pub const DateRangeStringQuery = types.DateRangeStringQuery;
 pub const DisjunctionQuery = types.DisjunctionQuery;
 pub const DocIdQuery = types.DocIdQuery;
+pub const EqualsQuery = types.EqualsQuery;
 pub const Fuzziness = types.Fuzziness;
 pub const FuzzyQuery = types.FuzzyQuery;
 pub const GeoBoundingBoxQuery = types.GeoBoundingBoxQuery;
@@ -24,6 +30,7 @@ pub const MatchAllQuery = types.MatchAllQuery;
 pub const MatchNoneQuery = types.MatchNoneQuery;
 pub const MatchPhraseQuery = types.MatchPhraseQuery;
 pub const MatchQuery = types.MatchQuery;
+pub const MatchesQuery = types.MatchesQuery;
 pub const MultiMatchBody = types.MultiMatchBody;
 pub const MultiMatchQuery = types.MultiMatchQuery;
 pub const MultiPhraseQuery = types.MultiPhraseQuery;

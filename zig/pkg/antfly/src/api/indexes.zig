@@ -81,6 +81,7 @@ pub fn addIndexToTableIndexesJsonWithIo(
     index_name: []const u8,
     index_json: []const u8,
 ) ![]u8 {
+    if (@import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name)) return error.InvalidCreateIndexRequest;
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
     var config = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
@@ -122,7 +123,7 @@ pub fn addIndexToTableIndexesJsonWithIo(
     try out.append(alloc, ':');
     try out.appendSlice(alloc, stored_config);
     try out.append(alloc, '}');
-    return try out.toOwnedSlice(alloc);
+    return try @import("antfly_local_sources").storage_db_resolver_curation.retainRetiredMetadata(alloc, current_indexes_json, out.items);
 }
 
 fn storedIndexConfigForMutationAlloc(
@@ -194,6 +195,7 @@ pub fn removeIndexFromTableIndexesJson(
     current_indexes_json: []const u8,
     index_name: []const u8,
 ) !?[]u8 {
+    if (@import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name)) return error.ExtensionOwnedObject;
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
 
@@ -221,7 +223,7 @@ pub fn removeIndexFromTableIndexesJson(
     }
 
     try out.append(alloc, '}');
-    return try out.toOwnedSlice(alloc);
+    return try @import("antfly_local_sources").storage_db_resolver_curation.retainRetiredMetadata(alloc, current_indexes_json, out.items);
 }
 
 pub fn addEnrichmentToTableIndexesJson(
@@ -3247,15 +3249,17 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         terminal_failed_count == 0 and
         coverageAllSourcesTerminal(table_doc_count, produced_count, skipped_count, terminal_failed_count) and
         embeddingsArtifactPublishComplete(item, sparse, produced_count);
+    const artifact_publication_complete = embeddingsArtifactPublishComplete(item, sparse, produced_count);
     // External indexes are query-ready once their published artifacts and
     // replay are current. Their coverage remains independently observable and
     // may be incomplete because callers are not required to supply a vector
     // for every source document.
     const readiness_complete = if (coverage_policy == .external)
-        !coverage_incomplete and replay_current
+        !coverage_incomplete and replay_current and (sparse or artifact_publication_complete)
     else
         materialization_complete;
     const all_sources_settled = !coverage_incomplete and replay_current and
+        (coverage_policy != .external or sparse or artifact_publication_complete) and
         coverageAllSourcesTerminal(table_doc_count, produced_count, skipped_count, terminal_failed_count);
     const vector_projection_pending = @hasField(@TypeOf(item), "dense_vector_projection_pending") and
         item.dense_vector_projection_pending;
@@ -3307,8 +3311,8 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
     const replay_ready = view.replay_target_sequence > 0 and
         view.replay_target_sequence <= view.replay_applied_sequence and
         !(if (enrichment) |stats| stats.retrying or stats.worker_failed else false);
-    const artifact_visible = observation_current and embeddingsArtifactPublishComplete(item, sparse, produced_count);
-    if (replay_ready and !artifact_visible and view.replay_target_sequence > 0) {
+    const artifact_visible = observation_current and artifact_publication_complete;
+    if ((replay_ready or (coverage_policy == .external and !sparse)) and !artifact_visible) {
         view.backfill_active = true;
         view.backfill_progress = 0.0;
         return view;
@@ -5400,7 +5404,6 @@ fn consumerTests() type {
                 false,
                 0,
                 0,
-                null,
                 .{},
                 null,
                 null,
@@ -7196,6 +7199,31 @@ fn consumerTests() type {
             );
         }
 
+        test "external dense readiness requires complete artifact publication (#1210)" {
+            var item: db_mod.types.DBIndexStats = .{
+                .name = "vec",
+                .kind = .dense_vector,
+                .doc_count = 0,
+                .coverage_produced_count = 0,
+                .publication_target_count = 50,
+                .publication_target_ready = true,
+                .coverage_generation = 7,
+                .coverage_config_hash = 41,
+                .coverage_identity_ready = true,
+                .backfill_active = false,
+                .backfill_progress = 1.0,
+                .replay_applied_sequence = 9,
+                .replay_target_sequence = 9,
+            };
+            const pending = embeddingsRuntimeView(item, 200, .external, false, 7, 41, null, true);
+            try std.testing.expect(pending.backfill_active);
+            item.doc_count = 50;
+            item.node_count = 1;
+            const ready = embeddingsRuntimeView(item, 200, .external, false, 7, 41, null, true);
+            try std.testing.expect(!ready.backfill_active);
+            try std.testing.expectEqual(@as(f64, 1.0), ready.backfill_progress);
+        }
+
         test "native dense vector projection remains public readiness debt after external coverage converges" {
             const item: db_mod.types.DBIndexStats = .{
                 .name = "vec",
@@ -7684,6 +7712,8 @@ fn consumerTests() type {
             try expectCreatedObjectAllowlistCovers(chunking_openapi.ChunkerConfig, .chunker);
             try expectCreatedObjectAllowlistCovers(chunking_api_openapi.TextChunkOptions, .chunker_text);
             try expectCreatedObjectAllowlistCovers(chunking_api_openapi.AudioChunkOptions, .chunker_audio);
+            try expectCreatedObjectAllowlistCovers(chunking_api_openapi.ChunkEmbeddingTarget, .chunker_embedding);
+            try expectCreatedObjectAllowlistCovers(chunking_api_openapi.MediaChunkPolicy, .chunker_policy);
             try expectCreatedObjectAllowlistCovers(indexes_openapi.IndexExecutionConfig, .index_execution);
             try expectCreatedObjectAllowlistCovers(indexes_openapi.ExecutionPolicy, .execution_policy);
 
@@ -7710,12 +7740,32 @@ fn consumerTests() type {
                 .chunker,
                 .chunker_text,
                 .chunker_audio,
+                .chunker_embedding,
+                .chunker_policy,
                 .index_execution,
                 .execution_policy,
             }) |shape| {
                 try std.testing.expect(!public_index_contract.isAllowedCreatedObjectField(shape, "client_value"));
                 try std.testing.expect(!public_index_contract.isAllowedCreatedObjectField(shape, "settings"));
             }
+            const config =
+                \\{"type":"embeddings","dimension":2,"chunker":{"provider":"antfly","model":"model-aware","embedding":{"model":"encoder","dimensions":2,"execute":false,"allow_partial":true,"client_value":"private"},"policy":{"max_frames":8,"target_tokens":"invalid","settings":"private"}}}
+            ;
+            const created = try encodeCreatedIndexConfig(std.testing.allocator, "media", config);
+            defer std.testing.allocator.free(created);
+            var decoded = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, created, .{});
+            defer decoded.deinit();
+            const chunker = decoded.value.object.get("chunker").?.object;
+            const embedding = chunker.get("embedding").?.object;
+            try std.testing.expectEqualStrings("encoder", embedding.get("model").?.string);
+            try std.testing.expectEqual(@as(i64, 2), embedding.get("dimensions").?.integer);
+            try std.testing.expect(!embedding.get("execute").?.bool);
+            try std.testing.expect(embedding.get("allow_partial").?.bool);
+            try std.testing.expect(!embedding.contains("client_value"));
+            const policy = chunker.get("policy").?.object;
+            try std.testing.expectEqual(@as(i64, 8), policy.get("max_frames").?.integer);
+            try std.testing.expect(!policy.contains("target_tokens"));
+            try std.testing.expect(!policy.contains("settings"));
         }
 
         test "public index config encoders redact nested credentials" {
@@ -9841,6 +9891,8 @@ fn consumerTests() type {
                 .name = try std.testing.allocator.dupe(u8, "vec"),
                 .kind = .dense_vector,
                 .doc_count = 50_000,
+                .publication_target_ready = true,
+                .publication_target_count = 50_000,
                 .node_count = 24,
                 .coverage_produced_count = 50_000,
                 .coverage_generation = 42,
@@ -10960,4 +11012,16 @@ test "artifact enrichment list does not expose internal JSON or producer credent
     try std.testing.expect(std.mem.indexOf(u8, listed, "producer_json") == null);
     try std.testing.expect(std.mem.indexOf(u8, listed, "chunker_json") == null);
     try std.testing.expect(std.mem.indexOf(u8, listed, "\"chunker\":{") != null);
+}
+
+test "resolver curation HTTP hides destination namespace metadata from index resources" {
+    const a = std.testing.allocator;
+    const source = "{\"default\":{\"type\":\"full_text\"},\"_resolver_curation\":{\"identities\":[]},\"_resolver_namespaces\":{\"version\":1,\"namespaces\":[]}}";
+    const configs = try encodeIndexConfigMap(a, source);
+    defer a.free(configs);
+    try std.testing.expect(std.mem.indexOf(u8, configs, "_resolver_") == null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, configs, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.object.count());
+    try std.testing.expect(parsed.value.object.contains("default"));
 }

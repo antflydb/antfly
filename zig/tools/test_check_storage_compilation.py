@@ -79,6 +79,15 @@ class LiteralSourceOwnership(unittest.TestCase):
         local = measurement.ZIG_ROOT / "pkg/antfly-embedded/src"
         catalog = local / "source_catalog_control.zig"
         self.assertEqual(catalog.read_text(), measurement.control_catalog_contents())
+        # These are control contracts; a new transitive physical import must
+        # fail this small check rather than silently hiding their exports.
+        for name in (
+            "common_config",
+            "api_local_backups",
+            "storage_db_resolver_curation",
+            "metadata_local_index_reconcile",
+        ):
+            self.assertIn(f"pub const {name} =", catalog.read_text())
         for relative in ("storage/db/db.zig", "storage/query.zig", "storage/write.zig"):
             with self.subTest(source=relative):
                 self.assertIsNone(
@@ -175,7 +184,13 @@ class BuildMemoryAccounting(unittest.TestCase):
 
 
 class BuildFailureEvidence(unittest.TestCase):
-    def test_contract_rollover_discards_both_caches_and_keeps_mutations(self):
+    def test_contract_reuses_both_caches_when_disk_has_headroom(self):
+        self.exercise_contract_cache(low_disk=False)
+
+    def test_disk_pressure_rollover_discards_both_caches_and_keeps_mutations(self):
+        self.exercise_contract_cache(low_disk=True)
+
+    def exercise_contract_cache(self, *, low_disk):
         expected = (
             ("cold", set()),
             ("warm", set()),
@@ -188,8 +203,14 @@ class BuildFailureEvidence(unittest.TestCase):
             ("physical local query", {"antfly-storage-kernel"}),
             ("owner integration test", {"storage-owner-tests"}),
             ("consumer test root", {"api-table-read-tests"}),
-            ("storage contract cold", set()),
-            ("storage contract warm", set()),
+            *(
+                (
+                    ("storage contract cold", set()),
+                    ("storage contract warm", set()),
+                )
+                if low_disk
+                else ()
+            ),
             (
                 "storage contract",
                 {
@@ -210,6 +231,11 @@ class BuildFailureEvidence(unittest.TestCase):
             self.assertNotIn("--global-cache-dir", command)
             self.assertIn("-Dstrip=true", command)
             global_cache = Path(env["ZIG_GLOBAL_CACHE_DIR"])
+            self.assertEqual(
+                (global_cache / "p" / archive_name).read_bytes(), b"pinned source"
+            )
+            self.assertFalse((global_cache / "o").exists())
+            self.assertFalse((global_cache / "p/unrelated.tar.gz").exists())
             self.assertEqual(local_cache.parent, cwd.parent.parent)
             self.assertEqual(global_cache.parent, cwd.parent.parent)
             if first_cache is None:
@@ -226,6 +252,9 @@ class BuildFailureEvidence(unittest.TestCase):
                     b"storage compilation ownership regression",
                     (cwd / "pkg/antfly/src/api/table_reads.zig").read_bytes(),
                 )
+            if label == "storage contract" and not low_disk:
+                self.assertTrue((local_cache / "marker").is_file())
+                self.assertTrue((global_cache / "marker").is_file())
             local_cache.mkdir(exist_ok=True)
             (local_cache / "marker").touch()
             (global_cache / "marker").touch()
@@ -257,7 +286,20 @@ class BuildFailureEvidence(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             report = Path(directory) / "report.json"
+            seed = Path(directory) / "seed"
+            (seed / "p").mkdir(parents=True)
+            inventory = json.loads(
+                (
+                    measurement.ZIG_ROOT.parent / "scripts/ci/zig-dependencies.json"
+                ).read_text()
+            )
+            archive_name = inventory["packages"][0]["hash"] + ".tar.gz"
+            (seed / "p" / archive_name).write_bytes(b"pinned source")
+            (seed / "p/unrelated.tar.gz").write_bytes(b"unrelated package")
+            (seed / "o").mkdir()
+            (seed / "o/compiled-object").write_bytes(b"must not seed compiler output")
             with (
+                mock.patch.dict(os.environ, {"ZIG_GLOBAL_CACHE_DIR": str(seed)}),
                 mock.patch.object(
                     sys,
                     "argv",
@@ -266,13 +308,13 @@ class BuildFailureEvidence(unittest.TestCase):
                 mock.patch.object(
                     measurement, "measured_build", side_effect=fake_build
                 ),
-                # This case exercises the explicit contract rollover. Host disk
-                # pressure has its own runtime trigger and must not change the
-                # mocked sequence of builds.
+                # Trigger disk pressure only before the final mutation.
                 mock.patch.object(
                     measurement.shutil,
                     "disk_usage",
-                    return_value=mock.Mock(free=64 << 30),
+                    side_effect=lambda *_: mock.Mock(
+                        free=(8 if low_disk and len(seen) == 8 else 64) << 30
+                    ),
                 ),
             ):
                 measurement.main()

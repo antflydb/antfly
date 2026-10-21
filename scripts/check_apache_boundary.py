@@ -63,6 +63,8 @@ PACKAGE_ENTRYPOINTS = (
 # Generated data modules resolve to their producers. Only Zig's standard library
 # and build-generated configuration constants terminate traversal.
 SOURCE_MODULES = {
+    "antfly_media": ("zig/lib/media/src/mod.zig",),
+    "antfly_video": ("zig/lib/video/src/mod.zig",),
     "storage_ordinals": ("zig/pkg/antfly-embedded/src/storage/ordinals/root.zig",),
     "storage_ordinal_options": (),
     "storage_engine_options": (),
@@ -71,6 +73,10 @@ SOURCE_MODULES = {
     "root": tuple(SOURCE_ROOT + name for name in ENTRYPOINTS) + PACKAGE_ENTRYPOINTS,
     "antfly_local_sources": ("zig/pkg/antfly-embedded/src/source_catalog.zig",),
     "antfly_inference_host": ("zig/pkg/inference/src/host/host.zig",),
+    "antfly_inference_engine": ("zig/pkg/inference/src/host/engine.zig",),
+    "engine_options": (),
+    "engine_errors": ("zig/pkg/inference/src/host/engine_errors.zig",),
+    "engine_memory": ("zig/lib/runtime/src/runtime_memory_abi.zig",),
     "sql_parser": ("zig/lib/sql/root.zig",),
     "antfly_public_server_openapi": (
         "zig/pkg/antfly-server-api/src/openapi/generated/antfly_public_server_openapi/root.zig",
@@ -146,6 +152,7 @@ SOURCE_MODULES = {
     "antfly_embedded_db": ("zig/pkg/antfly-embedded/src/engine/db.zig",),
     "antfly_embeddings": ("zig/lib/embeddings/src/mod.zig",),
     "antfly_decisions": ("zig/lib/decisions/root.zig",),
+    "antfly_structured": ("zig/lib/structured/root.zig",),
     "antfly_decision_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_decision_openapi/root.zig",
     ),
@@ -165,6 +172,7 @@ SOURCE_MODULES = {
     "antfly_google": ("zig/lib/google/src/root.zig",),
     "antfly_hash": ("zig/lib/hash/src/mod.zig",),
     "antfly_image": ("zig/lib/image/src/mod.zig",),
+    "antfly_video_media": ("zig/lib/media/src/inference.zig",),
     "antfly_indexes_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_indexes_openapi/root.zig",
     ),
@@ -234,6 +242,7 @@ SOURCE_MODULES = {
     "antfly_reader_config": ("zig/lib/readers/src/config.zig",),
     "antfly_readers": ("zig/lib/readers/src/mod.zig",),
     "antfly_regex": ("zig/lib/regex/src/mod.zig",),
+    "antfly_grapheme": ("zig/lib/tokenizer/src/grapheme.zig",),
     "antfly_capture_regex": ("zig/lib/regex/src/captures.zig",),
     "antfly_sql_regex": ("zig/lib/sql_regex/src/mod.zig",),
     "antfly_reranking": ("zig/lib/reranking/src/mod.zig",),
@@ -340,6 +349,7 @@ CONFIGURATION_IMPORTS = {
     "standalone_runtime_options",
     "antfly_lite_options",
     "build_options",
+    "grep_cache_options",
     "capi_build_options",
     "storage_source_options",
     "std",

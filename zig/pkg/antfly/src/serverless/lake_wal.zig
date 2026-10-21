@@ -25,7 +25,8 @@ pub const max_pending = 64;
 pub const Record = struct { lsn: u64, payload: []const u8, operation_id: []const u8, previous: ?[]const u8 };
 const StoredRecord = struct { lsn: u64, payload_ref: []const u8, operation_id: []const u8, previous: ?[]const u8 };
 const Receipt = struct { version: u8 = 1, lsn: u64, operation_id: []const u8, payload_hash: []const u8 };
-const Head = struct { lsn: u64, key: []const u8 };
+pub const Head = struct { lsn: u64, key: []const u8 };
+pub const Range = struct { lsn: u64, records: []const Record };
 const Object = struct { bytes: []const u8, etag: ?[]const u8 };
 pub const Store = struct {
     client: objectstore.Client,
@@ -169,13 +170,23 @@ pub const Store = struct {
     }
     /// Pin one immutable accepted tail and return its complete bounded suffix.
     /// Changes accepted after this call belong to a subsequent read snapshot.
-    pub fn range(self: Store, a: A, cut: u64) !struct { lsn: u64, records: []const Record } {
+    /// Validate retirement and capture the immutable chain identity once.
+    pub fn pin(self: Store, a: A, cut: u64) !?Head {
         if (cut < try self.gcFloor(a)) return error.LakeOverlayCoverageUnavailable;
         const current = try self.tail(a);
         const head = current.head orelse {
             if (cut != 0) return error.LakeWalCoverageGap;
-            return .{ .lsn = 0, .records = &.{} };
+            return null;
         };
+        if (head.lsn < cut or head.lsn - cut > max_pending) return error.LakeOverlayCoverageUnavailable;
+        return head;
+    }
+    pub fn range(self: Store, a: A, cut: u64) !Range {
+        return self.rangePinned(a, cut, try self.pin(a, cut));
+    }
+    /// The caller owns the pin, and must have validated it using pin().
+    pub fn rangePinned(self: Store, a: A, cut: u64, pinned: ?Head) !Range {
+        const head = pinned orelse return .{ .lsn = cut, .records = &.{} };
         if (head.lsn < cut or head.lsn - cut > max_pending) return error.LakeOverlayCoverageUnavailable;
         var records: std.ArrayList(Record) = .empty;
         var ref = head.key;
@@ -192,6 +203,14 @@ pub const Store = struct {
         }
         std.mem.reverse(Record, records.items);
         return .{ .lsn = head.lsn, .records = records.items };
+    }
+    /// Extend only a proven immutable chain; equal LSNs alone are insufficient
+    /// when a queue has been restored or its head replaced.
+    pub fn rangeAfterHead(self: Store, a: A, previous: Head, head: Head) !?Range {
+        const suffix = try self.rangePinned(a, previous.lsn, head);
+        if (suffix.records.len == 0) return if (std.mem.eql(u8, previous.key, head.key)) suffix else null;
+        const parent = suffix.records[0].previous orelse return null;
+        return if (std.mem.eql(u8, previous.key, parent)) suffix else null;
     }
     pub fn gcFloor(self: Store, a: A) !u64 {
         const value = (try self.get(a, try self.key(a, "gc-floor"))) orelse return 0;

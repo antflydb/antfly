@@ -32,7 +32,7 @@ pub const Artifact = struct {
 pub fn add(b: *std.Build, options: std.Build.TestOptions) Artifact {
     var object_options = options;
     object_options.use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(options.root_module.resolved_target.?.result);
-    object_options.max_rss = @import("runtime_memory.zig").linkedTestCompileMaxRss(options.name, b.graph.host.result, options.root_module.resolved_target.?.result, options.root_module.optimize, options.max_rss);
+    object_options.max_rss = @import("runtime_memory.zig").testCompileMaxRss(options.name, b.graph.host.result, options.root_module.resolved_target.?.result, options.root_module.optimize, options.max_rss);
     object_options.emit_object = true;
     object_options.test_runner = options.test_runner orelse .{
         .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
@@ -165,4 +165,51 @@ fn buildArguments(b: *std.Build) ?[]const []const u8 {
         .list => |values| values.items,
         else => null,
     };
+}
+
+/// Resolve final native links after owners have attached their metadata and
+/// runtime archives, and after ownership/inventory audits have identified the
+/// test objects. Preserve the authored run arguments and prerequisites.
+pub fn finalizeNativeLinks(b: *std.Build) void {
+    if (b.graph.host.result.os.tag != .macos) return;
+    var visited = std.AutoHashMap(*std.Build.Step, void).init(b.allocator);
+    var images = std.AutoHashMap(*std.Build.Step.Compile, @import("../../../build_support/embedded/shared_library.zig").NativeExecutable).init(b.allocator);
+    for (b.top_level_steps.values()) |root| finalizeStep(b, &root.step, &visited, &images);
+}
+
+fn finalizeStep(
+    b: *std.Build,
+    step: *std.Build.Step,
+    visited: *std.AutoHashMap(*std.Build.Step, void),
+    images: *std.AutoHashMap(*std.Build.Step.Compile, @import("../../../build_support/embedded/shared_library.zig").NativeExecutable),
+) void {
+    if ((visited.getOrPut(step) catch @panic("OOM")).found_existing) return;
+    if (step.cast(std.Build.Step.Run)) |run| {
+        for (run.argv.items) |*arg| {
+            if (arg.* != .artifact) continue;
+            const authored = arg.artifact;
+            const facade = authored.artifact;
+            if (facade.kind != .exe or facade.root_module.root_source_file != null) continue;
+            const target = facade.root_module.resolved_target.?.result;
+            if (target.os.tag != .macos or target.cpu.arch != b.graph.host.result.cpu.arch) continue;
+            const object = @import("unit_test_inventory.zig").testObject(facade) orelse continue;
+            if (object.kind != .test_obj) continue;
+            const entry = images.getOrPut(facade) catch @panic("OOM");
+            if (!entry.found_existing) {
+                const native = @import("../../../build_support/embedded/shared_library.zig");
+                entry.value_ptr.* = native.nativeExecutableLink(b, object, facade.name);
+                native.addNativeExecutableLinks(b, entry.value_ptr.*, object, facade.root_module);
+            }
+            const image = entry.value_ptr.*;
+            arg.* = .{ .lazy_path = .{ .prefix = authored.prefix, .suffix = authored.suffix, .make_absolute = authored.make_absolute, .lazy_path = image.binary } };
+            // addRunArtifact authored this dependency. Replace just the final
+            // linker, retaining every other ordering and audit dependency.
+            for (step.dependencies.items) |*dependency| {
+                if (dependency.* == &facade.step) dependency.* = &image.link.step;
+            }
+            if (run.producer == facade) run.producer = null;
+            image.binary.addStepDependencies(step);
+        }
+    }
+    for (step.dependencies.items) |dependency| finalizeStep(b, dependency, visited, images);
 }

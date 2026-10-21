@@ -113,7 +113,12 @@ pub fn readManifestFromFile(
     source: std.Io.File,
     source_size: u64,
 ) !bundle.ParsedManifest {
+    return readManifestFromFileLimited(alloc, io, source, source_size, backup_codec.max_block_payload_bytes);
+}
+
+pub fn readManifestFromFileLimited(alloc: std.mem.Allocator, io: std.Io, source: std.Io.File, source_size: u64, max_block_bytes: usize) !bundle.ParsedManifest {
     var reader = backup_codec.FileReader.init(io, source, source_size);
+    reader.max_block_bytes = max_block_bytes;
     const header = try reader.readHeader();
     if (header.format_version != backup_codec.format_version)
         return error.BackupArtifactFormatMismatch;
@@ -562,17 +567,33 @@ pub fn extractNativeFileToStagingDirectoryWithBase(
     staging_root: []const u8,
     base: ?NativeBaseBlobSource,
 ) !void {
+    return extractNativeFileToStagingDirectoryOptions(alloc, io, source, source_size, staging_root, base, .none, false, backup_codec.max_block_payload_bytes);
+}
+
+/// Cancellable inspection uses private scratch; existing restore entry points
+/// retain their portable path handling and default directory permissions.
+pub fn extractNativeFileToStagingDirectoryCancellable(alloc: std.mem.Allocator, io: std.Io, source: std.Io.File, source_size: u64, staging_root: []const u8, cancellation: @import("antfly_cancellation").CancellationToken) !void {
+    return extractNativeFileToStagingDirectoryCancellableLimited(alloc, io, source, source_size, staging_root, cancellation, backup_codec.max_block_payload_bytes);
+}
+
+pub fn extractNativeFileToStagingDirectoryCancellableLimited(alloc: std.mem.Allocator, io: std.Io, source: std.Io.File, source_size: u64, staging_root: []const u8, cancellation: @import("antfly_cancellation").CancellationToken, max_block_bytes: usize) !void {
+    return extractNativeFileToStagingDirectoryOptions(alloc, io, source, source_size, staging_root, null, cancellation, true, max_block_bytes);
+}
+
+fn extractNativeFileToStagingDirectoryOptions(alloc: std.mem.Allocator, io: std.Io, source: std.Io.File, source_size: u64, staging_root: []const u8, base: ?NativeBaseBlobSource, cancellation: @import("antfly_cancellation").CancellationToken, private_scratch: bool, max_block_bytes: usize) !void {
+    try cancellation.check();
     if (pathExists(io, staging_root)) return error.PathAlreadyExists;
     const blob_root = try std.fmt.allocPrint(alloc, "{s}.afb2-blobs", .{staging_root});
     defer alloc.free(blob_root);
     if (pathExists(io, blob_root)) return error.PathAlreadyExists;
-    try fs_paths.createDirPathPortable(io, staging_root);
+    if (private_scratch) try createPrivateExtractionDirectory(io, staging_root) else try fs_paths.createDirPathPortable(io, staging_root);
     errdefer std.Io.Dir.cwd().deleteTree(io, staging_root) catch {};
-    try fs_paths.createDirPathPortable(io, blob_root);
+    if (private_scratch) try createPrivateExtractionDirectory(io, blob_root) else try fs_paths.createDirPathPortable(io, blob_root);
     defer std.Io.Dir.cwd().deleteTree(io, blob_root) catch {};
 
     const trailer = try readTrailerFromFile(io, source, source_size);
     var reader = backup_codec.FileReader.init(io, source, source_size - bundle.trailer_size);
+    reader.max_block_bytes = max_block_bytes;
     const header = try reader.readHeader();
     if (header.format_version != backup_codec.format_version) return error.BackupArtifactFormatMismatch;
     const manifest_block = try reader.readBlock(alloc);
@@ -605,6 +626,7 @@ pub fn extractNativeFileToStagingDirectoryWithBase(
     };
 
     while (reader.hasRemaining()) {
+        try cancellation.check();
         const block_offset = reader.pos;
         const block = try reader.readBlock(alloc);
         defer alloc.free(block.payload);
@@ -670,6 +692,7 @@ pub fn extractNativeFileToStagingDirectoryWithBase(
         return error.IncompleteBackupInventory;
 
     for (parsed_manifest.value.blobs) |blob| {
+        try cancellation.check();
         const blob_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ blob_root, blob.sha256 });
         defer alloc.free(blob_path);
         if (!blob.included) {
@@ -696,12 +719,14 @@ pub fn extractNativeFileToStagingDirectoryWithBase(
         std.math.cast(u32, parsed_manifest.value.blobs.len) orelse return error.BackupManifestTooLarge,
     );
     for (parsed_manifest.value.objects) |object| {
+        try cancellation.check();
         const result = blob_reference_counts.getOrPutAssumeCapacity(object.sha256);
         if (!result.found_existing) result.value_ptr.* = 0;
         result.value_ptr.* = std.math.add(usize, result.value_ptr.*, 1) catch
             return error.BackupManifestTooLarge;
     }
     for (parsed_manifest.value.objects) |object| {
+        try cancellation.check();
         const blob_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ blob_root, object.sha256 });
         defer alloc.free(blob_path);
         const destination = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ staging_root, object.logical_path });
@@ -714,7 +739,7 @@ pub fn extractNativeFileToStagingDirectoryWithBase(
         if (blob_reference_counts.get(object.sha256).? == 1)
             try renameFilePortable(io, blob_path, destination)
         else
-            try copyFileBounded(io, blob_path, destination, object.size_bytes);
+            try copyFileBoundedCancellable(io, blob_path, destination, object.size_bytes, cancellation);
     }
     try fs_paths.syncDirPortable(io, staging_root);
 }
@@ -759,6 +784,10 @@ fn verifyFileDigest(io: std.Io, path: []const u8, expected_size: u64, expected_h
 }
 
 fn copyFileBounded(io: std.Io, source_path: []const u8, destination_path: []const u8, size: u64) !void {
+    return copyFileBoundedCancellable(io, source_path, destination_path, size, .none);
+}
+
+fn copyFileBoundedCancellable(io: std.Io, source_path: []const u8, destination_path: []const u8, size: u64, cancellation: @import("antfly_cancellation").CancellationToken) !void {
     var source = if (std.fs.path.isAbsolute(source_path))
         try std.Io.Dir.openFileAbsolute(io, source_path, .{})
     else
@@ -769,6 +798,7 @@ fn copyFileBounded(io: std.Io, source_path: []const u8, destination_path: []cons
     var buffer: [io_buffer_bytes]u8 = undefined;
     var offset: u64 = 0;
     while (offset < size) {
+        try cancellation.check();
         const wanted: usize = @intCast(@min(@as(u64, buffer.len), size - offset));
         const read = try source.readPositionalAll(io, buffer[0..wanted], offset);
         if (read != wanted) return error.BackupArtifactIntegrityMismatch;
@@ -800,6 +830,17 @@ fn finishExtractedBlob(
         active.file.close(io);
         active.header.deinit(alloc);
         current.* = null;
+    }
+}
+
+fn createPrivateExtractionDirectory(io: std.Io, path: []const u8) !void {
+    // Keep the shared path helper's support for symlinked absolute ancestors.
+    // Create only the new leaf with private permissions, without a chmod window.
+    if (std.fs.path.dirname(path)) |parent| try fs_paths.createDirPathPortable(io, parent);
+    if (std.fs.path.isAbsolute(path)) {
+        try std.Io.Dir.createDirAbsolute(io, path, .fromMode(0o700));
+    } else {
+        try std.Io.Dir.cwd().createDir(io, path, .fromMode(0o700));
     }
 }
 
@@ -853,6 +894,35 @@ test "AFB2 native directory round trips through staged extraction" {
     const restored = try std.Io.Dir.cwd().readFileAlloc(io, restored_dense_path, alloc, .limited(1024));
     defer alloc.free(restored);
     try std.testing.expectEqualStrings("searchable-dense-generation", restored);
+
+    if (@import("builtin").os.tag != .windows) {
+        // Absolute temporary roots may contain symlinks (for example /tmp on
+        // macOS). Both existing restore and private inspection must accept them.
+        try output_tmp.dir.symLink(io, ".", "directory-link", .{ .is_directory = true });
+        const output_root = try output_tmp.dir.realPathFileAlloc(io, ".", alloc);
+        defer alloc.free(output_root);
+        const legacy = try std.fmt.allocPrint(alloc, "{s}/directory-link/legacy", .{output_root});
+        defer alloc.free(legacy);
+        const private = try std.fmt.allocPrint(alloc, "{s}/directory-link/private", .{output_root});
+        defer alloc.free(private);
+        const reference = try std.fmt.allocPrint(alloc, "{s}/directory-link/reference", .{output_root});
+        defer alloc.free(reference);
+        try fs_paths.createDirPathPortable(io, reference);
+        try extractNativeFileToStagingDirectory(alloc, io, archive_file, archive.items.len, legacy);
+        try extractNativeFileToStagingDirectoryCancellable(alloc, io, archive_file, archive.items.len, private, .none);
+        const reference_stat = try std.Io.Dir.cwd().statFile(io, reference, .{});
+        const legacy_stat = try std.Io.Dir.cwd().statFile(io, legacy, .{});
+        const private_stat = try std.Io.Dir.cwd().statFile(io, private, .{});
+        try std.testing.expectEqual(reference_stat.permissions.toMode(), legacy_stat.permissions.toMode());
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), private_stat.permissions.toMode() & 0o777);
+        for ([_][]const u8{ legacy, private }) |root| {
+            const content_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense/segment.bin", .{root});
+            defer alloc.free(content_path);
+            const content = try std.Io.Dir.cwd().readFileAlloc(io, content_path, alloc, .limited(1024));
+            defer alloc.free(content);
+            try std.testing.expectEqualStrings("searchable-dense-generation", content);
+        }
+    }
 }
 
 const TestBaseBlobContext = struct {

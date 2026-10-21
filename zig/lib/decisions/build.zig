@@ -13,11 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const std = @import("std");
-
-/// Share a single source identity across SQL and inference consumers. This
-/// std-only module inherits the consumer's target and optimization settings.
-pub fn create(b: *std.Build, root: std.Build.LazyPath) *std.Build.Module {
-    if (b.modules.get("antfly_decisions")) |existing| return existing;
-    return b.addModule("antfly_decisions", .{ .root_source_file = root });
-}
+// Keep one constructor identity for composed builds and the standalone
+// inference package, whose build module cannot import outside its own root.
+const support = @import("../../pkg/inference/build/decision_modules.zig");
+pub const create = support.create;
+pub const createOpenApi = support.createOpenApi;

@@ -30,6 +30,59 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .grouped_source_owner_changed, .err = error.GroupedSourceOwnerChanged },
+    .{ .status = .grouped_source_topology_unavailable, .err = error.GroupedSourceTopologyUnavailable },
+    .{ .status = .apple_intelligence_provider_unavailable, .err = error.AppleIntelligenceProviderUnavailable },
+    .{ .status = .artifact_publication_pending, .err = error.ArtifactPublicationPending },
+    .{ .status = .chatgpt_billing_fallback_forbidden, .err = error.ChatGPTBillingFallbackForbidden },
+    .{ .status = .chatgpt_disabled, .err = error.ChatGPTDisabled },
+    .{ .status = .chatgpt_interactive_only, .err = error.ChatGPTInteractiveOnly },
+    .{ .status = .conflicting_rate_limit_policy, .err = error.ConflictingRateLimitPolicy },
+    .{ .status = .constrained_input_too_large, .err = error.ConstrainedInputTooLarge },
+    .{ .status = .decide_request_limit_exceeded, .err = error.DecideRequestLimitExceeded },
+    .{ .status = .durable_root_incarnation_unavailable, .err = error.DurableRootIncarnationUnavailable },
+    .{ .status = .enrichment_source_changed, .err = error.EnrichmentSourceChanged },
+    .{ .status = .generated_extraction_limit_exceeded, .err = error.GeneratedExtractionLimitExceeded },
+    .{ .status = .grouped_prior_context_limit_exceeded, .err = error.GroupedPriorContextLimitExceeded },
+    .{ .status = .grouped_source_baseline_pending, .err = error.GroupedSourceBaselinePending },
+    .{ .status = .grouped_source_busy, .err = error.GroupedSourceBusy },
+    .{ .status = .grouped_source_corrupt, .err = error.GroupedSourceCorrupt },
+    .{ .status = .grouped_source_earlier_work_pending, .err = error.GroupedSourceEarlierWorkPending },
+    .{ .status = .grouped_source_identity_conflict, .err = error.GroupedSourceIdentityConflict },
+    .{ .status = .grouped_source_limit_exceeded, .err = error.GroupedSourceLimitExceeded },
+    .{ .status = .grouped_source_member_limit_exceeded, .err = error.GroupedSourceMemberLimitExceeded },
+    .{ .status = .grouped_source_member_too_large, .err = error.GroupedSourceMemberTooLarge },
+    .{ .status = .grouped_source_partition_too_large, .err = error.GroupedSourcePartitionTooLarge },
+    .{ .status = .grouped_source_retirement_pending, .err = error.GroupedSourceRetirementPending },
+    .{ .status = .invalid_constrained_generation_config, .err = error.InvalidConstrainedGenerationConfig },
+    .{ .status = .invalid_constrained_output, .err = error.InvalidConstrainedOutput },
+    .{ .status = .invalid_constrained_probabilities, .err = error.InvalidConstrainedProbabilities },
+    .{ .status = .invalid_constrained_schema, .err = error.InvalidConstrainedSchema },
+    .{ .status = .invalid_decide_request, .err = error.InvalidDecideRequest },
+    .{ .status = .invalid_decision_output, .err = error.InvalidDecisionOutput },
+    .{ .status = .invalid_generated_extractor_config, .err = error.InvalidGeneratedExtractorConfig },
+    .{ .status = .invalid_generator_config, .err = error.InvalidGeneratorConfig },
+    .{ .status = .invalid_generator_tool_config, .err = error.InvalidGeneratorToolConfig },
+    .{ .status = .invalid_grouped_prior_context, .err = error.InvalidGroupedPriorContext },
+    .{ .status = .invalid_grouped_source_command, .err = error.InvalidGroupedSourceCommand },
+    .{ .status = .invalid_grouped_source_config, .err = error.InvalidGroupedSourceConfig },
+    .{ .status = .invalid_grouped_source_member, .err = error.InvalidGroupedSourceMember },
+    .{ .status = .invalid_grouped_source_mutation, .err = error.InvalidGroupedSourceMutation },
+    .{ .status = .invalid_grouped_source_query, .err = error.InvalidGroupedSourceQuery },
+    .{ .status = .invalid_grouped_source_transfer, .err = error.InvalidGroupedSourceTransfer },
+    .{ .status = .invalid_rate_limit_policy, .err = error.InvalidRateLimitPolicy },
+    .{ .status = .invalid_structured_output, .err = error.InvalidStructuredOutput },
+    .{ .status = .missing_generator_credentials, .err = error.MissingGeneratorCredentials },
+    .{ .status = .provider_token_budget_exceeded, .err = error.ProviderTokenBudgetExceeded },
+    .{ .status = .secret_not_found, .err = error.SecretNotFound },
+    .{ .status = .unknown_schema_version, .err = error.UnknownSchemaVersion },
+    .{ .status = .unsupported_apple_generation_options, .err = error.UnsupportedAppleGenerationOptions },
+    .{ .status = .unsupported_constrained_output, .err = error.UnsupportedConstrainedOutput },
+    .{ .status = .unsupported_constrained_probabilities, .err = error.UnsupportedConstrainedProbabilities },
+    .{ .status = .unsupported_constrained_schema, .err = error.UnsupportedConstrainedSchema },
+    .{ .status = .unsupported_generated_extraction_schema, .err = error.UnsupportedGeneratedExtractionSchema },
+    .{ .status = .unsupported_local_rate_limit, .err = error.UnsupportedLocalRateLimit },
+    .{ .status = .unsupported_media_token_budget, .err = error.UnsupportedMediaTokenBudget },
     .{ .status = .setting_authority_unavailable, .err = error.SettingAuthorityUnavailable },
     .{ .status = .online_merge_artifact_tails_unsupported, .err = error.OnlineMergeArtifactTailsUnsupported },
     .{ .status = .artifact_catalog_corrupt, .err = error.ArtifactCatalogCorrupt },
@@ -309,6 +362,9 @@ const mappings = [_]Mapping{
     .{ .status = .invalid_aggregation, .err = error.InvalidAggregation },
     .{ .status = .unsupported_aggregation, .err = error.UnsupportedAggregation },
     .{ .status = .query_candidate_budget_exceeded, .err = error.QueryCandidateBudgetExceeded },
+    .{ .status = .value_verification_requires_scan, .err = error.ValueSearchRequiresScan },
+    .{ .status = .value_verification_limit_exceeded, .err = error.ValueSearchLimitExceeded },
+    .{ .status = .decision_limit_exceeded, .err = error.DecisionLimitExceeded },
     .{ .status = .invalid_index_config, .err = error.InvalidIndexConfig },
     .{ .status = .algebraic_planner_scan_too_large, .err = error.AlgebraicPlannerScanTooLarge },
     .{ .status = .algebraic_result_bucket_limit, .err = error.AlgebraicResultBucketLimit },
@@ -1037,5 +1093,19 @@ test "committed visibility outcomes survive the storage owner boundary" {
         try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
         try std.testing.expectError(err, statusToError(failure.status));
         try std.testing.expectEqualStrings(@errorName(err), failure.errorName());
+    }
+}
+
+test "external lake evaluation limits survive the compiled query owner boundary" {
+    const failure = failureFromError(error.DecisionLimitExceeded, .local_query, abi.abi_version, 4);
+    try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+    try std.testing.expectError(error.DecisionLimitExceeded, statusToError(failure.status));
+    try std.testing.expectEqualStrings("DecisionLimitExceeded", failure.errorName());
+}
+
+test "logical value query policy errors retain identity across compiled storage boundaries" {
+    inline for (.{ error.ValueSearchRequiresScan, error.ValueSearchLimitExceeded }) |err| {
+        try std.testing.expect(statusFromError(err) != .internal);
+        try std.testing.expectError(err, statusToError(statusFromError(err)));
     }
 }

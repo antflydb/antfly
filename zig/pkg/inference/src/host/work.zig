@@ -910,6 +910,10 @@ pub const InferenceCapabilities = struct {
     /// envelope. Unlike borrowed_attachments, this is a wire capability and
     /// is therefore safe to advertise across process boundaries.
     framed_attachments: bool = false,
+    /// Concrete generation executor accepts schema-constrained native decoding.
+    generation_grammar_v1: bool = false,
+    generation_token_logprobs_v1: bool = false,
+    model_aware_chunking_v1: bool = false,
     /// The HTTP route guarantees AFN1 dense/score responses when requested
     /// exclusively. Version 1 has a fixed 4-MiB frame ceiling.
     numeric_responses_v1: bool = false,
@@ -935,6 +939,7 @@ pub const InferenceCapabilities = struct {
 
     pub fn validate(self: InferenceCapabilities) !void {
         try self.batch.validate();
+        if ((self.generation_grammar_v1 or self.generation_token_logprobs_v1) and self.task != .generate) return error.InvalidInferenceCapabilities;
         if (self.image_transform) |transform| {
             try transform.validate();
             if (!self.input_modalities.image) return error.InvalidInferenceCapabilities;

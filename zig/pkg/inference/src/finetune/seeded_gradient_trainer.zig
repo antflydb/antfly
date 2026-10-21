@@ -150,9 +150,7 @@ const CombinedControl = struct {
         // Both full controls remain borrowed until every synchronous binding
         // operation/guard completes. Retain their worker/IO carrier as well as
         // callbacks: process-required primitives must still arm the watchdog.
-        result.ptr = self;
-        result.check_fn = checkBoth;
-        return result;
+        return result.withCheckpoint(self, checkBoth);
     }
 };
 
@@ -211,7 +209,7 @@ test "seeded gradient trainer binding control preserves worker carrier both canc
     {
         // This exercises the real process-required guard/monitor contract
         // without a process, thread, device, timer or tensor allocation.
-        var guard = try active.enterUninterruptible(.process_required);
+        var guard = try active.enterUninterruptible(.uninterruptible);
         defer guard.deinit();
         const monitor = original.monitor.?;
         try std.testing.expectEqual(future - 2, monitor.deadline_ns.?);
@@ -243,7 +241,7 @@ test "seeded gradient trainer binding control preserves worker carrier both canc
     try std.testing.expectEqual(request.io.?, active.io.?);
     try std.testing.expectEqual(future - 3, active.deadline_ns.?);
     {
-        var guard = try active.enterUninterruptible(.process_required);
+        var guard = try active.enterUninterruptible(.uninterruptible);
         defer guard.deinit();
         try requested.monitor.?.check();
     }
@@ -256,7 +254,7 @@ test "seeded gradient trainer binding control preserves worker carrier both canc
     try std.testing.expectError(error.Timeout, active.check());
     combined.primary = null;
     combined.secondary = .{};
-    try std.testing.expectError(error.ProcessIsolationRequired, combined.control().enterUninterruptible(.process_required));
+    try std.testing.expectError(error.ProcessIsolationRequired, combined.control().enterUninterruptible(.uninterruptible));
 }
 
 fn validateSchedule(schedule: optimizers.LearningRateSchedule) !void {
@@ -288,6 +286,9 @@ pub const Trainer = struct {
     /// The device epoch is authoritative in resident mode. Host mirrors are
     /// certified only after a complete bounded checkpoint/export readback.
     host_mirrors_current: bool = true,
+    /// Device state was last written by a successful transaction, which
+    /// proved it finite (see `device_transaction.State.committed_finite`).
+    device_state_proven: bool = false,
     last_device_receipt: ?device_transaction.Receipt = null,
 
     pub fn init(a: Allocator, cb: *const ops.ComputeBackend, parameters: []const Parameter, config: Config) !Trainer {
@@ -712,6 +713,7 @@ pub const Trainer = struct {
             .pytorch_clip_order = self.pytorch_clip_order,
             .slots = slots,
             .groups = groups,
+            .committed_finite = self.device_state_proven,
         }, .{ .expected = .{ .optimizer_step = expected.optimizer_step, .microbatch_step = expected.microbatch_step }, .action = if (flush_only) .flush else .submit, .loss = loss, .gradients = incoming }, transaction_limits, control);
         defer pending.deinit();
         try check(control);
@@ -744,6 +746,7 @@ pub const Trainer = struct {
         self.owner.accum_count = receipt.accumulated_microbatches;
         if (pending.replacements.len != 0) self.host_mirrors_current = false;
         self.last_device_receipt = receipt;
+        self.device_state_proven = true;
         return .{ .loss = receipt.loss, .optimizer_stepped = receipt.optimizer_stepped, .grad_norm = receipt.grad_norm, .identity = self.identity(), .accumulated_microbatches = receipt.accumulated_microbatches };
     }
 
@@ -760,6 +763,7 @@ pub const Trainer = struct {
     }
 
     fn initializeDevice(self: *Trainer, control: ?Control) !void {
+        self.device_state_proven = false;
         _ = try device_state.initializeFromHost(&self.owner, self.deviceLimits(), control);
         self.host_mirrors_current = true;
     }

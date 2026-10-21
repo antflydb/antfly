@@ -118,6 +118,19 @@ pub const Invocation = struct {
         self.phase = .prepared;
     }
 
+    pub fn prepareNativeOrJson(self: *Invocation, backing: A, json: []const std.json.Value, native: ?[]const scalar.Datum, limits: frames.Limits) !void {
+        const values = native orelse return self.prepareJson(backing, json, limits);
+        if (self.phase != .binding or values.len != json.len or values.len > 1024) return error.InvalidSqlParameters;
+        try self.freeze();
+        var inputs: [1024]frames.Input = undefined;
+        for (values, inputs[0..values.len]) |value, *input| input.* = .{ .datum = value };
+        var frame = try frames.Frame.prepare(backing, self.descriptors, inputs[0..values.len], limits);
+        errdefer frame.deinit();
+        try self.validateFrame(&frame);
+        self.frame = frame;
+        self.phase = .prepared;
+    }
+
     fn freeze(self: *Invocation) !void {
         for (self.descriptors, 0..) |*descriptor, index| {
             // Unused positional holes have no SQL constraint. Preserve the

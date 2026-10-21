@@ -125,6 +125,19 @@ pub const ObjectMetadata = struct {
     }
 };
 
+/// Evidence applies only to the exact non-null generation supplied to the
+/// request. It never proves immutability of the current name. Expiry comes from
+/// the provider. observed_ms bounds its Date upward for precision and transfer
+/// time; callers must refresh provider time before reusing persisted evidence
+/// and account for elapsed time and their operation deadline thereafter.
+pub const VersionRetention = struct {
+    observed_ms: u64,
+    until_ms: u64,
+    pub fn protectsThrough(self: @This(), deadline_ms: u64) bool {
+        return self.observed_ms < self.until_ms and deadline_ms < self.until_ms;
+    }
+};
+
 pub const PutOptions = struct {
     content_type: ?[]const u8 = null,
     if_match_etag: ?[]const u8 = null,
@@ -171,6 +184,7 @@ pub const GetOptions = struct {
 };
 
 pub const StatOptions = struct {
+    version_id: ?[]const u8 = null,
     cancellation: ?CancellationToken = null,
 };
 
@@ -214,6 +228,8 @@ pub const ObjectVersionEntry = struct {
 };
 
 pub const ListObjectVersionsOptions = struct {
+    continuation_token: ?[]const u8 = null,
+    cancellation: ?CancellationToken = null,
     prefix: []const u8 = "",
     /// S3-style pagination is a tuple. `version_id_marker` is invalid without
     /// `key_marker`; a key marker alone is permitted by the provider API.
@@ -239,6 +255,10 @@ pub const PutResult = struct {
 };
 
 pub const GetResult = struct {
+    /// Wire response metadata; local providers leave these null.
+    response_status: ?u16 = null,
+    response_etag_strong: bool = false,
+    response_range: ?ContentRange = null,
     /// The provider enforced the supplied If-Match condition on this successful
     /// GET. Media and JSON metadata can expose different ETag representations;
     /// callers may use this proof instead of comparing those representations.
@@ -313,6 +333,7 @@ pub const ListResult = struct {
 };
 
 pub const ListObjectVersionsResult = struct {
+    next_continuation_token: ?[]u8 = null,
     entries: []ObjectVersionEntry,
     is_truncated: bool,
     next_key_marker: ?[]u8 = null,
@@ -321,6 +342,7 @@ pub const ListObjectVersionsResult = struct {
     pub fn deinit(self: *ListObjectVersionsResult, alloc: Allocator) void {
         for (self.entries) |*entry| entry.deinit(alloc);
         alloc.free(self.entries);
+        if (self.next_continuation_token) |value| alloc.free(value);
         if (self.next_key_marker) |value| alloc.free(value);
         if (self.next_version_id_marker) |value| alloc.free(value);
         self.* = undefined;
@@ -358,4 +380,38 @@ test "object attributes own part metadata" {
         .etag = try alloc.dupe(u8, "part-etag"),
     };
     attrs.deinit(alloc);
+}
+
+/// A single, closed HTTP byte range. Wildcard totals and multipart ranges are
+/// unsuitable for immutable random access and deliberately rejected.
+pub const ContentRange = struct {
+    offset: u64,
+    length: u64,
+    total: u64,
+    pub fn parse(value: []const u8) !ContentRange {
+        if (!std.mem.startsWith(u8, value, "bytes ")) return error.InvalidContentRange;
+        const dash = std.mem.indexOfScalarPos(u8, value, 6, '-') orelse return error.InvalidContentRange;
+        const slash = std.mem.indexOfScalarPos(u8, value, dash + 1, '/') orelse return error.InvalidContentRange;
+        const offset = try decimal(value[6..dash]);
+        const end = try decimal(value[dash + 1 .. slash]);
+        const total = try decimal(value[slash + 1 ..]);
+        if (end < offset or end >= total) return error.InvalidContentRange;
+        return .{ .offset = offset, .length = end - offset + 1, .total = total };
+    }
+    fn decimal(value: []const u8) !u64 {
+        if (value.len == 0) return error.InvalidContentRange;
+        for (value) |byte| if (byte < '0' or byte > '9') return error.InvalidContentRange;
+        return std.fmt.parseInt(u64, value, 10) catch error.InvalidContentRange;
+    }
+};
+test "HTTP content range rejects open multipart malformed and overflow ranges" {
+    try std.testing.expectEqual(ContentRange{ .offset = 2, .length = 4, .total = 16 }, try ContentRange.parse("bytes 2-5/16"));
+    for ([_][]const u8{ "bytes 2-5/*", "bytes 2-1/16", "bytes 2-16/16", "bytes -2-5/16", "bytes 2-5/16,18-19/20", "bytes 2-5/18446744073709551616", "bytes +2-5/16", "bytes 0-0/0" }) |value| try std.testing.expectError(error.InvalidContentRange, ContentRange.parse(value));
+}
+
+pub fn isStrongEtag(value: ?[]const u8) bool {
+    const tag = value orelse return false;
+    if (tag.len < 2 or tag[0] != '"' or tag[tag.len - 1] != '"') return false;
+    for (tag[1 .. tag.len - 1]) |byte| if (byte < 0x21 or byte == 0x22 or byte == 0x7f) return false;
+    return true;
 }

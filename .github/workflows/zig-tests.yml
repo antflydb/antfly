@@ -69,6 +69,56 @@ jobs:
       comment_id: ${{ inputs.comment_id }}
       suite: ${{ inputs.full_validation && 'full' || 'zig' }}
 
+  grep-qualification:
+    name: native grep qualification
+    needs: admission
+    if: ${{ !cancelled() && needs.admission.result == 'success' && inputs.validation_scope != 'inference-e2e' && (inputs.pr_number == '' || github.run_attempt == 1) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/load-toolchain-policy
+        id: toolchain
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+      - name: Install compression oracles
+        run: sudo apt-get update && sudo apt-get install -y bzip2 xz-utils time
+      - name: Verify native Linux and pinned oracle
+        shell: bash
+        run: |
+          test "$(uname -m)" = x86_64
+          curl --fail --location --retry 3 https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-unknown-linux-musl.tar.gz -o "$RUNNER_TEMP/rg.tar.gz"
+          tar -xzf "$RUNNER_TEMP/rg.tar.gz" -C "$RUNNER_TEMP"
+          echo 'e62198eb19b136b88c330af83647b5a962cb99b6b1f066758568f12de1974849  '"$RUNNER_TEMP/ripgrep-15.2.0-x86_64-unknown-linux-musl/rg" | sha256sum --check
+          echo "$RUNNER_TEMP/ripgrep-15.2.0-x86_64-unknown-linux-musl" >> "$GITHUB_PATH"
+      - name: Native tests and generated differential campaign
+        run: |
+          zig build --build-file zig/build.zig -Dgrep-only=true -Doptimize=ReleaseFast -Dstrip=true grep grep-test
+          mkdir -p zig/zig-out/grep-qualification
+          python3 zig/pkg/antfly-grep/tests/differential.py zig/zig-out/bin/antfly-grep "$(command -v rg)" --seed 116417 --cases 5000 --output zig/zig-out/grep-qualification/differential.json
+      - name: Benchmark native CPU and cache configurations
+        shell: bash
+        run: |
+          python3 zig/pkg/antfly-grep/bench/compare.py zig/zig-out/bin/antfly-grep --extended --codecs --mib 8 --rounds 7 --quiet --output zig/zig-out/grep-qualification/warm.json
+          python3 zig/pkg/antfly-grep/bench/compare.py zig/zig-out/bin/antfly-grep --mib 32 --rounds 7 --cpus 1 --threads 1 --case literal-miss --case buffered-regex --output zig/zig-out/grep-qualification/cpu-one.json --quiet
+          python3 zig/pkg/antfly-grep/bench/compare.py zig/zig-out/bin/antfly-grep --mib 32 --rounds 7 --cpus 1 --cache-mode cold-advice --case literal-miss --case buffered-regex --output zig/zig-out/grep-qualification/cold-advice.json --quiet
+          for jobs in 1 2 4 8; do
+            python3 zig/pkg/antfly-grep/bench/compare.py zig/zig-out/bin/antfly-grep --repository go/pkg/sdk --threads "$jobs" --rounds 7 --case repository-files --case repository-search --output "zig/zig-out/grep-qualification/workers-$jobs.json" --quiet
+          done
+      - name: Verify standalone release contents
+        run: |
+          python3 -m unittest discover -s scripts/packaging -p test_grep_packaging.py
+          python3 scripts/packaging/package_grep_release.py --binary zig/zig-out/bin/antfly-grep --output zig/zig-out/grep-qualification/antfly-grep-linux-x86_64.tar.gz
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: native-grep-qualification
+          path: zig/zig-out/grep-qualification/
+
   changes:
     if: >-
       ${{ !cancelled() &&
@@ -384,6 +434,12 @@ jobs:
         run: scripts/test-backup-s3-integration.sh
 
   arm64-codec:
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      id-token: write
     if: >-
       ${{ !cancelled() &&
       success() &&
@@ -447,6 +503,23 @@ jobs:
             --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
+      # The admitted branch can predate this action. Bootstrap tooling from
+      # the same immutable revision as the executing approval workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+          sparse-checkout-cone-mode: false
+
+      - name: Prepare verified Zig source dependencies
+        uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
+
       - name: Verify Zig version
         env:
           ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
@@ -469,6 +542,12 @@ jobs:
           zig test zig/lib/hash/src/mod.zig -O safe -mcpu=baseline -lc
 
   zig-base-tests:
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      id-token: write
     if: >-
       ${{ !cancelled() &&
       success() &&
@@ -511,7 +590,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file libopenblas0-pthread
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -530,6 +609,23 @@ jobs:
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
           mkdir -p "$local_cache" "$global_cache"
 
+      # The admitted branch can predate this action. Bootstrap tooling from
+      # the same immutable revision as the executing approval workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+          sparse-checkout-cone-mode: false
+
+      - name: Prepare verified Zig source dependencies
+        uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
+
       - name: Verify Zig version
         run: zig version
 
@@ -545,6 +641,14 @@ jobs:
       - name: Test portable Linux x86 inference kernel dispatch
         run: python3 zig/tools/verify_linux_x86_kernels.py
 
+      - name: Test native Linux x86 video decoding and logical indexing
+        working-directory: zig/lib/video
+        run: |
+          uname -srm
+          test "$(uname -s)" = "Linux"
+          test "$(uname -m)" = "x86_64"
+          zig build test-video -Dcpu=baseline -Doptimize=ReleaseSafe -j1 --summary all
+
       - name: Test optional OpenBLAS dispatch and fallback
         run: python3 zig/tools/verify_runtime_openblas.py --openblas-library /usr/lib/x86_64-linux-gnu/libopenblas.so.0
 
@@ -556,26 +660,15 @@ jobs:
           # A successful aggregate could hide a skipped process check.
           grep -q 'run python3 success' "$RUNNER_TEMP/platform-musl.log"
 
-      - name: Set up Node for WASM tests
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - name: Set up Node for generated source checks
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: ts/package.json
 
-      - name: Build and test Apache WASM artifacts
-        working-directory: zig
-        run: |
-          # The @antfly/web package contract suite runs from its built ESM
-          # artifact in the TypeScript SDK gate.
-          node pkg/antfly-embedded/wasm_client_test.mjs
-          python3 tools/run_bounded_zig_build.py build wasm-test inference-wasm -Dmetal=false -j1 -freference-trace=30 --summary all
-          EXTRACTION_WASM=zig-out/antfly-extraction-cpu.wasm node --test pkg/inference/web/test-extraction-runtime.mjs pkg/inference/web/test-laya-runtime.mjs pkg/inference/web/test-decide-runtime.mjs pkg/inference/web/test-backends-runtime.mjs
-          zig build inference-wasm -Dwebgpu=true -Dmetal=false -j1 -freference-trace=30 --summary all
-          zig build inference-wasm -Dwasm-memory-model=wasm64 -Dmetal=false -j1 -freference-trace=30 --summary all
-          cd pkg/inference
-          zig build wasm -Dwasm=true -j1 --summary all
-          node web/test-wasm-abi.mjs wasm32
-          zig build wasm -Dwasm=true -Dwasm-memory-model=wasm64 -j1 --summary all
-          node web/test-wasm-abi.mjs wasm64
+      - name: Verify Zig source cache round trip
+        env:
+          ANTFLY_TEST_ZIG: zig
+        run: python3 -m unittest discover -s scripts/ci -p test_zig_dependencies.py
 
       - name: Check generated sources
         run: make zig-generated-check
@@ -627,9 +720,9 @@ jobs:
       - name: Check inference kernels through the root build graph
         working-directory: zig
         run: >-
-          zig build inference-test -Dmetal=false -Dcuda=false --
-          --test-filter "quant kernel compiler"
-          --test-filter "metal renderer"
+          zig build inference-test -Dmetal=false -Dcuda=false
+          -Dtest-filter="quant kernel compiler"
+          -Dtest-filter="metal renderer"
 
       - name: Run inference benchmark and release contract tests
         working-directory: zig/pkg/inference
@@ -668,54 +761,6 @@ jobs:
       - name: Test reproducible release archive packaging
         run: python3 scripts/packaging/test_reproducible_tar.py
 
-      - name: Exercise real Lite extraction through public graph APIs
-        if: needs.changes.outputs.zig_tests == 'true'
-        timeout-minutes: 25
-        run: |
-          set -euo pipefail
-          models_root="$GITHUB_WORKSPACE/zig/.test-models/lite-eval"
-          model_dir="$models_root/fastino/gliner2.5-base-v1"
-          trap 'rm -rf "$models_root"' EXIT
-          python3 scripts/ci/prepare_lite_graph_model.py "$model_dir" --embedding-destination "$models_root/Qwen/Qwen3-Embedding-0.6B-GGUF"
-          cd zig
-          ANTFLY_LITE_REQUIRE_EXTRACTOR_TEST=1 ANTFLY_LITE_EXTRACTOR_MODEL_DIR="$model_dir" python3 tools/run_bounded_zig_build.py build capi capi-test \
-            -Dembedded-only=true -Dlite-local-inference-runtime=true -Dmetal=false -Dcuda=false \
-            -j1
-          cd pkg/inference
-          python3 ../../tools/run_bounded_zig_build.py build test \
-            '-Dtest-filter=capi resolver model identity' -Dmetal=false -Dcuda=false -j1 \
-            --cache-dir ../../.zig-cache --prefix ../../zig-out
-          cd ../../..
-          python3 scripts/ci/prepare_lite_previous_reader.py
-          ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
-          ANTFLY_LITE_PREVIOUS_LIBRARY="$GITHUB_WORKSPACE/.worktrees/reader-baseline-e8666a5b75/zig/zig-out/lib/libantfly.so" \
-          ANTFLY_LITE_REQUIRE_PREVIOUS_READER=1 \
-          ANTFLY_LITE_REQUIRE_LIBRARY=1 PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
-            uv run --no-project --with pytest python -m pytest -q py/packages/embedded/tests/test_graph_edge_readiness.py
-          ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
-          PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
-            python3 scripts/ci/run_lite_extraction_eval.py --models-dir "$models_root" \
-              --output "$RUNNER_TEMP/lite-extraction-eval.json"
-          ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
-          PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
-            python3 scripts/ci/run_lite_embedding_test.py --models-dir "$models_root"
-
-      - name: Locate real-model extraction evaluation
-        id: lite_extraction_report
-        if: always() && needs.changes.outputs.zig_tests == 'true'
-        run: |
-          if [ -f "$RUNNER_TEMP/lite-extraction-eval.json" ]; then
-            echo 'exists=true' >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Upload real-model extraction evaluation
-        if: always() && needs.changes.outputs.zig_tests == 'true' && steps.lite_extraction_report.outputs.exists == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: lite-extraction-evaluation
-          path: ${{ runner.temp }}/lite-extraction-eval.json
-          if-no-files-found: error
-
       - name: Release completed pre-unit test artifacts
         if: needs.changes.outputs.zig_tests == 'true'
         run: |
@@ -753,181 +798,10 @@ jobs:
           ANTFLY_TEST_WORK_PROFILE: "1"
           ANTFLY_TEST_CLEANUP_TRACE: "1"
           ANTFLY_TEST_TIMINGS: "1"
-        run: |
-          set -euo pipefail
-
-          collect_descendants() {
-            local roots="$*"
-            local all=" ${roots} "
-            local changed=1
-            while [ "$changed" -eq 1 ]; do
-              changed=0
-              while read -r pid ppid; do
-                if [[ " $all " == *" $ppid "* && " $all " != *" $pid "* ]]; then
-                  all="${all}${pid} "
-                  changed=1
-                fi
-              done < <(ps -eo pid=,ppid=)
-            done
-            echo "$all"
-          }
-
-          dump_stacks() {
-            local root_pid="$1"
-            for partition_log in "$ANTFLY_TEST_LOG_DIR"/*.log; do
-              [ -f "$partition_log" ] || continue
-              echo "::group::partition progress $partition_log"
-              tail -n 80 "$partition_log" || true
-              echo "::endgroup::"
-            done
-            echo "::group::antfly unit watchdog ptrace settings"
-            if [ -r /proc/sys/kernel/yama/ptrace_scope ]; then
-              cat /proc/sys/kernel/yama/ptrace_scope || true
-            fi
-            sysctl kernel.yama.ptrace_scope 2>/dev/null || true
-            echo "::endgroup::"
-
-            echo "::group::antfly unit watchdog process tree"
-            ps -eo pid,ppid,stat,etime,cmd | awk 'NR == 1 || /zig build|zig-local|\/test|make zig-unit-test|make -C \.\/zig unit-test/' || true
-            echo "::endgroup::"
-
-            local pids
-            pids="$(collect_descendants "$root_pid")"
-            for pid in $pids; do
-              if ! kill -0 "$pid" 2>/dev/null; then
-                continue
-              fi
-              local cmdline
-              cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
-              case "$cmdline" in
-                *"/test "*|*"/test"*|*"-tests "*|*"-tests"|*"zig build"*|*" make "*)
-                  # Ephemeral runner caches disappear with the pod. Keep the
-                  # test bytes even when ptrace cannot supply a stack trace.
-                  python3 zig/tools/retain_test_process.py "$pid" "$ANTFLY_TEST_LOG_DIR/hung" || true
-                  echo "::group::proc snapshot pid=$pid cmd=$cmdline"
-                  if [ -r "/proc/$pid/status" ]; then
-                    grep -E "^(Name|State|Pid|PPid|Threads|VmRSS|VmHWM|voluntary_ctxt_switches|nonvoluntary_ctxt_switches):" "/proc/$pid/status" || true
-                  fi
-                  if [ -r "/proc/$pid/wchan" ]; then
-                    printf "wchan="
-                    cat "/proc/$pid/wchan" || true
-                    printf "\n"
-                  fi
-                  if [ -r "/proc/$pid/stack" ]; then
-                    cat "/proc/$pid/stack" || true
-                  fi
-                  echo "::endgroup::"
-
-                  echo "::group::gdb thread dump pid=$pid cmd=$cmdline"
-                  timeout 45s gdb -batch -p "$pid" \
-                    -ex "set pagination off" \
-                    -ex "thread apply all bt" \
-                    -ex "detach" || \
-                    timeout 45s sudo gdb -batch -p "$pid" \
-                      -ex "set pagination off" \
-                      -ex "thread apply all bt" \
-                      -ex "detach" || true
-                  echo "::endgroup::"
-                  ;;
-              esac
-            done
-          }
-
-          terminate_tree() {
-            local root_pid="$1"
-            local pids
-            pids="$(collect_descendants "$root_pid")"
-            for pid in $pids; do
-              if [ "$pid" != "$$" ]; then
-                kill -TERM "$pid" 2>/dev/null || true
-              fi
-            done
-            sleep 5
-            for pid in $pids; do
-              if [ "$pid" != "$$" ]; then
-                kill -KILL "$pid" 2>/dev/null || true
-              fi
-            done
-          }
-
-          if [ -r /proc/sys/kernel/yama/ptrace_scope ]; then
-            echo "::group::configure ptrace for unit watchdog"
-            echo "ptrace_scope before: $(cat /proc/sys/kernel/yama/ptrace_scope || true)"
-            sudo sysctl -w kernel.yama.ptrace_scope=0 || true
-            echo "ptrace_scope after: $(cat /proc/sys/kernel/yama/ptrace_scope || true)"
-            echo "::endgroup::"
-          fi
-
-          unit_log="${RUNNER_TEMP:-/tmp}/antfly-zig-unit.log"
-          : > "$unit_log"
-          export ANTFLY_TEST_LOG_DIR="${RUNNER_TEMP:-/tmp}/antfly-zig-test-logs"
-          mkdir -p "$ANTFLY_TEST_LOG_DIR"
-
-          (
-            set +e
-            taskset -c "${{ steps.cpus.outputs.list }}" make zig-unit-test ZIG_BUILD_FLAGS="--maxrss ${{ steps.cpus.outputs.max_rss }} --summary all" 2>&1 | tee -a "$unit_log"
-            exit "${PIPESTATUS[0]}"
-          ) &
-          unit_pid="$!"
-          (
-            # A cold Zig compile can legitimately remain silent for more than
-            # 15 minutes on the x86_64 ARC runner. Keep the idle watchdog below
-            # the independent hard limit without killing an active cold build.
-            idle_limit_secs="${ANTFLY_UNIT_WATCHDOG_IDLE_SECS:-1800}"
-            # PR #716's DB-core execution started 52 minutes into the combined
-            # build/test step and was still progressing at the old 60m limit.
-            # Allow 90m total, retaining the 30m idle and 120m outer job limits.
-            hard_limit_secs="${ANTFLY_UNIT_WATCHDOG_HARD_SECS:-5400}"
-            start_epoch="$(date +%s)"
-            last_progress_epoch="$start_epoch"
-            last_mtime=0
-            while kill -0 "$unit_pid" 2>/dev/null; do
-              sleep 15
-              now_epoch="$(date +%s)"
-              for progress_log in "$unit_log" "$ANTFLY_TEST_LOG_DIR"/*.log; do
-                [ -f "$progress_log" ] || continue
-                current_mtime="$(stat -c %Y "$progress_log" 2>/dev/null || echo 0)"
-                if [ "$current_mtime" -gt "$last_mtime" ]; then
-                  last_mtime="$current_mtime"
-                  last_progress_epoch="$now_epoch"
-                fi
-              done
-
-              elapsed_secs=$((now_epoch - start_epoch))
-              idle_secs=$((now_epoch - last_progress_epoch))
-              if [ "$hard_limit_secs" -gt 0 ] && [ "$elapsed_secs" -ge "$hard_limit_secs" ]; then
-                echo "::error::zig-unit-test hard watchdog fired after ${elapsed_secs}s; dumping stacks before terminating live test processes"
-                tail -n 200 "$unit_log" || true
-                dump_stacks "$unit_pid"
-                terminate_tree "$unit_pid"
-                exit 0
-              fi
-              if [ "$idle_limit_secs" -gt 0 ] && [ "$idle_secs" -ge "$idle_limit_secs" ]; then
-                echo "::error::zig-unit-test idle watchdog fired after ${idle_secs}s without unit log progress; dumping stacks before terminating live test processes"
-                tail -n 200 "$unit_log" || true
-                dump_stacks "$unit_pid"
-                terminate_tree "$unit_pid"
-                exit 0
-              fi
-            done
-          ) &
-          watchdog_pid="$!"
-
-          status=0
-          wait "$unit_pid" || status="$?"
-          kill "$watchdog_pid" 2>/dev/null || true
-          wait "$watchdog_pid" 2>/dev/null || true
-          if [ "$status" -ne 0 ] && [ -d /sys/fs/cgroup ]; then
-            echo "::group::unit failure cgroup memory"
-            for metric in memory.current memory.peak memory.max memory.events; do
-              if [ -r "/sys/fs/cgroup/$metric" ]; then
-                echo "[$metric]"
-                cat "/sys/fs/cgroup/$metric"
-              fi
-            done
-            echo "::endgroup::"
-          fi
-          exit "$status"
+        run: >-
+          bash scripts/ci/run-zig-unit-tests.sh
+          '${{ steps.cpus.outputs.list }}'
+          '${{ steps.cpus.outputs.max_rss }}'
 
       - name: Verify externally fetched Apache Zig source package
         run: >-
@@ -944,7 +818,7 @@ jobs:
 
       - name: Retain unit test progress
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: zig-unit-progress-${{ github.job }}-${{ github.run_attempt }}
           path: |
@@ -956,7 +830,7 @@ jobs:
 
       - name: Set up Java for TLA+
         if: needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
-        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: "temurin"
           java-version: "21"
@@ -970,14 +844,278 @@ jobs:
 
       - name: Retain TLA trace evidence
         if: always() && !cancelled()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tla-traces-${{ github.job }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/antfly-tla-traces/
           if-no-files-found: ignore
           retention-days: 14
 
+  # Independent target matrices own their clocks and disposable compiler caches;
+  # they do not consume the native unit gate's watchdog allowance.
+  zig-base-wasm:
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      id-token: write
+    if: >-
+      ${{ !cancelled() &&
+      success() &&
+      !inputs.full_validation &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) &&
+      ((inputs.pr_number != '' ||
+      github.event.schedule == '0 3 * * 0') &&
+      (needs.changes.outputs.zig_tests == 'true' ||
+      needs.changes.outputs.model_check == 'true' ||
+      needs.changes.outputs.trace_validate == 'true')) }}
+    name: zig-base / wasm
+    needs: [admission, changes]
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 120
+    env:
+      ANTFLY_ZIG_MAX_RSS: "23622320128"
+      ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+          submodules: true
+
+      - name: Sample ARC runner disk use
+        uses: ./.github/actions/runner-disk-audit
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file libopenblas0-pthread
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+
+      - name: Restore ARC Zig cache dirs
+        id: cache
+        run: |
+          # Compiler outputs belong on the PVC; runner temp counts toward
+          # the pod's 10 GiB ephemeral-storage limit. Retire completed phase
+          # caches below before starting the next phase.
+          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          global_cache="/mnt/cache/antfly/zig/zig-global"
+          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
+          mkdir -p "$local_cache" "$global_cache"
+
+      # The admitted branch can predate this action. Bootstrap tooling from
+      # the same immutable revision as the executing approval workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+          sparse-checkout-cone-mode: false
+
+      - name: Prepare verified Zig source dependencies
+        uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
+
+      - name: Verify Zig version
+        run: zig version
+
+      - name: Set up Node for WASM tests
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: ts/package.json
+
+      - name: Build and test Apache WASM artifacts
+        working-directory: zig
+        run: |
+          # The @antfly/web package contract suite runs from its built ESM
+          # artifact in the TypeScript SDK gate.
+          node pkg/antfly-embedded/wasm_client_test.mjs
+          python3 tools/run_bounded_zig_build.py build wasm-test inference-wasm -Dmetal=false -j1 -freference-trace=30 --summary all
+          EXTRACTION_WASM=zig-out/antfly-extraction-cpu.wasm node --test pkg/inference/web/test-extraction-runtime.mjs pkg/inference/web/test-laya-runtime.mjs pkg/inference/web/test-decide-runtime.mjs pkg/inference/web/test-backends-runtime.mjs
+          zig build inference-wasm -Dwebgpu=true -Dmetal=false -j1 -freference-trace=30 --summary all
+          zig build inference-wasm -Dwasm-memory-model=wasm64 -Dmetal=false -j1 -freference-trace=30 --summary all
+          cd pkg/inference
+          zig build wasm -Dwasm=true -j1 --summary all
+          node web/test-wasm-abi.mjs wasm32
+          zig build wasm -Dwasm=true -Dwasm-memory-model=wasm64 -j1 --summary all
+          node web/test-wasm-abi.mjs wasm64
+
+      - name: Release completed qualification artifacts
+        if: always() && steps.cache.outcome == 'success'
+        run: python3 zig/tools/prune_completed_test_cache.py --release-phase "$ZIG_LOCAL_CACHE_DIR"
+
+  zig-base-lite-models:
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      id-token: write
+    if: >-
+      ${{ !cancelled() &&
+      success() &&
+      !inputs.full_validation &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) &&
+      ((inputs.pr_number != '' ||
+      github.event.schedule == '0 3 * * 0') &&
+      (needs.changes.outputs.zig_tests == 'true' ||
+      needs.changes.outputs.model_check == 'true' ||
+      needs.changes.outputs.trace_validate == 'true')) &&
+      needs.changes.outputs.zig_tests == 'true' }}
+    name: zig-base / lite-models
+    needs: [admission, changes]
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 120
+    env:
+      ANTFLY_ZIG_MAX_RSS: "23622320128"
+      ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+          submodules: true
+
+      - name: Sample ARC runner disk use
+        uses: ./.github/actions/runner-disk-audit
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file libopenblas0-pthread
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+
+      - name: Restore ARC Zig cache dirs
+        id: cache
+        run: |
+          # Compiler outputs belong on the PVC; runner temp counts toward
+          # the pod's 10 GiB ephemeral-storage limit. Retire completed phase
+          # caches below before starting the next phase.
+          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          global_cache="/mnt/cache/antfly/zig/zig-global"
+          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
+          mkdir -p "$local_cache" "$global_cache"
+
+      # The admitted branch can predate this action. Bootstrap tooling from
+      # the same immutable revision as the executing approval workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+          sparse-checkout-cone-mode: false
+
+      - name: Prepare verified Zig source dependencies
+        uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
+
+      - name: Verify Zig version
+        run: zig version
+
+      - name: Build Lite qualification libraries
+        timeout-minutes: 60
+        run: |
+          # Cold current/baseline library builds precede the real-model clock.
+          # The following test step retains its 25-minute execution bound.
+          cd zig
+          python3 tools/run_bounded_zig_build.py build capi \
+            -Dembedded-only=true -Dlite-local-inference-runtime=true -Dmetal=false -Dcuda=false -j1
+          cd ..
+          python3 scripts/ci/prepare_lite_previous_reader.py
+
+      - name: Exercise real Lite extraction through public graph APIs
+        if: needs.changes.outputs.zig_tests == 'true'
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          models_root="$GITHUB_WORKSPACE/zig/.test-models/lite-eval"
+          model_dir="$models_root/fastino/gliner2.5-base-v1"
+          trap 'rm -rf "$models_root"' EXIT
+          python3 scripts/ci/prepare_lite_graph_model.py "$model_dir" --embedding-destination "$models_root/Qwen/Qwen3-Embedding-0.6B-GGUF"
+          cd zig
+          ANTFLY_LITE_REQUIRE_EXTRACTOR_TEST=1 ANTFLY_LITE_EXTRACTOR_MODEL_DIR="$model_dir" python3 tools/run_bounded_zig_build.py build capi-test \
+            -Dembedded-only=true -Dlite-local-inference-runtime=true -Dmetal=false -Dcuda=false \
+            -j1
+          cd pkg/inference
+          python3 ../../tools/run_bounded_zig_build.py build test \
+            '-Dtest-filter=capi resolver model identity' -Dmetal=false -Dcuda=false -j1 \
+            --cache-dir "$ZIG_LOCAL_CACHE_DIR" --prefix ../../zig-out
+          cd ../../..
+          ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
+          ANTFLY_LITE_PREVIOUS_LIBRARY="$GITHUB_WORKSPACE/.worktrees/reader-baseline-e8666a5b75/zig/zig-out/lib/libantfly.so" \
+          ANTFLY_LITE_REQUIRE_PREVIOUS_READER=1 \
+          ANTFLY_LITE_REQUIRE_LIBRARY=1 PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
+            uv run --no-project --with pytest python -m pytest -q py/packages/embedded/tests/test_graph_edge_readiness.py
+          ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
+          PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
+            python3 scripts/ci/run_lite_extraction_eval.py --models-dir "$models_root" \
+              --output "$RUNNER_TEMP/lite-extraction-eval.json"
+          ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
+          PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
+            python3 scripts/ci/run_lite_embedding_test.py --models-dir "$models_root"
+
+      - name: Locate real-model extraction evaluation
+        id: lite_extraction_report
+        if: always() && needs.changes.outputs.zig_tests == 'true'
+        run: |
+          if [ -f "$RUNNER_TEMP/lite-extraction-eval.json" ]; then
+            echo 'exists=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload real-model extraction evaluation
+        if: always() && needs.changes.outputs.zig_tests == 'true' && steps.lite_extraction_report.outputs.exists == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lite-extraction-evaluation
+          path: ${{ runner.temp }}/lite-extraction-eval.json
+          if-no-files-found: error
+
+      - name: Release completed qualification artifacts
+        if: always() && steps.cache.outcome == 'success'
+        run: python3 zig/tools/prune_completed_test_cache.py --release-phase "$ZIG_LOCAL_CACHE_DIR"
+
   zig-full-tests:
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      id-token: write
     if: >-
       ${{ !cancelled() &&
       success() &&
@@ -1017,10 +1155,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31
         with:
           nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
       - name: Install glibc-linked Zig
@@ -1046,8 +1184,30 @@ jobs:
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
           mkdir -p "$local_cache" "$global_cache"
 
+      # The admitted branch can predate this action. Bootstrap tooling from
+      # the same immutable revision as the executing approval workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+          sparse-checkout-cone-mode: false
+
+      - name: Prepare verified Zig source dependencies
+        uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
+
       - name: Verify Zig version
         run: zig version
+
+      - name: Verify Zig source cache round trip
+        env:
+          ANTFLY_TEST_ZIG: zig
+        run: python3 -m unittest discover -s scripts/ci -p test_zig_dependencies.py
 
       - name: Check generated sources
         run: make zig-generated-check
@@ -1115,21 +1275,10 @@ jobs:
       - name: Run library, Antfly, and inference unit tests
         env:
           ANTFLY_TEST_TIMINGS: "1"
-        run: |
-          set +e
-          taskset -c ${{ steps.cpus.outputs.list }} make zig-unit-test ZIG_BUILD_FLAGS="--maxrss ${{ steps.cpus.outputs.max_rss }} --summary all"
-          status="$?"
-          if [ "$status" -ne 0 ] && [ -d /sys/fs/cgroup ]; then
-            echo "::group::unit failure cgroup memory"
-            for metric in memory.current memory.peak memory.max memory.events; do
-              if [ -r "/sys/fs/cgroup/$metric" ]; then
-                echo "[$metric]"
-                cat "/sys/fs/cgroup/$metric"
-              fi
-            done
-            echo "::endgroup::"
-          fi
-          exit "$status"
+        run: >-
+          bash scripts/ci/run-zig-unit-tests.sh
+          '${{ steps.cpus.outputs.list }}'
+          '${{ steps.cpus.outputs.max_rss }}'
 
       - name: Verify server-free Apache Lite, lake, C API, WASM, and inference builds
         run: >-
@@ -1154,7 +1303,7 @@ jobs:
           cd pkg/inference
           python3 ../../tools/run_bounded_zig_build.py build test \
             '-Dtest-filter=capi resolver model identity' -Dmetal=false -Dcuda=false -j1 \
-            --cache-dir ../../.zig-cache --prefix ../../zig-out
+            --cache-dir "$ZIG_LOCAL_CACHE_DIR" --prefix ../../zig-out
           cd ../../..
           python3 scripts/ci/prepare_lite_previous_reader.py
           ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
@@ -1180,7 +1329,7 @@ jobs:
 
       - name: Upload real-model extraction evaluation
         if: always() && !cancelled() && steps.lite_extraction_report.outputs.exists == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: lite-extraction-evaluation
           path: ${{ runner.temp }}/lite-extraction-eval.json
@@ -1194,6 +1343,19 @@ jobs:
           # Later scale and qualification phases keep their disk-backed paths.
           echo 'ANTFLY_TEST_WORKSPACE=' >> "$GITHUB_ENV"
           echo 'ANTFLY_TEST_WORKSPACE_MOUNTED=' >> "$GITHUB_ENV"
+
+      - name: Retain unit test progress
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zig-unit-progress-${{ github.job }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/antfly-zig-unit.log
+            ${{ runner.temp }}/antfly-zig-test-logs/*.log
+            ${{ runner.temp }}/antfly-zig-test-logs/hung/
+          if-no-files-found: ignore
+          retention-days: 14
+
 
       - name: Release completed phase compiler cache
         run: |
@@ -1216,7 +1378,7 @@ jobs:
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
       - name: Set up Java for TLA+
-        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: "temurin"
           java-version: "21"
@@ -1229,7 +1391,7 @@ jobs:
 
       - name: Retain TLA trace evidence
         if: always() && !cancelled()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tla-traces-${{ github.job }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/antfly-tla-traces/
@@ -1268,7 +1430,7 @@ jobs:
       - name: Retain VOPR qualification diagnostics
         if: always()
         timeout-minutes: 5
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vopr-qualification-diagnostics
           path: |
@@ -1321,6 +1483,12 @@ jobs:
           rm -rf -- "$ZIG_LOCAL_CACHE_DIR"
 
   zig-build-cache-tests:
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      id-token: write
     if: >-
       ${{ !cancelled() &&
       success() &&
@@ -1338,7 +1506,9 @@ jobs:
     name: zig-full / build-cache / ${{ matrix.shard }}
     needs: [admission, changes]
     runs-on: arc-antfly-heavy
-    timeout-minutes: 40
+    # The production ownership audit includes seven incremental source
+    # mutations: measured cold/read/write phases alone take 35 minutes.
+    timeout-minutes: ${{ matrix.shard == 'storage-ownership' && 90 || 40 }}
     strategy:
       fail-fast: false
       matrix:
@@ -1365,10 +1535,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils file
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31
         with:
           nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
       - name: Install glibc-linked Zig
@@ -1394,6 +1564,23 @@ jobs:
       # Each shard gets its own runner and PVC. Physical storage ownership has
       # several production rebuilds, so give it the full job budget separately
       # from the cold host-generator and linked-cache contract fixtures.
+      # The admitted branch can predate this action. Bootstrap tooling from
+      # the same immutable revision as the executing approval workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+          sparse-checkout-cone-mode: false
+
+      - name: Prepare verified Zig source dependencies
+        uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
+
       - name: Test runtime compilation and cache contracts
         if: startsWith(matrix.shard, 'runtime-')
         working-directory: zig
@@ -1413,7 +1600,7 @@ jobs:
 
       - name: Upload storage compilation measurements
         if: ${{ always() && matrix.shard == 'storage-ownership' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: storage-compilation
           path: zig/storage-compilation.json
@@ -1441,19 +1628,28 @@ jobs:
       needs.changes.outputs.model_check == 'true' ||
       needs.changes.outputs.trace_validate == 'true' )) }}
     name: zig-base
-    needs: [admission, changes, zig-base-tests, arm64-codec]
+    needs: [admission, changes, zig-base-tests, zig-base-wasm, zig-base-lite-models, arm64-codec, grep-qualification]
     runs-on: arc-antfly-standard-runtime
     steps:
       - name: Verify zig-base shards
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
           X86_64_RESULT: ${{ needs.zig-base-tests.result }}
+          WASM_RESULT: ${{ needs.zig-base-wasm.result }}
+          LITE_MODEL_RESULT: ${{ needs.zig-base-lite-models.result }}
+          REQUIRE_LITE_MODELS: ${{ needs.changes.outputs.zig_tests == 'true' }}
           ARM64_CODEC_RESULT: ${{ needs.arm64-codec.result }}
+          GREP_RESULT: ${{ needs.grep-qualification.result }}
         run: |
           set -euo pipefail
           test "$CHANGES_RESULT" = "success"
           test "$X86_64_RESULT" = "success"
           test "$ARM64_CODEC_RESULT" = "success"
+          test "$GREP_RESULT" = "success"
+          test "$WASM_RESULT" = "success"
+          if [ "$REQUIRE_LITE_MODELS" = "true" ] || [ "$LITE_MODEL_RESULT" != "skipped" ]; then
+            test "$LITE_MODEL_RESULT" = "success"
+          fi
 
   zig-full:
     if: >-
@@ -1471,7 +1667,7 @@ jobs:
       inputs.validation_scope == 'all') ||
       github.event.schedule == '0 8 * * *' )) }}
     name: zig-full
-    needs: [admission, changes, zig-full-tests, zig-build-cache-tests, arm64-codec]
+    needs: [admission, changes, zig-full-tests, zig-build-cache-tests, arm64-codec, grep-qualification]
     runs-on: arc-antfly-standard-runtime
     steps:
       - name: Verify zig-full shards
@@ -1480,14 +1676,22 @@ jobs:
           X86_64_RESULT: ${{ needs.zig-full-tests.result }}
           BUILD_CACHE_RESULT: ${{ needs.zig-build-cache-tests.result }}
           ARM64_CODEC_RESULT: ${{ needs.arm64-codec.result }}
+          GREP_RESULT: ${{ needs.grep-qualification.result }}
         run: |
           set -euo pipefail
           test "$CHANGES_RESULT" = "success"
           test "$X86_64_RESULT" = "success"
           test "$BUILD_CACHE_RESULT" = "success"
           test "$ARM64_CODEC_RESULT" = "success"
+          test "$GREP_RESULT" = "success"
 
   e2e-base-build:
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      id-token: write
     if: >-
       ${{ !cancelled() &&
       success() &&
@@ -1545,19 +1749,38 @@ jobs:
           mountpoint -q /mnt/cache || { echo "E2E compilation requires the heavy runner scratch PVC" >&2; exit 1; }
           cache_root="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}"
           mkdir -p "$cache_root/zig-local" "$cache_root/zig-global" "$cache_root/tmp"
-          echo "ANTFLY_E2E_BUILD_CACHE_ROOT=$cache_root" >> "$GITHUB_ENV"
-          echo "ZIG_LOCAL_CACHE_DIR=$cache_root/zig-local" >> "$GITHUB_ENV"
-          echo "ZIG_GLOBAL_CACHE_DIR=$cache_root/zig-global" >> "$GITHUB_ENV"
-          echo "TMPDIR=$cache_root/tmp" >> "$GITHUB_ENV"
+          {
+            echo "ANTFLY_E2E_BUILD_CACHE_ROOT=$cache_root"
+            echo "ZIG_LOCAL_CACHE_DIR=$cache_root/zig-local"
+            echo "ZIG_GLOBAL_CACHE_DIR=$cache_root/zig-global"
+            echo "TMPDIR=$cache_root/tmp"
+          } >> "$GITHUB_ENV"
+
+      # The admitted branch can predate this action. Bootstrap tooling from
+      # the same immutable revision as the executing approval workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+          sparse-checkout-cone-mode: false
+
+      - name: Prepare verified Zig source dependencies
+        uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
 
       - name: Build E2E executable once
         run: scripts/ci/zig-build-e2e-binaries.sh
 
       - name: Package E2E executable
-        run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-base.tar.gz" zig-out/bin/antfly
+        run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-base.tar.gz" zig-out/bin/antfly zig-out/bin/antfly-grep
 
       - name: Upload E2E executable
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: antfly-e2e-base-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-base.tar.gz
@@ -1569,7 +1792,7 @@ jobs:
         run: tar -C zig/zig-out -czf "${RUNNER_TEMP}/libantfly-e2e-base.tar.gz" lib include
 
       - name: Upload native SDK library installation
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: libantfly-e2e-base-${{ github.run_id }}
           path: ${{ runner.temp }}/libantfly-e2e-base.tar.gz
@@ -1609,7 +1832,7 @@ jobs:
       - name: Install native test tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config
       - name: Download native SDK library installation
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: libantfly-e2e-${{ needs.e2e-base-build.result == 'success' && 'base' || 'full' }}-${{ github.run_id }}
           path: ${{ runner.temp }}/native-sdk-artifact
@@ -1635,10 +1858,10 @@ jobs:
           python-version: ${{ steps.toolchain.outputs.python_build }}
       - name: Set up uv
         if: matrix.sdk == 'python'
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
       - name: Set up Node
         if: matrix.sdk == 'typescript'
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: ts/package.json
       - name: Set up pnpm
@@ -1673,7 +1896,7 @@ jobs:
       - name: Install driver build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config
       - name: Download candidate E2E executable
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: antfly-e2e-${{ needs.e2e-base-build.result == 'success' && 'base' || 'full' }}-${{ github.run_id }}
           path: ${{ runner.temp }}/pgwire-driver-artifact
@@ -1685,7 +1908,7 @@ jobs:
           go-version: ${{ steps.toolchain.outputs.go_version }}
           cache: false
       - name: Set up Node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: ts/package.json
       - name: Set up Rust
@@ -1697,7 +1920,7 @@ jobs:
         with:
           python-version: ${{ steps.toolchain.outputs.python_build }}
       - name: Set up uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
       - name: Test standard PostgreSQL drivers against candidate runtime
         run: >-
           uv run --no-project --with requests --with pytest
@@ -1724,7 +1947,7 @@ jobs:
         with:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
       - name: Restore common E2E duration history
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -1744,7 +1967,7 @@ jobs:
           uv run --project e2e/antfly pytest --collect-only -q -p zig_e2e_shard \
             --antfly-ci-plan-output "${RUNNER_TEMP}/e2e-plan/plan.json" \
             -m "$(python3 ../scripts/ci/zig_e2e_shard.py base-marker)" e2e/antfly
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: antfly-e2e-plan-${{ github.run_id }}
           path: ${{ runner.temp }}/e2e-plan
@@ -1843,7 +2066,7 @@ jobs:
           ln -s "$cache_root/home-antfly-${{ matrix.suite }}" ~/.antfly
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Compute CPU bound for E2E
         id: e2e_cpus
@@ -1853,7 +2076,7 @@ jobs:
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
 
       - name: Download E2E executable
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: antfly-e2e-base-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-base
@@ -1862,7 +2085,7 @@ jobs:
         run: tar -xzf "${RUNNER_TEMP}/antfly-e2e-base/antfly-e2e-base.tar.gz" -C zig
 
       - name: Download common E2E plan and timing baseline
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: antfly-e2e-plan-${{ github.run_id }}
           path: ${{ runner.temp }}/e2e-plan
@@ -1928,7 +2151,7 @@ jobs:
           >> "$GITHUB_STEP_SUMMARY"
       - name: Retain E2E timings and per-test results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: antfly-e2e-timings-${{ matrix.suite }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/e2e-reports
@@ -1937,7 +2160,7 @@ jobs:
 
       - name: Retain failed E2E server logs and cluster diagnostics
         if: failure() && startsWith(matrix.suite, 'antfly')
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: antfly-e2e-server-logs-${{ matrix.suite }}-${{ github.run_attempt }}
           path: |
@@ -2023,7 +2246,7 @@ jobs:
           ln -s "$cache_root/home-antfly-low-fd" ~/.antfly
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Compute CPU bound for E2E
         id: e2e_cpus
@@ -2033,7 +2256,7 @@ jobs:
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
 
       - name: Download E2E executable
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: antfly-e2e-base-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-base
@@ -2063,7 +2286,7 @@ jobs:
 
       - name: Retain low-FD regression results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: antfly-low-fd-results-${{ github.run_attempt }}
           path: ${{ runner.temp }}/low-fd-reports
@@ -2072,7 +2295,7 @@ jobs:
 
       - name: Retain failed low-FD server logs and cluster diagnostics
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: antfly-low-fd-server-logs-${{ github.run_attempt }}
           path: |
@@ -2121,11 +2344,11 @@ jobs:
           test "$NATIVE_SDK_RESULT" = "success"
           test "$PGWIRE_DRIVER_RESULT" = "success"
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: antfly-e2e-plan-${{ github.run_id }}
           path: ${{ runner.temp }}/e2e-plan
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           pattern: antfly-e2e-timings-*
           path: ${{ runner.temp }}/e2e-observations
@@ -2141,6 +2364,12 @@ jobs:
           key: antfly-e2e-durations-v2-${{ github.run_id }}-${{ github.run_attempt }}
 
   e2e-full-build:
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      id-token: write
     if: >-
       ${{ !cancelled() &&
       success() &&
@@ -2197,10 +2426,29 @@ jobs:
           mountpoint -q /mnt/cache || { echo "E2E compilation requires the heavy runner scratch PVC" >&2; exit 1; }
           cache_root="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}"
           mkdir -p "$cache_root/zig-local" "$cache_root/zig-global" "$cache_root/tmp"
-          echo "ANTFLY_E2E_BUILD_CACHE_ROOT=$cache_root" >> "$GITHUB_ENV"
-          echo "ZIG_LOCAL_CACHE_DIR=$cache_root/zig-local" >> "$GITHUB_ENV"
-          echo "ZIG_GLOBAL_CACHE_DIR=$cache_root/zig-global" >> "$GITHUB_ENV"
-          echo "TMPDIR=$cache_root/tmp" >> "$GITHUB_ENV"
+          {
+            echo "ANTFLY_E2E_BUILD_CACHE_ROOT=$cache_root"
+            echo "ZIG_LOCAL_CACHE_DIR=$cache_root/zig-local"
+            echo "ZIG_GLOBAL_CACHE_DIR=$cache_root/zig-global"
+            echo "TMPDIR=$cache_root/tmp"
+          } >> "$GITHUB_ENV"
+
+      # The admitted branch can predate this action. Bootstrap tooling from
+      # the same immutable revision as the executing approval workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+          sparse-checkout-cone-mode: false
+
+      - name: Prepare verified Zig source dependencies
+        uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
 
       - name: Build E2E executable once
         run: scripts/ci/zig-build-e2e-binaries.sh
@@ -2209,7 +2457,7 @@ jobs:
         run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-full.tar.gz" zig-out/bin/antfly
 
       - name: Upload E2E executable
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: antfly-e2e-full-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-full.tar.gz
@@ -2221,7 +2469,7 @@ jobs:
         run: tar -C zig/zig-out -czf "${RUNNER_TEMP}/libantfly-e2e-full.tar.gz" lib include
 
       - name: Upload native SDK library installation
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: libantfly-e2e-full-${{ github.run_id }}
           path: ${{ runner.temp }}/libantfly-e2e-full.tar.gz
@@ -2255,12 +2503,13 @@ jobs:
       github.event.schedule == '0 8 * * *')) }}
     name: e2e-full / ${{ matrix.suite }}
     needs: [admission, changes, e2e-base-build, e2e-full-build]
-    runs-on: ${{ matrix.suite != 'inference' && 'arc-antfly-heavy-runtime' || 'arc-antfly-heavy' }}
+    runs-on: ${{ !startsWith(matrix.suite, 'inference-') && 'arc-antfly-heavy-runtime' || 'arc-antfly-heavy' }}
     timeout-minutes: 150
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
-        suite: ${{ fromJSON((inputs.pr_number == '' && github.event_name == 'workflow_dispatch') && inputs.validation_scope == 'inference-e2e' && '["inference"]' || '["inference","antfly"]') }}
+        suite: ${{ fromJSON((inputs.pr_number == '' && github.event_name == 'workflow_dispatch') && inputs.validation_scope == 'inference-e2e' && '["inference-generation","inference-speech","inference-embedding"]' || '["inference-generation","inference-speech","inference-embedding","antfly"]') }}
     env:
       # Full Antfly E2E has the same multi-process groups as the base shards.
       # Keep one process-owning worker per runner while lightweight tests may
@@ -2281,7 +2530,7 @@ jobs:
         uses: ./.github/actions/load-toolchain-policy
 
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb libopenblas0-pthread
 
       - name: Prepare ARC test cache dirs
         run: |
@@ -2310,7 +2559,7 @@ jobs:
           ln -s "$home_cache_root/home-antfly-full-${{ matrix.suite }}" ~/.antfly
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Compute CPU bound for E2E
         id: e2e_cpus
@@ -2331,7 +2580,7 @@ jobs:
         run: cargo build --manifest-path extensions/memoryaf/Cargo.toml --release --target wasm32-wasip2
 
       - name: Download E2E executable
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: antfly-e2e-${{ inputs.full_validation && 'base' || 'full' }}-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-full
@@ -2343,7 +2592,7 @@ jobs:
       # C ABI artifact produced by the same build as the server under test.
       - name: Download ingestion native library
         if: matrix.suite == 'antfly'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: libantfly-e2e-${{ inputs.full_validation && 'base' || 'full' }}-${{ github.run_id }}
           path: ${{ runner.temp }}/libantfly-e2e-full
@@ -2356,7 +2605,7 @@ jobs:
           echo "ANTFLY_LIBRARY=${GITHUB_WORKSPACE}/zig/zig-out/lib/libantfly.so" >> "$GITHUB_ENV"
 
       - name: Report inference memory baseline
-        if: matrix.suite == 'inference'
+        if: startsWith(matrix.suite, 'inference-')
         run: |
           echo "memory.current=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || echo unavailable)"
           echo "memory.max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo unavailable)"
@@ -2387,10 +2636,16 @@ jobs:
           echo "LD_LIBRARY_PATH=$root/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
 
       - name: Run Antfly inference full E2E
-        if: matrix.suite == 'inference'
+        if: startsWith(matrix.suite, 'inference-')
         working-directory: zig
         env:
+          # CPU inference qualifies the shipped optional LP64 pthread backend.
+          # Fail fast if the artifact/runner cannot load it instead of silently
+          # exercising Debug scalar kernels under a serving-latency deadline.
+          ANTFLY_INFERENCE_BLAS: openblas
+          OPENBLAS_NUM_THREADS: "2"
           ANTFLY_BIN: ./zig-out/bin/antfly
+          ANTFLY_INFERENCE_REPORT_DIR: ${{ runner.temp }}/inference-reports
           ANTFLY_INFERENCE_SERVER_LOG_DIR: ${{ runner.temp }}/inference-server-logs
           ANTFLY_INFERENCE_DOWNLOAD: "1"
           # Gemma 4 covers ordinary, tool-calling, and multimodal generation;
@@ -2403,9 +2658,8 @@ jobs:
           # explicitly covering first-use paths opt into this hard bound.
           ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT: "1800"
           ANTFLY_INFERENCE_MAX_LOADED_MODELS: "1"
-          # This Burstable pod has a 15000Mi request but no finite memory.max.
-          # Bound leaf-cgroup working set at 14000Mi so admission retains its
-          # emergency reserve and leaves another 1000Mi of pod-request margin.
+          # Keep the model process inside its existing 14GiB admission budget.
+          # Shards remain serial and use the existing heavy runner envelope.
           ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB: "14000"
           # Bound the native hot set while allowing the measured 11173MiB 2B
           # decoder working set plus its scoped projector to complete. Keep
@@ -2417,10 +2671,11 @@ jobs:
           RUN_CLIPCLAP_CONTRACT_TESTS: "1"
         run: |
           chmod +x ./zig-out/bin/antfly
-          taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/inference pytest -q --continue-on-collection-errors e2e/inference
+          shard="${{ matrix.suite }}"
+          taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/inference python ../scripts/ci/inference_e2e_shards.py "${shard#inference-}"
 
       - name: Validate standalone inference resource composition
-        if: matrix.suite == 'inference'
+        if: matrix.suite == 'inference-generation'
         working-directory: zig
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
@@ -2450,17 +2705,17 @@ jobs:
           taskset -c ${{ steps.e2e_cpus.outputs.list }} ../scripts/ci/zig-antfly-e2e-pytest.sh e2e/antfly
 
       - name: Retain full inference server logs
-        if: always() && matrix.suite == 'inference'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always() && startsWith(matrix.suite, 'inference-')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: antfly-inference-full-server-logs-${{ github.run_attempt }}
+          name: antfly-inference-full-server-logs-${{ matrix.suite }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/inference-server-logs/*.log
           if-no-files-found: ignore
           retention-days: 7
 
       - name: Retain failed full E2E server logs and cluster diagnostics
         if: failure() && matrix.suite == 'antfly'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: antfly-e2e-full-server-logs-${{ matrix.suite }}-${{ github.run_attempt }}
           path: |
@@ -2473,6 +2728,15 @@ jobs:
             ${{ env.TMPDIR }}/antfly-zig-metadata-backup-e2e-*/native-stacks.txt
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: Retain inference timings
+        if: always() && startsWith(matrix.suite, 'inference-')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: inference-timings-${{ matrix.suite }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/inference-reports
+          if-no-files-found: warn
+          retention-days: 14
 
   e2e-full:
     if: >-

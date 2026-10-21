@@ -76,10 +76,10 @@ import {
 import { useApiConfig } from "@/hooks/use-api-config";
 import { useInferenceRegistry } from "@/hooks/use-inference-registry";
 import {
-  type ModelRuntime,
-  type ModelRuntimeInstance,
-  useModelRuntime,
-} from "@/hooks/use-model-runtime";
+  type ModelInstancesForModel,
+  type ModelInstance,
+  useModelInstancesForModel,
+} from "@/hooks/use-model-instances";
 import { huggingFaceRepoId } from "@/lib/huggingface-model-ref";
 import { cn } from "@/lib/utils";
 
@@ -123,9 +123,9 @@ function modelProvider(model: InferenceModel): string {
   return (namespace || model.provider).toLowerCase();
 }
 
-function runtimeStatus(runtime: ModelRuntime | undefined) {
+function runtimeStatus(runtime: ModelInstancesForModel | undefined) {
   if (!runtime) return { label: "Available", tone: "text-muted-foreground" };
-  if (runtime.runtimes.some((item) => item.state === "in_use")) {
+  if (runtime.runtimes.some((item) => item.active_handles > 0)) {
     return { label: "In use", tone: "af-status-text-info" };
   }
   if (
@@ -138,8 +138,8 @@ function runtimeStatus(runtime: ModelRuntime | undefined) {
   return { label: "Available", tone: "text-muted-foreground" };
 }
 
-function runtimeInstanceLabel(instance: ModelRuntimeInstance): string {
-  if (instance.state === "in_use") return "In use";
+function runtimeInstanceLabel(instance: ModelInstance): string {
+  if (instance.active_handles > 0) return "In use";
   if (instance.state === "loading") return "Loading";
   return "Loaded";
 }
@@ -444,7 +444,7 @@ const TypePill: React.FC<{
 
 const ModelCard: React.FC<{
   model: InferenceModel;
-  runtime?: ModelRuntime;
+  runtime?: ModelInstancesForModel;
   providerManaged: boolean;
   onClick: () => void;
 }> = ({ model, runtime, providerManaged, onClick }) => {
@@ -533,7 +533,7 @@ const ModelDetailSheet: React.FC<{
   onOpenChange: (open: boolean) => void;
   types: { type: ModelType; name: string }[];
   quantizationOptions: QuantizationOption[];
-  runtime?: ModelRuntime;
+  runtime?: ModelInstancesForModel;
   runtimeSupported: boolean;
   providerManaged: boolean;
   actionPending: boolean;
@@ -703,7 +703,7 @@ const ModelDetailSheet: React.FC<{
                     : providerManaged
                       ? "Loading and residency are managed by this provider."
                       : !runtimeSupported
-                        ? "This server does not support Antfarm model controls. Running a request still loads the model on demand."
+                        ? "This server does not support model instance controls. Running a request still loads the model on demand."
                         : "Load and unload affect the shared server cache, including other clients. Idle eviction still applies."}
                 </p>
               </div>
@@ -718,9 +718,9 @@ const ModelDetailSheet: React.FC<{
 
             {!builtIn && !providerManaged && runtimeSupported ? (
               <div className="mt-3 space-y-2">
-                {(runtime?.runtimes ?? []).map((instance: ModelRuntimeInstance) => (
+                {(runtime?.runtimes ?? []).map((instance: ModelInstance) => (
                   <div
-                    key={instance.runtime_id}
+                    key={instance.id}
                     className="flex items-center justify-between gap-3 border-t border-border pt-2"
                   >
                     <div className="min-w-0 text-xs">
@@ -729,8 +729,6 @@ const ModelDetailSheet: React.FC<{
                         {instance.backend ? ` · ${instance.backend}` : ""}
                       </div>
                       <div className="truncate text-muted-foreground">
-                        {instance.runtime_kind}
-                        {instance.device ? ` · ${instance.device}` : ""}
                         {instance.residency_mode ? ` · ${instance.residency_mode}` : ""}
                         {instance.startup_managed ? " · Startup managed" : ""}
                       </div>
@@ -739,20 +737,15 @@ const ModelDetailSheet: React.FC<{
                       type="button"
                       size="sm"
                       variant="outline"
-                      disabled={
-                        actionPending ||
-                        instance.state !== "loaded" ||
-                        instance.startup_managed ||
-                        instance.active_requests > 0
-                      }
+                      disabled={actionPending || !instance.unloadable}
                       title={
                         instance.startup_managed
                           ? "Startup-managed models cannot be unloaded here"
-                          : instance.state === "in_use" || instance.active_requests > 0
+                          : instance.active_handles > 0 || instance.active_handles > 0
                             ? "Wait for active requests to finish"
                             : undefined
                       }
-                      onClick={() => void onUnload(instance.runtime_id).catch(() => undefined)}
+                      onClick={() => void onUnload(instance.id).catch(() => undefined)}
                     >
                       <PowerOff className="size-3.5" /> Unload
                     </Button>
@@ -1077,7 +1070,7 @@ const TypeContextBanner: React.FC<{
 const ModelsPage: React.FC = () => {
   const { models, types, quantizationOptions, loading, error, retry } = useInferenceRegistry();
   const { apiUrl, inferenceApiUrl } = useApiConfig();
-  const runtime = useModelRuntime();
+  const runtime = useModelInstancesForModel();
   const navigate = useNavigate();
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedType, setSelectedType] = useState<ModelType | "all">("all");
@@ -1223,7 +1216,7 @@ const ModelsPage: React.FC = () => {
   return (
     <AIWorkflowPage>
       <AIWorkflowHeader
-        title="Models & Runtime"
+        title="Models & Instances"
         description={`Browse ${models.length} models available through local, shared, and external inference connections.`}
         actions={
           <div className="flex items-center gap-4 text-sm text-muted-foreground">

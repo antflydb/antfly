@@ -182,12 +182,16 @@ pub const Cache = struct {
         var metadata_budget: local.sql_memory_budget = .{ .backing = self.inventory_budget.allocator(), .limit = self.inventory_budget.limit };
         var metadata_arena = std.heap.ArenaAllocator.init(metadata_budget.allocator());
         defer metadata_arena.deinit();
-        const inventory = (if (selection) |files|
-            corpus.admitSelectedServingInventory(metadata_arena.allocator(), self.inventory_budget.allocator(), directory, store, cached, cancellation, files)
-        else
-            corpus.admitServingInventory(metadata_arena.allocator(), self.inventory_budget.allocator(), directory, store, cached, cancellation)) catch |err| {
-            if (err == error.OutOfMemory and (self.inventory_budget.isExhausted() or metadata_budget.isExhausted())) return error.NativeLakeTextCacheBusy;
-            return err;
+        const inventory = inventory: {
+            const started = platform.time.monotonicNs();
+            defer if (cached.metrics) |metrics| metrics.record(.text_inventory, started);
+            break :inventory (if (selection) |files|
+                corpus.admitSelectedServingInventory(metadata_arena.allocator(), self.inventory_budget.allocator(), directory, store, cached, cancellation, files)
+            else
+                corpus.admitServingInventory(metadata_arena.allocator(), self.inventory_budget.allocator(), directory, store, cached, cancellation)) catch |err| {
+                if (err == error.OutOfMemory and (self.inventory_budget.isExhausted() or metadata_budget.isExhausted())) return error.NativeLakeTextCacheBusy;
+                return err;
+            };
         };
         defer inventory.deinit();
         const root = inventory.root;
@@ -427,6 +431,8 @@ const Entry = struct {
     allocator: A,
     resource_manager: ?*local.storage_resource_manager.ResourceManager = null,
     fn build(self: *Entry, io: std.Io, store: stores.ArtifactStore, root: corpus.Root, name: []const u8, schema_json: []const u8, cached: artifacts.CachedRead, cancellation: Cancellation, base: ?*Entry, peers: []const *Entry) !void {
+        const started = platform.time.monotonicNs();
+        defer if (cached.metrics) |metrics| metrics.record(.text_opening, started);
         self.seekable = root.seekable;
         self.statistics_version = root.statistics_version;
         self.term_statistics = root.term_statistics;
@@ -696,7 +702,7 @@ const Entry = struct {
         }
     };
     fn source(self: *Entry, store: stores.ArtifactStore, cached: artifacts.CachedRead, context: Context, cancellation: Cancellation) !local.storage_db_query_search_exec.PinnedTextSource {
-        if (!self.seekable) return .{ .snapshot = self.writer.?.acquireSnapshot(), .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .selected_field = self.selected_field, .stored_projection_fields = self.stored_projection_fields, .provider_metadata = &self.identities, .owner = self, .release_owner = releaseSource };
+        if (!self.seekable) return .{ .snapshot = self.writer.?.acquireSnapshot(), .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .selected_field = self.selected_field, .stored_projection_fields = self.stored_projection_fields, .provider_metadata = &self.identities, .logical_tie_rank = self.identities.tie_rank, .owner = self, .release_owner = releaseSource };
         const lease = self.allocator.create(QueryLease) catch return error.NativeLakeTextCacheBusy;
         errdefer self.allocator.destroy(lease);
         lease.* = .{ .entry = self, .statistics = .{ .domain = self.domain, .global = null, .segments = &.{}, .read = undefined }, .read = .{ .store = store, .cache = cached, .context = context, .cancellation = cancellation, .resource_manager = self.resource_manager, .descriptors = if (self.descriptors.count() != 0) &self.descriptors else null } };
@@ -705,7 +711,7 @@ const Entry = struct {
             lease.statistics = .{ .read = lease.read, .domain = self.domain, .global = self.term_statistics, .segments = self.segment_summaries, .directory = self.term_directory, .identities = self.statistics_identities, .ordinals = self.statistics_ordinals, .routing = self.statistics_routing, .allocator = self.allocator, .partial_inventory = self.identities.partial_inventory };
             snapshot.text_statistics = lease.statistics.interface();
         }
-        return .{ .read_context = &lease.read, .snapshot = snapshot, .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .selected_field = self.selected_field, .stored_projection_fields = self.stored_projection_fields, .provider_metadata = &self.identities, .owner = lease, .release_owner = QueryLease.release };
+        return .{ .read_context = &lease.read, .snapshot = snapshot, .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .selected_field = self.selected_field, .stored_projection_fields = self.stored_projection_fields, .provider_metadata = &self.identities, .logical_tie_rank = self.identities.tie_rank, .owner = lease, .release_owner = QueryLease.release };
     }
     fn releaseSource(raw: *anyopaque) void {
         const self: *Entry = @ptrCast(@alignCast(raw));

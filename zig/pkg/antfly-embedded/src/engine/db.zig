@@ -285,27 +285,37 @@ pub const DB = struct {
         return try self.inner.replayGeneratedEnrichmentsFromStoredDocs(alloc);
     }
 
+    fn requireEmbeddedCatalogOwnership(self: *DB) !void {
+        if (self.owned_lite_backend) |*backend| try backend.requireEmbeddedCatalogOwnership();
+    }
+
     pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
+        try self.requireEmbeddedCatalogOwnership();
         try self.inner.addIndex(cfg);
     }
 
     pub fn deleteIndex(self: *DB, name: []const u8) !bool {
+        try self.requireEmbeddedCatalogOwnership();
         return try self.inner.deleteIndex(name);
     }
 
     pub fn addEnrichment(self: *DB, cfg: types.EnrichmentConfig) !void {
+        try self.requireEmbeddedCatalogOwnership();
         try self.inner.addEnrichment(cfg);
     }
 
     pub fn deleteEnrichment(self: *DB, kind: types.EnrichmentKind, name: []const u8) !bool {
+        try self.requireEmbeddedCatalogOwnership();
         return try self.inner.deleteEnrichment(kind, name);
     }
 
     pub fn setSchema(self: *DB, table_schema: support.schema.TableSchema) !void {
+        try self.requireEmbeddedCatalogOwnership();
         try self.inner.setSchema(table_schema);
     }
 
     pub fn setSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
+        try self.requireEmbeddedCatalogOwnership();
         try self.inner.setSchemaJson(alloc, schema_json);
     }
 
@@ -319,6 +329,7 @@ pub const DB = struct {
     }
 
     pub fn importPortable(self: *DB, alloc: Allocator, backup: []const u8) !void {
+        try self.requireEmbeddedCatalogOwnership();
         if (self.owned_lite_backend) |*lite_backend| {
             try lite_restore_staging.importPortableIntoLiteDb(alloc, self.inner, lite_backend, backup);
             return;
@@ -1052,4 +1063,26 @@ test "embedded db createLite files are openable through the CLI's lite Connectio
         try std.testing.expectEqual(@as(usize, 1), indexes.len);
         try std.testing.expectEqualStrings(support.full_text_index_defaults.default_full_text_index_name, indexes[0].name);
     }
+}
+
+test "embedded db standalone catalog changes require the server after snapshot reopen" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/owned.aflite", .{tmp.sub_path});
+    defer alloc.free(path);
+    {
+        var db = try DB.createLite(alloc, path, .{});
+        defer db.close();
+        try db.owned_lite_backend.?.adoptEmbeddedRootAsNamespace("group-42/table-db");
+        try db.owned_lite_backend.?.markStandaloneArtifact();
+    }
+    var db = try DB.openLite(alloc, path, .{});
+    defer db.close();
+    try std.testing.expectError(error.StandaloneLiteCatalogRequiresApi, db.setSchemaJson(alloc, "{}"));
+    try std.testing.expectError(error.StandaloneLiteCatalogRequiresApi, db.addIndex(.{ .name = "other", .kind = .full_text, .config_json = "{}" }));
+    try std.testing.expectError(error.StandaloneLiteCatalogRequiresApi, db.deleteIndex("full_text_index_v0"));
+    try std.testing.expectError(error.StandaloneLiteCatalogRequiresApi, db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 8 }));
+    try std.testing.expectError(error.StandaloneLiteCatalogRequiresApi, db.deleteEnrichment(.chunk, "chunks"));
+    try db.batch(.{ .writes = &.{.{ .key = "edited", .value = "{\"body\":\"offline edit\"}" }}, .sync_level = .write });
 }

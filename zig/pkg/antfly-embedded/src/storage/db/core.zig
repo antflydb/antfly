@@ -157,6 +157,8 @@ pub const PendingWorkStats = struct {
     enrichment: types.EnrichmentStats,
     resolution: types.ReplayStageStats = .{},
     promotion: types.ReplayStageStats = .{},
+    resolution_worker_started: bool = false,
+    promotion_worker_started: bool = false,
     text_merge: types.TextMergeStats = .{},
     repair_metadata_rebuild_pending: bool = false,
     graph_metric: index_manager_mod.IndexManager.GraphMetricPlannedWorkStats = .{},
@@ -1109,9 +1111,10 @@ pub const DBCore = struct {
                 // mutation-free target advance may publish coverage here, but
                 // must never consume a newer transaction it does not own.
                 try self.index_manager.ensureDensePostingCoverageByName(index_name, sequence);
-                // The posting checkpoint/WAL commit boundary is the durable
-                // dense applied sequence. Lifecycle metadata is persisted only
-                // when status/generation/config identity changes.
+                try self.index_manager.preserveCertifiedEmptyDenseCheckpoint(self.alloc, self.store, self.applied_sequence_checkpoint_path, index_name);
+                // Native WAL remains the applied-sequence authority. Nonempty
+                // ingestion needs lifecycle metadata only when its status,
+                // generation or config identity changes.
                 return;
             }
             const published_count = if (self.index_manager.denseIndex(index_name)) |entry|

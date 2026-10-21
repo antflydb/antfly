@@ -59,6 +59,37 @@ def _file_location(path: str | Path) -> str:
     return Path(path).resolve().as_uri()
 
 
+def _wait_for_constraints_enforced(
+    session: requests.Session,
+    api_url: str,
+    table_name: str,
+    *,
+    timeout_s: float = 90.0,
+) -> bool:
+    """Observe setup readiness within one budget, including timed-out reads."""
+    deadline = time.monotonic() + timeout_s
+    while (remaining := deadline - time.monotonic()) > 0:
+        try:
+            response = session.get(
+                f"{api_url}/tables/{table_name}/constraints/status",
+                timeout=min(5.0, remaining),
+            )
+        except requests.Timeout:
+            # A slow metadata read must consume the existing readiness budget,
+            # not abort it at the first five-second request timeout.
+            pass
+        else:
+            if response.status_code == 200:
+                if response.json().get("state") == "enforced":
+                    return time.monotonic() <= deadline
+            else:
+                assert response.status_code in (404, 409, 503), response.text
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(1.0, remaining))
+    return False
+
+
 def _wait_for_terminal_restore_job(
     backup_api, response: requests.Response, *, timeout_s: float = 30.0
 ) -> dict:
@@ -543,6 +574,8 @@ def _constraint_probe_outcome(response, expected_error):
             return False
     if response.status_code == 503 and text == "write unavailable":
         return False
+    if _precommit_batch_retry_delay(response) is not None:
+        return False
     raise AssertionError(
         f"expected {expected_error}, got {response.status_code}: {text}"
     )
@@ -554,28 +587,34 @@ def _assert_constraint_rejected(
     deadline = time.monotonic() + timeout_s
     observations = []
 
-    def rejected():
-        cluster.assert_processes_alive()
-        # No transport-exception retry: an invalid write might have committed
-        # if enforcement regressed and only its response was lost.
-        try:
-            response = session.post(
-                f"{cluster.data_api_urls[0]}/tables/{table}/batch",
-                json={"inserts": inserts},
-                timeout=max(0.001, min(20.0, deadline - time.monotonic())),
-            )
-        except requests.RequestException as exc:
-            # wait_until also serves read-only polling and understands some
-            # retryable HTTPError responses. Do not inherit that for writes.
-            raise AssertionError(f"constraint probe transport failed: {exc}") from exc
-        observations.append(f"{response.status_code}: {response.text[:1024]}")
-        del observations[:-8]
-        return _constraint_probe_outcome(response, expected_error)
-
     try:
-        assert wait_until(rejected, timeout_s=timeout_s, interval_s=0.5), (
-            f"constraint did not return {expected_error}"
-        )
+        while True:
+            cluster.assert_processes_alive()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            # A lost response might conceal a committed invalid write. Only
+            # the explicit non-commit responses below authorize another probe.
+            try:
+                response = session.post(
+                    f"{cluster.data_api_urls[0]}/tables/{table}/batch",
+                    json={"inserts": inserts},
+                    timeout=min(20.0, remaining),
+                )
+            except requests.RequestException as exc:
+                raise AssertionError(
+                    f"constraint probe transport failed: {exc}"
+                ) from exc
+            observations.append(f"{response.status_code}: {response.text[:1024]}")
+            del observations[:-8]
+            if _constraint_probe_outcome(response, expected_error):
+                return
+            delay = _precommit_batch_retry_delay(response)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.5 if delay is None else delay, remaining))
+        raise AssertionError(f"constraint did not return {expected_error}")
     except (AssertionError, requests.RequestException) as exc:
         raise AssertionError(
             f"constraint probe failed: {exc}; observations={observations}\n"
@@ -672,6 +711,35 @@ def test_unique_claim_probes_are_independent_bounded_and_joined(monkeypatch, fai
     assert all(session.closed and session.used for session in sessions)
 
 
+def _precommit_batch_retry_delay(response) -> float | None:
+    """Only the public API's definite non-commit responses allow replay."""
+    if response.status_code != 503:
+        return None
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("code"), str)
+        or payload.get("code")
+        not in {
+            "transaction_precommit_read_unavailable",
+            "transaction_precommit_aborted",
+            "constraint_activation_pending",
+        }
+    ):
+        return None
+    if payload.get("retryable") is not True or any(
+        payload.get(key) is not None for key in ("transaction_id", "status")
+    ):
+        return None
+    delay_ms = payload.get("retry_after_ms", 1000)
+    if type(delay_ms) is not int or delay_ms < 0:
+        return None
+    return max(0.1, delay_ms / 1000)
+
+
 def _batch_cluster_docs_when_writable(
     cluster,
     session: requests.Session,
@@ -721,6 +789,9 @@ def _batch_cluster_docs_when_writable(
             # Activation and leader/route convergence may abort a transaction
             # after admission. A reported abort is safe to retry; constraint
             # violations and unknown outcomes do not match either response.
+            return None
+        if (retry_delay := _precommit_batch_retry_delay(last_response)) is not None:
+            time.sleep(min(retry_delay, max(0.0, deadline - time.monotonic())))
             return None
         if last_response.status_code == 409:
             try:
@@ -2149,6 +2220,89 @@ def _seed_online_merge_setup_docs(cluster, session, table_name, documents):
         _seed_cluster_docs_when_writable(cluster, session, table_name, batch)
 
 
+@pytest.mark.parametrize(
+    "code",
+    [
+        "transaction_precommit_read_unavailable",
+        "transaction_precommit_aborted",
+        "constraint_activation_pending",
+    ],
+)
+def test_setup_batch_retries_explicit_precommit_rejection(monkeypatch, code):
+    from types import SimpleNamespace
+
+    unavailable = requests.Response()
+    unavailable.status_code = 503
+    unavailable._content = json.dumps(
+        {"code": code, "retryable": True, "retry_after_ms": 100}
+    ).encode()
+    success = requests.Response()
+    success.status_code = 200
+    success._content = b'{"inserted":1}'
+    responses = iter((unavailable, success))
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append((url, kwargs["json"]))
+        return next(responses)
+
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    cluster = SimpleNamespace(
+        assert_processes_alive=lambda: None, data_api_urls=["http://fixture"]
+    )
+    result = _batch_cluster_docs_when_writable(
+        cluster, SimpleNamespace(post=post), "rows", inserts={"a": {"value": 1}}
+    )
+    assert result == {"inserted": 1}
+    assert len(calls) == 2 and calls[0] == calls[1]
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"code": "transaction_outcome_unknown"},
+        {"code": "constraint_violation"},
+        {"code": []},
+        {"code": {}},
+        {"retryable": False},
+        {"status": "committed_pending"},
+        {"transaction_id": "opaque"},
+        {"retry_after_ms": True},
+    ],
+)
+def test_setup_batch_does_not_retry_ambiguous_outcomes(changes):
+    from types import SimpleNamespace
+
+    response = requests.Response()
+    response.status_code = 503
+    response.request = requests.Request(
+        "POST", "http://fixture/tables/rows/batch"
+    ).prepare()
+    response._content = json.dumps(
+        {"code": "transaction_precommit_read_unavailable", "retryable": True, **changes}
+    ).encode()
+    calls = []
+
+    def post(*args, **kwargs):
+        calls.append(args)
+        return response
+
+    cluster = SimpleNamespace(
+        assert_processes_alive=lambda: None,
+        data_api_urls=["http://fixture"],
+        debug_logs=lambda: "fixture logs",
+    )
+    with pytest.raises(AssertionError, match="POST .* failed"):
+        _batch_cluster_docs_when_writable(
+            cluster,
+            SimpleNamespace(post=post),
+            "rows",
+            inserts={"a": {}},
+            timeout_s=0.05,
+        )
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("count", [0, 1, 8, 9, 35, 36])
 def test_online_merge_setup_batches_preserve_complete_corpus(monkeypatch, count):
     documents = {f"key:{i}": {"id": i} for i in range(count)}
@@ -2219,18 +2373,9 @@ def _exercise_online_document_merge(
     if timings:
         timings.mark("parent.replicated_topology")
     if schema and (schema.get("unique_constraints") or schema.get("foreign_keys")):
-
-        def enforced():
-            response = session.get(
-                f"{cluster.data_api_urls[0]}/tables/{table_name}/constraints/status",
-                timeout=5,
-            )
-            if response.status_code == 200:
-                return response.json().get("state") == "enforced"
-            assert response.status_code in (404, 409, 503), response.text
-            return False
-
-        assert wait_until(enforced, timeout_s=90), cluster.debug_logs()
+        assert _wait_for_constraints_enforced(
+            session, cluster.data_api_urls[0], table_name
+        ), cluster.debug_logs()
     if timings:
         timings.mark("parent.constraints_enforced")
     documents = (

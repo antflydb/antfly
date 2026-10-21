@@ -301,6 +301,26 @@ def source_owner_path(relative: str) -> str:
     return f"zig/pkg/{owner}/{relative}"
 
 
+def seed_global_cache(destination: Path) -> None:
+    """Reuse pinned source inputs, never compiled objects, in a cold audit cache."""
+    destination.mkdir()
+    source = os.environ.get("ZIG_GLOBAL_CACHE_DIR")
+    if not source:
+        return
+    packages = Path(source) / "p"
+    if not packages.is_dir():
+        return
+    inventory = json.loads(
+        (ZIG_ROOT.parent / "scripts/ci/zig-dependencies.json").read_text()
+    )
+    for package in inventory["packages"]:
+        name = package["hash"] + ".tar.gz"
+        archive = packages / name
+        if archive.is_file():
+            (destination / "p").mkdir(exist_ok=True)
+            shutil.copyfile(archive, destination / "p" / name)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--zig", default="zig")
@@ -416,7 +436,7 @@ def main() -> None:
             own(root, source_owner_path(relative))
         local_cache = work / "cache"
         global_cache = work / "global-cache"
-        global_cache.mkdir()
+        seed_global_cache(global_cache)
 
         def build(label: str) -> dict[str, str]:
             print(f"{label}: compiling production artifacts", flush=True)
@@ -517,7 +537,7 @@ def main() -> None:
             for directory in (local_cache, global_cache):
                 if directory.exists():
                     shutil.rmtree(directory)
-            global_cache.mkdir()
+            seed_global_cache(global_cache)
             build(f"{reason} cold")
             warmed = build(f"{reason} warm")
             assert all(warmed[name] == "cached" for name in ARCHIVES | CONSUMERS), (
@@ -525,12 +545,10 @@ def main() -> None:
             )
 
         for label, relative, rebuilt, cached in cases:
-            # The final contract mutation rebuilds more production artifacts
-            # than any other case. Give it a fresh cache before that peak. An
-            # earlier rollover also keeps a long mutation series below the PVC.
-            if label == "storage contract" or shutil.disk_usage(work).free < 12 * (
-                1 << 30
-            ):
+            # Keep the measured warm cache across mutations. A second cold
+            # build adds a full production compile without testing another
+            # ownership property. Roll over only under real disk pressure.
+            if shutil.disk_usage(work).free < 12 * (1 << 30):
                 restart_cache(label)
             path = own(root, source_owner_path(relative))
             # Keep earlier edits in this private overlay. Restoring one would

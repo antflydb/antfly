@@ -540,6 +540,11 @@ fn replaceTableDefinitionGuardedWithContextReceipt(
         return error.InvalidTableDefinitionReplacement;
     const store = service.projectedStore() orelse return error.MissingMetadataStore;
     if (comptime @TypeOf(service.*) == MetadataService or @TypeOf(service.*) == MetadataHttpService) {
+        try service.ensureLinearizableReadWithContext(context);
+        if (!try store.resolverProjectionValid(service.alloc, service.metadata_group_id, replacement)) return error.ResolverCurationConflict;
+    }
+
+    if (comptime @TypeOf(service.*) == MetadataService or @TypeOf(service.*) == MetadataHttpService) {
         if (replacement.lake_index_catalog_json.len != 0 or expected.lake_index_catalog_json.len != 0) {
             try service.ensureLinearizableReadWithContext(context);
             var arena = std.heap.ArenaAllocator.init(service.alloc);
@@ -607,7 +612,8 @@ fn replaceTableDefinitionGuardedWithContextReceipt(
         return error.MetadataMutationOutcomeUnknown;
     };
     defer metadata_table_manager.freeTable(service.alloc, current);
-    if (metadata_table_manager.tableDefinitionsEqual(current, replacement)) return .{
+    if (try store.resolverNamespaceReplacementRejected(service.alloc, service.metadata_group_id, receipt.term, receipt.index, expected, replacement)) return error.TableGenerationChanged;
+    if (try store.resolverNamespaceReplacementMatches(service.alloc, service.metadata_group_id, current, replacement)) return .{
         .metadata_group_id = service.metadata_group_id,
         .metadata_incarnation = metadata_incarnation,
         .term = receipt.term,
@@ -694,6 +700,13 @@ test "table definition stamp distinguishes rejection from post-admission ambigui
     const FakeStore = struct {
         current: metadata_table_manager.TableRecord,
         reads: usize = 0,
+        rejected_index: ?u64 = null,
+        pub fn resolverNamespaceReplacementRejected(self: *@This(), _: std.mem.Allocator, _: u64, term: u64, index: u64, _: metadata_table_manager.TableRecord, _: metadata_table_manager.TableRecord) !bool {
+            return term == 7 and self.rejected_index == index;
+        }
+        pub fn resolverNamespaceReplacementMatches(_: *@This(), _: std.mem.Allocator, _: u64, current: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !bool {
+            return metadata_table_manager.tableDefinitionsEqual(current, replacement);
+        }
 
         fn getTableTransitionFence(
             _: *@This(),
@@ -814,6 +827,12 @@ test "table definition stamp distinguishes rejection from post-admission ambigui
     );
     try std.testing.expectEqual(@as(usize, 1), superseded.wait_calls);
     try std.testing.expectEqual(@as(usize, 1), superseded.store.reads);
+    superseded.store.rejected_index = 19;
+    try std.testing.expectError(error.TableGenerationChanged, replaceTableDefinitionStampedWithReceipt(&superseded, expected, replacement));
+    // A rejection for identical bytes at a different apply position certifies
+    // nothing about this proposal, including after an intervening ABA edit.
+    superseded.store.rejected_index = 20;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, replaceTableDefinitionStampedWithReceipt(&superseded, expected, replacement));
     const guard: relation_catalog.RelationMutationGuard = .{ .target = .{ .name = "idx" }, .logical_table = "logical", .owner = .{ .table_id = expected.table_id, .schema_version = 1, .schema_digest = @splat(1), .kind = .index }, .incarnation = @splat(1) };
     const guarded_stamp = try replaceTableDefinitionGuardedWithReceipt(&committed, expected, replacement, guard);
     try std.testing.expectEqual(@as(u64, 19), guarded_stamp.index);
@@ -941,6 +960,11 @@ fn preflightProjectedPlacementWithContextImpl(service: anytype, request: api_ope
 }
 
 fn preflightTableRecordWithContextImpl(service: anytype, request: api_operation.RequestContext, table: metadata_table_manager.TableRecord) !void {
+    if (comptime @TypeOf(service.*) == MetadataService or @TypeOf(service.*) == MetadataHttpService) {
+        try service.ensureLinearizableReadWithContext(request);
+        const store = service.projectedStore() orelse return error.MissingMetadataStore;
+        if (!try store.resolverProjectionValid(service.alloc, service.metadata_group_id, table)) return error.ResolverCurationConflict;
+    }
     const required_version = transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table });
     if (required_version != 0)
         _ = try service.ensureTableTopologyProtocolReadyWithContext(request, required_version);
@@ -3406,6 +3430,23 @@ fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16)
 /// decode them. This classifier is shared by single and batched proposals;
 /// ordinary document metadata retains its predecessor admission contract.
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    const namespace_indexes = switch (command) {
+        .apply_restore_staging, .apply_system_catalog => |bytes| bytes,
+        .upsert_table => |table| table.indexes_json,
+        .compare_and_replace_table => |cas| cas.replacement.indexes_json,
+        .apply_table_topology => |mutation| switch (mutation) {
+            .create => |create| create.table.indexes_json,
+            .drop => "",
+        },
+        else => "",
+    };
+    if (metadata_topology_protocol.usesResolverNamespaces(namespace_indexes)) return metadata_topology_protocol.resolver_namespaces_version;
+    switch (command) {
+        .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |delta| for (delta.upsert_tables) |table| {
+            if (transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }) >= metadata_topology_protocol.resolver_namespaces_version) return metadata_topology_protocol.resolver_namespaces_version;
+        },
+        else => {},
+    }
     if (command == .compare_and_replace_table and command.compare_and_replace_table.relation_guard != null)
         return metadata_topology_protocol.relation_mutation_version;
     if (command == .apply_relation_reconciliation) {
@@ -4294,6 +4335,22 @@ fn closeRelationPublicationPreparation(service: anytype) void {
     service.relation_reconciliation_worker.closing = true;
     service.relation_publication_preparation.cancel();
     if (service.projectedStore()) |store| store.closeRelationPublicationProof(service.metadata_group_id);
+}
+
+/// Namespace replay is metadata work, with one bounded page per lifecycle
+/// round. The catalog CAS binds the exact canonical cut and fences retries.
+fn runResolverNamespaceRound(service: anytype) !void {
+    const store = service.projectedStore() orelse return;
+    if (!try service.ensureReconcileLease()) return;
+    var arena = std.heap.ArenaAllocator.init(service.alloc);
+    defer arena.deinit();
+    const table = (try store.pendingResolverNamespaceTable(arena.allocator(), service.metadata_group_id)) orelse {
+        const id = (try store.pendingResolverNamespaceDrop(arena.allocator(), service.metadata_group_id)) orelse return;
+        const fence = try store.getTableTransitionFence(service.metadata_group_id, id);
+        _ = try service.proposeTransitionCommandWithReceipt(.{ .remove_table = .{ .table_id = id, .expected_transition_generation = fence.generation } });
+        return;
+    };
+    _ = try service.proposeTransitionCommandWithReceipt(.{ .compare_and_replace_table = .{ .expected = table, .replacement = table } });
 }
 
 fn runRelationReconciliationRound(service: anytype) !void {
@@ -7174,6 +7231,7 @@ pub const MetadataService = struct {
         }
         if (!try self.ensureMetadataIncarnation()) return;
         try runRelationReconciliationRound(self);
+        try runResolverNamespaceRound(self);
         if (!self.observe_local_replica_root) return;
         const backfill_markers = try self.refreshStoreStatusBackfillMarkersForRound();
         if ((self.store_status_ticks >= 40 or backfill_markers.len > 0) and shouldRefreshLocalStoreStatus(self, backfill_markers)) {
@@ -7211,6 +7269,7 @@ pub const MetadataService = struct {
         }
         if (!try self.ensureMetadataIncarnation()) return;
         try runRelationReconciliationRound(self);
+        try runResolverNamespaceRound(self);
         if (!self.observe_local_replica_root) return;
 
         const backfill_markers = try self.refreshStoreStatusBackfillMarkersForLifecycleRound();
@@ -10820,6 +10879,7 @@ pub const MetadataHttpService = struct {
         self.refreshProbeReady();
         if (raft_diagnostics_snapshot.last_runtime_round) |round| logMetadataRaftRoundDiagnostics(round);
         try runRelationReconciliationRound(self);
+        try runResolverNamespaceRound(self);
         if (!self.observe_local_replica_root) return;
 
         phase_start_ns = platform_time.monotonicNs();
@@ -10924,6 +10984,7 @@ pub const MetadataHttpService = struct {
         }
         self.refreshProbeReady();
         try runRelationReconciliationRound(self);
+        try runResolverNamespaceRound(self);
         if (!self.observe_local_replica_root) return;
 
         var local_transition_inputs = try captureLocalTransitionInputs(self);
@@ -13187,6 +13248,50 @@ test "metadata service reallocation barrier requires a current protocol from the
     ));
     current_status.metadata_incarnation = null;
     try std.testing.expect(!reallocationBarrierStatusCompatible(current_status, 42, 7, incarnation));
+}
+
+test "metadata table topology protocol fences namespace writers and restored declarations" {
+    const version = metadata_topology_protocol.resolver_namespaces_version;
+    const table: metadata_table_manager.TableRecord = .{ .table_id = 1, .name = "source", .indexes_json = "{\"knowledge\":{\"resolvers\":[]}}" };
+    try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_system_catalog = "{\"topology\":{\"create\":{\"table\":{\"indexes_json\":\"{\\\"resolvers\\\":[]}\"}}}}" }));
+    try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }));
+    try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .compare_and_replace_table = .{ .expected = table, .replacement = table } }));
+    try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{table} } }));
+    try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_restore_staging = "{\"indexes_json\":\"{\\\"_resolver_namespaces\\\":{}}\"}" }));
+    // The predecessor advertises v35 but cannot parse the provenance fields
+    // emitted even by an otherwise empty new curation state. Every table
+    // writer, including reserved-only retired/proposal metadata, must fence it.
+    try std.testing.expect(version > 35);
+    for ([_][]const u8{
+        "{\"_curation_proposals\":{\"proposals\":[]}}",
+        "{\"_resolver_curation\":{\"identities\":[]}}",
+        "{\"_resolver_namespaces\":{\"namespaces\":[]}}",
+    }) |indexes| {
+        var replacement = table;
+        replacement.indexes_json = indexes;
+        try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = replacement }));
+        try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .compare_and_replace_table = .{ .expected = table, .replacement = replacement } }));
+        try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_extension_lifecycle = .{ .upsert_tables = &.{replacement} } }));
+        try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{replacement} } }));
+        const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .indexes_json = indexes }, .{});
+        defer std.testing.allocator.free(encoded);
+        try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_restore_staging = encoded }));
+        try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_system_catalog = encoded }));
+    }
+    const incarnation: metadata_mod.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
+    var predecessor = MetadataStatus{
+        .metadata_group_id = 42,
+        .metadata_incarnation = incarnation,
+        .metadata_raft_local_node_id = 7,
+        .table_topology_protocol_version = 35,
+        .metrics = .{},
+    };
+    for ([_]u16{ 35, 36 }) |old_version| {
+        predecessor.table_topology_protocol_version = old_version;
+        try std.testing.expect(!tableTopologyProtocolCompatible(predecessor, 42, 7, incarnation, version));
+    }
+    predecessor.table_topology_protocol_version = version;
+    try std.testing.expect(tableTopologyProtocolCompatible(predecessor, 42, 7, incarnation, version));
 }
 
 test "metadata table topology protocol checks the command's required version and exact replica" {

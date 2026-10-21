@@ -336,6 +336,8 @@ pub const TransactionMutation = union(enum) {
 };
 
 pub const BatchRequest = struct {
+    /// Private ordered curator decision; never accepted from public batch JSON.
+    resolver_review: ?@import("resolver_review.zig").Command = null,
     /// Trusted ingress attaches a signed write principal and the admission
     /// instant after authenticating the live request. Replicas verify against
     /// that committed instant so delayed Raft replay is deterministic.
@@ -357,6 +359,8 @@ pub const BatchRequest = struct {
     online_source: ?@import("online_source_contract.zig").Command = null,
     /// Ordered complete artifact catalog; accepted only by private Raft ingress.
     artifact_catalog: ?@import("artifact_inventory.zig").Command = null,
+    /// Private grouped-source control; public batch JSON cannot populate it.
+    group_source: ?@import("group_source_contract.zig").Command = null,
     /// Exact producer result; only authenticated owner-leader Raft ingress.
     artifact_publication: ?@import("artifact_publication.zig").Command = null,
     /// Bounded authenticated upload stages for a large ordered publication.
@@ -602,6 +606,7 @@ pub const EnrichmentKind = enum {
     chunk,
     asset,
     embedding,
+    group,
 };
 
 pub const ArtifactKind = enum {
@@ -671,6 +676,8 @@ pub const ArtifactRef = struct {
 pub const EnrichmentConfig = struct {
     name: []const u8,
     kind: EnrichmentKind,
+    source: ?@import("group_sources.zig").Config = null,
+    prior_context: ?@import("group_sources.zig").PriorContext = null,
     field: []const u8 = "",
     template: []const u8 = "",
     source_artifact_name: []const u8 = "",
@@ -687,27 +694,25 @@ pub const EnrichmentConfig = struct {
     execution: ?EnrichmentExecutionConfig = null,
 
     pub fn clone(alloc: Allocator, cfg: EnrichmentConfig) !EnrichmentConfig {
-        return .{
-            .name = try alloc.dupe(u8, cfg.name),
-            .kind = cfg.kind,
-            .field = if (cfg.field.len > 0) try alloc.dupe(u8, cfg.field) else "",
-            .template = if (cfg.template.len > 0) try alloc.dupe(u8, cfg.template) else "",
-            .source_artifact_name = if (cfg.source_artifact_name.len > 0) try alloc.dupe(u8, cfg.source_artifact_name) else "",
-            .embedding_input = cfg.embedding_input,
-            .expected_dims = cfg.expected_dims,
-            .vector_space = if (cfg.vector_space.len > 0) try alloc.dupe(u8, cfg.vector_space) else "",
-            .chunk_size = cfg.chunk_size,
-            .chunk_overlap = cfg.chunk_overlap,
-            .chunker_json = if (cfg.chunker_json.len > 0) try alloc.dupe(u8, cfg.chunker_json) else "",
-            .full_text_index = cfg.full_text_index,
-            .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
-            .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
-            .neighbor_context = if (cfg.neighbor_context) |context| try EnrichmentNeighborContextConfig.clone(alloc, context) else null,
-            .execution = cfg.execution,
-        };
+        var out = cfg;
+        inline for (.{ "name", "field", "template", "source_artifact_name", "vector_space", "chunker_json", "content_type", "producer_json" }) |field| @field(out, field) = "";
+        out.source = null;
+        out.prior_context = null;
+        out.neighbor_context = null;
+        errdefer out.deinit(alloc);
+        inline for (.{ "name", "field", "template", "source_artifact_name", "vector_space", "chunker_json", "content_type", "producer_json" }) |field| {
+            const value = @field(cfg, field);
+            if (value.len > 0) @field(out, field) = try alloc.dupe(u8, value);
+        }
+        if (cfg.source) |source| out.source = try source.clone(alloc);
+        if (cfg.prior_context) |context| out.prior_context = try context.clone(alloc);
+        if (cfg.neighbor_context) |context| out.neighbor_context = try EnrichmentNeighborContextConfig.clone(alloc, context);
+        return out;
     }
 
     pub fn deinit(self: *EnrichmentConfig, alloc: Allocator) void {
+        if (self.source) |*source| source.deinit(alloc);
+        if (self.prior_context) |*context| context.deinit(alloc);
         alloc.free(self.name);
         if (self.field.len > 0) alloc.free(self.field);
         if (self.template.len > 0) alloc.free(self.template);
@@ -770,6 +775,14 @@ pub fn enrichmentConfigHash(cfg: EnrichmentConfig) u64 {
     var hasher = std.hash.Wyhash.init(0x41454a4346470001);
     hashLengthPrefixedBytes(&hasher, cfg.name);
     hashLengthPrefixedBytes(&hasher, @tagName(cfg.kind));
+    if (cfg.source) |source| hasher.update(&source.semanticDigest());
+    if (cfg.prior_context) |context| {
+        hashLengthPrefixedBytes(&hasher, context.artifact);
+        hashLengthPrefixedBytes(&hasher, context.render);
+        hashU32(&hasher, context.max_items);
+        hashU32(&hasher, context.max_bytes);
+        hashU32(&hasher, context.horizon_segments);
+    }
     hashLengthPrefixedBytes(&hasher, cfg.field);
     hashLengthPrefixedBytes(&hasher, cfg.template);
     hashLengthPrefixedBytes(&hasher, cfg.source_artifact_name);
@@ -1036,6 +1049,8 @@ pub const TextMultiMatchField = struct {
 };
 
 pub const TextQuery = union(enum) {
+    value: @import("../../search/value_query.zig").Spec,
+    autocomplete: struct { field: []const u8, text: []const u8, boost: f32 = 1.0 },
     match_none: void,
     match_all: void,
     phrase: struct {
@@ -1162,6 +1177,14 @@ pub const TextQuery = union(enum) {
 
     pub fn deinit(self: *TextQuery, alloc: Allocator) void {
         switch (self.*) {
+            .value => |v| {
+                alloc.free(v.field);
+                alloc.free(v.text);
+            },
+            .autocomplete => |v| {
+                alloc.free(v.field);
+                alloc.free(v.text);
+            },
             .match_none, .match_all => {},
             .phrase => |phrase| {
                 alloc.free(phrase.field);
@@ -1415,6 +1438,8 @@ pub const LookupOptions = struct {
     relational_integrity_jobs_json: []const u8 = "",
     relational_activation_json: []const u8 = "",
     relational_index_status_json: []const u8 = "",
+    /// Authenticated private grouped-source control read.
+    group_source_query_json: []const u8 = "",
     relational_topology_json: []const u8 = "",
     /// Local FK source-control capability. Never parsed from HTTP or encoded
     /// on the lookup wire; only the authenticated owner receiver sets it.
@@ -1593,6 +1618,7 @@ pub const ScanHash = struct {
 
 /// One row yielded by a snapshot-consistent scan. Slices are borrowed for the
 /// duration of the callback; consumers that retain them must copy them.
+pub const BorrowedScanDocument = @import("../scan_document.zig").Borrowed;
 pub const ScanVisitEntry = struct {
     id: []const u8,
     hash: u64,
@@ -1601,9 +1627,13 @@ pub const ScanVisitEntry = struct {
     relational_cursor: ?[]const u8 = null,
     json_null_fields: []const []const u8 = &.{},
     document_json: ?[]const u8 = null,
+    document_stream: ?BorrowedScanDocument = null,
 };
 
 pub const ScanVisitor = struct {
+    /// Opt in only when the callback consumes document_stream synchronously.
+    /// Ordinary collectors retain their existing document_json contract.
+    borrow_documents: bool = false,
     context: ?*anyopaque,
     visit: *const fn (context: ?*anyopaque, entry: ScanVisitEntry) anyerror!void,
     callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
@@ -1872,6 +1902,14 @@ pub const SearchRequest = struct {
         return self.evaluation_limit > 0 and !self.evaluation_graph;
     }
 
+    /// Trusted request-local preparation, never decoded from public input.
+    value_search_execution: @import("../../search/value_query.zig").Policy = .{},
+    value_search_work: ?*@import("../../search/value_query.zig").Work = null,
+    value_search_scope: ?@import("../../search/value_membership.zig").Scope = null,
+    native_text_tie_rank: ?@import("../../search/scorer.zig").TieRank = null,
+    text_navigation_plan: ?*const @import("../../search/search.zig").TextNavigationPlan = null,
+    text_pattern_programs: ?*@import("../../search/query.zig").PatternPrograms = null,
+    text_pattern_membership: ?*@import("../../search/query.zig").PatternMembership = null,
     /// Authenticated internal two-phase hydration, never set by public parsing.
     document_authority_mode: document_authority.Mode = .none,
     document_authority_group: u64 = 0,
@@ -2062,6 +2100,8 @@ const hierarchy_children_validated_fields = [_][]const u8{
 };
 
 const hierarchy_children_supported_internal_fields = [_][]const u8{
+    "value_search_work",
+    "value_search_scope",
     "document_authority_mode",
     "document_authority_group",
     "document_output_allocator",
@@ -2095,6 +2135,7 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
 };
 
 const hierarchy_children_rejected_fields = [_][]const u8{
+    "value_search_execution",
     "evaluation_json",
     "evaluation_limit",
     "evaluation_matches",
@@ -2149,6 +2190,10 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "require_algebraic_filter_resolution",
     "distributed_text_stats",
     "minimum_competitive_score",
+    "text_navigation_plan",
+    "text_pattern_programs",
+    "text_pattern_membership",
+    "native_text_tie_rank",
 };
 
 fn auditHierarchyChildrenSearchRequestFields() void {
@@ -2931,6 +2976,7 @@ pub const ShardIdentityReadGeneration = struct {
 };
 
 pub const SearchResult = struct {
+    value_search_profile_json: ?[]u8 = null,
     /// Only private hydration results may split body ownership from metadata.
     /// Move bodies into the destination before retiring worker scratch.
     stored_data_allocator: ?Allocator = null,
@@ -2980,6 +3026,7 @@ pub const SearchResult = struct {
     }
 
     pub fn deinit(self: *SearchResult) void {
+        if (self.value_search_profile_json) |json| self.alloc.free(json);
         if (self.sort_profile_storage) |storage| self.alloc.free(storage);
         for (self.hits) |*hit| {
             if (self.stored_data_allocator) |body_allocator| {
@@ -3456,12 +3503,16 @@ pub const ReplayStageStats = struct {
 
 pub const ResolverReplayDiagnostic = struct {
     name: []const u8 = "",
+    config_generation: u64 = 0,
+    effective_generation: u64 = 0,
+    curation_revision: u64 = 0,
     table: []const u8 = "",
     source_artifact: []const u8 = "",
     resolution_artifact: []const u8 = "",
 };
 
 pub const ResolverReplayDiagnostics = struct {
+    reresolve_pending: bool = false,
     resolver_count: u64 = 0,
     resolution_runtime_present: bool = false,
     resolution_worker_started: bool = false,
@@ -4138,6 +4189,10 @@ pub const RepairCapacityCheck = struct {
 };
 
 pub const ArtifactRepairRunOptions = struct {
+    /// Lite's live coordinator may enqueue a bounded source page or retire a
+    /// proven canonical initial build. It must never construct/activate a
+    /// shadow while holding the short connection publication fence.
+    source_replay_only: bool = false,
     /// Absolute local catalog-admission deadline in the source routing clock.
     /// Background admission must not consume the quantum waiting for metadata.
     admission_deadline_ns: ?u64 = null,

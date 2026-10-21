@@ -162,6 +162,38 @@ antfly inference pull hf:BAAI/bge-small-en-v1.5:i8 --tasks embed
 
 With no variant the pull is `auto`. Keep one variant per model directory: a second variant pulled beside the first leaves both in place, and different parts of a model can then resolve to different variants. If a model misbehaves after a second pull, delete the directory and pull once.
 
+## Local Gemma4 Video Prompts
+
+Linux CUDA builds accept one local H.264 MP4 clip with a Gemma4 GGUF model and
+its matching vision projector:
+
+```bash
+antfly inference generate /models/gemma4 'Describe this video.' \
+  --video clip.mp4 --backend cuda --max-tokens 128 --disable-thinking
+```
+
+The GPU must support compute capability 7.5 or newer, and the NVIDIA driver must
+expose `libnvcuvid.so.1` and support H.264 NVDEC decoding.
+In NVIDIA containers, expose the driver's `video` capability alongside `compute`
+and `utility`. The runtime uses checked-in CUDA kernels; video decoding does not
+require FFmpeg, a CUDA compiler, or NVRTC at runtime.
+
+Clips must be progressive 8-bit 4:2:0 SDR, at most 256 MiB and 60 seconds, with
+coded dimensions no larger than 4096 on either axis and no more than 18,000
+samples. The GPU's own decoder minimum and maximum dimensions also apply.
+Frames are selected in presentation order at one frame per second, with up to
+70 visual tokens per selected frame. MP4 edit-list end times are respected.
+Decoded surfaces, resized patches, projected features, and the prompt embedding
+handoff stay on the GPU. Compressed packets, timestamps, and model weights still
+use host memory; weights upload once per request.
+
+This route supports the local CLI and native generation library. The HTTP API
+does not accept video yet. Audio tracks in the clip are ignored. Rotation,
+non-square pixels, HDR, interlacing, other codecs, mixed image/audio attachments,
+raw prompts, and speculative decoding are unsupported. Unsupported clips fail
+explicitly. NVDEC owns additional driver memory outside Antfly's tensor-budget
+counters; leave GPU headroom for decoder surfaces when setting memory limits.
+
 ## Model Storage
 
 Models live under `$ANTFLY_INFERENCE_MODELS_DIR`, else `~/.antfly/inference/models`; `--models-dir` overrides both. A variant-less pull installs flat under the HuggingFace owner and repository name:
@@ -259,3 +291,27 @@ Then prompt it with the outcome, for example "Set up local embeddings and rerank
 - [Inference API reference](/inference/api): the HTTP surface
 
 - [Typed Decisions](decisions.md): named choice, ordinal score, and Boolean questions through HTTP and C, Rust, Go, Python, or TypeScript embedded inference
+
+### Model instances
+
+Antfly inference owns the shared model cache. Antfarm and other clients use the
+same model-instance API:
+
+- `GET /ai/v1/models/instances` lists loading and loaded instances without
+  extending their idle deadlines. Each incarnation appears once, with all its
+  supported tasks.
+- `POST /ai/v1/models/instances` with `{ "model": "owner/model", "task": "embedder" }`
+  prepares the same instance used by that task's inference requests. Existing
+  compatible instances are reused. Normal eviction still applies. Readers that
+  own sessions per request have no persistent instance and return an unsupported
+  instance error; their ordinary inference requests remain available.
+- `DELETE /ai/v1/models/instances/{instance_id}` unloads one exact incarnation.
+  An absent or stale ID succeeds without affecting a replacement. Busy, loading,
+  and startup-managed instances return a conflict.
+
+A model is an artifact; a model instance is one loading or loaded incarnation
+inside a server; a backend is its selected execution implementation. Loaded
+instances may stream weights and do not promise full GPU residency.
+`active_handles` counts internal owners and load waiters, rather than HTTP
+requests. `unloadable` and `unload_blocked_reason` describe eviction eligibility
+at snapshot time; concurrent work can change it before an unload arrives.

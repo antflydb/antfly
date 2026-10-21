@@ -1,0 +1,1500 @@
+// Vendored Yuku 0.20.1; upstream revision e68066ff291d2fe43c727054f03636f4a633596b.
+// SPDX-License-Identifier: MIT
+//
+// MIT License
+//
+// Copyright (c) 2026 Yuku
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+const std = @import("std");
+const Token = @import("token.zig").Token;
+const TokenTag = @import("token.zig").TokenTag;
+const Span = @import("token.zig").Span;
+const TokenFlag = @import("token.zig").TokenFlag;
+const flagMask = @import("token.zig").flagMask;
+const ast = @import("ast.zig");
+const util = @import("util");
+const Simd = util.Simd;
+
+pub const LexicalError = error{
+    UnterminatedString,
+    NonTerminatedTemplateLiteral,
+    UnterminatedRegexLiteral,
+    InvalidRegexLineTerminator,
+    InvalidRegexFlag,
+    DuplicateRegexFlag,
+    IncompatibleRegexFlags,
+    InvalidIdentifierStart,
+    InvalidIdentifierContinue,
+    UnterminatedMultiLineComment,
+    InvalidUnicodeEscape,
+    InvalidHexEscape,
+    InvalidOctalEscape,
+    InvalidOctalLiteralDigit,
+    InvalidBinaryLiteral,
+    InvalidHexLiteral,
+    InvalidExponentPart,
+    NumericSeparatorMisuse,
+    ConsecutiveNumericSeparators,
+    InvalidBigIntSuffix,
+    IdentifierAfterNumericLiteral,
+    InvalidUtf8,
+    OutOfMemory,
+    JsxIdentifierCannotContainEscapes,
+    JsxIdentifierCannotStartWithBackslash,
+};
+
+pub const LexerMode = enum {
+    normal,
+    /// Inside a JSX tag, where identifiers may contain hyphens, escapes are disabled,
+    /// strings may span lines, and `>` is always a single token.
+    jsx_tag,
+};
+
+inline fn identContinueRun(chunk: Simd.Chunk) u32 {
+    const lower = chunk | Simd.splat(0x20);
+    const alpha = (lower -% Simd.splat('a')) < Simd.splat(26);
+    const digit = (chunk -% Simd.splat('0')) < Simd.splat(10);
+    const underscore = chunk == Simd.splat('_');
+    const dollar = chunk == Simd.splat('$');
+    return Simd.leadingTrueCount(alpha | digit | underscore | dollar);
+}
+
+fn findAnyPos(comptime chars: []const u8, src: []const u8, from: u32) u32 {
+    var i: usize = from;
+    while (i + 16 <= src.len) : (i += 16) {
+        const chunk = Simd.loadChunk(src, i);
+        var hit: @Vector(16, bool) = @splat(false);
+        inline for (chars) |ch| hit = hit | (chunk == Simd.splat(ch));
+        const first = Simd.firstTrueLane(hit);
+        if (first < 16) return @intCast(i + first);
+    }
+    while (i < src.len) : (i += 1) {
+        inline for (chars) |ch| {
+            if (src[i] == ch) return @intCast(i);
+        }
+    }
+    return @intCast(src.len);
+}
+
+pub const LexerState = struct {
+    /// Flags attached to the next emitted token.
+    token_flags: u8 = 0,
+};
+
+pub const Lexer = struct {
+    /// Comments in source order, populated only when `collect_comments` is set.
+    comments: std.ArrayList(ast.Comment),
+    collect_comments: bool,
+    allocator: std.mem.Allocator,
+    state: LexerState,
+    mode: LexerMode = .normal,
+
+    source: []const u8,
+    cursor: u32,
+
+    source_type: ast.SourceType,
+    hashbang: ?struct { start: u32, len: u32 } = null,
+
+    pub fn init(
+        source: []const u8,
+        allocator: std.mem.Allocator,
+        source_type: ast.SourceType,
+        collect_comments: bool,
+    ) Lexer {
+        std.debug.assert(source.len <= std.math.maxInt(u32));
+        var self: Lexer = .{
+            .source = source,
+            .state = .{},
+            .cursor = 0,
+            .comments = .empty,
+            .collect_comments = collect_comments,
+            .allocator = allocator,
+            .source_type = source_type,
+        };
+        self.skipHashbang();
+        std.debug.assert(self.cursor <= self.source.len);
+        return self;
+    }
+
+    fn skipHashbang(self: *Lexer) void {
+        std.debug.assert(self.cursor == 0);
+        if (self.source.len >= 2 and self.source[0] == '#' and self.source[1] == '!') {
+            var end: u32 = 2;
+            while (end < self.source.len and
+                self.source[end] != '\n' and
+                self.source[end] != '\r')
+            {
+                end += 1;
+            }
+            std.debug.assert(end >= 2);
+            std.debug.assert(end <= self.source.len);
+            self.hashbang = .{ .start = 2, .len = end - 2 };
+            self.cursor = end;
+        }
+    }
+
+    /// `nextToken`, written into `out`.
+    pub fn nextTokenInto(self: *Lexer, out: *Token) LexicalError!void {
+        // avoids a stack round trip
+        out.* = try @call(.always_inline, nextToken, .{self});
+    }
+
+    pub fn nextToken(self: *Lexer) LexicalError!Token {
+        std.debug.assert(self.cursor <= self.source.len);
+        self.clearTokenFlags();
+        try self.skipTrivia();
+        std.debug.assert(self.cursor <= self.source.len);
+
+        if (self.cursor >= self.source.len) {
+            return self.createToken(.eof, self.cursor, self.cursor);
+        }
+
+        const current_char = self.source[self.cursor];
+
+        if (ident_start_table_ascii[current_char] and self.mode == .normal) {
+            var token: Token = undefined;
+            if (self.scanAsciiIdentifier(&token)) return token;
+            return self.scanIdentifierOrKeyword();
+        }
+
+        return switch (current_char) {
+            '+',
+            '*',
+            '-',
+            '!',
+            '<',
+            '>',
+            '=',
+            '|',
+            '&',
+            '^',
+            '%',
+            '/',
+            '?',
+            => self.scanPunctuation(),
+            '.' => self.scanDot(),
+            '0'...'9' => try self.scanNumber(),
+            '"', '\'' => self.scanString(),
+            '`' => self.scanTemplateLiteral(),
+            '~', '(', ')', '{', '}', '[', ']', ';', ',', ':', '@' => self.scanSimplePunctuation(),
+            else => self.scanIdentifierOrKeyword(),
+        };
+    }
+
+    /// Fast path into `out` for identifiers and simple punctuation, false otherwise.
+    pub inline fn tryNextToken(self: *Lexer, out: *Token) bool {
+        std.debug.assert(self.cursor <= self.source.len);
+
+        if (self.mode != .normal) return false;
+
+        const src = self.source;
+        if (self.cursor >= src.len) return false;
+
+        if (src[self.cursor] == ' ') {
+            self.cursor += 1;
+            if (self.cursor >= src.len) return false;
+        } else if (src[self.cursor] == '\n') {
+            return self.tryNextTokenOnNewLine(out);
+        }
+
+        switch (fast_class[src[self.cursor]]) {
+            .ident => return self.scanAsciiIdentifier(out),
+            .punct => {
+                out.* = self.scanSimplePunctuation();
+                return true;
+            },
+            .dot => {
+                const c1 = self.peek(1);
+                if (c1 == '.' or std.ascii.isDigit(c1)) return false;
+                out.* = self.puncToken(1, .dot, self.cursor);
+                return true;
+            },
+            .slow => return false,
+        }
+    }
+
+    // a miss rewinds to the line feed
+    inline fn tryNextTokenOnNewLine(self: *Lexer, out: *Token) bool {
+        const src = self.source;
+        const line_feed = self.cursor;
+        std.debug.assert(src[line_feed] == '\n');
+
+        var pos = line_feed + 1;
+        while (pos + 16 <= src.len) {
+            const run = Simd.leadingTrueCount(Simd.loadChunk(src, pos) == Simd.splat(' '));
+            pos += run;
+            if (run < 16) break;
+        } else {
+            while (pos < src.len and src[pos] == ' ') pos += 1;
+        }
+        if (pos >= src.len) return false;
+        std.debug.assert(src[pos] != ' ');
+
+        const class = fast_class[src[pos]];
+        if (class != .ident and class != .punct) return false;
+
+        self.cursor = pos;
+        self.clearTokenFlags();
+        self.setTokenFlag(.line_terminator_before);
+
+        if (class == .ident) {
+            if (self.scanAsciiIdentifier(out)) return true;
+            self.cursor = line_feed;
+            return false;
+        }
+        out.* = self.scanSimplePunctuation();
+        return true;
+    }
+
+    // false on an escape or non-ascii byte
+    inline fn scanAsciiIdentifier(self: *Lexer, out: *Token) bool {
+        const src = self.source;
+        const start = self.cursor;
+        std.debug.assert(ident_start_table_ascii[src[start]]);
+
+        var pos = start + 1;
+        while (pos + 16 <= src.len) {
+            const run = identContinueRun(Simd.loadChunk(src, pos));
+            pos += run;
+            if (run < 16) break;
+        } else {
+            while (pos < src.len and ident_continue_table_ascii[src[pos]]) {
+                pos += 1;
+            }
+        }
+        std.debug.assert(pos > start);
+        if (pos < src.len) std.debug.assert(!ident_continue_table_ascii[src[pos]]);
+        if (pos < src.len and (src[pos] == '\\' or src[pos] >= 0x80)) return false;
+
+        self.cursor = pos;
+        const first = src[start];
+        const len = pos - start;
+        const is_keyword_candidate = first >= 'a' and first <= 'z' and
+            len >= keyword_length_min and len <= keyword_length_max;
+        const tag: TokenTag = if (is_keyword_candidate)
+            getKeywordType(src[start..pos])
+        else
+            .identifier;
+        out.* = self.createToken(tag, start, pos);
+        return true;
+    }
+
+    const simple_punct_tag: [256]TokenTag = blk: {
+        var t: [256]TokenTag = @splat(.eof);
+        t['~'] = .bitwise_not;
+        t['('] = .left_paren;
+        t[')'] = .right_paren;
+        t['{'] = .left_brace;
+        t['}'] = .right_brace;
+        t['['] = .left_bracket;
+        t[']'] = .right_bracket;
+        t[';'] = .semicolon;
+        t[','] = .comma;
+        t[':'] = .colon;
+        t['@'] = .at;
+        break :blk t;
+    };
+
+    const FastClass = enum(u8) { slow, ident, punct, dot };
+
+    const fast_class: [256]FastClass = blk: {
+        var t: [256]FastClass = @splat(.slow);
+        for (0..256) |c| {
+            if (ident_start_table_ascii[c]) t[c] = .ident;
+            if (simple_punct_tag[c] != .eof) t[c] = .punct;
+        }
+        t['.'] = .dot;
+        break :blk t;
+    };
+
+    inline fn scanSimplePunctuation(self: *Lexer) Token {
+        std.debug.assert(self.cursor < self.source.len);
+
+        const start = self.cursor;
+        const tag = simple_punct_tag[self.source[start]];
+        self.cursor = start + 1;
+
+        std.debug.assert(tag != .eof);
+        return self.createToken(tag, start, start + 1);
+    }
+
+    inline fn puncToken(self: *Lexer, len: u32, tag: TokenTag, start: u32) Token {
+        std.debug.assert(len > 0);
+        std.debug.assert(start == self.cursor);
+        std.debug.assert(start + len <= self.source.len);
+
+        self.cursor += len;
+        return self.createToken(tag, start, self.cursor);
+    }
+
+    fn scanPunctuation(self: *Lexer) LexicalError!Token {
+        std.debug.assert(self.cursor < self.source.len);
+
+        const start = self.cursor;
+        const c0 = self.source[self.cursor];
+        const c1 = self.peek(1);
+        const c2 = self.peek(2);
+        const c3 = self.peek(3);
+
+        std.debug.assert(switch (c0) {
+            '+', '-', '*', '/', '%', '<', '>', '=', '!', '&', '|', '^', '?' => true,
+            else => false,
+        });
+
+        return switch (c0) {
+            '+' => switch (c1) {
+                '+' => self.puncToken(2, .increment, start),
+                '=' => self.puncToken(2, .plus_assign, start),
+                else => self.puncToken(1, .plus, start),
+            },
+            '-' => switch (c1) {
+                '-' => self.puncToken(2, .decrement, start),
+                '=' => self.puncToken(2, .minus_assign, start),
+                else => self.puncToken(1, .minus, start),
+            },
+            '*' => if (c1 == '*' and c2 == '=')
+                self.puncToken(3, .exponent_assign, start)
+            else switch (c1) {
+                '*' => self.puncToken(2, .exponent, start),
+                '=' => self.puncToken(2, .star_assign, start),
+                else => self.puncToken(1, .star, start),
+            },
+            '/' => if (c1 == '=')
+                self.puncToken(2, .slash_assign, start)
+            else
+                self.puncToken(1, .slash, start),
+            '%' => switch (c1) {
+                '=' => self.puncToken(2, .percent_assign, start),
+                else => self.puncToken(1, .percent, start),
+            },
+            '<' => if (c1 == '<' and c2 == '=')
+                self.puncToken(3, .left_shift_assign, start)
+            else switch (c1) {
+                '<' => self.puncToken(2, .left_shift, start),
+                '=' => self.puncToken(2, .less_than_equal, start),
+                else => self.puncToken(1, .less_than, start),
+            },
+            // inside a jsx tag `>` only closes the tag, so `<div>=</div>` and the
+            // trailing `>>` of `<div attr=<e></e>></div>` must not merge
+            '>' => if (self.mode == .jsx_tag)
+                self.puncToken(1, .greater_than, start)
+            else if (c1 == '>' and c2 == '=')
+                self.puncToken(3, .right_shift_assign, start)
+            else if (c1 == '>' and c2 == '>')
+                if (c3 == '=')
+                    self.puncToken(4, .unsigned_right_shift_assign, start)
+                else
+                    self.puncToken(3, .unsigned_right_shift, start)
+            else switch (c1) {
+                '>' => self.puncToken(2, .right_shift, start),
+                '=' => self.puncToken(2, .greater_than_equal, start),
+                else => self.puncToken(1, .greater_than, start),
+            },
+            '=' => if (c1 == '=' and c2 == '=')
+                self.puncToken(3, .strict_equal, start)
+            else switch (c1) {
+                '=' => self.puncToken(2, .equal, start),
+                '>' => self.puncToken(2, .arrow, start),
+                else => self.puncToken(1, .assign, start),
+            },
+            '!' => if (c1 == '=' and c2 == '=')
+                self.puncToken(3, .strict_not_equal, start)
+            else switch (c1) {
+                '=' => self.puncToken(2, .not_equal, start),
+                else => self.puncToken(1, .logical_not, start),
+            },
+            '&' => if (c1 == '&' and c2 == '=')
+                self.puncToken(3, .logical_and_assign, start)
+            else switch (c1) {
+                '&' => self.puncToken(2, .logical_and, start),
+                '=' => self.puncToken(2, .bitwise_and_assign, start),
+                else => self.puncToken(1, .bitwise_and, start),
+            },
+            '|' => if (c1 == '|' and c2 == '=')
+                self.puncToken(3, .logical_or_assign, start)
+            else switch (c1) {
+                '|' => self.puncToken(2, .logical_or, start),
+                '=' => self.puncToken(2, .bitwise_or_assign, start),
+                else => self.puncToken(1, .bitwise_or, start),
+            },
+            '^' => switch (c1) {
+                '=' => self.puncToken(2, .bitwise_xor_assign, start),
+                else => self.puncToken(1, .bitwise_xor, start),
+            },
+            '?' => if (c1 == '?' and c2 == '=')
+                self.puncToken(3, .nullish_assign, start)
+            else switch (c1) {
+                '?' => self.puncToken(2, .nullish_coalescing, start),
+                '.' => if (std.ascii.isDigit(c2))
+                    self.puncToken(1, .question, start)
+                else
+                    self.puncToken(2, .optional_chaining, start),
+                else => self.puncToken(1, .question, start),
+            },
+            else => unreachable,
+        };
+    }
+
+    inline fn peek(self: *const Lexer, offset: u32) u8 {
+        const idx = @as(usize, self.cursor) + offset;
+        if (idx >= self.source.len) {
+            return 0;
+        }
+        return self.source[idx];
+    }
+
+    inline fn setTokenFlag(self: *Lexer, comptime flag: TokenFlag) void {
+        self.state.token_flags |= flagMask(flag);
+    }
+
+    inline fn hasTokenFlag(self: *const Lexer, comptime flag: TokenFlag) bool {
+        return (self.state.token_flags & flagMask(flag)) != 0;
+    }
+
+    inline fn clearTokenFlags(self: *Lexer) void {
+        self.state.token_flags = 0;
+    }
+
+    inline fn consumeTokenFlags(self: *Lexer) u8 {
+        const flags = self.state.token_flags;
+        self.state.token_flags = 0;
+        return flags;
+    }
+
+    pub inline fn rewindTo(self: *Lexer, position: u32) void {
+        std.debug.assert(position <= self.source.len);
+        self.cursor = position;
+        self.clearTokenFlags();
+    }
+
+    inline fn isLineTerminator(self: *const Lexer) bool {
+        return util.Utf.lineBreakLen(self.source, self.cursor) > 0;
+    }
+
+    /// Scans the `template_middle` or `template_tail` that starts at the `}` closing
+    /// a substitution.
+    pub fn reScanTemplateContinuation(self: *Lexer, right_brace_start: u32) LexicalError!Token {
+        std.debug.assert(right_brace_start < self.source.len);
+        std.debug.assert(self.source[right_brace_start] == '}');
+        self.rewindTo(right_brace_start + 1);
+        return try self.scanTemplateSpan(right_brace_start, .template_tail, .template_middle) orelse
+            return error.NonTerminatedTemplateLiteral;
+    }
+
+    /// Splits a `>`-led token into a leading `>` so nested type argument lists like
+    /// `Foo<Bar<T>>` can close.
+    pub fn reScanGreaterThan(self: *Lexer, token_start: u32) Token {
+        std.debug.assert(token_start < self.source.len);
+        std.debug.assert(self.source[token_start] == '>');
+        self.rewindTo(token_start + 1);
+        return self.createToken(.greater_than, token_start, token_start + 1);
+    }
+
+    /// Splits `<<` into a leading `<` so nested generics like `Foo<<T>(x: T) => R>` can open.
+    pub fn reScanLessThan(self: *Lexer, token_start: u32) Token {
+        std.debug.assert(token_start < self.source.len);
+        std.debug.assert(self.source[token_start] == '<');
+        self.rewindTo(token_start + 1);
+        return self.createToken(.less_than, token_start, token_start + 1);
+    }
+
+    /// Scans a JSX text run.
+    pub fn reScanJsxText(self: *Lexer, initial_cursor: u32) Token {
+        std.debug.assert(initial_cursor <= self.source.len);
+        self.rewindTo(initial_cursor);
+        const start = self.cursor;
+        while (self.cursor < self.source.len) {
+            switch (self.source[self.cursor]) {
+                '<', '{', '>', '}' => break,
+                else => self.cursor += 1,
+            }
+        }
+
+        std.debug.assert(self.cursor >= start);
+        return self.createToken(.jsx_text, start, self.cursor);
+    }
+
+    const RegexResult = struct {
+        span: Span,
+        pattern: []const u8,
+        flags: []const u8,
+    };
+
+    /// Re-scans a `/` token as a regex literal once the parser knows it is not division.
+    pub fn reScanAsRegex(self: *Lexer, slash_token_start: u32) LexicalError!RegexResult {
+        std.debug.assert(slash_token_start < self.source.len);
+        std.debug.assert(self.source[slash_token_start] == '/');
+
+        self.rewindTo(slash_token_start);
+        const start = self.cursor;
+        self.cursor += 1;
+        var in_class = false;
+
+        while (self.cursor < self.source.len) {
+            if (self.isLineTerminator()) return error.InvalidRegexLineTerminator;
+            const c = self.source[self.cursor];
+            if (c == '\\') {
+                self.cursor += 1;
+                if (self.cursor >= self.source.len) return error.UnterminatedRegexLiteral;
+                if (self.isLineTerminator()) return error.InvalidRegexLineTerminator;
+                self.cursor += 1;
+                continue;
+            }
+            if (c == '[') {
+                in_class = true;
+                self.cursor += 1;
+                continue;
+            }
+            if (c == ']' and in_class) {
+                in_class = false;
+                self.cursor += 1;
+                continue;
+            }
+            if (c == '/' and !in_class) {
+                self.cursor += 1;
+                const flags_start = self.cursor;
+
+                var flags_seen: u32 = 0;
+                while (std.ascii.isAlphabetic(self.peek(0))) : (self.cursor += 1) {
+                    const flag = self.peek(0);
+                    switch (flag) {
+                        'g', 'i', 'm', 's', 'u', 'y', 'd', 'v' => {},
+                        else => return error.InvalidRegexFlag,
+                    }
+                    const flag_bit = @as(u32, 1) << @intCast(flag - 'a');
+                    if (flags_seen & flag_bit != 0) return error.DuplicateRegexFlag;
+                    flags_seen |= flag_bit;
+                }
+
+                const u_bit = @as(u32, 1) << ('u' - 'a');
+                const v_bit = @as(u32, 1) << ('v' - 'a');
+                if (flags_seen & u_bit != 0 and flags_seen & v_bit != 0) {
+                    return error.IncompatibleRegexFlags;
+                }
+
+                return .{
+                    .span = .{ .start = start, .end = self.cursor },
+                    .pattern = self.source[start + 1 .. flags_start - 1],
+                    .flags = self.source[flags_start..self.cursor],
+                };
+            }
+
+            self.cursor += 1;
+        }
+        return error.UnterminatedRegexLiteral;
+    }
+
+    fn scanString(self: *Lexer) LexicalError!Token {
+        std.debug.assert(self.cursor < self.source.len);
+
+        const start = self.cursor;
+        const src = self.source;
+        const quote = src[start];
+        std.debug.assert(quote == '"' or quote == '\'');
+        var pos = self.cursor + 1;
+
+        if (self.mode == .normal) {
+            while (pos < src.len) {
+                const hit = if (quote == '"')
+                    findAnyPos("\"\\\n\r", src, pos)
+                else
+                    findAnyPos("'\\\n\r", src, pos);
+                if (hit >= src.len) {
+                    pos = hit;
+                    break;
+                }
+                if (src[hit] == quote) {
+                    pos = hit + 1;
+                    self.cursor = pos;
+                    return self.createToken(.string_literal, start, pos);
+                }
+                if (src[hit] == '\\') {
+                    self.cursor = hit;
+                    try self.consumeEscape(.string);
+                    pos = self.cursor;
+                    continue;
+                }
+                std.debug.assert(src[hit] == '\n' or src[hit] == '\r');
+                self.cursor = hit;
+                return error.UnterminatedString;
+            }
+        } else {
+            // jsx attribute values have no escapes and may span lines
+            while (pos < src.len) {
+                if (src[pos] == quote) {
+                    pos += 1;
+                    self.cursor = pos;
+                    return self.createToken(.string_literal, start, pos);
+                }
+                pos += 1;
+            }
+        }
+
+        self.cursor = pos;
+        return error.UnterminatedString;
+    }
+
+    fn scanTemplateLiteral(self: *Lexer) LexicalError!Token {
+        std.debug.assert(self.cursor < self.source.len);
+        std.debug.assert(self.source[self.cursor] == '`');
+
+        const start = self.cursor;
+        self.cursor += 1;
+        return try self.scanTemplateSpan(start, .no_substitution_template, .template_head) orelse {
+            self.cursor = @intCast(self.source.len);
+            return error.NonTerminatedTemplateLiteral;
+        };
+    }
+
+    inline fn scanTemplateSpan(
+        self: *Lexer,
+        start: u32,
+        comptime backtick_tag: TokenTag,
+        comptime substitution_tag: TokenTag,
+    ) LexicalError!?Token {
+        const src = self.source;
+        var pos = self.cursor;
+        while (true) {
+            pos = findAnyPos("`\\$\r", src, pos);
+            if (pos >= src.len) return null;
+            switch (src[pos]) {
+                '`' => {
+                    self.cursor = pos + 1;
+                    return self.createToken(backtick_tag, start, self.cursor);
+                },
+                '\\' => {
+                    self.cursor = pos;
+                    try self.consumeEscape(.template);
+                    pos = self.cursor;
+                },
+                '$' => {
+                    if (pos + 1 < src.len and src[pos + 1] == '{') {
+                        self.cursor = pos + 2;
+                        return self.createToken(substitution_tag, start, self.cursor);
+                    }
+                    pos += 1;
+                },
+                // a raw CR must be normalized in the cooked value, so it counts as escaped
+                '\r' => {
+                    self.setTokenFlag(.escaped);
+                    pos += 1;
+                },
+                else => unreachable,
+            }
+        }
+    }
+
+    const EscapeContext = enum {
+        string,
+        template,
+    };
+
+    // a bad template escape is not fatal, tagged templates still get a token with an
+    // undefined cooked value
+    fn consumeEscape(self: *Lexer, comptime context: EscapeContext) LexicalError!void {
+        if (context == .template) {
+            self.consumeEscapeImpl(context) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                self.setTokenFlag(.invalid_escape);
+                if (self.cursor < self.source.len) self.cursor += 1;
+            };
+        } else {
+            try self.consumeEscapeImpl(context);
+        }
+    }
+
+    fn consumeEscapeImpl(self: *Lexer, comptime context: EscapeContext) LexicalError!void {
+        std.debug.assert(self.cursor < self.source.len);
+        std.debug.assert(self.source[self.cursor] == '\\');
+
+        self.cursor += 1;
+        self.setTokenFlag(.escaped);
+        if (self.cursor >= self.source.len) return error.UnterminatedString;
+
+        switch (self.source[self.cursor]) {
+            '0' => {
+                // `\0` is a null escape only when no digit follows
+                if (!std.ascii.isDigit(self.peek(1))) {
+                    self.cursor += 1;
+                    return;
+                }
+                if (context == .template) return error.InvalidOctalEscape;
+                try self.consumeOctal();
+            },
+            'x' => try self.consumeHex(),
+            'u' => {
+                const cp = try self.consumeUnicodeEscape(.normal);
+                if (std.unicode.isSurrogateCodepoint(cp)) {
+                    const is_high_paired = std.unicode.utf16IsHighSurrogate(@intCast(cp)) and
+                        self.peek(0) == '\\' and
+                        self.peek(1) == 'u';
+                    if (is_high_paired) {
+                        self.cursor += 1;
+                        const next_cp = try self.consumeUnicodeEscape(.normal);
+                        if (next_cp < 0xDC00 or next_cp > 0xDFFF) {
+                            self.setTokenFlag(.lone_surrogates);
+                        }
+                    } else self.setTokenFlag(.lone_surrogates);
+                }
+            },
+            '1'...'7' => {
+                if (context == .template) return error.InvalidOctalEscape;
+                try self.consumeOctal();
+            },
+            '8'...'9' => {
+                if (context == .template) return error.InvalidOctalEscape;
+                self.cursor += 1;
+            },
+            '\n' => self.cursor += 1,
+            '\r' => {
+                self.cursor += 1;
+                if (self.cursor < self.source.len and self.source[self.cursor] == '\n') {
+                    self.cursor += 1;
+                }
+            },
+            else => self.cursor += @max(1, util.Utf.unicodeSeparatorLen(self.source, self.cursor)),
+        }
+    }
+
+    fn consumeOctal(self: *Lexer) LexicalError!void {
+        std.debug.assert(self.cursor < self.source.len);
+        const result = util.Utf.parseOctal(self.source, self.cursor);
+        if (result.end == self.cursor) {
+            return error.InvalidOctalEscape;
+        }
+        std.debug.assert(result.end > self.cursor);
+        self.cursor = @intCast(result.end);
+    }
+
+    fn consumeHex(self: *Lexer) LexicalError!void {
+        std.debug.assert(self.cursor < self.source.len);
+        if (util.Utf.parseHex2(self.source, self.cursor + 1)) |r| {
+            std.debug.assert(r.end >= self.cursor + 1);
+            self.cursor = @intCast(r.end);
+        } else {
+            return error.InvalidHexEscape;
+        }
+    }
+
+    const ConsumeUnicodeContext = enum {
+        identifier_start,
+        identifier_continue,
+        normal,
+    };
+
+    fn consumeUnicodeEscape(
+        self: *Lexer,
+        comptime context: ConsumeUnicodeContext,
+    ) LexicalError!u21 {
+        if (self.cursor >= self.source.len or self.source[self.cursor] != 'u') {
+            return error.InvalidUnicodeEscape;
+        }
+        self.setTokenFlag(.escaped);
+
+        const parsed = util.Utf.parseUnicodeEscape(self.source, self.cursor + 1) orelse
+            return error.InvalidUnicodeEscape;
+        switch (context) {
+            .identifier_start => {
+                if (!util.UnicodeId.canStartId(parsed.value)) return error.InvalidIdentifierStart;
+            },
+            .identifier_continue => {
+                if (!util.UnicodeId.canContinueId(parsed.value)) {
+                    return error.InvalidIdentifierContinue;
+                }
+            },
+            .normal => {},
+        }
+        self.cursor = @intCast(parsed.end);
+        return parsed.value;
+    }
+
+    fn scanDot(self: *Lexer) LexicalError!Token {
+        std.debug.assert(self.cursor < self.source.len);
+        std.debug.assert(self.source[self.cursor] == '.');
+
+        const start = self.cursor;
+        const c1 = self.peek(1);
+        if (std.ascii.isDigit(c1)) return self.scanNumber();
+        if (c1 == '.' and self.peek(2) == '.') return self.puncToken(3, .spread, start);
+        return self.puncToken(1, .dot, start);
+    }
+
+    const ident_start_table_ascii: [256]bool = blk: {
+        var t: [256]bool = @splat(false);
+        for ('a'..('z' + 1)) |c| t[c] = true;
+        for ('A'..('Z' + 1)) |c| t[c] = true;
+        t['_'] = true;
+        t['$'] = true;
+        break :blk t;
+    };
+
+    const ident_continue_table_ascii: [256]bool = blk: {
+        var t: [256]bool = @splat(false);
+        for ('a'..('z' + 1)) |c| t[c] = true;
+        for ('A'..('Z' + 1)) |c| t[c] = true;
+        for ('0'..('9' + 1)) |c| t[c] = true;
+        t['_'] = true;
+        t['$'] = true;
+        break :blk t;
+    };
+
+    const ident_continue_jsx_table_ascii: [256]bool = blk: {
+        var t = ident_continue_table_ascii;
+        t['-'] = true;
+        break :blk t;
+    };
+
+    fn scanIdentifierBody(self: *Lexer, is_jsx_tag: bool) !bool {
+        std.debug.assert(self.cursor <= self.source.len);
+        const table = if (is_jsx_tag)
+            &ident_continue_jsx_table_ascii
+        else
+            &ident_continue_table_ascii;
+        const src = self.source;
+        const entry_pos = self.cursor;
+        var pos = entry_pos;
+        var has_escape = false;
+
+        while (true) {
+            while (pos < src.len and table[src[pos]]) pos += 1;
+            if (pos >= src.len) break;
+
+            const c = src[pos];
+            if (c == '\\') {
+                if (is_jsx_tag) {
+                    self.cursor = pos;
+                    return error.JsxIdentifierCannotContainEscapes;
+                }
+                has_escape = true;
+                self.cursor = pos + 1;
+                _ = try self.consumeUnicodeEscape(.identifier_continue);
+                pos = self.cursor;
+                continue;
+            }
+            if (c >= 0x80) {
+                @branchHint(.cold);
+                self.cursor = pos;
+                const cp = try util.Utf.codePointAt(src, pos);
+                if (util.UnicodeId.canContinueId(cp.value)) {
+                    pos += cp.len;
+                    continue;
+                }
+            }
+            break;
+        }
+
+        std.debug.assert(pos >= entry_pos);
+        self.cursor = pos;
+        return has_escape;
+    }
+
+    fn scanIdentifierOrKeyword(self: *Lexer) !Token {
+        std.debug.assert(self.cursor < self.source.len);
+        const start = self.cursor;
+        const is_jsx_tag = self.mode == .jsx_tag;
+        const is_private = self.peek(0) == '#';
+        if (is_private) self.cursor += 1;
+
+        var has_escape = false;
+        const first_char = self.peek(0);
+        if (std.ascii.isAscii(first_char)) {
+            @branchHint(.likely);
+            if (first_char == '\\') {
+                if (is_jsx_tag) return error.JsxIdentifierCannotStartWithBackslash;
+                has_escape = true;
+                self.cursor += 1;
+                _ = try self.consumeUnicodeEscape(.identifier_start);
+            } else {
+                if (!ident_start_table_ascii[first_char]) {
+                    @branchHint(.cold);
+                    return error.InvalidIdentifierStart;
+                }
+                self.cursor += 1;
+            }
+            const body_has_escape = try self.scanIdentifierBody(is_jsx_tag);
+            has_escape = has_escape or body_has_escape;
+        } else {
+            @branchHint(.cold);
+            const cp = try util.Utf.codePointAt(self.source, self.cursor);
+            if (!util.UnicodeId.canStartId(cp.value)) return error.InvalidIdentifierStart;
+            self.cursor += cp.len;
+            has_escape = try self.scanIdentifierBody(is_jsx_tag);
+        }
+
+        std.debug.assert(self.cursor > start);
+        const lexeme = self.source[start..self.cursor];
+        const tag: TokenTag = if (is_jsx_tag)
+            .jsx_identifier
+        else if (is_private)
+            .private_identifier
+        else if (has_escape)
+            getEscapedKeywordType(lexeme)
+        else
+            getKeywordType(lexeme);
+
+        return self.createToken(tag, start, self.cursor);
+    }
+
+    fn getEscapedKeywordType(lexeme: []const u8) TokenTag {
+        @branchHint(.cold);
+        std.debug.assert(lexeme.len > 0);
+        var buf: [keyword_length_max]u8 = undefined;
+        var out: usize = 0;
+        var i: usize = 0;
+        while (i < lexeme.len) {
+            if (out == buf.len) return .identifier;
+            if (lexeme[i] == '\\' and i + 1 < lexeme.len and lexeme[i + 1] == 'u') {
+                const parsed = util.Utf.parseUnicodeEscape(lexeme, i + 2) orelse return .identifier;
+                if (parsed.value >= 0x80) return .identifier;
+                buf[out] = @intCast(parsed.value);
+                out += 1;
+                i = parsed.end;
+            } else {
+                if (!std.ascii.isAscii(lexeme[i])) return .identifier;
+                buf[out] = lexeme[i];
+                out += 1;
+                i += 1;
+            }
+        }
+        return getKeywordType(buf[0..out]);
+    }
+
+    const keyword_length_min = 2;
+    const keyword_length_max = 11;
+
+    const KeywordEntry = struct {
+        name: [keyword_length_max]u8,
+        len: u8,
+        tag: TokenTag,
+    };
+
+    // perfect hash over (first, second, last, length). the multipliers were found by
+    // offline search so every keyword lands in a distinct slot of the 512-entry table
+    inline fn keywordHash(c0: u8, c1: u8, c_last: u8, length: usize) u32 {
+        const h = @as(u32, c0) * 56 + @as(u32, c1) * 97 +
+            @as(u32, c_last) * 108 + @as(u32, @intCast(length)) * 117;
+        return h & 511;
+    }
+
+    const keyword_table: [512]KeywordEntry = blk: {
+        @setEvalBranchQuota(20_000);
+        var t: [512]KeywordEntry = @splat(.{ .name = @splat(0), .len = 0, .tag = .identifier });
+        for (std.enums.values(TokenTag)) |keyword_tag| {
+            if (!keyword_tag.isIdentifierLike()) continue;
+            const name = keyword_tag.toString() orelse continue;
+            std.debug.assert(name.len >= keyword_length_min);
+            std.debug.assert(name.len <= keyword_length_max);
+            const h = keywordHash(name[0], name[1], name[name.len - 1], name.len);
+            if (t[h].len != 0) @compileError("keyword perfect hash collision: " ++ name);
+            var entry: KeywordEntry = .{ .name = @splat(0), .len = name.len, .tag = keyword_tag };
+            @memcpy(entry.name[0..name.len], name);
+            t[h] = entry;
+        }
+        break :blk t;
+    };
+
+    fn getKeywordType(lexeme: []const u8) TokenTag {
+        if (lexeme.len < keyword_length_min or lexeme.len > keyword_length_max) {
+            return .identifier;
+        }
+        const h = keywordHash(lexeme[0], lexeme[1], lexeme[lexeme.len - 1], lexeme.len);
+        const entry = &keyword_table[h];
+        if (entry.len != lexeme.len) return .identifier;
+        if (!std.mem.eql(u8, entry.name[0..lexeme.len], lexeme)) return .identifier;
+        return entry.tag;
+    }
+
+    fn scanNumber(self: *Lexer) LexicalError!Token {
+        std.debug.assert(self.cursor < self.source.len);
+        const lead = self.source[self.cursor];
+        std.debug.assert(lead == '.' or std.ascii.isDigit(lead));
+
+        const start = self.cursor;
+        var tag: TokenTag = .numeric_literal;
+        var has_decimal_or_exponent = false;
+        var is_leading_zero = false;
+
+        if (self.peek(0) == '0') {
+            self.cursor += 1;
+            switch (self.peek(0)) {
+                'x', 'X' => {
+                    tag = .hex_literal;
+                    try self.consumeRadixDigits(std.ascii.isHex, error.InvalidHexLiteral);
+                },
+                'o', 'O' => {
+                    tag = .octal_literal;
+                    try self.consumeRadixDigits(
+                        util.Utf.isOctalDigit,
+                        error.InvalidOctalLiteralDigit,
+                    );
+                },
+                'b', 'B' => {
+                    tag = .binary_literal;
+                    try self.consumeRadixDigits(isBinaryDigit, error.InvalidBinaryLiteral);
+                },
+                '0'...'9' => {
+                    is_leading_zero = true;
+                    // legacy octal `077` or decimal `089`, neither allows separators
+                    var is_legacy_octal = true;
+                    while (self.cursor < self.source.len) {
+                        const c = self.source[self.cursor];
+                        if (std.ascii.isDigit(c)) {
+                            if (c >= '8') is_legacy_octal = false;
+                            self.cursor += 1;
+                        } else break;
+                    }
+                    tag = if (is_legacy_octal) .octal_literal else .numeric_literal;
+                },
+                else => {},
+            }
+        } else {
+            try self.consumeDecimalDigits();
+        }
+
+        if (tag == .numeric_literal and self.peek(0) == '.') {
+            const next = self.peek(1);
+            if (next == '_') return error.NumericSeparatorMisuse;
+            self.cursor += 1;
+            has_decimal_or_exponent = true;
+            if (std.ascii.isDigit(next)) try self.consumeDecimalDigits();
+        }
+
+        if (tag == .numeric_literal) {
+            const exp = self.peek(0);
+            if (exp == 'e' or exp == 'E') {
+                has_decimal_or_exponent = true;
+                try self.consumeExponent();
+            }
+        }
+
+        if (!is_leading_zero and self.peek(0) == 'n') {
+            if (has_decimal_or_exponent) return error.InvalidBigIntSuffix;
+            self.cursor += 1;
+            tag = .bigint_literal;
+        }
+
+        const c = self.peek(0);
+        if (ident_start_table_ascii[c] or c == '\\') return error.IdentifierAfterNumericLiteral;
+        std.debug.assert(self.cursor > start);
+        return self.createToken(tag, start, self.cursor);
+    }
+
+    inline fn consumeDigits(self: *Lexer, comptime isValidDigit: fn (u8) bool) LexicalError!void {
+        std.debug.assert(self.cursor <= self.source.len);
+        if (self.cursor < self.source.len and self.source[self.cursor] == '_') {
+            return error.NumericSeparatorMisuse;
+        }
+
+        var last_was_separator = false;
+        while (self.cursor < self.source.len) {
+            const c = self.source[self.cursor];
+            if (isValidDigit(c)) {
+                self.cursor += 1;
+                last_was_separator = false;
+            } else if (c == '_') {
+                if (last_was_separator) return error.ConsecutiveNumericSeparators;
+                self.cursor += 1;
+                last_was_separator = true;
+            } else {
+                break;
+            }
+        }
+        if (last_was_separator) return error.NumericSeparatorMisuse;
+    }
+
+    inline fn consumeDecimalDigits(self: *Lexer) LexicalError!void {
+        return self.consumeDigits(std.ascii.isDigit);
+    }
+
+    inline fn consumeRadixDigits(
+        self: *Lexer,
+        comptime isValidDigit: fn (u8) bool,
+        comptime empty_error: LexicalError,
+    ) LexicalError!void {
+        self.cursor += 1;
+        const digits_start = self.cursor;
+        try self.consumeDigits(isValidDigit);
+        if (self.cursor == digits_start) return empty_error;
+    }
+
+    fn isBinaryDigit(c: u8) bool {
+        return c == '0' or c == '1';
+    }
+
+    fn consumeExponent(self: *Lexer) LexicalError!void {
+        std.debug.assert(self.cursor < self.source.len);
+        std.debug.assert(self.source[self.cursor] == 'e' or self.source[self.cursor] == 'E');
+        self.cursor += 1;
+        const sign = self.peek(0);
+        if (sign == '+' or sign == '-') self.cursor += 1;
+        const digits_start = self.cursor;
+        try self.consumeDecimalDigits();
+        if (self.cursor == digits_start) return error.InvalidExponentPart;
+    }
+
+    const TriviaClass = enum(u8) { none, space, line_break, slash, less_than, minus, non_ascii };
+
+    const trivia_class: [256]TriviaClass = blk: {
+        var t: [256]TriviaClass = @splat(.none);
+        t[' '] = .space;
+        t['\t'] = .space;
+        t[0x0B] = .space;
+        t[0x0C] = .space;
+        t['\n'] = .line_break;
+        t['\r'] = .line_break;
+        t['/'] = .slash;
+        t['<'] = .less_than;
+        t['-'] = .minus;
+        for (0x80..256) |i| t[i] = .non_ascii;
+        break :blk t;
+    };
+
+    fn isMultiByteSpace(cp: u21) bool {
+        return switch (cp) {
+            '\u{FEFF}',
+            '\u{00A0}',
+            // not WhiteSpace in the spec, but tsc scans NEL as a space and not a line break
+            '\u{0085}',
+            '\u{2000}'...'\u{200A}',
+            '\u{202F}',
+            '\u{205F}',
+            '\u{3000}',
+            '\u{1680}',
+            => true,
+            else => false,
+        };
+    }
+
+    inline fn skipTrivia(self: *Lexer) LexicalError!void {
+        std.debug.assert(self.cursor <= self.source.len);
+
+        if (self.cursor < self.source.len and trivia_class[self.source[self.cursor]] == .none) {
+            return;
+        }
+
+        var can_be_html_close_comment =
+            self.cursor == 0 or self.hasTokenFlag(.line_terminator_before);
+
+        const src = self.source;
+        var pos = self.cursor;
+        const entry_pos = pos;
+
+        while (pos < src.len) {
+            if (src[pos] == ' ') {
+                pos += 1;
+                continue;
+            }
+            switch (trivia_class[src[pos]]) {
+                .space => pos += 1,
+                .line_break => {
+                    self.setTokenFlag(.line_terminator_before);
+                    can_be_html_close_comment = true;
+                    pos += 1;
+                },
+                .slash => {
+                    self.cursor = pos;
+                    switch (self.peek(1)) {
+                        '/' => try self.scanLineComment(),
+                        '*' => {
+                            try self.scanBlockComment();
+                            if (self.hasTokenFlag(.line_terminator_before)) {
+                                can_be_html_close_comment = true;
+                            }
+                        },
+                        else => break,
+                    }
+                    pos = self.cursor;
+                },
+                .less_than => {
+                    // annex B html comments are script-only
+                    if (self.source_type == .module or pos + 3 >= src.len or
+                        src[pos + 1] != '!' or src[pos + 2] != '-' or src[pos + 3] != '-') break;
+                    self.cursor = pos;
+                    try self.scanHtmlComment();
+                    pos = self.cursor;
+                },
+                .minus => {
+                    // `-->` closes only at line start
+                    if (self.source_type == .module or
+                        !can_be_html_close_comment or
+                        pos + 2 >= src.len or
+                        src[pos + 1] != '-' or
+                        src[pos + 2] != '>') break;
+                    self.cursor = pos;
+                    try self.scanHtmlCloseComment();
+                    pos = self.cursor;
+                },
+                .non_ascii => {
+                    @branchHint(.unlikely);
+                    const us_len = util.Utf.unicodeSeparatorLen(src, pos);
+                    if (us_len > 0) {
+                        self.setTokenFlag(.line_terminator_before);
+                        can_be_html_close_comment = true;
+                        pos += us_len;
+                        continue;
+                    }
+                    self.cursor = pos;
+                    const cp = try util.Utf.codePointAt(src, pos);
+                    if (!isMultiByteSpace(cp.value)) break;
+                    pos += cp.len;
+                },
+                .none => break,
+            }
+        }
+
+        std.debug.assert(pos >= entry_pos);
+        std.debug.assert(pos <= src.len);
+        self.cursor = pos;
+    }
+
+    pub inline fn recordComment(
+        self: *Lexer,
+        @"type": ast.Comment.Type,
+        start: u32,
+        end: u32,
+    ) error{OutOfMemory}!void {
+        std.debug.assert(start < end);
+        std.debug.assert(end <= self.source.len);
+        if (!self.collect_comments) return;
+        // `<!--` is 4 wide, `-->` is 3 with no tail, `//` and `/*` are 2
+        const head: u32 = switch (self.source[start]) {
+            '<' => 4,
+            '-' => 3,
+            else => 2,
+        };
+        const tail: u32 = if (@"type" == .block) 2 else 0;
+        try self.comments.append(self.allocator, .{
+            .type = @"type",
+            .value = .{ .start = start + head, .end = end - tail },
+            .span = .{ .start = start, .end = end },
+        });
+    }
+
+    fn scanLineComment(self: *Lexer) LexicalError!void {
+        std.debug.assert(self.cursor + 1 < self.source.len);
+        std.debug.assert(self.source[self.cursor] == '/');
+        std.debug.assert(self.source[self.cursor + 1] == '/');
+        const start = self.cursor;
+        const src = self.source;
+        var pos = start + 2;
+        while (true) {
+            pos = findAnyPos("\r\n\xe2", src, pos);
+            if (pos >= src.len) break;
+            const c = src[pos];
+            if (c == '\n' or c == '\r') break;
+            if (c == 0xE2 and util.Utf.unicodeSeparatorLen(src, pos) > 0) break;
+            pos += 1;
+        }
+        self.cursor = pos;
+        try self.recordComment(.line, start, pos);
+    }
+
+    fn scanBlockComment(self: *Lexer) LexicalError!void {
+        std.debug.assert(self.cursor + 1 < self.source.len);
+        std.debug.assert(self.source[self.cursor] == '/');
+        std.debug.assert(self.source[self.cursor + 1] == '*');
+        const start = self.cursor;
+        const src = self.source;
+        var pos = start + 2;
+        while (pos < src.len) {
+            const c = src[pos];
+            switch (c) {
+                '*' => {
+                    if (pos + 1 < src.len and src[pos + 1] == '/') {
+                        pos += 2;
+                        self.cursor = pos;
+                        try self.recordComment(.block, start, pos);
+                        return;
+                    }
+                    pos += 1;
+                },
+                '\n', '\r' => {
+                    self.setTokenFlag(.line_terminator_before);
+                    pos += 1;
+                    break;
+                },
+                0x80...0xFF => {
+                    const lt_len = util.Utf.unicodeSeparatorLen(src, pos);
+                    if (lt_len > 0) {
+                        self.setTokenFlag(.line_terminator_before);
+                        pos += lt_len;
+                        break;
+                    } else pos += 1;
+                },
+                else => pos += 1,
+            }
+        }
+        // the offset load catches `*/` across chunks
+        var w = pos - 1;
+        while (w + 17 <= src.len) {
+            const stars = Simd.loadChunk(src, w) == Simd.splat('*');
+            const slashes = Simd.loadChunk(src, w + 1) == Simd.splat('/');
+            const first = Simd.firstTrueLane(stars & slashes);
+            if (first < 16) {
+                self.cursor = w + first + 2;
+                try self.recordComment(.block, start, self.cursor);
+                return;
+            }
+            w += 16;
+        }
+        while (w + 1 < src.len) : (w += 1) {
+            if (src[w] == '*' and src[w + 1] == '/') {
+                self.cursor = @intCast(w + 2);
+                try self.recordComment(.block, start, self.cursor);
+                return;
+            }
+        }
+        self.cursor = @intCast(src.len);
+        return error.UnterminatedMultiLineComment;
+    }
+
+    fn scanHtmlComment(self: *Lexer) LexicalError!void {
+        std.debug.assert(self.source_type != .module);
+        std.debug.assert(self.cursor + 3 < self.source.len);
+        std.debug.assert(self.source[self.cursor] == '<');
+        std.debug.assert(self.source[self.cursor + 1] == '!');
+        const start = self.cursor;
+        const src = self.source;
+        self.cursor += 4;
+        while (self.cursor < src.len) {
+            const c = src[self.cursor];
+            if (c == '-' and self.peek(1) == '-' and self.peek(2) == '>') {
+                self.cursor += 3;
+                return self.recordComment(.line, start, self.cursor);
+            }
+            if (self.isLineTerminator()) break;
+            self.cursor += 1;
+        }
+        try self.recordComment(.line, start, self.cursor);
+    }
+
+    fn scanHtmlCloseComment(self: *Lexer) LexicalError!void {
+        std.debug.assert(self.source_type != .module);
+        std.debug.assert(self.cursor + 2 < self.source.len);
+        std.debug.assert(self.source[self.cursor] == '-');
+        std.debug.assert(self.source[self.cursor + 1] == '-');
+        std.debug.assert(self.source[self.cursor + 2] == '>');
+        const start = self.cursor;
+        self.cursor += 3;
+        while (self.cursor < self.source.len) : (self.cursor += 1) {
+            if (self.isLineTerminator()) break;
+        }
+        try self.recordComment(.line, start, self.cursor);
+    }
+
+    pub inline fn createToken(self: *Lexer, tag: TokenTag, start: u32, end: u32) Token {
+        std.debug.assert(start <= end);
+        std.debug.assert(end <= self.source.len);
+        return .{
+            .tag = tag,
+            .span = .{ .start = start, .end = end },
+            .flags = self.consumeTokenFlags(),
+        };
+    }
+};
+
+pub fn getLexicalErrorMessage(error_type: LexicalError) []const u8 {
+    return switch (error_type) {
+        error.InvalidHexEscape => "Invalid hexadecimal escape sequence",
+        error.UnterminatedString => "Unterminated string literal",
+        error.NonTerminatedTemplateLiteral => "Unterminated template literal",
+        error.UnterminatedRegexLiteral => "Unterminated regular expression literal",
+        error.InvalidRegexLineTerminator => "Line terminator not allowed in regular expression" ++
+            " literal",
+        error.InvalidRegexFlag => "Invalid regular expression flag",
+        error.DuplicateRegexFlag => "Duplicate regular expression flag",
+        error.IncompatibleRegexFlags => "The 'u' and 'v' regular expression flags cannot be" ++
+            " used together",
+        error.InvalidIdentifierStart => "Invalid character at start of identifier",
+        error.InvalidIdentifierContinue => "Invalid character in identifier",
+        error.UnterminatedMultiLineComment => "Unterminated multi-line comment",
+        error.InvalidUnicodeEscape => "Invalid Unicode escape sequence",
+        error.InvalidOctalEscape => "Invalid octal escape sequence",
+        error.InvalidOctalLiteralDigit => "Octal literal must contain at least one octal digit",
+        error.InvalidBinaryLiteral => "Binary literal must contain at least one binary digit",
+        error.InvalidHexLiteral => "Hexadecimal literal must contain at least one hex digit",
+        error.InvalidExponentPart => "Exponent part is missing a number",
+        error.NumericSeparatorMisuse => "Numeric separator is only allowed between two digits",
+        error.ConsecutiveNumericSeparators => "Numeric literal cannot contain consecutive" ++
+            " separators",
+        error.InvalidBigIntSuffix => "BigInt literal cannot contain decimal point or exponent",
+        error.IdentifierAfterNumericLiteral => "Identifier cannot immediately follow a" ++
+            " numeric literal",
+        error.InvalidUtf8 => "Invalid UTF-8 byte sequence",
+        error.OutOfMemory => "Out of memory",
+        error.JsxIdentifierCannotContainEscapes => "JSX tag names cannot contain escape" ++
+            " sequences",
+        error.JsxIdentifierCannotStartWithBackslash => "JSX tag names cannot start with a" ++
+            " backslash",
+    };
+}
+
+pub fn getLexicalErrorHelp(error_type: LexicalError) []const u8 {
+    return switch (error_type) {
+        error.InvalidHexEscape => "Try adding two hexadecimal digits here (e.g., \\x41 for 'A')",
+        error.UnterminatedString => "Try adding a closing quote here to complete the string",
+        error.NonTerminatedTemplateLiteral => "Try adding a closing backtick (`) here to" ++
+            " complete the template",
+        error.UnterminatedRegexLiteral => "Try adding a closing slash (/) here, optionally" ++
+            " followed by flags (g, i, m, etc.)",
+        error.InvalidRegexLineTerminator => "Try removing the line break here or escaping" ++
+            " it within the regex pattern",
+        error.InvalidRegexFlag => "Valid regex flags are: `g` (global), `i` (ignoreCase)," ++
+            " `m` (multiline), `s` (dotAll), `u` (unicode), `y` (sticky), `d` (hasIndices)," ++
+            " `v` (setNotation)",
+        error.DuplicateRegexFlag => "Remove the duplicate flag; each flag can only appear once",
+        error.IncompatibleRegexFlags => "The 'u' (unicode) and 'v' (unicodeSets) flags are" ++
+            " mutually exclusive; use one or the other",
+        error.InvalidIdentifierStart => "Try starting the identifier here with a letter" ++
+            " (a-z, A-Z), underscore (_), or dollar sign ($)",
+        error.InvalidIdentifierContinue => "Try using a valid identifier character here" ++
+            " (letters, digits, underscore, or dollar sign)",
+        error.UnterminatedMultiLineComment => "Try adding the closing delimiter (*/) here" ++
+            " to complete the comment",
+        error.InvalidUnicodeEscape => "Try using \\uHHHH (4 hex digits) or \\u{HHHHHH}" ++
+            " (1-6 hex digits) here",
+        error.InvalidOctalEscape => "Try using a valid octal sequence here (\\0-7, \\00-77," ++
+            " or \\000-377)",
+        error.InvalidOctalLiteralDigit => "Try adding at least one octal digit (0-7) here" ++
+            " after '0o'",
+        error.InvalidBinaryLiteral => "Try adding at least one binary digit (0 or 1) here" ++
+            " after '0b'",
+        error.InvalidHexLiteral => "Try adding at least one hex digit (0-9, a-f, A-F) here" ++
+            " after '0x'",
+        error.InvalidExponentPart => "Try adding digits here after the exponent" ++
+            " (e.g., e10, e-5, E+2)",
+        error.NumericSeparatorMisuse => "Try placing the separator between two digits," ++
+            " or removing it",
+        error.ConsecutiveNumericSeparators => "Try removing one of the consecutive underscores" ++
+            " here",
+        error.InvalidBigIntSuffix => "Try removing the 'n' suffix here, or remove the decimal" ++
+            " point/exponent from the number",
+        error.IdentifierAfterNumericLiteral => "Try adding whitespace here between the number" ++
+            " and identifier",
+        error.InvalidUtf8 => "The source file contains invalid UTF-8 encoding. Ensure the" ++
+            " file is saved with valid UTF-8 encoding",
+        error.OutOfMemory => "The system ran out of memory while parsing",
+        error.JsxIdentifierCannotContainEscapes => "Remove the escape sequence and use the" ++
+            " literal character instead",
+        error.JsxIdentifierCannotStartWithBackslash => "JSX tag names must be plain" ++
+            " identifiers without escape sequences",
+    };
+}

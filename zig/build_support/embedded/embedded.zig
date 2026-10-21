@@ -241,6 +241,8 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     capi_options.addOption(bool, "inference_enabled", true);
     capi_mod.addOptions("capi_build_options", capi_options);
     capi_root_mod.addOptions("capi_build_options", capi_options);
+    embedded_support_mod.addOptions("capi_build_options", capi_options);
+    embedded_support_mod.addImport("antfly_storage_root", embedded_support_mod);
     capi_root_mod.addImport("antfly_storage_root", capi_root_mod);
     capi_mod.addImport("antfly_vector", vector_mod);
     capi_mod.addImport("structlog", structlog_mod);
@@ -537,6 +539,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     capi_package_test_step.dependOn(&run_cabi_packaging_tests.step);
 
     const capi_default_filters = [_][]const u8{
+        "capi lite standalone snapshots",
         "issue1015",
         "capi SQL",
         "storage owner runtime status",
@@ -566,6 +569,9 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi aggregate hits rejects stale identity generation before aggregation materialization",
         "capi lite local-runtime-configured flag reports local_embedded only when the build links inference",
         "capi lite explicit resource budget overrides are reported in status",
+        "capi lite inference service survives foreground and maintenance snapshots",
+        "capi lite inference producer retry is visible in graph replacement status",
+        "capi lite inference failed open drains the configured generation before releasing its service",
         "capi lite defaults embedded generation budgets when no override is given",
         "capi lite drains an antfly embedder with no api_url through the embedded inference provider",
         "capi inference options are prefix compatible and reject unknown flags and reserved bits",
@@ -581,8 +587,13 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi inference streaming reports request errors without a model",
         "capi get edges json does not double free a non-empty edge slice",
         "capi native text queries",
+        "capi native replacement wait",
+        "capi native resolver maintenance retries",
+        "capi native idle maintenance",
+        "SQL overlay native pages retain typed cells",
         "capi Lite models_dir loads a real extractor",
         "capi Lite promotion resolves ANN",
+        "capi Lite promotion retains writer admission",
         "capi inline resolver ownership",
         "capi retired resolver identities",
         "capi query retry errors",
@@ -592,6 +603,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi lite merged indexes JSON discovers a standalone asset extractor and chunk enrichment with no owning index",
         "capi lite run until idle drains a standalone chunk enrichment with no owning index",
         "capi lite AddIndexJSON registers a graph config",
+        "inline resolver replacement",
         "capi lite AddIndexJSON restores the enrichment catalog when admission rejects the index",
     };
     const capi_tests = b.addTest(.{
@@ -641,7 +653,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .optimize = optimize,
     });
     antfly_imports.configureEmbedded(b, resolution_test_mod, link_libc);
-    const resolution_tests = b.addTest(.{ .root_module = resolution_test_mod, .filters = &.{ "resolver backfill skips", "incremental resolution", "processRecordKeys", "reresolveAll", "embedding (cosine) scoring", "db ttl cleanup defers transaction guarded" } });
+    const resolution_tests = b.addTest(.{ .root_module = resolution_test_mod, .filters = &.{ "resolver curation", "resolver review", "resolver adjudication", "resolver backfill skips", "incremental resolution", "processRecordKeys", "reresolveAll", "embedding (cosine) scoring", "db ttl cleanup defers transaction guarded" } });
     const run_resolution = b.addRunArtifact(resolution_tests);
     b.step("embedded-resolver-replay-test", "Test selective embedded resolver replay").dependOn(&run_resolution.step);
     capi_test_step.dependOn(&run_resolution.step);

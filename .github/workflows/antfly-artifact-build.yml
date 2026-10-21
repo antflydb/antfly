@@ -140,7 +140,7 @@ jobs:
 
       - name: Install Nix
         if: ${{ matrix.os == 'linux' }}
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31
         with:
           nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ needs.release-plan.outputs.zig_nixpkgs_revision }}.tar.gz
 
@@ -210,11 +210,23 @@ jobs:
             scripts/packaging/build_zig_release_archive.sh "${build_args[@]}"
           done < <(jq -r '.[]' <<< "$RUNTIME_PRODUCTS")
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.artifact_name }}
           path: dist/release-archives/*.tar.gz
           if-no-files-found: error
+
+      - name: Upload compiler diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-diagnostics-${{ matrix.artifact_name }}
+          path: |
+            ${{ runner.temp }}/antfly-zig-release-*/*attempt*.log
+            ${{ runner.temp }}/antfly-zig-release-*/archive-contents.txt
+            ${{ runner.temp }}/antfly-zig-release-*/zig-cache/o/*/libantfly.map
+            ${{ github.workspace }}/.zig-cache/release/o/*/libantfly.map
+          if-no-files-found: warn
 
   test-macos-homebrew:
     name: Test Apple Silicon Homebrew install and upgrade
@@ -226,7 +238,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.release-plan.outputs.build_controller_commit }}
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: antfly-zig-*
           merge-multiple: true
@@ -289,7 +301,7 @@ jobs:
           python3 scripts/packaging/package_embedded_zig_source.py \
             --commit "$SOURCE_COMMIT" --version "${RELEASE_TAG#v}" \
             --out-dir dist/embedded-zig-source
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: antfly-embedded-zig-source
           path: dist/embedded-zig-source/
@@ -310,7 +322,7 @@ jobs:
           python scripts/release/stage_release_source.py \
             --commit "${{ inputs.source_commit }}" \
             --out-dir dist/release-source
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: antfly-release-source
           path: dist/release-source/
@@ -354,7 +366,7 @@ jobs:
             --build-controller-commit "$BUILD_CONTROLLER_COMMIT" \
             --build-contract-schema "$BUILD_CONTRACT_SCHEMA" \
             > dist/release-request/release-request.json
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: antfly-release-request
           path: dist/release-request/release-request.json

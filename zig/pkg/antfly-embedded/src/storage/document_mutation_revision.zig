@@ -18,6 +18,7 @@
 //! Keep tombstones after deletion to reject delete/reinsert ABA.
 const std = @import("std");
 const keys = @import("internal_keys.zig");
+const projection = @import("document_projection.zig");
 const prefix = "\x00\x00__metadata__:document_mutation_revision_v1:";
 pub const Key = [prefix.len + 32]u8;
 const content_prefix = "\x00\x00__metadata__:document_content_authority_v1:";
@@ -38,9 +39,9 @@ fn decodeContent(raw: []const u8) !Content {
 pub fn loadContent(txn: anytype, physical: []const u8) !?Content {
     if (!keys.isStoredDocumentRowKey(physical)) return null;
     const key = keyForPhysical(physical).?;
-    const raw = txn.get(&contentKey(key)) catch |err| switch (err) {
-        error.NotFound => return null,
-        else => return err,
+    const raw = txn.get(&contentKey(key)) catch |err| {
+        if (err == error.NotFound) return null;
+        return err;
     };
     const value = try decodeContent(raw);
     if (value.kind != physical[physical.len - 1] or value.revision != try load(txn, key)) return null;
@@ -149,9 +150,9 @@ pub fn keyForDocumentAlloc(alloc: std.mem.Allocator, document: []const u8) !Key 
 }
 
 pub fn load(txn: anytype, key: Key) !u64 {
-    const raw = txn.get(&key) catch |err| switch (err) {
-        error.NotFound => return 0,
-        else => return err,
+    const raw = txn.get(&key) catch |err| {
+        if (err == error.NotFound) return 0;
+        return err;
     };
     if (raw.len != 8) return error.InvalidDocumentMutationRevision;
     return std.mem.readInt(u64, raw[0..8], .little);
@@ -236,14 +237,14 @@ fn stageContent(txn: anytype, physical: []const u8, content: Content) !bool {
     return true;
 }
 
-const backfill_key = "\x00\x00__metadata__:document_content_backfill_v1";
+const backfill_key = "\x00\x00__metadata__:document_content_backfill_v2";
 
 /// A disposable cache migration. Hash under a read snapshot; publish only
 /// under the ordinary leader/apply gate with matching document revisions.
 /// Cursor and cache records share one physical transaction; user data and
 /// logical mutation revisions are never rewritten by this migration.
 pub const BackfillPage = struct {
-    const Entry = struct { physical: []const u8, content: Content };
+    const Entry = struct { physical: []const u8, content: Content, directory: ?[]const u8 };
     arena: std.heap.ArenaAllocator,
     before: ?[]const u8,
     after: []const u8,
@@ -305,15 +306,27 @@ pub const BackfillPage = struct {
                 var digest: [32]u8 = undefined;
                 // Physical primary rows have no embedding-payload indirection.
                 // Check the cache first; cursor values retain their own lease.
-                if (try loadContent(&metadata, last) == null) {
-                    // Values are fetched only for missing proofs, with an
-                    // independent row lease from the same visibility cut.
+                const cached = try loadContent(&metadata, last);
+                const needs_projection = if (cached) |proof| blk: {
+                    if (proof.kind != keys.primary_kind or proof.bytes < projection.minimum_bytes) break :blk false;
+                    const encoded = metadata.get(&projection.keyForRevision(keyForPhysical(last).?)) catch |err| {
+                        if (err == error.NotFound) break :blk true;
+                        return err;
+                    };
+                    break :blk !try projection.isCurrent(a, encoded, proof);
+                } else false;
+                if (cached == null or needs_projection) {
+                    // Independently scoped primary bytes die after this row;
+                    // only bounded directory/proof data survives to publication.
                     var primary = try read.openReadScope(alloc);
                     defer primary.close();
                     const raw = try primary.get(last);
-                    std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
-                    const revision = try load(&metadata, keyForPhysical(last).?);
-                    try entries.append(a, .{ .physical = last, .content = .{ .revision = revision, .bytes = raw.len, .kind = last[last.len - 1], .digest = digest } });
+                    const content = cached orelse blk: {
+                        std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
+                        break :blk Content{ .revision = try load(&metadata, keyForPhysical(last).?), .bytes = raw.len, .kind = last[last.len - 1], .digest = digest };
+                    };
+                    const directory = try projection.buildAuthority(a, raw, content.kind, content.digest);
+                    if (cached == null or directory != null) try entries.append(a, .{ .physical = last, .content = content, .directory = directory });
                     bytes +|= raw.len;
                 }
             }
@@ -334,7 +347,14 @@ pub const BackfillPage = struct {
         if ((current == null) != (self.before == null) or (current != null and !std.mem.eql(u8, current.?, self.before.?))) return error.DocumentAuthorityCursorChanged;
         var installed: usize = 0;
         for (self.entries) |entry| {
-            installed += @intFromBool(try stageContent(txn, entry.physical, entry.content));
+            var changed = try stageContent(txn, entry.physical, entry.content);
+            if (entry.directory) |directory| if (try loadContent(txn, entry.physical)) |current_content| {
+                if (std.meta.eql(current_content, entry.content)) {
+                    try txn.put(&projection.keyForRevision(keyForPhysical(entry.physical).?), directory);
+                    changed = true;
+                }
+            };
+            installed += @intFromBool(changed);
         }
         try txn.put(backfill_key, self.after);
         return installed;
@@ -344,12 +364,14 @@ pub const BackfillPage = struct {
 /// One revision per affected document per transaction, including artifact-only
 /// commits. Capture fixed keys rather than retaining every artifact key.
 pub const Capture = struct {
-    const Change = union(enum) { unchanged, deleted, written: Content };
+    const Change = union(enum) { unchanged, deleted, written: struct { proof: Content, directory: ?[]u8 } };
     documents: std.AutoHashMapUnmanaged(Key, Change) = .empty,
     staged: bool = false,
     poisoned: bool = false,
 
     pub fn deinit(self: *Capture, alloc: std.mem.Allocator) void {
+        var values = self.documents.valueIterator();
+        while (values.next()) |value| if (value.* == .written) if (value.written.directory) |directory| alloc.free(directory);
         self.documents.deinit(alloc);
     }
 
@@ -367,11 +389,15 @@ pub const Capture = struct {
         try self.touch(alloc, physical);
         if (!keys.isStoredDocumentRowKey(physical)) return;
         const entry = self.documents.getPtr(keyForPhysical(physical).?).?;
-        if (value) |bytes| {
+        errdefer self.poisoned = true;
+        const next: Change = if (value) |bytes| blk: {
             var digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-            entry.* = .{ .written = .{ .revision = 0, .bytes = bytes.len, .kind = physical[physical.len - 1], .digest = digest } };
-        } else entry.* = .deleted;
+            const kind = physical[physical.len - 1];
+            break :blk .{ .written = .{ .proof = .{ .revision = 0, .bytes = bytes.len, .kind = kind, .digest = digest }, .directory = try projection.buildAuthority(alloc, bytes, kind, digest) } };
+        } else .deleted;
+        if (entry.* == .written) if (entry.written.directory) |directory| alloc.free(directory);
+        entry.* = next;
     }
 
     pub fn stage(self: *Capture, txn: anytype) !void {
@@ -385,12 +411,12 @@ pub const Capture = struct {
             const next = std.math.add(u64, old, 1) catch return error.DocumentMutationRevisionExhausted;
             const cached_key = contentKey(key);
             var cached: ?Content = switch (entry.value_ptr.*) {
-                .written => |value| value,
+                .written => |value| value.proof,
                 .deleted => null,
                 .unchanged => blk: {
-                    const raw = txn.get(&cached_key) catch |err| switch (err) {
-                        error.NotFound => break :blk null,
-                        else => return err,
+                    const raw = txn.get(&cached_key) catch |err| {
+                        if (err == error.NotFound) break :blk null;
+                        return err;
                     };
                     const value = try decodeContent(raw);
                     break :blk if (value.revision == old) value else null;
@@ -402,10 +428,21 @@ pub const Capture = struct {
                 value.revision = next;
                 try txn.put(&cached_key, &encodeContent(value.*));
             } else if (entry.value_ptr.* == .deleted) {
-                txn.delete(&cached_key) catch |err| switch (err) {
-                    error.NotFound => {},
-                    else => return err,
+                txn.delete(&cached_key) catch |err| {
+                    if (err != error.NotFound) return err;
                 };
+            }
+            switch (entry.value_ptr.*) {
+                .written => |value| if (value.directory) |directory| {
+                    try txn.put(&projection.keyForRevision(key), directory);
+                },
+                // Small writes do not add a cache lookup/delete to the hot
+                // path. A previous directory is harmless: digest/length checks
+                // exclude it, and a rewrite or deletion replaces/removes it.
+                .deleted => txn.delete(&projection.keyForRevision(key)) catch |err| {
+                    if (err != error.NotFound) return err;
+                },
+                .unchanged => {},
             }
             var raw: [8]u8 = undefined;
             std.mem.writeInt(u64, &raw, next, .little);
@@ -470,8 +507,8 @@ test "public graph metric borrowed wire cached content authority fences legacy w
             pub fn put(self: *@This(), key: []const u8, raw: []const u8) !void {
                 if (std.mem.startsWith(u8, key, content_prefix)) self.content = raw[0..49].* else self.revision = raw[0..8].*;
             }
-            pub fn delete(self: *@This(), _: []const u8) !void {
-                self.content = null;
+            pub fn delete(self: *@This(), key: []const u8) !void {
+                if (std.mem.startsWith(u8, key, content_prefix)) self.content = null;
             }
         };
         fn run(a: std.mem.Allocator) !void {
@@ -816,4 +853,56 @@ test "public graph metric borrowed wire metadata window slab encodes binary iden
     };
     try Case.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "projected authority backfill fences concurrent replacement and preserves logical revisions" {
+    const a = std.testing.allocator;
+    const Lite = @import("lite/docstore.zig");
+    const Store = @import("docstore.zig").DocStore;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/projection-migration.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var lite = try Lite.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    defer lite.close();
+    var store = try Store.openRuntime(a, try lite.runtimeStore(a));
+    defer store.close();
+    const physical = try keys.documentKeyAlloc(a, "doc");
+    defer a.free(physical);
+    const revision_key = keyForPhysical(physical).?;
+    const directory_key = projection.keyForRevision(revision_key);
+    const ignored = try a.alloc(u8, projection.minimum_bytes);
+    defer a.free(ignored);
+    @memset(ignored, 'x');
+    const large = try std.fmt.allocPrint(a, "{{\"ignored\":\"{s}\",\"body\":\"old\"}}", .{ignored});
+    defer a.free(large);
+    try store.put(physical, large);
+    try store.delete(&directory_key);
+    var stale = (try BackfillPage.prepare(a, &store, true)).?;
+    defer stale.deinit();
+    try std.testing.expectEqual(@as(usize, 1), stale.entries.len);
+    try std.testing.expect(stale.entries[0].directory != null);
+    try store.put(physical, "{\"body\":\"new\"}");
+    {
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        try std.testing.expectEqual(@as(usize, 0), try stale.stage(&write));
+        try std.testing.expectError(error.NotFound, write.get(&directory_key));
+        try write.commit();
+    }
+    try store.put(physical, large);
+    try store.delete(&directory_key);
+    var current = (try BackfillPage.prepare(a, &store, true)).?;
+    defer current.deinit();
+    {
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        const before = try load(&write, revision_key);
+        try std.testing.expectEqual(@as(usize, 1), try current.stage(&write));
+        try std.testing.expectEqual(before, try load(&write, revision_key));
+        const proof = (try loadContent(&write, physical)).?;
+        const directory = try write.get(&directory_key);
+        try std.testing.expect(try projection.isCurrent(a, directory, proof));
+        try write.commit();
+    }
 }

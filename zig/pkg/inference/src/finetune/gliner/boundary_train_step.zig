@@ -755,9 +755,7 @@ const CombinedControl = struct {
             if (result.progress == null) result.progress = original.progress;
             if (original.deadline_ns) |deadline| result.deadline_ns = if (result.deadline_ns) |other| @min(deadline, other) else deadline;
         }
-        result.ptr = self;
-        result.check_fn = apply;
-        return result;
+        return result.withCheckpoint(self, apply);
     }
 };
 
@@ -1993,7 +1991,7 @@ test "boundary training step control preserves independent callbacks cancellatio
     {
         // Use the real guard/monitor API without a thread or process. The
         // monitor must retain both full controls until its guard is disarmed.
-        var guard = try active.enterUninterruptible(.process_required);
+        var guard = try active.enterUninterruptible(.uninterruptible);
         defer guard.deinit();
         const monitor = original.monitor.?;
         try std.testing.expectEqual(future - 2, monitor.deadline_ns.?);
@@ -2026,7 +2024,7 @@ test "boundary training step control preserves independent callbacks cancellatio
     try active.update(.executing, 1, 1);
     try std.testing.expectEqual(@as(usize, 1), request.progress);
     {
-        var guard = try active.enterUninterruptible(.process_required);
+        var guard = try active.enterUninterruptible(.uninterruptible);
         defer guard.deinit();
         try request.monitor.?.check();
     }
@@ -2041,7 +2039,7 @@ test "boundary training step control preserves independent callbacks cancellatio
     checks.request = null;
     active = checks.value();
     try active.check();
-    try std.testing.expectError(error.ProcessIsolationRequired, active.enterUninterruptible(.process_required));
+    try std.testing.expectError(error.ProcessIsolationRequired, active.enterUninterruptible(.uninterruptible));
 }
 
 test "boundary training step terminal allocation cause survives resize misses and nested owner limits" {

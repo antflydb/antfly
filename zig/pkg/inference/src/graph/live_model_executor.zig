@@ -253,7 +253,7 @@ fn runtimeCapabilities(ctx: *anyopaque) model_runtime.RuntimeCapabilities {
         .supports_sample_decode = true,
         .supports_greedy_decode = true,
         .state_ownership = .runtime_owned_host_cache,
-        .interruption = if (runtime_ctx.cb.kind() == .metal) .process_required else .cooperative,
+        .interruption = if (runtime_ctx.cb.kind() == .metal) .uninterruptible else .cooperative,
     };
 }
 

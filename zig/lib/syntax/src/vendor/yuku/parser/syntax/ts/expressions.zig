@@ -1,0 +1,192 @@
+// Vendored Yuku 0.20.1; upstream revision e68066ff291d2fe43c727054f03636f4a633596b.
+// SPDX-License-Identifier: MIT
+//
+// MIT License
+//
+// Copyright (c) 2026 Yuku
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+const std = @import("std");
+const ast = @import("../../ast.zig");
+const Parser = @import("../../parser.zig").Parser;
+const Error = @import("../../parser.zig").Error;
+const Token = @import("../../token.zig").Token;
+const TokenTag = @import("../../token.zig").TokenTag;
+const Precedence = @import("../../token.zig").Precedence;
+
+const expressions = @import("../expressions.zig");
+
+const core = @import("types/core.zig");
+const generics = @import("types/generics.zig");
+
+pub fn parseTypeAssertion(parser: *Parser) Error!?ast.NodeIndex {
+    std.debug.assert(parser.current_token.tag == .less_than);
+
+    const start = parser.current_token.span.start;
+
+    try parser.advance() orelse return null;
+
+    const type_node = try core.parseType(parser) orelse return null;
+
+    if (!try parser.expect(
+        .greater_than,
+        "Expected '>' to close a type assertion",
+        "A type assertion is written '<Type>expression'",
+    )) return null;
+
+    const expr = try expressions.parseExpression(parser, Precedence.Unary, .{}) orelse return null;
+
+    return try parser.tree.addNode(
+        .{ .ts_type_assertion = .{ .type_annotation = type_node, .expression = expr } },
+        .{ .start = start, .end = parser.tree.span(expr).end },
+    );
+}
+
+pub fn parseAsOrSatisfiesExpression(parser: *Parser, left: ast.NodeIndex) Error!?ast.NodeIndex {
+    const keyword_tag = parser.current_token.tag;
+    std.debug.assert(keyword_tag == .as or keyword_tag == .satisfies);
+
+    try parser.advance() orelse return null;
+
+    const type_node = try core.parseType(parser) orelse return null;
+
+    const data: ast.NodeData = if (keyword_tag == .as)
+        .{ .ts_as_expression = .{ .expression = left, .type_annotation = type_node } }
+    else
+        .{ .ts_satisfies_expression = .{ .expression = left, .type_annotation = type_node } };
+
+    return try parser.tree.addNode(data, .{
+        .start = parser.tree.span(left).start,
+        .end = parser.tree.span(type_node).end,
+    });
+}
+
+pub fn parseNonNullExpression(parser: *Parser, left: ast.NodeIndex) Error!?ast.NodeIndex {
+    std.debug.assert(parser.current_token.tag == .logical_not);
+
+    const bang_end = parser.current_token.span.end;
+    try parser.advance() orelse return null;
+
+    return try parser.tree.addNode(
+        .{ .ts_non_null_expression = .{ .expression = left } },
+        .{ .start = parser.tree.span(left).start, .end = bang_end },
+    );
+}
+
+pub fn parseTypeArgumentedCallOrInstantiation(
+    parser: *Parser,
+    callee: ast.NodeIndex,
+) Error!?ast.NodeIndex {
+    const type_arguments = try tryParseTypeArgumentsInExpression(parser);
+    if (type_arguments == .null) return null;
+
+    return switch (parser.current_token.tag) {
+        .left_paren => expressions.parseCallExpression(parser, callee, false, type_arguments),
+        .no_substitution_template, .template_head => expressions.parseTaggedTemplateExpression(
+            parser,
+            callee,
+            type_arguments,
+        ),
+        else => blk: {
+            const node = try parser.tree.addNode(
+                .{ .ts_instantiation_expression = .{
+                    .expression = callee,
+                    .type_arguments = type_arguments,
+                } },
+                .{
+                    .start = parser.tree.span(callee).start,
+                    .end = parser.tree.span(type_arguments).end,
+                },
+            );
+
+            if (parser.current_token.tag == .dot) {
+                try parser.report(
+                    parser.tree.span(node),
+                    "An instantiation expression cannot be followed by a property access",
+                    .{ .help = "Wrap the instantiation expression in parentheses." },
+                );
+            }
+
+            break :blk node;
+        },
+    };
+}
+
+// rewind so `<` can stay a relational compare
+pub fn tryParseTypeArgumentsInExpression(parser: *Parser) Error!ast.NodeIndex {
+    if (!generics.isAngleOpen(parser.current_token.tag)) return .null;
+
+    const after = parser.peekAhead();
+    if (!core.isStartOfType(after.tag) and after.tag != .greater_than) return .null;
+
+    const cp = parser.checkpoint();
+
+    const args = try generics.parseTypeArgumentsInExpression(parser);
+    if (args == .null or !canFollowTypeArgumentsInExpression(parser.current_token)) {
+        parser.rewind(cp);
+        return .null;
+    }
+
+    return args;
+}
+
+fn canFollowTypeArgumentsInExpression(token: Token) bool {
+    return switch (token.tag) {
+        .left_paren, .no_substitution_template, .template_head => true,
+
+        // favor relational parse for `a < b > -c`
+        .less_than, .greater_than, .plus, .minus => false,
+
+        else => token.hasLineTerminatorBefore() or
+            isBinaryOperatorLike(token.tag) or
+            !isStartOfExpression(token.tag),
+    };
+}
+
+fn isBinaryOperatorLike(tag: TokenTag) bool {
+    return tag.isBinaryOperator() or tag.isLogicalOperator() or
+        tag.isAssignmentOperator() or tag == .comma or tag == .question or
+        tag == .as or tag == .satisfies;
+}
+
+fn isStartOfExpression(tag: TokenTag) bool {
+    return switch (tag) {
+        .private_identifier,
+        .string_literal,
+        .no_substitution_template,
+        .template_head,
+        .regex_literal,
+        .left_paren,
+        .left_bracket,
+        .left_brace,
+        .plus,
+        .minus,
+        .logical_not,
+        .bitwise_not,
+        .increment,
+        .decrement,
+        .spread,
+        .at,
+        .slash,
+        .slash_assign,
+        => true,
+        else => tag.isIdentifierLike() or tag.isNumericLiteral(),
+    };
+}

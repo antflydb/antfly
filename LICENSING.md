@@ -6,7 +6,8 @@ the explicit Apache source list below identify exceptions.
 
 ## Apache License 2.0
 
-The embedded database engine, Antfly Lite file-oriented CLI, native `libantfly`,
+The embedded database engine, Antfly Lite file-oriented CLI, standalone
+`antfly-grep` CLI/library, native `libantfly`,
 Zig embedding package, language bindings, and inference implementation and
 executable are Apache-2.0. The engine includes local storage, search/indexing,
 schemas, transactions, enrichment, maintenance, portable backups, and the SQL

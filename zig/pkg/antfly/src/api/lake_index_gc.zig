@@ -26,6 +26,11 @@ const A = std.mem.Allocator;
 pub const Options = struct { dry_run: bool = true, max_marked: usize = 262144, max_read_bytes: u64 = 512 * 1024 * 1024, max_deleted: usize = 4096 };
 pub const Result = struct { marked: usize = 0, eligible: usize = 0, deleted: usize = 0, complete: bool = false };
 pub const Collector = struct {
+    // Artifact membership and dependency expansion have independent lifetimes.
+    // Keep expansion bits beside the owned reference, within max_marked.
+    const Marked = struct { artifact_id: []const u8, checksum: []const u8, byte_len: u64, expanded: u8 = 0 };
+    const Expansion = enum(u3) { directory, maintenance, manifest, seekable_manifest, text_root, artifact, ordered_page, native_page };
+
     a: A,
     table: u64,
     authority: lease_api.Authority,
@@ -37,11 +42,12 @@ pub const Collector = struct {
     expires_ms: u64 = 0,
     authority_deadline: u64 = 0,
     remaining_reads: u64 = 0,
-    marked: std.StringHashMapUnmanaged(artifacts.ChunkRef) = .empty,
+    marked: std.StringHashMapUnmanaged(Marked) = .empty,
     result: Result = .{},
     upload_cutoff: u64 = 0,
     upload_floor: u64 = 0,
     namespace: ?[32]u8 = null,
+    audit_only: bool = false,
     progress: ?*@import("lake_index_gc_progress.zig").Progress = null,
 
     pub fn run(self: *Collector) !Result {
@@ -78,8 +84,6 @@ pub const Collector = struct {
             self.marked.deinit(self.a);
             self.marked = .empty;
         }
-        var scratch = std.heap.ArenaAllocator.init(self.a);
-        defer scratch.deinit();
         // Every non-retired generation is a root, including long-lived reader
         // and builder sessions. Reused roots retain their original upload IDs.
         const roots = try state.gcPublications(self.a);
@@ -91,26 +95,10 @@ pub const Collector = struct {
             } else false;
             if (retired) continue;
             try self.check();
-            _ = scratch.reset(.retain_capacity);
-            const sa = scratch.allocator();
-            var hydrated = publication;
-            if (hydrated.directory) |directory| {
-                _ = try self.mark(.{ .artifact_id = directory.artifact_id, .checksum = directory.checksum, .byte_len = directory.byte_len });
-                try stores.chargeReadBudget(&self.remaining_reads, directory.byte_len);
-                const directories = @import("lake_index_directory.zig");
-                const document = try directories.loadDocument(sa, self.store, .{ .kind = .external_base_source, .artifact_id = directory.artifact_id, .checksum = directory.checksum, .byte_len = directory.byte_len }, self.cancellation(), null);
-                hydrated.declarations = document.declarations;
-                hydrated.file_contributions = document.file_contributions;
-                if (document.contribution_index) |root| try self.markContributionIndex(sa, root);
-                for (document.contribution_pages) |page| {
-                    _ = try self.mark(.{ .artifact_id = page.artifact_id, .checksum = page.checksum, .byte_len = page.byte_len });
-                    try stores.chargeReadBudget(&self.remaining_reads, page.byte_len);
-                    for (try directories.loadContributionPage(sa, self.store, page, self.cancellation(), null)) |contribution| try self.markArtifact(sa, contribution.artifact);
-                }
-            }
-            _ = try self.mark(.{ .artifact_id = publication.inventory.artifact_id, .checksum = publication.inventory.checksum, .byte_len = publication.inventory.byte_len });
-            for (hydrated.declarations) |declaration| try self.markArtifact(sa, declaration.artifact);
-            for (hydrated.file_contributions) |contribution| try self.markArtifact(sa, contribution.artifact);
+            try self.markPublication(publication);
+        }
+        for (state.stores) |binding| {
+            if (std.mem.eql(u8, &binding.identity, &self.identity)) if (binding.vacuum) |cut| try self.markPages(a, cut.domain, cut.marks, false);
         }
         self.result.marked = self.marked.count();
         // No destructive work until the complete bounded mark phase succeeds.
@@ -126,6 +114,49 @@ pub const Collector = struct {
         self.result.complete = true;
         return self.result;
     }
+    pub fn markPublication(self: *Collector, publication: local.metadata_lake_index_catalog.Publication) !void {
+        var scratch = std.heap.ArenaAllocator.init(self.a);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var binding: ?@import("lake_cloud_publication.zig").Binding = if (self.store.providerStore()) |object| try @import("lake_cloud_publication.zig").Binding.init(std.heap.page_allocator, object, publication, self.cancellation()) else null;
+        defer if (binding) |*value| value.deinit();
+        var hydrated = publication;
+        if (hydrated.directory) |directory| {
+            _ = try self.mark(.{ .artifact_id = directory.artifact_id, .checksum = directory.checksum, .byte_len = directory.byte_len });
+            try stores.chargeReadBudget(&self.remaining_reads, directory.byte_len);
+            const directories = @import("lake_index_directory.zig");
+            const document = try directories.loadDocument(a, self.store, .{ .kind = .external_base_source, .artifact_id = directory.artifact_id, .checksum = directory.checksum, .byte_len = directory.byte_len }, self.cancellation(), null);
+            hydrated.declarations = document.declarations;
+            hydrated.file_contributions = document.file_contributions;
+            if (document.contribution_index) |root| try self.markContributionIndex(a, root);
+            for (document.contribution_pages) |page| {
+                _ = try self.mark(.{ .artifact_id = page.artifact_id, .checksum = page.checksum, .byte_len = page.byte_len });
+                try stores.chargeReadBudget(&self.remaining_reads, page.byte_len);
+                for (try directories.loadContributionPage(a, self.store, page, self.cancellation(), null)) |contribution| try self.markArtifact(a, contribution.artifact);
+            }
+        }
+        _ = try self.mark(.{ .artifact_id = publication.inventory.artifact_id, .checksum = publication.inventory.checksum, .byte_len = publication.inventory.byte_len });
+        if (publication.source_navigation) |ref| {
+            _ = try self.mark(.{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len });
+            try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
+            const navigation = try @import("lake_source_navigation.zig").load(a, self.store, ref, self.cancellation(), null);
+            for (@import("lake_source_navigation.zig").dependencies(navigation)) |root| try self.markPages(a, navigation.domain, root, false);
+        }
+        for (hydrated.declarations) |declaration| try self.markArtifact(a, declaration.artifact);
+        for (hydrated.file_contributions) |contribution| try self.markArtifact(a, contribution.artifact);
+
+        if (binding) |*held| {
+            const Visitor = struct {
+                collector: *Collector,
+                pub fn page(v: *@This(), ref: local.serverless_manifest_artifact_ref.ProviderGenerationRef) !void {
+                    _ = try v.collector.mark(.{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len });
+                }
+                pub fn record(_: *@This(), _: @import("../serverless/artifacts/cloud_generations.zig").Record) !void {}
+            };
+            var visitor: Visitor = .{ .collector = self };
+            try held.reader.walk(self.a, &visitor, self.cancellation());
+        }
+    }
     pub fn cancellation(self: *Collector) @import("antfly_cancellation").CancellationToken {
         return .{ .ptr = self, .is_cancelled_fn = canceled };
     }
@@ -136,6 +167,7 @@ pub const Collector = struct {
     }
     pub fn check(self: *Collector) !void {
         try self.context.ensureActive();
+        if (self.audit_only) return;
         const unix = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
         const authority = @import("antfly_platform").time.authorityNs();
         if (unix == 0 or authority == 0 or unix >= self.expires_ms or authority >= self.authority_deadline) return error.LakeIndexCollectionFenceChanged;
@@ -155,6 +187,18 @@ pub const Collector = struct {
             return false;
         }
         if (self.marked.count() == self.options.max_marked) return error.LakeIndexGcBudgetExceeded;
+        if (self.audit_only) {
+            var size = ref.byte_len;
+            if (size == 0) {
+                var metadata = try self.store.statWithCancellation(ref.artifact_id, self.cancellation());
+                defer metadata.deinit(self.store.allocator);
+                size = metadata.byte_len;
+            }
+            // Charge payload verification too: providers without authoritative
+            // SHA-256 metadata may stream the entire object.
+            try stores.chargeReadBudget(&self.remaining_reads, size);
+            try self.store.verifyContentWithCancellationUsingAllocator(self.a, ref.artifact_id, size, ref.checksum, self.cancellation());
+        }
         const owned = try self.a.dupe(u8, ref.artifact_id);
         errdefer self.a.free(owned);
         // The checksum is part of this canonical immutable identity. Borrowing
@@ -162,15 +206,31 @@ pub const Collector = struct {
         try self.marked.put(self.a, owned, .{ .artifact_id = owned, .checksum = owned[7..71], .byte_len = ref.byte_len });
         return true;
     }
+    fn expand(self: *Collector, ref: artifacts.ChunkRef, mode: Expansion, reason: []const u8) !bool {
+        if (self.progress) |progress| return progress.expand(ref, reason);
+        _ = try self.mark(ref);
+        const entry = self.marked.getPtr(ref.artifact_id).?;
+        const mask = @as(u8, 1) << @backingInt(mode);
+        if (entry.expanded & mask != 0) return false;
+        // Set before recursion to bound cycles. Any failed expansion aborts
+        // the complete audit/mark phase; incomplete marks are never swept.
+        entry.expanded |= mask | switch (mode) {
+            .manifest => @as(u8, 1) << @backingInt(Expansion.maintenance),
+            .seekable_manifest => (@as(u8, 1) << @backingInt(Expansion.maintenance)) | (@as(u8, 1) << @backingInt(Expansion.manifest)),
+            else => @as(u8, 0),
+        };
+        return true;
+    }
     /// Collection must understand the preceding immutable root format after an
     /// upgrade, while serving and rebuild selection continue to require current metadata.
     fn retainedNativeRoot(self: *Collector, a: A, comptime native: type, ref: local.serverless_manifest_artifact_ref.ArtifactRef) !native.Root {
-        const current = if (@hasDecl(native, "supportsBuildMetadata")) native.supportsBuildMetadata(ref.metadata_version) else ref.metadata_version == native.metadata_version;
+        const current = if (@hasDecl(native, "supportsBuildMetadata")) native.supportsBuildMetadata(ref.metadata_version) else if (@hasDecl(native, "supportsMetadata")) native.supportsMetadata(ref.metadata_version) else ref.metadata_version == native.metadata_version;
         if (current) {
+            if (@hasDecl(native, "loadRootLazy")) return native.loadRootLazy(a, self.store, ref, self.cancellation(), null);
             if (@hasDecl(native, "loadRootDirectory")) return native.loadRootDirectory(a, self.store, ref, self.cancellation(), null);
             return native.loadRoot(a, self.store, ref, self.cancellation(), null);
         }
-        const supported_old = if (@hasField(native.Root, "seekable")) ref.metadata_version >= 1 and ref.metadata_version < native.metadata_version else if (@hasField(native.Root, "tuple_encoding")) ref.metadata_version >= 2 and ref.metadata_version < native.metadata_version else ref.metadata_version +| 1 == native.metadata_version;
+        const supported_old = if (@hasField(native.Root, "seekable")) ref.metadata_version >= 1 and ref.metadata_version < native.metadata_version else if (@hasField(native.Root, "tuple_encoding")) ref.metadata_version >= 2 and ref.metadata_version < native.metadata_version else if (@hasField(native.Root, "file_directory")) ref.metadata_version == 1 else ref.metadata_version +| 1 == native.metadata_version;
         if (!supported_old) return error.InvalidNativeLakeGcReference;
         const limit = if (@hasDecl(native, "max_root_bytes")) native.max_root_bytes else @import("lake_index_native_files.zig").max_root_bytes;
         if (ref.byte_len > limit) return error.InvalidNativeLakeGcReference;
@@ -217,7 +277,7 @@ pub const Collector = struct {
         try @import("../serverless/graph_segment/page_tree.zig").walkPage(a, pages.store(), root, &visitor);
     }
     pub fn markTextDirectory(self: *Collector, a: A, ref: artifacts.ChunkRef) !void {
-        const fresh = if (self.progress) |progress| try progress.expand(ref, "native-text-directory-v1") else try self.mark(ref);
+        const fresh = try self.expand(ref, .directory, "native-text-directory-v1");
         if (!fresh) return;
         try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
         const directory = try @import("lake_index_seekable_text.zig").loadDirectory(a, .{ .store = self.store, .cache = null, .context = .{}, .cancellation = self.cancellation() }, ref);
@@ -226,44 +286,128 @@ pub const Collector = struct {
         for (directory.blocks) |piece| _ = try self.mark(piece.retainedArtifact());
     }
     pub fn markTextManifest(self: *Collector, a: A, ref: artifacts.ChunkRef, seekable: bool) !void {
-        const fresh = if (self.progress) |progress| try progress.expand(ref, "text-manifest") else try self.mark(ref);
+        return self.markTextManifestMode(a, ref, seekable, false);
+    }
+    pub fn markTextManifestMode(self: *Collector, a: A, ref: artifacts.ChunkRef, seekable: bool, maintenance_only: bool) !void {
+        const fresh = try self.expand(ref, if (maintenance_only) .maintenance else if (seekable) .seekable_manifest else .manifest, if (maintenance_only) "text-maintenance" else if (seekable) "text-manifest-seekable" else "text-manifest");
         if (!fresh) return;
         // Charge before I/O, independently from the serving metadata budget.
         try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
         const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(self.table, self.identity, self.namespace);
-        const group = try @import("lake_index_native_text.zig").loadFileManifest(a, self.store, ref, domain, self.cancellation(), null);
-        for (group.members) |member| {
-            if (self.progress) |progress| try progress.enqueue(.{ .text_manifest = .{ .ref = member.physical, .seekable = false } }) else try self.markTextManifest(a, member.physical, false);
+        const group = try @import("lake_index_native_text.zig").loadFileManifestBudget(a, self.store, ref, domain, self.cancellation(), null, &self.remaining_reads);
+        if (!maintenance_only) for (group.opening_packs) |pack| {
+            _ = try self.mark(pack.artifact);
+        };
+        for (group.source_pages) |page| _ = try self.mark(page);
+        for (group.sources) |span| {
+            if (self.progress) |progress| try progress.enqueue(.{ .text_manifest = .{ .ref = span.physical, .seekable = false, .maintenance_only = true } }) else try self.markTextManifestMode(a, span.physical, false, true);
         }
-        for (group.opening_packs) |pack| _ = try self.mark(pack.artifact);
-        for (group.descriptors) |descriptor| _ = try self.mark(descriptor);
+        if (!maintenance_only) for (group.descriptors) |descriptor| {
+            _ = try self.mark(descriptor);
+        };
         if (group.physical_manifest) |physical| _ = try self.mark(physical);
         for (group.summaries) |summary| try self.markPages(a, domain, summary, false);
         for (group.rows) |block| {
             if (block.bitmap) |bitmap| _ = try self.mark(bitmap);
         }
+        if (maintenance_only) return;
         for (group.segments) |segment| {
             if (seekable) {
                 if (self.progress) |progress| try progress.enqueue(.{ .text_directory = segment }) else try self.markTextDirectory(a, segment);
             } else _ = try self.mark(segment);
         }
     }
+    pub fn markTextRootAuto(self: *Collector, a: A, ref: artifacts.ChunkRef) anyerror!void {
+        const fresh = try self.expand(ref, .text_root, "text_segment");
+        if (!fresh) return;
+        try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
+        const decoded = try @import("lake_index_native_text.zig").loadRootDirectoryAuto(a, self.store, ref, self.cancellation(), null);
+        try self.markTextRoot(a, decoded.root, decoded.metadata_version);
+    }
+    fn markTextRoot(self: *Collector, a: A, root: @import("lake_index_native_text.zig").Root, metadata_version: u16) anyerror!void {
+        if (root.checkpoint_base) |base| {
+            const child: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .metadata_version = @import("lake_index_native_text.zig").metadata_version, .artifact_id = base.artifact_id, .checksum = base.checksum, .byte_len = base.byte_len };
+            if (self.progress) |progress| try progress.enqueue(.{ .artifact = child }) else try self.markArtifact(a, child);
+        }
+        if (root.serving orelse root.compacted) |serving| {
+            if (root.serving != null) {
+                const child: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .metadata_version = @import("lake_index_native_text.zig").metadata_version, .artifact_id = serving.artifact_id, .checksum = serving.checksum, .byte_len = serving.byte_len };
+                if (self.progress) |progress| try progress.enqueue(.{ .artifact = child }) else try self.markArtifact(a, child);
+            } else if (self.progress) |progress| try progress.enqueue(.{ .text_root = serving }) else try self.markTextRootAuto(a, serving);
+        }
+        try self.markPages(a, root.domain, root.checkpoint_removed_files, false);
+        if (root.checkpoint_files) |files| {
+            if (self.progress) |progress| {
+                try progress.enqueue(.{ .page = .{ .ref = files, .ordered_rows = false, .text_files = .{ .seekable = root.seekable, .maintenance_only = false } } });
+            } else {
+                try self.markPages(a, root.domain, files, false);
+                var directory = root;
+                directory.directories = .{ .files = files };
+                directory.file_count = root.checkpoint_file_count;
+                const records = try @import("lake_index_text_directory.zig").fileRecordsBudget(a, directory, self.store, null, self.cancellation(), &self.remaining_reads);
+                for (records) |record| try self.markTextManifestMode(a, record.manifest, root.seekable, false);
+            }
+        }
+        try self.markPages(a, root.domain, root.serving_inventory, false);
+        try self.markPages(a, root.domain, root.serving_routes, false);
+        try self.markPages(a, root.domain, root.segment_files, false);
+        const paged_text_files = self.progress != null and root.inventory_version == 3 and metadata_version >= 11;
+        if (paged_text_files) {
+            if (root.directories.files) |files| try self.progress.?.enqueue(.{ .page = .{ .ref = files, .ordered_rows = false, .text_files = .{ .seekable = root.seekable, .maintenance_only = root.serving != null } } });
+        } else try self.markPages(a, root.domain, root.directories.files, false);
+        try self.markPages(a, root.domain, root.directories.segments, false);
+        try self.markPages(a, root.domain, root.directories.routing, false);
+        try self.markPages(a, root.domain, root.pack_ownership, false);
+        try self.markPages(a, root.domain, root.source_routes, false);
+        try self.markPages(a, root.domain, root.tie_bounds, false);
+        try self.markPages(a, root.domain, root.term_statistics, false);
+        for (root.statistics_deltas) |delta_run| try self.markPages(a, root.domain, delta_run.page, false);
+        try self.markPages(a, root.domain, root.term_directory.branches, false);
+        try self.markPages(a, root.domain, root.term_directory.leaves, false);
+        for (root.file_groups) |group| {
+            for (group.opening_packs) |pack| _ = try self.mark(pack.artifact);
+            for (group.summaries) |summary| try self.markPages(a, root.domain, summary, false);
+        }
+
+        const manifests = if (paged_text_files) &.{} else if (root.inventory_version == 3) blk: {
+            const records = try @import("lake_index_text_directory.zig").fileRecordsBudget(a, root, self.store, null, self.cancellation(), &self.remaining_reads);
+            const refs = try a.alloc(artifacts.ChunkRef, records.len);
+            for (refs, records) |*manifest, record| manifest.* = record.manifest;
+            break :blk refs;
+        } else root.manifests;
+        for (manifests) |manifest| {
+            if (self.progress) |progress| try progress.enqueue(.{ .text_manifest = .{ .ref = manifest, .seekable = root.seekable, .maintenance_only = root.serving != null } }) else try self.markTextManifestMode(a, manifest, root.seekable, root.serving != null);
+        }
+        for (root.file_groups) |group| for (group.rows) |block| {
+            if (block.bitmap) |bitmap| _ = try self.mark(bitmap);
+        };
+        for (root.segments) |segment| {
+            if (root.seekable) {
+                if (self.progress) |progress| try progress.enqueue(.{ .text_directory = segment }) else try self.markTextDirectory(a, segment);
+            } else _ = try self.mark(segment);
+        }
+    }
     pub fn markArtifact(self: *Collector, a: A, ref: local.serverless_manifest_artifact_ref.ArtifactRef) !void {
         const root_chunk: artifacts.ChunkRef = .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
-        const fresh = if (self.progress) |progress| try progress.expand(root_chunk, @tagName(ref.kind)) else try self.mark(root_chunk);
+        const fresh = try self.expand(root_chunk, .artifact, @tagName(ref.kind));
         if (!fresh) return;
         switch (ref.kind) {
             .algebraic_segment => {
                 if (!artifacts.supportsMetadataVersion(ref.metadata_version)) return error.InvalidNativeLakeGcReference;
-                if (ref.metadata_version == 3) {
-                    try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len *| 3);
-                    for (try artifacts.partitionChildren(a, self.store, ref, self.cancellation())) |child| {
+                if (@import("lake_index_aggregate_artifact.zig").isPartitioned(ref.metadata_version)) {
+                    try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
+                    const references = try artifacts.partitionReferences(a, self.store, ref, self.cancellation());
+                    if (references.cohort) |descriptor| _ = try self.mark(descriptor);
+                    for (references.children) |child| {
                         if (self.progress) |progress| try progress.enqueue(.{ .artifact = child }) else try self.markArtifact(a, child);
                     }
                     return;
                 }
                 try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len *| 2);
-                for (try artifacts.descendantsAlloc(a, self.store, ref, self.cancellation())) |child| _ = try self.mark(child);
+                const leaf = try artifacts.leafReferences(a, self.store, ref, self.cancellation());
+                if (leaf.key_index) |index| if (index.inline_page.len == 0) try self.markPages(a, index.domain, index.page, false);
+                if (leaf.state_tree) |index| try self.markPages(a, index.domain, index.page, false);
+                for (leaf.blocks) |child| _ = try self.mark(child);
             },
             .ordered_row_index => {
                 try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
@@ -273,6 +417,12 @@ pub const Collector = struct {
                 try self.markPages(a, root.domain, root.reverse, false);
                 try self.markPages(a, root.domain, root.ties, false);
                 try self.markPages(a, root.domain, root.predicates, false);
+                if (root.file_dictionary) |dictionary| {
+                    try self.markPages(a, root.domain, dictionary.slots, false);
+                    try self.markPages(a, root.domain, dictionary.names, false);
+                    try self.markPages(a, root.domain, dictionary.public, false);
+                    try self.markPages(a, root.domain, dictionary.free, false);
+                }
             },
             // These lake producers publish self-contained segments. New paged
             // formats must register a child-reference walker before GC accepts
@@ -290,78 +440,84 @@ pub const Collector = struct {
                 if (ref.metadata_version >= 1 and ref.metadata_version <= @import("lake_index_native_text.zig").metadata_version) {
                     try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
                     const root = try self.retainedNativeRoot(a, @import("lake_index_native_text.zig"), ref);
-                    if (root.compacted) |compact| {
-                        const child: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .metadata_version = @import("lake_index_native_text.zig").metadata_version, .artifact_id = compact.artifact_id, .checksum = compact.checksum, .byte_len = compact.byte_len };
-                        if (self.progress) |progress| try progress.enqueue(.{ .artifact = child }) else try self.markArtifact(a, child);
-                    }
-                    try self.markPages(a, root.domain, root.serving_inventory, false);
-                    try self.markPages(a, root.domain, root.serving_routes, false);
-                    try self.markPages(a, root.domain, root.segment_files, false);
-                    try self.markPages(a, root.domain, root.directories.files, false);
-                    try self.markPages(a, root.domain, root.directories.segments, false);
-                    try self.markPages(a, root.domain, root.directories.routing, false);
-                    try self.markPages(a, root.domain, root.term_statistics, false);
-                    for (root.statistics_deltas) |delta_run| try self.markPages(a, root.domain, delta_run.page, false);
-                    try self.markPages(a, root.domain, root.term_directory.branches, false);
-                    try self.markPages(a, root.domain, root.term_directory.leaves, false);
-                    for (root.file_groups) |group| {
-                        for (group.members) |member| {
-                            if (self.progress) |progress| try progress.enqueue(.{ .text_manifest = .{ .ref = member.physical, .seekable = false } }) else try self.markTextManifest(a, member.physical, false);
-                        }
-                        for (group.opening_packs) |pack| _ = try self.mark(pack.artifact);
-                        for (group.summaries) |summary| try self.markPages(a, root.domain, summary, false);
-                    }
-
-                    const manifests = if (root.inventory_version == 3) blk: {
-                        const records = try @import("lake_index_text_directory.zig").fileRecordsBudget(a, root, self.store, null, self.cancellation(), &self.remaining_reads);
-                        const refs = try a.alloc(artifacts.ChunkRef, records.len);
-                        for (refs, records) |*manifest, record| manifest.* = record.manifest;
-                        break :blk refs;
-                    } else root.manifests;
-                    for (manifests) |manifest| {
-                        if (self.progress) |progress| try progress.enqueue(.{ .text_manifest = .{ .ref = manifest, .seekable = root.seekable } }) else try self.markTextManifest(a, manifest, root.seekable);
-                    }
-                    for (root.file_groups) |group| for (group.rows) |block| {
-                        if (block.bitmap) |bitmap| _ = try self.mark(bitmap);
-                    };
-                    for (root.segments) |segment| {
-                        if (root.seekable) {
-                            if (self.progress) |progress| try progress.enqueue(.{ .text_directory = segment }) else try self.markTextDirectory(a, segment);
-                        } else _ = try self.mark(segment);
-                    }
+                    try self.markTextRoot(a, root, ref.metadata_version);
                 } else if (ref.metadata_version != 0) return error.InvalidNativeLakeGcReference;
             },
             .sparse_segment => {
-                if ((ref.metadata_version == @import("lake_index_native_sparse.zig").metadata_version or ref.metadata_version +| 1 == @import("lake_index_native_sparse.zig").metadata_version)) {
+                if ((@import("lake_index_native_sparse.zig").supportsMetadata(ref.metadata_version) or ref.metadata_version == 1)) {
                     try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
                     const root = try self.retainedNativeRoot(a, @import("lake_index_native_sparse.zig"), ref);
+                    if (root.file_directory) |directory| try self.markNativeFiles(a, root.generation.domain, directory);
                     for (root.file_states) |file| for (file.docs) |document_ref| {
                         _ = try self.mark(document_ref);
                     };
-                    for (root.generation.files) |file| for (file.chunks) |chunk| {
-                        _ = try self.mark(chunk);
-                    };
+                    try self.markNativeGeneration(a, root.generation);
                 } else if (ref.metadata_version != 0) return error.InvalidNativeLakeGcReference;
             },
             .vector_segment => {
-                if ((ref.metadata_version == @import("lake_index_native_dense.zig").metadata_version or ref.metadata_version +| 1 == @import("lake_index_native_dense.zig").metadata_version)) {
+                if ((@import("lake_index_native_dense.zig").supportsMetadata(ref.metadata_version) or ref.metadata_version == 1)) {
                     try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
                     const root = try self.retainedNativeRoot(a, @import("lake_index_native_dense.zig"), ref);
+                    if (root.file_directory) |directory| try self.markNativeFiles(a, root.generation.domain, directory);
                     for (root.file_states) |file| for (file.docs) |document_ref| {
                         _ = try self.mark(document_ref);
                     };
-                    for (root.generation.files) |file| for (file.chunks) |chunk| {
-                        _ = try self.mark(chunk);
-                    };
+                    try self.markNativeGeneration(a, root.generation);
                 } else if (ref.metadata_version != 0) return error.InvalidNativeLakeGcReference;
             },
             .graph_metric_segment => if (ref.metadata_version != local.serverless_manifest_artifact_ref.graph_metric_segment_wire_version) return error.InvalidNativeLakeGcReference,
             else => return error.InvalidNativeLakeGcReference,
         }
     }
-    fn markPages(self: *Collector, a: A, domain: [32]u8, root: ?@import("../serverless/graph_segment/page_tree.zig").Ref, ordered_rows: bool) !void {
+    fn markNativeGeneration(self: *Collector, a: A, root: @import("lake_index_native_files.zig").Root) !void {
+        if (root.directory) |page| return self.markGenerationPage(a, root.domain, page, false);
+        for (root.files) |file| {
+            if (file.chunk_root) |page| try self.markGenerationPage(a, root.domain, page, true);
+            for (file.chunks) |ref| _ = try self.mark(ref);
+        }
+    }
+    pub fn markGenerationPage(self: *Collector, a: A, domain: [32]u8, root: @import("../serverless/graph_segment/page_tree.zig").Ref, chunks: bool) anyerror!void {
         if (self.progress) |progress| {
-            if (root) |page| try progress.enqueue(.{ .page = .{ .ref = page, .ordered_rows = ordered_rows } });
+            try progress.enqueue(.{ .page = .{ .ref = root, .ordered_rows = false, .native_generation = !chunks, .native_chunks = chunks } });
+            return;
+        }
+        const directory = @import("lake_index_native_directory.zig");
+        var writes: u64 = 0;
+        var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = domain, .artifacts = &self.store, .cancellation = self.cancellation(), .remaining_read_bytes = &self.remaining_reads, .remaining_write_bytes = &writes };
+        const Walker = struct {
+            collector: *Collector,
+            a: A,
+            domain: [32]u8,
+            chunks: bool,
+            pub fn visitRecord(w: *@This(), _: directory.tree.Ref, key: []const u8, bytes: []const u8) !void {
+                var scratch = std.heap.ArenaAllocator.init(w.a);
+                defer scratch.deinit();
+                if (w.chunks) {
+                    if (key.len != 8) return error.InvalidNativeLakeGcReference;
+                    _ = try w.collector.mark(try directory.decodeChunk(scratch.allocator(), bytes, w.domain));
+                } else {
+                    const file = try directory.decodeFile(scratch.allocator(), key, bytes, w.domain);
+                    if (file.chunk_root) |page| try w.collector.markGenerationPage(w.a, w.domain, page, true);
+                }
+            }
+            pub fn skip(w: *@This(), page: directory.tree.Ref) !bool {
+                const ref: artifacts.ChunkRef = .{ .artifact_id = &try @import("../serverless/graph_segment/page_store.zig").PageStore.identity(w.domain, page), .checksum = &std.fmt.bytesToHex(&page.digest, .lower), .byte_len = page.bytes };
+                return !try w.collector.expand(ref, .native_page, if (w.chunks) "native-generation-chunks" else "native-generation-files");
+            }
+            pub fn visit(_: *@This(), _: directory.tree.Ref) !void {}
+        };
+        var walker: Walker = .{ .collector = self, .a = a, .domain = domain, .chunks = chunks };
+        try directory.tree.walkPostOrder(a, pages.store(), root, &walker, false);
+    }
+    pub fn markNativeFiles(self: *Collector, a: A, domain: [32]u8, root: @import("../serverless/graph_segment/page_tree.zig").Ref) !void {
+        return self.markPagesMode(a, domain, root, false, true);
+    }
+    fn markPages(self: *Collector, a: A, domain: [32]u8, root: ?@import("../serverless/graph_segment/page_tree.zig").Ref, ordered_rows: bool) !void {
+        return self.markPagesMode(a, domain, root, ordered_rows, false);
+    }
+    fn markPagesMode(self: *Collector, a: A, domain: [32]u8, root: ?@import("../serverless/graph_segment/page_tree.zig").Ref, ordered_rows: bool, native_files: bool) !void {
+        if (self.progress) |progress| {
+            if (root) |page| try progress.enqueue(.{ .page = .{ .ref = page, .ordered_rows = ordered_rows, .native_files = native_files } });
             return;
         }
         const page_store = @import("../serverless/graph_segment/page_store.zig");
@@ -372,8 +528,16 @@ pub const Collector = struct {
             collector: *Collector,
             domain: [32]u8,
             ordered_rows: bool,
+            native_files: bool,
             a: A,
-            pub fn visitRecord(w: *@This(), _: tree.Ref, _: []const u8, value: []const u8) !void {
+            pub fn visitRecord(w: *@This(), _: tree.Ref, key: []const u8, value: []const u8) !void {
+                if (w.native_files) {
+                    var arena = std.heap.ArenaAllocator.init(w.a);
+                    defer arena.deinit();
+                    const file = try @import("lake_index_native_state.zig").decodeDirectoryFile(arena.allocator(), key, value, w.domain);
+                    for (file.docs) |ref| _ = try w.collector.mark(ref);
+                    return;
+                }
                 if (!w.ordered_rows) return;
                 if (try @import("lake_index_ordered_rows.zig").coverReference(w.a, w.domain, value)) |cover| {
                     defer w.a.free(cover.block.artifact_id);
@@ -381,11 +545,14 @@ pub const Collector = struct {
                 }
             }
             pub fn skip(w: *@This(), child: tree.Ref) !bool {
-                return !try w.collector.mark(.{ .artifact_id = &try page_store.PageStore.identity(w.domain, child), .checksum = &std.fmt.bytesToHex(&child.digest, .lower), .byte_len = child.bytes });
+                const ref: artifacts.ChunkRef = .{ .artifact_id = &try page_store.PageStore.identity(w.domain, child), .checksum = &std.fmt.bytesToHex(&child.digest, .lower), .byte_len = child.bytes };
+                if (w.native_files) return !try w.collector.expand(ref, .native_page, "native-file-state-page");
+                if (w.ordered_rows) return !try w.collector.expand(ref, .ordered_page, "ordered-page");
+                return !try w.collector.mark(ref);
             }
             pub fn visit(_: *@This(), _: tree.Ref) !void {}
         };
-        var walker: Walker = .{ .collector = self, .domain = domain, .ordered_rows = ordered_rows, .a = a };
+        var walker: Walker = .{ .collector = self, .domain = domain, .ordered_rows = ordered_rows, .native_files = native_files, .a = a };
         if (root) |page| try tree.walkPostOrder(a, pages.store(), page, &walker, false);
     }
     fn visit(raw: *anyopaque, scope: stores.UploadScope, id: []const u8) !void {
@@ -394,12 +561,12 @@ pub const Collector = struct {
         if (scope.fencingToken() < self.upload_floor or scope.fencingToken() >= self.upload_cutoff or self.marked.contains(id)) return;
         self.result.eligible += 1;
         if (self.options.dry_run or self.result.deleted == self.options.max_deleted) return;
-        try self.store.delete(id);
+        try self.store.deleteWithCancellation(id, self.cancellation());
         self.result.deleted += 1;
     }
 };
 
-test "external lake native GC retains shared aggregate blocks and durable reader roots" {
+test "external lake global frontier native GC retains shared aggregate blocks navigation and durable reader roots" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -419,6 +586,18 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     store.upload_scope = scope;
     var inventory = try store.put("native inventory");
     defer inventory.deinit(a);
+    const navigation_api = @import("lake_source_navigation.zig");
+    const nav_files = try ca.alloc(local.serverless_external_source_types.FileEntry, 2);
+    nav_files[0] = .{ .file_id = @constCast("nav-a"), .object_uri = @constCast("file:///nav-a.parquet"), .etag = @constCast("qualified-a"), .byte_len = 128, .row_count = 0, .row_groups = &.{} };
+    nav_files[1] = .{ .file_id = @constCast("nav-b"), .object_uri = @constCast("file:///nav-b.parquet"), .etag = @constCast("qualified-b"), .byte_len = 128, .row_count = 0, .row_groups = &.{} };
+    var nav_source: local.serverless_query_lake_serving.ServingSource = undefined;
+    nav_source.inventory = .{ .format = .parquet, .source_id = @constCast("nav-source"), .source_uri = @constCast("file:///nav"), .snapshot_id = @constCast("first"), .schema_fingerprint = @constCast("schema"), .files = nav_files[0..1] };
+    nav_source.verified_files = null;
+    nav_source.prepared_deletes = null;
+    nav_source.scanner.iceberg_delete_plan = null;
+    var nav_provider: @import("lake_index_row_source.zig").Provider = .{ .source = &nav_source, .context = .{ .io = std.testing.io } };
+    const nav_old = try navigation_api.build(a, ca, &store, &nav_provider, null, .none);
+    const nav_old_root = try navigation_api.load(ca, store, nav_old.ref, .none, null);
     const spec: local.sql_operators.AggregateSpec = .{ .kind = .sum, .input_type = .integer };
     const recipe: local.sql_aggregate_materialization.Recipe = .{ .keys = &.{}, .inputs = &.{.{ .spec = spec, .column = .{ .path = "amount", .type = .integer, .nullable = false } }} };
     const group = try local.sql_operators.Grouped.create(a, &.{spec}, .{ .groups = 1, .bytes = 1024 * 1024 });
@@ -508,7 +687,22 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     }, .{});
     var text_manifest = try store.put(manifest_bytes);
     defer text_manifest.deinit(a);
-    const text_root_bytes = try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = text_binding, .config_json = "{}", .serving_inventory = serving_inventory, .serving_routes = serving_routes, .statistics_version = 2, .term_statistics = global_statistics, .term_directory = .{ .branches = term_branches, .leaves = term_leaves }, .manifests = &.{.{ .artifact_id = text_manifest.artifact_id, .checksum = text_manifest.checksum, .byte_len = text_manifest.byte_len }} }, .{});
+    const file_record = try std.json.Stringify.valueAlloc(ca, @import("lake_index_text_directory.zig").FileRecord{ .file = .{ .id = "part", .digest = @splat(7) }, .manifest = .{ .artifact_id = text_manifest.artifact_id, .checksum = text_manifest.checksum, .byte_len = text_manifest.byte_len } }, .{});
+    const FileSource = struct {
+        bytes: []const u8,
+        emitted: bool = false,
+        key: [36]u8,
+        pub fn next(self: *@This()) !?tree.Cursor.Record {
+            if (self.emitted) return null;
+            self.emitted = true;
+            return .{ .key = &self.key, .value = self.bytes };
+        }
+    };
+    var file_key: [36]u8 = @splat(0);
+    file_key[0..32].* = text.term_directory.identity("part");
+    var file_source: FileSource = .{ .bytes = file_record, .key = file_key };
+    const text_files = (try tree.buildSorted(a, stats_pages.store(), &file_source)).?;
+    const text_root_bytes = try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = text_binding, .config_json = "{}", .serving_inventory = serving_inventory, .serving_routes = serving_routes, .statistics_version = 2, .term_statistics = global_statistics, .term_directory = .{ .branches = term_branches, .leaves = term_leaves }, .inventory_version = 3, .file_count = 1, .segment_count = 1, .directories = .{ .files = text_files } }, .{});
     var text_upload = try store.put(text_root_bytes);
     defer text_upload.deinit(a);
     const text_ref: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .name = "text", .kind = .text_segment, .metadata_version = @import("lake_index_native_text.zig").metadata_version, .artifact_id = text_upload.artifact_id, .checksum = text_upload.checksum, .byte_len = text_upload.byte_len };
@@ -524,10 +718,11 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     sparse_binding.sidecar_kind = .sparse;
     var sparse_child = try store.put("authenticated native sparse file block");
     defer sparse_child.deinit(a);
+    const paged_generation = try @import("lake_index_native_directory.zig").persist(a, ca, &store, .{ .domain = domain, .files = &.{.{ .path = "manifest.bin", .bytes = sparse_child.byte_len, .chunks = &.{.{ .artifact_id = sparse_child.artifact_id, .checksum = sparse_child.checksum, .byte_len = sparse_child.byte_len }} }} }, null, .none, null);
     const sparse_bytes = try std.json.Stringify.valueAlloc(ca, @import("lake_index_native_sparse.zig").Root{
         .binding = sparse_binding,
         .config_json = "{}",
-        .generation = .{ .domain = domain, .files = &.{.{ .path = "manifest.bin", .bytes = sparse_child.byte_len, .chunks = &.{.{ .artifact_id = sparse_child.artifact_id, .checksum = sparse_child.checksum, .byte_len = sparse_child.byte_len }} }} },
+        .generation = paged_generation,
     }, .{});
     var sparse_upload = try store.put(sparse_bytes);
     defer sparse_upload.deinit(a);
@@ -542,9 +737,12 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     defer second_orphan.deinit(a);
     const second_scope = try stores.UploadScope.forPublication(domain, 2, std.testing.io);
     store.upload_scope = second_scope;
+    nav_source.inventory.files = nav_files;
+    nav_source.inventory.snapshot_id = @constCast("second");
+    const nav_new = try navigation_api.build(a, ca, &store, &nav_provider, nav_old_root, .none);
     const directory_two = try @import("lake_index_directory.zig").publishWithContributions(ca, &store, &.{ .{ .name = "sum", .binding = binding, .artifact = root }, .{ .name = row_root.name, .binding = row_binding, .artifact = row_root }, .{ .name = "text", .binding = text_binding, .artifact = text_ref }, .{ .name = "sparse", .binding = sparse_binding, .artifact = sparse_ref } }, &.{.{ .file = @splat(1), .recipe = recipe.fingerprint(), .name = "sum", .artifact = root }}, .none);
     var publication: local.metadata_lake_index_catalog.Publication = .{
-        .reader_protocol = 24,
+        .reader_protocol = local.metadata_lake_index_catalog.native_reader_protocol,
         .namespace = namespace,
         .generation = 1,
         .token = scope.attempt,
@@ -553,6 +751,7 @@ test "external lake native GC retains shared aggregate blocks and durable reader
         .base_source = .{ .external_parquet = .{ .format = .parquet_prefix, .source_uri = "s3://bucket/lake", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .file_inventory_artifact = inventory.artifact_id } },
         .inventory = .{ .kind = .external_base_source, .artifact_id = inventory.artifact_id, .checksum = inventory.checksum, .byte_len = inventory.byte_len },
         .directory = directory_one,
+        .source_navigation = nav_old.ref,
     };
     const Harness = struct {
         a: A,
@@ -573,6 +772,7 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     publication.generation = 2;
     publication.token = second_scope.attempt;
     publication.directory = directory_two;
+    publication.source_navigation = nav_new.ref;
     harness.state = try harness.state.synchronize(ca, .{ .namespace = namespace, .generation = 2, .published = publication });
     const authority: lease_api.Authority = .{ .ptr = &harness, .context = .{}, .read = Harness.read, .mutate = Harness.mutate };
     var planner: Collector = .{ .a = a, .table = 4, .authority = authority, .store = store, .identity = identity, .context = .{}, .options = .{ .dry_run = true, .max_deleted = 1 }, .token = @splat(7) };
@@ -619,10 +819,19 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     defer a.free(retained_old_inventory);
     const retained_old_routes = try store.getAlloc(&try page_store.PageStore.identity(domain, old_serving_routes));
     defer a.free(retained_old_routes);
+    const retained_nav = try navigation_api.load(ca, store, nav_old.ref, .none, null);
+    for ([_]?tree.Ref{ retained_nav.files, retained_nav.public, retained_nav.private }) |ref| {
+        const bytes = try store.getAlloc(&try page_store.PageStore.identity(domain, ref.?));
+        defer a.free(bytes);
+        try std.testing.expectEqual(ref.?.bytes, bytes.len);
+    }
     harness.state = try harness.state.release(ca, @splat(9));
     var second: Collector = .{ .a = a, .table = 4, .authority = authority, .store = store, .identity = identity, .context = .{}, .options = .{ .dry_run = false }, .token = @splat(8) };
     try std.testing.expect((try second.run()).deleted >= 2);
     try std.testing.expectEqual(@as(usize, 1), harness.state.publications.len);
+    _ = try navigation_api.load(ca, store, nav_new.ref, .none, null);
+    try std.testing.expectError(error.FileNotFound, store.getAlloc(nav_old.ref.artifact_id));
+    for ([_]?tree.Ref{ nav_old_root.files, nav_old_root.public, nav_old_root.private }) |ref| try std.testing.expectError(error.FileNotFound, store.getAlloc(&try page_store.PageStore.identity(domain, ref.?)));
     for ([_]tree.Ref{ global_statistics, segment_statistics, serving_inventory, serving_routes, term_branches, term_leaves }) |ref| {
         const retained_statistics = try store.getAlloc(&try page_store.PageStore.identity(domain, ref));
         defer a.free(retained_statistics);
@@ -645,7 +854,7 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     const cursor = (try artifacts.Reader.open(a, store, root, recipe, .none)).cursor();
     defer cursor.close(cursor.ptr);
     const result = (try cursor.next(cursor.ptr, ca, 1)).?;
-    var partial = try local.sql_aggregate_partial.decode(a, result[0].aggregates[0], spec);
+    var partial = try local.sql_aggregate_partial.read(a, result[0], 0, spec);
     defer partial.deinit();
     try std.testing.expectEqual(@as(i128, 9007199254740993), partial.integer_sum);
     var row_reader: ordered.Reader = undefined;
@@ -792,23 +1001,6 @@ test "external lake native GC follows paged file catalogs and independent text d
     }
     try collector.markArtifact(ca, .{ .kind = .text_segment, .metadata_version = text.metadata_version, .artifact_id = root.artifact_id, .checksum = root.checksum, .byte_len = root.byte_len });
     for ([_][]const u8{ root.artifact_id, manifest.artifact_id, child.artifact_id, descriptor.artifact_id, physical.artifact_id, &try page_store.PageStore.identity(domain, files) }) |id| try std.testing.expect(collector.marked.contains(id));
-    // A compacted serving generation is a separate root, and its original
-    // member bitmap must be protected even without another canonical marker.
-    var bitmap = try store.put("retained member hole bitmap");
-    defer bitmap.deinit(a);
-    const member_group: text.FileGroup = .{ .file = .{ .id = "member", .digest = @splat(9) }, .segments = &.{}, .rows = &.{.{ .group = 0, .high = 0, .lower = 0, .base = 0, .count = 1, .bitmap = .{ .artifact_id = bitmap.artifact_id, .checksum = bitmap.checksum, .byte_len = bitmap.byte_len } }} };
-    var member = try store.put(try std.json.Stringify.valueAlloc(ca, member_group, .{}));
-    defer member.deinit(a);
-    var merged = try store.put("distinct compacted heap segment");
-    defer merged.deinit(a);
-    const merged_ref: artifacts.ChunkRef = .{ .artifact_id = merged.artifact_id, .checksum = merged.checksum, .byte_len = merged.byte_len };
-    const merged_group: text.FileGroup = .{ .file = group.file, .segments = &.{merged_ref}, .members = &.{.{ .file = member_group.file, .physical = .{ .artifact_id = member.artifact_id, .checksum = member.checksum, .byte_len = member.byte_len }, .source_lower = 0, .lower = 0, .count = 1 }} };
-    var serving = try store.put(try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = binding, .config_json = "{}", .segments = &.{merged_ref}, .file_groups = &.{merged_group} }, .{}));
-    defer serving.deinit(a);
-    var parent = try store.put(try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = binding, .config_json = "{}", .compacted = .{ .artifact_id = serving.artifact_id, .checksum = serving.checksum, .byte_len = serving.byte_len } }, .{}));
-    defer parent.deinit(a);
-    try collector.markArtifact(ca, .{ .kind = .text_segment, .metadata_version = text.metadata_version, .artifact_id = parent.artifact_id, .checksum = parent.checksum, .byte_len = parent.byte_len });
-    for ([_][]const u8{ parent.artifact_id, serving.artifact_id, merged.artifact_id, member.artifact_id, bitmap.artifact_id }) |id| try std.testing.expect(collector.marked.contains(id));
     // A non-serving statistics checkpoint owns pages absent from the serving
     // base. GC must retain those signed runs until finalization or retirement.
     var signed: [8]u8 = undefined;
@@ -863,13 +1055,28 @@ test "external lake native GC marks checkpoint forests and their covering blocks
         keep[slot] = true;
         previous = try ordered.loadRoot(ca, store, ref, .none, null);
     }
-    const root = previous.?;
+    var root = previous.?;
+    var reads: u64 = 16 * 1024 * 1024;
+    var writes: u64 = 16 * 1024 * 1024;
+    var bridge: page_store.PageStore = .{ .domain = domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    var free_builder: @import("../serverless/graph_segment/page_tree.zig").SortedBuilder = .{ .alloc = a, .store = bridge.store() };
+    defer free_builder.deinit();
+    try free_builder.add(&ordered.file_dictionary.slotKey(0), "");
+    root.file_dictionary.?.free = try free_builder.finish();
+    root.file_dictionary.?.free_complete = true;
+    const payload = try std.json.Stringify.valueAlloc(ca, root, .{});
+    var updated = try store.put(payload);
+    defer updated.deinit(a);
+    ref.artifact_id = updated.artifact_id;
+    ref.checksum = updated.checksum;
+    ref.byte_len = updated.byte_len;
     try std.testing.expectEqual(ordered.checkpoint_metadata_version, ref.metadata_version);
     try std.testing.expectEqual(@as(usize, 1), root.build_runs.len);
     // This graph-only mark does not read or mutate the catalog authority.
     var collector: Collector = .{ .a = ca, .table = 4, .authority = undefined, .store = store, .identity = identity, .context = .{}, .token = @splat(7), .expires_ms = std.math.maxInt(u64), .authority_deadline = std.math.maxInt(u64), .remaining_reads = 16 * 1024 * 1024 };
     try collector.markArtifact(ca, ref);
     try std.testing.expect(collector.marked.contains(ref.artifact_id));
+    try std.testing.expect(collector.marked.contains(&try page_store.PageStore.identity(domain, root.file_dictionary.?.free.?)));
     var count: usize = 0;
     for ([_]@import("../serverless/graph_segment/page_tree.zig").Ref{ root.page.?, root.build_runs[0].page }) |page| {
         try std.testing.expect(collector.marked.contains(&try page_store.PageStore.identity(domain, page)));
@@ -887,4 +1094,46 @@ test "external lake native GC marks checkpoint forests and their covering blocks
         }
     }
     try std.testing.expectEqual(@as(usize, 3), count);
+}
+
+test "external lake native GC retains external aggregate key pages and embedded navigation" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var temporary = try local.common_test_directory.TestDirectory.init("aggregate-key-gc");
+    defer temporary.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, temporary.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const identity: [32]u8 = @splat(4);
+    const namespace: [32]u8 = @splat(8);
+    const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(4, identity, namespace);
+    store.upload_scope = try stores.UploadScope.forPublication(domain, 1, std.testing.io);
+    const specs = [_]local.sql_operators.AggregateSpec{.{ .kind = .count }};
+    const recipe: local.sql_aggregate_materialization.Recipe = .{ .keys = &.{.{ .path = "k", .type = .string, .nullable = false }}, .inputs = &.{.{ .spec = specs[0], .column = null }} };
+    for ([_]usize{ 4, 256 }) |count| {
+        const group = try local.sql_operators.Grouped.create(a, &specs, .{ .bytes = 2 * 1024 * 1024 });
+        defer group.deinit();
+        var label: [128]u8 = @splat('x');
+        for (0..count) |index| {
+            _ = try std.fmt.bufPrint(label[124..], "{d:0>4}", .{index});
+            try group.add(&.{local.sql_scalar.Datum.json(.{ .string = &label })}, &.{.{}});
+        }
+        const refs = try artifacts.publishCohort(a, out, &store, &.{"stats.count"}, group, recipe, .none);
+        const reader = try artifacts.Reader.open(a, store, refs[0], recipe, .none);
+        defer reader.cursor().close(reader);
+        const index = reader.root.key_index.?;
+        try std.testing.expectEqual(count == 4, index.inline_page.len != 0);
+        var collector: Collector = .{ .a = a, .table = 4, .authority = undefined, .store = store, .identity = identity, .namespace = namespace, .context = .{}, .token = @splat(1), .expires_ms = std.math.maxInt(u64), .authority_deadline = std.math.maxInt(u64), .remaining_reads = 32 * 1024 * 1024 };
+        defer {
+            var iterator = collector.marked.keyIterator();
+            while (iterator.next()) |key| a.free(key.*);
+            collector.marked.deinit(a);
+        }
+        try collector.markArtifact(out, refs[0]);
+        try std.testing.expectEqual(index.inline_page.len == 0, collector.marked.contains(&try @import("../serverless/graph_segment/page_store.zig").PageStore.identity(domain, index.page)));
+        try std.testing.expect(try reader.cursor().select_keys.?(reader, .{ .order = &.{.{ .column = "k" }} }));
+        try std.testing.expectEqual(@as(usize, 1), (try reader.cursor().next(reader, out, 1)).?.len);
+    }
 }

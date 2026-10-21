@@ -24,7 +24,7 @@ async function visibleStandaloneSemicolons(page: Page): Promise<string[]> {
 }
 
 const routes = [
-  ["/inference/models", "Models & Runtime"],
+  ["/inference/models", "Models & Instances"],
   ["/inference/playground/chunk", "Chunking Playground"],
   ["/inference/playground/extract", "Extraction Playground"],
   ["/inference/playground/rewrite", "Rewrite"],
@@ -121,8 +121,8 @@ async function installApiMocks(page: Page) {
   await page.route("**/ai/v1/_antfarm/readers", (route) =>
     route.fulfill({ json: { apple_ocr: { available: false } } })
   );
-  await page.route("**/ai/v1/_antfarm/models/status", (route) =>
-    route.fulfill({ json: { object: "model_runtime", models: [] } })
+  await page.route("**/ai/v1/models/instances", (route) =>
+    route.fulfill({ json: { object: "list", data: [] } })
   );
   await page.route("**/ai/v1/models", (route) =>
     route.fulfill({
@@ -328,37 +328,32 @@ test.describe("AI workflow routes", () => {
   test("models can be warmed and released through lifecycle controls", async ({ page }) => {
     let loaded = false;
     const actions: string[] = [];
-    const runtimeModel = () => ({
-      task: "embedder",
+    const instance = {
+      id: "instance-1",
       model: "mock-embed",
-      load_state: "idle",
-      runtimes: loaded
-        ? [
-            {
-              runtime_id: "runtime-1",
-              state: "loaded",
-              runtime_kind: "primary",
-              active_requests: 0,
-              startup_managed: false,
-              backend: "mock",
-              device: "cpu",
-            },
-          ]
-        : [],
+      tasks: ["embedder"],
+      state: "loaded",
+      active_handles: 0,
+      startup_managed: false,
+      unloadable: true,
+      backend: "mock",
+      residency_mode: "backend_managed",
+      idle_ms: 0,
+    };
+    await page.route("**/ai/v1/models/instances", async (route) => {
+      if (route.request().method() === "POST") {
+        loaded = true;
+        actions.push("load");
+        await route.fulfill({ json: instance });
+      } else {
+        await route.fulfill({ json: { object: "list", data: loaded ? [instance] : [] } });
+      }
     });
-
-    await page.route("**/ai/v1/_antfarm/models/status", (route) =>
-      route.fulfill({ json: { object: "model_runtime", models: [runtimeModel()] } })
-    );
-    await page.route("**/ai/v1/_antfarm/models/load", async (route) => {
-      loaded = true;
-      actions.push("load");
-      await route.fulfill({ json: { outcome: "loaded", model: runtimeModel() } });
-    });
-    await page.route("**/ai/v1/_antfarm/models/unload", async (route) => {
+    await page.route("**/ai/v1/models/instances/instance-1", async (route) => {
+      expect(route.request().method()).toBe("DELETE");
       loaded = false;
       actions.push("unload");
-      await route.fulfill({ json: { outcome: "unloaded", runtime_id: "runtime-1" } });
+      await route.fulfill({ json: { outcome: "unloaded" } });
     });
 
     await page.goto("/inference/models");

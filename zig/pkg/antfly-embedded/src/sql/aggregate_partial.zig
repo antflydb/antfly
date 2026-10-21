@@ -40,6 +40,207 @@ pub fn read(a: A, group: operators.GroupResult, index: usize, spec: operators.Ag
     return state;
 }
 
+/// Finalization of a borrowed immutable state must not mutate its NUMERIC
+/// result memo or allocate through a shared cache owner's allocator.
+pub fn finishBorrowed(a: A, state: operators.Aggregate) !Datum {
+    if (state.numeric) |numeric| {
+        // The caller often uses a result arena. Clone and finalize in private
+        // reclaimable scratch so only the immutable result survives this call.
+        var scratch = std.heap.ArenaAllocator.init(@import("memory_budget.zig").reclaimingAllocator(a));
+        defer scratch.deinit();
+        var owned = try numeric.clone(scratch.allocator());
+        defer owned.deinit();
+        const value = (try owned.finish(state.kind == .avg)) orelse return .{};
+        return operators.cloneDatum(a, Datum.typedNumeric(value));
+    }
+    return operators.cloneDatum(a, try state.finish());
+}
+
+/// Providers finish primitive native transitions without constructing reducers.
+pub fn finish(a: A, scratch: A, group: operators.GroupResult, index: usize, spec: operators.AggregateSpec) !Datum {
+    if (index >= try partialCount(group)) return error.InvalidSqlBackendResponse;
+    if (group.state_reader) |reader| if (reader.finish) |kernel| return kernel(reader.ptr, a, index, spec);
+    return finishBorrowed(a, try read(scratch, group, index, spec));
+}
+fn integerLane(block: @import("spill.zig").ColumnarBlock, row: usize, column: usize) !i64 {
+    const value = try block.cell(row, column);
+    if (value.sql_null or value.value != .integer or value.numeric != null) return error.InvalidSqlSpill;
+    return value.value.integer;
+}
+pub fn finishPhysical(a: A, block: @import("spill.zig").ColumnarBlock, row: usize, column: usize, spec: operators.AggregateSpec) !Datum {
+    if (!physicalEligible(spec) or column > block.values.len or physicalColumns(spec).len > block.values.len - column) return error.InvalidSqlSpill;
+    const count = try integerLane(block, row, column);
+    if (count < 0) return error.InvalidSqlSpill;
+    if (spec.kind == .count) return Datum.json(.{ .integer = count });
+    if (spec.kind == .sum and spec.input_type == .integer) {
+        const low: u64 = @bitCast(try integerLane(block, row, column + 1));
+        const high: u64 = @bitCast(try integerLane(block, row, column + 2));
+        const sum: i128 = @bitCast(@as(u128, high) << 64 | low);
+        return if (count == 0) .{} else Datum.json(.{ .integer = std.math.cast(i64, sum) orelse return error.SqlNumericOutOfRange });
+    }
+    if (spec.kind == .bool_and or spec.kind == .bool_or) {
+        const value = try block.cell(row, column + 1);
+        if (value.sql_null or value.value != .bool) return error.InvalidSqlSpill;
+        return if (count == 0) .{} else value;
+    }
+    // Variable coefficients, extrema and floating validation preserve the
+    // established exact semantics and immutable cache ownership.
+    var scratch = std.heap.ArenaAllocator.init(@import("memory_budget.zig").reclaimingAllocator(a));
+    defer scratch.deinit();
+    const state = try readPhysical(scratch.allocator(), block, row, column, spec);
+    return operators.cloneDatum(a, try state.finish());
+}
+
+/// Native aggregate block layout. Fixed counters and transition bits are
+/// independent physical columns; extrema use the existing typed scalar codec,
+/// and exact NUMERIC keeps its portable coefficient buffer. No AGS row envelope
+/// or signature is repeated for every group; the enclosing recipe binds it.
+pub const physical_width = 9;
+pub fn physicalEligible(spec: operators.AggregateSpec) bool {
+    return !spec.distinct and spec.kind != .pattern_set;
+}
+pub fn physicalColumns(spec: operators.AggregateSpec) []const u8 {
+    return switch (spec.kind) {
+        .count => &.{0},
+        .sum => if (spec.input_element == .numeric) &.{ 0, 8 } else if (spec.input_type == .integer) &.{ 0, 1, 2 } else if (spec.input_element == .float32) &.{ 0, 3 } else &.{ 0, 3, 4 },
+        .avg => if (spec.input_element == .numeric) &.{ 0, 8 } else &.{ 0, 5 },
+        .min, .max => &.{ 0, 7 },
+        .bool_and, .bool_or => &.{ 0, 6 },
+        .pattern_set => &.{},
+    };
+}
+pub fn physicalWidth(inputs: anytype) usize {
+    var width: usize = 0;
+    for (inputs) |input| width += physicalColumns(input.spec).len;
+    return width;
+}
+pub fn physicalOffset(inputs: anytype, column: usize) usize {
+    return physicalWidth(inputs[0..column]);
+}
+pub fn physicalCells(a: A, state: operators.Aggregate) ![physical_width]Datum {
+    if (state.distinct or state.patterns != null or state.count > std.math.maxInt(i64)) return error.InvalidSqlSpill;
+    const bits: u128 = @bitCast(state.integer_sum);
+    var numeric: Datum = .{};
+    if (state.numeric) |reducer| {
+        if (reducer.state.count != state.count) return error.InvalidSqlSpill;
+        var ctx: @import("numeric_value.zig").Context = .{ .alloc = a };
+        const bytes = try a.alloc(u8, try reducer.state.encodedSize(&ctx));
+        var writer: std.Io.Writer = .fixed(bytes);
+        try reducer.state.encode(&ctx, &writer);
+        numeric = Datum.json(.{ .string = bytes });
+    }
+    return .{
+        Datum.json(.{ .integer = @intCast(state.count) }),
+        Datum.json(.{ .integer = @bitCast(@as(u64, @truncate(bits))) }),
+        Datum.json(.{ .integer = @bitCast(@as(u64, @truncate(bits >> 64))) }),
+        Datum.json(.{ .integer = @bitCast(state.number_sum) }),
+        Datum.json(.{ .integer = @bitCast(state.compensation) }),
+        Datum.json(.{ .integer = @bitCast(state.mean) }),
+        Datum.json(.{ .bool = state.boolean }),
+        if (state.selected) |selected| selected.row.values[0] else .{},
+        numeric,
+    };
+}
+pub fn readPhysical(a: A, block: @import("spill.zig").ColumnarBlock, row: usize, column: usize, spec: operators.AggregateSpec) !operators.Aggregate {
+    const lanes = physicalColumns(spec);
+    if (!physicalEligible(spec) or column > block.values.len or lanes.len > block.values.len - column) return error.InvalidSqlSpill;
+    var cells: [physical_width]Datum = @splat(.{});
+    @memset(cells[0..6], Datum.json(.{ .integer = 0 }));
+    cells[6] = Datum.json(.{ .bool = false });
+    for (lanes, 0..) |lane, offset| cells[lane] = try block.cell(row, column + offset);
+    return readPhysicalCells(a, cells, spec);
+}
+pub fn readPhysicalCells(a: A, cells: [physical_width]Datum, spec: operators.AggregateSpec) !operators.Aggregate {
+    if (!physicalEligible(spec)) return error.InvalidSqlSpill;
+    for (cells[0..6]) |lane| if (lane.sql_null or lane.value != .integer or lane.numeric != null) return error.InvalidSqlSpill;
+    if (cells[0].value.integer < 0 or cells[6].sql_null or cells[6].value != .bool) return error.InvalidSqlSpill;
+    var state = try operators.Aggregate.initTyped(a, spec.kind, spec.input_type, spec.input_element);
+    errdefer state.deinit();
+    state.count = @intCast(cells[0].value.integer);
+    const low: u64 = @bitCast(cells[1].value.integer);
+    const high: u64 = @bitCast(cells[2].value.integer);
+    state.integer_sum = @bitCast(@as(u128, high) << 64 | low);
+    state.number_sum = @bitCast(cells[3].value.integer);
+    state.compensation = @bitCast(cells[4].value.integer);
+    state.mean = @bitCast(cells[5].value.integer);
+    state.boolean = cells[6].value.bool;
+    const sql_floating = spec.input_element == .float32 or spec.input_element == .float64;
+    for ([_]f64{ state.number_sum, state.compensation, state.mean }, 0..) |number, lane| {
+        if (!std.math.isFinite(number) and !(sql_floating and ((lane == 0 and spec.kind == .sum) or (lane == 2 and spec.kind == .avg)))) return error.InvalidSqlSpill;
+    }
+    if (spec.kind == .sum and spec.input_element == .float32) {
+        const rounded: f32 = @floatCast(state.number_sum);
+        if ((state.number_sum != @as(f64, rounded) and !(std.math.isNan(state.number_sum) and std.math.isNan(rounded))) or state.compensation != 0 or state.mean != 0) return error.InvalidSqlSpill;
+    }
+    if (state.numeric) |reducer| {
+        if (cells[8].sql_null or cells[8].value != .string or state.integer_sum != 0 or state.number_sum != 0 or state.compensation != 0 or state.mean != 0 or state.boolean) return error.InvalidSqlSpill;
+        var ctx: @import("numeric_value.zig").Context = .{ .alloc = a };
+        reducer.state = try @import("numeric_aggregate.zig").decode(&ctx, cells[8].value.string);
+        if (reducer.state.count != state.count) return error.InvalidSqlSpill;
+    } else if (!cells[8].sql_null) return error.InvalidSqlSpill;
+    const selected = cells[7];
+    if (!selected.sql_null) {
+        if ((spec.kind != .min and spec.kind != .max) or state.count == 0) return error.InvalidSqlSpill;
+        const valid = switch (spec.input_type orelse .json) {
+            .integer => selected.value == .integer,
+            .number => selected.numeric != null or selected.value == .integer or selected.value == .float,
+            .boolean => selected.value == .bool,
+            .string, .datetime, .uuid => selected.value == .string,
+            .json => true,
+            .array => selected.array != null,
+        };
+        if (!valid) return error.InvalidSqlSpill;
+        state.selected = try @TypeOf(state.selected.?).init(a, .{ .values = &.{selected}, .keys = &.{}, .ordinal = 0 });
+    } else if ((spec.kind == .min or spec.kind == .max) and state.count != 0) return error.InvalidSqlSpill;
+    return state;
+}
+/// Finalize selected schema-bound transitions without constructing a block.
+pub fn finishPhysicalCells(a: A, cells: [physical_width]Datum, spec: operators.AggregateSpec) !Datum {
+    const counter = cells[0];
+    if (!physicalEligible(spec) or counter.sql_null or counter.numeric != null or counter.value != .integer or counter.value.integer < 0) return error.InvalidSqlSpill;
+    const count = counter.value.integer;
+    if (spec.kind == .count) return counter;
+    if (spec.kind == .sum and spec.input_type == .integer) {
+        for (cells[1..3]) |lane| if (lane.sql_null or lane.value != .integer or lane.numeric != null) return error.InvalidSqlSpill;
+        const low: u64 = @bitCast(cells[1].value.integer);
+        const high: u64 = @bitCast(cells[2].value.integer);
+        const sum: i128 = @bitCast(@as(u128, high) << 64 | low);
+        return if (count == 0) .{} else Datum.json(.{ .integer = std.math.cast(i64, sum) orelse return error.SqlNumericOutOfRange });
+    }
+    if (spec.kind == .bool_and or spec.kind == .bool_or) {
+        if (cells[6].sql_null or cells[6].value != .bool) return error.InvalidSqlSpill;
+        return if (count == 0) .{} else cells[6];
+    }
+    var scratch = std.heap.ArenaAllocator.init(@import("memory_budget.zig").reclaimingAllocator(a));
+    defer scratch.deinit();
+    // This reducer is privately decoded in scratch, so finalization can memoize
+    // in place. Borrowed cached reducers still use finishBorrowed above.
+    const state = try readPhysicalCells(scratch.allocator(), cells, spec);
+    return operators.cloneDatum(a, try state.finish());
+}
+
+/// Clone only the selected row's state across a page-owner boundary.
+pub fn cloneBorrowed(a: A, source: operators.Aggregate) !operators.Aggregate {
+    if (source.distinct or source.patterns != null) {
+        const encoded = try cell(a, source);
+        defer a.free(encoded.value.string);
+        return decode(a, encoded, .{ .kind = source.kind, .input_type = source.input_type, .input_element = source.input_element, .distinct = source.distinct });
+    }
+    var state = source;
+    state.alloc = a;
+    state.numeric = null;
+    state.selected = null;
+    errdefer state.deinit();
+    if (source.numeric) |numeric| {
+        const copy = try a.create(@import("numeric_aggregate.zig").Reducer);
+        errdefer a.destroy(copy);
+        copy.* = try numeric.clone(a);
+        state.numeric = copy;
+    }
+    if (source.selected) |selected| state.selected = try @TypeOf(state.selected.?).init(a, selected.row);
+    return state;
+}
+
 fn elementId(identity: ?@import("array_value.zig").ElementType) u8 {
     return if (identity) |kind| switch (kind) {
         .text => 0,
@@ -229,9 +430,68 @@ pub fn cell(a: A, state: operators.Aggregate) !Datum {
     return Datum.json(.{ .string = try encoder.bytes.toOwnedSlice(a) });
 }
 
+/// Borrowed primitive checkpoint lanes. The AGS wire version and signature are
+/// identical to scalar restore; extrema borrow their winning payload until merge.
+pub const Fixed = struct { count: u64, sum: i128, boolean: bool, selected: Datum, numeric: ?@import("numeric_aggregate.zig").State = null };
+pub fn fixedEligible(spec: operators.AggregateSpec) bool {
+    return !spec.distinct and operators.exactMergeable(spec) and spec.kind != .pattern_set;
+}
+pub fn decodeFixed(a: A, value: Datum, spec: operators.AggregateSpec) !?Fixed {
+    if (!fixedEligible(spec)) return null;
+    if (value.sql_null or value.value != .string or value.patterns != null or value.array != null or value.numeric != null) return error.InvalidSqlSpill;
+    var decoder: Decoder = .{ .a = a, .bytes = value.value.string };
+    if (!std.mem.eql(u8, try decoder.raw(4), magic)) return error.InvalidSqlSpill;
+    const signature = try decoder.raw(5);
+    if (signature[0] != kindId(spec.kind) or signature[1] != typeId(spec.input_type) or signature[2] != 0 or signature[3] > 1 or signature[4] != elementId(spec.input_element)) return error.InvalidSqlSpill;
+    const count = try decoder.integer(u64);
+    if (count > std.math.maxInt(i64)) return error.InvalidSqlSpill;
+    const sum = try decoder.integer(i128);
+    var numbers: [3]f64 = undefined;
+    for (&numbers) |*number| {
+        number.* = @bitCast(try decoder.integer(u64));
+        if (!std.math.isFinite(number.*)) return error.InvalidSqlSpill;
+    }
+    const exact = spec.input_element == .numeric and (spec.kind == .sum or spec.kind == .avg);
+    if (try decoder.integer(u8) != @intFromBool(exact)) return error.InvalidSqlSpill;
+    var context: @import("numeric_value.zig").Context = .{ .alloc = a };
+    var numeric: ?@import("numeric_aggregate.zig").State = if (exact) @import("numeric_aggregate.zig").decode(&context, try decoder.text()) catch |err| return switch (err) {
+        error.InvalidNumericAggregateState => error.InvalidSqlSpill,
+        else => err,
+    } else null;
+    var retained = false;
+    defer if (!retained) if (numeric) |*state| state.deinit(a);
+    if (numeric) |state| if (state.count != count or sum != 0 or numbers[0] != 0 or numbers[1] != 0 or numbers[2] != 0 or signature[3] != 0) return error.InvalidSqlSpill;
+    const selected: Datum = switch (try decoder.integer(u8)) {
+        0 => .{},
+        2 => blk: {
+            const boolean = try decoder.integer(u8);
+            if (boolean > 1) return error.InvalidSqlSpill;
+            break :blk Datum.json(.{ .bool = boolean == 1 });
+        },
+        3 => Datum.json(.{ .integer = try decoder.integer(i64) }),
+        5 => Datum.json(.{ .string = try decoder.text() }),
+        else => return null,
+    };
+    if (selected.sql_null) {
+        if ((spec.kind == .min or spec.kind == .max) and count != 0) return error.InvalidSqlSpill;
+    } else {
+        if ((spec.kind != .min and spec.kind != .max) or count == 0) return error.InvalidSqlSpill;
+        const valid = switch (spec.input_type orelse .json) {
+            .integer => selected.value == .integer,
+            .boolean => selected.value == .bool,
+            .string => selected.value == .string,
+            else => false,
+        };
+        if (!valid) return error.InvalidSqlSpill;
+    }
+    if (try decoder.integer(u64) != 0 or try decoder.integer(u64) != std.math.maxInt(u64) or decoder.position != decoder.bytes.len) return error.InvalidSqlSpill;
+    retained = true;
+    return .{ .count = count, .sum = sum, .boolean = signature[3] == 1, .selected = selected, .numeric = numeric };
+}
+
 pub fn decode(a: A, value: Datum, spec: operators.AggregateSpec) !operators.Aggregate {
     if (value.sql_null or value.patterns != null or value.value != .string) return error.InvalidSqlSpill;
-    var scratch = std.heap.ArenaAllocator.init(a);
+    var scratch = std.heap.ArenaAllocator.init(@import("memory_budget.zig").reclaimingAllocator(a));
     defer scratch.deinit();
     const sql_floating = spec.input_element == .float32 or spec.input_element == .float64;
     var decoder: Decoder = .{ .a = scratch.allocator(), .bytes = value.value.string, .sql_floating = sql_floating };
@@ -551,8 +811,8 @@ test "SQL aggregate typed-array partials use the shared portable block codec" {
             defer decoded.deinit();
             const value = decoded.selected.?.row.values[0];
             try std.testing.expectEqual(@as(i32, -3), value.array.?.dimensions[0].lower);
-            try std.testing.expectEqual(@as(i64, 9007199254740993), value.array.?.elements[0].value.integer);
-            try std.testing.expect(value.array.?.elements[1].sql_null);
+            try std.testing.expectEqual(@as(i64, 9007199254740993), value.array.?.flatCell(0).value.integer);
+            try std.testing.expect(value.array.?.flatCell(1).sql_null);
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
@@ -626,4 +886,119 @@ test "external lake partial readers share signature validation across typed lazy
     group.state_reader = null;
     try std.testing.expectEqual(@as(u64, 4), (try read(a, group, 0, spec)).count);
     try std.testing.expectError(error.InvalidSqlBackendResponse, read(a, group, 1, spec));
+}
+
+test "SQL partial primitive checkpoint lanes validate signatures truncation and exact state" {
+    const a = std.testing.allocator;
+    const specs = [_]operators.AggregateSpec{ .{ .kind = .count }, .{ .kind = .sum, .input_type = .integer }, .{ .kind = .min, .input_type = .integer }, .{ .kind = .max, .input_type = .boolean }, .{ .kind = .min, .input_type = .string }, .{ .kind = .bool_and, .input_type = .boolean } };
+    const values = [_]Datum{ Datum.json(.{ .integer = 1 }), Datum.json(.{ .integer = std.math.maxInt(i64) }), Datum.json(.{ .integer = -99 }), Datum.json(.{ .bool = true }), Datum.json(.{ .string = "borrowed" }), Datum.json(.{ .bool = false }) };
+    for (specs, values) |spec, value| {
+        var state = try operators.Aggregate.initTyped(a, spec.kind, spec.input_type, spec.input_element);
+        defer state.deinit();
+        try state.update(value);
+        try state.update(value);
+        const encoded = try cell(a, state);
+        defer a.free(encoded.value.string);
+        const lane = (try decodeFixed(a, encoded, spec)).?;
+        try std.testing.expectEqual(state.count, lane.count);
+        try std.testing.expectEqual(state.integer_sum, lane.sum);
+        try std.testing.expectEqual(state.boolean, lane.boolean);
+        if (state.selected) |selected| try std.testing.expectEqualDeep(selected.row.values[0], lane.selected);
+        for (0..encoded.value.string.len) |end| try std.testing.expectError(error.InvalidSqlSpill, decodeFixed(a, Datum.json(.{ .string = encoded.value.string[0..end] }), spec));
+        var wrong = spec;
+        wrong.input_type = .json;
+        if (fixedEligible(wrong) and spec.input_type != .json) try std.testing.expectError(error.InvalidSqlSpill, decodeFixed(a, encoded, wrong));
+    }
+}
+
+test "SQL exact NUMERIC checkpoint lanes validate full signatures and truncated coefficients" {
+    const a = std.testing.allocator;
+    for ([_]operators.Aggregate.Kind{ .sum, .avg }) |kind| {
+        var state = try operators.Aggregate.initTyped(a, kind, .number, .numeric);
+        defer state.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var work: @import("array_value.zig").Budget = .{};
+        for ([_][]const u8{ "10000.0000", "0.0001", "-1.25", "Infinity", "-Infinity", "NaN" }) |text| try state.update(try @import("scalar.zig").numericTextLeaky(arena.allocator(), text, &work));
+        const encoded = try cell(a, state);
+        defer a.free(encoded.value.string);
+        const spec: operators.AggregateSpec = .{ .kind = kind, .input_type = .number, .input_element = .numeric };
+        var lane = (try decodeFixed(a, encoded, spec)).?;
+        defer lane.numeric.?.deinit(a);
+        try std.testing.expectEqual(state.count, lane.count);
+        var context: @import("numeric_value.zig").Context = .{ .alloc = a };
+        try std.testing.expect(try lane.numeric.?.equivalent(&context, state.numeric.?.state));
+        for (0..encoded.value.string.len) |end| try std.testing.expectError(error.InvalidSqlSpill, decodeFixed(a, Datum.json(.{ .string = encoded.value.string[0..end] }), spec));
+    }
+}
+
+test "SQL borrowed NUMERIC cached finalization reclaims scratch and leaves shared memo immutable" {
+    const a = std.testing.allocator;
+    const numeric = @import("numeric_value.zig");
+    var context: numeric.Context = .{ .alloc = a };
+    var value = try numeric.parse(&context, "9007199254740993.1200");
+    defer value.deinit();
+    for ([_]operators.Aggregate.Kind{ .sum, .avg }) |kind| {
+        var source = try operators.Aggregate.initTyped(a, kind, .number, .numeric);
+        defer source.deinit();
+        try source.update(Datum.typedNumeric(&value.value));
+        const group: operators.GroupResult = .{ .keys = &.{}, .aggregates = &.{}, .typed_states = &.{source}, .ordinal = 0 };
+        const spec: operators.AggregateSpec = .{ .kind = kind, .input_type = .number, .input_element = .numeric };
+        var budget: @import("memory_budget.zig") = .{ .backing = a, .limit = 4 * 1024 * 1024 };
+        var page = std.heap.ArenaAllocator.init(budget.allocator());
+        defer page.deinit();
+        var read_scratch = std.heap.ArenaAllocator.init(a);
+        defer read_scratch.deinit();
+        // A wide cached result previously failed after 10,057 SUM outputs:
+        // temporary reducer coefficients accumulated in the output page.
+        for (0..16384) |_| {
+            const result = try finish(page.allocator(), read_scratch.allocator(), group, 0, spec);
+            try std.testing.expectEqual(std.math.Order.eq, try numeric.order(&context, result.numeric.?.*, value.value));
+            try std.testing.expect(source.numeric.?.result == null);
+        }
+        try std.testing.expect(budget.peak < 2 * 1024 * 1024);
+        std.debug.print("borrowed NUMERIC {t}: finalized=16384 peak={}\n", .{ kind, budget.peak });
+    }
+}
+
+test "SQL native transition finalizers match reducer results for empty signed boolean and overflow states" {
+    const spilling = @import("spill.zig");
+    const a = std.testing.allocator;
+    for ([_]operators.AggregateSpec{
+        .{ .kind = .count },
+        .{ .kind = .sum, .input_type = .integer },
+        .{ .kind = .bool_and, .input_type = .boolean },
+        .{ .kind = .bool_or, .input_type = .boolean },
+        .{ .kind = .min, .input_type = .integer },
+    }) |spec| for (0..3) |count| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const out = arena.allocator();
+        var state = try operators.Aggregate.initTyped(a, spec.kind, spec.input_type, spec.input_element);
+        defer state.deinit();
+        for (0..count) |i| try state.update(if (spec.input_type == .boolean) Datum.json(.{ .bool = i == 0 }) else Datum.json(.{ .integer = -123 }));
+        const physical = try physicalCells(out, state);
+        const columns = physicalColumns(spec);
+        const values = try out.alloc(Datum, columns.len);
+        for (values, columns) |*value, column| value.* = physical[column];
+        const rows = [_]operators.Row{.{ .values = values, .keys = &.{}, .ordinal = 0 }};
+        const bytes = try spilling.encodeColumnarBlockAlloc(out, &rows, 64 * 1024);
+        const block = try spilling.decodeColumnarBlockInArena(out, bytes, 64 * 1024);
+        defer block.deinit();
+        try std.testing.expectEqualDeep(try finishBorrowed(out, state), try finishPhysical(out, block, 0, 0, spec));
+    };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    const spec: operators.AggregateSpec = .{ .kind = .sum, .input_type = .integer };
+    var state = try operators.Aggregate.init(a, .sum, .integer);
+    defer state.deinit();
+    try state.update(Datum.json(.{ .integer = std.math.maxInt(i64) }));
+    try state.update(Datum.json(.{ .integer = std.math.maxInt(i64) }));
+    const physical = try physicalCells(out, state);
+    const rows = [_]operators.Row{.{ .values = physical[0..3], .keys = &.{}, .ordinal = 0 }};
+    const bytes = try spilling.encodeColumnarBlockAlloc(out, &rows, 64 * 1024);
+    const block = try spilling.decodeColumnarBlockInArena(out, bytes, 64 * 1024);
+    defer block.deinit();
+    try std.testing.expectError(error.SqlNumericOutOfRange, finishPhysical(out, block, 0, 0, spec));
 }

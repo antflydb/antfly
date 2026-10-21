@@ -202,6 +202,11 @@ components:
           type: string
           minLength: 1
           maxLength: 1048576
+        context_index:
+          x-go-type-skip-optional-pointer: false
+          type: integer
+          minimum: 0
+          description: Index into request contexts. Requires context_version 1. Effective input is context, newline, then input; the 1 MiB input limit applies after expansion.
     DecideLongDocument:
       type: object
       additionalProperties: false
@@ -231,6 +236,94 @@ components:
           maximum: 128
           default: 128
           x-go-type-skip-optional-pointer: false
+    GeneratedChoiceDecisionQuestion:
+      type: object
+      additionalProperties: false
+      required: [type, name, choices]
+      properties:
+        type: { type: string, enum: [choice] }
+        name: { type: string, minLength: 1 }
+        instructions:
+          type: string
+          minLength: 1
+          description: May inherit nonempty generated decider instructions.
+        choices:
+          type: array
+          minItems: 2
+          maxItems: 64
+          items: { $ref: '#/components/schemas/DecisionChoice' }
+    GeneratedMultiChoiceDecisionQuestion:
+      type: object
+      additionalProperties: false
+      required: [type, name, choices]
+      properties:
+        type: { type: string, enum: [multi_choice] }
+        name: { type: string, minLength: 1 }
+        instructions:
+          type: string
+          minLength: 1
+          description: May inherit nonempty generated decider instructions.
+        choices:
+          type: array
+          minItems: 2
+          maxItems: 64
+          items: { $ref: '#/components/schemas/DecisionChoice' }
+    GeneratedPredicateDecisionQuestion:
+      type: object
+      additionalProperties: false
+      required: [type, name]
+      properties:
+        type: { type: string, enum: [predicate] }
+        name: { type: string, minLength: 1 }
+        instructions:
+          type: string
+          minLength: 1
+          description: May inherit nonempty generated decider instructions.
+    GeneratedScoreDecisionQuestion:
+      type: object
+      additionalProperties: false
+      required: [type, name]
+      properties:
+        type: { type: string, enum: [score] }
+        name: { type: string, minLength: 1 }
+        instructions:
+          type: string
+          minLength: 1
+          description: May inherit nonempty generated decider instructions.
+    GeneratedDecideQuestion:
+      oneOf:
+      - $ref: '#/components/schemas/GeneratedChoiceDecisionQuestion'
+      - $ref: '#/components/schemas/GeneratedMultiChoiceDecisionQuestion'
+      - $ref: '#/components/schemas/GeneratedPredicateDecisionQuestion'
+      - $ref: '#/components/schemas/GeneratedScoreDecisionQuestion'
+    DecisionRequest:
+      description: A trained decider request or a constrained generator request.
+      oneOf:
+        - $ref: '#/components/schemas/DecideRequest'
+        - $ref: '#/components/schemas/GeneratedDecideRequest'
+    GeneratedDecideRequest:
+      type: object
+      additionalProperties: false
+      required: [decision_method, generator, questions]
+      description: Supply exactly one of input or inputs. Each question requires instructions unless nonempty decider instructions are supplied. Inference nodes admit registered native generators; hosted execution uses configured producer and SQL runtimes.
+      properties:
+        decision_method: { type: string, enum: [generated] }
+        generator: { $ref: '../shared/generating.yaml#/components/schemas/GeneratorConfig' }
+        input: { type: string, minLength: 1, maxLength: 1048576 }
+        inputs:
+          type: array
+          minItems: 1
+          maxItems: 128
+          items: { $ref: '#/components/schemas/DecisionInput' }
+        questions:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items: { $ref: '#/components/schemas/GeneratedDecideQuestion' }
+        instructions: { type: string, maxLength: 65536 }
+        output: { $ref: '../shared/generating.yaml#/components/schemas/ConstrainedOutput' }
+        probabilities: { $ref: '../shared/generating.yaml#/components/schemas/ConstrainedProbabilities' }
+        batch: { $ref: '../shared/generating.yaml#/components/schemas/ConstrainedGenerationBatch' }
     DecideRequest:
       type: object
       additionalProperties: false
@@ -238,6 +331,18 @@ components:
       - model
       - questions
       properties:
+        context_version:
+          type: integer
+          enum: [1]
+          description: Explicit shared-context transport version. Requires batched inputs and contexts; unknown versions are rejected.
+        contexts:
+          type: array
+          maxItems: 128
+          items:
+            type: string
+            minLength: 1
+            maxLength: 1048576
+          description: Shared immutable context strings referenced by context_index. Requires context_version 1. Total expanded input bytes are limited to 16 MiB.
         model: *id001
         model_identity:
           type: string
@@ -548,8 +653,90 @@ components:
             thresholds.
       description: Raw cosine scores are neither probabilities nor confidence. Empty means no label met
         its threshold; abstained means the requested margin could not be established.
+    GeneratedChoiceAnswer:
+      type: object
+      additionalProperties: false
+      required: [name, type, decision_method, probability_source, raw_structured_answer, choice, probabilities]
+      properties:
+        name: { type: string, minLength: 1 }
+        type: { type: string, enum: [choice] }
+        decision_method: { type: string, enum: [generated] }
+        probability_source:
+          type: string
+          enum: [token_logprobs, verdict]
+          description: Measured decoder evidence, or an explicit verdict-only 0/1 assertion. No model-written confidence.
+        raw_structured_answer:
+          type: string
+        choice:
+          type: string
+        probabilities:
+          type: array
+          items: { $ref: '#/components/schemas/DecisionChoiceProbability' }
+    GeneratedMultiChoiceAnswer:
+      type: object
+      additionalProperties: false
+      required: [name, type, decision_method, probability_source, raw_structured_answer, choices, probabilities]
+      properties:
+        name: { type: string, minLength: 1 }
+        type: { type: string, enum: [multi_choice] }
+        decision_method: { type: string, enum: [generated] }
+        probability_source:
+          type: string
+          enum: [token_logprobs, verdict]
+          description: Measured decoder evidence, or an explicit verdict-only 0/1 assertion. No model-written confidence.
+        raw_structured_answer:
+          type: array
+          items: { type: string }
+          uniqueItems: true
+        choices:
+          type: array
+          uniqueItems: true
+          items: { type: string }
+        probabilities:
+          type: array
+          items: { $ref: '#/components/schemas/DecisionChoiceProbability' }
+    GeneratedPredicateAnswer:
+      type: object
+      additionalProperties: false
+      required: [name, type, decision_method, probability_source, raw_structured_answer, probability]
+      properties:
+        name: { type: string, minLength: 1 }
+        type: { type: string, enum: [predicate] }
+        decision_method: { type: string, enum: [generated] }
+        probability_source:
+          type: string
+          enum: [token_logprobs, verdict]
+          description: Measured decoder evidence, or an explicit verdict-only 0/1 assertion. No model-written confidence.
+        raw_structured_answer:
+          type: boolean
+        probability:
+          type: number
+          minimum: 0
+          maximum: 1
+    GeneratedScoreAnswer:
+      type: object
+      additionalProperties: false
+      required: [name, type, decision_method, probability_source, raw_structured_answer, score]
+      properties:
+        name: { type: string, minLength: 1 }
+        type: { type: string, enum: [score] }
+        decision_method: { type: string, enum: [generated] }
+        probability_source:
+          type: string
+          enum: [token_logprobs, verdict]
+          description: Measured decoder evidence, or an explicit verdict-only 0/1 assertion. No model-written confidence.
+        raw_structured_answer:
+          type: number
+        score:
+          type: number
+          minimum: 0
+          maximum: 1
     DecideAnswer:
       oneOf:
+      - $ref: '#/components/schemas/GeneratedChoiceAnswer'
+      - $ref: '#/components/schemas/GeneratedMultiChoiceAnswer'
+      - $ref: '#/components/schemas/GeneratedPredicateAnswer'
+      - $ref: '#/components/schemas/GeneratedScoreAnswer'
       - $ref: '#/components/schemas/TrainedChoiceAnswer'
       - $ref: '#/components/schemas/TrainedScoreAnswer'
       - $ref: '#/components/schemas/TrainedPredicateAnswer'
@@ -566,6 +753,9 @@ components:
           type: integer
           minimum: 0
         id: *id001
+        error:
+          type: string
+          description: Generated batches preserve valid siblings; a failed item has an empty answers array and this error code.
         answers:
           type: array
           items:

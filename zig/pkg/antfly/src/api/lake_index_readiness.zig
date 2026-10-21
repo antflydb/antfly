@@ -60,7 +60,21 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
         };
         context = reader_lease.?.readContext();
     }
-    var selected = (try @import("lake_index_selection.zig").selectCached(sa, sql_table, &source, &store, context, .automatic, &server.lake_read_cache)) orelse return &.{};
+    var selected = (@import("lake_index_selection.zig").selectCached(sa, sql_table, &source, &store, context, .required, &server.lake_read_cache) catch |err| {
+        try context.ensureActive();
+        if (err == error.OutOfMemory) return err;
+        switch (err) {
+            error.ExternalLakeIndexUnavailable,
+            error.ExternalLakeIndexDefinitionChanged,
+            error.ExternalLakeIndexSourceChanged,
+            error.ExternalLakeSnapshotMismatch,
+            error.ExternalLakeIndexCredentialsChanged,
+            error.ExternalLakeIndexStoreChanged,
+            => try server.requestLakePublication(table.name),
+            else => {},
+        }
+        return &.{};
+    }) orelse return &.{};
     defer selected.deinit();
     const definitions = try std.json.parseFromSliceLeaky(std.json.Value, sa, table.indexes_json, .{});
     if (definitions != .object) return error.InvalidTableIndexMetadata;
@@ -177,7 +191,7 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
             defer tuple.deinit();
             var predicate: ?local.storage_db_relational_index_predicate.Plan = if (index.where.len == 0) null else try local.storage_db_relational_index_predicate.Plan.init(a, runtime, &layout, index.where);
             defer if (predicate) |*plan| plan.deinit();
-            const root = @import("lake_index_ordered_rows.zig").loadRoot(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.identity, .context = context }) catch |err| {
+            const root = @import("lake_index_ordered_rows.zig").loadRootLazy(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.identity, .context = context }) catch |err| {
                 try context.ensureActive();
                 if (err == error.OutOfMemory) return err;
                 continue;

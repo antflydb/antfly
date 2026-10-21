@@ -4,6 +4,7 @@
 const std = @import("std");
 const httpx = @import("httpx");
 const types = @import("types.zig");
+const antfly_decision_openapi = @import("antfly_decision_openapi");
 const antfly_extraction_openapi = @import("antfly_extraction_openapi");
 
 pub fn ApiResponse(comptime T: type) type {
@@ -116,20 +117,21 @@ pub const Client = struct {
         return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
     }
 
-    /// Chunk text into smaller segments
+    /// Chunk content with optional model-aware embeddings
     /// POST /chunk
-    pub fn chunkText(self: *@This(), body: types.ChunkRequest) !ApiResponse(types.ChunkResponse) {
+    pub fn chunkText(self: *@This(), body: types.ChunkRequest) !RawResponse {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/chunk", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.ChunkResponse).fromResponse(self.allocator, &resp);
+        defer resp.deinit();
+        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
     }
 
     /// Answer named decision questions
     /// POST /decisions
-    pub fn decide(self: *@This(), body: types.DecideRequest) !ApiResponse(types.DecideResponse) {
+    pub fn decide(self: *@This(), body: antfly_decision_openapi.DecisionRequest) !ApiResponse(types.DecideResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/decisions", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
@@ -182,7 +184,7 @@ pub const Client = struct {
 
     /// Extract entities, relations, classifications, and structures
     /// POST /extract
-    pub fn extract(self: *@This(), body: antfly_extraction_openapi.ExtractionRequest) !ApiResponse(antfly_extraction_openapi.ExtractionResponse) {
+    pub fn extract(self: *@This(), body: antfly_extraction_openapi.ExtractionInputRequest) !ApiResponse(antfly_extraction_openapi.ExtractionResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/extract", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
@@ -221,6 +223,37 @@ pub const Client = struct {
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.ModelsResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// List model instances
+    /// GET /models/instances
+    pub fn listModelInstances(self: *@This()) !ApiResponse(types.ModelInstanceList) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/models/instances", .{self.base_url});
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ModelInstanceList).fromResponse(self.allocator, &resp);
+    }
+
+    /// Load a model instance
+    /// POST /models/instances
+    pub fn loadModelInstance(self: *@This(), body: types.ModelInstanceLoadRequest) !ApiResponse(types.ModelInstance) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/models/instances", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.ModelInstance).fromResponse(self.allocator, &resp);
+    }
+
+    /// Unload a model instance
+    /// DELETE /models/instances/{instance_id}
+    pub fn unloadModelInstance(self: *@This(), instance_id: []const u8) !ApiResponse(types.ModelInstanceUnloadResponse) {
+        const encoded_instance_id = try httpx.PercentEncoding.encode(self.allocator, instance_id);
+        defer self.allocator.free(encoded_instance_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/models/instances/{s}", .{ self.base_url, encoded_instance_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ModelInstanceUnloadResponse).fromResponse(self.allocator, &resp);
     }
 
     /// Run a traditional ML predictor

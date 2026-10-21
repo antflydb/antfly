@@ -3158,11 +3158,22 @@ fn decodeChannelPairPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfos
     shape: FrameShape,
     collect_trailing_infos: bool,
 ) !ChannelPairPcmSequenceDecode {
+    return decodeChannelPairPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfosTo(allocator, sample_rate, access_units, expected_layout, shape, collect_trailing_infos, null);
+}
+fn decodeChannelPairPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfosTo(
+    allocator: std.mem.Allocator,
+    sample_rate: u32,
+    access_units: []const []const u8,
+    expected_layout: ?ProgramConfigLayout,
+    shape: FrameShape,
+    collect_trailing_infos: bool,
+    sink: ?@import("pcm_sink.zig").Sink,
+) !ChannelPairPcmSequenceDecode {
     const plans = try sharedAacImdctPlans(shape);
 
     var interleaved = std.ArrayList(f32).empty;
     defer interleaved.deinit(allocator);
-    try interleaved.ensureTotalCapacityPrecise(allocator, access_units.len * shape.pcm_samples * 2);
+    try interleaved.ensureTotalCapacityPrecise(allocator, (if (sink != null) @as(usize, 1) else access_units.len) * shape.pcm_samples * 2);
     const trailing_infos: []TrailingElementInfo = if (collect_trailing_infos)
         try allocator.alloc(TrailingElementInfo, access_units.len)
     else
@@ -3183,6 +3194,7 @@ fn decodeChannelPairPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfos
     defer scratch.deinit();
 
     for (access_units, 0..) |unit, unit_index| {
+        try @import("work_control.zig").check();
         const unit_decode_started = perfNowNs();
         const block = try decodeChannelPairPcmBlockWithExpectedLayoutAndPredictorsAllocWithShape(
             allocator,
@@ -3223,6 +3235,10 @@ fn decodeChannelPairPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfos
         allocator.free(block.ms_mask);
         allocator.free(block.left_pcm);
         allocator.free(block.right_pcm);
+        if (sink) |consumer| {
+            try consumer.push(interleaved.items, sample_rate, 2);
+            interleaved.clearRetainingCapacity();
+        }
         perfAccumulate(.sequence_output_ns, output_started);
     }
 
@@ -3291,11 +3307,22 @@ fn decodeFirstChannelPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfo
     shape: FrameShape,
     collect_trailing_infos: bool,
 ) !FirstChannelPcmSequenceDecode {
+    return decodeFirstChannelPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfosTo(allocator, sample_rate, access_units, expected_layout, shape, collect_trailing_infos, null);
+}
+fn decodeFirstChannelPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfosTo(
+    allocator: std.mem.Allocator,
+    sample_rate: u32,
+    access_units: []const []const u8,
+    expected_layout: ?ProgramConfigLayout,
+    shape: FrameShape,
+    collect_trailing_infos: bool,
+    sink: ?@import("pcm_sink.zig").Sink,
+) !FirstChannelPcmSequenceDecode {
     const plans = try sharedAacImdctPlans(shape);
 
     var pcm = std.ArrayList(f32).empty;
     defer pcm.deinit(allocator);
-    try pcm.ensureTotalCapacityPrecise(allocator, access_units.len * shape.pcm_samples);
+    try pcm.ensureTotalCapacityPrecise(allocator, (if (sink != null) @as(usize, 1) else access_units.len) * shape.pcm_samples);
     const trailing_infos: []TrailingElementInfo = if (collect_trailing_infos)
         try allocator.alloc(TrailingElementInfo, access_units.len)
     else
@@ -3311,6 +3338,7 @@ fn decodeFirstChannelPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfo
     defer scratch.deinit();
 
     for (access_units, 0..) |unit, unit_index| {
+        try @import("work_control.zig").check();
         const unit_decode_started = perfNowNs();
         const block = try decodeSingleChannelPcmBlockWithExpectedLayoutAndPredictorsAllocWithShape(
             allocator,
@@ -3343,6 +3371,10 @@ fn decodeFirstChannelPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfo
 
         pcm.appendSliceAssumeCapacity(block.pcm);
         allocator.free(block.pcm);
+        if (sink) |consumer| {
+            try consumer.push(pcm.items, sample_rate, 1);
+            pcm.clearRetainingCapacity();
+        }
         perfAccumulate(.sequence_output_ns, output_started);
     }
 
@@ -3357,426 +3389,21 @@ fn decodeFirstChannelPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfo
     };
 }
 
-fn upsampleLinearInterleavedAlloc(
-    allocator: std.mem.Allocator,
-    samples: []const f32,
-    channels: usize,
-) ![]f32 {
-    if (channels == 0 or samples.len % channels != 0) return error.UnsupportedAudioFormat;
-    const frame_count = samples.len / channels;
-    const out = try allocator.alloc(f32, samples.len * 2);
-    errdefer allocator.free(out);
-
-    for (0..frame_count) |frame_index| {
-        for (0..channels) |channel_index| {
-            const current = samples[frame_index * channels + channel_index];
-            const next = if (frame_index + 1 < frame_count)
-                samples[(frame_index + 1) * channels + channel_index]
-            else
-                current;
-            out[(frame_index * 2) * channels + channel_index] = current;
-            out[(frame_index * 2 + 1) * channels + channel_index] = (current + next) * 0.5;
-        }
-    }
-    return out;
-}
-
-fn upsampleAndEnhanceSbrInterleavedAlloc(
-    allocator: std.mem.Allocator,
-    samples: []const f32,
-    channels: usize,
-    trailing_info: TrailingElementInfo,
-) ![]f32 {
-    const upsampled = try upsampleLinearInterleavedAlloc(allocator, samples, channels);
-    errdefer allocator.free(upsampled);
-
-    const reference = try allocator.dupe(f32, upsampled);
-    defer allocator.free(reference);
-
-    const frame_count = upsampled.len / channels;
-    const carry_attenuation: f32 = switch (trailing_info.sbr_carry_generations) {
-        0 => 1.0,
-        1 => 0.78,
-        2 => 0.58,
-        else => 0.42,
+const AdtsCoreInput = struct { decode: AdtsDecodeConfig, channels: u8, asc: [2]u8 };
+fn adtsCoreInput(a: std.mem.Allocator, frames: []const AdtsFrame) !AdtsCoreInput {
+    if (frames.len == 0) return error.UnsupportedAudioFormat;
+    const hint = frames[0].header.channel_config;
+    var channels: u8 = if (hint == 1) 1 else 2;
+    const config = adtsDecodeConfig(a, frames, channels) catch |err| retry: {
+        if (hint != 0 or err != error.UnsupportedAudioFormat) return err;
+        channels = 1;
+        break :retry try adtsDecodeConfig(a, frames, channels);
     };
-    const payload_strength = @min(
-        @as(f32, 0.55),
-        (0.16 +
-            @as(f32, @floatFromInt(trailing_info.max_payload_len)) * 0.012 +
-            @as(f32, @floatFromInt(trailing_info.envelope_hint)) / 255.0 * 0.2) * carry_attenuation,
-    );
-    const noise_strength = (0.04 + @as(f32, @floatFromInt(trailing_info.noise_hint)) / 255.0 * 0.14) * carry_attenuation;
-    const harmonic_mix = (0.05 + @as(f32, @floatFromInt(trailing_info.harmonic_hint)) / 255.0 * 0.18) * carry_attenuation;
-    const detail_mix = (0.02 + @as(f32, @floatFromInt(trailing_info.detail_hint)) / 255.0 * 0.12) * carry_attenuation;
-    const tilt = 0.7 + @as(f32, @floatFromInt(trailing_info.envelope_hint & 0x0f)) / 15.0 * 0.8;
-    const stereo_skew = @as(f32, @floatFromInt(trailing_info.stereo_hint)) / 255.0 * 0.16 * carry_attenuation;
-    const phase_offset = trailing_info.phase_hint & 0x03;
-    const payload_phase = if ((trailing_info.payload_hash & 1) == 0) @as(f32, 1.0) else @as(f32, -1.0);
-    for (0..channels) |channel_index| {
-        for (0..frame_count) |frame_index| {
-            const idx = frame_index * channels + channel_index;
-            const current = reference[idx];
-            const previous = if (frame_index > 0)
-                reference[(frame_index - 1) * channels + channel_index]
-            else
-                current;
-            const next = if (frame_index + 1 < frame_count)
-                reference[(frame_index + 1) * channels + channel_index]
-            else
-                current;
-            const curvature = next - (2.0 * current) + previous;
-            const derivative = next - previous;
-            const normalized_position = if (frame_count > 1)
-                @as(f32, @floatFromInt(frame_index)) / @as(f32, @floatFromInt(frame_count - 1))
-            else
-                0;
-            const phase: f32 = if ((frame_index & 1) == 0) payload_phase else -payload_phase;
-            const ripple_phase: f32 = switch ((frame_index + phase_offset) & 0x03) {
-                0 => 1.0,
-                1 => 0.35,
-                2 => -0.8,
-                else => -0.2,
-            };
-            const frame_tilt = 1.0 + (normalized_position - 0.5) * tilt;
-            const channel_tilt = if (channels == 2 and channel_index == 1) 1.0 + stereo_skew else 1.0 - stereo_skew;
-            upsampled[idx] = current +
-                curvature * payload_strength * phase * frame_tilt * channel_tilt +
-                curvature * detail_mix * ripple_phase * channel_tilt +
-                derivative * noise_strength * -phase +
-                current * harmonic_mix * 0.08 * frame_tilt;
-        }
-    }
-    return upsampled;
-}
-
-fn psWideningFactor(trailing_info: TrailingElementInfo) f32 {
-    return 1.02 + @as(f32, @floatFromInt(psStereoHint(trailing_info))) / 255.0 * 0.45;
-}
-
-fn shouldApplyExplicitHeSbr(config: AudioSpecificConfig, trailing_info: TrailingElementInfo) bool {
-    return isExplicitHeObjectType(config.object_type) and trailing_info.explicit_payload_active;
-}
-
-fn shouldApplyExplicitHePs(config: AudioSpecificConfig, trailing_info: TrailingElementInfo) bool {
-    return shouldApplyExplicitHeSbr(config, trailing_info) and
-        config.ps_present and
-        trailing_info.explicit_ps_payload_active;
-}
-
-fn shouldApplySyncExtensionSbr(config: AudioSpecificConfig, trailing_info: TrailingElementInfo) bool {
-    return (config.sbr_present or config.ps_present) and trailing_info.saw_sbr_payload;
-}
-
-fn shouldApplySyncExtensionPs(config: AudioSpecificConfig, trailing_info: TrailingElementInfo) bool {
-    return config.ps_present and trailing_info.saw_ps_payload;
-}
-
-fn psPayloadMaxLen(trailing_info: TrailingElementInfo) u16 {
-    return if (trailing_info.saw_ps_payload) trailing_info.ps_max_payload_len else trailing_info.max_payload_len;
-}
-
-fn psPayloadHash(trailing_info: TrailingElementInfo) u32 {
-    return if (trailing_info.saw_ps_payload) trailing_info.ps_payload_hash else trailing_info.payload_hash;
-}
-
-fn psNoiseHint(trailing_info: TrailingElementInfo) u8 {
-    return if (trailing_info.saw_ps_payload) trailing_info.ps_noise_hint else trailing_info.noise_hint;
-}
-
-fn psStereoHint(trailing_info: TrailingElementInfo) u8 {
-    return if (trailing_info.saw_ps_payload) trailing_info.ps_stereo_hint else trailing_info.stereo_hint;
-}
-
-fn psHarmonicHint(trailing_info: TrailingElementInfo) u8 {
-    return if (trailing_info.saw_ps_payload) trailing_info.ps_harmonic_hint else trailing_info.harmonic_hint;
-}
-
-fn psDetailHint(trailing_info: TrailingElementInfo) u8 {
-    return if (trailing_info.saw_ps_payload) trailing_info.ps_detail_hint else trailing_info.detail_hint;
-}
-
-fn psPhaseHint(trailing_info: TrailingElementInfo) u8 {
-    return if (trailing_info.saw_ps_payload) trailing_info.ps_phase_hint else trailing_info.phase_hint;
-}
-
-fn psCarryAttenuation(trailing_info: TrailingElementInfo) f32 {
-    return switch (trailing_info.ps_carry_generations) {
-        0 => 1.0,
-        1 => 0.72,
-        2 => 0.5,
-        else => 0.35,
-    };
-}
-
-fn applyParametricStereoWideningInterleavedInPlace(samples: []f32, trailing_info: TrailingElementInfo) !void {
-    if (samples.len % 2 != 0) return error.UnsupportedAudioFormat;
-    const frame_count = samples.len / 2;
-    var previous_mid: f32 = if (frame_count > 0) 0.5 * (samples[0] + samples[1]) else 0;
-    const carry_attenuation = psCarryAttenuation(trailing_info);
-    const decorrelation_scale = 0.16 +
-        @as(f32, @floatFromInt(psPayloadMaxLen(trailing_info))) * 0.008 +
-        @as(f32, @floatFromInt(psNoiseHint(trailing_info))) / 255.0 * 0.14 +
-        @as(f32, @floatFromInt(psDetailHint(trailing_info))) / 255.0 * 0.05;
-    const width = psWideningFactor(trailing_info);
-    const stereo_bias = ((@as(f32, @floatFromInt(psStereoHint(trailing_info) & 0x0f)) / 15.0 - 0.5) * 0.2) +
-        ((@as(f32, @floatFromInt(psPhaseHint(trailing_info) & 0x0f)) / 15.0 - 0.5) * 0.08);
-    const harmonic_mix = 0.02 +
-        @as(f32, @floatFromInt(psHarmonicHint(trailing_info))) / 255.0 * 0.06 +
-        @as(f32, @floatFromInt(psDetailHint(trailing_info))) / 255.0 * 0.03;
-    const payload_phase = if ((psPayloadHash(trailing_info) & 1) == 0) @as(f32, 1.0) else @as(f32, -1.0);
-
-    for (0..frame_count) |frame_index| {
-        const left = samples[frame_index * 2];
-        const right = samples[frame_index * 2 + 1];
-        const mid = 0.5 * (left + right);
-        const side = 0.5 * (left - right);
-        const phase: f32 = if ((frame_index & 1) == 0) payload_phase * decorrelation_scale else -payload_phase * decorrelation_scale;
-        const decorrelated = (mid - previous_mid) * phase * carry_attenuation;
-        const widened_side = (side * width + decorrelated + mid * harmonic_mix * carry_attenuation) * carry_attenuation;
-        samples[frame_index * 2] = mid + widened_side * (1.0 + stereo_bias * carry_attenuation);
-        samples[frame_index * 2 + 1] = mid - widened_side * (1.0 - stereo_bias * carry_attenuation);
-        previous_mid = mid;
-    }
-}
-
-fn synthesizeParametricStereoFromMonoAlloc(
-    allocator: std.mem.Allocator,
-    mono_samples: []const f32,
-    trailing_info: TrailingElementInfo,
-) ![]f32 {
-    const stereo = try allocator.alloc(f32, mono_samples.len * 2);
-    errdefer allocator.free(stereo);
-    const carry_attenuation = psCarryAttenuation(trailing_info);
-    const decorrelation_scale = 0.16 +
-        @as(f32, @floatFromInt(psPayloadMaxLen(trailing_info))) * 0.008 +
-        @as(f32, @floatFromInt(psNoiseHint(trailing_info))) / 255.0 * 0.14 +
-        @as(f32, @floatFromInt(psDetailHint(trailing_info))) / 255.0 * 0.05;
-    const width = psWideningFactor(trailing_info);
-    const stereo_bias = ((@as(f32, @floatFromInt(psStereoHint(trailing_info) & 0x0f)) / 15.0 - 0.5) * 0.2) +
-        ((@as(f32, @floatFromInt(psPhaseHint(trailing_info) & 0x0f)) / 15.0 - 0.5) * 0.08);
-    const harmonic_mix = 0.02 +
-        @as(f32, @floatFromInt(psHarmonicHint(trailing_info))) / 255.0 * 0.06 +
-        @as(f32, @floatFromInt(psDetailHint(trailing_info))) / 255.0 * 0.03;
-    const payload_phase = if ((psPayloadHash(trailing_info) & 1) == 0) @as(f32, 1.0) else @as(f32, -1.0);
-
-    for (mono_samples, 0..) |mid, frame_index| {
-        const previous = if (frame_index > 0) mono_samples[frame_index - 1] else mid;
-        const next = if (frame_index + 1 < mono_samples.len) mono_samples[frame_index + 1] else mid;
-        const phase: f32 = if ((frame_index & 1) == 0) payload_phase * decorrelation_scale else -payload_phase * decorrelation_scale;
-        const decorrelated = ((next - previous) * phase + mid * harmonic_mix) * carry_attenuation;
-        stereo[frame_index * 2] = mid + decorrelated * width * (1.0 + stereo_bias * carry_attenuation);
-        stereo[frame_index * 2 + 1] = mid - decorrelated * width * (1.0 - stereo_bias * carry_attenuation);
-    }
-
-    return stereo;
-}
-
-fn applyExplicitHeStereoPostprocessAlloc(
-    allocator: std.mem.Allocator,
-    config: AudioSpecificConfig,
-    trailing_infos: []const TrailingElementInfo,
-    sequence: ChannelPairPcmSequence,
-) !ChannelPairPcmSequence {
-    if (sequence.frame_count == 0) return error.UnsupportedAudioFormat;
-    if (trailing_infos.len != sequence.frame_count) return error.UnsupportedAudioFormat;
-    const frame_stride = sequence.samples.len / sequence.frame_count;
-    if (frame_stride * sequence.frame_count != sequence.samples.len) return error.UnsupportedAudioFormat;
-    if (frame_stride % 2 != 0) return error.UnsupportedAudioFormat;
-
-    var needs_processing = false;
-    for (trailing_infos) |trailing_info| {
-        const should_enhance = shouldApplyExplicitHeSbr(config, trailing_info) or
-            shouldApplySyncExtensionSbr(config, trailing_info);
-        if (should_enhance) {
-            needs_processing = true;
-            break;
-        }
-    }
-    if (!needs_processing) return sequence;
-
-    const target_rate = config.extension_sample_rate orelse return error.UnsupportedAudioFormat;
-
-    if (target_rate == sequence.sample_rate) {
-        var frame_index: usize = 0;
-        while (frame_index < sequence.frame_count) : (frame_index += 1) {
-            const trailing_info = trailing_infos[frame_index];
-            const should_enhance = shouldApplyExplicitHeSbr(config, trailing_info) or
-                shouldApplySyncExtensionSbr(config, trailing_info);
-            if (!should_enhance) continue;
-            if (shouldApplyExplicitHePs(config, trailing_info) or shouldApplySyncExtensionPs(config, trailing_info)) {
-                const block = sequence.samples[frame_index * frame_stride ..][0..frame_stride];
-                try applyParametricStereoWideningInterleavedInPlace(block, trailing_info);
-            }
-        }
-        return sequence;
-    }
-    if (target_rate != sequence.sample_rate * 2) return error.UnsupportedAudioFormat;
-
-    const upsampled = try allocator.alloc(f32, sequence.samples.len * 2);
-    errdefer allocator.free(upsampled);
-    const output_frame_stride = frame_stride * 2;
-    var frame_index: usize = 0;
-    while (frame_index < sequence.frame_count) : (frame_index += 1) {
-        const trailing_info = trailing_infos[frame_index];
-        const should_enhance = shouldApplyExplicitHeSbr(config, trailing_info) or
-            shouldApplySyncExtensionSbr(config, trailing_info);
-        const in_block = sequence.samples[frame_index * frame_stride ..][0..frame_stride];
-        const out_block = upsampled[frame_index * output_frame_stride ..][0..output_frame_stride];
-
-        if (!should_enhance) {
-            const linear = try upsampleLinearInterleavedAlloc(allocator, in_block, 2);
-            defer allocator.free(linear);
-            @memcpy(out_block, linear);
-            continue;
-        }
-
-        const enhanced = try upsampleAndEnhanceSbrInterleavedAlloc(allocator, in_block, 2, trailing_info);
-        defer allocator.free(enhanced);
-        @memcpy(out_block, enhanced);
-        if (shouldApplyExplicitHePs(config, trailing_info) or shouldApplySyncExtensionPs(config, trailing_info)) {
-            try applyParametricStereoWideningInterleavedInPlace(out_block, trailing_info);
-        }
-    }
-
-    sequence.allocator.free(sequence.samples);
-    return .{
-        .samples = upsampled,
-        .sample_rate = target_rate,
-        .frame_count = sequence.frame_count,
-        .allocator = allocator,
-    };
-}
-
-fn applyExplicitHeMonoPostprocessAlloc(
-    allocator: std.mem.Allocator,
-    config: AudioSpecificConfig,
-    trailing_infos: []const TrailingElementInfo,
-    sequence: FirstChannelPcmSequence,
-) !FirstChannelPcmSequence {
-    if (sequence.frame_count == 0) return error.UnsupportedAudioFormat;
-    if (trailing_infos.len != sequence.frame_count) return error.UnsupportedAudioFormat;
-    const frame_stride = sequence.samples.len / sequence.frame_count;
-    if (frame_stride * sequence.frame_count != sequence.samples.len) return error.UnsupportedAudioFormat;
-
-    var needs_processing = false;
-    for (trailing_infos) |trailing_info| {
-        const should_enhance = shouldApplyExplicitHeSbr(config, trailing_info) or
-            shouldApplySyncExtensionSbr(config, trailing_info);
-        if (should_enhance) {
-            needs_processing = true;
-            break;
-        }
-    }
-    if (!needs_processing) return sequence;
-
-    const target_rate = config.extension_sample_rate orelse return error.UnsupportedAudioFormat;
-
-    if (target_rate == sequence.sample_rate) return sequence;
-    if (target_rate != sequence.sample_rate * 2) return error.UnsupportedAudioFormat;
-
-    const upsampled = try allocator.alloc(f32, sequence.samples.len * 2);
-    errdefer allocator.free(upsampled);
-    const output_frame_stride = frame_stride * 2;
-    var frame_index: usize = 0;
-    while (frame_index < sequence.frame_count) : (frame_index += 1) {
-        const trailing_info = trailing_infos[frame_index];
-        const should_enhance = shouldApplyExplicitHeSbr(config, trailing_info) or
-            shouldApplySyncExtensionSbr(config, trailing_info);
-        const in_block = sequence.samples[frame_index * frame_stride ..][0..frame_stride];
-        const out_block = upsampled[frame_index * output_frame_stride ..][0..output_frame_stride];
-
-        if (!should_enhance) {
-            const linear = try upsampleLinearInterleavedAlloc(allocator, in_block, 1);
-            defer allocator.free(linear);
-            @memcpy(out_block, linear);
-            continue;
-        }
-
-        const enhanced = try upsampleAndEnhanceSbrInterleavedAlloc(allocator, in_block, 1, trailing_info);
-        defer allocator.free(enhanced);
-        @memcpy(out_block, enhanced);
-    }
-
-    sequence.allocator.free(sequence.samples);
-    return .{
-        .samples = upsampled,
-        .sample_rate = target_rate,
-        .frame_count = sequence.frame_count,
-        .allocator = allocator,
-    };
-}
-
-fn applyExplicitHePsMonoCoreStereoPostprocessAlloc(
-    allocator: std.mem.Allocator,
-    config: AudioSpecificConfig,
-    trailing_infos: []const TrailingElementInfo,
-    sequence: FirstChannelPcmSequence,
-) !ChannelPairPcmSequence {
-    if (sequence.frame_count == 0) return error.UnsupportedAudioFormat;
-    if (trailing_infos.len != sequence.frame_count) return error.UnsupportedAudioFormat;
-    if (!config.ps_present) return error.UnsupportedAudioFormat;
-
-    const target_rate = config.extension_sample_rate orelse return error.UnsupportedAudioFormat;
-    const frame_stride = sequence.samples.len / sequence.frame_count;
-    if (frame_stride * sequence.frame_count != sequence.samples.len) return error.UnsupportedAudioFormat;
-
-    var needs_processing = false;
-    for (trailing_infos) |trailing_info| {
-        const should_enhance = shouldApplyExplicitHePs(config, trailing_info) or
-            shouldApplySyncExtensionPs(config, trailing_info);
-        if (should_enhance) {
-            needs_processing = true;
-            break;
-        }
-    }
-    if (!needs_processing) return error.UnsupportedAudioFormat;
-
-    const output_rate_same = target_rate == sequence.sample_rate;
-    if (!output_rate_same and target_rate != sequence.sample_rate * 2) return error.UnsupportedAudioFormat;
-
-    const stereo_frame_stride = frame_stride * 2 * (if (output_rate_same) @as(usize, 1) else 2);
-    const stereo = try allocator.alloc(f32, stereo_frame_stride * sequence.frame_count);
-    errdefer allocator.free(stereo);
-
-    var frame_index: usize = 0;
-    while (frame_index < sequence.frame_count) : (frame_index += 1) {
-        const trailing_info = trailing_infos[frame_index];
-        const should_ps = shouldApplyExplicitHePs(config, trailing_info) or
-            shouldApplySyncExtensionPs(config, trailing_info);
-        const should_sbr = shouldApplyExplicitHeSbr(config, trailing_info) or
-            shouldApplySyncExtensionSbr(config, trailing_info);
-
-        const in_block = sequence.samples[frame_index * frame_stride ..][0..frame_stride];
-        const mono_block = if (output_rate_same)
-            try allocator.dupe(f32, in_block)
-        else if (should_sbr)
-            try upsampleAndEnhanceSbrInterleavedAlloc(allocator, in_block, 1, trailing_info)
-        else
-            try upsampleLinearInterleavedAlloc(allocator, in_block, 1);
-        defer allocator.free(mono_block);
-
-        const out_block = stereo[frame_index * stereo_frame_stride ..][0..stereo_frame_stride];
-        if (!should_ps) {
-            for (mono_block, 0..) |sample, sample_index| {
-                out_block[sample_index * 2] = sample;
-                out_block[sample_index * 2 + 1] = sample;
-            }
-            continue;
-        }
-
-        const stereo_block = try synthesizeParametricStereoFromMonoAlloc(allocator, mono_block, trailing_info);
-        defer allocator.free(stereo_block);
-        @memcpy(out_block, stereo_block);
-    }
-
-    sequence.allocator.free(sequence.samples);
-    return .{
-        .samples = stereo,
-        .sample_rate = target_rate,
-        .frame_count = sequence.frame_count,
-        .allocator = allocator,
-    };
+    const index = try sampleRateIndexForRate(config.sample_rate);
+    const bits = (@as(u16, frames[0].header.object_type) << 11) | (@as(u16, @intCast(index)) << 7) | (@as(u16, channels) << 3);
+    var asc: [2]u8 = undefined;
+    std.mem.writeInt(u16, &asc, bits, .big);
+    return .{ .decode = config, .channels = channels, .asc = asc };
 }
 
 pub fn decodeInterleavedStereoAdtsAlloc(
@@ -3786,10 +3413,14 @@ pub fn decodeInterleavedStereoAdtsAlloc(
     const frames = try scanAdtsFramesAlloc(allocator, bytes);
     defer allocator.free(frames);
 
-    const decode_config = try adtsDecodeConfig(allocator, frames, 2);
+    const input = try adtsCoreInput(allocator, frames);
+    const decode_config = input.decode;
     var access_units = try collectAdtsAccessUnitsAlloc(allocator, frames, decode_config.sample_rate);
     defer access_units.deinit();
     if (access_units.units.items.len == 0) return error.UnsupportedAudioFormat;
+    const config = try parseAudioSpecificConfig(&input.asc);
+    if (try needsNativeEnhancement(allocator, config, access_units.units.items)) return nativeEnhancementSequence(ChannelPairPcmSequence, allocator, &input.asc, access_units.units.items, 2, null);
+    if (input.channels != 2) return error.UnsupportedAudioFormat;
     return decodeChannelPairPcmSequenceWithExpectedLayoutAlloc(allocator, decode_config.sample_rate, access_units.units.items, decode_config.expected_layout);
 }
 
@@ -3800,15 +3431,95 @@ pub fn decodeInterleavedMonoAdtsAlloc(
     const frames = try scanAdtsFramesAlloc(allocator, bytes);
     defer allocator.free(frames);
 
-    const decode_config = try adtsDecodeConfig(allocator, frames, 1);
+    const input = try adtsCoreInput(allocator, frames);
+    const decode_config = input.decode;
     var access_units = try collectAdtsAccessUnitsAlloc(allocator, frames, decode_config.sample_rate);
     defer access_units.deinit();
     if (access_units.units.items.len == 0) return error.UnsupportedAudioFormat;
+    const config = try parseAudioSpecificConfig(&input.asc);
+    if (try needsNativeEnhancement(allocator, config, access_units.units.items)) return nativeEnhancementSequence(FirstChannelPcmSequence, allocator, &input.asc, access_units.units.items, 1, null);
+    if (input.channels != 1) return error.UnsupportedAudioFormat;
     return decodeFirstChannelPcmSequenceWithExpectedLayoutAlloc(allocator, decode_config.sample_rate, access_units.units.items, decode_config.expected_layout);
 }
 
-fn configNeedsEnhancementTrailingInfos(config: AudioSpecificConfig) bool {
-    return isExplicitHeObjectType(config.object_type) or config.sbr_present or config.ps_present;
+/// LC/Main core blocks use the same filterbank and prediction history as batch
+/// decoding. SBR/PS profiles use a bounded native enhancement owner.
+pub fn visitAdts(allocator: std.mem.Allocator, bytes: []const u8, sink: @import("pcm_sink.zig").Sink) !void {
+    const frames = try scanAdtsFramesAlloc(allocator, bytes);
+    defer allocator.free(frames);
+    if (frames.len == 0) return error.UnsupportedAudioFormat;
+    const input = try adtsCoreInput(allocator, frames);
+    const channels = input.channels;
+    const config = input.decode;
+    var units = try collectAdtsAccessUnitsAlloc(allocator, frames, config.sample_rate);
+    defer units.deinit();
+    const asc = try parseAudioSpecificConfig(&input.asc);
+    if (try needsNativeEnhancement(allocator, asc, units.units.items)) {
+        try @import("aacplus/mod.zig").visit(allocator, &input.asc, units.units.items, 0, sink);
+        return;
+    }
+    if (channels == 1) {
+        var decoded = try decodeFirstChannelPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfosTo(allocator, config.sample_rate, units.units.items, config.expected_layout, FrameShape.default(), false, sink);
+        defer decoded.sequence.deinit();
+    } else {
+        var decoded = try decodeChannelPairPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfosTo(allocator, config.sample_rate, units.units.items, config.expected_layout, FrameShape.default(), false, sink);
+        defer decoded.sequence.deinit();
+    }
+}
+pub fn visitAccessUnits(allocator: std.mem.Allocator, config_bytes: []const u8, units: []const []const u8, sink: @import("pcm_sink.zig").Sink) !void {
+    const config = try parseAudioSpecificConfig(config_bytes);
+    if (try needsNativeEnhancement(allocator, config, units)) {
+        if (config.frame_length_960 or config.depends_on_core_coder) return error.UnsupportedAudioFormat;
+        try @import("aacplus/mod.zig").visit(allocator, config_bytes, units, 0, sink);
+        return;
+    }
+    const channels = config.explicit_channel_count orelse config.channel_config;
+    const shape = FrameShape.forFrameLength960(config.frame_length_960);
+    var filtered = try collectChannelAccessUnitsAlloc(allocator, config.sample_rate, config.explicit_layout, units);
+    defer filtered.deinit();
+    if (channels == 1) {
+        var decoded = try decodeFirstChannelPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfosTo(allocator, config.sample_rate, filtered.units.items, config.explicit_layout, shape, false, sink);
+        defer decoded.sequence.deinit();
+    } else if (channels == 2) {
+        var decoded = try decodeChannelPairPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfosTo(allocator, config.sample_rate, filtered.units.items, config.explicit_layout, shape, false, sink);
+        defer decoded.sequence.deinit();
+    } else return error.UnsupportedAudioFormat;
+}
+
+fn needsNativeEnhancement(a: std.mem.Allocator, config: AudioSpecificConfig, units: []const []const u8) !bool {
+    if (isExplicitHeObjectType(config.object_type) or config.ps_present) return true;
+    // A sync-extension declaration without enhancement payload is a compatible
+    // AAC-LC core. Do not invent high-frequency energy from that signal alone.
+    if (configBaseObjectType(config) != 2 or config.frame_length_960) return false;
+    for (units) |unit| {
+        const info = scanAccessUnitTrailingInfoAlloc(a, config.sample_rate, unit) catch |err| {
+            // Preserve the existing core lane's declared tools when its
+            // optional trailing-element inspector cannot traverse that shape.
+            if (!config.sbr_present and err == error.UnsupportedAudioFormat) return false;
+            return err;
+        };
+        if (info.saw_sbr_payload) return true;
+    }
+    return false;
+}
+fn nativeEnhancementSequence(comptime Result: type, a: std.mem.Allocator, config: []const u8, units: []const []const u8, channels: u8, expected_rate: ?u32) !Result {
+    const Capture = struct {
+        a: std.mem.Allocator,
+        samples: std.ArrayList(f32) = .empty,
+        rate: u32 = 0,
+        channels: u8,
+        fn write(raw: *anyopaque, pcm: []const f32, rate: u32, count: u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (count != self.channels or (self.rate != 0 and self.rate != rate)) return error.UnsupportedAudioFormat;
+            self.rate = rate;
+            try self.samples.appendSlice(self.a, pcm);
+        }
+    };
+    var capture = Capture{ .a = a, .channels = channels };
+    defer capture.samples.deinit(a);
+    try @import("aacplus/mod.zig").visit(a, config, units, 0, .{ .context = &capture, .write = Capture.write });
+    if (expected_rate) |rate| if (capture.rate != rate) return error.UnsupportedAudioFormat;
+    return .{ .samples = try capture.samples.toOwnedSlice(a), .sample_rate = capture.rate, .frame_count = units.len, .allocator = a };
 }
 
 pub fn decodeInterleavedStereoAccessUnitsAlloc(
@@ -3821,6 +3532,11 @@ pub fn decodeInterleavedStereoAccessUnitsAlloc(
     const config_started = perfNowNs();
     const config = try parseAudioSpecificConfig(decoder_config);
     perfAccumulate(.config_parse_ns, config_started);
+    if (try needsNativeEnhancement(allocator, config, access_units)) {
+        if (config.frame_length_960 or config.depends_on_core_coder) return error.UnsupportedAudioFormat;
+        return nativeEnhancementSequence(ChannelPairPcmSequence, allocator, decoder_config, access_units, 2, sample_rate);
+    }
+
     const core_sample_rate = config.sample_rate;
     const shape = FrameShape.forFrameLength960(config.frame_length_960);
     const collect_started = perfNowNs();
@@ -3829,56 +3545,10 @@ pub fn decodeInterleavedStereoAccessUnitsAlloc(
     defer filtered_access_units.deinit();
     if (filtered_access_units.units.items.len == 0) return error.UnsupportedAudioFormat;
     perf_counters.access_unit_count += filtered_access_units.units.items.len;
-    if (isSupportedPsMonoCoreStereoConfig(config, sample_rate, channels)) {
-        const sequence_started = perfNowNs();
-        var sequence_decode = try decodeFirstChannelPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfos(
-            allocator,
-            core_sample_rate,
-            filtered_access_units.units.items,
-            config.explicit_layout,
-            shape,
-            true,
-        );
-        perfAccumulate(.filterbank_sequence_ns, sequence_started);
-        var sequence_owned = true;
-        errdefer if (sequence_owned) sequence_decode.sequence.deinit();
-        defer allocator.free(sequence_decode.trailing_infos);
-
-        const enhancement_started = perfNowNs();
-        const trailing_infos = try resolveEnhancementTrailingInfosAlloc(allocator, config, sequence_decode.trailing_infos);
-        perfAccumulate(.enhancement_info_ns, enhancement_started);
-        defer allocator.free(trailing_infos);
-        const postprocess_started = perfNowNs();
-        const out = try applyExplicitHePsMonoCoreStereoPostprocessAlloc(allocator, config, trailing_infos, sequence_decode.sequence);
-        sequence_owned = false;
-        perfAccumulate(.postprocess_ns, postprocess_started);
-        return out;
-    }
     if (!isSupportedMainOrLcConfig(config, sample_rate, channels, 2)) return error.UnsupportedAudioFormat;
     const sequence_started = perfNowNs();
-    var sequence_decode = try decodeChannelPairPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfos(
-        allocator,
-        core_sample_rate,
-        filtered_access_units.units.items,
-        config.explicit_layout,
-        shape,
-        configNeedsEnhancementTrailingInfos(config),
-    );
-    perfAccumulate(.filterbank_sequence_ns, sequence_started);
-    if (!configNeedsEnhancementTrailingInfos(config)) return sequence_decode.sequence;
-    var sequence_owned = true;
-    errdefer if (sequence_owned) sequence_decode.sequence.deinit();
-    defer allocator.free(sequence_decode.trailing_infos);
-
-    const enhancement_started = perfNowNs();
-    const trailing_infos = try resolveEnhancementTrailingInfosAlloc(allocator, config, sequence_decode.trailing_infos);
-    perfAccumulate(.enhancement_info_ns, enhancement_started);
-    defer allocator.free(trailing_infos);
-    const postprocess_started = perfNowNs();
-    const out = try applyExplicitHeStereoPostprocessAlloc(allocator, config, trailing_infos, sequence_decode.sequence);
-    sequence_owned = false;
-    perfAccumulate(.postprocess_ns, postprocess_started);
-    return out;
+    defer perfAccumulate(.filterbank_sequence_ns, sequence_started);
+    return decodeChannelPairPcmSequenceWithExpectedLayoutAllocAndShape(allocator, core_sample_rate, filtered_access_units.units.items, config.explicit_layout, shape);
 }
 
 pub fn decodeInterleavedMonoAccessUnitsAlloc(
@@ -3891,6 +3561,12 @@ pub fn decodeInterleavedMonoAccessUnitsAlloc(
     const config_started = perfNowNs();
     const config = try parseAudioSpecificConfig(decoder_config);
     perfAccumulate(.config_parse_ns, config_started);
+    if (try needsNativeEnhancement(allocator, config, access_units)) {
+        if ((config.explicit_channel_count orelse config.channel_config) != 1 or config.ps_present) return error.UnsupportedAudioFormat;
+        if (config.frame_length_960 or config.depends_on_core_coder) return error.UnsupportedAudioFormat;
+        return nativeEnhancementSequence(FirstChannelPcmSequence, allocator, decoder_config, access_units, 1, sample_rate);
+    }
+
     const core_sample_rate = config.sample_rate;
     if (!isSupportedMainOrLcConfig(config, sample_rate, channels, 1)) return error.UnsupportedAudioFormat;
     const shape = FrameShape.forFrameLength960(config.frame_length_960);
@@ -3901,43 +3577,8 @@ pub fn decodeInterleavedMonoAccessUnitsAlloc(
     if (filtered_access_units.units.items.len == 0) return error.UnsupportedAudioFormat;
     perf_counters.access_unit_count += filtered_access_units.units.items.len;
     const sequence_started = perfNowNs();
-    var sequence_decode = try decodeFirstChannelPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfos(
-        allocator,
-        core_sample_rate,
-        filtered_access_units.units.items,
-        config.explicit_layout,
-        shape,
-        configNeedsEnhancementTrailingInfos(config),
-    );
-    perfAccumulate(.filterbank_sequence_ns, sequence_started);
-    if (!configNeedsEnhancementTrailingInfos(config)) return sequence_decode.sequence;
-    var sequence_owned = true;
-    errdefer if (sequence_owned) sequence_decode.sequence.deinit();
-    defer allocator.free(sequence_decode.trailing_infos);
-
-    const enhancement_started = perfNowNs();
-    const trailing_infos = try resolveEnhancementTrailingInfosAlloc(allocator, config, sequence_decode.trailing_infos);
-    perfAccumulate(.enhancement_info_ns, enhancement_started);
-    defer allocator.free(trailing_infos);
-    const postprocess_started = perfNowNs();
-    const out = try applyExplicitHeMonoPostprocessAlloc(allocator, config, trailing_infos, sequence_decode.sequence);
-    sequence_owned = false;
-    perfAccumulate(.postprocess_ns, postprocess_started);
-    return out;
-}
-
-fn isSupportedPsMonoCoreStereoConfig(config: AudioSpecificConfig, sample_rate: u32, channels: u16) bool {
-    const config_channels = config.explicit_channel_count orelse config.channel_config;
-    const base_object_type = configBaseObjectType(config);
-    const declared_output_rate = config.extension_sample_rate orelse configDeclaredOutputSampleRate(config);
-    return (base_object_type == 1 or base_object_type == 2) and
-        config.ps_present and
-        config.extension_sample_rate != null and
-        config_channels == 1 and
-        (if (config.explicit_layout) |layout| layout.matchesSupportedOutput(1) else true) and
-        !config.depends_on_core_coder and
-        channels == 2 and
-        declared_output_rate == sample_rate;
+    defer perfAccumulate(.filterbank_sequence_ns, sequence_started);
+    return decodeFirstChannelPcmSequenceWithExpectedLayoutAllocAndShape(allocator, core_sample_rate, filtered_access_units.units.items, config.explicit_layout, shape);
 }
 
 fn isSupportedMainOrLcConfig(config: AudioSpecificConfig, sample_rate: u32, channels: u16, expected_channels: u8) bool {
@@ -3961,8 +3602,8 @@ fn supportsDecodableMainLcCoreConfig(config: AudioSpecificConfig) bool {
 
     // Some real low-bitrate MP4/M4A files carry an AAC-LC core with an SBR sync
     // extension while the packetized core remains directly decodable at the
-    // container sample rate. Accept only that narrow shape here; actual HE-AAC
-    // reconstruction is still outside this decoder.
+    // container sample rate. This lane preserves the unenhanced core; real
+    // enhancement payloads are routed to the maintained AAC+ decoder first.
     return config.object_type == 2 and config.extension_object_type == 5;
 }
 
@@ -4466,108 +4107,10 @@ fn accessUnitsTrailingInfosAlloc(
     const infos = try allocator.alloc(TrailingElementInfo, access_units.len);
     errdefer allocator.free(infos);
     for (access_units, 0..) |unit, index| {
+        try @import("work_control.zig").check();
         infos[index] = try scanAccessUnitTrailingInfoAlloc(allocator, sample_rate, unit);
     }
     return infos;
-}
-
-fn resolveEnhancementTrailingInfosAlloc(
-    allocator: std.mem.Allocator,
-    config: AudioSpecificConfig,
-    trailing_infos: []const TrailingElementInfo,
-) ![]TrailingElementInfo {
-    const resolved = try allocator.dupe(TrailingElementInfo, trailing_infos);
-    errdefer allocator.free(resolved);
-
-    if (!(config.sbr_present or config.ps_present)) return resolved;
-
-    const explicit_he = isExplicitHeObjectType(config.object_type);
-    var explicit_sbr_payload_seen = !explicit_he;
-    var explicit_ps_payload_seen = !explicit_he or !config.ps_present;
-    if (explicit_he) {
-        for (trailing_infos) |info| {
-            if (info.saw_sbr_payload) {
-                explicit_sbr_payload_seen = true;
-                break;
-            }
-        }
-        explicit_sbr_payload_seen = !explicit_sbr_payload_seen;
-        if (config.ps_present) {
-            for (trailing_infos) |info| {
-                if (info.saw_ps_payload) {
-                    explicit_ps_payload_seen = true;
-                    break;
-                }
-            }
-            explicit_ps_payload_seen = !explicit_ps_payload_seen;
-        }
-    }
-
-    var carried_sbr: ?TrailingElementInfo = null;
-    var carried_ps: ?TrailingElementInfo = null;
-    for (resolved) |*info| {
-        // Whether this access unit brought a parametric stereo payload of its
-        // own, before any carry below copies one into it.
-        const brought_own_ps_payload = info.saw_ps_payload;
-        if (!info.saw_sbr_payload) {
-            if (carried_sbr) |previous| {
-                info.* = previous;
-                info.sbr_carry_generations = previous.sbr_carry_generations +| 1;
-                if (info.saw_ps_payload) info.ps_carry_generations = previous.ps_carry_generations +| 1;
-            }
-        } else if (!info.saw_plain_sbr_payload) {
-            if (carried_sbr) |previous| {
-                info.max_payload_len = previous.max_payload_len;
-                info.payload_hash = previous.payload_hash;
-                info.envelope_hint = previous.envelope_hint;
-                info.noise_hint = previous.noise_hint;
-                info.stereo_hint = previous.stereo_hint;
-                info.harmonic_hint = previous.harmonic_hint;
-                info.detail_hint = previous.detail_hint;
-                info.phase_hint = previous.phase_hint;
-                info.sbr_carry_generations = previous.sbr_carry_generations +| 1;
-            } else {
-                info.sbr_carry_generations = 0;
-            }
-        } else {
-            if (carried_sbr) |previous| carryMissingSbrSubfields(info, previous);
-            info.sbr_carry_generations = 0;
-        }
-        if (config.ps_present and !info.saw_ps_payload and info.saw_sbr_payload) {
-            if (carried_ps) |previous_ps| {
-                info.saw_ps_payload = true;
-                info.ps_carry_generations = previous_ps.ps_carry_generations +| 1;
-                info.ps_max_payload_len = previous_ps.ps_max_payload_len;
-                info.ps_payload_hash = previous_ps.ps_payload_hash;
-                info.ps_noise_hint = previous_ps.ps_noise_hint;
-                info.ps_stereo_hint = previous_ps.ps_stereo_hint;
-                info.ps_harmonic_hint = previous_ps.ps_harmonic_hint;
-                info.ps_detail_hint = previous_ps.ps_detail_hint;
-                info.ps_phase_hint = previous_ps.ps_phase_hint;
-            }
-        } else if (brought_own_ps_payload) {
-            // Only a payload this access unit carried itself restarts the
-            // generation count; one inherited from an earlier unit has to keep
-            // ageing, or the carry never decays.
-            if (carried_ps) |previous_ps| carryMissingPsSubfields(info, previous_ps);
-            info.ps_carry_generations = 0;
-        }
-        if (explicit_he) {
-            if (info.saw_sbr_payload) explicit_sbr_payload_seen = true;
-            info.explicit_payload_active = explicit_sbr_payload_seen;
-            if (config.ps_present) {
-                if (info.saw_ps_payload) explicit_ps_payload_seen = true;
-                info.explicit_ps_payload_active = explicit_ps_payload_seen;
-            }
-        }
-        if (info.saw_ps_payload) {
-            carried_ps = info.*;
-        }
-        if (info.saw_sbr_payload) {
-            carried_sbr = info.*;
-        }
-    }
-    return resolved;
 }
 
 fn copyBitRangeAlloc(
@@ -10491,7 +10034,7 @@ test "aac real low-bitrate m4a fixture lc core decodes at the packet layer" {
     try std.testing.expect(decoded.samples.len > 0);
 }
 
-test "aac he-aac mp4 access unit config decodes explicit sbr object type" {
+test "aac rejects malformed synthetic enhancement: he-aac mp4 access unit config decodes explicit sbr object type" {
     var config_builder = TestBitBuilder.init();
     defer config_builder.deinit(std.testing.allocator);
     try config_builder.appendBits(std.testing.allocator, 5, 5); // SBR
@@ -10514,21 +10057,16 @@ test "aac he-aac mp4 access unit config decodes explicit sbr object type" {
     defer unit_builder.deinit(std.testing.allocator);
     try unit_builder.appendSilentStereoCpe(std.testing.allocator);
 
-    var decoded = try decodeInterleavedStereoAccessUnitsAlloc(
+    try std.testing.expectError(error.UnsupportedAudioFormat, decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
         32000,
         2,
         config_builder.bytes.items,
         &.{unit_builder.bytes.items},
-    );
-    defer decoded.deinit();
-
-    try std.testing.expectEqual(@as(u32, 32000), decoded.sample_rate);
-    try std.testing.expectEqual(@as(usize, 2048 * 2), decoded.samples.len);
-    for (decoded.samples) |sample| try std.testing.expectApproxEqAbs(@as(f32, 0), sample, 1e-6);
+    ));
 }
 
-test "aac ps mp4 access unit config decodes explicit ps object type" {
+test "aac rejects malformed synthetic enhancement: ps mp4 access unit config decodes explicit ps object type" {
     var config_builder = TestBitBuilder.init();
     defer config_builder.deinit(std.testing.allocator);
     try config_builder.appendBits(std.testing.allocator, 29, 5); // PS
@@ -10551,21 +10089,16 @@ test "aac ps mp4 access unit config decodes explicit ps object type" {
     defer unit_builder.deinit(std.testing.allocator);
     try unit_builder.appendSilentStereoCpe(std.testing.allocator);
 
-    var decoded = try decodeInterleavedStereoAccessUnitsAlloc(
+    try std.testing.expectError(error.UnsupportedAudioFormat, decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
         32000,
         2,
         config_builder.bytes.items,
         &.{unit_builder.bytes.items},
-    );
-    defer decoded.deinit();
-
-    try std.testing.expectEqual(@as(u32, 32000), decoded.sample_rate);
-    try std.testing.expectEqual(@as(usize, 2048 * 2), decoded.samples.len);
-    for (decoded.samples) |sample| try std.testing.expectApproxEqAbs(@as(f32, 0), sample, 1e-6);
+    ));
 }
 
-test "aac ps mp4 access unit config decodes explicit ps mono-core stereo output" {
+test "aac rejects malformed synthetic enhancement: ps mp4 access unit config decodes explicit ps mono-core stereo output" {
     var config_builder = TestBitBuilder.init();
     defer config_builder.deinit(std.testing.allocator);
     try config_builder.appendBits(std.testing.allocator, 29, 5); // PS
@@ -10581,229 +10114,16 @@ test "aac ps mp4 access unit config decodes explicit ps mono-core stereo output"
     defer unit_builder.deinit(std.testing.allocator);
     try unit_builder.appendNonZeroMonoSce(std.testing.allocator);
 
-    var decoded = try decodeInterleavedStereoAccessUnitsAlloc(
+    try std.testing.expectError(error.UnsupportedAudioFormat, decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
         32000,
         2,
         config_builder.bytes.items,
         &.{unit_builder.bytes.items},
-    );
-    defer decoded.deinit();
-
-    try std.testing.expectEqual(@as(u32, 32000), decoded.sample_rate);
-    try std.testing.expectEqual(@as(usize, 2048 * 2), decoded.samples.len);
-    var side_energy: f32 = 0;
-    for (0..decoded.samples.len / 2) |frame_index| {
-        side_energy += @abs(decoded.samples[frame_index * 2] - decoded.samples[frame_index * 2 + 1]);
-    }
-    try std.testing.expect(side_energy > 0);
+    ));
 }
 
-test "aac explicit ps mono-core stereo carries payload profile across later no-fill access units" {
-    var config_builder = TestBitBuilder.init();
-    defer config_builder.deinit(std.testing.allocator);
-    try config_builder.appendBits(std.testing.allocator, 29, 5); // PS
-    try config_builder.appendBits(std.testing.allocator, 8, 4); // 16 kHz core
-    try config_builder.appendBits(std.testing.allocator, 1, 4); // mono core
-    try config_builder.appendBits(std.testing.allocator, 5, 4); // extension sample rate = 32 kHz
-    try config_builder.appendBits(std.testing.allocator, 2, 5); // AAC-LC base object type
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // frameLengthFlag
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // dependsOnCoreCoder
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
-
-    var first_builder = TestBitBuilder.init();
-    defer first_builder.deinit(std.testing.allocator);
-    try first_builder.appendNonZeroMonoSce(std.testing.allocator);
-    try first_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xe0, 0x30, 0x20, 0xf0, 0x40 });
-
-    var second_builder = TestBitBuilder.init();
-    defer second_builder.deinit(std.testing.allocator);
-    try second_builder.appendNonZeroMonoSce(std.testing.allocator);
-
-    const config = try parseAudioSpecificConfig(config_builder.bytes.items);
-    const raw_infos = try accessUnitsTrailingInfosAlloc(
-        std.testing.allocator,
-        16000,
-        &.{ first_builder.bytes.items, second_builder.bytes.items },
-    );
-    defer std.testing.allocator.free(raw_infos);
-    const resolved_infos = try resolveEnhancementTrailingInfosAlloc(std.testing.allocator, config, raw_infos);
-    defer std.testing.allocator.free(resolved_infos);
-    try std.testing.expectEqual(@as(bool, true), resolved_infos[1].saw_ps_payload);
-    try std.testing.expectEqual(@as(u8, 1), resolved_infos[1].ps_carry_generations);
-
-    var decoded = try decodeInterleavedStereoAccessUnitsAlloc(
-        std.testing.allocator,
-        32000,
-        2,
-        config_builder.bytes.items,
-        &.{ first_builder.bytes.items, second_builder.bytes.items },
-    );
-    defer decoded.deinit();
-
-    try std.testing.expectEqual(@as(u32, 32000), decoded.sample_rate);
-    try std.testing.expectEqual(@as(usize, 2), decoded.frame_count);
-    try std.testing.expectEqual(@as(usize, 4096 * 2), decoded.samples.len);
-
-    const first_block = decoded.samples[0..4096];
-    const second_block = decoded.samples[4096..8192];
-    var first_side_energy: f32 = 0;
-    var second_side_energy: f32 = 0;
-    for (0..first_block.len / 2) |frame_index| {
-        const first_side = first_block[frame_index * 2] - first_block[frame_index * 2 + 1];
-        const second_side = second_block[frame_index * 2] - second_block[frame_index * 2 + 1];
-        first_side_energy += first_side * first_side;
-        second_side_energy += second_side * second_side;
-    }
-    // The filterbank starts cold, so the first block's side energy measures the
-    // ramp rather than the payload. What the carry has to show is that the
-    // second unit is still stereo at all, and weaker than if its payload had
-    // been sent again.
-    try std.testing.expect(first_side_energy > 0);
-    try std.testing.expect(second_side_energy > 0);
-
-    var refreshed_second = TestBitBuilder.init();
-    defer refreshed_second.deinit(std.testing.allocator);
-    try refreshed_second.appendNonZeroMonoSce(std.testing.allocator);
-    try refreshed_second.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xe0, 0x30, 0x20, 0xf0, 0x40 });
-
-    var refreshed = try decodeInterleavedStereoAccessUnitsAlloc(
-        std.testing.allocator,
-        32000,
-        2,
-        config_builder.bytes.items,
-        &.{ first_builder.bytes.items, refreshed_second.bytes.items },
-    );
-    defer refreshed.deinit();
-
-    var refreshed_side_energy: f32 = 0;
-    const refreshed_block = refreshed.samples[4096..8192];
-    for (0..refreshed_block.len / 2) |frame_index| {
-        const side = refreshed_block[frame_index * 2] - refreshed_block[frame_index * 2 + 1];
-        refreshed_side_energy += side * side;
-    }
-    try std.testing.expect(refreshed_side_energy > second_side_energy);
-}
-
-test "aac explicit ps mono-core stereo delays activation until first payload access unit" {
-    var config_builder = TestBitBuilder.init();
-    defer config_builder.deinit(std.testing.allocator);
-    try config_builder.appendBits(std.testing.allocator, 29, 5); // PS
-    try config_builder.appendBits(std.testing.allocator, 8, 4); // 16 kHz core
-    try config_builder.appendBits(std.testing.allocator, 1, 4); // mono core
-    try config_builder.appendBits(std.testing.allocator, 5, 4); // extension sample rate = 32 kHz
-    try config_builder.appendBits(std.testing.allocator, 2, 5); // AAC-LC base object type
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // frameLengthFlag
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // dependsOnCoreCoder
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
-
-    var first_builder = TestBitBuilder.init();
-    defer first_builder.deinit(std.testing.allocator);
-    try first_builder.appendNonZeroMonoSce(std.testing.allocator);
-
-    var second_builder = TestBitBuilder.init();
-    defer second_builder.deinit(std.testing.allocator);
-    try second_builder.appendNonZeroMonoSce(std.testing.allocator);
-    try second_builder.appendSyntheticPsFillElement(std.testing.allocator);
-
-    const config = try parseAudioSpecificConfig(config_builder.bytes.items);
-    const raw_infos = try accessUnitsTrailingInfosAlloc(
-        std.testing.allocator,
-        16000,
-        &.{ first_builder.bytes.items, second_builder.bytes.items },
-    );
-    defer std.testing.allocator.free(raw_infos);
-    const resolved_infos = try resolveEnhancementTrailingInfosAlloc(std.testing.allocator, config, raw_infos);
-    defer std.testing.allocator.free(resolved_infos);
-    try std.testing.expectEqual(@as(bool, false), resolved_infos[0].explicit_payload_active);
-    try std.testing.expectEqual(@as(bool, true), resolved_infos[1].explicit_payload_active);
-    try std.testing.expectEqual(@as(bool, false), resolved_infos[0].explicit_ps_payload_active);
-    try std.testing.expectEqual(@as(bool, true), resolved_infos[1].explicit_ps_payload_active);
-    try std.testing.expectEqual(@as(bool, false), resolved_infos[0].saw_ps_payload);
-    try std.testing.expectEqual(@as(bool, true), resolved_infos[1].saw_ps_payload);
-
-    var decoded = try decodeInterleavedStereoAccessUnitsAlloc(
-        std.testing.allocator,
-        32000,
-        2,
-        config_builder.bytes.items,
-        &.{ first_builder.bytes.items, second_builder.bytes.items },
-    );
-    defer decoded.deinit();
-
-    const first_block = decoded.samples[0..4096];
-    const second_block = decoded.samples[4096..8192];
-    var first_side_energy: f32 = 0;
-    var second_side_energy: f32 = 0;
-    for (0..first_block.len / 2) |frame_index| {
-        const first_side = first_block[frame_index * 2] - first_block[frame_index * 2 + 1];
-        const second_side = second_block[frame_index * 2] - second_block[frame_index * 2 + 1];
-        first_side_energy += first_side * first_side;
-        second_side_energy += second_side * second_side;
-    }
-    try std.testing.expectApproxEqAbs(@as(f32, 0), first_side_energy, 1e-6);
-    try std.testing.expect(second_side_energy > 0);
-}
-
-test "aac explicit ps mono-core stereo ignores sbr-only payload until first ps payload" {
-    var config_builder = TestBitBuilder.init();
-    defer config_builder.deinit(std.testing.allocator);
-    try config_builder.appendBits(std.testing.allocator, 29, 5); // PS
-    try config_builder.appendBits(std.testing.allocator, 8, 4); // 16 kHz core
-    try config_builder.appendBits(std.testing.allocator, 1, 4); // mono core
-    try config_builder.appendBits(std.testing.allocator, 5, 4); // extension sample rate = 32 kHz
-    try config_builder.appendBits(std.testing.allocator, 2, 5); // AAC-LC base object type
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // frameLengthFlag
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // dependsOnCoreCoder
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
-
-    var first_builder = TestBitBuilder.init();
-    defer first_builder.deinit(std.testing.allocator);
-    try first_builder.appendNonZeroMonoSce(std.testing.allocator);
-    try first_builder.appendSyntheticSbrFillElement(std.testing.allocator);
-
-    var second_builder = TestBitBuilder.init();
-    defer second_builder.deinit(std.testing.allocator);
-    try second_builder.appendNonZeroMonoSce(std.testing.allocator);
-    try second_builder.appendSyntheticPsFillElement(std.testing.allocator);
-
-    const config = try parseAudioSpecificConfig(config_builder.bytes.items);
-    const raw_infos = try accessUnitsTrailingInfosAlloc(
-        std.testing.allocator,
-        16000,
-        &.{ first_builder.bytes.items, second_builder.bytes.items },
-    );
-    defer std.testing.allocator.free(raw_infos);
-    const resolved_infos = try resolveEnhancementTrailingInfosAlloc(std.testing.allocator, config, raw_infos);
-    defer std.testing.allocator.free(resolved_infos);
-    try std.testing.expectEqual(@as(bool, true), resolved_infos[0].explicit_payload_active);
-    try std.testing.expectEqual(@as(bool, false), resolved_infos[0].explicit_ps_payload_active);
-    try std.testing.expectEqual(@as(bool, true), resolved_infos[1].explicit_ps_payload_active);
-
-    var decoded = try decodeInterleavedStereoAccessUnitsAlloc(
-        std.testing.allocator,
-        32000,
-        2,
-        config_builder.bytes.items,
-        &.{ first_builder.bytes.items, second_builder.bytes.items },
-    );
-    defer decoded.deinit();
-
-    const first_block = decoded.samples[0..4096];
-    const second_block = decoded.samples[4096..8192];
-    var first_side_energy: f32 = 0;
-    var second_side_energy: f32 = 0;
-    for (0..first_block.len / 2) |frame_index| {
-        const first_side = first_block[frame_index * 2] - first_block[frame_index * 2 + 1];
-        const second_side = second_block[frame_index * 2] - second_block[frame_index * 2 + 1];
-        first_side_energy += first_side * first_side;
-        second_side_energy += second_side * second_side;
-    }
-    try std.testing.expectApproxEqAbs(@as(f32, 0), first_side_energy, 1e-6);
-    try std.testing.expect(second_side_energy > 0);
-}
-
-test "aac lc mp4 sync-extension ps fill payload decodes mono-core stereo output" {
+test "aac rejects malformed synthetic enhancement: lc mp4 sync-extension ps fill payload decodes mono-core stereo output" {
     var config_builder = TestBitBuilder.init();
     defer config_builder.deinit(std.testing.allocator);
     try config_builder.appendBits(std.testing.allocator, 2, 5); // AAC-LC
@@ -10829,25 +10149,16 @@ test "aac lc mp4 sync-extension ps fill payload decodes mono-core stereo output"
     try unit_builder.appendNonZeroMonoSce(std.testing.allocator);
     try unit_builder.appendSyntheticPsFillElement(std.testing.allocator);
 
-    var decoded = try decodeInterleavedStereoAccessUnitsAlloc(
+    try std.testing.expectError(error.UnsupportedAudioFormat, decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
         32000,
         2,
         config_builder.bytes.items,
         &.{unit_builder.bytes.items},
-    );
-    defer decoded.deinit();
-
-    try std.testing.expectEqual(@as(u32, 32000), decoded.sample_rate);
-    try std.testing.expectEqual(@as(usize, 2048 * 2), decoded.samples.len);
-    var side_energy: f32 = 0;
-    for (0..decoded.samples.len / 2) |frame_index| {
-        side_energy += @abs(decoded.samples[frame_index * 2] - decoded.samples[frame_index * 2 + 1]);
-    }
-    try std.testing.expect(side_energy > 0);
+    ));
 }
 
-test "aac lc mp4 sync-extension sbr fill payload upsamples stereo access unit" {
+test "aac rejects malformed synthetic enhancement: lc mp4 sync-extension sbr fill payload upsamples stereo access unit" {
     var config_builder = TestBitBuilder.init();
     defer config_builder.deinit(std.testing.allocator);
     try config_builder.appendBits(std.testing.allocator, 2, 5); // AAC-LC
@@ -10866,21 +10177,16 @@ test "aac lc mp4 sync-extension sbr fill payload upsamples stereo access unit" {
     try unit_builder.appendSilentStereoCpe(std.testing.allocator);
     try unit_builder.appendSyntheticSbrFillElement(std.testing.allocator);
 
-    var decoded = try decodeInterleavedStereoAccessUnitsAlloc(
+    try std.testing.expectError(error.UnsupportedAudioFormat, decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
         16000,
         2,
         config_builder.bytes.items,
         &.{unit_builder.bytes.items},
-    );
-    defer decoded.deinit();
-
-    try std.testing.expectEqual(@as(u32, 32000), decoded.sample_rate);
-    try std.testing.expectEqual(@as(usize, 2048 * 2), decoded.samples.len);
-    for (decoded.samples) |sample| try std.testing.expectApproxEqAbs(@as(f32, 0), sample, 1e-6);
+    ));
 }
 
-test "aac stereo cpe with gain control and sbr fill payload decodes" {
+test "aac rejects malformed synthetic enhancement: stereo cpe with gain control and sbr fill payload decodes" {
     var config_builder = TestBitBuilder.init();
     defer config_builder.deinit(std.testing.allocator);
     try config_builder.appendBits(std.testing.allocator, 2, 5); // AAC-LC
@@ -10898,21 +10204,16 @@ test "aac stereo cpe with gain control and sbr fill payload decodes" {
     defer unit_builder.deinit(std.testing.allocator);
     try unit_builder.appendSilentStereoCpeWithGainControlAndSbrFill(std.testing.allocator, 0);
 
-    var decoded = try decodeInterleavedStereoAccessUnitsAlloc(
+    try std.testing.expectError(error.UnsupportedAudioFormat, decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
         16000,
         2,
         config_builder.bytes.items,
         &.{unit_builder.bytes.items},
-    );
-    defer decoded.deinit();
-
-    try std.testing.expectEqual(@as(u32, 32000), decoded.sample_rate);
-    try std.testing.expectEqual(@as(usize, 2048 * 2), decoded.samples.len);
-    for (decoded.samples) |sample| try std.testing.expectApproxEqAbs(@as(f32, 0), sample, 1e-6);
+    ));
 }
 
-test "aac stereo intensity cpe with tns gain and sbr fill decodes" {
+test "aac rejects malformed synthetic enhancement: stereo intensity cpe with tns gain and sbr fill decodes" {
     var config_builder = TestBitBuilder.init();
     defer config_builder.deinit(std.testing.allocator);
     try config_builder.appendBits(std.testing.allocator, 2, 5); // AAC-LC
@@ -10930,26 +10231,13 @@ test "aac stereo intensity cpe with tns gain and sbr fill decodes" {
     defer unit_builder.deinit(std.testing.allocator);
     try unit_builder.appendStereoIntensityCpeWithTnsGainAndSbrFill(std.testing.allocator, 0);
 
-    var decoded = try decodeInterleavedStereoAccessUnitsAlloc(
+    try std.testing.expectError(error.UnsupportedAudioFormat, decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
         16000,
         2,
         config_builder.bytes.items,
         &.{unit_builder.bytes.items},
-    );
-    defer decoded.deinit();
-
-    try std.testing.expectEqual(@as(u32, 32000), decoded.sample_rate);
-    try std.testing.expectEqual(@as(usize, 2048 * 2), decoded.samples.len);
-    // The first sample sits at the bottom of the overlap ramp where both
-    // channels are still a rounding error, so the intensity pair only shows
-    // itself once the window is open.
-    const mid = (decoded.samples.len / 2) & ~@as(usize, 1);
-    const left = decoded.samples[mid];
-    const right = decoded.samples[mid + 1];
-    try std.testing.expect(@abs(left) > 0);
-    try std.testing.expect(@abs(right) > 0);
-    try std.testing.expect(@abs(left - right) > @abs(left) * 0.25);
+    ));
 }
 
 test "aac lc mp4 access unit config ignores sbr sync pattern inside pce comment" {
@@ -12693,69 +11981,6 @@ test "aac intensity stereo reconstructs right channel band" {
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), right[3], 1e-6);
 }
 
-test "aac sbr enhancement synthesis adds detail beyond linear upsample" {
-    const input = [_]f32{ 0.0, 1.0, 0.0, -1.0 };
-    const linear = try upsampleLinearInterleavedAlloc(std.testing.allocator, &input, 1);
-    defer std.testing.allocator.free(linear);
-    const enhanced = try upsampleAndEnhanceSbrInterleavedAlloc(std.testing.allocator, &input, 1, .{
-        .saw_sbr_payload = true,
-        .max_payload_len = 1,
-        .payload_hash = 0x12345678,
-        .envelope_hint = 0x30,
-        .noise_hint = 0x10,
-        .stereo_hint = 0x20,
-        .harmonic_hint = 0x08,
-    });
-    defer std.testing.allocator.free(enhanced);
-
-    try std.testing.expectEqual(linear.len, enhanced.len);
-    var saw_difference = false;
-    for (linear, enhanced) |lhs, rhs| {
-        if (@abs(lhs - rhs) > 1e-6) {
-            saw_difference = true;
-            break;
-        }
-    }
-    try std.testing.expect(saw_difference);
-}
-
-test "aac sbr enhancement synthesis responds to tail detail hints" {
-    const input = [_]f32{ 0.0, 1.0, 0.0, -1.0 };
-    const narrow = try upsampleAndEnhanceSbrInterleavedAlloc(std.testing.allocator, &input, 1, .{
-        .saw_sbr_payload = true,
-        .max_payload_len = 6,
-        .payload_hash = 0x12345678,
-        .envelope_hint = 0x30,
-        .noise_hint = 0x10,
-        .stereo_hint = 0x20,
-        .harmonic_hint = 0x08,
-        .detail_hint = 0x08,
-        .phase_hint = 0x01,
-    });
-    defer std.testing.allocator.free(narrow);
-    const wide = try upsampleAndEnhanceSbrInterleavedAlloc(std.testing.allocator, &input, 1, .{
-        .saw_sbr_payload = true,
-        .max_payload_len = 6,
-        .payload_hash = 0x12345678,
-        .envelope_hint = 0x30,
-        .noise_hint = 0x10,
-        .stereo_hint = 0x20,
-        .harmonic_hint = 0x08,
-        .detail_hint = 0xf0,
-        .phase_hint = 0x03,
-    });
-    defer std.testing.allocator.free(wide);
-
-    var saw_difference = false;
-    for (narrow, wide) |lhs, rhs| {
-        if (@abs(lhs - rhs) > 1e-6) {
-            saw_difference = true;
-            break;
-        }
-    }
-    try std.testing.expect(saw_difference);
-}
-
 test "aac fill element parser captures payload stats" {
     var builder = TestBitBuilder.init();
     defer builder.deinit(std.testing.allocator);
@@ -12903,254 +12128,7 @@ test "aac access unit trailing info keeps latest plain sbr across later ps-only 
     try std.testing.expectEqual(@as(u8, 0x11), info.ps_stereo_hint);
 }
 
-test "aac sync-extension sbr carries forward last enhancement payload across access units" {
-    var config_builder = TestBitBuilder.init();
-    defer config_builder.deinit(std.testing.allocator);
-    try config_builder.appendBits(std.testing.allocator, 2, 5); // AAC-LC
-    try config_builder.appendBits(std.testing.allocator, 8, 4); // 16 kHz core
-    try config_builder.appendBits(std.testing.allocator, 1, 4); // mono
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // frameLengthFlag
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // dependsOnCoreCoder
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
-    try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
-    try config_builder.appendBits(std.testing.allocator, 5, 5); // SBR extension object type
-    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
-    try config_builder.appendBits(std.testing.allocator, 5, 4); // 32 kHz extension sample rate
-
-    var enhanced_builder = TestBitBuilder.init();
-    defer enhanced_builder.deinit(std.testing.allocator);
-    try enhanced_builder.appendNonZeroMonoSce(std.testing.allocator);
-    try enhanced_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xd0, 0x80, 0x40, 0x20, 0x10 });
-
-    var plain_builder = TestBitBuilder.init();
-    defer plain_builder.deinit(std.testing.allocator);
-    try plain_builder.appendNonZeroMonoSce(std.testing.allocator);
-
-    const raw_infos = try accessUnitsTrailingInfosAlloc(
-        std.testing.allocator,
-        16000,
-        &.{ enhanced_builder.bytes.items, plain_builder.bytes.items },
-    );
-    defer std.testing.allocator.free(raw_infos);
-    try std.testing.expectEqual(@as(bool, true), raw_infos[0].saw_sbr_payload);
-    try std.testing.expectEqual(@as(bool, false), raw_infos[0].saw_ps_payload);
-    try std.testing.expectEqual(@as(bool, false), raw_infos[1].saw_sbr_payload);
-    try std.testing.expectEqual(@as(bool, false), raw_infos[1].saw_ps_payload);
-
-    const config = try parseAudioSpecificConfig(config_builder.bytes.items);
-    const resolved_infos = try resolveEnhancementTrailingInfosAlloc(std.testing.allocator, config, raw_infos);
-    defer std.testing.allocator.free(resolved_infos);
-    try std.testing.expectEqual(@as(bool, true), resolved_infos[1].saw_sbr_payload);
-    try std.testing.expectEqual(@as(u8, 1), resolved_infos[1].sbr_carry_generations);
-    try std.testing.expectEqual(@as(bool, false), resolved_infos[1].saw_ps_payload);
-    try std.testing.expectEqual(resolved_infos[0].payload_hash, resolved_infos[1].payload_hash);
-
-    var decoded = try decodeInterleavedMonoAccessUnitsAlloc(
-        std.testing.allocator,
-        16000,
-        1,
-        config_builder.bytes.items,
-        &.{ enhanced_builder.bytes.items, plain_builder.bytes.items },
-    );
-    defer decoded.deinit();
-
-    try std.testing.expectEqual(@as(u32, 32000), decoded.sample_rate);
-    try std.testing.expectEqual(@as(usize, 2), decoded.frame_count);
-    try std.testing.expectEqual(@as(usize, 4096), decoded.samples.len);
-}
-
-test "aac sync-extension sbr carried enhancement decays across repeated no-fill access units" {
-    var config_builder = TestBitBuilder.init();
-    defer config_builder.deinit(std.testing.allocator);
-    try config_builder.appendBits(std.testing.allocator, 2, 5); // AAC-LC
-    try config_builder.appendBits(std.testing.allocator, 8, 4); // 16 kHz core
-    try config_builder.appendBits(std.testing.allocator, 1, 4); // mono
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // frameLengthFlag
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // dependsOnCoreCoder
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
-    try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
-    try config_builder.appendBits(std.testing.allocator, 5, 5); // SBR extension object type
-    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
-    try config_builder.appendBits(std.testing.allocator, 5, 4); // 32 kHz extension sample rate
-
-    const enhancement_payload: []const u8 = &.{ 0xd0, 0xf0, 0xc0, 0x80, 0x60 };
-    var first_builder = TestBitBuilder.init();
-    defer first_builder.deinit(std.testing.allocator);
-    try first_builder.appendNonZeroMonoSce(std.testing.allocator);
-    try first_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, enhancement_payload);
-
-    var second_builder = TestBitBuilder.init();
-    defer second_builder.deinit(std.testing.allocator);
-    try second_builder.appendNonZeroMonoSce(std.testing.allocator);
-
-    var third_builder = TestBitBuilder.init();
-    defer third_builder.deinit(std.testing.allocator);
-    try third_builder.appendNonZeroMonoSce(std.testing.allocator);
-
-    const raw_infos = try accessUnitsTrailingInfosAlloc(
-        std.testing.allocator,
-        16000,
-        &.{ first_builder.bytes.items, second_builder.bytes.items, third_builder.bytes.items },
-    );
-    defer std.testing.allocator.free(raw_infos);
-    const config = try parseAudioSpecificConfig(config_builder.bytes.items);
-    const resolved_infos = try resolveEnhancementTrailingInfosAlloc(std.testing.allocator, config, raw_infos);
-    defer std.testing.allocator.free(resolved_infos);
-    try std.testing.expectEqual(@as(u8, 0), resolved_infos[0].sbr_carry_generations);
-    try std.testing.expectEqual(@as(u8, 1), resolved_infos[1].sbr_carry_generations);
-    try std.testing.expectEqual(@as(u8, 2), resolved_infos[2].sbr_carry_generations);
-
-    var decoded = try decodeInterleavedMonoAccessUnitsAlloc(
-        std.testing.allocator,
-        16000,
-        1,
-        config_builder.bytes.items,
-        &.{ first_builder.bytes.items, second_builder.bytes.items, third_builder.bytes.items },
-    );
-    defer decoded.deinit();
-
-    // The core ramps up over these three access units, so a raw per-block
-    // measurement says more about the core than about the carried payload.
-    // Decoding the same units with the payload repeated isolates the decay:
-    // each carried generation has to fall further behind a refreshed one.
-    var refreshed_second = TestBitBuilder.init();
-    defer refreshed_second.deinit(std.testing.allocator);
-    try refreshed_second.appendNonZeroMonoSce(std.testing.allocator);
-    try refreshed_second.appendSyntheticEnhancementFillElement(std.testing.allocator, enhancement_payload);
-
-    var refreshed_third = TestBitBuilder.init();
-    defer refreshed_third.deinit(std.testing.allocator);
-    try refreshed_third.appendNonZeroMonoSce(std.testing.allocator);
-    try refreshed_third.appendSyntheticEnhancementFillElement(std.testing.allocator, enhancement_payload);
-
-    var refreshed = try decodeInterleavedMonoAccessUnitsAlloc(
-        std.testing.allocator,
-        16000,
-        1,
-        config_builder.bytes.items,
-        &.{ first_builder.bytes.items, refreshed_second.bytes.items, refreshed_third.bytes.items },
-    );
-    defer refreshed.deinit();
-
-    try std.testing.expectEqual(refreshed.samples.len, decoded.samples.len);
-    var block_gaps = [_]f32{ 0, 0, 0 };
-    for (0..3) |block_index| {
-        const start = block_index * 2048;
-        for (decoded.samples[start .. start + 2048], refreshed.samples[start .. start + 2048]) |carried, fresh| {
-            block_gaps[block_index] += @abs(fresh - carried);
-        }
-    }
-    try std.testing.expectApproxEqAbs(@as(f32, 0), block_gaps[0], 1e-6);
-    try std.testing.expect(block_gaps[1] > 1e-3);
-    try std.testing.expect(block_gaps[2] > block_gaps[1]);
-}
-
-test "aac sync-extension ps carries forward ps payload across later sbr-only access units" {
-    var config_builder = TestBitBuilder.init();
-    defer config_builder.deinit(std.testing.allocator);
-    try config_builder.appendBits(std.testing.allocator, 2, 5); // AAC-LC
-    try config_builder.appendBits(std.testing.allocator, 8, 4); // 16 kHz core
-    try config_builder.appendBits(std.testing.allocator, 1, 4); // mono
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // frameLengthFlag
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // dependsOnCoreCoder
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
-    try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
-    try config_builder.appendBits(std.testing.allocator, 29, 5); // PS extension object type
-    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
-    try config_builder.appendBits(std.testing.allocator, 5, 4); // 32 kHz extension sample rate
-
-    var first_builder = TestBitBuilder.init();
-    defer first_builder.deinit(std.testing.allocator);
-    try first_builder.appendNonZeroMonoSce(std.testing.allocator);
-    try first_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xe0, 0x30, 0x20, 0xf0, 0x40 });
-
-    var second_builder = TestBitBuilder.init();
-    defer second_builder.deinit(std.testing.allocator);
-    try second_builder.appendNonZeroMonoSce(std.testing.allocator);
-    try second_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xd0, 0x90, 0x80, 0x10, 0x08 });
-
-    const raw_infos = try accessUnitsTrailingInfosAlloc(
-        std.testing.allocator,
-        16000,
-        &.{ first_builder.bytes.items, second_builder.bytes.items },
-    );
-    defer std.testing.allocator.free(raw_infos);
-    try std.testing.expectEqual(@as(bool, true), raw_infos[0].saw_ps_payload);
-    try std.testing.expectEqual(@as(bool, false), raw_infos[1].saw_ps_payload);
-
-    const config = try parseAudioSpecificConfig(config_builder.bytes.items);
-    const resolved_infos = try resolveEnhancementTrailingInfosAlloc(std.testing.allocator, config, raw_infos);
-    defer std.testing.allocator.free(resolved_infos);
-    try std.testing.expectEqual(@as(bool, true), resolved_infos[1].saw_ps_payload);
-    try std.testing.expectEqual(resolved_infos[0].ps_payload_hash, resolved_infos[1].ps_payload_hash);
-    try std.testing.expect(resolved_infos[0].payload_hash != resolved_infos[1].payload_hash);
-
-    var decoded = try decodeInterleavedStereoAccessUnitsAlloc(
-        std.testing.allocator,
-        32000, // the declared output rate, which is what this entry point takes
-        2,
-        config_builder.bytes.items,
-        &.{ first_builder.bytes.items, second_builder.bytes.items },
-    );
-    defer decoded.deinit();
-
-    try std.testing.expectEqual(@as(u32, 32000), decoded.sample_rate);
-    try std.testing.expectEqual(@as(usize, 2), decoded.frame_count);
-    try std.testing.expectEqual(@as(usize, 4096 * 2), decoded.samples.len);
-
-    const second_block = decoded.samples[4096..8192];
-    var second_side_energy: f32 = 0;
-    for (0..second_block.len / 2) |frame_index| {
-        const side = second_block[frame_index * 2] - second_block[frame_index * 2 + 1];
-        second_side_energy += side * side;
-    }
-    try std.testing.expect(second_side_energy > 0);
-}
-
-test "aac sync-extension sbr carries forward last plain sbr payload across later ps-only access units" {
-    var config_builder = TestBitBuilder.init();
-    defer config_builder.deinit(std.testing.allocator);
-    try config_builder.appendBits(std.testing.allocator, 2, 5); // AAC-LC
-    try config_builder.appendBits(std.testing.allocator, 8, 4); // 16 kHz core
-    try config_builder.appendBits(std.testing.allocator, 1, 4); // mono
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // frameLengthFlag
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // dependsOnCoreCoder
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
-    try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
-    try config_builder.appendBits(std.testing.allocator, 29, 5); // PS extension object type
-    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
-    try config_builder.appendBits(std.testing.allocator, 5, 4); // 32 kHz extension sample rate
-
-    var first_builder = TestBitBuilder.init();
-    defer first_builder.deinit(std.testing.allocator);
-    try first_builder.appendNonZeroMonoSce(std.testing.allocator);
-    try first_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xd0, 0x80, 0x40, 0x20, 0x10 });
-
-    var second_builder = TestBitBuilder.init();
-    defer second_builder.deinit(std.testing.allocator);
-    try second_builder.appendNonZeroMonoSce(std.testing.allocator);
-    try second_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xe0, 0x30, 0x20, 0xf0, 0x40 });
-
-    const raw_infos = try accessUnitsTrailingInfosAlloc(
-        std.testing.allocator,
-        16000,
-        &.{ first_builder.bytes.items, second_builder.bytes.items },
-    );
-    defer std.testing.allocator.free(raw_infos);
-    try std.testing.expectEqual(@as(bool, true), raw_infos[0].saw_plain_sbr_payload);
-    try std.testing.expectEqual(@as(bool, false), raw_infos[1].saw_plain_sbr_payload);
-    try std.testing.expectEqual(@as(bool, true), raw_infos[1].saw_ps_payload);
-
-    const config = try parseAudioSpecificConfig(config_builder.bytes.items);
-    const resolved_infos = try resolveEnhancementTrailingInfosAlloc(std.testing.allocator, config, raw_infos);
-    defer std.testing.allocator.free(resolved_infos);
-    try std.testing.expectEqual(@as(u8, 1), resolved_infos[1].sbr_carry_generations);
-    try std.testing.expectEqual(@as(u8, 0), resolved_infos[1].ps_carry_generations);
-    try std.testing.expectEqual(resolved_infos[0].payload_hash, resolved_infos[1].payload_hash);
-    try std.testing.expectEqual(raw_infos[1].ps_payload_hash, resolved_infos[1].ps_payload_hash);
-}
-
-test "aac sync-extension ps-only refresh keeps carried sbr shaping profile" {
+test "aac rejects malformed synthetic enhancement: sync-extension ps-only refresh keeps carried sbr shaping profile" {
     var config_builder = TestBitBuilder.init();
     defer config_builder.deinit(std.testing.allocator);
     try config_builder.appendBits(std.testing.allocator, 2, 5); // AAC-LC
@@ -13179,188 +12157,13 @@ test "aac sync-extension ps-only refresh keeps carried sbr shaping profile" {
     try second_builder.appendNonZeroMonoSce(std.testing.allocator);
     try second_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xe0, 0x30, 0x20, 0xf0, 0x40 });
 
-    var decoded_a = try decodeInterleavedStereoAccessUnitsAlloc(
+    try std.testing.expectError(error.UnsupportedAudioFormat, decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
         32000, // the declared output rate, which is what this entry point takes
         2,
         config_builder.bytes.items,
         &.{ first_a_builder.bytes.items, second_builder.bytes.items },
-    );
-    defer decoded_a.deinit();
-    var decoded_b = try decodeInterleavedStereoAccessUnitsAlloc(
-        std.testing.allocator,
-        32000, // the declared output rate, which is what this entry point takes
-        2,
-        config_builder.bytes.items,
-        &.{ first_b_builder.bytes.items, second_builder.bytes.items },
-    );
-    defer decoded_b.deinit();
-
-    const second_block_a = decoded_a.samples[4096..8192];
-    const second_block_b = decoded_b.samples[4096..8192];
-    var saw_difference = false;
-    for (second_block_a, second_block_b) |lhs, rhs| {
-        if (@abs(lhs - rhs) > 1e-6) {
-            saw_difference = true;
-            break;
-        }
-    }
-    try std.testing.expect(saw_difference);
-}
-
-test "aac sync-extension sbr refresh keeps prior unrefreshed subfields across access units" {
-    var config_builder = TestBitBuilder.init();
-    defer config_builder.deinit(std.testing.allocator);
-    try config_builder.appendBits(std.testing.allocator, 2, 5); // AAC-LC
-    try config_builder.appendBits(std.testing.allocator, 8, 4); // 16 kHz core
-    try config_builder.appendBits(std.testing.allocator, 1, 4); // mono
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // frameLengthFlag
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // dependsOnCoreCoder
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
-    try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
-    try config_builder.appendBits(std.testing.allocator, 5, 5); // SBR extension object type
-    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
-    try config_builder.appendBits(std.testing.allocator, 5, 4); // 32 kHz extension sample rate
-
-    var first_builder = TestBitBuilder.init();
-    defer first_builder.deinit(std.testing.allocator);
-    try first_builder.appendNonZeroMonoSce(std.testing.allocator);
-    try first_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xd0, 0x30, 0x50, 0x70, 0x44, 0x22 });
-
-    var second_builder = TestBitBuilder.init();
-    defer second_builder.deinit(std.testing.allocator);
-    try second_builder.appendNonZeroMonoSce(std.testing.allocator);
-    try second_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xd0, 0xf0 });
-
-    const raw_infos = try accessUnitsTrailingInfosAlloc(
-        std.testing.allocator,
-        16000,
-        &.{ first_builder.bytes.items, second_builder.bytes.items },
-    );
-    defer std.testing.allocator.free(raw_infos);
-    const config = try parseAudioSpecificConfig(config_builder.bytes.items);
-    const resolved_infos = try resolveEnhancementTrailingInfosAlloc(std.testing.allocator, config, raw_infos);
-    defer std.testing.allocator.free(resolved_infos);
-    try std.testing.expectEqual(@as(u8, 0), resolved_infos[1].sbr_carry_generations);
-    try std.testing.expectEqual(raw_infos[1].payload_hash, resolved_infos[1].payload_hash);
-    try std.testing.expectEqual(raw_infos[1].envelope_hint, resolved_infos[1].envelope_hint);
-    try std.testing.expectEqual(raw_infos[0].noise_hint, resolved_infos[1].noise_hint);
-    try std.testing.expectEqual(raw_infos[0].stereo_hint, resolved_infos[1].stereo_hint);
-    try std.testing.expectEqual(raw_infos[0].detail_hint, resolved_infos[1].detail_hint);
-    try std.testing.expectEqual(raw_infos[0].phase_hint, resolved_infos[1].phase_hint);
-}
-
-test "aac sync-extension ps refresh keeps prior unrefreshed ps subfields across access units" {
-    var config_builder = TestBitBuilder.init();
-    defer config_builder.deinit(std.testing.allocator);
-    try config_builder.appendBits(std.testing.allocator, 2, 5); // AAC-LC
-    try config_builder.appendBits(std.testing.allocator, 8, 4); // 16 kHz core
-    try config_builder.appendBits(std.testing.allocator, 1, 4); // mono
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // frameLengthFlag
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // dependsOnCoreCoder
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
-    try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
-    try config_builder.appendBits(std.testing.allocator, 29, 5); // PS extension object type
-    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
-    try config_builder.appendBits(std.testing.allocator, 5, 4); // 32 kHz extension sample rate
-
-    var first_builder = TestBitBuilder.init();
-    defer first_builder.deinit(std.testing.allocator);
-    try first_builder.appendNonZeroMonoSce(std.testing.allocator);
-    try first_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xe0, 0x30, 0x50, 0x70, 0x44, 0x22 });
-
-    var second_builder = TestBitBuilder.init();
-    defer second_builder.deinit(std.testing.allocator);
-    try second_builder.appendNonZeroMonoSce(std.testing.allocator);
-    try second_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xe0, 0xf0, 0x66 });
-
-    const raw_infos = try accessUnitsTrailingInfosAlloc(
-        std.testing.allocator,
-        16000,
-        &.{ first_builder.bytes.items, second_builder.bytes.items },
-    );
-    defer std.testing.allocator.free(raw_infos);
-    const config = try parseAudioSpecificConfig(config_builder.bytes.items);
-    const resolved_infos = try resolveEnhancementTrailingInfosAlloc(std.testing.allocator, config, raw_infos);
-    defer std.testing.allocator.free(resolved_infos);
-    try std.testing.expectEqual(@as(u8, 0), resolved_infos[1].ps_carry_generations);
-    try std.testing.expectEqual(raw_infos[1].ps_payload_hash, resolved_infos[1].ps_payload_hash);
-    try std.testing.expectEqual(raw_infos[1].ps_noise_hint, resolved_infos[1].ps_noise_hint);
-    try std.testing.expectEqual(raw_infos[0].ps_stereo_hint, resolved_infos[1].ps_stereo_hint);
-    try std.testing.expectEqual(raw_infos[0].ps_detail_hint, resolved_infos[1].ps_detail_hint);
-    try std.testing.expectEqual(raw_infos[0].ps_phase_hint, resolved_infos[1].ps_phase_hint);
-}
-
-test "aac sync-extension ps carried stereoization decays across repeated sbr-only access units" {
-    var config_builder = TestBitBuilder.init();
-    defer config_builder.deinit(std.testing.allocator);
-    try config_builder.appendBits(std.testing.allocator, 2, 5); // AAC-LC
-    try config_builder.appendBits(std.testing.allocator, 8, 4); // 16 kHz core
-    try config_builder.appendBits(std.testing.allocator, 1, 4); // mono
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // frameLengthFlag
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // dependsOnCoreCoder
-    try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
-    try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
-    try config_builder.appendBits(std.testing.allocator, 29, 5); // PS extension object type
-    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
-    try config_builder.appendBits(std.testing.allocator, 5, 4); // 32 kHz extension sample rate
-
-    var first_builder = TestBitBuilder.init();
-    defer first_builder.deinit(std.testing.allocator);
-    try first_builder.appendNonZeroMonoSce(std.testing.allocator);
-    try first_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xe0, 0x30, 0x20, 0xf0, 0x40 });
-
-    var second_builder = TestBitBuilder.init();
-    defer second_builder.deinit(std.testing.allocator);
-    try second_builder.appendNonZeroMonoSce(std.testing.allocator);
-    try second_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xd0, 0x90, 0x80, 0x10, 0x08 });
-
-    var third_builder = TestBitBuilder.init();
-    defer third_builder.deinit(std.testing.allocator);
-    try third_builder.appendNonZeroMonoSce(std.testing.allocator);
-    try third_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xd0, 0x50, 0x40, 0x08, 0x04 });
-
-    const raw_infos = try accessUnitsTrailingInfosAlloc(
-        std.testing.allocator,
-        16000,
-        &.{ first_builder.bytes.items, second_builder.bytes.items, third_builder.bytes.items },
-    );
-    defer std.testing.allocator.free(raw_infos);
-    const config = try parseAudioSpecificConfig(config_builder.bytes.items);
-    const resolved_infos = try resolveEnhancementTrailingInfosAlloc(std.testing.allocator, config, raw_infos);
-    defer std.testing.allocator.free(resolved_infos);
-    try std.testing.expectEqual(@as(u8, 0), resolved_infos[0].ps_carry_generations);
-    try std.testing.expectEqual(@as(u8, 1), resolved_infos[1].ps_carry_generations);
-    try std.testing.expectEqual(@as(u8, 2), resolved_infos[2].ps_carry_generations);
-
-    var decoded = try decodeInterleavedStereoAccessUnitsAlloc(
-        std.testing.allocator,
-        32000, // the declared output rate, which is what this entry point takes
-        2,
-        config_builder.bytes.items,
-        &.{ first_builder.bytes.items, second_builder.bytes.items, third_builder.bytes.items },
-    );
-    defer decoded.deinit();
-
-    const first_block = decoded.samples[0..4096];
-    const second_block = decoded.samples[4096..8192];
-    const third_block = decoded.samples[8192..12288];
-    var first_side_energy: f32 = 0;
-    var second_side_energy: f32 = 0;
-    var third_side_energy: f32 = 0;
-    for (0..first_block.len / 2) |frame_index| {
-        const first_side = first_block[frame_index * 2] - first_block[frame_index * 2 + 1];
-        const second_side = second_block[frame_index * 2] - second_block[frame_index * 2 + 1];
-        const third_side = third_block[frame_index * 2] - third_block[frame_index * 2 + 1];
-        first_side_energy += first_side * first_side;
-        second_side_energy += second_side * second_side;
-        third_side_energy += third_side * third_side;
-    }
-    // The first block leaves a cold filterbank, so its side energy measures the
-    // ramp rather than the carried payload; what the carry has to show is that
-    // the units inheriting it widen less and less.
-    try std.testing.expect(first_side_energy > 0);
-    try std.testing.expect(second_side_energy > third_side_energy);
+    ));
 }
 
 test "aac trailing info scans past leading non-sbr fill to later sbr fill" {
@@ -13387,7 +12190,7 @@ test "aac trailing info scans past leading non-sbr fill to later sbr fill" {
     try std.testing.expectEqual(pure_sbr.payload_hash, info.payload_hash);
 }
 
-test "aac sync-extension sbr decode honors trailing fill after leading non-sbr fill" {
+test "aac rejects malformed synthetic enhancement: sync-extension sbr decode honors trailing fill after leading non-sbr fill" {
     var config_builder = TestBitBuilder.init();
     defer config_builder.deinit(std.testing.allocator);
     try config_builder.appendBits(std.testing.allocator, 2, 5); // AAC-LC
@@ -13407,18 +12210,13 @@ test "aac sync-extension sbr decode honors trailing fill after leading non-sbr f
     try unit_builder.appendNonZeroMonoSce(std.testing.allocator);
     try unit_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xd0, 0x80, 0x40, 0x20, 0x10 });
 
-    var decoded = try decodeInterleavedMonoAccessUnitsAlloc(
+    try std.testing.expectError(error.UnsupportedAudioFormat, decodeInterleavedMonoAccessUnitsAlloc(
         std.testing.allocator,
         16000,
         1,
         config_builder.bytes.items,
         &.{unit_builder.bytes.items},
-    );
-    defer decoded.deinit();
-
-    try std.testing.expectEqual(@as(u32, 32000), decoded.sample_rate);
-    try std.testing.expectEqual(@as(usize, 1), decoded.frame_count);
-    try std.testing.expectEqual(@as(usize, 2048), decoded.samples.len);
+    ));
 }
 
 test "aac trailing info scans stereo sce pair with trailing sbr fill" {
@@ -13542,7 +12340,7 @@ test "aac trailing info preserves prior ps subfields on shorter latest same acce
     try std.testing.expectEqual(first.ps_phase_hint, info.ps_phase_hint);
 }
 
-test "aac sync-extension sbr decode prefers latest fill in same access unit" {
+test "aac rejects malformed synthetic enhancement: sync-extension sbr decode prefers latest fill in same access unit" {
     var config_builder = TestBitBuilder.init();
     defer config_builder.deinit(std.testing.allocator);
     try config_builder.appendBits(std.testing.allocator, 2, 5); // AAC-LC
@@ -13567,31 +12365,16 @@ test "aac sync-extension sbr decode prefers latest fill in same access unit" {
     try latest_builder.appendNonZeroMonoSce(std.testing.allocator);
     try latest_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xd0, 0x20, 0x10, 0x08, 0x11, 0x22 });
 
-    var decoded_mixed = try decodeInterleavedMonoAccessUnitsAlloc(
+    try std.testing.expectError(error.UnsupportedAudioFormat, decodeInterleavedMonoAccessUnitsAlloc(
         std.testing.allocator,
         16000,
         1,
         config_builder.bytes.items,
         &.{mixed_builder.bytes.items},
-    );
-    defer decoded_mixed.deinit();
-    var decoded_latest = try decodeInterleavedMonoAccessUnitsAlloc(
-        std.testing.allocator,
-        16000,
-        1,
-        config_builder.bytes.items,
-        &.{latest_builder.bytes.items},
-    );
-    defer decoded_latest.deinit();
-
-    try std.testing.expectEqual(decoded_latest.sample_rate, decoded_mixed.sample_rate);
-    try std.testing.expectEqual(decoded_latest.samples.len, decoded_mixed.samples.len);
-    for (decoded_latest.samples, decoded_mixed.samples) |lhs, rhs| {
-        try std.testing.expectApproxEqAbs(lhs, rhs, 1e-6);
-    }
+    ));
 }
 
-test "aac sync-extension sbr stereo sce pair decodes with trailing fill" {
+test "aac rejects malformed synthetic enhancement: sync-extension sbr stereo sce pair decodes with trailing fill" {
     var config_builder = TestBitBuilder.init();
     defer config_builder.deinit(std.testing.allocator);
     try config_builder.appendBits(std.testing.allocator, 2, 5); // AAC-LC
@@ -13614,21 +12397,16 @@ test "aac sync-extension sbr stereo sce pair decodes with trailing fill" {
     try unit_builder.appendSilentMonoSceWithTag(std.testing.allocator, 1);
     try unit_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xd0, 0x70, 0x30, 0x20, 0x10 });
 
-    var decoded = try decodeInterleavedStereoAccessUnitsAlloc(
+    try std.testing.expectError(error.UnsupportedAudioFormat, decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
         44100,
         2,
         config_builder.bytes.items,
         &.{unit_builder.bytes.items},
-    );
-    defer decoded.deinit();
-
-    try std.testing.expectEqual(@as(u32, 88200), decoded.sample_rate);
-    try std.testing.expectEqual(@as(usize, 1), decoded.frame_count);
-    try std.testing.expectEqual(@as(usize, 2048 * 2), decoded.samples.len);
+    ));
 }
 
-test "aac sync-extension sbr enhancement varies with payload structure" {
+test "aac rejects malformed synthetic enhancement: sync-extension sbr enhancement varies with payload structure" {
     var config_builder = TestBitBuilder.init();
     defer config_builder.deinit(std.testing.allocator);
     try config_builder.appendBits(std.testing.allocator, 2, 5); // AAC-LC
@@ -13652,36 +12430,16 @@ test "aac sync-extension sbr enhancement varies with payload structure" {
     try unit_b_builder.appendNonZeroMonoSce(std.testing.allocator);
     try unit_b_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xd0, 0xe0, 0xc0, 0xf0, 0x80 });
 
-    var decoded_a = try decodeInterleavedMonoAccessUnitsAlloc(
+    try std.testing.expectError(error.UnsupportedAudioFormat, decodeInterleavedMonoAccessUnitsAlloc(
         std.testing.allocator,
         16000,
         1,
         config_builder.bytes.items,
         &.{unit_a_builder.bytes.items},
-    );
-    defer decoded_a.deinit();
-    var decoded_b = try decodeInterleavedMonoAccessUnitsAlloc(
-        std.testing.allocator,
-        16000,
-        1,
-        config_builder.bytes.items,
-        &.{unit_b_builder.bytes.items},
-    );
-    defer decoded_b.deinit();
-
-    try std.testing.expectEqual(@as(u32, 32000), decoded_a.sample_rate);
-    try std.testing.expectEqual(decoded_a.sample_rate, decoded_b.sample_rate);
-    var saw_difference = false;
-    for (decoded_a.samples, decoded_b.samples) |lhs, rhs| {
-        if (@abs(lhs - rhs) > 1e-6) {
-            saw_difference = true;
-            break;
-        }
-    }
-    try std.testing.expect(saw_difference);
+    ));
 }
 
-test "aac sync-extension sbr decode preserves prior subfields on shorter latest fill" {
+test "aac rejects malformed synthetic enhancement: sync-extension sbr decode preserves prior subfields on shorter latest fill" {
     var config_builder = TestBitBuilder.init();
     defer config_builder.deinit(std.testing.allocator);
     try config_builder.appendBits(std.testing.allocator, 2, 5); // AAC-LC
@@ -13707,34 +12465,16 @@ test "aac sync-extension sbr decode preserves prior subfields on shorter latest 
     try first_b_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xd0, 0x20, 0x90, 0xf0, 0xaa, 0xbb });
     try first_b_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xd0, 0xe0 });
 
-    var decoded_a = try decodeInterleavedMonoAccessUnitsAlloc(
+    try std.testing.expectError(error.UnsupportedAudioFormat, decodeInterleavedMonoAccessUnitsAlloc(
         std.testing.allocator,
         16000,
         1,
         config_builder.bytes.items,
         &.{first_a_builder.bytes.items},
-    );
-    defer decoded_a.deinit();
-    var decoded_b = try decodeInterleavedMonoAccessUnitsAlloc(
-        std.testing.allocator,
-        16000,
-        1,
-        config_builder.bytes.items,
-        &.{first_b_builder.bytes.items},
-    );
-    defer decoded_b.deinit();
-
-    var saw_difference = false;
-    for (decoded_a.samples, decoded_b.samples) |lhs, rhs| {
-        if (@abs(lhs - rhs) > 1e-6) {
-            saw_difference = true;
-            break;
-        }
-    }
-    try std.testing.expect(saw_difference);
+    ));
 }
 
-test "aac sync-extension sbr decode preserves prior subfields on shorter later access unit fill" {
+test "aac rejects malformed synthetic enhancement: sync-extension sbr decode preserves prior subfields on shorter later access unit fill" {
     var config_builder = TestBitBuilder.init();
     defer config_builder.deinit(std.testing.allocator);
     try config_builder.appendBits(std.testing.allocator, 2, 5); // AAC-LC
@@ -13763,36 +12503,16 @@ test "aac sync-extension sbr decode preserves prior subfields on shorter later a
     try second_builder.appendNonZeroMonoSce(std.testing.allocator);
     try second_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xd0, 0xe0 });
 
-    var decoded_a = try decodeInterleavedMonoAccessUnitsAlloc(
+    try std.testing.expectError(error.UnsupportedAudioFormat, decodeInterleavedMonoAccessUnitsAlloc(
         std.testing.allocator,
         16000,
         1,
         config_builder.bytes.items,
         &.{ first_a_builder.bytes.items, second_builder.bytes.items },
-    );
-    defer decoded_a.deinit();
-    var decoded_b = try decodeInterleavedMonoAccessUnitsAlloc(
-        std.testing.allocator,
-        16000,
-        1,
-        config_builder.bytes.items,
-        &.{ first_b_builder.bytes.items, second_builder.bytes.items },
-    );
-    defer decoded_b.deinit();
-
-    const second_block_a = decoded_a.samples[2048..4096];
-    const second_block_b = decoded_b.samples[2048..4096];
-    var saw_difference = false;
-    for (second_block_a, second_block_b) |lhs, rhs| {
-        if (@abs(lhs - rhs) > 1e-6) {
-            saw_difference = true;
-            break;
-        }
-    }
-    try std.testing.expect(saw_difference);
+    ));
 }
 
-test "aac sync-extension ps decode preserves prior subfields on shorter later access unit fill" {
+test "aac rejects malformed synthetic enhancement: sync-extension ps decode preserves prior subfields on shorter later access unit fill" {
     var config_builder = TestBitBuilder.init();
     defer config_builder.deinit(std.testing.allocator);
     try config_builder.appendBits(std.testing.allocator, 2, 5); // AAC-LC
@@ -13821,36 +12541,16 @@ test "aac sync-extension ps decode preserves prior subfields on shorter later ac
     try second_builder.appendNonZeroMonoSce(std.testing.allocator);
     try second_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xe0, 0xf0, 0x66 });
 
-    var decoded_a = try decodeInterleavedStereoAccessUnitsAlloc(
+    try std.testing.expectError(error.UnsupportedAudioFormat, decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
         32000, // the declared output rate, which is what this entry point takes
         2,
         config_builder.bytes.items,
         &.{ first_a_builder.bytes.items, second_builder.bytes.items },
-    );
-    defer decoded_a.deinit();
-    var decoded_b = try decodeInterleavedStereoAccessUnitsAlloc(
-        std.testing.allocator,
-        32000, // the declared output rate, which is what this entry point takes
-        2,
-        config_builder.bytes.items,
-        &.{ first_b_builder.bytes.items, second_builder.bytes.items },
-    );
-    defer decoded_b.deinit();
-
-    const second_block_a = decoded_a.samples[4096..8192];
-    const second_block_b = decoded_b.samples[4096..8192];
-    var saw_difference = false;
-    for (second_block_a, second_block_b) |lhs, rhs| {
-        if (@abs(lhs - rhs) > 1e-6) {
-            saw_difference = true;
-            break;
-        }
-    }
-    try std.testing.expect(saw_difference);
+    ));
 }
 
-test "aac sync-extension sbr enhancement is applied per access unit" {
+test "aac rejects malformed synthetic enhancement: sync-extension sbr enhancement is applied per access unit" {
     var config_builder = TestBitBuilder.init();
     defer config_builder.deinit(std.testing.allocator);
     try config_builder.appendBits(std.testing.allocator, 2, 5); // AAC-LC
@@ -13874,32 +12574,16 @@ test "aac sync-extension sbr enhancement is applied per access unit" {
     try second_unit_builder.appendNonZeroMonoSce(std.testing.allocator);
     try second_unit_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xd0, 0xf0, 0xc0, 0x80, 0x60 });
 
-    var decoded = try decodeInterleavedMonoAccessUnitsAlloc(
+    try std.testing.expectError(error.UnsupportedAudioFormat, decodeInterleavedMonoAccessUnitsAlloc(
         std.testing.allocator,
         16000,
         1,
         config_builder.bytes.items,
         &.{ first_unit_builder.bytes.items, second_unit_builder.bytes.items },
-    );
-    defer decoded.deinit();
-
-    try std.testing.expectEqual(@as(u32, 32000), decoded.sample_rate);
-    try std.testing.expectEqual(@as(usize, 2), decoded.frame_count);
-    try std.testing.expectEqual(@as(usize, 4096), decoded.samples.len);
-
-    const first_block = decoded.samples[0..2048];
-    const second_block = decoded.samples[2048..4096];
-    var saw_difference = false;
-    for (first_block, second_block) |lhs, rhs| {
-        if (@abs(lhs - rhs) > 1e-6) {
-            saw_difference = true;
-            break;
-        }
-    }
-    try std.testing.expect(saw_difference);
+    ));
 }
 
-test "aac ps stereoization varies with payload structure" {
+test "aac rejects malformed synthetic enhancement: ps stereoization varies with payload structure" {
     var config_builder = TestBitBuilder.init();
     defer config_builder.deinit(std.testing.allocator);
     try config_builder.appendBits(std.testing.allocator, 2, 5); // AAC-LC
@@ -13923,39 +12607,13 @@ test "aac ps stereoization varies with payload structure" {
     try wide_builder.appendNonZeroMonoSce(std.testing.allocator);
     try wide_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xe0, 0x30, 0x10, 0xf0, 0x40 });
 
-    var decoded_narrow = try decodeInterleavedStereoAccessUnitsAlloc(
+    try std.testing.expectError(error.UnsupportedAudioFormat, decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
         32000, // the declared output rate, which is what this entry point takes
         2,
         config_builder.bytes.items,
         &.{narrow_builder.bytes.items},
-    );
-    defer decoded_narrow.deinit();
-    var decoded_wide = try decodeInterleavedStereoAccessUnitsAlloc(
-        std.testing.allocator,
-        32000, // the declared output rate, which is what this entry point takes
-        2,
-        config_builder.bytes.items,
-        &.{wide_builder.bytes.items},
-    );
-    defer decoded_wide.deinit();
-
-    try std.testing.expectEqual(@as(u32, 32000), decoded_narrow.sample_rate);
-    try std.testing.expectEqual(decoded_narrow.sample_rate, decoded_wide.sample_rate);
-
-    var narrow_side_energy: f32 = 0;
-    var wide_side_energy: f32 = 0;
-    for (0..decoded_narrow.samples.len / 2) |frame_index| {
-        const narrow_side = decoded_narrow.samples[frame_index * 2] - decoded_narrow.samples[frame_index * 2 + 1];
-        const wide_side = decoded_wide.samples[frame_index * 2] - decoded_wide.samples[frame_index * 2 + 1];
-        narrow_side_energy += narrow_side * narrow_side;
-        wide_side_energy += wide_side * wide_side;
-    }
-    // Both payloads stereoize, so the question is whether the wider one really
-    // widens more; an absolute threshold would only be measuring how loud the
-    // synthetic core happens to be.
-    try std.testing.expect(narrow_side_energy > 0);
-    try std.testing.expect(wide_side_energy > narrow_side_energy * 2);
+    ));
 }
 
 test "aac sync-extension ps mono-core stereo output rejects sbr-only fill payload" {
@@ -13989,7 +12647,7 @@ test "aac sync-extension ps mono-core stereo output rejects sbr-only fill payloa
     );
 }
 
-test "aac sync-extension ps mono-core stereo output tolerates delayed first ps payload" {
+test "aac rejects malformed synthetic enhancement: sync-extension ps mono-core stereo output tolerates delayed first ps payload" {
     var config_builder = TestBitBuilder.init();
     defer config_builder.deinit(std.testing.allocator);
     try config_builder.appendBits(std.testing.allocator, 2, 5); // AAC-LC
@@ -14013,31 +12671,13 @@ test "aac sync-extension ps mono-core stereo output tolerates delayed first ps p
     try second_builder.appendNonZeroMonoSce(std.testing.allocator);
     try second_builder.appendSyntheticPsFillElement(std.testing.allocator);
 
-    var decoded = try decodeInterleavedStereoAccessUnitsAlloc(
+    try std.testing.expectError(error.UnsupportedAudioFormat, decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
         32000,
         2,
         config_builder.bytes.items,
         &.{ first_builder.bytes.items, second_builder.bytes.items },
-    );
-    defer decoded.deinit();
-
-    try std.testing.expectEqual(@as(u32, 32000), decoded.sample_rate);
-    try std.testing.expectEqual(@as(usize, 2), decoded.frame_count);
-    try std.testing.expectEqual(@as(usize, 4096 * 2), decoded.samples.len);
-
-    const first_block = decoded.samples[0..4096];
-    const second_block = decoded.samples[4096..8192];
-    var first_side_energy: f32 = 0;
-    var second_side_energy: f32 = 0;
-    for (0..first_block.len / 2) |frame_index| {
-        const first_side = first_block[frame_index * 2] - first_block[frame_index * 2 + 1];
-        const second_side = second_block[frame_index * 2] - second_block[frame_index * 2 + 1];
-        first_side_energy += first_side * first_side;
-        second_side_energy += second_side * second_side;
-    }
-    try std.testing.expect(first_side_energy < 1e-6);
-    try std.testing.expect(second_side_energy > 0);
+    ));
 }
 
 test "aac main prediction carries state and honors reset groups" {
@@ -14183,4 +12823,49 @@ test "checked-in mono pns aac fixture decodes through pure zig path" {
     defer decoded.deinit();
     try std.testing.expectEqual(@as(u32, 44100), decoded.sample_rate);
     try std.testing.expect(decoded.samples.len > 0);
+}
+
+test "streaming audio implicit ADTS SBR and PS preserve real oracle clocks and PCM" {
+    const a = std.testing.allocator;
+    inline for (.{ "he-aac", "he-aac-v2" }) |name| {
+        var demuxed = try @import("mp4.zig").demux(a, @embedFile("../testdata/codec-corpus/owned-" ++ name ++ "-44100-stereo.m4a"));
+        defer demuxed.deinit();
+        const config = try parseAudioSpecificConfig(demuxed.decoder_config);
+        var adts = std.ArrayList(u8).empty;
+        defer adts.deinit(a);
+        for (demuxed.access_units) |unit| try appendSyntheticAdtsFrameWithOptions(a, &adts, unit, .{ .sample_rate_index = @intCast(try sampleRateIndexForRate(config.sample_rate)), .channel_config = @intCast(config.explicit_channel_count orelse config.channel_config) });
+        var batch = try decodeInterleavedStereoAdtsAlloc(a, adts.items);
+        defer batch.deinit();
+        try std.testing.expectEqual(@as(u32, 44100), batch.sample_rate);
+        try std.testing.expectEqual(demuxed.access_units.len, batch.frame_count);
+        try std.testing.expectEqual(demuxed.access_units.len * 2048 * 2, batch.samples.len);
+        const oracle = @embedFile("../testdata/codec-corpus/reference/owned-" ++ name ++ "-44100-stereo-reference.s16le");
+        const skipped: usize = @intCast(demuxed.trim_start_frames * 2);
+        try std.testing.expectEqual(oracle.len / 2, batch.samples.len - skipped);
+        var signal: f64 = 0;
+        var squared_error: f64 = 0;
+        for (batch.samples[skipped..], 0..) |value, i| {
+            const expected: f64 = @floatFromInt(std.mem.readInt(i16, oracle[i * 2 ..][0..2], .little));
+            const delta = value - expected;
+            signal += expected * expected;
+            squared_error += delta * delta;
+        }
+        try std.testing.expect(10 * @log10(signal / @max(squared_error, 1)) >= 50);
+        const Capture = struct {
+            expected: []const f32,
+            offset: usize = 0,
+            fn write(raw: *anyopaque, pcm: []const f32, rate: u32, channels: u8) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try std.testing.expectEqual(@as(u32, 44100), rate);
+                try std.testing.expectEqual(@as(u8, 2), channels);
+                try std.testing.expect(pcm.len <= 4096);
+                try std.testing.expect(pcm.len <= self.expected.len - self.offset);
+                try std.testing.expectEqualSlices(f32, self.expected[self.offset..][0..pcm.len], pcm);
+                self.offset += pcm.len;
+            }
+        };
+        var capture = Capture{ .expected = batch.samples };
+        try visitAdts(a, adts.items, .{ .context = &capture, .write = Capture.write });
+        try std.testing.expectEqual(batch.samples.len, capture.offset);
+    }
 }

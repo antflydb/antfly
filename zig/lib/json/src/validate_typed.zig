@@ -26,9 +26,10 @@ const std = @import("std");
 pub fn validateTyped(comptime T: type, alloc: std.mem.Allocator, input: []const u8) !void {
     var scanner = std.json.Scanner.initCompleteInput(alloc, input);
     defer scanner.deinit();
-    var validator: Validator = .{ .alloc = alloc, .scanner = &scanner, .options = .{ .allocate = .alloc_if_needed, .max_value_len = input.len }, .dynamic_scan = .init(alloc), .typed_keys = .init(alloc) };
+    var validator: Validator = .{ .alloc = alloc, .scanner = &scanner, .options = .{ .allocate = .alloc_if_needed, .max_value_len = input.len }, .dynamic_scan = .init(alloc), .typed_keys = .init(alloc), .schema_keys = .init(alloc) };
     defer validator.dynamic_scan.deinit();
     defer validator.typed_keys.deinit();
+    defer validator.schema_keys.deinit();
     try validator.value(T);
     if (try scanner.next() != .end_of_document) return error.UnexpectedToken;
 }
@@ -113,7 +114,7 @@ pub const ValueScanner = struct {
                     depth += 1;
                 },
                 .string, .number, .true, .false, .null => {
-                    try scanner.skipValue();
+                    if (try scanner.peekNextTokenType() != .string or !try @import("string_scan.zig").skip(scanner)) try scanner.skipValue();
                     if (depth == 1 and member_name != null) {
                         try observer.?.member_fn(observer.?.ctx, member_name.?, scanner.input[member_start..scanner.cursor]);
                         member_name = null;
@@ -133,6 +134,7 @@ const Validator = struct {
     dynamic_scan: ValueScanner,
     typed_keys: @import("object_key_workspace.zig").ObjectKeyWorkspace(void),
     typed_depth: usize = 0,
+    schema_keys: std.heap.ArenaAllocator,
 
     fn expect(self: *@This(), comptime token: std.meta.Tag(std.json.Token)) !void {
         if (try self.scanner.next() != token) return error.UnexpectedToken;
@@ -175,8 +177,9 @@ const Validator = struct {
         const info = @typeInfo(T).@"struct";
         var seen: [info.field_names.len]bool = @splat(false);
         try self.expect(.object_begin);
-        var key_scratch = std.heap.ArenaAllocator.init(self.alloc);
-        defer key_scratch.deinit();
+        // A decoded schema name is used only to dispatch the next child. No
+        // borrow survives that dispatch, so nested objects share this scratch.
+        const key_scratch = &self.schema_keys;
         while (true) {
             if (!key_scratch.reset(.{ .retain_with_limit = 4096 })) _ = key_scratch.reset(.free_all);
             const token = try self.scanner.nextAllocMax(key_scratch.allocator(), .alloc_if_needed, self.options.max_value_len.?);
@@ -360,7 +363,10 @@ test "value scanner retains wide sibling tables within the shared budget" {
     try input.writer.writeByte('}');
     const Fixture = struct {
         fn run(backing: std.mem.Allocator, json: []const u8) !void {
-            var counted: std.testing.FailingAllocator = .init(backing, .{});
+            // Failure enumeration must not depend on whether a particular
+            // Linux allocator layout can resize/remap a decoded-key arena.
+            // Refuse resizes so every growth uses the counted alloc/copy path.
+            var counted: std.testing.FailingAllocator = .init(backing, .{ .resize_fail_index = 0 });
             var workspace: ValueScanner = .init(counted.allocator());
             defer workspace.deinit();
             for (0..4) |iteration| {
@@ -570,7 +576,7 @@ test "idle key storage remains bounded while ancestors are active" {
     }
     for (0..6) |i| {
         try keys.finishFrame(5 - i);
-        try std.testing.expect(keys.idle_bytes + keys.stack.capacity * @sizeOf(Keys.Frame) <= Keys.reuse_limit);
+        try std.testing.expect(keys.idle_bytes <= Keys.reuse_limit);
         try std.testing.expectEqual(counted.allocated_bytes - counted.freed_bytes, keys.retainedBytes());
         var total: usize = 0;
         var idle: usize = 0;
@@ -608,6 +614,80 @@ test "typed scalar maps reuse keys while preserving child contracts and ownershi
     try input.writer.writeByte(']');
     var counted: std.testing.FailingAllocator = .init(a, .{});
     try validateTyped([]Map, counted.allocator(), input.written());
+    try std.testing.expect(counted.allocations <= 4);
+    try std.testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
+}
+
+test "deep active traversal preserves sibling reuse and retires metadata between values" {
+    const a = std.testing.allocator;
+    const depth = 5000;
+    var input: std.Io.Writer.Allocating = .init(a);
+    defer input.deinit();
+    try input.writer.splatByteAll('[', depth);
+    for (0..1000) |i| {
+        if (i != 0) try input.writer.writeByte(',');
+        try input.writer.writeAll("{\"\\u0061\":0}");
+    }
+    try input.writer.splatByteAll(']', depth);
+    var counted: std.testing.FailingAllocator = .init(a, .{});
+    var workspace: ValueScanner = .init(counted.allocator());
+    defer workspace.deinit();
+    var scanner = std.json.Scanner.initCompleteInput(a, input.written());
+    defer scanner.deinit();
+    try workspace.scan(&scanner, input.written().len, null);
+    // Only stack growth and the first sibling need backing allocations.
+    try std.testing.expect(counted.allocations < 32);
+    try std.testing.expectEqual(@as(usize, 0), workspace.keys.retainedBytes());
+    try std.testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
+    var next = std.json.Scanner.initCompleteInput(a, "{\"a\":0}");
+    defer next.deinit();
+    try workspace.scan(&next, 7, null);
+    try std.testing.expect(workspace.keys.retainedBytes() <= ValueScanner.Keys.reuse_limit);
+}
+
+test "schema name scratch reuses across siblings and recursive dispatch" {
+    const Leaf = struct {
+        value: u32,
+        pub const openApiFieldMetadata = .{.{ "value", "value", false }};
+    };
+    const Row = struct {
+        a: u32 = 0,
+        child: ?Leaf = null,
+        pub const openApiFieldMetadata = .{ .{ "a", "a", false }, .{ "child", "child", false } };
+    };
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            try validateTyped([]Row, alloc, "[{\"\\u0063hild\":{\"\\u0076alue\":1},\"\\u0061\":2},{\"\\u0061\":3}]");
+        }
+    };
+    try Fixture.run(a);
+    try std.testing.checkAllAllocationFailures(a, Fixture.run, .{});
+    for ([_][]const u8{
+        "{\"\\u0063hild\":{\"value\":1},\"child\":null}",
+        "{\"child\":{\"value\":1,\"\\u0076alue\":2}}",
+        "{\"child\":{}}",
+        "{\"child\":{\"unknown\":1}}",
+        "{\"a\":false}",
+    }) |input| {
+        var parsed = std.json.parseFromSlice(Row, a, input, .{});
+        const expected: ?anyerror = if (parsed) |*result| done: {
+            result.deinit();
+            break :done null;
+        } else |err| err;
+        const actual: ?anyerror = if (validateTyped(Row, a, input)) |_| null else |err| err;
+        try std.testing.expectEqual(expected, actual);
+    }
+    var input: std.Io.Writer.Allocating = .init(a);
+    defer input.deinit();
+    try input.writer.writeByte('[');
+    for (0..1000) |i| {
+        if (i != 0) try input.writer.writeByte(',');
+        try input.writer.writeAll("{\"\\u0063hild\":{\"\\u0076alue\":1},\"\\u0061\":2}");
+    }
+    try input.writer.writeByte(']');
+    var counted: std.testing.FailingAllocator = .init(a, .{});
+    try validateTyped([]Row, counted.allocator(), input.written());
     try std.testing.expect(counted.allocations <= 4);
     try std.testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
 }

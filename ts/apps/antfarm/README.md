@@ -11,7 +11,7 @@ direction.
 
 ## Runtime profiles
 
-Models & Runtime includes a device card and a selectable model radar profile.
+Models & Instances includes a device card and a selectable model radar profile.
 Choose the runtime connection, then use **Set up device** to enter its name,
 chip, CPU cores, memory, and bandwidth. Hardware details are user-configured;
 the browser does not identify the inference host automatically.

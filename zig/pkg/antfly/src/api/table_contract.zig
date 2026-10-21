@@ -582,6 +582,17 @@ fn appendNormalizedGraphResolversField(alloc: std.mem.Allocator, out: *std.Array
     for (value.array.items, 0..) |item, i| {
         if (i != 0) try out.append(alloc, ',');
         if (item != .object) return error.InvalidCreateIndexRequest;
+        if (item.object.get("suppress")) |policy| if (policy != .null) {
+            const raw = try stringifyJsonAlloc(alloc, policy);
+            defer alloc.free(raw);
+            @import("antfly_resolver").curation.validateConfig(alloc, raw) catch |err| return if (err == error.OutOfMemory) err else error.InvalidCreateIndexRequest;
+        };
+        if (item.object.get("adjudicate")) |policy| if (policy != .null) {
+            const raw = try stringifyJsonAlloc(alloc, policy);
+            defer alloc.free(raw);
+            @import("antfly_local_sources").functions_resolver_adjudication.validate(alloc, raw) catch |err| return if (err == error.OutOfMemory) err else error.InvalidCreateIndexRequest;
+            if (item.object.get("scorer") == null and item.object.get("scorer_json") == null) return error.InvalidCreateIndexRequest;
+        };
         const scorer = item.object.get("scorer");
         if (scorer == null or scorer.? == .null) {
             if (item.object.get("scorer_json")) |legacy| {
@@ -1014,6 +1025,41 @@ fn validatePublicArtifactEnrichmentField(field: []const u8, value: std.json.Valu
     }
 }
 
+test "resolver adjudication public policy validates and redacts frozen credentials" {
+    const a = std.testing.allocator;
+    const request =
+        \\{"type":"graph","resolvers":[{"name":"concepts","table":"entities","source_artifact":"kg","resolution_artifact":"resolved","key_template":"{{_entity.text}}","scorer":{"comparisons":[]},"adjudicate":{"decider":{"provider":"antfly","model":"fixture","api_key":"private-key"},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Are these the same entity?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9}}}]}
+    ;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var value = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), request, .{});
+    const normalized = try normalizeIndexConfigJson(a, value.object, "g", .{ .include_name = true, .default_type = true });
+    defer a.free(normalized);
+    const public = try indexes_api.encodeCreatedIndexConfig(a, "g", normalized);
+    defer a.free(public);
+    try std.testing.expect(std.mem.indexOf(u8, public, "private-key") == null);
+    try std.testing.expect(std.mem.indexOf(u8, public, "\"adjudicate\":") != null);
+    const resolver = &value.object.getPtr("resolvers").?.array.items[0];
+    try resolver.object.getPtr("adjudicate").?.object.put(arena.allocator(), "silent_typo", .{ .bool = true });
+    try std.testing.expectError(error.InvalidCreateIndexRequest, normalizeIndexConfigJson(a, value.object, "g", .{ .include_name = true, .default_type = true }));
+}
+
+test "resolver curation public policy preserves suppression and rejects misspelled rules" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var value = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(),
+        \\{"type":"graph","resolvers":[{"name":"concepts","table":"entities","source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{uslug _entity.text}}","suppress":{"keys":["concept/note"],"texts":["content"],"min_text_chars":3}}]}
+    , .{});
+    const normalized = try normalizeIndexConfigJson(a, value.object, "g", .{ .include_name = true, .default_type = true });
+    defer a.free(normalized);
+    const public = try indexes_api.encodeCreatedIndexConfig(a, "g", normalized);
+    defer a.free(public);
+    try std.testing.expect(std.mem.indexOf(u8, public, "\"suppress\":") != null);
+    try value.object.getPtr("resolvers").?.array.items[0].object.getPtr("suppress").?.object.put(arena.allocator(), "min_chars", .{ .integer = 3 });
+    try std.testing.expectError(error.InvalidCreateIndexRequest, normalizeIndexConfigJson(a, value.object, "g", .{ .include_name = true, .default_type = true }));
+}
+
 test "typed enrichment producer and graph scorer normalize to legacy storage fields" {
     const alloc = std.testing.allocator;
     const enrichment = try parseArtifactEnrichmentRequest(alloc, "units",
@@ -1188,7 +1234,7 @@ fn appendDefaultFullTextIndexEntry(
 }
 
 fn validateCreateTableIndexName(index_name: []const u8) !void {
-    if (index_name.len == 0) return error.InvalidCreateTableRequest;
+    if (index_name.len == 0 or (std.mem.eql(u8, index_name, "_resolver_curation") or std.mem.eql(u8, index_name, "_resolver_namespaces") or std.mem.eql(u8, index_name, "_curation_proposals"))) return error.InvalidCreateTableRequest;
     if (isReservedFullTextIndexName(index_name)) return error.InvalidCreateTableRequest;
 }
 
@@ -1197,7 +1243,7 @@ fn isReservedFullTextIndexName(index_name: []const u8) bool {
 }
 
 fn isReservedPublicCreateIndexName(index_name: []const u8) bool {
-    return isReservedFullTextIndexName(index_name) or
+    return (std.mem.eql(u8, index_name, "_resolver_curation") or std.mem.eql(u8, index_name, "_resolver_namespaces") or std.mem.eql(u8, index_name, "_curation_proposals")) or isReservedFullTextIndexName(index_name) or
         std.mem.eql(u8, index_name, "default");
 }
 
@@ -1545,6 +1591,24 @@ test "table contract rejects malformed multi-source members" {
             parseCreateIndexRequest(std.testing.allocator, "multi", body),
         );
     }
+}
+
+test "table contract retains pinned embedding identity through table and index admission and responses" {
+    const a = std.testing.allocator;
+    const identity = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const index = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"google/embeddinggemma-2\",\"api_url\":\"http://localhost:8082\",\"model_identity\":\"" ++ identity ++ "\"}}";
+    var table = try parseCreateTableRequest(a, "{\"indexes\":{\"vectors\":" ++ index ++ "}}");
+    defer table.deinit(a);
+    var catalog = try std.json.parseFromSlice(std.json.Value, a, table.indexes_json.?, .{});
+    defer catalog.deinit();
+    try std.testing.expectEqualStrings(identity, catalog.value.object.get("vectors").?.object.get("embedder").?.object.get("model_identity").?.string);
+    const normalized = try parseCreateIndexRequest(a, "vectors", index);
+    defer a.free(normalized);
+    const response = try indexes_api.encodeCreatedIndexConfig(a, "vectors", normalized);
+    defer a.free(response);
+    var created = try std.json.parseFromSlice(std.json.Value, a, response, .{});
+    defer created.deinit();
+    try std.testing.expectEqualStrings(identity, created.value.object.get("embedder").?.object.get("model_identity").?.string);
 }
 
 test "table contract public response omits unknown nested provider fields" {
@@ -2419,5 +2483,22 @@ test "external lake public compatibility normalization preserves exact schema li
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
     try std.testing.expectError(error.InvalidCreateTableRequest, parseCreateTableRequest(std.testing.allocator,
         \\{"indexes":{"text":{"type":"full_text","store_source":true,"_index_incarnation":7}}}
+    ));
+}
+
+test "grouped enrichment public normalization retains typed source and finite prior policy" {
+    const a = std.testing.allocator;
+    const group = try parseArtifactEnrichmentRequest(a, "turns",
+        \\{"kind":"group","source":{"group_by":"thread","order_by":"ordinal","segment_by":"turn","field":"text","filter":{"term":{"speaker":["user","assistant"]}},"max_bytes":32768}}
+    );
+    defer a.free(group);
+    const consumer = try parseArtifactEnrichmentRequest(a, "claims",
+        \\{"kind":"asset","source_artifact_name":"turns","prior_context":{"artifact":"claims","render":"{{id}}","horizon_segments":8},"producer":{"type":"generator","config":{}}}
+    );
+    defer a.free(consumer);
+    try std.testing.expect(std.mem.indexOf(u8, group, "group_by") != null);
+    try std.testing.expect(std.mem.indexOf(u8, consumer, "prior_context") != null);
+    try std.testing.expectError(error.InvalidArtifactEnrichmentRequest, parseArtifactEnrichmentRequest(a, "turns",
+        \\{"kind":"group","source":{"group_by":"thread","order_by":"ordinal","field":"text","max_bytez":1}}
     ));
 }

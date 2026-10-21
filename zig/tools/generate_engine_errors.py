@@ -47,6 +47,7 @@ def contents(zig):
         ROOT / "pkg/inference/src",
         ROOT / "lib",
         ROOT / "pkg/antfly-embedded/src",
+        ROOT / "pkg/antfly-embedded/resolver/src",
         std,
     ]
     names = set()
@@ -89,6 +90,11 @@ def contents(zig):
         "    }\n",
         '    try std.testing.expectEqual(error.RuntimeBoundaryFailure, fromName(""));\n',
         '    try std.testing.expectEqual(error.RuntimeBoundaryFailure, fromName("_antfly_unknown_error_name_"));\n',
+        "}\n",
+        'test "engine errors preserve model-aware chunk failure identities" {\n',
+        "    for ([_]anyerror{ error.StaleChunkContinuation, error.IncompleteChunkCoverage, error.InvalidChunkCoordinates, error.ChunkOutputTooLarge, error.SourceVersionChanged, error.EmbeddingIdentityMismatch, error.InvalidChunkReplay }) |err| {\n",
+        "        try std.testing.expectEqual(err, fromName(@errorName(err)));\n",
+        "    }\n",
         "}\n",
     ]
     return subprocess.check_output(

@@ -28,6 +28,17 @@ const default_download_timeout_ms: u64 = 30_000;
 /// one operation context without coupling this library to an application.
 pub const CancellationToken = objectstore.CancellationToken;
 
+/// Supported media transports. Shared with offline dependency inspection so
+/// destination evidence cannot enable a protocol this runtime cannot execute.
+pub const ContentScheme = enum { http, https, file, s3, data };
+
+pub fn contentScheme(scheme: []const u8) error{UnsupportedUrlScheme}!ContentScheme {
+    inline for (@typeInfo(ContentScheme).@"enum".field_names) |name| {
+        if (std.ascii.eqlIgnoreCase(scheme, name)) return @field(ContentScheme, name);
+    }
+    return error.UnsupportedUrlScheme;
+}
+
 pub const DownloadedContent = struct {
     content_type: []u8,
     data: []u8,
@@ -183,20 +194,21 @@ pub const RemoteContentConfig = struct {
 
     pub const RemoteContentRuntime = struct {
         context: *anyopaque,
-        acquire_fn: *const fn (*anyopaque) ?Snapshot,
-        health_fn: *const fn (*anyopaque) RuntimeHealth,
+        acquire_fn: *const fn (*anyopaque) anyerror!Snapshot,
+        health_fn: ?*const fn (*anyopaque) RuntimeHealth = null,
 
-        pub fn acquire(self: RemoteContentRuntime) ?Snapshot {
+        pub fn acquire(self: RemoteContentRuntime) !Snapshot {
             return self.acquire_fn(self.context);
         }
 
-        pub fn health(self: RemoteContentRuntime) RuntimeHealth {
-            return self.health_fn(self.context);
+        pub fn health(self: RemoteContentRuntime) ?RuntimeHealth {
+            return if (self.health_fn) |health_fn| health_fn(self.context) else null;
         }
     };
 
-    pub fn acquire(self: *const RemoteContentConfig) Snapshot {
-        if (self.runtime) |runtime| return runtime.acquire() orelse .{ .config = self };
+    /// Acquisition failures propagate without fetching with a fallback policy.
+    pub fn acquire(self: *const RemoteContentConfig) !Snapshot {
+        if (self.runtime) |runtime| return runtime.acquire();
         return .{ .config = self };
     }
 
@@ -322,28 +334,30 @@ fn downloadContentOutcomeAllocImpl(
     }
 
     const parsed = try std.Uri.parse(uri);
-    if (std.ascii.eqlIgnoreCase(parsed.scheme, "http") or std.ascii.eqlIgnoreCase(parsed.scheme, "https")) {
-        try validateUrlSecurity(parsed, security);
-        if (maybe_context) |context| return downloadHttpOutcomeAlloc(alloc, context, uri, security, http_headers);
-        var io_impl = std.Io.Threaded.init(alloc, .{});
-        defer io_impl.deinit();
-        return downloadHttpOutcomeAlloc(alloc, .{ .io = io_impl.io() }, uri, security, http_headers);
+    switch (try contentScheme(parsed.scheme)) {
+        .http, .https => {
+            try validateUrlSecurity(parsed, security);
+            if (maybe_context) |context| return downloadHttpOutcomeAlloc(alloc, context, uri, security, http_headers);
+            var io_impl = std.Io.Threaded.init(alloc, .{});
+            defer io_impl.deinit();
+            return downloadHttpOutcomeAlloc(alloc, .{ .io = io_impl.io() }, uri, security, http_headers);
+        },
+        .file => {
+            if (parsed.host) |host| {
+                if (host.percent_encoded.len > 0 and !std.ascii.eqlIgnoreCase(host.percent_encoded, "localhost"))
+                    return error.InvalidHost;
+            }
+            const path_buf = try alloc.dupe(u8, parsed.path.percent_encoded);
+            defer alloc.free(path_buf);
+            const path = std.Uri.percentDecodeInPlace(path_buf);
+            if (maybe_context) |context| return .{ .ok = try downloadFileAllocWithContext(alloc, context, path, security) };
+            return .{ .ok = try downloadFileAlloc(alloc, path, security) };
+        },
+        .s3 => {
+            return .{ .ok = try downloadS3Alloc(alloc, maybe_context, parsed, security, s3_credentials) };
+        },
+        .data => unreachable, // Handled before URI parsing.
     }
-    if (std.ascii.eqlIgnoreCase(parsed.scheme, "file")) {
-        if (parsed.host) |host| {
-            if (host.percent_encoded.len > 0 and !std.ascii.eqlIgnoreCase(host.percent_encoded, "localhost"))
-                return error.InvalidHost;
-        }
-        const path_buf = try alloc.dupe(u8, parsed.path.percent_encoded);
-        defer alloc.free(path_buf);
-        const path = std.Uri.percentDecodeInPlace(path_buf);
-        if (maybe_context) |context| return .{ .ok = try downloadFileAllocWithContext(alloc, context, path, security) };
-        return .{ .ok = try downloadFileAlloc(alloc, path, security) };
-    }
-    if (std.ascii.eqlIgnoreCase(parsed.scheme, "s3")) {
-        return .{ .ok = try downloadS3Alloc(alloc, maybe_context, parsed, security, s3_credentials) };
-    }
-    return error.UnsupportedUrlScheme;
 }
 
 pub fn isEmptyContentSecurity(value: ContentSecurityConfig) bool {
@@ -754,6 +768,160 @@ fn allocRemainingBounded(reader: *std.Io.Reader, alloc: Allocator, max_size: usi
     return data;
 }
 
+/// Version-pinned range transport under the same URI, DNS and credential
+/// boundaries as ordinary downloads. No redirects or mutable-object fallback.
+pub const PinnedRange = struct {
+    pub const VersionKind = enum { strong_etag, s3_version_id };
+    allocator: Allocator,
+    context: DownloadContext,
+    security: ?*const ContentSecurityConfig,
+    uri: []u8 = &.{},
+    version: []u8 = &.{},
+    identity: []u8 = &.{},
+    kind: VersionKind,
+    length: u64,
+    bucket: []u8 = &.{},
+    key: []u8 = &.{},
+    backend: ?union(enum) { http: httpx.Client, s3: objectstore.S3.Client } = null,
+    headers: []const HTTPHeader = &.{},
+
+    /// Validate the immutable source contract without allocation, credential
+    /// resolution, transport construction or I/O. Destination policy and
+    /// credentials are checked separately when creating the transport.
+    pub fn validateReference(uri: []const u8, version: []const u8, kind: VersionKind, length: u64) !std.Uri {
+        if (length == 0 or version.len == 0 or version.len > 4096 or uri.len > 16 * 1024) return error.InvalidSourceReference;
+        if (kind == .strong_etag) {
+            if (version.len < 2 or version[0] != '"' or version[version.len - 1] != '"') return error.ImmutableVersionRequired;
+            for (version[1 .. version.len - 1]) |byte| if (byte < 0x21 or byte == 0x22 or byte == 0x7f) return error.ImmutableVersionRequired;
+        } else if (std.mem.eql(u8, version, "null")) return error.ImmutableVersionRequired;
+        const parsed = try std.Uri.parse(uri);
+        if (parsed.user != null or parsed.password != null or parsed.fragment != null) return error.InvalidSourceReference;
+        if (std.ascii.eqlIgnoreCase(parsed.scheme, "http") or std.ascii.eqlIgnoreCase(parsed.scheme, "https")) {
+            if (kind != .strong_etag) return error.InvalidSourceReference;
+            try validateHttpUri(parsed);
+        } else if (std.ascii.eqlIgnoreCase(parsed.scheme, "s3")) {
+            try validateS3Uri(parsed, .{});
+        } else return error.UnsupportedUrlScheme;
+        return parsed;
+    }
+
+    pub fn create(alloc: Allocator, context: DownloadContext, uri: []const u8, version: []const u8, kind: VersionKind, length: u64, security: ?*const ContentSecurityConfig, credentials: ?*const S3CredentialsConfig, headers: []const HTTPHeader) !*PinnedRange {
+        try context.check();
+        if (headers.len > 128) return error.InvalidSourceReference;
+        const parsed = try validateReference(uri, version, kind, length);
+        const self = try alloc.create(PinnedRange);
+        self.* = .{ .allocator = alloc, .context = context, .security = security, .kind = kind, .length = length, .headers = headers };
+        errdefer self.destroy();
+        self.uri = try alloc.dupe(u8, uri);
+        self.version = try alloc.dupe(u8, version);
+        if (std.ascii.eqlIgnoreCase(parsed.scheme, "http") or std.ascii.eqlIgnoreCase(parsed.scheme, "https")) {
+            try validateUrlSecurity(parsed, security);
+            self.identity = try alloc.dupe(u8, uri);
+            for (headers) |header| {
+                if (std.ascii.eqlIgnoreCase(header.name, "Range") or std.ascii.eqlIgnoreCase(header.name, "If-Match") or std.ascii.eqlIgnoreCase(header.name, "Accept-Encoding")) return error.InvalidSourceReference;
+                if (header.credential_base_url) |base| if (!httpUrlMatchesBase(parsed, base)) return error.CredentialUrlMismatch;
+            }
+            self.backend = .{ .http = httpx.Client.initWithConfig(alloc, context.io, httpClientConfig(security)) };
+        } else if (std.ascii.eqlIgnoreCase(parsed.scheme, "s3")) {
+            if (headers.len != 0) return error.InvalidSourceReference;
+            const cfg = credentials orelse return error.MissingS3Credentials;
+            var endpoint = try objectstore.resolveS3EndpointAlloc(alloc, cfg.endpoint orelse return error.MissingEndpoint, cfg.use_ssl orelse true);
+            defer endpoint.deinit(alloc);
+            const bucket, const key = try parseS3LocationAlloc(alloc, parsed, endpoint.endpoint, endpoint.use_ssl);
+            self.bucket = bucket;
+            self.key = key;
+            self.identity = try std.fmt.allocPrint(alloc, "s3:{s}:{s}:{s}/{s}", .{ if (endpoint.use_ssl) "https" else "http", endpoint.endpoint, bucket, key });
+            const joined = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ bucket, key });
+            defer alloc.free(joined);
+            try validateS3PathSecurity(joined, security);
+            var owned = try allocS3Credentials(alloc, endpoint.endpoint, endpoint.use_ssl, cfg);
+            const client = objectstore.S3.Client.initWithHttpContext(alloc, .{ .credentials = owned, .addressing_style = .path }, .{ .io = context.io, .timeout_ms = context.timeout_ms, .client_config = httpClientConfig(security) }) catch |err| {
+                owned.deinit(alloc);
+                return err;
+            };
+            self.backend = .{ .s3 = client };
+        } else return error.UnsupportedUrlScheme;
+        return self;
+    }
+    pub fn destroy(self: *PinnedRange) void {
+        if (self.backend) |*backend| switch (backend.*) {
+            .http => |*client| client.deinit(),
+            .s3 => |*client| client.deinit(),
+        };
+        const a = self.allocator;
+        a.free(self.uri);
+        a.free(self.version);
+        a.free(self.identity);
+        a.free(self.bucket);
+        a.free(self.key);
+        a.destroy(self);
+    }
+    pub fn readAt(self: *PinnedRange, offset: u64, out: []u8) !usize {
+        try self.context.check();
+        if (offset > self.length or out.len == 0 or out.len > self.length - offset) return error.InvalidRemoteRange;
+        if (out.len > maxDownloadSize(self.security)) return error.StreamTooLong;
+        const ceiling = try DownloadCeiling.init(self.context, self.security);
+        switch (self.backend.?) {
+            .http => |*client| {
+                const headers = try self.allocator.alloc([2][]const u8, self.headers.len + 3);
+                defer self.allocator.free(headers);
+                var range: [96]u8 = undefined;
+                headers[0] = .{ "Range", try std.fmt.bufPrint(&range, "bytes={d}-{d}", .{ offset, offset + out.len - 1 }) };
+                headers[1] = .{ "If-Match", self.version };
+                headers[2] = .{ "Accept-Encoding", "identity" };
+                for (self.headers, headers[3..]) |header, *dest| dest.* = .{ header.name, header.value };
+                var response = try client.get(self.uri, .{ .headers = headers, .max_response_size = out.len, .follow_redirects = false, .max_retries = 0, .cookies_enabled = false, .timeout_ms = try ceiling.remainingTimeoutMs(), .cancellation = if (self.context.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null });
+                defer response.deinit();
+                try self.context.check();
+                if (response.status.code == 412) return error.SourceVersionChanged;
+                if (response.status.code != 206) return error.InvalidRemoteRange;
+                if (!std.mem.eql(u8, response.header("ETag") orelse return error.SourceVersionChanged, self.version)) return error.SourceVersionChanged;
+                if (response.header("Content-Encoding")) |encoding| if (!std.ascii.eqlIgnoreCase(encoding, "identity")) return error.InvalidRemoteRange;
+                const body = response.body orelse return error.InvalidRemoteRange;
+                if (body.len != out.len) return error.InvalidRemoteRange;
+                try validatePinnedContentRange(response.header("Content-Range") orelse return error.InvalidRemoteRange, offset, out.len, self.length);
+                @memcpy(out, body);
+            },
+            .s3 => |*client| {
+                var store = client.client();
+                var result = try store.getObject(self.bucket, self.key, .{ .version_id = if (self.kind == .s3_version_id) self.version else null, .if_match_etag = if (self.kind == .strong_etag) self.version else null, .range = .{ .offset = offset, .length = out.len }, .skip_metadata_probe = true, .max_response_bytes = out.len, .cancellation = self.context.cancellation });
+                defer result.deinit(self.allocator);
+                try self.context.check();
+                const range = result.response_range orelse return error.InvalidRemoteRange;
+                if (result.response_status != 206 or range.offset != offset or range.total != self.length or range.length != out.len or result.body.len != out.len) return error.InvalidRemoteRange;
+                if (self.kind == .strong_etag) {
+                    if (!result.response_etag_strong) return error.SourceVersionChanged;
+                    const etag = result.metadata.etag orelse return error.SourceVersionChanged;
+                    const normalized = if (etag.len >= 2 and etag[0] == '"' and etag[etag.len - 1] == '"') etag[1 .. etag.len - 1] else etag;
+                    if (!std.mem.eql(u8, normalized, self.version[1 .. self.version.len - 1])) return error.SourceVersionChanged;
+                } else if (!std.mem.eql(u8, result.metadata.version_id orelse return error.SourceVersionChanged, self.version)) return error.SourceVersionChanged;
+                @memcpy(out, result.body);
+            },
+        }
+        return out.len;
+    }
+};
+fn validatePinnedContentRange(value: []const u8, offset: u64, length: usize, total: u64) !void {
+    if (!std.mem.startsWith(u8, value, "bytes ")) return error.InvalidRemoteRange;
+    var parts = std.mem.splitScalar(u8, value[6..], '/');
+    const endpoints = parts.next() orelse return error.InvalidRemoteRange;
+    const wire_total = std.fmt.parseInt(u64, parts.next() orelse return error.InvalidRemoteRange, 10) catch return error.InvalidRemoteRange;
+    if (parts.next() != null or wire_total != total) return error.InvalidRemoteRange;
+    var range = std.mem.splitScalar(u8, endpoints, '-');
+    const first = std.fmt.parseInt(u64, range.next().?, 10) catch return error.InvalidRemoteRange;
+    const last = std.fmt.parseInt(u64, range.next() orelse return error.InvalidRemoteRange, 10) catch return error.InvalidRemoteRange;
+    if (range.next() != null or first != offset or last < first or last >= total or last - first + 1 != length) return error.InvalidRemoteRange;
+}
+
+/// Structural S3 validation without credentials, allocation or transport I/O.
+/// A template prefix may have a known authority while its key is still open.
+pub fn validateS3Uri(uri: std.Uri, options: struct { complete: bool = true }) !void {
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "s3")) return error.UnsupportedUrlScheme;
+    const host = uri.host orelse return error.InvalidS3Url;
+    if (host.percent_encoded.len == 0) return error.InvalidS3Url;
+    if (options.complete and trimLeftSlash(uri.path.percent_encoded).len == 0) return error.InvalidS3Url;
+}
+
 fn downloadS3Alloc(
     alloc: Allocator,
     maybe_context: ?DownloadContext,
@@ -761,6 +929,7 @@ fn downloadS3Alloc(
     security: ?*const ContentSecurityConfig,
     s3_credentials: ?*const S3CredentialsConfig,
 ) !DownloadedContent {
+    try validateS3Uri(parsed, .{});
     var local_io_impl: ?std.Io.Threaded = if (maybe_context == null)
         std.Io.Threaded.init(alloc, .{})
     else
@@ -873,13 +1042,13 @@ fn parseS3LocationAlloc(
     configured_endpoint: []const u8,
     use_ssl: bool,
 ) !struct { []u8, []u8 } {
-    const host = parsed.host orelse return error.InvalidS3Url;
-    const host_text = host.percent_encoded;
+    try validateS3Uri(parsed, .{});
+    const host_text = parsed.host.?.percent_encoded;
     const path = trimLeftSlash(parsed.path.percent_encoded);
-    if (path.len == 0) return error.InvalidS3Url;
 
     if (try s3AuthorityMatchesEndpoint(alloc, host_text, parsed.port, configured_endpoint, use_ssl)) {
         const slash = std.mem.indexOfScalar(u8, path, '/') orelse return error.InvalidS3Url;
+        if (slash == 0 or slash + 1 == path.len) return error.InvalidS3Url;
         const bucket = try alloc.dupe(u8, path[0..slash]);
         errdefer alloc.free(bucket);
         return .{
@@ -1858,6 +2027,8 @@ const TestHttpResponseServer = struct {
     server: *std.Io.net.Server,
     body: []const u8,
     content_encoding: ?[]const u8,
+    status_code: u16 = 200,
+    extra_headers: []const u8 = "",
     failure: ?anyerror = null,
 
     fn serve(self: *@This()) void {
@@ -1881,10 +2052,9 @@ const TestHttpResponseServer = struct {
 
         var write_buffer: [1024]u8 = undefined;
         var writer = stream.writer(self.io, &write_buffer);
-        writer.interface.writeAll(
-            "HTTP/1.1 200 OK\r\n" ++
-                "Content-Type: text/plain; charset=utf-8\r\n" ++
-                "Connection: close\r\n",
+        writer.interface.print(
+            "HTTP/1.1 {d} OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n{s}",
+            .{ self.status_code, self.extra_headers },
         ) catch |err| {
             self.failure = err;
             return;
@@ -1982,4 +2152,105 @@ test "HTTP download enforces its size limit on decoded bytes" {
         error.StreamTooLong,
         downloadTestHttpResponseAlloc(alloc, &gzip, "gzip", 41),
     );
+}
+
+test "pinned remote ranges enforce immutable length and version without whole object fallback" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const cases = [_]struct { status: u16, headers: []const u8, expected: ?anyerror }{
+        .{ .status = 206, .headers = "ETag: \"v1\"\r\nContent-Range: bytes 2-5/10\r\n", .expected = null },
+        .{ .status = 206, .headers = "ETag: \"v2\"\r\nContent-Range: bytes 2-5/10\r\n", .expected = error.SourceVersionChanged },
+        .{ .status = 206, .headers = "ETag: \"v1\"\r\nContent-Range: bytes 2-5/11\r\n", .expected = error.InvalidRemoteRange },
+        .{ .status = 200, .headers = "ETag: \"v1\"\r\n", .expected = error.InvalidRemoteRange },
+        .{ .status = 412, .headers = "", .expected = error.SourceVersionChanged },
+    };
+    for (cases) |case| {
+        var server = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{});
+        var open = true;
+        defer if (open) server.deinit(io);
+        var fixture = TestHttpResponseServer{ .io = io, .server = &server, .body = "2345", .content_encoding = null, .status_code = case.status, .extra_headers = case.headers };
+        const uri = try std.fmt.allocPrint(a, "http://{f}/blob", .{server.socket.address});
+        defer a.free(uri);
+        var security = ContentSecurityConfig{ .block_private_ips = false };
+        const range = try PinnedRange.create(a, .{ .io = io }, uri, "\"v1\"", .strong_etag, 10, &security, null, &.{});
+        defer range.destroy();
+        var thread = try std.testing.io.concurrent(TestHttpResponseServer.serve, .{&fixture});
+        var out: [4]u8 = undefined;
+        const result = range.readAt(2, &out);
+        server.deinit(io);
+        open = false;
+        thread.await(std.testing.io);
+        if (fixture.failure) |err| return err;
+        if (case.expected) |err| try std.testing.expectError(err, result) else {
+            try std.testing.expectEqual(@as(usize, 4), try result);
+            try std.testing.expectEqualStrings("2345", &out);
+        }
+    }
+}
+
+test "pinned source reference validation is shared and requires no allocator or transport" {
+    const Case = struct {
+        uri: []const u8 = "https://example.org/clip.mp4",
+        version: []const u8 = "\"v1\"",
+        kind: PinnedRange.VersionKind = .strong_etag,
+        length: u64 = 1024,
+        expected: anyerror,
+    };
+    const long_version: [4097]u8 = @splat('x');
+    const long_uri: [16 * 1024 + 1]u8 = @splat('x');
+    const cases = [_]Case{
+        .{ .version = "", .expected = error.InvalidSourceReference },
+        .{ .version = "v1", .expected = error.ImmutableVersionRequired },
+        .{ .version = "W/\"v1\"", .expected = error.ImmutableVersionRequired },
+        .{ .version = "\"bad\"etag\"", .expected = error.ImmutableVersionRequired },
+        .{ .version = "\"bad\netag\"", .expected = error.ImmutableVersionRequired },
+        .{ .version = &long_version, .expected = error.InvalidSourceReference },
+        .{ .uri = &long_uri, .expected = error.InvalidSourceReference },
+        .{ .length = 0, .expected = error.InvalidSourceReference },
+        .{ .kind = .s3_version_id, .expected = error.InvalidSourceReference },
+        .{ .uri = "https://user:password@example.org/clip.mp4", .expected = error.InvalidSourceReference },
+        .{ .uri = "https://example.org/clip.mp4#page=2", .expected = error.InvalidSourceReference },
+        .{ .uri = "data:video/mp4;base64,AQID", .expected = error.UnsupportedUrlScheme },
+        .{ .uri = "gs://bucket/clip.mp4", .expected = error.UnsupportedUrlScheme },
+        .{ .uri = "s3://bucket/clip.mp4", .version = "null", .kind = .s3_version_id, .expected = error.ImmutableVersionRequired },
+        .{ .uri = "s3://bucket", .version = "v1", .kind = .s3_version_id, .expected = error.InvalidS3Url },
+    };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    for (cases) |case| {
+        try std.testing.expectError(case.expected, PinnedRange.validateReference(case.uri, case.version, case.kind, case.length));
+        // Runtime rejects the same contract before allocating or constructing
+        // an HTTP/S3 client; no destination credentials are required here.
+        try std.testing.expectError(case.expected, PinnedRange.create(failing.allocator(), .{ .io = std.testing.io }, case.uri, case.version, case.kind, case.length, null, null, &.{}));
+    }
+    _ = try PinnedRange.validateReference("https://example.org/clip.mp4", "\"v1\"", .strong_etag, 1024);
+    _ = try PinnedRange.validateReference("http://example.org/clip.mp4", "\"\"", .strong_etag, 1024);
+    _ = try PinnedRange.validateReference("s3://bucket/clip.mp4", "v1", .s3_version_id, 1024);
+    _ = try PinnedRange.validateReference("s3://endpoint/bucket/clip.mp4", "\"etag\"", .strong_etag, 1024);
+}
+
+test "S3 URI structure is checked before allocation credentials or transport" {
+    const a = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    for ([_][]const u8{ "s3://bucket", "s3:relative", "s3:///key", "s3://bucket/", "s3://bucket///" }) |text| {
+        const uri = try std.Uri.parse(text);
+        try std.testing.expectError(error.InvalidS3Url, validateS3Uri(uri, .{}));
+        try std.testing.expectError(error.InvalidS3Url, downloadContentAlloc(failing.allocator(), text, null, null));
+        try std.testing.expectError(error.InvalidS3Url, PinnedRange.validateReference(text, "v1", .s3_version_id, 1024));
+    }
+    try validateS3Uri(try std.Uri.parse("s3://bucket/"), .{ .complete = false });
+    try std.testing.expectError(error.InvalidS3Url, validateS3Uri(try std.Uri.parse("s3:///key"), .{ .complete = false }));
+    try validateS3Uri(try std.Uri.parse("s3://bucket/key"), .{});
+    try validateS3Uri(try std.Uri.parse("S3://bucket/key"), .{});
+
+    for ([_][]const u8{ "s3://objects.example.org/bucket", "s3://objects.example.org/bucket/" }) |text| {
+        try std.testing.expectError(error.InvalidS3Url, s3BucketAlloc(a, try std.Uri.parse(text), "https://objects.example.org", true));
+    }
+    // A nonempty key ending in '/' is valid in either addressing style.
+    for ([_][]const u8{ "s3://bucket/folder/", "s3://objects.example.org/bucket/folder/" }) |text| {
+        const bucket = try s3BucketAlloc(a, try std.Uri.parse(text), "https://objects.example.org", true);
+        defer a.free(bucket);
+        try std.testing.expectEqualStrings("bucket", bucket);
+    }
 }
