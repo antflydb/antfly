@@ -549,6 +549,7 @@ pub const storage_internal_keys = @import("storage/internal_keys.zig");
 pub const storage_lite_allocator_v4 = @import("storage/lite/allocator_v4.zig");
 pub const storage_lite_artifact_source = @import("storage/lite/artifact_source.zig");
 pub const storage_lite_backend = @import("storage/lite/backend.zig");
+pub const storage_lite_backup_preflight = @import("storage/lite/backup_preflight.zig");
 pub const storage_lite_benchmark = @import("storage/lite/benchmark.zig");
 pub const storage_lite_bridge = @import("storage/lite/bridge.zig");
 pub const storage_lite_conformance_test = @import("storage/lite/conformance_test.zig");

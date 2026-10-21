@@ -66,6 +66,19 @@ pub const ProducerType = enum {
     extractor,
     decision,
 
+    /// Whether a source template is interpreted as content parts after rendering.
+    /// Copy preserves its output verbatim; document extraction consumes a locator.
+    pub fn rendersTemplateParts(self: ProducerType) bool {
+        return switch (self) {
+            .copy, .document_extraction => false,
+            .generator, .reader, .transcriber, .extractor, .decision => true,
+        };
+    }
+
+    pub fn usesTemplateParts(self: ProducerType, source_template: []const u8) bool {
+        return source_template.len > 0 and self.rendersTemplateParts();
+    }
+
     pub fn parse(text: []const u8) ?ProducerType {
         if (std.mem.eql(u8, text, "decision")) return .decision;
         if (std.mem.eql(u8, text, "copy")) return .copy;

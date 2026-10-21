@@ -113,7 +113,12 @@ pub fn readManifestFromFile(
     source: std.Io.File,
     source_size: u64,
 ) !bundle.ParsedManifest {
+    return readManifestFromFileLimited(alloc, io, source, source_size, backup_codec.max_block_payload_bytes);
+}
+
+pub fn readManifestFromFileLimited(alloc: std.mem.Allocator, io: std.Io, source: std.Io.File, source_size: u64, max_block_bytes: usize) !bundle.ParsedManifest {
     var reader = backup_codec.FileReader.init(io, source, source_size);
+    reader.max_block_bytes = max_block_bytes;
     const header = try reader.readHeader();
     if (header.format_version != backup_codec.format_version)
         return error.BackupArtifactFormatMismatch;
@@ -562,16 +567,20 @@ pub fn extractNativeFileToStagingDirectoryWithBase(
     staging_root: []const u8,
     base: ?NativeBaseBlobSource,
 ) !void {
-    return extractNativeFileToStagingDirectoryOptions(alloc, io, source, source_size, staging_root, base, .none, false);
+    return extractNativeFileToStagingDirectoryOptions(alloc, io, source, source_size, staging_root, base, .none, false, backup_codec.max_block_payload_bytes);
 }
 
 /// Cancellable inspection uses private scratch; existing restore entry points
 /// retain their portable path handling and default directory permissions.
 pub fn extractNativeFileToStagingDirectoryCancellable(alloc: std.mem.Allocator, io: std.Io, source: std.Io.File, source_size: u64, staging_root: []const u8, cancellation: @import("antfly_cancellation").CancellationToken) !void {
-    return extractNativeFileToStagingDirectoryOptions(alloc, io, source, source_size, staging_root, null, cancellation, true);
+    return extractNativeFileToStagingDirectoryCancellableLimited(alloc, io, source, source_size, staging_root, cancellation, backup_codec.max_block_payload_bytes);
 }
 
-fn extractNativeFileToStagingDirectoryOptions(alloc: std.mem.Allocator, io: std.Io, source: std.Io.File, source_size: u64, staging_root: []const u8, base: ?NativeBaseBlobSource, cancellation: @import("antfly_cancellation").CancellationToken, private_scratch: bool) !void {
+pub fn extractNativeFileToStagingDirectoryCancellableLimited(alloc: std.mem.Allocator, io: std.Io, source: std.Io.File, source_size: u64, staging_root: []const u8, cancellation: @import("antfly_cancellation").CancellationToken, max_block_bytes: usize) !void {
+    return extractNativeFileToStagingDirectoryOptions(alloc, io, source, source_size, staging_root, null, cancellation, true, max_block_bytes);
+}
+
+fn extractNativeFileToStagingDirectoryOptions(alloc: std.mem.Allocator, io: std.Io, source: std.Io.File, source_size: u64, staging_root: []const u8, base: ?NativeBaseBlobSource, cancellation: @import("antfly_cancellation").CancellationToken, private_scratch: bool, max_block_bytes: usize) !void {
     try cancellation.check();
     if (pathExists(io, staging_root)) return error.PathAlreadyExists;
     const blob_root = try std.fmt.allocPrint(alloc, "{s}.afb2-blobs", .{staging_root});
@@ -584,6 +593,7 @@ fn extractNativeFileToStagingDirectoryOptions(alloc: std.mem.Allocator, io: std.
 
     const trailer = try readTrailerFromFile(io, source, source_size);
     var reader = backup_codec.FileReader.init(io, source, source_size - bundle.trailer_size);
+    reader.max_block_bytes = max_block_bytes;
     const header = try reader.readHeader();
     if (header.format_version != backup_codec.format_version) return error.BackupArtifactFormatMismatch;
     const manifest_block = try reader.readBlock(alloc);

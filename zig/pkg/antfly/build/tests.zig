@@ -1031,6 +1031,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "AFB2 relationship inventory requires reader version three",
             "document batch round-trip",
             "file reader detects same-size archive replacement between passes",
+            "bounded block readers reject stored payload before allocation and accept exact limits",
             "AFB2 manifest separates representation from snapshot mode",
             "AFB2 manifest rejects ambiguous delta and traversal paths",
             "AFB2 delta base binds inventory and identity to one canonical manifest",
@@ -2725,7 +2726,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, lite_restore_io_tests).step);
     const backup_preflight_tests = b.addTest(.{
         .root_module = lite_native_test_mod,
-        .filters = &.{ "backup preflight", "lite restore staging", "storage.backup_bundle_io.", "storage.backup_bundle." },
+        .filters = &.{ "backup preflight", "canonical JSON", "lite restore staging", "storage.backup_bundle_io.", "storage.backup_bundle." },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("backup-preflight-test", "Verify read-only backup dependency inspection and preparation").dependOn(&addFilteredTestRunArtifact(b, backup_preflight_tests).step);

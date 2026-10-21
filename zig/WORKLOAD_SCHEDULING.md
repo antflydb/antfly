@@ -1531,3 +1531,16 @@ executable recovery RAM/CPU/I/O/dependencies and derived-log quota, DB/execution
 lifetimes and normal required PREPARE drivers remain open. Broader fair/default/
 session/whole-node/tenant/remote rollout remains incomplete. Strong defaults stay
 off, the full objective remains active, and nothing was pushed.
+
+Merged origin/main d2a3003929 (backup preflight) after the writer-guard commit.
+The single enrichment-runtime append conflict preserves both scheduler visibility
+tests and upstream preflight tests. Regenerated engine error names with pinned
+Zig 0.17; removed obsolete UnsupportedFieldPath. Shared native request layouts
+are unchanged by this merge; private ABI epochs remain Native54/storage-owner112.
+Focused backup-preflight, derived-visibility, writer-guard, prepared-effects and
+grouped-source checks plus runtime error/failure identity checks all pass:
+92/92 build steps, 395 test executions, no skips, failures or leaks. All four
+native commands exited zero and source hashes remained unchanged. Evidence:
+post-guards-main-v1.json/log in the cumulative integration receipt directory.
+Full Linux qualification remains waived. Strong defaults and normal required
+PREPARE drivers remain off; the full design is incomplete. No push.
