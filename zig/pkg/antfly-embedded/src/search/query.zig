@@ -2465,12 +2465,25 @@ const BorrowedCount = struct {
                 return left_live - intersection + right_live;
             }
         }
-        // Only visit absent words if the *result* can match with all inputs
-        // empty. An all-documents child intersected with a sparse predicate
-        // does not require walking the entire segment's document universe.
+        // Boolean operations are bitwise: outside the input union their
+        // value equals evaluation on zero inputs. Count a true default from
+        // the live-document cardinality and subtract only sparse exceptions.
+        // Complements therefore never walk absent document-number words.
         const empty_inputs: [64]u64 = @splat(0);
         const universe = self.evaluate(empty_inputs[0..self.pin_count]) != 0;
         if (self.op_count == 1 and self.ops[0] == .all) return count - (if (deleted) |d| d.rangeCardinality(0, count) else 0);
+        if (self.pin_count == 1) {
+            const pin = self.pins[0];
+            if ((pin.bitmap.maximum() orelse 0) < count) {
+                const present = self.evaluate(&.{~@as(u64, 0)}) != 0;
+                const live: usize = if (universe) count - (if (deleted) |d| d.rangeCardinality(0, count) else 0) else 0;
+                // A one-variable Boolean expression is constant, the input,
+                // or its complement. Reuse publication-time cardinality.
+                if (universe == present) return if (universe) live else 0;
+                const matched = (pin.cached_cardinality orelse pin.bitmap.cardinality()) - (if (deleted) |d| pin.bitmap.intersectionCardinality(d) else 0);
+                return if (universe) live - matched else matched;
+            }
+        }
         var iterators: [64]roaring.RoaringBitmap.WordIterator = undefined;
         var current: [64]?roaring.RoaringBitmap.Word = @splat(null);
         for (self.pins[0..self.pin_count], 0..) |pin, i| {
@@ -2479,11 +2492,10 @@ const BorrowedCount = struct {
         }
         var deleted_iterator = if (deleted) |d| d.wordIterator() else null;
         var deleted_word = if (deleted_iterator) |*it| it.next() else null;
-        var universe_base: u64 = 0;
         var total: usize = 0;
         var steps: usize = 0;
         while (true) {
-            var next: u64 = if (universe) universe_base else count;
+            var next: u64 = count;
             for (current[0..self.pin_count]) |word| if (word) |value| {
                 next = @min(next, value.base);
             };
@@ -2500,16 +2512,16 @@ const BorrowedCount = struct {
                     current[i] = iterators[i].next();
                 }
             };
-            var bits = self.evaluate(inputs[0..self.pin_count]);
+            const result = self.evaluate(inputs[0..self.pin_count]);
+            var bits = if (universe) ~result else result;
             while (deleted_word != null and deleted_word.?.base < next) deleted_word = deleted_iterator.?.next();
             if (deleted_word) |word| if (word.base == next) {
                 bits &= ~word.bits;
             };
             if (count - next < 64) bits &= (@as(u64, 1) << @intCast(count - next)) - 1;
             total += @popCount(bits);
-            universe_base = next + 64;
         }
-        return total;
+        return if (universe) (count - (if (deleted) |d| d.rangeCardinality(0, count) else 0)) - total else total;
     }
 };
 
@@ -4777,9 +4789,61 @@ test "logical value borrowed sparse conjunction skips absent universe words" {
     try program.append(.{ .input = 0 });
     try program.append(.intersect);
     try testing.expectEqual(@as(usize, 1), try program.cardinality(std.math.maxInt(u32), null));
-    try testing.expectEqual(@as(usize, 1), steps);
+    try testing.expectEqual(@as(usize, 0), steps);
     program.ops[2] = .subtract;
     steps = 0;
     try testing.expectEqual(@as(usize, 126), try program.cardinality(127, null));
+    try testing.expectEqual(@as(usize, 0), steps);
+    steps = 0;
+    const started = @import("antfly_platform").time.monotonicNs();
+    try testing.expectEqual(@as(usize, std.math.maxInt(u32) - 1), try program.cardinality(std.math.maxInt(u32), null));
+    std.debug.print("SPARSE_COMPLEMENT words={d} elapsed_ns={d}\n", .{ steps, @import("antfly_platform").time.monotonicNs() - started });
+    try testing.expectEqual(@as(usize, 0), steps);
+}
+
+test "logical value borrowed sparse complement counts exceptions and clips deleted ranges" {
+    var left = roaring.RoaringBitmap.init(testing.allocator);
+    defer left.deinit();
+    var right = roaring.RoaringBitmap.init(testing.allocator);
+    defer right.deinit();
+    var deleted = roaring.RoaringBitmap.init(testing.allocator);
+    defer deleted.deinit();
+    for ([_]u32{ 3, 65 }) |id| try left.add(id);
+    for ([_]u32{ 3, 128 }) |id| try right.add(id);
+    for ([_]u32{ 7, 126, 127, std.math.maxInt(u32) }) |id| try deleted.add(id);
+    const Release = struct {
+        fn call(_: [2]*anyopaque) void {}
+    };
+    var steps: usize = 0;
+    var program: BorrowedCount = .{ .word_steps = &steps };
+    program.pin_count = 2;
+    program.pins[0] = .{ .bitmap = &left, .context = .{ &left, &left }, .release = Release.call };
+    program.pins[1] = .{ .bitmap = &right, .context = .{ &right, &right }, .release = Release.call };
+    defer program.deinit();
+    try program.append(.all);
+    try program.append(.{ .input = 0 });
+    try program.append(.{ .input = 1 });
+    try program.append(.intersect);
+    try program.append(.subtract);
+    // NOT(left AND right): absent words match by default; only the
+    // intersection at document 3 differs, even across the full u32 domain.
+    const started = @import("antfly_platform").time.monotonicNs();
+    try testing.expectEqual(@as(usize, std.math.maxInt(u32) - 4), try program.cardinality(std.math.maxInt(u32), &deleted));
+    std.debug.print("SPARSE_BOOLEAN_COMPLEMENT words={d} elapsed_ns={d}\n", .{ steps, @import("antfly_platform").time.monotonicNs() - started });
+    try testing.expectEqual(@as(usize, 3), steps);
+    steps = 0;
+    try testing.expectEqual(@as(usize, 124), try program.cardinality(127, &deleted));
     try testing.expectEqual(@as(usize, 2), steps);
+    try deleted.add(3);
+    try testing.expectEqual(@as(usize, 124), try program.cardinality(127, &deleted));
+    // Exercise the one-input cached-cardinality fast path with deletions,
+    // including deletion IDs outside the current segment's document domain.
+    program.pins[1].deinit();
+    program.pin_count = 1;
+    program.op_count = 3;
+    program.ops[2] = .subtract;
+    program.pins[0].cached_cardinality = 2;
+    steps = 0;
+    try testing.expectEqual(@as(usize, 123), try program.cardinality(127, &deleted));
+    try testing.expectEqual(@as(usize, 0), steps);
 }

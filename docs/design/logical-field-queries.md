@@ -731,9 +731,12 @@ insufficient coverage. Real-server retained-count tests use one and three shards
 and combine conjunction, disjunction, exclusion, nesting and threshold queries.
 
 
-The borrowed Boolean word executor visits absent document words only when the
-completed expression can match with every input bitmap empty. A match-all child
-intersected with a sparse predicate therefore iterates the sparse union of
-nonzero input words. A complement still visits the required universe. A regression
-counts one sparse match in the maximum document-number universe in one word
-step, and checks bounded complement coverage separately.
+The borrowed Boolean word executor evaluates the expression with all inputs
+empty to determine its default value outside the input union. A false default
+counts matching bits; a true default starts from the live-document cardinality
+and subtracts only exceptions within that union. Neither conjunctions nor
+complements walk absent document-number words. One-input expressions reduce to
+constants, the input, or its complement and reuse the publication-time
+cardinality, with compressed deletion intersections when needed. General nested
+negations retain sparse word execution. Regressions cover the maximum u32
+document domain, clipped final words and deletion IDs outside the domain.
