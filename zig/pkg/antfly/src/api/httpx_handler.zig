@@ -18666,3 +18666,295 @@ test "httpx inference gateway deployment disable fences public routes but preser
     config.public_inference.enabled = true;
     try std.testing.expectEqual(@import("kernel_abi.zig").AuthorizationDecision.allowed, try server.authorizeInferenceRequest(.{}, .write));
 }
+
+test "httpx inference gateway preserves framed media through raw and named native tasks" {
+    const State = struct {
+        operation: []const u8 = "",
+        calls: usize = 0,
+        chunk: bool = false,
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            check(context) catch |err| return inference_connection_abi.statusFromError(err);
+            return .ok;
+        }
+        fn check(context: *const inference_connection_abi.InvokeContext) !void {
+            const self: *@This() = @ptrCast(@alignCast(context.target_context));
+            self.calls += 1;
+            try std.testing.expectEqualStrings(self.operation, context.operation.slice());
+            try std.testing.expectEqualStrings(httpx.attachment_envelope.content_type, context.content_type.slice().?);
+            const a = context.allocator.asStd();
+            var envelope = try httpx.attachment_envelope.parseAlloc(a, context.body.slice(), .{});
+            defer envelope.deinit();
+            try std.testing.expectEqual(@as(usize, 1), envelope.attachments.len);
+            try std.testing.expectEqualStrings("image/png", envelope.attachments[0].mime_type);
+            try std.testing.expectEqualStrings("binary\x00payload", envelope.attachments[0].data);
+            const parsed = try std.json.parseFromSlice(std.json.Value, a, envelope.metadata, .{});
+            defer parsed.deinit();
+            const model = if (self.chunk) parsed.value.object.get("config").?.object.get("model").? else parsed.value.object.get("model").?;
+            try std.testing.expectEqualStrings(if (self.chunk) "fixed" else "backend", model.string);
+            context.out_response.* = .{ .status = 200, .body = .{ .ptr = (try a.dupe(u8, "{}")).ptr, .len = 2 } };
+        }
+    };
+    const a = std.testing.allocator;
+    var config = try common_config.Config.parseFromSlice(a,
+        \\{"public_inference":{"enabled":true},"inference_capabilities":{"generators/native":{"images":"supported"}},"chunkers":{"paragraphs":{"provider":"antfly","model":"fixed"}},"extractors":{"entities":{"connection":"local-inference","model":"backend"}},"generators":{"native":{"provider":"antfly","model":"backend"}}}
+    );
+    defer config.deinit();
+    var state: State = .{};
+    var source = AuthStatusSource{};
+    var server = ApiHttpServer.init(a, .{ .node_config = &config, .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &state, .invoke = State.invoke } }, source.iface(), null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    const Case = struct { path: []const u8, operation: []const u8, body: []const u8 };
+    for ([_]Case{
+        .{ .path = "read", .operation = "read", .body = "{\"model\":\"local/backend\",\"images\":[{\"url\":\"attachment:0\"}]}" },
+        .{ .path = "transcribe", .operation = "transcribe", .body = "{\"model\":\"local/backend\",\"audio\":\"attachment:0\"}" },
+        .{ .path = "extract", .operation = "extract", .body = "{\"model\":\"extractors/entities\",\"input\":[{\"type\":\"media\",\"data\":\"attachment:0\",\"mime_type\":\"image/png\"}]}" },
+        .{ .path = "chunk", .operation = "chunk", .body = "{\"model\":\"chunkers/paragraphs\",\"input\":{\"type\":\"media\",\"data\":\"attachment:0\",\"mime_type\":\"image/png\"}}" },
+        .{ .path = "generate", .operation = "generate", .body = "{\"model\":\"generators/native\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"media\",\"data\":\"attachment:0\",\"mime_type\":\"image/png\"}]}]}" },
+    }) |case| {
+        state.operation = case.operation;
+        state.chunk = std.mem.eql(u8, case.path, "chunk");
+        const url = try std.fmt.allocPrint(a, "http://localhost/ai/v1/{s}", .{case.path});
+        defer a.free(url);
+        var request = try httpx.Request.init(a, .POST, url);
+        defer request.deinit();
+        const framed = try httpx.attachment_envelope.encodeAlloc(a, case.body, &.{.{ .mime_type = "image/png", .data = "binary\x00payload" }});
+        defer a.free(framed);
+        request.body = framed;
+        try request.headers.set("content-type", "Application/Vnd.Antfly.Attachments.V1; version=1");
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        const before = state.calls;
+        var response = try handler.gatewayRequestOperation(&ctx, inference_gateway.taskForOperation(case.path).?, case.operation);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        try std.testing.expectEqual(before + 1, state.calls);
+    }
+    try std.testing.expectEqual(@as(usize, 0), server.inferenceAdmissionStats().in_flight);
+}
+
+test "httpx inference gateway generated tasks route nested generator without adding a model" {
+    const Target = struct {
+        calls: usize = 0,
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            check(context) catch |err| return inference_connection_abi.statusFromError(err);
+            return .ok;
+        }
+        fn check(context: *const inference_connection_abi.InvokeContext) !void {
+            const self: *@This() = @ptrCast(@alignCast(context.target_context));
+            self.calls += 1;
+            const a = context.allocator.asStd();
+            const parsed = try std.json.parseFromSlice(std.json.Value, a, context.body.slice(), .{});
+            defer parsed.deinit();
+            try std.testing.expect(!parsed.value.object.contains("model"));
+            const generator = parsed.value.object.get("generator").?.object;
+            try std.testing.expectEqualStrings("backend", generator.get("model").?.string);
+            try std.testing.expectEqualStrings("antfly", generator.get("provider").?.string);
+            try std.testing.expectEqualStrings("verdict_only", parsed.value.object.get("probabilities").?.string);
+            const operation = context.operation.slice();
+            try std.testing.expect(std.mem.eql(u8, operation, "decisions") or std.mem.eql(u8, operation, "extract"));
+            context.out_response.* = .{ .status = 200, .body = .{ .ptr = (try a.dupe(u8, "{}")).ptr, .len = 2 } };
+        }
+    };
+    const a = std.testing.allocator;
+    var config = try common_config.Config.parseFromSlice(a,
+        \\{"public_inference":{"enabled":true},"generators":{"native":{"provider":"antfly","model":"backend"}}}
+    );
+    defer config.deinit();
+    var target: Target = .{};
+    var source = AuthStatusSource{};
+    var server = ApiHttpServer.init(a, .{ .node_config = &config, .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke } }, source.iface(), null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    for ([_][]const u8{ "backend", "local/backend", "generators/native", "connections/local-inference/models/backend" }) |model| {
+        for ([_]bool{ false, true }) |extract| {
+            const body = try std.fmt.allocPrint(a, "{{\"{s}\":\"generated\",\"generator\":{{\"provider\":\"antfly\",\"model\":\"{s}\"}},\"probabilities\":\"verdict_only\",{s}}}", .{ if (extract) "method" else "decision_method", model, if (extract) "\"inputs\":[{\"content\":\"source\"}],\"schema\":{\"entities\":[\"person\"]}" else "\"input\":\"source\",\"questions\":[{\"name\":\"present\",\"type\":\"predicate\",\"instructions\":\"Present?\"}]" });
+            defer a.free(body);
+            var request = try httpx.Request.init(a, .POST, if (extract) "http://localhost/ai/v1/extract" else "http://localhost/ai/v1/decisions");
+            defer request.deinit();
+            request.body = body;
+            var ctx = httpx.Context.init(a, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try handler.gatewayRequest(&ctx, if (extract) .extract else .decide);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 8), target.calls);
+    try std.testing.expectEqual(@as(usize, 0), server.inferenceAdmissionStats().in_flight);
+}
+
+test "httpx inference gateway framed batch rebases each item and rejects unused attachments" {
+    const Target = struct {
+        calls: usize = 0,
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            check(context) catch |err| return inference_connection_abi.statusFromError(err);
+            return .ok;
+        }
+        fn check(context: *const inference_connection_abi.InvokeContext) !void {
+            const self: *@This() = @ptrCast(@alignCast(context.target_context));
+            const a = context.allocator.asStd();
+            var envelope = try httpx.attachment_envelope.parseAlloc(a, context.body.slice(), .{});
+            defer envelope.deinit();
+            try std.testing.expectEqual(@as(usize, 1), envelope.attachments.len);
+            try std.testing.expectEqualStrings(if (self.calls == 0) "first" else "second", envelope.attachments[0].data);
+            const parsed = try std.json.parseFromSlice(std.json.Value, a, envelope.metadata, .{});
+            defer parsed.deinit();
+            const content = parsed.value.object.get("messages").?.array.items[0].object.get("content").?.array.items;
+            try std.testing.expectEqualStrings("attachment:0", content[0].object.get("data").?.string);
+            self.calls += 1;
+            const response = try a.dupe(u8,
+                \\{"id":"test","object":"chat.completion","created":1,"model":"backend","usage":null,"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}
+            );
+            context.out_response.* = .{ .status = 200, .body = .{ .ptr = response.ptr, .len = response.len } };
+        }
+    };
+    const a = std.testing.allocator;
+    var config = try common_config.Config.parseFromSlice(a, "{\"public_inference\":{\"enabled\":true}}");
+    defer config.deinit();
+    var source = AuthStatusSource{};
+    var target: Target = .{};
+    var server = ApiHttpServer.init(a, .{ .node_config = &config, .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke } }, source.iface(), null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    const metadata =
+        \\{"requests":[{"custom_id":"a","body":{"model":"local/backend","messages":[{"role":"user","content":[{"type":"media","mime_type":"image/png","data":"attachment:1"}]}]}},{"custom_id":"b","body":{"model":"local/backend","messages":[{"role":"user","content":[{"type":"media","mime_type":"image/png","data":"attachment:0"}]}]}}]}
+    ;
+    for ([_]bool{ false, true }) |unused| {
+        const attachments = [_]httpx.attachment_envelope.Attachment{ .{ .mime_type = "image/png", .data = "second" }, .{ .mime_type = "image/png", .data = "first" }, .{ .mime_type = "image/png", .data = "unused" } };
+        const framed = try httpx.attachment_envelope.encodeAlloc(a, metadata, attachments[0..if (unused) @as(usize, 3) else 2]);
+        defer a.free(framed);
+        var request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/generate/batch");
+        defer request.deinit();
+        request.body = framed;
+        try request.headers.set("content-type", httpx.attachment_envelope.content_type);
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.gatewayBatch(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, if (unused) 400 else 200), response.status.code);
+        if (!unused) {
+            const parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("summary").?.object.get("succeeded").?.integer);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), target.calls);
+}
+
+test "httpx inference gateway remote generated and framed requests retain credentials and contracts" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const Check = struct {
+        fn generated(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer generator-key", req.header("authorization").?);
+            const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
+            defer parsed.deinit();
+            try std.testing.expect(!parsed.value.object.contains("model"));
+            try std.testing.expectEqualStrings("backend", parsed.value.object.get("generator").?.object.get("model").?.string);
+        }
+        fn framedGenerator(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer generator-key", req.header("authorization").?);
+            try std.testing.expectEqualStrings(httpx.attachment_envelope.content_type, req.header("content-type").?);
+            var envelope = try httpx.attachment_envelope.parseAlloc(std.testing.allocator, req.body, .{});
+            defer envelope.deinit();
+            try std.testing.expectEqualStrings("image", envelope.attachments[0].data);
+        }
+        fn framed(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer inference-key", req.header("authorization").?);
+            try std.testing.expectEqualStrings(httpx.attachment_envelope.content_type, req.header("content-type").?);
+            var envelope = try httpx.attachment_envelope.parseAlloc(std.testing.allocator, req.body, .{});
+            defer envelope.deinit();
+            try std.testing.expectEqual(@as(usize, 1), envelope.attachments.len);
+            try std.testing.expectEqualStrings("image", envelope.attachments[0].data);
+        }
+    };
+    var upstream = try httpx.TestServer.start(a, io_impl.io(), &.{
+        .{ .method = .POST, .path = "/ai/v1/decisions", .assert_request = Check.generated, .respond = .{ .body = "{}" } },
+        .{ .method = .POST, .path = "/ai/v1/read", .assert_request = Check.framed, .respond = .{ .body = "{}" } },
+        .{ .method = .POST, .path = "/ai/v1/generate", .assert_request = Check.framedGenerator, .respond = .{ .body = "{}" } },
+    });
+    defer upstream.deinit();
+    var config = try common_config.Config.parseFromSlice(a, "{\"public_inference\":{\"enabled\":true}}");
+    defer config.deinit();
+    config.inference.api_url = try a.dupe(u8, upstream.baseUrl());
+    config.inference.api_key = try a.dupe(u8, "inference-key");
+    try config.registry.registerGeneratorConfig("native", .{ .provider = .antfly, .model = "backend", .url = "", .api_key = "generator-key" });
+    try config.registry.inference_capabilities.put(a, try a.dupe(u8, "generators/native"), .{ .images = .supported });
+    var source = AuthStatusSource{};
+    var server = ApiHttpServer.init(a, .{ .node_config = &config, .imported_runtime_io = .{ .api = io_impl.io(), .api_network = io_impl.io() } }, source.iface(), null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    const Fiber = struct {
+        fn run(alloc: std.mem.Allocator, test_io: std.Io, handler_ptr: *AntflyApiHandler, failure: *?anyerror) void {
+            execute(alloc, test_io, handler_ptr) catch |err| {
+                failure.* = err;
+            };
+        }
+        fn execute(alloc: std.mem.Allocator, test_io: std.Io, h: *AntflyApiHandler) !void {
+            var request = try httpx.Request.init(alloc, .POST, "http://localhost/ai/v1/decisions");
+            defer request.deinit();
+            request.body = "{\"decision_method\":\"generated\",\"generator\":{\"provider\":\"antfly\",\"model\":\"generators/native\"},\"input\":\"source\",\"questions\":[{\"name\":\"present\",\"type\":\"predicate\",\"instructions\":\"Present?\"}]}";
+            var ctx = httpx.Context.init(alloc, test_io, &request);
+            defer ctx.deinit();
+            var response = try h.gatewayRequest(&ctx, .decide);
+            defer response.deinit();
+            if (response.status.code != 200) std.debug.print("generated response: {s}\n", .{response.body orelse ""});
+            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            const framed = try httpx.attachment_envelope.encodeAlloc(alloc, "{\"model\":\"backend\",\"images\":[{\"url\":\"attachment:0\"}]}", &.{.{ .mime_type = "image/png", .data = "image" }});
+            defer alloc.free(framed);
+            var media_request = try httpx.Request.init(alloc, .POST, "http://localhost/ai/v1/read");
+            defer media_request.deinit();
+            media_request.body = framed;
+            try media_request.headers.set("content-type", httpx.attachment_envelope.content_type);
+            const Sink = struct {
+                bytes: usize = 0,
+                closed: bool = false,
+                fn start(_: ?*anyopaque, status: u16, _: []const u8, _: *const httpx.Headers) !void {
+                    try std.testing.expectEqual(@as(u16, 200), status);
+                }
+                fn write(raw: ?*anyopaque, bytes: []const u8) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw.?));
+                    self.bytes += bytes.len;
+                }
+                fn close(raw: ?*anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw.?));
+                    self.closed = true;
+                }
+            };
+            var sink: Sink = .{};
+            var media_ctx = httpx.Context.init(alloc, test_io, &media_request);
+            media_ctx.stream_delegate = .{ .ptr = &sink, .start = Sink.start, .write = Sink.write, .close = Sink.close };
+            defer media_ctx.deinit();
+            var media_response = try h.gatewayRead(&media_ctx);
+            defer media_response.deinit();
+            if (media_response.status.code != 200) std.debug.print("framed response: {s}\n", .{media_response.body orelse ""});
+            try std.testing.expectEqual(@as(u16, 200), media_response.status.code);
+            try std.testing.expectEqual(@as(usize, 2), sink.bytes);
+            try std.testing.expect(sink.closed);
+            const generation_frame = try httpx.attachment_envelope.encodeAlloc(alloc,
+                \\{"model":"generators/native","messages":[{"role":"user","content":[{"type":"media","mime_type":"image/png","data":"attachment:0"}]}]}
+            , &.{.{ .mime_type = "image/png", .data = "image" }});
+            defer alloc.free(generation_frame);
+            var generation_request = try httpx.Request.init(alloc, .POST, "http://localhost/ai/v1/generate");
+            defer generation_request.deinit();
+            generation_request.body = generation_frame;
+            try generation_request.headers.set("content-type", httpx.attachment_envelope.content_type);
+            var generation_ctx = httpx.Context.init(alloc, test_io, &generation_request);
+            defer generation_ctx.deinit();
+            var generation_response = try h.gatewayGenerate(&generation_ctx);
+            defer generation_response.deinit();
+            if (generation_response.status.code != 200) std.debug.print("framed generation response: {s}\n", .{generation_response.body orelse ""});
+            try std.testing.expectEqual(@as(u16, 200), generation_response.status.code);
+        }
+    };
+    var group = std.Io.Group.init;
+    var failure: ?anyerror = null;
+    try group.concurrent(io_impl.io(), Fiber.run, .{ a, io_impl.io(), &handler, &failure });
+    defer group.cancel(io_impl.io());
+    for (0..3) |_| try upstream.handleOne();
+    try group.await(io_impl.io());
+    if (failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 0), server.inferenceAdmissionStats().in_flight);
+}

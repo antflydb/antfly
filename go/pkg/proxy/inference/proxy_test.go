@@ -6178,3 +6178,67 @@ func TestChainCatalogSupportsScopedLeasesAndExecution(t *testing.T) {
 		t.Fatalf("leased chain execution: %d %s (%d invocations)", response.Code, response.Body.String(), invocations.Load())
 	}
 }
+
+func TestGatewayRequestSelectors(t *testing.T) {
+	for _, test := range []struct{ operation, body, model string }{
+		{"chunk", `{"model":"chunkers/paragraphs","input":"hello"}`, "chunkers/paragraphs"},
+		{"chunk", `{"model":"chunkers/paragraphs","config":{"model":"fixed"}}`, "chunkers/paragraphs"},
+		{"chunk", `{"model":"fixed-bert-tokenizer"}`, "fixed"},
+		{"decide", `{"decision_method":"generated","generator":{"provider":"antfly","model":"generators/native"}}`, "generators/native"},
+		{"extract", `{"method":"generated","generator":{"provider":"antfly","model":"native"}}`, "native"},
+		{"decide", `{"model":"deciders/typed","decision_method":"typed"}`, "deciders/typed"},
+	} {
+		t.Run(test.operation+test.body, func(t *testing.T) {
+			got, err := proxyRequestModel([]byte(test.body), test.operation)
+			if err != nil || got != test.model {
+				t.Fatalf("model=%q, err=%v; want %q", got, err, test.model)
+			}
+		})
+	}
+	for _, test := range []struct{ operation, body string }{
+		{"chunk", `{"model":"","config":{"model":"fixed"}}`},
+		{"chunk", `{"model":null,"config":{"model":"fixed"}}`},
+		{"extract", `{"model":null,"method":"generated","generator":{"model":"native"}}`},
+		{"decide", `{"model":"other","decision_method":"generated","generator":{"model":"native"}}`},
+		{"extract", `{"model":"other","method":"generated","generator":{"model":"native"}}`},
+	} {
+		if _, err := proxyRequestModel([]byte(test.body), test.operation); err == nil {
+			t.Fatalf("accepted conflicting/empty selection: %s", test.body)
+		}
+	}
+}
+
+func TestGatewaySelectorsRouteBySelectedModelAndPreserveEnvelope(t *testing.T) {
+	for _, test := range []struct{ operation, selectionOperation, model, path, body string }{
+		{"chunk", "chunk", "chunkers/paragraphs", "/ai/v1/chunk", `{"model":"chunkers/paragraphs","config":{"model":"fixed"},"input":"hello"}`},
+		{"decide", "generate", "generators/native", "/ai/v1/decisions", `{"decision_method":"generated","generator":{"provider":"antfly","model":"generators/native"},"input":"source","questions":[{"name":"present","type":"predicate","instructions":"Present?"}]}`},
+		{"extract", "generate", "generators/native", "/ai/v1/extract", `{"method":"generated","generator":{"provider":"antfly","model":"generators/native"},"inputs":[{"content":"source"}],"schema":{"entities":["person"]}}`},
+	} {
+		t.Run(test.operation, func(t *testing.T) {
+			p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "default"}, Logger: zap.NewNop()})
+			p.RegisterEndpoint("http://selected", "default", WorkloadTypeGeneral)
+			advertiseModelOperation(p.registry, "http://selected", OperationType(test.selectionOperation), test.model)
+			p.RegisterEndpoint("http://fixed-only", "default", WorkloadTypeGeneral)
+			advertiseModelOperation(p.registry, "http://fixed-only", "chunk", "fixed")
+			calls := 0
+			p.registry.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				calls++
+				if r.URL.Host != "selected" || r.URL.Path != test.path {
+					t.Fatalf("wrong destination: %s", r.URL)
+				}
+				body, err := io.ReadAll(r.Body)
+				if err != nil || string(body) != test.body {
+					t.Fatalf("changed envelope: %s (%v)", body, err)
+				}
+				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{}`)), Request: r}, nil
+			})}
+			r := httptest.NewRequest("POST", test.path, strings.NewReader(test.body))
+			r.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			p.proxyRequest(w, r, test.operation)
+			if w.Code != 200 || calls != 1 {
+				t.Fatalf("status=%d calls=%d body=%s", w.Code, calls, w.Body)
+			}
+		})
+	}
+}

@@ -21,6 +21,7 @@ const registry = sources.common_provider_registry;
 const gateway = registry.gateway;
 const tasks = registry.tasks;
 const Json = std.json.Value;
+const payloads = @import("inference_payload.zig");
 const empty_registry = registry.Registry.init(std.heap.page_allocator);
 const generating = sources.generating_mod;
 
@@ -67,6 +68,7 @@ const ExecutionOptions = struct {
     response_delivery: enum { direct, buffered } = .direct,
     attempt_limit: u8 = 8,
     operation: ?[]const u8 = null,
+    attachments: ?[]const httpx.attachment_envelope.Attachment = null,
 };
 
 pub fn session(server: anytype, ctx: *httpx.Context, principal: []const u8, method: @import("antfly_runtime_abi").http_abi.HttpMethod, action: []const u8) !httpx.Response {
@@ -319,9 +321,12 @@ fn executeBounded(server: anytype, ctx: *httpx.Context, task: gateway.Task, back
     var arena = std.heap.ArenaAllocator.init(backing);
     defer arena.deinit();
     const a = arena.allocator();
-    const body = (try ctx.body()) orelse return error.InvalidInferenceRequest;
-    const request = try std.json.parseFromSliceLeaky(Json, a, body, .{});
+    const payload = try payloads.Payload.parse(a, ctx);
+    var execution = options;
+    execution.attachments = payload.attachments;
+    const request = payload.value;
     if (request != .object) return error.InvalidInferenceRequest;
+    if (try generatedSelector(task, request)) |model| return executeGenerated(server, ctx, task, a, request, model, execution);
     var effective = request;
     if (task == .chunk and !effective.object.contains("model")) {
         const config = effective.object.get("config") orelse Json{ .object = .empty };
@@ -332,8 +337,82 @@ fn executeBounded(server: anytype, ctx: *httpx.Context, task: gateway.Task, back
     const named = try view(server);
     const raw_models = if (std.mem.indexOfScalar(u8, model, '/') == null or named.contains(task, model)) try localModels(a, server, task) else &.{};
     const target = try named.resolve(task, model, raw_models);
-    if (target == .configured and target.configured.chain) return executeChain(server, ctx, a, request, named, target.configured.name, options);
-    return executeResolved(server, ctx, task, a, effective, named, target, null, false, 1, options);
+    if (target == .configured and target.configured.chain) return executeChain(server, ctx, a, request, named, target.configured.name, execution);
+    return executeResolved(server, ctx, task, a, effective, named, target, null, false, 1, execution);
+}
+
+fn generatedSelector(task: gateway.Task, request: Json) !?[]const u8 {
+    const field = switch (task) {
+        .decide => "decision_method",
+        .extract => "method",
+        else => return null,
+    };
+    const method = request.object.get(field) orelse return null;
+    if (method != .string) return error.InvalidInferenceRequest;
+    if (!std.mem.eql(u8, method.string, "generated")) return null;
+    if (request.object.contains("model")) return error.InvalidInferenceRequest;
+    const generator = request.object.get("generator") orelse return error.InvalidInferenceRequest;
+    if (generator != .object) return error.InvalidInferenceRequest;
+    return try string(generator.object.get("model") orelse return error.ModelRequired);
+}
+
+// Generated task envelopes select a generator, not a decider/extractor model.
+// Keep their native contract intact, including constrained-output admission.
+fn executeGenerated(server: anytype, ctx: *httpx.Context, task: gateway.Task, a: std.mem.Allocator, request: Json, model: []const u8, options: ExecutionOptions) !httpx.Response {
+    const named = try view(server);
+    const raw_models = if (std.mem.indexOfScalar(u8, model, '/') == null or named.contains(.generate, model)) try localModels(a, server, .generate) else &.{};
+    const target = try named.resolve(.generate, model, raw_models);
+    var destination: []const u8 = if (server.cfg.local_inference_connection_target != null) sources.common_config.local_inference_connection_id else sources.common_config.default_inference_connection_id;
+    var backend: []const u8 = undefined;
+    var endpoint: ?[]const u8 = null;
+    var api_key: ?[]const u8 = null;
+    switch (target) {
+        .local => |local| {
+            if (local.explicit and server.cfg.local_inference_connection_target == null) return error.ModelNotFound;
+            backend = local.model;
+        },
+        .connection => |connection| {
+            if (server.cfg.node_config) |config| if (config.connections.get(connection.connection)) |configured| {
+                if (configured.kind != .inference or configured.inference == null or !std.mem.eql(u8, configured.inference.?.provider, "antfly")) return error.UnsupportedInferenceFeature;
+            };
+            backend = connection.model;
+            destination = connection.connection;
+        },
+        .configured => |configured| {
+            if (configured.chain) return error.UnsupportedInferenceFeature;
+            const cfg = try named.providers.getGeneratorConfig(configured.name);
+            if (cfg.provider != .antfly or cfg.rate_limit != null) return error.UnsupportedInferenceFeature;
+            backend = cfg.model;
+            if (cfg.url.len != 0) endpoint = cfg.url;
+            api_key = cfg.api_key;
+            if (endpoint == null and server.cfg.local_inference_connection_target == null) {
+                if (server.cfg.node_config) |config| endpoint = config.inference.api_url;
+                api_key = api_key orelse server.cfg.inference_api_key orelse if (server.cfg.node_config) |config| config.inference.api_key else null;
+            }
+        },
+    }
+    var generator = request.object.get("generator").?;
+    try generator.object.put(a, "model", .{ .string = backend });
+    var adapted = request;
+    try adapted.object.put(a, "generator", generator);
+    const encoded = try std.json.Stringify.valueAlloc(a, adapted, .{});
+    var observation = tasks.Observation{
+        .allocator = a,
+        .request_id = ctx.response.headers.get("x-request-id") orelse try requestId(server, ctx, a),
+        .requested = model,
+        .resolved = try target.idAlloc(a),
+        .backend_model = backend,
+        .executor = "antfly",
+        .task = if (task == .decide) "decide" else "extract",
+        .attempt = 1,
+        .started_ns = @import("antfly_platform").time.monotonicNs(),
+    };
+    defer observation.finish();
+    const operation = if (task == .decide) "decisions" else "extract";
+    return (if (endpoint) |url| forwardEndpoint(server, ctx, url, api_key, operation, encoded, false, &observation, options) else forward(server, ctx, destination, operation, encoded, false, &observation, options)) catch |err| {
+        observation.failure = @errorName(err);
+        return err;
+    };
 }
 
 fn executeResolved(server: anytype, ctx: *httpx.Context, task: gateway.Task, a: std.mem.Allocator, request: Json, named: gateway.View, target: gateway.Target, generator_override: ?generating.GeneratorConfig, fallback: bool, attempt: u8, options: ExecutionOptions) anyerror!httpx.Response {
@@ -352,7 +431,8 @@ fn executeResolved(server: anytype, ctx: *httpx.Context, task: gateway.Task, a: 
     return response;
 }
 
-fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task, a: std.mem.Allocator, request: Json, named: gateway.View, target: gateway.Target, generator_override: ?generating.GeneratorConfig, fallback: bool, observation: *tasks.Observation, execution_options: ExecutionOptions) anyerror!httpx.Response {
+fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task, a: std.mem.Allocator, raw_request: Json, named: gateway.View, target: gateway.Target, generator_override: ?generating.GeneratorConfig, fallback: bool, observation: *tasks.Observation, execution_options: ExecutionOptions) anyerror!httpx.Response {
+    var request = raw_request;
     const model = try string(request.object.get("model") orelse return error.ModelRequired);
     if (target == .connection) if (server.cfg.node_config) |config| if (config.connections.get(target.connection.connection)) |connection| {
         if (connection.kind != .inference) return error.ConnectionNotInference;
@@ -406,7 +486,7 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
         if (!config.object.contains("text")) try config.object.put(a, "text", try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, cfg.text, .{}), .{}));
         try forwarded.object.put(a, "config", config);
         const encoded = try std.json.Stringify.valueAlloc(a, forwarded, .{});
-        if (cfg.api_url.len > 0) return forwardEndpoint(server, ctx, cfg.api_url, null, "chunk", encoded, observation);
+        if (cfg.api_url.len > 0) return forwardEndpoint(server, ctx, cfg.api_url, null, "chunk", encoded, false, observation, execution_options);
         return forward(server, ctx, if (server.cfg.local_inference_connection_target != null) sources.common_config.local_inference_connection_id else sources.common_config.default_inference_connection_id, "chunk", encoded, false, observation, execution_options);
     }
     if (task == .transcribe) {
@@ -417,6 +497,24 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
             return forward(server, ctx, try std.fmt.allocPrint(a, "transcribers/{s}", .{target.configured.name}), operation, encoded, false, observation, execution_options);
         }
     }
+    if (task == .generate and execution_options.attachments != null) {
+        var cfg = generator_override orelse try named.providers.getGeneratorConfig(target.configured.name);
+        if (cfg.provider == .antfly) {
+            if (cfg.url.len == 0 and server.cfg.local_inference_connection_target == null) {
+                if (server.cfg.node_config) |config| {
+                    if (config.inference.api_url) |url| cfg.url = try gateway.apiBaseAlloc(a, url);
+                    cfg.api_key = cfg.api_key orelse server.cfg.inference_api_key orelse config.inference.api_key;
+                }
+            }
+            if (cfg.rate_limit != null) return error.UnsupportedLocalRateLimit;
+            _ = try std.json.parseFromValue(@import("inference_api").GenerateRequest, a, request, .{});
+            try named.capabilities(target).require(try tasks.chatRequirements(request));
+            const body = try tasks.chatBody(a, try tasks.withGenerationOptions(cfg, try generationOptions(a, request)), request);
+            if (cfg.url.len != 0) return forwardEndpoint(server, ctx, cfg.url, cfg.api_key, execution_options.operation orelse "generate", body, fallback, observation, execution_options);
+            return forward(server, ctx, if (server.cfg.local_inference_connection_target != null) sources.common_config.local_inference_connection_id else sources.common_config.default_inference_connection_id, execution_options.operation orelse "generate", body, fallback, observation, execution_options);
+        }
+    }
+    if (execution_options.attachments) |attachments| request = try inlineTaskAttachments(a, task, request, attachments);
     const caller_owns_admission = if (generator_override) |cfg| !(cfg.provider == .antfly and cfg.url.len == 0 and server.antfly_provider != null and server.antfly_provider.?.owns_invocation_admission) else !try ownsLocalAdmission(server, named, target.configured.task, target.configured.name);
     if (caller_owns_admission and !server.tryAcquireInference()) return error.InferenceCapacityUnavailable;
     defer if (caller_owns_admission) server.releaseInference();
@@ -727,6 +825,93 @@ const PreparedGeneration = struct {
 // Shared qualification for direct requests and whole-chain preflight. Keep
 // native schema validation, adapter option support, and typed message parsing
 // together so fallback cannot discover invalid input after a provider call.
+// Typed hosted adapters use their existing inline-media contracts. Native
+// transports above keep borrowed attachments in their original wire format.
+fn inlineTaskAttachments(a: std.mem.Allocator, task: gateway.Task, request: Json, attachments: []const httpx.attachment_envelope.Attachment) !Json {
+    var adapted = request;
+    const State = struct {
+        a: std.mem.Allocator,
+        attachments: []const httpx.attachment_envelope.Attachment,
+        seen: []bool,
+        chat: bool,
+
+        fn take(self: *@This(), value: Json) !?httpx.attachment_envelope.Attachment {
+            if (value != .string) return error.InvalidInferenceRequest;
+            const index = (try payloads.attachmentIndex(value.string)) orelse return null;
+            if (index >= self.attachments.len or self.seen[index]) return error.InvalidInferenceRequest;
+            self.seen[index] = true;
+            return self.attachments[index];
+        }
+        fn media(self: *@This(), value: *Json) anyerror!void {
+            switch (value.*) {
+                .array => |items| for (items.items) |*item| try self.media(item),
+                .object => |object| {
+                    if (object.get("type")) |kind| if (kind == .string and std.mem.eql(u8, kind.string, "media")) {
+                        const data = object.getPtr("data") orelse return error.InvalidInferenceRequest;
+                        if (try self.take(data.*)) |attachment| {
+                            const mime = object.get("mime_type") orelse return error.InvalidInferenceRequest;
+                            if (mime != .string or !std.ascii.eqlIgnoreCase(mime.string, attachment.mime_type)) return error.InvalidInferenceRequest;
+                            data.* = .{ .string = try payloads.base64(self.a, attachment.data) };
+                        }
+                        if (self.chat) {
+                            const mime = object.get("mime_type") orelse return error.InvalidInferenceRequest;
+                            if (mime != .string or data.* != .string or !std.mem.startsWith(u8, mime.string, "image/")) return error.UnsupportedInferenceFeature;
+                            var image: Json = .{ .object = .empty };
+                            try image.object.put(self.a, "url", .{ .string = try std.fmt.allocPrint(self.a, "data:{s};base64,{s}", .{ mime.string, data.string }) });
+                            value.* = .{ .object = .empty };
+                            try value.object.put(self.a, "type", .{ .string = "image_url" });
+                            try value.object.put(self.a, "image_url", image);
+                        }
+                        return;
+                    };
+                    if (object.get("image_url")) |image| if (image == .object) {
+                        const url = image.object.getPtr("url") orelse return error.InvalidInferenceRequest;
+                        if (try self.take(url.*)) |attachment| url.* = .{ .string = try payloads.dataUri(self.a, attachment) };
+                    };
+                    inline for (.{ "messages", "content", "input", "documents", "prompts" }) |field| if (object.getPtr(field)) |child| try self.media(child);
+                },
+                else => {},
+            }
+        }
+    };
+    const seen = try a.alloc(bool, attachments.len);
+    @memset(seen, false);
+    var state = State{ .a = a, .attachments = attachments, .seen = seen, .chat = task == .generate };
+    switch (task) {
+        .generate, .embed, .rerank => try state.media(&adapted),
+        .read => {
+            const images = request.object.get("images") orelse return error.InvalidInferenceRequest;
+            if (images != .array) return error.InvalidInferenceRequest;
+            for (images.array.items) |*image| {
+                const url = if (image.* == .object) image.object.getPtr("url") orelse return error.InvalidInferenceRequest else image;
+                if (try state.take(url.*)) |attachment| url.* = .{ .string = try payloads.dataUri(a, attachment) };
+            }
+        },
+        .transcribe => {
+            const audio = request.object.get("audio") orelse return error.InvalidInferenceRequest;
+            if (try state.take(audio)) |attachment| {
+                const object = &adapted.object;
+                if (object.contains("url")) return error.InvalidInferenceRequest;
+                _ = object.swapRemove("audio");
+                try object.put(a, "url", .{ .string = try payloads.dataUri(a, attachment) });
+            }
+        },
+        else => return error.UnsupportedInferenceFeature,
+    }
+    for (seen) |used| if (!used) return error.InvalidInferenceRequest;
+    return adapted;
+}
+
+fn generationOptions(a: std.mem.Allocator, request: Json) !tasks.GenerationOptions {
+    return .{
+        .max_tokens = if (request.object.get("max_tokens")) |v| try integer(v) else null,
+        .max_completion_tokens = if (request.object.get("max_completion_tokens")) |v| try integer(v) else null,
+        .temperature = if (request.object.get("temperature")) |v| @floatCast(try number(v)) else null,
+        .tools_json = if (request.object.get("tools")) |v| try std.json.Stringify.valueAlloc(a, v, .{}) else null,
+        .tool_choice_json = if (request.object.get("tool_choice")) |v| try std.json.Stringify.valueAlloc(a, v, .{}) else null,
+    };
+}
+
 fn prepareGeneration(a: std.mem.Allocator, cfg: generating.GeneratorConfig, request: Json, operation: []const u8) !PreparedGeneration {
     if (cfg.provider == .antfly and std.mem.eql(u8, operation, "generate")) {
         _ = try std.json.parseFromValue(@import("inference_api").GenerateRequest, a, request, .{});
@@ -737,13 +922,7 @@ fn prepareGeneration(a: std.mem.Allocator, cfg: generating.GeneratorConfig, requ
     if (!rich_adapter) try only(request, &.{ "model", "messages", "stream", "max_tokens", "max_completion_tokens", "temperature", "tools", "tool_choice" });
     if (!rich_adapter and (requirements.streaming or requirements.structured_output or requirements.images or requirements.audio)) return error.UnsupportedInferenceFeature;
     const messages = try tasks.chatMessages(a, request);
-    const options = tasks.GenerationOptions{
-        .max_tokens = if (request.object.get("max_tokens")) |v| try integer(v) else null,
-        .max_completion_tokens = if (request.object.get("max_completion_tokens")) |v| try integer(v) else null,
-        .temperature = if (request.object.get("temperature")) |v| @floatCast(try number(v)) else null,
-        .tools_json = if (request.object.get("tools")) |v| try std.json.Stringify.valueAlloc(a, v, .{}) else null,
-        .tool_choice_json = if (request.object.get("tool_choice")) |v| try std.json.Stringify.valueAlloc(a, v, .{}) else null,
-    };
+    const options = try generationOptions(a, request);
     const configured = try tasks.withGenerationOptions(cfg, options);
     if (rich_adapter) try tasks.validateChatConfig(configured);
     return .{ .config = configured, .requirements = requirements, .messages = messages, .options = options };
@@ -810,8 +989,8 @@ pub fn batch(server: anytype, ctx: *httpx.Context) !httpx.Response {
     var arena = std.heap.ArenaAllocator.init(budget.allocator());
     defer arena.deinit();
     const a = arena.allocator();
-    const body = (try ctx.body()) orelse return error.InvalidInferenceRequest;
-    const request = try std.json.parseFromSliceLeaky(Json, a, body, .{});
+    const payload = try payloads.Payload.parse(a, ctx);
+    const request = payload.value;
     try only(request, &.{ "mode", "requests" });
     if (request.object.get("mode")) |mode| if (!std.mem.eql(u8, try string(mode), "sync")) return error.UnsupportedInferenceFeature;
     const items = request.object.get("requests") orelse return error.InvalidInferenceRequest;
@@ -824,6 +1003,13 @@ pub fn batch(server: anytype, ctx: *httpx.Context) !httpx.Response {
         if (value != .object or !value.object.contains("model")) return error.ModelRequired;
         if (value.object.get("stream")) |stream| if (stream != .bool or stream.bool) return error.UnsupportedInferenceFeature;
     }
+    const item_payloads = try a.alloc(payloads.Payload, items.array.items.len);
+    if (payload.attachments) |attachments| {
+        const seen = try a.alloc(bool, attachments.len);
+        @memset(seen, false);
+        for (items.array.items, item_payloads) |item, *out| out.* = try payloads.batchItem(a, item.object.get("body").?, attachments, seen);
+        for (seen) |used| if (!used) return error.InvalidInferenceRequest;
+    } else for (items.array.items, item_payloads) |item, *out| out.* = .{ .value = item.object.get("body").? };
     const Result = struct { custom_id: []const u8, index: usize, response: ?Json = null, @"error": ?struct { code: []const u8, message: []const u8, retryable: bool } = null };
     const results = try a.alloc(Result, items.array.items.len);
     var succeeded: usize = 0;
@@ -835,7 +1021,8 @@ pub fn batch(server: anytype, ctx: *httpx.Context) !httpx.Response {
         if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.Timeout;
         var item_request = try httpx.Request.init(a, .POST, "http://gateway/ai/v1/generate");
         defer item_request.deinit();
-        item_request.body = try std.json.Stringify.valueAlloc(a, item.object.get("body").?, .{});
+        item_request.body = try item_payloads[index].encode(a);
+        try item_request.headers.set("content-type", item_payloads[index].contentType());
         var item_context = httpx.Context.init(a, ctx.io, &item_request);
         defer item_context.deinit();
         item_context.application_deadline_ns = deadline;
@@ -1125,7 +1312,11 @@ fn forward(server: anytype, ctx: *httpx.Context, connection: []const u8, operati
     var transport = bridge.Outbound{ .context = ctx };
     const observed = observation.stream(transport.stream());
     var guard = tasks.FallbackSink{ .downstream = observed };
-    var result = server.invokeInferenceConnection(ctx.allocator, connection, operation, body, cancellation, @min(connections.inferenceInvocationDeadlineNs(), ctx.application_deadline_ns orelse std.math.maxInt(u64)), if (options.response_delivery == .buffered) .{} else if (fallback) guard.sink() else observed) catch |err| {
+    const encoded = try payloads.encodeMetadata(ctx.allocator, body, options.attachments);
+    defer if (options.attachments != null) ctx.allocator.free(encoded);
+    var client = httpx.Client.initWithConfig(ctx.allocator, server.inferenceIo(), .{ .keep_alive = false });
+    defer client.deinit();
+    var result = connections.invokeInferenceConnectionWithRequest(ctx.allocator, &client, server.cfg.node_config, server.cfg.local_inference_connection_target, server.cfg.secret_store, connection, operation, encoded, cancellation, @min(connections.inferenceInvocationDeadlineNs(), ctx.application_deadline_ns orelse std.math.maxInt(u64)), if (options.response_delivery == .buffered) .{} else if (fallback) guard.sink() else observed, .post, .{ .content_type = if (options.attachments != null) httpx.attachment_envelope.content_type else "application/json" }) catch |err| {
         if (transport.started or guard.committed) return error.InferenceResponseCommitted;
         return guard.failure orelse err;
     };
@@ -1141,7 +1332,7 @@ fn forward(server: anytype, ctx: *httpx.Context, connection: []const u8, operati
     return ctx.response.build();
 }
 
-fn forwardEndpoint(server: anytype, ctx: *httpx.Context, endpoint: []const u8, api_key: ?[]const u8, operation: []const u8, body: []const u8, observation: *tasks.Observation) !httpx.Response {
+fn forwardEndpoint(server: anytype, ctx: *httpx.Context, endpoint: []const u8, api_key: ?[]const u8, operation: []const u8, body: []const u8, fallback: bool, observation: *tasks.Observation, execution_options: ExecutionOptions) !httpx.Response {
     if (!server.tryAcquireInference()) return error.InferenceCapacityUnavailable;
     defer server.releaseInference();
     const a = ctx.allocator;
@@ -1169,8 +1360,11 @@ fn forwardEndpoint(server: anytype, ctx: *httpx.Context, endpoint: []const u8, a
     try headers.append(a, .{ "X-Antfly-Inference-Attempts-Remaining", "1" });
     try headers.append(a, .{ "X-Antfly-Inference-Timeout-Ms", timeout_header });
     if (authorization) |value| try headers.append(a, .{ "Authorization", value });
+    const encoded = try payloads.encodeMetadata(a, body, execution_options.attachments);
+    defer if (execution_options.attachments != null) a.free(encoded);
+    try headers.append(a, .{ "Content-Type", if (execution_options.attachments != null) httpx.attachment_envelope.content_type else "application/json" });
     const options = httpx.RequestOptions{
-        .json = body,
+        .body = encoded,
         .headers = headers.items,
         .timeout_ms = timeout_ms,
         .cancellation = cancellation,
@@ -1183,10 +1377,11 @@ fn forwardEndpoint(server: anytype, ctx: *httpx.Context, endpoint: []const u8, a
     const streaming = if (parsed.value.object.get("stream")) |value| value == .bool and value.bool else false;
     if (streaming) {
         var transport = @import("antfly_runtime_abi").http_bridge.Outbound{ .context = ctx };
-        var writer = tasks.StreamWriter{ .sink = observation.stream(transport.stream()) };
+        var guard = tasks.FallbackSink{ .downstream = observation.stream(transport.stream()) };
+        var writer = tasks.StreamWriter{ .sink = if (fallback) guard.sink() else guard.downstream };
         var response = client.requestToWriter(.POST, url, options, &writer, null, null) catch |err| {
-            if (transport.started) return error.InferenceResponseCommitted;
-            return err;
+            if (transport.started or guard.committed) return error.InferenceResponseCommitted;
+            return guard.failure orelse err;
         };
         defer response.deinit();
         writer.close() catch |err| {
@@ -1197,6 +1392,9 @@ fn forwardEndpoint(server: anytype, ctx: *httpx.Context, endpoint: []const u8, a
     }
     var response = try client.post(url, options);
     defer response.deinit();
+    observation.status = response.status.code;
+    if (response.body) |bytes| observation.usage(bytes);
+    if (fallback) if (gateway.transientStatus(response.status.code)) |failure| return failure;
     _ = ctx.status(response.status.code);
     if (response.header("retry-after")) |value| try ctx.setHeader("retry-after", value);
     try ctx.setHeader("content-type", response.contentType() orelse "application/json");
@@ -1405,4 +1603,27 @@ test "httpx inference gateway rejects elapsed or malformed session expiries befo
         const response = try parseSessionResponse(a, body);
         try std.testing.expectError(error.InvalidInferenceResponse, sessionLifetime(response, 500, 100 * std.time.ns_per_s, 2 * std.time.ns_per_s));
     }
+}
+
+test "httpx inference gateway framed typed adapters inline only media references" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const attachments: []const httpx.attachment_envelope.Attachment = &.{.{ .mime_type = "image/png", .data = "image" }};
+    const read = try std.json.parseFromSliceLeaky(Json, a, "{\"model\":\"readers/ocr\",\"images\":[{\"url\":\"attachment:0\"}]}", .{});
+    const adapted_read = try inlineTaskAttachments(a, .read, read, attachments);
+    try std.testing.expectEqualStrings("data:image/png;base64,aW1hZ2U=", adapted_read.object.get("images").?.array.items[0].object.get("url").?.string);
+    const embed = try std.json.parseFromSliceLeaky(Json, a, "{\"model\":\"embedders/dense\",\"input\":[{\"type\":\"text\",\"text\":\"attachment:0\"},{\"type\":\"media\",\"mime_type\":\"image/png\",\"data\":\"attachment:0\"}]}", .{});
+    const adapted_embed = try inlineTaskAttachments(a, .embed, embed, attachments);
+    try std.testing.expectEqualStrings("attachment:0", adapted_embed.object.get("input").?.array.items[0].object.get("text").?.string);
+    const parts = try tasks.embeddingParts(a, adapted_embed.object.get("input").?);
+    try std.testing.expectEqualStrings("image", parts[1].binary.data);
+    const audio = try std.json.parseFromSliceLeaky(Json, a, "{\"model\":\"transcribers/speech\",\"audio\":\"attachment:0\"}", .{});
+    const adapted_audio = try inlineTaskAttachments(a, .transcribe, audio, &.{.{ .mime_type = "audio/flac", .data = "audio" }});
+    try std.testing.expect(!adapted_audio.object.contains("audio"));
+    try std.testing.expectEqualStrings("data:audio/flac;base64,YXVkaW8=", adapted_audio.object.get("url").?.string);
+    const invalid = try std.json.parseFromSliceLeaky(Json, a, "{\"images\":[{\"url\":\"attachment:1\"}]}", .{});
+    try std.testing.expectError(error.InvalidInferenceRequest, inlineTaskAttachments(a, .read, invalid, attachments));
+    const unused = try std.json.parseFromSliceLeaky(Json, a, "{\"images\":[{\"url\":\"https://example.com/image\"}]}", .{});
+    try std.testing.expectError(error.InvalidInferenceRequest, inlineTaskAttachments(a, .read, unused, attachments));
 }

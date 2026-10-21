@@ -4820,7 +4820,13 @@ func (p *Proxy) proxyRequestWithReplayBody(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	lease, err := p.acquireRequestResolution(r.Context(), OperationType(operation), model, routing)
+	selectionOperation := OperationType(operation)
+	if generatedProxyRequest(routingPayload, operation) {
+		// Placement follows the generator inventory; the original task URL and
+		// body remain unchanged during forwarding.
+		selectionOperation = "generate"
+	}
+	lease, err := p.acquireRequestResolution(r.Context(), selectionOperation, model, routing)
 	if err != nil {
 		if writeResolutionError(w, err) {
 			return
@@ -5157,15 +5163,55 @@ func readProxyRequestBody(reader io.Reader, contentLength, maxBytes int64) ([]by
 	}
 }
 
+func generatedProxyRequest(body []byte, operation string) bool {
+	var request struct {
+		DecisionMethod string `json:"decision_method"`
+		Method         string `json:"method"`
+	}
+	if operation != "decide" && operation != "extract" {
+		return false
+	}
+	if json.Unmarshal(body, &request) != nil {
+		return false
+	}
+	return (operation == "decide" && request.DecisionMethod == "generated") || (operation == "extract" && request.Method == "generated")
+}
+
 func proxyRequestModel(body []byte, operation string) (string, error) {
+	if generatedProxyRequest(body, operation) {
+		var request struct {
+			Model     json.RawMessage `json:"model"`
+			Generator struct {
+				Model string `json:"model"`
+			} `json:"generator"`
+		}
+		if err := json.Unmarshal(body, &request); err != nil {
+			return "", err
+		}
+		if len(request.Model) != 0 {
+			return "", errors.New("generated requests select generator.model")
+		}
+		return strings.TrimSpace(request.Generator.Model), nil
+	}
 	if operation == "chunk" {
 		var request struct {
+			Model  json.RawMessage `json:"model"`
 			Config *struct {
 				Model string `json:"model"`
 			} `json:"config"`
 		}
 		if err := json.Unmarshal(body, &request); err != nil {
 			return "", err
+		}
+		if len(request.Model) != 0 {
+			var model string
+			if err := json.Unmarshal(request.Model, &model); err != nil {
+				return "", err
+			}
+			if strings.TrimSpace(model) == "" {
+				return "", errors.New("model must not be empty")
+			}
+			return canonicalChunkModel(model), nil
 		}
 		if request.Config == nil || strings.TrimSpace(request.Config.Model) == "" {
 			return "fixed", nil

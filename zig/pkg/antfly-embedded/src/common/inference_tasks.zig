@@ -374,7 +374,11 @@ pub fn chatRequirements(request: Json) !gateway.Requirements {
                 if (part != .object) return error.InvalidInferenceRequest;
                 const kind = part.object.get("type") orelse return error.InvalidInferenceRequest;
                 if (kind != .string) return error.InvalidInferenceRequest;
-                if (std.mem.eql(u8, kind.string, "image_url")) requirements.images = true else if (std.mem.eql(u8, kind.string, "input_audio")) requirements.audio = true else if (!std.mem.eql(u8, kind.string, "text")) return error.UnsupportedInferenceFeature;
+                if (std.mem.eql(u8, kind.string, "media")) {
+                    const mime = part.object.get("mime_type") orelse return error.InvalidInferenceRequest;
+                    if (mime != .string) return error.InvalidInferenceRequest;
+                    if (std.mem.startsWith(u8, mime.string, "image/")) requirements.images = true else if (std.mem.startsWith(u8, mime.string, "audio/")) requirements.audio = true else return error.UnsupportedInferenceFeature;
+                } else if (std.mem.eql(u8, kind.string, "image_url")) requirements.images = true else if (std.mem.eql(u8, kind.string, "input_audio")) requirements.audio = true else if (!std.mem.eql(u8, kind.string, "text")) return error.UnsupportedInferenceFeature;
             }
         };
     }
@@ -409,6 +413,11 @@ pub fn chatMessages(a: std.mem.Allocator, request: Json) ![]generating.ChatMessa
                         const url = image.object.get("url") orelse return error.InvalidInferenceRequest;
                         if (url != .string) return error.InvalidInferenceRequest;
                         out.* = .{ .image_url = .{ .url = url.string } };
+                    } else if (std.mem.eql(u8, kind, "media")) {
+                        const mime = part.object.get("mime_type") orelse return error.InvalidInferenceRequest;
+                        const data = part.object.get("data") orelse return error.InvalidInferenceRequest;
+                        if (mime != .string or data != .string) return error.InvalidInferenceRequest;
+                        out.* = .{ .media = .{ .mime_type = mime.string, .data = data.string } };
                     } else return error.UnsupportedInferenceFeature;
                 }
                 message.content = .{ .parts = typed };

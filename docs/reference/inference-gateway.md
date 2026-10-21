@@ -84,6 +84,22 @@ observation, not evidence of feature support.
 | `/ai/v1/synthesize` | `{model, text, voice?, format?, speed?}`; returns audio bytes |
 | `/ml/v1/predict`, `/models`, `/predictors` | Existing ordered feature-vector requests and predictor schemas |
 
+Native attachment envelopes (`application/vnd.antfly.attachments.v1`) retain their
+binary payloads while the gateway resolves and adapts metadata. Generation batches
+validate attachment ownership before dispatch and give each item its own rebased
+envelope. Typed hosted media adapters resolve attachment references into their
+existing inline media formats within the request memory budget.
+
+Generated decision and extraction requests select their generator through
+`generator.model`, with no top-level `model`. Native generator IDs and configured
+Antfly generator aliases use the same generator resolution as generation requests;
+the native runtime retains responsibility for constrained-output admission. The
+proxy places these requests using generator inventory and forwards the original
+task URL and envelope.
+
+For chunking, a top-level `model` takes precedence over `config.model`; omitting
+both selects `fixed`. The proxy and gateway use the same precedence.
+
 The supported OpenAI compatibility matrix is:
 
 | Adapter | Supported subset |
