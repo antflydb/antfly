@@ -248,8 +248,10 @@ Names/aliases, compact spelling and description overlap are recall signals,
 never calibrated merge confidence. Identity candidates require matching types,
 visibility/owner partitions and version-number signatures, respect explicit
 and shared pinned distinctions, and exclude existing canonical aliases.
-`kind: relationship` permits distinct/versioned concepts and advertises the
-pack's relation vocabulary. Paging examines 64 entities at a time and returns
+`kind: relationship` permits distinct/versioned concepts and returns the
+allowed predicates for each subject/object type pair, including heterogeneous
+custom ontology domains. Incompatible overrides of the software-team pack
+reject at configuration admission. Paging examines 64 entities at a time and returns
 an explicit cursor/completeness; this bounded lexical/description discovery
 does not claim exhaustive semantic nearest-neighbor search.
 
@@ -313,9 +315,10 @@ available and retains its existing lexical/vector pagination contract.
 - [#1244](https://github.com/antflydb/antfly/issues/1244): the private owner ABI
   forwards the actual entity sink's curation capability. Missing capability
   callbacks fail closed. Distributed atomic curation no longer loses support
-  while crossing the owner archive boundary. The merged main implementation supplies private owner ABI 82; the Lite grouped
-  control adds storage engine linkage v29. Rebuild native runtime units together.
-- [#1245](https://github.com/antflydb/antfly/issues/1245): The merged main implementation accepts qualified
+  while crossing the owner archive boundary. Main supplies private owner ABI 82;
+  the Lite grouped control adds storage engine linkage v29. Rebuild native
+  runtime units together.
+- [#1245](https://github.com/antflydb/antfly/issues/1245): main accepts qualified
   start identities for Lite traverse/neighbors and preserves
   table identity through admission, visited sets and paths. Use
   `start_nodes.identities: [{key, table}]` on both backends. Bare keys continue

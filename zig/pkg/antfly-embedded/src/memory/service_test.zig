@@ -3921,9 +3921,53 @@ test "memory candidate discovery preserves canonical distinctions and version bo
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, candidates, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 0), parsed.value.object.get("items").?.array.items.len);
-    const relationships = try store.run(.entity_candidates, "a", "{\"kind\":\"relationship\"}", "", 5);
+    try discard(&store, .configure, "", "{\"expected_revision\":5,\"config\":{\"ontology_pack\":\"software_team_v1\"}}", "pack", 5);
+    const relationships = try store.run(.entity_candidates, "a", "{\"kind\":\"relationship\"}", "", 6);
     defer std.testing.allocator.free(relationships);
     const related = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, relationships, .{});
     defer related.deinit();
     try std.testing.expectEqual(@as(usize, 2), related.value.object.get("items").?.array.items.len);
+}
+
+test "memory relationship candidates respect heterogeneous ontology domains" {
+    var store = Store.init();
+    defer store.deinit();
+    try discard(&store, .create, "", "{\"predicates\":[{\"name\":\"operates\",\"subject_type\":\"person\",\"object_type\":\"service\"}]}", "create", 1);
+    try discard(&store, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"source\",\"source_version\":\"1\",\"text\":\"The Antfly operator maintains the Antfly service\"}],\"entities\":[{\"id\":\"operator\",\"name\":\"Antfly operator\",\"type\":\"person\",\"evidence\":[{\"id\":\"e\"}]},{\"id\":\"service\",\"name\":\"Antfly service\",\"type\":\"service\",\"evidence\":[{\"id\":\"e\"}]}]}", "observe", 2);
+    const result = try store.run(.entity_candidates, "operator", "{\"kind\":\"relationship\"}", "", 3);
+    defer std.testing.allocator.free(result);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+    const items = parsed.value.object.get("items").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    try std.testing.expectEqualStrings("operates", items[0].object.get("predicates").?.array.items[0].string);
+    try std.testing.expectError(error.InvalidMemoryConfig, (m.types.Config{ .ontology_pack = .software_team_v1, .predicates = &.{.{ .name = "is_a", .object_type = "service" }} }).validate());
+}
+
+test "memory graph recall does not spend assertion work on disabled episode expansion" {
+    var store = Store.init();
+    defer store.deinit();
+    try externalReviewSetup(&store);
+    const a = store.arena.allocator();
+    const mentions = try a.alloc(m.types.EntityMention, 70);
+    for (mentions, 0..) |*mention, i| mention.* = .{ .id = try std.fmt.allocPrint(a, "mention-{d}", .{i}), .entity_id = "a", .evidence = &.{.{ .id = "e" }} };
+    const observation = try std.json.Stringify.valueAlloc(a, m.types.ObservationRequest{ .evidence = &.{.{ .id = "turn", .source_id = "history", .source_version = "1", .text = "A later observation" }}, .mentions = mentions }, .{});
+    try discard(&store, .observe, "", observation, "mentions", 3);
+    const result = try store.run(.recall, "", "{\"graph\":{\"entity_seeds\":[\"a\"],\"include_episodes\":false},\"token_budget\":8192}", "", 4);
+    defer std.testing.allocator.free(result);
+    const parsed = try std.json.parseFromSlice(m.types.RecallResult, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.graph.?.complete);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.episodes.len);
+    try discard(&store, .forget, "", "{\"evidence_ids\":[\"e\"]}", "forget", 5);
+    for (0..128) |i| {
+        if (!store.values.contains("cleanup")) break;
+        try discard(&store, .advance, "", "{}", try std.fmt.allocPrint(a, "cleanup-{d}", .{i}), @intCast(6 + i));
+    }
+    try std.testing.expect(!store.values.contains("cleanup"));
+    var rows = store.values.keyIterator();
+    while (rows.next()) |row| {
+        try std.testing.expect(!std.mem.startsWith(u8, row.*, "mention/"));
+        try std.testing.expect(!std.mem.startsWith(u8, row.*, "dependency/mention-"));
+    }
 }

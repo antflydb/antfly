@@ -97,6 +97,10 @@ pub const Config = struct {
         if (self.predicates.len > max_items) return error.InvalidMemoryConfig;
         for (self.predicates, 0..) |predicate, i| {
             try validateId(predicate.name);
+            if (self.ontology_pack == .software_team_v1 and (std.mem.eql(u8, predicate.name, "is_a") or std.mem.eql(u8, predicate.name, "part_of") or std.mem.eql(u8, predicate.name, "alternative_to"))) {
+                if (predicate.subject_type) |name| if (!std.mem.eql(u8, name, "concept")) return error.InvalidMemoryConfig;
+                if (predicate.object_type) |name| if (!std.mem.eql(u8, name, "concept")) return error.InvalidMemoryConfig;
+            }
             for (self.predicates[0..i]) |other| if (std.mem.eql(u8, other.name, predicate.name)) return error.InvalidMemoryConfig;
         }
     }

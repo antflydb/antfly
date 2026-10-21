@@ -80,7 +80,7 @@ pub fn description(action: Action) []const u8 {
         .entity_view => "Derive a canonical entity description from authorized current assertions, with exact dependency references and a content fingerprint.",
         .episodes => "Page through authorized evidence episodes grouped by thread, ordered by turn ordinal.",
         .episode => "Read an ordered evidence episode with grounded entity mentions and explicit pagination.",
-        .entity_candidates => "Discover bounded lexical identity candidates with immutable entity revisions; similarity is a proposal, never authority to merge.",
+        .entity_candidates => "Discover bounded name/description identity or typed relationship candidates with grounded views and immutable entity revisions; similarity is not authority to merge.",
         .propose_entity => "Queue an attributed external entity proposal with grounded evidence and a space revision fence. Requires administrator access.",
         .entity_proposals => "Page through retained entity review proposals. Requires administrator access.",
         .entity_proposal => "Get an entity proposal and its retained external verdict attribution. Requires administrator access.",

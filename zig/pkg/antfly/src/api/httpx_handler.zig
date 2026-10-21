@@ -18537,13 +18537,30 @@ test "native memory HTTP and MCP share persistent storage and private provenance
     try std.testing.expectEqual(@as(u16, 400), rejected_deep.status.code);
     try std.testing.expect(std.mem.indexOf(u8, rejected_deep.body.?, "UnknownField") != null);
     const body =
-        \\{"evidence":[{"id":"e1","source_id":"note","source_version":"1","text":"Production uses Terraform"}],"assertions":[{"id":"a1","subject":"production","predicate":"deploys_with","value":"Terraform","statement":"Production uses Terraform","evidence":[{"id":"e1"}]}]}
+        \\{"evidence":[{"id":"e1","source_id":"note","source_version":"1","text":"Production uses Terraform","thread_id":"thread","turn_id":"turn","ordinal":0}],"entities":[{"id":"production","name":"Production","evidence":[{"id":"e1"}]}],"assertions":[{"id":"a1","subject":"production","predicate":"deploys_with","value":"Terraform","statement":"Production uses Terraform","evidence":[{"id":"e1"}]}]}
     ;
     const headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ "idempotency-key", "observe" } };
     var accepted = try requestWithRetry(&client, threaded.io(), .POST, url, body, &headers, 20);
     defer accepted.deinit();
     if (accepted.status.code != 200) std.debug.print("memory HTTP: {s}\n", .{accepted.body orelse ""});
     try std.testing.expectEqual(@as(u16, 200), accepted.status.code);
+    const view_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/entities/production/view", .{base});
+    defer a.free(view_url);
+    var derived_view = try requestWithRetry(&client, threaded.io(), .POST, view_url, "{}", &.{.{ "content-type", "application/json" }}, 20);
+    defer derived_view.deinit();
+    try std.testing.expectEqual(@as(u16, 200), derived_view.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, derived_view.body.?, "Production uses Terraform") != null);
+    const episode_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/episodes/thread?known_at=0", .{base});
+    defer a.free(episode_url);
+    var before_episode = try requestWithRetry(&client, threaded.io(), .GET, episode_url, "", &.{}, 20);
+    defer before_episode.deinit();
+    try std.testing.expectEqual(@as(u16, 404), before_episode.status.code);
+    const current_episode_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/episodes/thread?limit=1", .{base});
+    defer a.free(current_episode_url);
+    var current_episode = try requestWithRetry(&client, threaded.io(), .GET, current_episode_url, "", &.{}, 20);
+    defer current_episode.deinit();
+    try std.testing.expectEqual(@as(u16, 200), current_episode.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, current_episode.body.?, "Production uses Terraform") != null);
     const outcome_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/outcomes", .{base});
     defer a.free(outcome_url);
     const feedback =
@@ -18587,6 +18604,18 @@ test "native memory HTTP and MCP share persistent storage and private provenance
     defer mcp_response.deinit(a);
     try std.testing.expectEqual(@as(u16, 200), mcp_response.status);
     try std.testing.expect(std.mem.indexOf(u8, mcp_response.body, "Production uses Terraform") != null);
+    var graph_recalled = try @import("protocol_adapters.zig").executeMemoryMcpRequest(&api, .{
+        .method = .post,
+        .endpoint_path = "/memory/v1/mcp",
+        .session_id = session_id,
+        .body =
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_recall","arguments":{"space":"team","body":{"graph":{"entity_seeds":["production"]},"token_budget":8192}}}}
+        ,
+    }, @as(?AuthenticatedIdentity, null));
+    defer graph_recalled.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), graph_recalled.status);
+    try std.testing.expect(std.mem.indexOf(u8, graph_recalled.body, "Production uses Terraform") != null);
+    try std.testing.expect(std.mem.indexOf(u8, graph_recalled.body, "personalized_pagerank") != null);
     // Verify exact integer-valued decimal tokens through the actual MCP
     // ingress and the native policy, rather than only the tool adapter.
     var exact_observation = try @import("protocol_adapters.zig").executeMemoryMcpRequest(&api, .{

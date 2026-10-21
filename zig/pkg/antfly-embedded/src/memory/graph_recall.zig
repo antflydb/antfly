@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Bounded personalized PageRank. Policy supplies only authorized, current nodes.
+//! Bounded weighted personalized PageRank over the authorized induced graph.
+//! graph.metrics accepts unweighted topology; memory's relation/provisional
+//! policy needs weighted transitions and a std-only portable policy kernel.
 const std = @import("std");
 const t = @import("types.zig");
 pub const Edge = struct { from: usize, to: usize, weight: f64 };

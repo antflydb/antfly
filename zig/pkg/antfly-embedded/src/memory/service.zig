@@ -1679,6 +1679,24 @@ const Run = struct {
         }
         return result;
     }
+    fn relationshipPredicates(self: *Run, subject_type: []const u8, object_type: []const u8) ![]const []const u8 {
+        var names: std.StringHashMapUnmanaged(void) = .empty;
+        for (self.state.config.predicates) |predicate| {
+            const target = predicate.object_type orelse continue;
+            if (!eql(u8, target, object_type)) continue;
+            if (predicate.subject_type) |source_type| if (!eql(u8, source_type, subject_type)) continue;
+            try names.put(self.a, predicate.name, {});
+        }
+        if (self.state.config.ontology_pack == .software_team_v1 and eql(u8, subject_type, "concept") and eql(u8, object_type, "concept")) {
+            for ([_][]const u8{ "is_a", "part_of", "alternative_to" }) |name| try names.put(self.a, name, {});
+        }
+        const result = try self.a.alloc([]const u8, names.count());
+        var iterator = names.keyIterator();
+        var i: usize = 0;
+        while (iterator.next()) |name| : (i += 1) result[i] = name.*;
+        std.mem.sort([]const u8, result, {}, stringLess);
+        return result;
+    }
     fn entityCandidates(self: *Run, id: []const u8, request: t.EntityCandidateRequest) ![]const u8 {
         if (request.limit == 0 or request.limit > 64) return error.InvalidMemoryRequest;
         const seed = (try self.read(t.EntityRecord, try key(self.a, "entity", id))) orelse return error.MemoryNotFound;
@@ -1689,7 +1707,7 @@ const Run = struct {
         const seed_distinctions = try self.declaredDistinct(id);
         const seed_view = try self.entityView(id, .{ .limit = 4 });
         var views_complete = seed_view.complete;
-        const Candidate = struct { entity: t.EntityRecord, view: t.EntityView, match_score: f64 };
+        const Candidate = struct { entity: t.EntityRecord, view: t.EntityView, match_score: f64, predicates: []const []const u8 };
         var matches: std.ArrayList(Candidate) = .empty;
         for (page.rows) |row| {
             try self.service.context.check();
@@ -1697,7 +1715,10 @@ const Run = struct {
             self.authorize(candidate.owner, candidate.entity.visibility) catch continue;
             if (!try self.entityVisible(candidate)) continue;
             const canonical_id = (try self.canonical(candidate.entity.id)) orelse continue;
-            if (!eql(u8, canonical_id, candidate.entity.id) or eql(u8, canonical_id, canonical_seed) or !eql(u8, candidate.entity.type, seed.entity.type)) continue;
+            if (!eql(u8, canonical_id, candidate.entity.id) or eql(u8, canonical_id, canonical_seed)) continue;
+            if (request.kind == .identity and !eql(u8, candidate.entity.type, seed.entity.type)) continue;
+            const predicates = if (request.kind == .relationship) try self.relationshipPredicates(seed.entity.type, candidate.entity.type) else &.{};
+            if (request.kind == .relationship and predicates.len == 0) continue;
             if (candidate.entity.visibility != seed.entity.visibility or (candidate.entity.visibility == .private and !eql(u8, candidate.owner, seed.owner))) continue;
             var distinct = false;
             for (seed.entity.distinct_from) |other| if (eql(u8, other, candidate.entity.id)) {
@@ -1719,7 +1740,7 @@ const Run = struct {
             const candidate_view = try self.entityView(candidate.entity.id, .{ .limit = 4 });
             views_complete = views_complete and candidate_view.complete;
             score = @max(score, lexical(seed_view.description, candidate_view.description));
-            if (score > 0) try matches.append(self.a, .{ .entity = candidate, .view = candidate_view, .match_score = score });
+            if (score > 0) try matches.append(self.a, .{ .entity = candidate, .view = candidate_view, .match_score = score, .predicates = predicates });
         }
         std.mem.sort(Candidate, matches.items, {}, struct {
             fn less(_: void, lhs: Candidate, rhs: Candidate) bool {
@@ -2562,6 +2583,12 @@ const Run = struct {
             if (entity_record == null or !try self.entityRetained(entity_record.?) or !try self.retainedSupport(stored.mention.evidence, &.{}, 0) or !try self.generationRetained("mention", stored.mention.id)) {
                 try self.put(try key(self.a, "forgotten-mention", stored.mention.id), true);
                 try self.remove(try self.generationKey("mention", stored.mention.id));
+                // Remove reverse bindings in the retirement transaction. The
+                // cleanup cursor visits dependency/ before mention/, so
+                // deferring these would strand dead adjacency until another
+                // erasure and eventually crowd live mentions out of recall.
+                try self.remove(try dependencyKey(self.a, "mention-entity", stored.mention.entity_id, stored.mention.id));
+                for (stored.mention.evidence) |ref| try self.remove(try dependencyKey(self.a, "mention-evidence", ref.id, stored.mention.id));
                 try self.remove(row.key);
             }
         } else if (std.mem.startsWith(u8, row.key, "dependency/mention-")) {
@@ -2575,7 +2602,7 @@ const Run = struct {
             if (!try self.relationshipRetained(proposal)) {
                 try self.put(try key(self.a, "forgotten-relationship-proposal", proposal.id), true);
                 try self.remove(row.key);
-            } else if (!try self.retainedSupport(proposal.verdict_evidence, &.{}, 0)) {
+            } else if (proposal.verdict_evidence.len > 0 and !try self.retainedSupport(proposal.verdict_evidence, &.{}, 0)) {
                 proposal.reason = "";
                 proposal.verdict_evidence = &.{};
                 try self.put(row.key, proposal);
@@ -3273,7 +3300,7 @@ const Run = struct {
                             };
                         }
                     }
-                    for (try self.identityMembers(node.id)) |name| {
+                    if (options.include_episodes) for (try self.identityMembers(node.id)) |name| {
                         if (graph.work + 1 >= 4096) {
                             graph.complete = false;
                             break;
@@ -3294,7 +3321,7 @@ const Run = struct {
                                 }
                             };
                         }
-                    }
+                    };
                 },
                 .assertion => {
                     const hit = node.hit.?;
