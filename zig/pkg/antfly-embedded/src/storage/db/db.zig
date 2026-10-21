@@ -145030,6 +145030,8 @@ test "db prepared transaction effects required funded replay commit retains HA d
     var directory = try TestDirectory.init("funded-replay-resolve");
     defer directory.cleanup();
     const id: types.TxnId = @splat(0xf5);
+    const long_id: [512]u8 = @splat('r');
+    const row_id: []const u8 = &long_id;
     const options: OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false };
     {
         var db = try DB.open(a, directory.path(), options);
@@ -145040,18 +145042,21 @@ test "db prepared transaction effects required funded replay commit retains HA d
         try inventory.initialize(db.core.store);
         try db.core.store.put(floors.minimum_reader_key, "11");
         try db.core.store.put(floors.replacement_reader_base_key, "11");
+        try db.batch(.{ .writes = &.{.{ .key = row_id, .value = "{\"body\":\"before\"}" }} });
         {
             db.core.lockApply();
             defer db.core.unlockApply();
             var manager = try db.core.initTxnManager();
             defer manager.deinit();
             try manager.initTransactionRequiringPreparedEffects(id, 1, 1, &.{}, false, false, .{ .mode = .deferred }, .{}, null);
-            try manager.writeIntents(id, &.{.{ .key = "row", .value = "{\"body\":\"committed\"}" }}, &.{});
+            try manager.writeIntents(id, &.{.{ .key = row_id, .value = "{\"body\":\"committed\"}" }}, &.{});
             const catalog = try db.core.preparedEffectsCatalogDigest(null);
             const contract = try manager.preparedEffectsContract(id, catalog, .deferred, null);
             const frame = try @import("prepared_transaction_effects.zig").encode(a, .{ .contract = contract, .effects = .{} }, null);
             defer a.free(frame);
-            try manager.sealPreparedEffectsAndReplayPlan(id, frame, catalog, .deferred, null, .{ .documents = &.{.{ .key = "row" }} }, .{}, null);
+            // The supplied batch omits even the primary row. Its changed and
+            // possible-overwrite lanes must come from the hashed intent owner.
+            try manager.sealPreparedEffectsAndReplayPlan(id, frame, catalog, .deferred, null, .{}, .{}, null);
         }
         try db.resolveTransactionIntentsWithSyncLevel(id, .committed, 2, .propose);
         try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(id));
@@ -145069,13 +145074,18 @@ test "db prepared transaction effects required funded replay commit retains HA d
     var decoded = try change_journal_mod.decodeRecord(a, outbox.replay_payload.?);
     defer decoded.deinit();
     var found = false;
-    for (decoded.record.changed_doc_keys) |key| if (std.mem.eql(u8, key, "row")) {
+    for (decoded.record.changed_doc_keys) |key| if (std.mem.eql(u8, key, row_id)) {
         found = true;
     };
     try std.testing.expect(found);
+    var overwritten = false;
+    for (decoded.record.overwritten_doc_keys) |key| if (std.mem.eql(u8, key, row_id)) {
+        overwritten = true;
+    };
+    try std.testing.expect(overwritten);
     // Releasing claims after materialization permits later local writes while
     // this immutable HA replay remains retained. Terminal retries cannot undo it.
-    try db.batch(.{ .writes = &.{.{ .key = "row", .value = "{\"body\":\"newer\"}" }} });
+    try db.batch(.{ .writes = &.{.{ .key = row_id, .value = "{\"body\":\"newer\"}" }} });
     // No configured publisher can acknowledge the durable HA obligation.
     try std.testing.expectError(error.ReplicationPublisherUnavailable, db.resolveTransactionIntentsWithSyncLevel(id, .committed, 99, .propose));
     {
@@ -145087,7 +145097,7 @@ test "db prepared transaction effects required funded replay commit retains HA d
     try manager.clearReplicationOutbox(id, .replay);
     try db.resolveTransactionIntentsWithSyncLevel(id, .committed, 99, .propose);
     try std.testing.expectEqual(sequence, db.core.nextDerivedAppendSequence());
-    const row = (try db.get(a, "row")).?;
+    const row = (try db.get(a, row_id)).?;
     defer a.free(row);
     try std.testing.expectEqualStrings("{\"body\":\"newer\"}", row);
 }

@@ -38,16 +38,32 @@ pub const Plan = struct {
         self.* = undefined;
     }
 };
+/// Logical primary keys from the authoritative stored intent snapshot. The
+/// transaction owner filters private metadata intents before supplying these.
+/// Possible overwrites reserve a lane even when the producer omitted it.
+pub const PrimaryKeys = struct {
+    writes: []const []const u8 = &.{},
+    deletes: []const []const u8 = &.{},
+};
+const changed_bit: u8 = 1;
+const deleted_bit: u8 = 2;
+const overwritten_bit: u8 = 4;
+const Required = struct { needed: u8 = 0, seen: u8 = 0 };
+
 const Builder = struct {
     allocator: A,
     original: ?control.Port,
     base: shape.Record = .{},
     roots: std.ArrayListUnmanaged([]const u8) = .empty,
     seen: std.StringHashMapUnmanaged(void) = .empty,
+    // Only authoritative input keys are retained here, borrowed through derive.
+    // Temporary generated/physical key buffers never enter this map.
+    required: std.StringHashMapUnmanaged(Required) = .empty,
     fn deinit(self: *Builder) void {
         for (self.roots.items) |root| self.allocator.free(root);
         self.roots.deinit(self.allocator);
         self.seen.deinit(self.allocator);
+        self.required.deinit(self.allocator);
     }
     fn checkpoint(self: *Builder) !void {
         if (self.original) |port| try port.checkpoint();
@@ -55,6 +71,31 @@ const Builder = struct {
     fn add(self: *Builder, comptime lane: []const u8, key: []const u8) !void {
         try self.checkpoint();
         try @field(self.base, lane).addKey(key.len);
+        const bit: u8 = comptime if (std.mem.eql(u8, lane, "changed_doc_keys")) changed_bit else if (std.mem.eql(u8, lane, "deleted_doc_keys")) deleted_bit else if (std.mem.eql(u8, lane, "overwritten_doc_keys")) overwritten_bit else 0;
+        if (bit != 0 and self.required.count() != 0) if (self.required.getPtr(key)) |entry| {
+            entry.seen |= bit;
+        };
+    }
+    fn primaryKeys(self: *Builder, primary: PrimaryKeys) !void {
+        for (primary.writes) |key| try self.requireKey(key, changed_bit | overwritten_bit);
+        for (primary.deletes) |key| try self.requireKey(key, deleted_bit);
+    }
+    fn requireKey(self: *Builder, key: []const u8, lanes: u8) !void {
+        try self.checkpoint();
+        const result = try self.required.getOrPut(self.allocator, key);
+        if (!result.found_existing) result.value_ptr.* = .{};
+        result.value_ptr.needed |= lanes;
+        try self.documentRoot(key);
+    }
+    fn completePrimaryFloor(self: *Builder) !void {
+        var iterator = self.required.iterator();
+        while (iterator.next()) |entry| {
+            try self.checkpoint();
+            const missing = entry.value_ptr.needed & ~entry.value_ptr.seen;
+            if (missing & changed_bit != 0) try self.add("changed_doc_keys", entry.key_ptr.*);
+            if (missing & deleted_bit != 0) try self.add("deleted_doc_keys", entry.key_ptr.*);
+            if (missing & overwritten_bit != 0) try self.add("overwritten_doc_keys", entry.key_ptr.*);
+        }
     }
     fn physicalRoot(self: *Builder, physical: []const u8) !void {
         try self.checkpoint();
@@ -170,11 +211,20 @@ fn assertFields(comptime T: type, comptime names: []const []const u8) void {
 /// artifact tombstones and graph clears. Existing artifact retirement is added
 /// separately from live known inventory by the durable credit owner.
 pub fn derive(a: A, request: derived.DerivedBatch, accepted: effects.PrecomputedGeneratedBatch, original: ?control.Port) !Plan {
+    return deriveWithPrimaryKeys(a, .{}, request, accepted, original);
+}
+
+/// Add missing primary replay lanes and roots from exact stored inputs without
+/// counting a key twice when the supplied canonical plan already covers it.
+/// This floor does not certify complete auxiliary/generated-effect preparation.
+pub fn deriveWithPrimaryKeys(a: A, primary: PrimaryKeys, request: derived.DerivedBatch, accepted: effects.PrecomputedGeneratedBatch, original: ?control.Port) !Plan {
     var builder: Builder = .{ .allocator = a, .original = original };
     defer builder.deinit();
     try builder.checkpoint();
+    try builder.primaryKeys(primary);
     try builder.request(request);
     try builder.accepted(accepted);
+    try builder.completePrimaryFloor();
     _ = try builder.base.encodedBytes();
     try builder.checkpoint();
     const roots = try builder.roots.toOwnedSlice(a);
@@ -310,4 +360,79 @@ test "prepared replay plan reserves document deletion without inventing preserve
     defer a.free(actual);
     try std.testing.expectEqual(actual.len, try plan.base.encodedBytes());
     try std.testing.expectEqual(@as(usize, 3), plan.roots.len);
+}
+
+test "prepared replay plan authoritative primary floor covers omitted write delete overwrite lanes and roots" {
+    const a = std.testing.allocator;
+    const primary: PrimaryKeys = .{ .writes = &.{ "written", "shared", "written" }, .deletes = &.{ "removed", "shared" } };
+    var plan = try deriveWithPrimaryKeys(a, primary, .{}, .{}, null);
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(u64, 2), plan.base.changed_doc_keys.count);
+    try std.testing.expectEqual(@as(u64, 2), plan.base.deleted_doc_keys.count);
+    try std.testing.expectEqual(@as(u64, 2), plan.base.overwritten_doc_keys.count);
+    try std.testing.expectEqual(@as(usize, 3), plan.roots.len);
+    const payload = try @import("db/derived/change_journal.zig").encodeRecord(a, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{ "written", "shared" },
+        .deleted_doc_keys = &.{ "removed", "shared" },
+        .overwritten_doc_keys = &.{ "written", "shared" },
+    });
+    defer a.free(payload);
+    try std.testing.expect(payload.len <= try plan.base.encodedBytes());
+    for ([_][]const u8{ "written", "shared", "removed" }) |key| {
+        const physical = try keys.documentKeyAlloc(a, key);
+        defer a.free(physical);
+        const prefix = try inventory.docPrefix(physical);
+        var found = false;
+        for (plan.roots) |root| if (std.mem.eql(u8, root, prefix)) {
+            found = true;
+        };
+        try std.testing.expect(found);
+    }
+}
+
+test "prepared replay plan authoritative primary floor reuses covered lanes without dropping supplied multiplicity" {
+    const a = std.testing.allocator;
+    const request: derived.DerivedBatch = .{
+        .documents = &.{ .{ .key = "written" }, .{ .key = "written" }, .{ .key = "generated" } },
+        .deleted_keys = &.{"removed"},
+        .overwritten_doc_keys = &.{"written"},
+    };
+    var original = try derive(a, request, .{}, null);
+    defer original.deinit();
+    var covered = try deriveWithPrimaryKeys(a, .{ .writes = &.{"written"}, .deletes = &.{"removed"} }, request, .{}, null);
+    defer covered.deinit();
+    try std.testing.expectEqualDeep(original.base, covered.base);
+    try std.testing.expectEqual(original.roots.len, covered.roots.len);
+    // A preserved base document is not changed by the request alone. The
+    // authoritative floor still reserves possible primary application lanes.
+    var preserved = try deriveWithPrimaryKeys(a, .{ .writes = &.{"written"} }, .{ .documents = &.{.{ .key = "written", .action = .preserve_base_document }} }, .{}, null);
+    defer preserved.deinit();
+    try std.testing.expectEqual(@as(u64, 1), preserved.base.changed_doc_keys.count);
+    try std.testing.expectEqual(@as(u64, 1), preserved.base.overwritten_doc_keys.count);
+}
+
+test "prepared replay plan authoritative primary floor unwinds all owned allocations and original checkpoints" {
+    const Checks = struct {
+        calls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == self.fail_at) return error.DeadlineExceeded;
+        }
+        fn run(a: A, checks: ?*@This()) !void {
+            var payload: control.Payload = .{ .ptr = checks orelse undefined, .vtable = &.{ .checkpoint = check } };
+            var plan = try deriveWithPrimaryKeys(a, .{ .writes = &.{ "binary\x00key", "other" }, .deletes = &.{"removed"} }, .{ .documents = &.{.{ .key = "other" }} }, .{}, if (checks != null) control.Port.init(&payload) else null);
+            defer plan.deinit();
+            try std.testing.expectEqual(@as(usize, 3), plan.roots.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Checks.run, .{@as(?*Checks, null)});
+    var baseline: Checks = .{};
+    try Checks.run(std.testing.allocator, &baseline);
+    for (1..baseline.calls + 1) |fail_at| {
+        var checks: Checks = .{ .fail_at = fail_at };
+        try std.testing.expectError(error.DeadlineExceeded, Checks.run(std.testing.allocator, &checks));
+    }
 }

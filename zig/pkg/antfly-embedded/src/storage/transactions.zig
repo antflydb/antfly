@@ -1717,14 +1717,34 @@ pub const TxnManager = struct {
         if (!std.meta.eql(record.preparation_binding, binding)) return error.PreparationContractConflict;
         if (try self.loadPreparationRequirementInner(txn_id, control)) |required| if (required.mode != mode) return error.PreparationContractConflict;
         const inspection = try prepared_effects.inspect(frame, control);
-        const expected = try self.preparedEffectsContractInner(txn_id, catalog_digest, mode, control);
-        if (!std.meta.eql(expected, inspection.contract)) return error.PreparedEffectsMismatch;
-        var replay_plan: ?@import("prepared_replay_plan.zig").Plan = if (request) |canonical| blk: {
-            var decoded = try prepared_effects.decode(self.alloc, frame, expected, control);
-            defer decoded.deinit();
-            break :blk try @import("prepared_replay_plan.zig").derive(self.alloc, canonical, decoded.plan.effects, control);
-        } else null;
+        var replay_plan: ?@import("prepared_replay_plan.zig").Plan = null;
         defer if (replay_plan) |*plan| plan.deinit();
+        {
+            // Hash and plan from the same owned inputs. Release the snapshot and
+            // decode slab before opening the publication writer; only roots and
+            // scalar wire totals survive into the atomic seal.
+            var inputs = try self.capturePreparedIntentsInner(self.alloc, txn_id, catalog_digest, mode, control);
+            defer inputs.deinit();
+            const expected = inputs.contract;
+            if (!std.meta.eql(expected, inspection.contract)) return error.PreparedEffectsMismatch;
+            if (request) |canonical| {
+                var writes: std.ArrayListUnmanaged([]const u8) = .empty;
+                defer writes.deinit(self.alloc);
+                var deletes: std.ArrayListUnmanaged([]const u8) = .empty;
+                defer deletes.deinit(self.alloc);
+                for (inputs.batch.writes) |write| {
+                    if (control) |owner| try owner.checkpoint();
+                    if (!isRawMetadataIntentKey(write.key)) try writes.append(self.alloc, write.key);
+                }
+                for (inputs.batch.deletes) |deleted| {
+                    if (control) |owner| try owner.checkpoint();
+                    if (!isRawMetadataIntentKey(deleted)) try deletes.append(self.alloc, deleted);
+                }
+                var decoded = try prepared_effects.decode(self.alloc, frame, expected, control);
+                defer decoded.deinit();
+                replay_plan = try @import("prepared_replay_plan.zig").deriveWithPrimaryKeys(self.alloc, .{ .writes = writes.items, .deletes = deletes.items }, canonical, decoded.plan.effects, control);
+            }
+        }
         const reservation: ?backend_erased.PreparedReplayReservation = if (replay_plan) |plan| .{
             .txn_id = txn_id,
             .frame = inspection.fingerprint,
@@ -8182,4 +8202,39 @@ test "prepared transaction effects replay commit rejects grant metadata on unsup
     var outbox = try manager.loadReplicationOutbox(a, id);
     defer outbox.deinit(a);
     try std.testing.expect(outbox.replay_payload == null);
+}
+
+test "prepared transaction effects replay seal derives primary floors from exact stored intents" {
+    const a = std.testing.allocator;
+    const F = PreparedReplaySealFixture;
+    var f: F = .{};
+    try f.init();
+    defer f.deinit();
+    // Include a private physical metadata intent. It is not a logical document
+    // and must not acquire a phantom primary root or replay-key allowance.
+    const metadata = "\x00\x00__metadata__:relational_integrity_activation";
+    try f.manager.writeIntents(F.id, &.{ .{ .key = metadata, .value = "physical-metadata" }, .{ .key = "removed", .value = null } }, &.{});
+    const artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "row", "old");
+    defer a.free(artifact);
+    try f.store.put(artifact, "existing");
+    const frame = try f.frame();
+    defer a.free(frame);
+    // Even a supplied empty derived request cannot omit the stored user keys.
+    try f.manager.sealPreparedEffectsAndReplayPlan(F.id, frame, F.catalog, .deferred, null, .{}, .{}, null);
+    {
+        var read = try f.store.beginReadTxn();
+        defer read.abort();
+        const grant = (try F.credit.load(&read, F.id)).?;
+        try std.testing.expectEqual(@as(u64, 2), grant.root_count);
+        try std.testing.expectEqual(@as(u64, 1), grant.base.changed_doc_keys.count);
+        try std.testing.expectEqual(@as(u64, 1), grant.base.deleted_doc_keys.count);
+        try std.testing.expectEqual(@as(u64, 1), grant.base.overwritten_doc_keys.count);
+        try std.testing.expectEqualDeep(try (@import("artifact_replay_inventory.zig").State{ .count = 1, .key_bytes = artifact.len }).retirementReplayShape(), grant.current);
+    }
+    var accepted = (try f.manager.loadPreparedEffects(a, F.id, null)).?;
+    defer accepted.deinit();
+    const payload = try @import("db/derived/change_journal.zig").encodeRecord(a, .{ .sequence = 1, .changed_doc_keys = &.{"row"}, .deleted_doc_keys = &.{ "removed", artifact }, .overwritten_doc_keys = &.{"row"}, .changed_artifact_keys = &.{artifact} });
+    defer a.free(payload);
+    try std.testing.expect((try f.manager.resolvePreparedIntents(F.id, 2, &accepted, .{ .deletes = &.{artifact}, .replay = .{ .sequence = 1, .payload = payload } }, null)).applied);
+    try f.manager.clearReplicationOutbox(F.id, .replay);
 }

@@ -21221,3 +21221,47 @@ restore eligibility and the full original scheduling/default-policy scope remain
 incomplete. Full Linux qualification remains waived. Public package consumer and
 full storage/provider archive qualification were not rerun for this private
 behavior change.
+
+
+### Authoritative primary-key floor at the replay seal
+
+The funded seal now retains the exact intent snapshot used for its digest while
+building the replay plan. Every non-metadata stored write contributes a mandatory
+changed-key and possible-overwrite allowance; every stored deletion contributes
+its deleted-key allowance. Their logical document roots are always included, so
+existing physical artifact retirement is funded by the live inventory even when
+the supplied DerivedBatch omits the primary keys entirely. Private metadata
+intents use the same classification as transaction application and do not acquire
+phantom document roots.
+
+`deriveWithPrimaryKeys` tracks only borrowed authoritative keys and marks lanes
+already covered by the supplied request or accepted effects. It adds missing
+lanes without duplicating an existing allowance or reducing supplied
+multiplicity. Possible overwrites are conservative because this layer has no
+certified absence/read-set proof. The planner changes scalar budgets and roots,
+not actual replay notifications or primary application semantics. Input and
+accepted-effect decode owners retire before the publication writer opens; the
+plan retains only its owned root prefixes and scalar wire totals.
+
+Three new planner cases cover missing lanes/roots, reuse of supplied coverage,
+duplicates/preserved documents, binary IDs, allocation failures and original
+checkpoints. A new seal case uses an empty supplied request, real primary write/
+delete intents and private metadata, verifies the existing embedding inventory's
+retirement allowance, then commits its retirement and acknowledges replay. The
+DB restart regression now overwrites an existing 512-byte document ID with an
+empty supplied request; canonical changed/overwritten replay fits, survives
+restart and HA retention, and terminal retries preserve a newer local write.
+
+`prepared-primary-floor-v3.json` and its raw log record 137 executions across the
+planner, prepared-effect, required DB, replay-credit and canonical encoding
+suites: 97/97 steps, zero skips, failures or leaks. No ABI, reader version or
+durable format changes are introduced. Public package/provider/archive
+qualification was not rerun; full Linux qualification remains waived.
+
+This establishes the primary-intent minimum, not full predecision certification.
+Complete auxiliary/group/generated physical effects and replay keys still need
+canonical preparation under retained schema/catalog/route witnesses. Separate
+derived-log quota, minimum executable recovery bundles, legacy/import/restore
+eligibility, normal required PREPARE negotiation and the original broader
+scheduler/default-policy scope remain incomplete. Strong provider defaults stay
+off and the full goal remains active.
