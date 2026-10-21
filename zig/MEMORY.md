@@ -129,10 +129,17 @@ persisting consumer session credentials. Each enabled role is qualified
 independently even when one model serves several roles.
 
 Source snapshots are scoped to a native execution. After generation, reconciliation,
-or embedding releases its lease, the service revalidates every ordinary resource
-read by the plan, including uncited context and candidate dependencies. It checks
-again immediately before committing inferred changes. Revoked access rolls back
-the attempt without spending the durable retry budget; a changed source cancels
+or embedding releases its lease, the service revalidates the ordinary resources
+in that invocation’s input closure, including uncited generation context, shared
+parents and candidate explanation dependencies. Captures include cached source
+reads and rebuild visibility memoization within the invocation. Lease epochs force
+inputs not checked since an intervening inference to be revalidated before reuse.
+Before committing
+inferred changes, it revalidates the complete transaction read set once.
+Independent embedding inputs therefore require linear source reads across a batch;
+earlier invocations do not inflate each later invocation’s boundary check.
+Revoked access rolls back the attempt without spending the durable retry budget;
+a changed source cancels
 work admitted against that revision. Results never silently adopt a newer source.
 These live checks accompany the memory control-row CAS; they do not create a
 cross-table serializable transaction with ordinary source writers.
@@ -368,6 +375,19 @@ execution authority, retry readiness, inference, or publication. Revoked or
 unsupported bindings stay fenced and pending without consuming model attempts;
 they cannot pin later jobs, including jobs beyond the first queue page. Execution
 deadlines and transient failures also leave the selection cursor advanced.
+The worker gives model processing a 120-second budget, separate from five-second
+selection/cleanup and finalization budgets. Provider deadlines leave a grace period
+for durable retry/error publication. If the entire attempt overruns, the worker
+re-enters the native service with a fresh, bounded finalization context and the
+original revision/receipt fence, recording the failure without invoking a model.
+Receipt replay handles an ambiguously committed result; a changed control revision
+rejects stale recovery. Failure finalization writes only outcome metadata, without
+reacquiring the source plan or invoking a model. It retains live destination
+authorization, retry limits, backoff, configuration cleanup and leadership checks.
+Actual processing and artifact publication retain their source authorization gates. Foreground
+request cancellation and deadlines remain authoritative and cannot be renewed by
+this worker-only path. A crash or unavailable storage can still require replay;
+inference calls are not exactly once.
 Cleanup uses the space's own saved binding, independently of every operation's
 binding. A revoked cleanup identity does not block valid operations, and a busy
 operation queue does not starve authorized cleanup. Each authorized quantum still

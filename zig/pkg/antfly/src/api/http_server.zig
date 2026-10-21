@@ -5410,29 +5410,46 @@ pub const ApiHttpServer = struct {
         const control_json = module.engine.decodeRow(a, control.json) catch return;
         const state = std.json.parseFromSliceLeaky(module.memory.types.State, a, control_json, .{}) catch return;
         if (state.space.len == 0) return;
-        const Deadline = struct {
-            end: u64,
-            fn check(ptr: *anyopaque) !void {
-                const deadline_state: *@This() = @ptrCast(@alignCast(ptr));
-                if (platform_time.monotonicNs() >= deadline_state.end) return error.DeadlineExceeded;
-            }
-        };
-        var deadline: Deadline = .{ .end = platform_time.monotonicNs() +| 5 * std.time.ns_per_s };
-        const context: module.memory.Context = .{ .check_ptr = &deadline, .check_fn = Deadline.check, .principal = state.owner, .admin = false, .now_ms = @intCast(platform_time.realtimeNs() / std.time.ns_per_ms) };
+        var deadline: MemoryWorkDeadline = .{ .server = self, .group_id = owner_range.group_id, .end = platform_time.monotonicNs() +| MemoryWorkDeadline.finalization_ns };
+        const context: module.memory.Context = .{ .check_ptr = &deadline, .check_fn = MemoryWorkDeadline.check, .principal = state.owner, .admin = false, .now_ms = @intCast(platform_time.realtimeNs() / std.time.ns_per_ms) };
         var adapter: module.engine.Routed = .{ .table = table, .reads = reader, .writes = writer, .context = context };
         adapter.request = .{ .deadline_ns = deadline.end };
         const entry = try self.memory_work_cursors.getOrPut(self.alloc, owner_range.table_id);
         if (!entry.found_existing) entry.value_ptr.* = .{};
-        var work: MemoryWorkExecution = .{ .server = self, .alloc = a, .table = table, .state = state, .context = context, .deadline_ns = deadline.end };
+        var work: MemoryWorkExecution = .{ .server = self, .alloc = a, .table = table, .state = state, .context = context, .deadline = &deadline };
         try @import("antfly_local_sources").memory_scheduling.advance(adapter.backend(), a, context.now_ms, state, entry.value_ptr, .{ .ptr = &work, .execute = MemoryWorkExecution.execute });
     }
+    const MemoryWorkDeadline = struct {
+        // Selection/cleanup and durable finalization stay short. Model work has
+        // its own bounded budget, leaving time to record a provider timeout.
+        const inference_ns = 120 * std.time.ns_per_s;
+        const finalization_ns = 5 * std.time.ns_per_s;
+        server: *ApiHttpServer,
+        group_id: u64,
+        end: u64,
+        fn beginProcessing(self: *@This(), now: u64) u64 {
+            const inference_end = now +| inference_ns;
+            self.end = inference_end +| finalization_ns;
+            return inference_end;
+        }
+        fn beginFinalization(self: *@This(), now: u64) void {
+            self.end = now +| finalization_ns;
+        }
+        fn check(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.server.cfg.relational_maintenance_leadership) |leadership| {
+                if (!leadership.isLocalLeader(self.group_id)) return error.NotLeader;
+            } else if (self.server.cfg.deployment_mode != .standalone) return error.NotLeader;
+            if (platform_time.monotonicNs() >= self.end) return error.DeadlineExceeded;
+        }
+    };
     const MemoryWorkExecution = struct {
         server: *ApiHttpServer,
         alloc: std.mem.Allocator,
         table: []const u8,
         state: @import("memory.zig").memory.types.State,
         context: @import("memory.zig").memory.Context,
-        deadline_ns: u64,
+        deadline: *MemoryWorkDeadline,
 
         fn execute(ptr: *anyopaque, pending: ?@import("memory.zig").memory.types.Operation) !void {
             const work: *@This() = @ptrCast(@alignCast(ptr));
@@ -5442,6 +5459,9 @@ pub const ApiHttpServer = struct {
             const state = work.state;
             const module = @import("memory.zig");
             var context = work.context;
+            const inference_deadline = if (pending != null) work.deadline.beginProcessing(platform_time.monotonicNs()) else work.deadline.end;
+            context.now_ms = @intCast(platform_time.realtimeNs() / std.time.ns_per_ms);
+            try context.check();
             var adapter: module.engine.Routed = .{ .table = table, .reads = server.table_reads.?, .writes = server.table_writes.?, .context = context };
             const executor = if (pending) |item| item.execution_principal else state.execution_principal;
             const signature = if (pending) |item| item.execution_signature else state.execution_signature;
@@ -5482,17 +5502,35 @@ pub const ApiHttpServer = struct {
             context.database = state.database;
             context.namespace = state.namespace;
             context.space = state.space;
-            var resources: MemoryResourceReader = .{ .server = server, .executor = executor, .database = state.database, .request = .{ .deadline_ns = work.deadline_ns } };
+            var resources: MemoryResourceReader = .{ .server = server, .executor = executor, .database = state.database, .request = .{ .deadline_ns = work.deadline.end } };
             adapter.resource_ptr = &resources;
             adapter.resource_fn = MemoryResourceReader.read;
             adapter.context = context;
-            adapter.request = .{ .deadline_ns = work.deadline_ns };
+            adapter.request = .{ .deadline_ns = work.deadline.end };
             const Runtime = @import("antfly_local_sources").asset_producer_runtime.Runtime;
             const runtime = try Runtime.createOwned(a, server.inferenceIo(), .{ .antfly_provider = server.antfly_provider, .inference_api_url = server.configuredInferenceAPIURL(), .secret_store = server.cfg.secret_store, .source_table = table });
             defer runtime.deinit();
-            var bridge: @import("antfly_local_sources").memory_models.Bridge = .{ .base = adapter.backend(), .producer = runtime.producer().withInvocationContext(.{ .io = server.inferenceIo(), .deadline_ns = work.deadline_ns, .max_response_bytes = state.config.max_input_bytes }), .alloc = a, .embedding_options = .{ .deadline_ns = work.deadline_ns, .bounded_http_request = true, .antfly_provider = server.antfly_provider, .io = server.inferenceIo(), .secret_store = server.cfg.secret_store, .inference_api_url = server.configuredInferenceAPIURL(), .source_table = table } };
+            var bridge: @import("antfly_local_sources").memory_models.Bridge = .{ .base = adapter.backend(), .producer = runtime.producer().withInvocationContext(.{ .io = server.inferenceIo(), .deadline_ns = inference_deadline, .max_response_bytes = state.config.max_input_bytes }), .alloc = a, .embedding_options = .{ .deadline_ns = inference_deadline, .bounded_http_request = true, .antfly_provider = server.antfly_provider, .io = server.inferenceIo(), .secret_store = server.cfg.secret_store, .inference_api_url = server.configuredInferenceAPIURL(), .source_table = table } };
             const token = try std.fmt.allocPrint(a, "worker:{d}:{s}", .{ state.revision, if (pending) |item| item.id else "maintenance" });
-            _ = try (module.memory.Service{ .backend = bridge.backend(), .context = context }).execute(a, .advance, if (pending) |item| item.id else "", "{}", token);
+            const service: module.memory.Service = .{ .backend = bridge.backend(), .context = context };
+            _ = service.advanceAtRevision(a, if (pending) |item| item.id else "", token, state.revision) catch |err| {
+                if (!module.memory.isProcessingTimeout(err) or pending == null) return err;
+                // A provider that overruns its deadline, or storage work that
+                // exhausts the grace period, must not erase the retry attempt.
+                // Re-enter policy with fresh live authority and a bounded budget.
+                // The revision/receipt fence prevents double charging an
+                // ambiguously committed result or modifying newer work.
+                work.deadline.beginFinalization(platform_time.monotonicNs());
+                context.now_ms = @intCast(platform_time.realtimeNs() / std.time.ns_per_ms);
+                adapter.context = context;
+                adapter.request.deadline_ns = work.deadline.end;
+                resources.request.deadline_ns = work.deadline.end;
+                _ = (module.memory.Service{ .backend = bridge.backend(), .context = context }).recordAttemptFailure(a, pending.?.id, token, state.revision, err) catch |failure| {
+                    if (failure == error.MemoryRevisionConflict) return;
+                    return failure;
+                };
+                return;
+            };
         }
     };
 
@@ -59448,4 +59486,34 @@ test "resolver curation HTTP destination checks ignore opaque control metadata" 
     try std.testing.expect(try graphResolverValueDestinationsAllowed(null, payload));
     const actual = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"graph\":{\"resolvers\":false}}", .{});
     try std.testing.expectError(error.InvalidCreateTableRequest, graphResolverValueDestinationsAllowed(null, actual));
+}
+
+test "native memory worker separates model and finalization budgets while fencing leadership" {
+    const Fixture = struct {
+        leader: bool = true,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn isLeader(ptr: *anyopaque, group: u64) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return group == 7001 and self.leader;
+        }
+    };
+    var fixture: Fixture = .{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{ .deployment_mode = .standalone, .relational_maintenance_leadership = .{ .ptr = &fixture, .vtable = &.{ .is_local_leader = Fixture.isLeader } } }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status } }, null, null);
+    defer server.deinit();
+    const now = platform_time.monotonicNs();
+    var budget: ApiHttpServer.MemoryWorkDeadline = .{ .server = &server, .group_id = 7001, .end = now };
+    const inference_end = budget.beginProcessing(now);
+    // A provider taking more than the scheduling quantum remains admissible,
+    // and a model timeout still leaves a storage/publication grace period.
+    try std.testing.expect(inference_end > now + 5 * std.time.ns_per_s);
+    try std.testing.expect(budget.end > inference_end);
+    try ApiHttpServer.MemoryWorkDeadline.check(&budget);
+    budget.end = 0;
+    try std.testing.expectError(error.DeadlineExceeded, ApiHttpServer.MemoryWorkDeadline.check(&budget));
+    budget.beginFinalization(platform_time.monotonicNs());
+    try ApiHttpServer.MemoryWorkDeadline.check(&budget);
+    fixture.leader = false;
+    try std.testing.expectError(error.NotLeader, ApiHttpServer.MemoryWorkDeadline.check(&budget));
 }

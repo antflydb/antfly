@@ -3018,3 +3018,288 @@ test "memory reindex source changes roll back projections and release configurat
     while (keys.next()) |key| try std.testing.expect(!std.mem.startsWith(u8, key.*, "vector/"));
     _ = try modelService(&store, 6).execute(a, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = state.revision, .config = previous.config }, .{}), "next-configuration");
 }
+
+test "memory embedding source checks scale with each invocation input set" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const config: m.types.Config = .{ .features = .{ .semantic_recall = true }, .models = .{ .embedder = fake_model } };
+    const service = modelService(&store, 1);
+    _ = try service.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    var evidence: [32]m.types.Evidence = undefined;
+    var claims: [32]m.types.Assertion = undefined;
+    for (&evidence, &claims, 0..) |*source_item, *claim, i| {
+        const id = try std.fmt.allocPrint(a, "source-{d}", .{i});
+        source_item.* = .{ .id = id, .resource_selector = .{ .table = "business", .id = id } };
+        const refs = try a.alloc(m.types.EvidenceRef, 1);
+        refs[0] = .{ .id = id };
+        claim.* = .{ .id = try std.fmt.allocPrint(a, "claim-{d}", .{i}), .subject = "production", .predicate = "uses", .value = id, .statement = "Deployment", .evidence = refs };
+    }
+    _ = try service.execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = evidence }, .{}), "sources");
+    store.resource_reads = 0;
+    _ = try service.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = claims }, .{}), "claims");
+    // Admission, that invocation's boundary, and transaction publication each
+    // visit a source once. Earlier invocation inputs do not accumulate here.
+    try std.testing.expectEqual(@as(usize, 96), store.resource_reads);
+}
+
+test "memory final publication still fences earlier invocation inputs" {
+    const Model = struct {
+        fn resource(ptr: *anyopaque, a: A, reference: m.types.provenance.Resource) !m.types.provenance.Snapshot {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            if (store.reject_decision and std.mem.eql(u8, reference.id, "first")) return .{ .state = .denied };
+            return Store.resource(ptr, a, reference);
+        }
+        fn embed(ptr: *anyopaque, a: A, model: m.types.Model, text: []const u8) ![]const f32 {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.decisions += 1;
+            if (store.decisions == 2) store.reject_decision = true;
+            return fakeEmbed(ptr, a, model, text);
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var service = modelService(&store, 1);
+    service.backend.resource = Model.resource;
+    const config: m.types.Config = .{ .features = .{ .semantic_recall = true }, .models = .{ .embedder = fake_model } };
+    _ = try service.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    _ = try service.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"first\",\"resource_selector\":{\"table\":\"business\",\"id\":\"first\"}},{\"id\":\"second\",\"resource_selector\":{\"table\":\"business\",\"id\":\"second\"}}]}", "sources");
+    service.backend.embed = Model.embed;
+    const claims = [_]m.types.Assertion{
+        .{ .id = "first", .subject = "production", .predicate = "uses", .value = "A", .statement = "First", .evidence = &.{.{ .id = "first" }} },
+        .{ .id = "second", .subject = "production", .predicate = "uses", .value = "B", .statement = "Second", .evidence = &.{.{ .id = "second" }} },
+    };
+    const revision = store.revision;
+    try std.testing.expectError(error.MemorySourceAccessDenied, service.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = claims }, .{}), "claims"));
+    try std.testing.expectEqual(@as(usize, 2), store.decisions);
+    try std.testing.expectEqual(revision, store.revision);
+    try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "assertion/", null, 64)).rows.len);
+}
+
+test "memory invocation scopes retain cached parent dependencies" {
+    const Model = struct {
+        fn embed(ptr: *anyopaque, a: A, model: m.types.Model, text: []const u8) ![]const f32 {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.decisions += 1;
+            store.resource_state = .denied;
+            return fakeEmbed(ptr, a, model, text);
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var service = modelService(&store, 1);
+    const config: m.types.Config = .{ .features = .{ .semantic_recall = true }, .models = .{ .embedder = fake_model } };
+    _ = try service.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    _ = try service.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e1\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}},{\"id\":\"note\",\"source_id\":\"note\",\"source_version\":\"1\",\"text\":\"Deployment\"}]}", "sources");
+    _ = try service.execute(a, .assertions, "", helm, "parent");
+    const child: m.types.Assertion = .{ .id = "child", .subject = "production", .predicate = "child", .value = "A", .statement = "Child", .evidence = &.{.{ .id = "note" }}, .depends_on = &.{"helm"} };
+    var second = child;
+    second.id = "second";
+    service.backend.embed = Model.embed;
+    try std.testing.expectError(error.MemorySourceAccessDenied, service.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{ child, second } }, .{}), "children"));
+    // The parent source must be checked at the first child's boundary, rather
+    // than discovering its denial only after both model calls at commit.
+    try std.testing.expectEqual(@as(usize, 1), store.decisions);
+}
+
+test "memory timeout recovery persists bounded attempts and idempotent receipts" {
+    const Worker = struct {
+        fn check(ptr: *anyopaque) !void {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            if (store.failures == 1) return error.DeadlineExceeded;
+        }
+        fn generate(ptr: *anyopaque, _: A, _: m.types.Config, _: []const m.types.StoredEvidence) !m.types.Generated {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.failures = 1;
+            return error.DeadlineExceeded;
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const id = try managedSetup(&store);
+    for (0..3) |attempt| {
+        const now: i64 = @intCast(10000 * (attempt + 1));
+        var service = modelService(&store, now);
+        const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+        const token = try std.fmt.allocPrint(a, "worker-{d}", .{attempt});
+        var expired = service;
+        expired.backend.generate = Worker.generate;
+        expired.context.check_ptr = &store;
+        expired.context.check_fn = Worker.check;
+        store.failures = 0;
+        try std.testing.expectError(error.DeadlineExceeded, expired.advanceAtRevision(a, id, token, state.revision));
+        // Only the worker creates a fresh finalization context. Reusing the
+        // foreground's expired context remains forbidden and writes nothing.
+        try std.testing.expectError(error.DeadlineExceeded, expired.recordAttemptFailure(a, id, token, state.revision, error.DeadlineExceeded));
+        const recovered = try service.recordAttemptFailure(a, id, token, state.revision, error.DeadlineExceeded);
+        const status = try std.json.parseFromSliceLeaky(m.types.Operation, a, recovered, .{});
+        try std.testing.expectEqual(@as(u8, @intCast(attempt + 1)), status.attempts);
+        try std.testing.expectEqual(if (attempt == 2) m.types.Stage.failed else .pending, status.phase);
+        try std.testing.expectEqualStrings("DeadlineExceeded", status.error_code.?);
+        try std.testing.expect(!status.assertions_ready);
+        if (attempt < 2) try std.testing.expect(status.next_retry_at.? > now);
+        // Receipt lookup precedes the old revision fence on ambiguous replay.
+        try std.testing.expectEqualStrings(recovered, try service.recordAttemptFailure(a, id, token, state.revision, error.DeadlineExceeded));
+    }
+    try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "pending/", null, 64)).rows.len);
+}
+
+test "memory timeout recovery cannot overwrite newer state or committed success" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const id = try managedSetup(&store);
+    const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    _ = try modelService(&store, 3).execute(a, .observe, "", "{\"evidence\":[{\"id\":\"other\",\"source_id\":\"other\",\"source_version\":\"1\",\"text\":\"Other\"}]}", "concurrent");
+    const service = modelService(&store, 4);
+    try std.testing.expectError(error.MemoryRevisionConflict, service.recordAttemptFailure(a, id, "stale", state.revision, error.DeadlineExceeded));
+    const current = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    const succeeded = try service.advanceAtRevision(a, id, "committed", current.revision);
+    const replay = try service.recordAttemptFailure(a, id, "committed", current.revision, error.DeadlineExceeded);
+    try std.testing.expectEqualStrings(succeeded, replay);
+    const status = try std.json.parseFromSliceLeaky(m.types.Operation, a, replay, .{});
+    try std.testing.expectEqual(m.types.Stage.succeeded, status.phase);
+    try std.testing.expectEqual(@as(u8, 1), status.attempts);
+}
+
+test "memory timeout recovery rechecks live publication authority" {
+    const Authority = struct {
+        fn check(ptr: *anyopaque) !void {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            if (store.reject_decision) return error.Forbidden;
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const id = try managedSetup(&store);
+    const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    var service = modelService(&store, 10000);
+    service.context.final_check_ptr = &store;
+    service.context.final_check_fn = Authority.check;
+    store.reject_decision = true;
+    const revision = store.revision;
+    try std.testing.expectError(error.Forbidden, service.recordAttemptFailure(a, id, "attempt", state.revision, error.DeadlineExceeded));
+    try std.testing.expectEqual(revision, store.revision);
+    store.reject_decision = false;
+    const result = try service.recordAttemptFailure(a, id, "attempt", state.revision, error.DeadlineExceeded);
+    const receipt = try std.json.parseFromSliceLeaky(m.types.Operation, a, result, .{});
+    try std.testing.expectEqual(@as(u8, 1), receipt.attempts);
+}
+
+test "memory reindex timeout recovery exhausts retries without publishing configuration" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    try discard(&store, .assertions, "", helm, "claim", 3);
+    const previous = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    const config: m.types.Config = .{ .features = .{ .semantic_recall = true }, .models = .{ .embedder = fake_model } };
+    const configured = try modelService(&store, 4).execute(a, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = previous.revision, .config = config }, .{}), "configure");
+    const pending = try std.json.parseFromSliceLeaky(m.types.Operation, a, configured, .{});
+    for (0..3) |attempt| {
+        const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+        const now: i64 = @intCast((attempt + 1) * 10000);
+        const result = try modelService(&store, now).recordAttemptFailure(a, pending.id, try std.fmt.allocPrint(a, "attempt-{d}", .{attempt}), state.revision, error.DeadlineExceeded);
+        const receipt = try std.json.parseFromSliceLeaky(m.types.Operation, a, result, .{});
+        try std.testing.expectEqual(@as(u8, @intCast(attempt + 1)), receipt.attempts);
+        try std.testing.expectEqual(if (attempt == 2) m.types.Stage.failed else .pending, receipt.phase);
+        const latest = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+        try std.testing.expectEqual(previous.config.generation, latest.config.generation);
+        try std.testing.expectEqual(attempt < 2, latest.pending_config != null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "vector/", null, 64)).rows.len);
+}
+
+test "memory provider timeout finalizes with backoff from completion time" {
+    const Worker = struct {
+        fn generate(ptr: *anyopaque, _: A, _: m.types.Config, _: []const m.types.StoredEvidence) !m.types.Generated {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            return if (store.failures == 1) error.Timeout else error.DeadlineExceeded;
+        }
+    };
+    for ([_]anyerror{ error.Timeout, error.DeadlineExceeded }) |timeout| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        const id = try managedSetup(&store);
+        const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+        var service = modelService(&store, 3);
+        service.backend.generate = Worker.generate;
+        store.failures = if (timeout == error.Timeout) 1 else 0;
+        const revision = store.revision;
+        // The provider times out while the operation's storage grace is live.
+        try std.testing.expectError(timeout, service.advanceAtRevision(a, id, "attempt", state.revision));
+        try std.testing.expectEqual(revision, store.revision);
+        service.context.now_ms = 120003;
+        const raw = try service.recordAttemptFailure(a, id, "attempt", state.revision, timeout);
+        const receipt = try std.json.parseFromSliceLeaky(m.types.Operation, a, raw, .{});
+        try std.testing.expectEqual(@as(u8, 1), receipt.attempts);
+        try std.testing.expect(receipt.next_retry_at.? > service.context.now_ms);
+        try std.testing.expectError(error.MemoryRetryNotReady, service.advanceAtRevision(a, id, "early", receipt.revision));
+    }
+}
+
+test "memory invocation epochs reauthorize cached inputs before later model use" {
+    const Model = struct {
+        fn resource(ptr: *anyopaque, a: A, reference: m.types.provenance.Resource) !m.types.provenance.Snapshot {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            if (store.reject_decision and std.mem.eql(u8, reference.id, "first")) return .{ .state = .denied };
+            return Store.resource(ptr, a, reference);
+        }
+        fn embed(ptr: *anyopaque, a: A, model: m.types.Model, text: []const u8) ![]const f32 {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.decisions += 1;
+            if (store.decisions == 2) store.reject_decision = true;
+            return fakeEmbed(ptr, a, model, text);
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var service = modelService(&store, 1);
+    service.backend.resource = Model.resource;
+    const config: m.types.Config = .{ .features = .{ .semantic_recall = true }, .models = .{ .embedder = fake_model } };
+    _ = try service.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    _ = try service.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"first\",\"resource_selector\":{\"table\":\"business\",\"id\":\"first\"}},{\"id\":\"other\",\"resource_selector\":{\"table\":\"business\",\"id\":\"other\"}}]}", "sources");
+    service.backend.embed = Model.embed;
+    const claims = [_]m.types.Assertion{
+        .{ .id = "first", .subject = "production", .predicate = "uses", .value = "A", .statement = "First", .evidence = &.{.{ .id = "first" }} },
+        .{ .id = "other", .subject = "production", .predicate = "uses", .value = "B", .statement = "Other", .evidence = &.{.{ .id = "other" }} },
+        .{ .id = "reuse", .subject = "production", .predicate = "uses", .value = "A", .statement = "Reuse first input", .evidence = &.{.{ .id = "first" }} },
+    };
+    const revision = store.revision;
+    try std.testing.expectError(error.MemorySourceAccessDenied, service.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = claims }, .{}), "claims"));
+    // The third invocation must not receive input revoked during the unrelated
+    // second invocation, even though that source already has a cached snapshot.
+    try std.testing.expectEqual(@as(usize, 2), store.decisions);
+    try std.testing.expectEqual(revision, store.revision);
+}
+
+test "memory failure finalization does not reacquire a timed out input plan" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const config: m.types.Config = .{ .processing = .managed, .features = .{ .assertion_distillation = true }, .models = .{ .generator = fake_model } };
+    _ = try modelService(&store, 1).execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    const observed = try modelService(&store, 2).execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e1\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}}]}", "source");
+    const pending = try std.json.parseFromSliceLeaky(m.types.Operation, a, observed, .{});
+    const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    store.resource_state = .denied;
+    const reads = store.resource_reads;
+    // Recording the already completed processing failure needs destination
+    // authority, not another read of its former inputs. It emits no artifacts.
+    const raw = try modelService(&store, 10000).recordAttemptFailure(a, pending.id, "timeout", state.revision, error.Timeout);
+    const receipt = try std.json.parseFromSliceLeaky(m.types.Operation, a, raw, .{});
+    try std.testing.expectEqual(reads, store.resource_reads);
+    try std.testing.expectEqual(@as(u8, 1), receipt.attempts);
+    try std.testing.expect(!receipt.assertions_ready);
+    try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "assertion/", null, 64)).rows.len);
+    const latest = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    // The next real processing attempt still checks source authorization and
+    // cannot consume an additional model attempt while access is denied.
+    try std.testing.expectError(error.MemorySourceAccessDenied, modelService(&store, 20000).advanceAtRevision(a, pending.id, "next", latest.revision));
+}

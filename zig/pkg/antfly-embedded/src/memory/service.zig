@@ -97,17 +97,36 @@ pub const Context = struct {
 };
 pub const Action = operations.Action;
 pub const mutates = operations.mutates;
+// Provider invocation/embedding budgets and request budgets use distinct native
+// timeout errors. Workers finalize both through the same bounded recovery path.
+pub fn isProcessingTimeout(err: anyerror) bool {
+    return err == error.Timeout or err == error.DeadlineExceeded;
+}
 pub const Service = struct {
     backend: Backend,
     context: Context,
 
+    const Execution = struct { expected_revision: ?u64 = null, processing_failure: ?anyerror = null, defer_timeouts: bool = false };
     pub fn execute(self: Service, alloc: A, action: Action, id: []const u8, body: []const u8, idempotency_key: []const u8) ![]u8 {
+        return self.executeInner(alloc, action, id, body, idempotency_key, .{});
+    }
+    /// Background execution and timeout recovery share one revision and receipt.
+    /// A stale worker cannot charge a failure to newer work or replace a result
+    /// whose commit succeeded despite a transport timeout.
+    pub fn advanceAtRevision(self: Service, alloc: A, id: []const u8, token: []const u8, revision: u64) ![]u8 {
+        return self.executeInner(alloc, .advance, id, "{}", token, .{ .expected_revision = revision, .defer_timeouts = true });
+    }
+    pub fn recordAttemptFailure(self: Service, alloc: A, id: []const u8, token: []const u8, revision: u64, failure: anyerror) ![]u8 {
+        if (id.len == 0) return error.InvalidMemoryRequest;
+        return self.executeInner(alloc, .advance, id, "{}", token, .{ .expected_revision = revision, .processing_failure = failure });
+    }
+    fn executeInner(self: Service, alloc: A, action: Action, id: []const u8, body: []const u8, idempotency_key: []const u8, execution: Execution) ![]u8 {
         try self.context.check();
         if (body.len > 4 * 1024 * 1024) return error.MemoryInputTooLarge;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        var run: Run = .{ .service = self, .a = a };
+        var run: Run = .{ .service = self, .a = a, .processing_failure = execution.processing_failure, .defer_timeouts = execution.defer_timeouts };
         const state_row = try self.backend.get(self.backend.ptr, a, "control");
         run.state_row = state_row;
         if (action == .create and state_row == null) {
@@ -135,6 +154,7 @@ pub const Service = struct {
                 try self.context.finish();
                 return try std.json.Stringify.valueAlloc(alloc, publicOperation(receipt), .{});
             }
+            if (execution.expected_revision) |revision| if (run.state.revision != revision) return error.MemoryRevisionConflict;
             if (run.state.pending_config != null and action != .advance and action != .forget and action != .stage_embeddings) return error.MemoryConfigurationTransition;
             if (action == .create) {
                 if (state_row != null) return error.MemorySpaceExists;
@@ -263,7 +283,8 @@ pub const Service = struct {
 };
 
 const Run = struct {
-    const ResourceRead = struct { reference: prov.Resource, snapshot: prov.Snapshot };
+    const ResourceRead = struct { reference: prov.Resource, snapshot: prov.Snapshot, epoch: u64 };
+    const ResourceSet = std.StringHashMapUnmanaged(void);
     service: Service,
     a: A,
     state: t.State = undefined,
@@ -279,6 +300,10 @@ const Run = struct {
     retention_maintenance: bool = false,
     resource_states: std.StringHashMapUnmanaged(ResourceRead) = .empty,
     inferred: bool = false,
+    inference_epoch: u64 = 0,
+    capturing_resources: ?*ResourceSet = null,
+    processing_failure: ?anyerror = null,
+    defer_timeouts: bool = false,
     explanation_decisions: std.StringHashMapUnmanaged(void) = .empty,
     explanation_truncated: bool = false,
     explanation_incomplete_history: bool = false,
@@ -461,37 +486,77 @@ const Run = struct {
         if (!reference.external()) return error.InvalidResourceReference;
         if (!eql(u8, reference.database, self.state.database)) return error.Forbidden;
         const cache_key = try hash(self.a, .{ reference, self.service.context.principal });
-        if (self.resource_states.get(cache_key)) |value| return value.snapshot;
+        if (self.capturing_resources) |inputs| try inputs.put(self.a, cache_key, {});
+        if (self.resource_states.getPtr(cache_key)) |value| {
+            // Another invocation may have released the lease since this input
+            // was checked. Validate before exposing it to a later invocation.
+            if (value.epoch != self.inference_epoch) {
+                try self.validateResource(value.*);
+                value.epoch = self.inference_epoch;
+            }
+            return value.snapshot;
+        }
         const resolve = self.service.backend.resource orelse return error.MemoryCapabilityUnavailable;
         const value = try resolve(self.service.backend.ptr, self.a, reference);
         try self.cacheResource(reference, value);
         return value;
     }
     fn cacheResource(self: *Run, reference: prov.Resource, snapshot: prov.Snapshot) !void {
-        try self.resource_states.put(self.a, try hash(self.a, .{ reference, self.service.context.principal }), .{ .reference = reference, .snapshot = snapshot });
+        try self.resource_states.put(self.a, try hash(self.a, .{ reference, self.service.context.principal }), .{ .reference = reference, .snapshot = snapshot, .epoch = self.inference_epoch });
     }
-    // Inference releases native leases. Re-read every resource observed by the
-    // plan, including uncited context and reconciliation candidates, before
-    // accepting its result. Never replace the admitted snapshot with a newer one.
+    fn Captured(comptime handler: anytype) type {
+        const Result = @typeInfo(@typeInfo(@TypeOf(handler)).@"fn".return_type.?).error_union.payload;
+        return struct { resources: ResourceSet, result: Result };
+    }
+    // Capture the actual native input closure, including cache hits. Visibility
+    // memoization is local to this capture, so shared parents and redacted
+    // decision lineage cannot disappear from a later invocation's read set.
+    fn captureResources(self: *Run, comptime handler: anytype, args: anytype) !Captured(handler) {
+        var inputs: ResourceSet = .empty;
+        std.debug.assert(self.capturing_resources == null);
+        self.capturing_resources = &inputs;
+        defer self.capturing_resources = null;
+        self.views.clearRetainingCapacity();
+        const result = try @call(.auto, handler, .{self} ++ args);
+        return .{ .resources = inputs, .result = result };
+    }
+    fn validateResource(self: *Run, input: ResourceRead) !void {
+        try self.service.context.check();
+        const current = try self.service.backend.resource.?(self.service.backend.ptr, self.a, input.reference);
+        const admitted = input.snapshot;
+        if (current.state == .denied and admitted.state != .denied) return error.MemorySourceAccessDenied;
+        if (current.state != admitted.state or current.table_id != admitted.table_id or current.revision != admitted.revision or current.payload_truncated != admitted.payload_truncated or
+            !eql(u8, current.json, admitted.json) or !eql(u8, current.digest orelse "", admitted.digest orelse "")) return error.MemoryResourceChanged;
+    }
+    // The transaction-wide read set is checked once at publication. Each
+    // inference boundary checks only that invocation's causal input closure.
     fn validateResources(self: *Run) !void {
         var reads = self.resource_states.valueIterator();
-        while (reads.next()) |read_resource| {
-            try self.service.context.check();
-            const current = try self.service.backend.resource.?(self.service.backend.ptr, self.a, read_resource.reference);
-            const admitted = read_resource.snapshot;
-            if (current.state == .denied and admitted.state != .denied) return error.MemorySourceAccessDenied;
-            if (current.state != admitted.state or current.table_id != admitted.table_id or current.revision != admitted.revision or current.payload_truncated != admitted.payload_truncated or
-                !eql(u8, current.json, admitted.json) or !eql(u8, current.digest orelse "", admitted.digest orelse "")) return error.MemoryResourceChanged;
+        while (reads.next()) |input| try self.validateResource(input.*);
+    }
+    fn inferenceCompleted(self: *Run, inputs: ResourceSet) !void {
+        self.inferred = true;
+        self.inference_epoch += 1;
+        var reads = inputs.keyIterator();
+        while (reads.next()) |path| {
+            const input = self.resource_states.getPtr(path.*).?;
+            try self.validateResource(input.*);
+            input.epoch = self.inference_epoch;
         }
     }
-    fn inferenceCompleted(self: *Run) !void {
-        self.inferred = true;
-        try self.validateResources();
-    }
-    fn embed(self: *Run, model: t.Model, text: []const u8) ![]const f32 {
+    fn embed(self: *Run, model: t.Model, text: []const u8, inputs: ResourceSet) ![]const f32 {
         const result = try self.service.backend.embed.?(self.service.backend.ptr, self.a, model, text);
-        try self.inferenceCompleted();
+        try self.inferenceCompleted(inputs);
         return result;
+    }
+    fn embeddingInputs(self: *Run, claim: t.Assertion, generated: bool) !void {
+        try self.validateAssertion(claim, generated);
+        if (!try self.generationVisible("assertion", claim.id)) return error.MemoryForgotten;
+    }
+    fn generationInputs(self: *Run, sources: []const t.StoredEvidence) !void {
+        for (sources) |source| if (source.evidence.resource) |reference| {
+            _ = try self.resourceSnapshot(reference);
+        };
     }
     fn resourceCurrent(self: *Run, source: t.StoredEvidence) !bool {
         const reference = source.evidence.resource orelse return true;
@@ -937,7 +1002,10 @@ const Run = struct {
             if (!generated and std.mem.startsWith(u8, claim.producer, "managed:")) return error.MemoryProducerConflict;
             if (generated) claim.producer = try std.fmt.allocPrint(self.a, "managed:{d}", .{self.state.config.generation});
             const input_hash = try hash(self.a, claim);
-            try self.validateAssertion(claim, generated);
+            var embedding_inputs: ResourceSet = .empty;
+            if (self.state.config.features.semantic_recall and claim.embedding == null) {
+                embedding_inputs = (try self.captureResources(embeddingInputs, .{ claim, generated })).resources;
+            } else try self.validateAssertion(claim, generated);
             if (try self.assertion(claim.id)) |old| {
                 try self.authorize(old.owner, .private);
                 if (old.input_hash.len > 0) {
@@ -953,7 +1021,7 @@ const Run = struct {
                 continue;
             }
             if (self.state.config.features.semantic_recall and claim.embedding == null) {
-                claim.embedding = try self.embed(self.state.config.models.embedder.?, claim.statement);
+                claim.embedding = try self.embed(self.state.config.models.embedder.?, claim.statement, embedding_inputs);
                 claim.embedding_model = self.state.config.models.embedder;
             }
             try self.validateAssertion(claim, generated);
@@ -1003,14 +1071,15 @@ const Run = struct {
     fn decideClaim(self: *Run, claim: *t.Assertion, owner: []const u8, previous_reason: ?[]const u8) !?[]const u8 {
         if (!self.singlePredicate(claim.predicate) or claim.modality != .actual or claim.role == .hypothesized or claim.stability != .settled) return null;
         const decide = self.service.backend.decide orelse return error.MemoryCapabilityUnavailable;
-        const prior = try self.candidates(claim.*, owner);
-        if (prior.len == 0) return null;
         // Capture the artifact actually supplied to inference before replacing
         // its text. A rebuild rewrites this assertion's history revision in the
         // same transaction, so a self-reference to that row is not a snapshot.
         const incoming_reason = if (claim.reconciliation_reason != null) previous_reason else null;
+        const inputs = try self.captureResources(decisionInputs, .{ claim.*, owner, incoming_reason });
+        const prior = inputs.result;
+        if (prior.len == 0) return null;
         const decision = try decide(self.service.backend.ptr, self.a, self.state.config, claim.*, prior);
-        try self.inferenceCompleted();
+        try self.inferenceCompleted(inputs.resources);
         if (decision.reason.len == 0 or decision.reason.len > t.max_text_bytes) return error.MemoryUngroundedOutput;
         for (decision.supersedes) |target| {
             var found = false;
@@ -1023,6 +1092,14 @@ const Run = struct {
         claim.supersedes = decision.supersedes;
         claim.reconciliation_reason = decision.reason;
         return try self.storeDecision(claim.*, prior, incoming_reason);
+    }
+    fn decisionInputs(self: *Run, claim: t.Assertion, owner: []const u8, incoming_reason: ?[]const u8) ![]const t.StoredAssertion {
+        _ = try self.supportVisible(claim.evidence, claim.depends_on, 0);
+        for (claim.support_sets) |support| _ = try self.supportVisible(support.evidence, support.depends_on, 0);
+        _ = try self.generationVisible("assertion", claim.id);
+        _ = try self.identityVisible(claim);
+        if (incoming_reason) |reason| _ = try self.decisionVisible(reason, 0);
+        return self.candidates(claim, owner);
     }
     fn reconcileModel(self: *Run, incoming: t.StoredAssertion) !void {
         if (incoming.lifecycle != .active or incoming.stale or !try self.evidenceVisible(incoming)) return;
@@ -1615,7 +1692,8 @@ const Run = struct {
         self.service.context.principal = pending.owner;
         defer self.service.context.principal = caller;
         if (eql(u8, pending.action, "configure")) {
-            self.reindex(path, &pending) catch |err| {
+            const processed: anyerror!void = if (self.processing_failure) |failure| failure else self.reindex(path, &pending);
+            processed catch |err| {
                 // Source authorization is a publication prerequisite, not a
                 // producer failure. Keep the durable cursor and retry budget.
                 if (err == error.MemorySourceAccessDenied) return err;
@@ -1635,6 +1713,14 @@ const Run = struct {
         }
         if (pending.attempts >= self.state.config.max_attempts) return error.MemoryRetryExhausted;
         if (pending.next_retry_at) |time| if (time > self.service.context.now_ms) return error.MemoryRetryNotReady;
+        // Failure finalization publishes only outcome metadata. Do not repeat
+        // source acquisition under its short budget or expose any input to a
+        // model. The original revision fence and live destination grants guard
+        // this update; the next processing attempt revalidates its input plan.
+        if (self.processing_failure) |failure| {
+            pending.attempts += 1;
+            return self.processingFailure(path, &pending, failure);
+        }
         var sources: std.ArrayList(t.StoredEvidence) = .empty;
         for (pending.inputs) |input| {
             const source = (try self.evidence(input)) orelse {
@@ -1656,9 +1742,10 @@ const Run = struct {
             try sources.append(self.a, source);
         }
         pending.attempts += 1;
+        const inputs = try self.captureResources(generationInputs, .{sources.items});
         const generate = self.service.backend.generate orelse return error.MemoryCapabilityUnavailable;
         const generated = generate(self.service.backend.ptr, self.a, self.state.config, sources.items) catch |err| return self.processingFailure(path, &pending, err);
-        self.inferenceCompleted() catch |err| return self.processingFailure(path, &pending, err);
+        self.inferenceCompleted(inputs.resources) catch |err| return self.processingFailure(path, &pending, err);
         self.publishGenerated(pending, generated, sources.items) catch |err| return self.processingFailure(path, &pending, err);
         pending.phase = .succeeded;
         pending.assertions_ready = true;
@@ -1699,6 +1786,10 @@ const Run = struct {
         return true;
     }
     fn processingFailure(self: *Run, path: []const u8, pending: *t.Operation, err: anyerror) !void {
+        // Worker timeouts are finalized under a fresh bounded context even if
+        // the outer deadline has grace left. Backoff starts at completion, not
+        // at the beginning of a potentially long model call.
+        if (self.defer_timeouts and isProcessingTimeout(err)) return err;
         // Authorization failure rolls back the whole attempt, preserving both
         // the durable obligation and its retry budget.
         if (err == error.MemorySourceAccessDenied) return err;
@@ -1776,11 +1867,12 @@ const Run = struct {
         const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "assertion/", pending.cursor, 8);
         for (page.rows) |row| {
             const record = try parse(t.StoredAssertion, self.a, row.json);
-            if (!try self.publicationCandidate(record)) continue;
+            const inputs = try self.captureResources(publicationCandidate, .{record});
+            if (!inputs.result) continue;
             if (eql(u8, config.models.embedder.?.provider, "external")) {
                 if (try self.vectorFor(config, record.assertion) == null) return error.MemoryExternalVectorRequired;
             } else {
-                const embedding = try self.embed(config.models.embedder.?, record.assertion.statement);
+                const embedding = try self.embed(config.models.embedder.?, record.assertion.statement, inputs.resources);
                 try self.putVector(config, record.assertion, embedding);
             }
         }
@@ -2470,7 +2562,7 @@ const Run = struct {
             if (request.embedding_model == null or !eql(u8, try self.encode(request.embedding_model.?), try self.encode(model)) or supplied.len != model.dimensions.?) return error.MemoryEmbeddingMismatch;
             for (supplied) |value| if (!std.math.isFinite(value)) return error.MemoryEmbeddingMismatch;
         }
-        if (self.state.config.features.semantic_recall and vector == null and request.query.len > 0) vector = try self.embed(self.state.config.models.embedder.?, request.query);
+        if (self.state.config.features.semantic_recall and vector == null and request.query.len > 0) vector = try self.embed(self.state.config.models.embedder.?, request.query, .empty);
         var more = false;
         while (true) {
             try self.service.context.check();

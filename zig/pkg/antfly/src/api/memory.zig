@@ -71,7 +71,7 @@ pub fn status(err: anyerror) u16 {
         error.MemoryRetryNotReady, error.MemoryRetryExhausted, error.MemoryOverloaded => 429,
         error.MemoryCommitPending, error.NotLeader, error.Unavailable, error.StorageUnavailable, error.GroupLeaderUnavailable => 503,
         error.Canceled => 408,
-        error.DeadlineExceeded => 504,
+        error.Timeout, error.DeadlineExceeded => 504,
         error.OutOfMemory, error.MemoryCorruptState => 500,
         else => 400,
     };
