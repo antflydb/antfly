@@ -436,3 +436,27 @@ test "prepared replay credit codecs reject truncation corruption and impossible 
     impossible.base.changed_doc_keys = .{ .key_bytes = 1 };
     try std.testing.expectError(error.RecordTooLarge, impossible.encode());
 }
+
+test "prepared replay credit fences main curation readers and preparation-only readers on both sidecars" {
+    const Fixture = struct {
+        minimum: []const u8,
+        baseline: []const u8,
+        fn get(self: *@This(), key: []const u8) ![]const u8 {
+            return if (std.mem.eql(u8, key, floors.minimum_reader_key)) self.minimum else self.baseline;
+        }
+    };
+    try std.testing.expect(floors.scoped_curation_reader_version < floors.prepared_transaction_reader_version);
+    try std.testing.expect(floors.prepared_transaction_reader_version < floors.replay_credit_reader_version);
+    var enabled_buffer: [16]u8 = undefined;
+    const enabled = try std.fmt.bufPrint(&enabled_buffer, "{d}", .{floors.replay_credit_reader_version});
+    for ([_]u32{ floors.curation_provenance_reader_version, floors.scoped_curation_reader_version, floors.prepared_transaction_reader_version }) |version| {
+        var older_buffer: [16]u8 = undefined;
+        const older = try std.fmt.bufPrint(&older_buffer, "{d}", .{version});
+        var minimum: Fixture = .{ .minimum = older, .baseline = enabled };
+        try std.testing.expectError(error.PreparedTransactionProtocolDisabled, requireFloors(&minimum));
+        var baseline: Fixture = .{ .minimum = enabled, .baseline = older };
+        try std.testing.expectError(error.PreparedTransactionProtocolDisabled, requireFloors(&baseline));
+    }
+    var ready: Fixture = .{ .minimum = enabled, .baseline = enabled };
+    try requireFloors(&ready);
+}

@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const index_metadata = @import("../api/index_metadata.zig");
 const ant_json = @import("antfly-json");
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const request_context = @import("antfly_inference_execution_context");
@@ -859,7 +860,7 @@ fn collectEmbeddingVectorSpaces(value: std.json.Value, spaces: *VectorSpaceMap, 
             }
             var it = object.iterator();
             while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+                if (std.mem.eql(u8, entry.key_ptr.*, "enrichments") or index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;
                 try collectEmbeddingVectorSpaces(entry.value_ptr.*, spaces, alloc);
             }
         },
@@ -1148,6 +1149,7 @@ pub const ManagedEmbedder = struct {
 
         var it = object.iterator();
         while (it.next()) |entry| {
+            if (index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;
             var managed = try parseManagedEmbeddingEntry(alloc, entry.key_ptr.*, entry.value_ptr.*, options, sparse_kind) orelse continue;
             entries.append(alloc, managed) catch |err| {
                 managed.deinit(alloc);
@@ -3373,7 +3375,7 @@ fn findEmbeddingEnrichmentValue(
             }
             var it = object.iterator();
             while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+                if (std.mem.eql(u8, entry.key_ptr.*, "enrichments") or index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;
                 try findEmbeddingEnrichmentValue(entry.value_ptr.*, artifact_name, found);
             }
         },
@@ -3776,7 +3778,7 @@ fn validateAllEmbeddingEnrichmentProducers(
             }
             var it = object.iterator();
             while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+                if (std.mem.eql(u8, entry.key_ptr.*, "enrichments") or index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;
                 try validateAllEmbeddingEnrichmentProducers(alloc, entry.value_ptr.*, options, executable_entries, sparse_kind);
             }
         },
@@ -3943,6 +3945,7 @@ fn collectCatalogProducerOwners(
     if (root != .object) return error.InvalidManagedEmbeddingIndex;
     var it = root.object.iterator();
     while (it.next()) |entry| {
+        if (index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;
         if (entry.value_ptr.* != .object) continue;
         const object = entry.value_ptr.object;
         const type_value = object.get("type") orelse continue;
@@ -3996,6 +3999,7 @@ fn collectCatalogEmbeddingConsumers(
     if (root != .object) return error.InvalidManagedEmbeddingIndex;
     var it = root.object.iterator();
     while (it.next()) |entry| {
+        if (index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;
         if (entry.value_ptr.* != .object) continue;
         const object = entry.value_ptr.object;
         const type_value = object.get("type") orelse continue;
@@ -4207,7 +4211,7 @@ fn validateCatalogEmbeddingProducerOwnership(
             }
             var it = object.iterator();
             while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+                if (std.mem.eql(u8, entry.key_ptr.*, "enrichments") or index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;
                 try validateCatalogEmbeddingProducerOwnership(alloc, entry.value_ptr.*, owners, consumers, options);
             }
         },
@@ -4441,6 +4445,7 @@ fn addArtifactBackedManagedEmbeddingEntries(
     const object = root.object;
     var it = object.iterator();
     while (it.next()) |entry| {
+        if (index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;
         const index_object = switch (entry.value_ptr.*) {
             .object => |value| value,
             else => continue,

@@ -7860,8 +7860,8 @@ const PreparedReplaySealFixture = struct {
         errdefer self.store.close();
         try @import("artifact_footprint.zig").initializeEmpty(&self.store);
         try @import("artifact_replay_inventory.zig").initialize(&self.store);
-        try self.store.put(@import("db/catalog/reader_versions.zig").minimum_reader_key, "11");
-        try self.store.put(@import("db/catalog/reader_versions.zig").replacement_reader_base_key, "11");
+        try self.store.put(@import("db/catalog/reader_versions.zig").minimum_reader_key, try @import("db/catalog/resolver_catalog.zig").readerVersionBytes(@import("db/catalog/reader_versions.zig").replay_credit_reader_version));
+        try self.store.put(@import("db/catalog/reader_versions.zig").replacement_reader_base_key, try @import("db/catalog/resolver_catalog.zig").readerVersionBytes(@import("db/catalog/reader_versions.zig").replay_credit_reader_version));
         self.manager = try TxnManager.init(a, &self.store);
         errdefer self.manager.deinit();
         try self.manager.initTransactionRequiringPreparedEffects(id, 1, 1, &.{}, false, false, .{ .mode = .deferred }, .{}, null);

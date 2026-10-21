@@ -808,10 +808,11 @@ class AntflyClient:
                 httpx_args=httpx_args,
             )
         self.indexes = IndexOperations(self)
-        from .resolvers import EntityOperations, ResolverOperations
+        from .resolvers import CurationProposalOperations, EntityOperations, ResolverOperations
 
         self.resolvers = ResolverOperations(self)
         self.entities = EntityOperations(self)
+        self.curation_proposals = CurationProposalOperations(self)
 
     def close(self) -> None:
         """Release this client's pooled HTTP connections. May be called repeatedly."""

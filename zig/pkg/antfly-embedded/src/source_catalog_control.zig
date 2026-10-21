@@ -28,6 +28,7 @@ pub const api_coverage_policy = @import("api/coverage_policy.zig");
 pub const api_distributed_txn_contract = @import("api/distributed_txn_contract.zig");
 pub const api_full_text_indexes = @import("api/full_text_indexes.zig");
 pub const api_graph_wire_envelope = @import("api/graph_wire_envelope.zig");
+pub const api_index_metadata = @import("api/index_metadata.zig");
 pub const api_json_helpers = @import("api/json_helpers.zig");
 pub const api_local_backups = @import("api/backups.zig");
 pub const api_graph_expand_decode = @import("api/graph_expand_decode.zig");

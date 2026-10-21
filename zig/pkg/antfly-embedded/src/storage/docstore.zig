@@ -7844,8 +7844,8 @@ const PreparedReplayCreditFixture = struct {
         errdefer self.store.close();
         try @import("artifact_footprint.zig").initializeEmpty(&self.store);
         try artifact_replay_inventory.initialize(&self.store);
-        try self.store.put(floors.minimum_reader_key, "11");
-        try self.store.put(floors.replacement_reader_base_key, "11");
+        try self.store.put(floors.minimum_reader_key, try @import("db/catalog/resolver_catalog.zig").readerVersionBytes(floors.replay_credit_reader_version));
+        try self.store.put(floors.replacement_reader_base_key, try @import("db/catalog/resolver_catalog.zig").readerVersionBytes(floors.replay_credit_reader_version));
     }
     fn deinit(self: *@This()) void {
         self.store.close();
@@ -8012,7 +8012,7 @@ test "docstore prepared replay credit requires reader floors known inventory and
     }
     try fixture.store.put(F.floors.minimum_reader_key, "10");
     try std.testing.expectError(error.PreparedTransactionProtocolDisabled, fixture.reserve(id, &.{key}));
-    try fixture.store.put(F.floors.minimum_reader_key, "11");
+    try fixture.store.put(F.floors.minimum_reader_key, try @import("db/catalog/resolver_catalog.zig").readerVersionBytes(F.floors.replay_credit_reader_version));
     try fixture.store.put(@import("artifact_footprint.zig").key, "invalid");
     try std.testing.expectError(error.ArtifactCatalogCorrupt, fixture.reserve(id, &.{key}));
     const footprint = @import("artifact_footprint.zig");

@@ -2759,7 +2759,87 @@ export class AntflyClient {
     },
   };
 
+  curationProposals = {
+    create: async (
+      tableName: string,
+      body: components["schemas"]["CurationProposalRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/tables/{tableName}/curation/proposals",
+        { signal: options?.signal, params: { path: { tableName } }, body }
+      );
+      if (error) throw new Error(`curationProposals.create: ${error.error}`);
+      if (!data) throw new Error("curationProposals.create: empty response");
+      return data;
+    },
+    list: async (
+      tableName: string,
+      query?: { state?: string; action?: string; cursor?: string; limit?: number },
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.GET(
+        "/db/v1/tables/{tableName}/curation/proposals",
+        { signal: options?.signal, params: { path: { tableName }, query } }
+      );
+      if (error) throw new Error(`curationProposals.list: ${error.error}`);
+      if (!data) throw new Error("curationProposals.list: empty response");
+      return data;
+    },
+    get: async (tableName: string, proposalId: string, options?: { signal?: AbortSignal }) => {
+      const { data, error } = await this.client.GET(
+        "/db/v1/tables/{tableName}/curation/proposals/{proposalId}",
+        { signal: options?.signal, params: { path: { tableName, proposalId } } }
+      );
+      if (error) throw new Error(`curationProposals.get: ${error.error}`);
+      if (!data) throw new Error("curationProposals.get: empty response");
+      return data;
+    },
+    accept: async (
+      tableName: string,
+      proposalId: string,
+      body: components["schemas"]["CurationProposalDecisionRequest"] = {},
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/tables/{tableName}/curation/proposals/{proposalId}:accept",
+        { signal: options?.signal, params: { path: { tableName, proposalId } }, body }
+      );
+      if (error) throw new Error(`curationProposals.accept: ${error.error}`);
+      if (!data) throw new Error("curationProposals.accept: empty response");
+      return data;
+    },
+    reject: async (
+      tableName: string,
+      proposalId: string,
+      body: components["schemas"]["CurationProposalDecisionRequest"] = {},
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/tables/{tableName}/curation/proposals/{proposalId}:reject",
+        { signal: options?.signal, params: { path: { tableName, proposalId } }, body }
+      );
+      if (error) throw new Error(`curationProposals.reject: ${error.error}`);
+      if (!data) throw new Error("curationProposals.reject: empty response");
+      return data;
+    },
+  };
+
   entities = {
+    distinct: async (
+      tableName: string,
+      key: string,
+      body: components["schemas"]["EntityDistinctRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/tables/{tableName}/entities/{key}:distinct",
+        { signal: options?.signal, params: { path: { tableName, key } }, body }
+      );
+      if (error) throw new Error(`pinEntitiesDistinct: ${error.error}`);
+      if (!data) throw new Error("pinEntitiesDistinct: empty response");
+      return data;
+    },
     state: async (tableName: string, key: string, options?: { signal?: AbortSignal }) => {
       const { data, error } = await this.client.GET(
         "/db/v1/tables/{tableName}/entities/{key}/redirects",
@@ -2800,7 +2880,7 @@ export class AntflyClient {
     suppress: async (
       tableName: string,
       key: string,
-      body: components["schemas"]["ResolverUnmergeRequest"],
+      body: components["schemas"]["EntitySuppressRequest"],
       options?: { signal?: AbortSignal }
     ) => {
       const { data, error } = await this.client.POST(
@@ -3099,7 +3179,125 @@ export class AntflyClient {
     },
   };
 
+  namespaceCurationProposals = {
+    create: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      body: components["schemas"]["CurationProposalRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName } },
+          body,
+        }
+      );
+      if (error) throw new Error(`namespaceCurationProposals.create: ${error.error}`);
+      if (!data) throw new Error("namespaceCurationProposals.create: empty response");
+      return data;
+    },
+    list: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      query?: { state?: string; action?: string; cursor?: string; limit?: number },
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.GET(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName }, query },
+        }
+      );
+      if (error) throw new Error(`namespaceCurationProposals.list: ${error.error}`);
+      if (!data) throw new Error("namespaceCurationProposals.list: empty response");
+      return data;
+    },
+    get: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      proposalId: string,
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.GET(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName, proposalId } },
+        }
+      );
+      if (error) throw new Error(`namespaceCurationProposals.get: ${error.error}`);
+      if (!data) throw new Error("namespaceCurationProposals.get: empty response");
+      return data;
+    },
+    accept: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      proposalId: string,
+      body: components["schemas"]["CurationProposalDecisionRequest"] = {},
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:accept",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName, proposalId } },
+          body,
+        }
+      );
+      if (error) throw new Error(`namespaceCurationProposals.accept: ${error.error}`);
+      if (!data) throw new Error("namespaceCurationProposals.accept: empty response");
+      return data;
+    },
+    reject: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      proposalId: string,
+      body: components["schemas"]["CurationProposalDecisionRequest"] = {},
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:reject",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName, proposalId } },
+          body,
+        }
+      );
+      if (error) throw new Error(`namespaceCurationProposals.reject: ${error.error}`);
+      if (!data) throw new Error("namespaceCurationProposals.reject: empty response");
+      return data;
+    },
+  };
+
   namespaceEntities = {
+    distinct: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      key: string,
+      body: components["schemas"]["EntityDistinctRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:distinct",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName, key } },
+          body,
+        }
+      );
+      if (error) throw new Error(`pinEntitiesDistinct: ${error.error}`);
+      if (!data) throw new Error("pinEntitiesDistinct: empty response");
+      return data;
+    },
     state: async (
       databaseName: string,
       namespaceName: string,
@@ -3163,7 +3361,7 @@ export class AntflyClient {
       namespaceName: string,
       tableName: string,
       key: string,
-      body: components["schemas"]["ResolverUnmergeRequest"],
+      body: components["schemas"]["EntitySuppressRequest"],
       options?: { signal?: AbortSignal }
     ) => {
       const { data, error } = await this.client.POST(

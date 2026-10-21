@@ -145040,8 +145040,8 @@ test "db prepared transaction effects required funded replay commit retains HA d
         // or enable the normal required PREPARE negotiation/provider path.
         try @import("../artifact_footprint.zig").initializeEmpty(db.core.store);
         try inventory.initialize(db.core.store);
-        try db.core.store.put(floors.minimum_reader_key, "11");
-        try db.core.store.put(floors.replacement_reader_base_key, "11");
+        try db.core.store.put(floors.minimum_reader_key, try @import("catalog/resolver_catalog.zig").readerVersionBytes(floors.replay_credit_reader_version));
+        try db.core.store.put(floors.replacement_reader_base_key, try @import("catalog/resolver_catalog.zig").readerVersionBytes(floors.replay_credit_reader_version));
         try db.batch(.{ .writes = &.{.{ .key = row_id, .value = "{\"body\":\"before\"}" }} });
         {
             db.core.lockApply();

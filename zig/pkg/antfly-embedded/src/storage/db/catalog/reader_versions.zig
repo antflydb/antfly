@@ -22,10 +22,12 @@ pub const curation_reader_version: u32 = 6;
 pub const generated_producers_reader_version: u32 = 7;
 pub const grouped_sources_reader_version: u32 = 8;
 pub const namespace_curation_reader_version: u32 = 9;
+pub const curation_provenance_reader_version: u32 = 10;
+pub const scoped_curation_reader_version: u32 = 11;
 /// Required preparation retains exact participant and route bindings.
-pub const prepared_transaction_reader_version: u32 = 10;
+pub const prepared_transaction_reader_version: u32 = 12;
 /// Per-transaction replay retention claims and atomic inventory adjustment.
-pub const replay_credit_reader_version: u32 = 11;
+pub const replay_credit_reader_version: u32 = 13;
 pub const supported_reader_version: u32 = replay_credit_reader_version;
 pub const minimum_reader_key = "\x00\x00__metadata__:minimum_reader_version";
 pub const replacement_reader_base_key = "\x00\x00__metadata__:replacement_reader_base_v1";

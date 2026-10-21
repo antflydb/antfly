@@ -1029,3 +1029,24 @@ vote, separate derived-log funding, minimum recovery resources, normal required
 PREPARE negotiation and broader scheduler/default-policy work remain incomplete.
 Strong provider defaults stay off. Public consumer/provider archive and external
 HA qualification were not rerun; full Linux qualification remains waived.
+
+
+### Main integration: separate compatibility epochs
+
+Merged origin/main at `6e014d9b45b10e66a8906fc0964f663475217257` into the
+existing workload-scheduling branch. Both sides' appended regression cases and
+Lite restore/backup targets are retained. Main owns reader versions 10/11 for
+curation provenance and scoped curation; required preparation now uses 12 and
+replay retention uses 13. Shared reader constants and encoding cover all floors,
+and replay tests check both sidecars reject curation/preparation-only readers.
+Main owns topology versions 36/37; root-signed remote initialization now requires
+38, while resolver namespaces retain main's floor of 37. Mixed-peer admission
+must distinguish these capabilities. Earlier qualification records describe their
+historical numbers; they do not qualify the merged source. Strong defaults and
+normal required PREPARE activation remain off.
+
+`owned-mutation-main-merge-v2.json` and its raw log verify the merged source:
+237 test executions, 127/127 build steps, zero skips, failures or leaks across
+preparation, replay credit/encoding, remote-initialization metadata, Lite restore,
+resolver HTTP and embedded API/DB targets. All native inputs stayed unchanged.
+Full Linux qualification remains waived.

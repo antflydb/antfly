@@ -290,6 +290,7 @@ fn indexCreate(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterato
 
     var lite = try openEmbeddedDataSurface(allocator, path, .writer);
     defer lite.close();
+    try ensureOfflineRootOnlyOperationSupported(&lite);
 
     try lite.db.addIndex(parsed.value);
     const json = try mutationJson(allocator, "created", parsed.value.name, true);
@@ -304,6 +305,7 @@ fn indexDrop(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator)
 
     var lite = try openEmbeddedDataSurface(allocator, path, .writer);
     defer lite.close();
+    try ensureOfflineRootOnlyOperationSupported(&lite);
 
     const removed = try lite.db.deleteIndex(name);
     const json = try mutationJson(allocator, "removed", name, removed);
@@ -349,6 +351,7 @@ fn enrichmentCreate(allocator: Allocator, io: std.Io, args: *std.process.Args.It
 
     var lite = try openEmbeddedDataSurface(allocator, path, .writer);
     defer lite.close();
+    try ensureOfflineRootOnlyOperationSupported(&lite);
 
     try lite.db.addEnrichment(parsed.value);
     const json = try mutationJson(allocator, "created", parsed.value.name, true);
@@ -377,6 +380,7 @@ fn enrichmentDrop(allocator: Allocator, io: std.Io, args: *std.process.Args.Iter
 
     var lite = try openEmbeddedDataSurface(allocator, path, .writer);
     defer lite.close();
+    try ensureOfflineRootOnlyOperationSupported(&lite);
 
     const removed = try lite.db.deleteEnrichment(resolved_kind, resolved_name);
     const json = try mutationJson(allocator, "removed", resolved_name, removed);
@@ -418,6 +422,7 @@ fn schemaSet(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator)
 
     var lite = try openEmbeddedDataSurface(allocator, path, .writer);
     defer lite.close();
+    try ensureOfflineRootOnlyOperationSupported(&lite);
 
     try lite.db.setSchemaJson(allocator, body);
     writeJsonLine(io, "{\"updated\":true}");
@@ -468,7 +473,7 @@ fn ensureOfflinePortableBackupSupported(lite: *const LiteDb) !void {
 }
 
 fn ensureOfflineRootOnlyOperationSupported(lite: *const LiteDb) !void {
-    if (try lite.backend.isStandaloneArtifact()) return error.StandaloneLiteRequiresApi;
+    try lite.backend.requireEmbeddedCatalogOwnership();
 }
 
 const SnapshotOptions = struct {
@@ -2388,7 +2393,7 @@ test "lite offline portable backup rejects standalone-adopted artifacts" {
         ensureOfflinePortableBackupSupported(&fresh),
     );
     try std.testing.expectError(
-        error.StandaloneLiteRequiresApi,
+        error.StandaloneLiteCatalogRequiresApi,
         ensureOfflineRootOnlyOperationSupported(&fresh),
     );
 }

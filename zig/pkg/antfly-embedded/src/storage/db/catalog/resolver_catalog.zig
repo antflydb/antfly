@@ -73,6 +73,8 @@ pub const grouped_sources_reader_version = reader_versions.grouped_sources_reade
 pub const namespace_curation_reader_version = reader_versions.namespace_curation_reader_version;
 pub const prepared_transaction_reader_version = reader_versions.prepared_transaction_reader_version;
 pub const supported_reader_version = reader_versions.supported_reader_version;
+pub const curation_provenance_reader_version = reader_versions.curation_provenance_reader_version;
+pub const scoped_curation_reader_version = reader_versions.scoped_curation_reader_version;
 
 pub fn readerVersionBytes(version: u32) ![]const u8 {
     return switch (version) {
@@ -87,6 +89,8 @@ pub fn readerVersionBytes(version: u32) ![]const u8 {
         9 => "9",
         10 => "10",
         11 => "11",
+        12 => "12",
+        13 => "13",
         else => error.UnsupportedDatabaseReaderVersion,
     };
 }
@@ -117,6 +121,14 @@ pub fn catalogReaderVersion(a: Allocator, data: []const u8) !u32 {
                 if (config.value == .object) if (config.value.object.get("decider")) |decider| if (decider == .object) if (decider.object.get("decision_method")) |method| {
                     if (method == .string and std.mem.eql(u8, method.string, "generated")) required = @max(required, generated_producers_reader_version);
                 };
+            }
+        }
+        if (entry.object.get("curation_json")) |curation| {
+            if (curation == .string and curation.string.len > 0) {
+                const state = try std.json.parseFromSlice(std.json.Value, a, curation.string, .{});
+                defer state.deinit();
+                if (state.value == .object and (state.value.object.contains("redirect_origins") or state.value.object.contains("proposals"))) required = @max(required, curation_provenance_reader_version);
+                if (state.value == .object and state.value.object.contains("receipt_scope")) required = @max(required, scoped_curation_reader_version);
             }
         }
         if (entry.object.contains("namespace_curation_generation")) required = @max(required, namespace_curation_reader_version);
@@ -1090,4 +1102,16 @@ test "resolver public inspection redacts nested generated provider credentials w
     try std.testing.expect(std.mem.indexOf(u8, encoded, "https://safe.example/v1") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "gpt-4.1") != null);
     try std.testing.expect(std.mem.indexOf(u8, cfg.adjudicate_json, "nested-private-key") != null);
+}
+
+test "resolver curation state requires the current receipt decoder" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const curation = @import("antfly_resolver").curation;
+    const empty = try std.json.Stringify.valueAlloc(a, .{.{ .curation_json = try std.json.Stringify.valueAlloc(a, curation.State{}, .{}) }}, .{});
+    try std.testing.expectEqual(scoped_curation_reader_version, try catalogReaderVersion(a, empty));
+    const scoped = try std.json.Stringify.valueAlloc(a, .{.{ .curation_json = try std.json.Stringify.valueAlloc(a, curation.State{ .receipt_scope = @splat('a') }, .{}) }}, .{});
+    try std.testing.expectEqual(scoped_curation_reader_version, try catalogReaderVersion(a, scoped));
+    try std.testing.expectEqualStrings("11", try readerVersionBytes(scoped_curation_reader_version));
 }
