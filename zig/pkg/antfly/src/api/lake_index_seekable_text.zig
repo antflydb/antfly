@@ -173,6 +173,65 @@ fn uploadWidth(a: A, store: *const stores.ArtifactStore) usize {
     // for bounded provider staging and returned identities during parallel I/O.
     return @max(1, @min(stores.ArtifactStore.max_upload_batch, phase.max_parallel, available / (2 * pack_bytes)));
 }
+/// One optional next wave. The caller owns the source until cancellation/join
+/// drains; a child never borrows its parent's CPU/I/O phase or arena state.
+const PackReadAhead = struct {
+    const Scheduler = local.sql_parallel_scheduler;
+    a: A,
+    source: local.index.SegmentSource,
+    token: Cancellation,
+    offset: usize,
+    bytes: []u8,
+    count: usize,
+    scheduler: *Scheduler.Scheduler,
+    reservation: usize,
+    task: ?Scheduler.Task(anyerror!void) = null,
+    fn run(self: *PackReadAhead) anyerror!void {
+        try self.token.check();
+        try self.source.readInto(self.offset, self.bytes);
+        try self.token.check();
+    }
+    fn start(a: A, store: *stores.ArtifactStore, source: local.index.SegmentSource, offset: usize, width: usize, token: Cancellation) ?*PackReadAhead {
+        const phase = store.io_phase orelse return null;
+        const scheduler = phase.scheduler orelse return null;
+        if (phase.park == null or phase.resume_cpu == null or phase.max_parallel < 2) return null;
+        const raw = @import("lake_index_segment_spill.zig").LocalSegment.readAheadSource(source) orelse return null;
+        const length = @min(width * pack_bytes, source.len() - offset);
+        if (length == 0) return null;
+        const reservation = length * 2 + 64 * 1024;
+        if ((@import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(a) orelse 0) < reservation) return null;
+        if (!scheduler.reservePull(0, reservation)) return null;
+        var transferred = false;
+        defer if (!transferred) scheduler.releasePull(0, reservation);
+        const job = a.create(PackReadAhead) catch return null;
+        var job_live = true;
+        defer if (job_live) a.destroy(job);
+        const bytes = a.alloc(u8, length) catch return null;
+        var bytes_live = true;
+        defer if (bytes_live) a.free(bytes);
+        job.* = .{ .a = a, .source = raw, .token = token, .offset = offset, .bytes = bytes, .count = std.math.divCeil(usize, length, pack_bytes) catch unreachable, .scheduler = scheduler, .reservation = reservation };
+        job.task = scheduler.submitIoTransient(phase.io, 0, run, .{job}) orelse return null;
+        transferred = true;
+        job_live = false;
+        bytes_live = false;
+        return job;
+    }
+    fn join(self: *PackReadAhead, store: *stores.ArtifactStore) !void {
+        const phase = store.io_phase.?;
+        phase.park.?(phase.ptr);
+        const result = self.task.?.await(phase.io);
+        self.task = null;
+        try phase.resume_cpu.?(phase.ptr);
+        try result;
+        try self.token.check();
+    }
+    fn deinit(self: *PackReadAhead, io: std.Io) void {
+        if (self.task) |*task| _ = task.cancel(io) catch {};
+        self.a.free(self.bytes);
+        self.scheduler.releasePull(0, self.reservation);
+        self.a.destroy(self);
+    }
+};
 pub fn publish(a: A, out: A, store: *stores.ArtifactStore, bytes: []const u8, cancellation: Cancellation) !Ref {
     return publishWithOpeningCollector(a, out, store, bytes, cancellation, null);
 }
@@ -220,6 +279,8 @@ pub fn publishSourceWithOpeningCollector(a: A, out: A, store: *stores.ArtifactSt
     var blocks: std.ArrayList(Piece) = .empty;
     var position: usize = 0;
     var metadata_position: usize = 0;
+    var pending: ?*PackReadAhead = null;
+    defer if (pending) |job| job.deinit(store.io_phase.?.io);
     while (position < length) {
         var wave = std.heap.ArenaAllocator.init(a);
         defer wave.deinit();
@@ -227,8 +288,19 @@ pub fn publishSourceWithOpeningCollector(a: A, out: A, store: *stores.ArtifactSt
         var uploaded: [stores.ArtifactStore.max_upload_batch]stores.ArtifactMetadata = undefined;
         var count: usize = 0;
         var next = position;
-        const width = uploadWidth(a, store);
-        while (count < width and next < length) : (count += 1) {
+        const width = if (store.io_phase != null and @import("lake_index_segment_spill.zig").LocalSegment.readAheadSource(source) != null)
+            @min(uploadWidth(a, store), @max(1, store.io_phase.?.max_parallel -| 1))
+        else
+            uploadWidth(a, store);
+        const ready = pending;
+        pending = null;
+        defer if (ready) |job| job.deinit(store.io_phase.?.io);
+        if (ready) |job| {
+            try job.join(store);
+            count = job.count;
+            for (contents[0..count], 0..) |*payload, i| payload.* = job.bytes[i * pack_bytes .. @min(job.bytes.len, (i + 1) * pack_bytes)];
+            next += job.bytes.len;
+        } else while (count < width and next < length) : (count += 1) {
             const end = @min(next + pack_bytes, length);
             if (source == .contiguous) {
                 contents[count] = source.contiguous[next..end];
@@ -239,6 +311,7 @@ pub fn publishSourceWithOpeningCollector(a: A, out: A, store: *stores.ArtifactSt
             }
             next = end;
         }
+        if (next < length) pending = PackReadAhead.start(a, store, source, next, width, cancellation);
         // Payloads borrow the already-admitted immutable segment. Metadata
         // stays on the synchronized store allocator until every child drains;
         // only this serial owner mutates descriptor arenas after CPU resumes.
@@ -2225,4 +2298,95 @@ test "external lake seekable source publication bounds capture and preserves byt
     var fixed = std.heap.FixedBufferAllocator.init(&fixed_bytes);
     var unknown: local.sql_memory_budget = .{ .backing = fixed.allocator(), .limit = 64 * pack_bytes };
     try std.testing.expectEqual(@as(usize, 1), uploadWidth(unknown.allocator(), &store));
+}
+
+test "external lake seekable source publication pipelines local reads and drains admission" {
+    const a = std.testing.allocator;
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    var check: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &check, .checkpoint = Check.call, .async_writes = false };
+    defer manager.deinit();
+    var directory = try local.common_test_directory.TestDirectory.init("seekable-pack-read-ahead");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(7), .attempt = @splat(1) };
+    const bytes = try a.alloc(u8, 7 * pack_bytes + 17);
+    defer a.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i);
+    const staged = try @import("lake_index_segment_spill.zig").LocalSegment.create(a, &manager, &store, bytes);
+    defer staged.release();
+    var output = std.heap.ArenaAllocator.init(a);
+    defer output.deinit();
+    const expected = try publish(a, output.allocator(), &store, bytes, .none);
+    for ([_]usize{ 1, 3 }) |lanes| {
+        var scheduler: local.sql_parallel_scheduler.Scheduler = .{ .max_workers = 1, .max_io_workers = lanes, .max_bytes = 128 * 1024 * 1024 };
+        var execution: local.sql_parallel_scheduler.Execution = .{ .scheduler = &scheduler, .bytes = 1024 };
+        try execution.enter(std.testing.io);
+        defer execution.pause();
+        var phase: stores.ExecutionIo = .{ .execution = &execution, .io = std.testing.io };
+        store.io_phase = phase.capability();
+        defer store.io_phase = null;
+        staged.test_ahead_reads.store(0, .monotonic);
+        const actual = try publishSource(a, output.allocator(), &store, staged.source(), .none);
+        try std.testing.expectEqualStrings(expected.artifact_id, actual.artifact_id);
+        try std.testing.expectEqual(lanes > 1, staged.test_ahead_reads.load(.monotonic) > 0);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+        try std.testing.expect(execution.active);
+    }
+}
+
+test "external lake source pack upload failure and cancellation drain pending local read ahead" {
+    const a = std.testing.allocator;
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    const Fail = struct {
+        fn put(_: *anyopaque, _: A, _: stores.UploadScope, _: []const u8, _: Cancellation) !stores.ArtifactMetadata {
+            return error.TestUploadFailed;
+        }
+    };
+    var marker: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = Check.call, .async_writes = false };
+    defer manager.deinit();
+    var directory = try local.common_test_directory.TestDirectory.init("seekable-read-ahead-failure");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(7), .attempt = @splat(1) };
+    const bytes = try a.alloc(u8, 7 * pack_bytes + 17);
+    defer a.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i);
+    const staged = try @import("lake_index_segment_spill.zig").LocalSegment.create(a, &manager, &store, bytes);
+    defer staged.release();
+    var scheduler: local.sql_parallel_scheduler.Scheduler = .{ .max_workers = 1, .max_io_workers = 3, .max_bytes = 128 * 1024 * 1024 };
+    var execution: local.sql_parallel_scheduler.Execution = .{ .scheduler = &scheduler, .bytes = 1024 };
+    try execution.enter(std.testing.io);
+    defer execution.pause();
+    var phase: stores.ExecutionIo = .{ .execution = &execution, .io = std.testing.io };
+    store.io_phase = phase.capability();
+    defer store.io_phase = null;
+    var vtable = store.vtable.*;
+    vtable.put_scoped = Fail.put;
+    store.vtable = &vtable;
+    try std.testing.expectError(error.TestUploadFailed, publishSource(a, a, &store, staged.source(), .none));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+    try std.testing.expect(execution.active);
+    // Cancel a separately admitted next wave before adoption. Cancel/drain must
+    // finish before any leased source file or retained buffer is released.
+    var signal = std.atomic.Value(bool).init(false);
+    const token = Cancellation.fromAtomic(&signal);
+    const pending = PackReadAhead.start(a, &store, staged.source(), 0, 2, token) orelse return error.TestExpectedReadAhead;
+    signal.store(true, .release);
+    try std.testing.expectError(error.Canceled, pending.join(&store));
+    pending.deinit(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+    try std.testing.expect(execution.active);
 }

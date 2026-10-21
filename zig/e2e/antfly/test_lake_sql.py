@@ -1202,6 +1202,33 @@ def test_native_remote_ordered_index_exact_bounds_and_restart(tmp_path, covering
         body["after"] = previous_cursor
         resumed = call("POST", "/tables/lake_ordered/rows/query", body, lines=True)
         assert resumed and resumed[0]["_id"] == collected[1]["_id"]
+        if covering:
+            # Cold public search hydration must use typed index blocks. Retain
+            # immutable source identity/footer but make all data pages invalid.
+            object_path = objects / "part.parquet"
+            original_object = object_path.read_bytes()
+            header = original_object[:84]
+            footer = len(payload) - 8 - struct.unpack("<I", payload[-8:-4])[0]
+            server.pause()
+            object_path.write_bytes(
+                header + payload[:4] + b"\xff" * (footer - 4) + payload[footer:]
+            )
+            for cached in list(server.root.rglob("lake-ranges")):
+                if cached.is_dir():
+                    shutil.rmtree(cached)
+            server.resume()
+            for _ in range(2):
+                search = call(
+                    "POST", "/tables/lake_ordered/query",
+                    {"full_text_search": {"match_all": {}},
+                     "fields": ["amount", "label"], "limit": 5},
+                )
+                hits = search["hits"]["hits"]
+                assert len(hits) == 5, search
+                for hit in hits:
+                    row = int(hit["_source"]["label"].removeprefix("row-"))
+                    assert int(hit["_source"]["amount"]) == amounts[row], search
+            object_path.write_bytes(original_object)
         # A source replacement invalidates publication-bound continuation.
         replacement = pa.table(
             {"amount": pa.array([base + 17], type=pa.int64()), "label": ["replacement"]}

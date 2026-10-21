@@ -34,11 +34,15 @@
     "private_metadata_intermediate_provider_writes": 0,
     "private_metadata_intermediate_provider_reads": 0,
     "checkpointed_statistics_forests_remain_durable": true,
-    "private_metadata_hash_buckets_per_run": 256,
     "private_metadata_committed_runs_per_forest": 32,
     "private_metadata_transient_runs_per_forest": 64,
     "private_metadata_extent_bytes": 65536,
-    "private_metadata_reclamation": "retire consumed runs after forest commit; recycle shared extents"
+    "private_metadata_reclamation": "retire consumed runs after forest commit; recycle shared extents",
+    "private_metadata_index": "growing spill-backed open addressing",
+    "private_metadata_initial_index_slots": 64,
+    "private_metadata_maximum_load_factor": 0.5,
+    "private_metadata_replay_pages_in_test": 8192,
+    "private_metadata_replay_probes_per_page_less_than": 4
   },
   "text_publication": {
     "shared_manifest_consumers": [
@@ -116,7 +120,7 @@
     "statistics_flush": "checkpoint boundary or pressure threshold; no forced per-file run",
     "captured_statistics_append_buffer_bytes": 16384,
     "captured_statistics_replay_buffer_bytes": 65536,
-    "captured_statistics_frame_header_bytes": 6,
+    "captured_statistics_frame_header_bytes": 10,
     "captured_statistics_ordering": "native per-field term order; sort compact field directory only",
     "fresh_summary_provider_gets_during_canonical_publication": 0,
     "fresh_summary_contributions": "synchronous borrowed records copied into bounded DF and term-directory reducers",
@@ -135,9 +139,10 @@
       "memory serial",
       "spill serial",
       "spill lookahead with one I/O lane",
-      "summary capture quota fallback"
+      "summary capture quota fallback",
+      "three independently owned projection batches"
     ],
-    "encoder_lookahead_scope": "within one borrowed projection batch",
+    "encoder_lookahead_scope": "across owned projection batches with independently reserved arenas and column leases",
     "canonical_segment_output_spill_quota_bytes": 805306368,
     "canonical_optional_summary_spill_quota_bytes": 268435456,
     "serving_segment_output_spill_quota_bytes": 100663296,
@@ -146,10 +151,37 @@
     "encoder_lookahead_cpu_scheduling_allowance_bytes": 8388608,
     "encoder_lookahead_cpu_admission": "immediate atomic try; saturated dependencies stay inline",
     "encoder_related_producer_test_cpu_budget_bytes": 33554432,
-    "encoder_related_producer_test_retained_cpu_bytes": 8388608
+    "encoder_related_producer_test_retained_cpu_bytes": 8388608,
+    "captured_statistics_restart_terms": 64,
+    "captured_statistics_prefix_terms_in_test": 8192,
+    "captured_statistics_prefix_bytes_per_term_less_than": 64,
+    "local_pack_read_ahead_waves": 1,
+    "local_pack_read_ahead_io_lanes_left_free": 1,
+    "local_pack_read_ahead_minimum_io_lanes": 2,
+    "local_pack_read_ahead_payload_bytes_in_test": 7340049,
+    "local_pack_read_ahead_failure": "drain pending local reader, release retained bytes and I/O, restore CPU"
   },
   "qualification_outstanding": [
     "Controlled identical-fixture base/head HN one-file and 1024-file latency and post-GC footprint",
-    "Live object-provider publication throughput and durable retention qualification"
-  ]
+    "Live object-provider publication throughput and durable retention qualification",
+    "External rewrite reuse with trusted row lineage or stable keys plus indexed-value change detection",
+    "Pin-aware unified dirty execution-page pager and fully resumable shared operator scheduling"
+  ],
+  "remote_query": {
+    "predicate_cost": "requests, projected bytes, decode work and reverse tree height; relative units",
+    "covering_search_result_fields": "complete relational index key and INCLUDE values",
+    "covering_search_maximum_rows": 512,
+    "covering_search_optional_workspace_bytes": 8388608,
+    "covering_search_source_absent_in_process": true,
+    "covering_search_public_api_cold_test": "invalid Parquet data pages with unchanged source identity/footer",
+    "covering_search_identity_validation": "reverse coordinate, forward tuple and authenticated block key"
+  },
+  "sql_memory": {
+    "host_slice": "sql.execution_working_set",
+    "default_soft_bytes": 268435456,
+    "default_hard_bytes": 536870912,
+    "ownership": "retained until result deinit or stream close",
+    "host_cache_reclaim_before_denial": true,
+    "automatic_dirty_page_pager": false
+  }
 }

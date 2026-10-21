@@ -3485,8 +3485,9 @@ Private metadata forests now assign each newly built immutable tree a local run
 namespace. Forest publication commits its new roots before retiring consumed
 inputs and intermediate carries. The remaining runs share one anonymous SQL
 spill file through reusable 64 KiB extents, including quota accounting and
-cancellation-safe close. Each run has 256 disk hash buckets; at most 32 committed
-runs and 64 transient descriptors exist per forest. Closing a run releases its
+cancellation-safe close. Each run has a growing disk hash index with power-of-two
+capacity and at most half occupancy; at most 32 committed runs and 64 transient
+descriptors exist per forest. Closing a run releases its
 buffers and reuses its extents, trimming free tail extents when possible. This
 replaces cumulative merge-history retention without raising the disk quota or
 making checkpointed DF forests private. Local attempt tokens never escape:
@@ -3556,8 +3557,8 @@ compaction similarly divides its 128 MiB allowance into 96 MiB of payload and
 32 MiB of optional summaries. Retained summaries cannot exhaust required output
 space; exhausted summary pools use the reader fallback.
 
-Within a projection batch, one independently admitted encoder can prepare the
-next chunk while the serial owner merges and publishes the preceding chunk.
+One independently admitted encoder can prepare the next chunk while the serial
+owner builds the next projection batch, merges, or publishes the preceding chunk.
 Admission requires known construction headroom, a separate 48 MiB node retained
 reservation, and a scheduler with more than one CPU worker. The encoder has a
 32 MiB private workspace budget and its own CPU/I/O phase bridge. CPU admission
@@ -3571,7 +3572,10 @@ input order and replaces child-local capabilities before releasing the child.
 Failure/cancellation drains the child before any borrowed projection columns or
 spill manager retire. Unavailable admission stays serial; speculative encoder
 OOM retries the required encode after its workspace is released. This bounded
-lookahead ends at each projection batch, preserving the existing column leases.
+lookahead transfers an owned projection arena and its immutable column leases
+across batch boundaries. Its actual retained capacity has a separate scheduler
+reservation. Each next batch joins the previous encoder before adoption, keeping
+the queue bounded to one input and one encoded output.
 
 Regression coverage compares native artifacts, summary roots, global DF and
 term-directory roots across memory, spill, lookahead and capture-quota fallback.
@@ -3582,3 +3586,104 @@ under a one-byte staging quota, and a prefix-heavy dictionary reproduces summary
 scratch pressure while proving the fitting merged segment remains byte-identical.
 These are work, identity and resource contracts; they do not establish an archive
 throughput or live object-provider latency improvement.
+
+
+### Growing private indexes, compressed summaries, and pack read-ahead
+
+Private page runs replace fixed-bucket collision chains with a separately
+spill-accounted open-addressed index. Slots contain the immutable page digest
+and its payload offset. Capacity doubles before exceeding half occupancy;
+rehashing streams bounded slots through the shared extent pool and commits the
+replacement before releasing the old index. Duplicate digests do not append
+another payload. The regression replays 8,192 pages in fewer than four probes
+per page and checks allocation failures, corrupted references, and quota release.
+
+Captured per-field term summaries use a ten-byte frame header with prefix and
+suffix lengths, resetting compression at field boundaries and every 64 terms.
+This only changes private capture; segment bytes and durable summary roots stay
+identical. An 8,192-term prefix-heavy case retains under 64 bytes per term,
+including headers and summaries. Required segment output and optional summary
+capture keep independent quotas, even when compression makes capture fit where
+it previously exhausted its allowance.
+
+Local spill-backed publication can read one next pack wave while uploading the
+current wave. Reads use independent scheduler I/O admission, retained-byte
+reservations, and a raw local-file reader that never borrows the parent's I/O
+phase. Uploads leave one lane for read-ahead. One-lane configurations, opaque
+headroom and saturated admission use the serial path. Join parks CPU without
+reserving I/O; error and cancellation drain the reader before releasing its
+buffer or source file. Remote providers retain their ordinary authenticated
+read path. Pack ordering, directory identity and durable closure are unchanged.
+
+### Remote access costing and typed covering result delivery
+
+Predicate and ordered-path comparisons now include projected request fan-out,
+authenticated tree traversal, bytes, and per-candidate decode work. Duplicate
+bounds on one field do not count as separate projected column reads. Small-file
+archives therefore incur request work even when their total byte size is small.
+These are relative planner units, not calibrated network-latency predictions.
+Exact predicates, read budgets, snapshot validation and final limits remain the
+execution authority.
+
+Ranked search result delivery can gather requested fields from a complete
+relational covering index under its existing pinned publication. Reverse seeks
+resolve physical rows to forward entries; authenticated covering blocks must
+contain the exact expected key. Native integer, float, boolean and byte vectors
+are retained until response shaping; exact NUMERIC and arrays use the existing
+storage codec. Generated row identity and duplicate/ranked output positions are
+preserved. The optional path has an independent 8 MiB workspace and a 512-row
+selection threshold; missing coverage, partial indexes and larger selections use
+the physical batched reader. Integrity errors remain errors. Results own their
+payloads independently of decoded-cache leases. Tests remove the source object
+in process and damage data pages across public API restart while retaining the
+source identity/footer, proving that successful delivery uses index values.
+
+### Shared SQL memory ownership
+
+Materialized and streaming SQL executions now hold a heap-owned reclaiming
+allocator in the node's resource manager. The appended
+`sql.execution_working_set` slice has a 256 MiB soft and 512 MiB hard default;
+existing query limits still apply independently. Actual allocated capacity,
+including retained results and suspended streams, remains charged until its
+owner closes. Eligible shared caches can yield on host admission denial, and
+concurrent queries cannot each treat the full host budget as free memory.
+Portable result/stream ownership keeps allocator callbacks alive beyond an
+Adapter stack frame and releases the owner only after all execution allocations.
+Host admission failures are distinguishable from genuine backing allocator OOM
+inside nested SQL budgets and at the transport boundary. Stream decline, errors,
+allocation failures and independent concurrent-owner release have regression
+coverage.
+
+This shares host admission and cache reclamation. It does not yet make arbitrary
+hash/group state automatically evictable through a common dirty-page pager.
+That requires pin-aware relocatable execution pages, explicit spill ownership,
+restore scheduling and cancellation-safe page leases across every operator.
+Existing typed spill codecs remain the execution spill mechanism.
+
+### Identity boundary for external file rewrites
+
+Antfly-owned serving compaction retains canonical source coordinates and can
+reuse their immutable index artifacts. External Parquet/Iceberg rewrites cannot
+be inferred from file names, row counts or offsets. The intended extension has
+two verified inputs: a snapshot-bound rewrite map from a trusted producer, or a
+declared unique stable key with indexed-value version/fingerprint validation.
+A stable key alone cannot establish unchanged postings after a row update.
+Absent either proof, rebuild indexes for affected files.
+
+A future durable rewrite map must bind both immutable inventories, source and
+destination row domains, deletion coverage and the indexed-value equivalence
+proof. Publish it atomically with the new generation, include it in reader leases
+and artifact GC closure, and compose mappings to bounded lookup depth. Ambiguous
+keys, missing rows or changed indexed values force rebuild/update. Query readers
+must apply the same mapping to text, scalar predicates, deletes, covering values
+and public identity; a text-only mapping would be incorrect. This external
+rewrite reuse capability is not implemented by the publication optimizations.
+
+[Lance fragment reuse](https://lance.org/format/index/system/frag_reuse/) defers
+physical index remapping using verified compaction transitions.
+[Databricks row tracking](https://docs.databricks.com/aws/en/tables/features/row-tracking)
+separates stable row IDs from row commit versions. Elasticsearch exposes stable
+[`_id`](https://www.elastic.co/docs/reference/elasticsearch/mapping-reference/mapping-id-field)
+while [Lucene document numbers](https://lucene.apache.org/core/10_3_1/core/org/apache/lucene/index/IndexReader.html)
+remain ephemeral. These are useful identity patterns; none justifies assuming
+unchanged logical rows after an unverified external rewrite.

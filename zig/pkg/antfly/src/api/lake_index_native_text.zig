@@ -1293,7 +1293,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             defer rows.deinit(a);
             while (true) {
                 if (leases.full()) {
-                    try flush(&compactor, builder.batch(), analysis, store_source);
+                    try flushRetained(&compactor, &batch_arena, &leases, builder.batch(), analysis, store_source);
                     leases.clear();
                     _ = batch_arena.reset(.free_all);
                     builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
@@ -1313,7 +1313,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                     owner = null;
                 };
                 if (owner) |held| if (held.retained_bytes > ProjectionLeases.max_bytes -| leases.bytes) {
-                    try flush(&compactor, builder.batch(), analysis, store_source);
+                    try flushRetained(&compactor, &batch_arena, &leases, builder.batch(), analysis, store_source);
                     leases.clear();
                     _ = batch_arena.reset(.free_all);
                     builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
@@ -1334,7 +1334,11 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                         ordinals.add(ref.external.row_group_ordinal, ref.external.row_ordinal) catch |err| return buildFailure(err, "ordinal_pages", file_ordinal, segments.items.len);
                     }
                     if (builder.batch().docs.len >= 65536 or input_bytes >= 8 * 1024 * 1024 or batch_arena.queryCapacity() >= 24 * 1024 * 1024) {
-                        try flush(&compactor, builder.batch(), analysis, store_source);
+                        var retained = true;
+                        if (owner != null) {
+                            if (rows.retainColumns(a) catch null) |held| leases.add(held) else retained = false;
+                        }
+                        if (retained) try flushRetained(&compactor, &batch_arena, &leases, builder.batch(), analysis, store_source) else try flush(&compactor, builder.batch(), analysis, store_source);
                         leases.clear();
                         _ = batch_arena.reset(.free_all);
                         builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
@@ -1348,8 +1352,9 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                     }
                 }
             }
-            try flush(&compactor, builder.batch(), analysis, store_source);
+            try flushRetained(&compactor, &batch_arena, &leases, builder.batch(), analysis, store_source);
             leases.clear();
+            try compactor.finishEncoding();
             try compactor.finish();
             try opening.flush();
             group.opening_packs = opening.refs.items;
@@ -1919,6 +1924,7 @@ const Compactor = struct {
         }
     };
     a: A,
+    encoder: ?*EncoderPipeline = null,
     out: A,
     store: *stores.ArtifactStore,
     segments: *std.ArrayList(artifacts.ChunkRef),
@@ -1938,7 +1944,18 @@ const Compactor = struct {
     pending: [fan_in]?Owned = @splat(null),
     count: usize = 0,
     bytes: usize = 0,
+    fn finishEncoding(self: *Compactor) !void {
+        if (self.encoder) |encoder| try encoder.finish();
+    }
     fn deinit(self: *Compactor) void {
+        if (self.encoder) |encoder| {
+            encoder.deinit();
+            self.a.destroy(encoder);
+            self.encoder = null;
+        }
+        self.clearRuns();
+    }
+    fn clearRuns(self: *Compactor) void {
         for (self.pending[0..self.count]) |value| value.?.deinit(self.a);
         self.count = 0;
         self.bytes = 0;
@@ -1957,7 +1974,7 @@ const Compactor = struct {
     }
     fn finish(self: *Compactor) !void {
         if (self.count == 0) return;
-        defer self.deinit();
+        defer self.clearRuns();
         try self.cancellation.check();
         if (self.count == fan_in and self.io != null) {
             // Optional acceleration cannot exhaust the publication allocator.
@@ -2028,145 +2045,211 @@ fn flush(compactor: *Compactor, batch: mapper.TextProjectionBatch, analysis: loc
     return flushWithOptions(compactor, batch, analysis, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source });
 }
 fn flushWithOptions(compactor: *Compactor, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, build_options: mapper.BuildTextSegmentsOptions) !void {
+    try compactor.finishEncoding();
     try compactor.cancellation.check();
     for (batch.docs, 0..) |doc, i| {
         if (i != 0 and std.mem.order(u8, batch.docs[i - 1].id, doc.id) != .lt) return error.InvalidNativeLakeTextCorpus;
     }
-    const Consumer = struct {
-        const reservation = 48 * 1024 * 1024;
-        const Job = struct {
-            a: A,
-            manager: *local.sql_spill.Manager,
-            output_manager: *local.sql_spill.Manager,
-            store: stores.ArtifactStore,
-            chunk: mapper.TextProjectionBatch,
-            analysis: local.introducer.TextAnalysisConfig,
-            options: local.introducer.BuildTextOptions,
-            execution: local.sql_parallel_scheduler.Execution,
-            future: ?std.Io.Future(anyerror!Compactor.Owned) = null,
-            token: Cancellation,
-            threshold: usize,
-            fn check(raw: *anyopaque) !void {
-                try @as(*Job, @ptrCast(@alignCast(raw))).token.check();
-            }
-            fn run(self: *Job, io: std.Io) anyerror!Compactor.Owned {
-                defer self.execution.pause();
-                self.execution.checkpoint = .{ .ptr = self, .check = check };
-                try self.token.check();
-                var phase: stores.ExecutionIo = .{ .execution = &self.execution, .io = io };
-                self.store.io_phase = phase.capability();
-                var budget: local.sql_memory_budget = .{ .backing = self.a, .limit = 32 * 1024 * 1024 };
-                return encode(self.a, budget.allocator(), self.manager, self.output_manager, &self.store, self.chunk, self.analysis, self.options, self.threshold);
-            }
-        };
-        compactor: *Compactor,
-        analysis: local.introducer.TextAnalysisConfig,
-        job: ?*Job = null,
-        ready: ?Compactor.Owned = null,
-        fn encode(a: A, workspace: A, manager: *local.sql_spill.Manager, output_manager: *local.sql_spill.Manager, store: *stores.ArtifactStore, chunk: mapper.TextProjectionBatch, analysis_: local.introducer.TextAnalysisConfig, options: local.introducer.BuildTextOptions, threshold: usize) !Compactor.Owned {
-            const captured = statistics.Captured.create(a, manager) catch null;
-            if (captured) |value| value.phase = store.io_phase;
-            errdefer if (captured) |value| value.deinit();
-            var adaptive = @import("lake_index_segment_spill.zig").AdaptiveSink.init(a, output_manager, store);
-            defer adaptive.deinit();
-            adaptive.threshold = threshold;
-            var sink = adaptive.sink();
-            sink.term_observer = if (captured) |value| value.observer() else null;
-            try mapper.writeTextSegmentFromProjectionBatchToSink(workspace, chunk, analysis_, options, &sink);
-            if (captured) |value| try value.seal();
-            return if (adaptive.staged) |staged| blk: {
-                try staged.seal();
-                adaptive.staged = null;
-                break :blk .{ .payload = .{ .spill = staged }, .captured = captured };
-            } else .{ .payload = .{ .memory = try adaptive.memory.finishOwned() }, .captured = captured };
-        }
-        fn inlineEncode(self: *@This(), chunk: mapper.TextProjectionBatch, options: local.introducer.BuildTextOptions) !Compactor.Owned {
-            return encode(self.compactor.a, self.compactor.a, self.compactor.capture_manager.?, self.compactor.output_manager.?, self.compactor.store, chunk, self.analysis, options, self.compactor.encoding_memory_bytes);
-        }
-        fn take(self: *@This()) !?Compactor.Owned {
-            const job = self.job orelse {
-                const ready = self.ready;
-                self.ready = null;
-                return ready;
-            };
-            self.job = null;
-            defer job.a.destroy(job);
-            defer job.execution.scheduler.releasePull(1, reservation);
-            const phase = self.compactor.store.io_phase.?;
-            phase.park.?(phase.ptr);
-            const result = job.future.?.await(phase.io);
-            job.execution.pause(); // Also covers cancellation before start.
-            var owned = result catch |err| {
-                try phase.resume_cpu.?(phase.ptr);
-                if (err == error.OutOfMemory) return try self.inlineEncode(job.chunk, job.options);
-                return err;
-            };
-            // Worker-local capabilities cannot escape into the serial owner.
-            if (owned.payload == .spill) owned.payload.spill.store = self.compactor.store;
-            if (owned.captured) |captured| captured.phase = self.compactor.store.io_phase;
-            errdefer owned.deinit(self.compactor.a);
-            try phase.resume_cpu.?(phase.ptr);
-            return owned;
-        }
-        fn start(self: *@This(), chunk: mapper.TextProjectionBatch, options: local.introducer.BuildTextOptions) !void {
-            const phase = self.compactor.store.io_phase;
-            if (phase != null and phase.?.park != null and phase.?.resume_cpu != null and phase.?.scheduler != null and
-                (@import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(self.compactor.a) orelse 0) >= reservation * 2)
-            {
-                const scheduler = phase.?.scheduler.?;
-                if (scheduler.max_workers > 1 and scheduler.reservePull(1, reservation)) {
-                    var transferred = false;
-                    defer if (!transferred) scheduler.releasePull(1, reservation);
-                    if (self.compactor.a.create(Job)) |job| {
-                        job.* = .{ .a = self.compactor.a, .manager = self.compactor.capture_manager.?, .output_manager = self.compactor.output_manager.?, .store = self.compactor.store.*, .chunk = chunk, .analysis = self.analysis, .options = options, .execution = .{ .scheduler = scheduler, .bytes = 8 * 1024 * 1024 }, .token = self.compactor.cancellation, .threshold = self.compactor.encoding_memory_bytes };
-                        job.store.io_phase = null;
-                        if (!job.execution.tryEnter()) {
-                            job.a.destroy(job);
-                        } else if (phase.?.io.concurrent(Job.run, .{ job, phase.?.io })) |future| {
-                            job.future = future;
-                            self.job = job;
-                            if (@import("builtin").is_test) self.compactor.test_ahead_count += 1;
-                            transferred = true;
-                            return;
-                        } else |_| {
-                            job.execution.pause();
-                            self.compactor.a.destroy(job);
-                        }
-                    } else |_| {}
-                }
-            }
-            self.ready = try self.inlineEncode(chunk, options);
-        }
-        pub fn consume(self: *@This(), chunk: mapper.TextProjectionBatch, options: local.introducer.BuildTextOptions) !void {
-            const previous = try self.take();
-            var adopted = false;
-            defer if (!adopted) if (previous) |value| value.deinit(self.compactor.a);
-            // Encode the next chunk while the owner merges/uploads this one.
-            // At most one child and one unadopted payload exist.
-            try self.start(chunk, options);
-            adopted = true;
-            if (previous) |value| try self.compactor.addOwned(value);
-        }
-        fn finish(self: *@This()) !void {
-            if (try self.take()) |value| try self.compactor.addOwned(value);
-        }
-        fn deinit(self: *@This()) void {
-            if (self.ready) |value| value.deinit(self.compactor.a);
-            if (self.job) |job| {
-                // Cancellation drains the child before borrowed projection data
-                // or its spill manager can be released. It never resumes CPU.
-                const result = job.future.?.cancel(self.compactor.io.?);
-                job.execution.pause(); // Also covers cancellation before start.
-                if (result) |value| value.deinit(self.compactor.a) else |_| {}
-                job.execution.scheduler.releasePull(1, reservation);
-                job.a.destroy(job);
-            }
-        }
-    };
-    var consumer: Consumer = .{ .compactor = compactor, .analysis = analysis };
+    var consumer: EncoderPipeline = .{ .compactor = compactor, .analysis = analysis };
     defer consumer.deinit();
     mapper.consumeTextProjectionChunks(batch, build_options, &consumer) catch |err| return buildFailure(err, "encode_segments", compactor.file_ordinal, compactor.segments.items.len);
     try consumer.finish();
+}
+const EncoderPipeline = struct {
+    const reservation = 48 * 1024 * 1024;
+    const Job = struct {
+        a: A,
+        manager: *local.sql_spill.Manager,
+        output_manager: *local.sql_spill.Manager,
+        store: stores.ArtifactStore,
+        chunk: mapper.TextProjectionBatch,
+        analysis: local.introducer.TextAnalysisConfig,
+        options: local.introducer.BuildTextOptions,
+        execution: local.sql_parallel_scheduler.Execution,
+        future: ?std.Io.Future(anyerror!Compactor.Owned) = null,
+        token: Cancellation,
+        threshold: usize,
+        fn check(raw: *anyopaque) !void {
+            try @as(*Job, @ptrCast(@alignCast(raw))).token.check();
+        }
+        fn run(self: *Job, io: std.Io) anyerror!Compactor.Owned {
+            defer self.execution.pause();
+            self.execution.checkpoint = .{ .ptr = self, .check = check };
+            try self.token.check();
+            var phase: stores.ExecutionIo = .{ .execution = &self.execution, .io = io };
+            self.store.io_phase = phase.capability();
+            var budget: local.sql_memory_budget = .{ .backing = self.a, .limit = 32 * 1024 * 1024 };
+            return encode(self.a, budget.allocator(), self.manager, self.output_manager, &self.store, self.chunk, self.analysis, self.options, self.threshold);
+        }
+    };
+    compactor: *Compactor,
+    input: ?OwnedProjection = null,
+    analysis: local.introducer.TextAnalysisConfig,
+    job: ?*Job = null,
+    ready: ?Compactor.Owned = null,
+    fn releaseInput(self: *@This()) void {
+        if (self.input) |value| {
+            var owned = value;
+            self.input = null;
+            owned.deinit();
+        }
+    }
+    fn enqueue(self: *@This(), batch: mapper.TextProjectionBatch, input: OwnedProjection, options: mapper.BuildTextSegmentsOptions) !void {
+        var transferred = false;
+        defer if (!transferred) {
+            var owned = input;
+            owned.deinit();
+        };
+        // Join only after the producer has prepared the next batch. Its first
+        // encoder then overlaps publication of the preceding batch's last chunk.
+        const previous = try self.take();
+        self.releaseInput();
+        self.ready = previous;
+        self.input = input;
+        transferred = true;
+        try mapper.consumeTextProjectionChunks(batch, options, self);
+        if (self.job == null) self.releaseInput();
+    }
+    fn encode(a: A, workspace: A, manager: *local.sql_spill.Manager, output_manager: *local.sql_spill.Manager, store: *stores.ArtifactStore, chunk: mapper.TextProjectionBatch, analysis_: local.introducer.TextAnalysisConfig, options: local.introducer.BuildTextOptions, threshold: usize) !Compactor.Owned {
+        const captured = statistics.Captured.create(a, manager) catch null;
+        if (captured) |value| value.phase = store.io_phase;
+        errdefer if (captured) |value| value.deinit();
+        var adaptive = @import("lake_index_segment_spill.zig").AdaptiveSink.init(a, output_manager, store);
+        defer adaptive.deinit();
+        adaptive.threshold = threshold;
+        var sink = adaptive.sink();
+        sink.term_observer = if (captured) |value| value.observer() else null;
+        try mapper.writeTextSegmentFromProjectionBatchToSink(workspace, chunk, analysis_, options, &sink);
+        if (captured) |value| try value.seal();
+        return if (adaptive.staged) |staged| blk: {
+            try staged.seal();
+            adaptive.staged = null;
+            break :blk .{ .payload = .{ .spill = staged }, .captured = captured };
+        } else .{ .payload = .{ .memory = try adaptive.memory.finishOwned() }, .captured = captured };
+    }
+    fn inlineEncode(self: *@This(), chunk: mapper.TextProjectionBatch, options: local.introducer.BuildTextOptions) !Compactor.Owned {
+        return encode(self.compactor.a, self.compactor.a, self.compactor.capture_manager.?, self.compactor.output_manager.?, self.compactor.store, chunk, self.analysis, options, self.compactor.encoding_memory_bytes);
+    }
+    fn take(self: *@This()) !?Compactor.Owned {
+        const job = self.job orelse {
+            const ready = self.ready;
+            self.ready = null;
+            return ready;
+        };
+        self.job = null;
+        defer job.a.destroy(job);
+        defer job.execution.scheduler.releasePull(1, reservation);
+        const phase = self.compactor.store.io_phase.?;
+        phase.park.?(phase.ptr);
+        const result = job.future.?.await(phase.io);
+        job.execution.pause(); // Also covers cancellation before start.
+        var owned = result catch |err| {
+            try phase.resume_cpu.?(phase.ptr);
+            if (err == error.OutOfMemory) return try self.inlineEncode(job.chunk, job.options);
+            return err;
+        };
+        // Worker-local capabilities cannot escape into the serial owner.
+        if (owned.payload == .spill) owned.payload.spill.store = self.compactor.store;
+        if (owned.captured) |captured| captured.phase = self.compactor.store.io_phase;
+        errdefer owned.deinit(self.compactor.a);
+        try phase.resume_cpu.?(phase.ptr);
+        return owned;
+    }
+    fn start(self: *@This(), chunk: mapper.TextProjectionBatch, options: local.introducer.BuildTextOptions) !void {
+        const phase = self.compactor.store.io_phase;
+        if (phase != null and phase.?.park != null and phase.?.resume_cpu != null and phase.?.scheduler != null and
+            (@import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(self.compactor.a) orelse 0) >= reservation * 2)
+        {
+            const scheduler = phase.?.scheduler.?;
+            if (scheduler.max_workers > 1 and scheduler.reservePull(1, reservation)) {
+                var transferred = false;
+                defer if (!transferred) scheduler.releasePull(1, reservation);
+                if (self.compactor.a.create(Job)) |job| {
+                    job.* = .{ .a = self.compactor.a, .manager = self.compactor.capture_manager.?, .output_manager = self.compactor.output_manager.?, .store = self.compactor.store.*, .chunk = chunk, .analysis = self.analysis, .options = options, .execution = .{ .scheduler = scheduler, .bytes = 8 * 1024 * 1024 }, .token = self.compactor.cancellation, .threshold = self.compactor.encoding_memory_bytes };
+                    job.store.io_phase = null;
+                    if (!job.execution.tryEnter()) {
+                        job.a.destroy(job);
+                    } else if (phase.?.io.concurrent(Job.run, .{ job, phase.?.io })) |future| {
+                        job.future = future;
+                        self.job = job;
+                        if (@import("builtin").is_test) self.compactor.test_ahead_count += 1;
+                        transferred = true;
+                        return;
+                    } else |_| {
+                        job.execution.pause();
+                        self.compactor.a.destroy(job);
+                    }
+                } else |_| {}
+            }
+        }
+        self.ready = try self.inlineEncode(chunk, options);
+    }
+    pub fn consume(self: *@This(), chunk: mapper.TextProjectionBatch, options: local.introducer.BuildTextOptions) !void {
+        const previous = try self.take();
+        var adopted = false;
+        defer if (!adopted) if (previous) |value| value.deinit(self.compactor.a);
+        // Encode the next chunk while the owner merges/uploads this one.
+        // At most one child and one unadopted payload exist.
+        try self.start(chunk, options);
+        adopted = true;
+        if (previous) |value| try self.compactor.addOwned(value);
+    }
+    fn finish(self: *@This()) !void {
+        defer self.releaseInput();
+        if (try self.take()) |value| try self.compactor.addOwned(value);
+    }
+    fn deinit(self: *@This()) void {
+        defer self.releaseInput();
+        if (self.ready) |value| value.deinit(self.compactor.a);
+        if (self.job) |job| {
+            // Cancellation drains the child before borrowed projection data
+            // or its spill manager can be released. It never resumes CPU.
+            const result = job.future.?.cancel(self.compactor.io.?);
+            job.execution.pause(); // Also covers cancellation before start.
+            if (result) |value| value.deinit(self.compactor.a) else |_| {}
+            job.execution.scheduler.releasePull(1, reservation);
+            job.a.destroy(job);
+        }
+    }
+};
+
+const OwnedProjection = struct {
+    arena: std.heap.ArenaAllocator,
+    leases: ProjectionLeases,
+    scheduler: *local.sql_parallel_scheduler.Scheduler,
+    reservation: usize,
+    fn deinit(self: *@This()) void {
+        self.leases.clear();
+        self.arena.deinit();
+        self.scheduler.releasePull(0, self.reservation);
+    }
+};
+fn flushRetained(compactor: *Compactor, arena: *std.heap.ArenaAllocator, leases: *ProjectionLeases, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, store_source: bool) !void {
+    const phase = compactor.store.io_phase;
+    const bytes = arena.queryCapacity() +| leases.bytes;
+    if (batch.docs.len != 0 and phase != null and phase.?.scheduler != null and phase.?.park != null and phase.?.resume_cpu != null and
+        (@import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(compactor.a) orelse 0) >= bytes +| 96 * 1024 * 1024)
+    {
+        const scheduler = phase.?.scheduler.?;
+        if (scheduler.max_workers > 1 and scheduler.reservePull(0, bytes)) {
+            var transferred = false;
+            defer if (!transferred) scheduler.releasePull(0, bytes);
+            if (compactor.encoder == null) {
+                const created = compactor.a.create(EncoderPipeline) catch return flush(compactor, batch, analysis, store_source);
+                created.* = .{ .compactor = compactor, .analysis = analysis };
+                compactor.encoder = created;
+            }
+            const encoder = compactor.encoder.?;
+            if (encoder.compactor != compactor) unreachable;
+            const owned: OwnedProjection = .{ .arena = arena.*, .leases = leases.*, .scheduler = scheduler, .reservation = bytes };
+            arena.* = .init(compactor.a);
+            leases.* = .{};
+            transferred = true;
+            try encoder.enqueue(batch, owned, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source });
+            return;
+        }
+    }
+    try flush(compactor, batch, analysis, store_source);
 }
 const ProjectionLeases = struct {
     const max_bytes = 8 * 1024 * 1024;
@@ -2730,7 +2813,7 @@ test "external lake publication encoding lookahead spill and direct contribution
     var expected_summaries: []const ?statistics.Ref = &.{};
     var expected_global: ?statistics.Ref = null;
     var expected_directory: term_directory.Roots = .{};
-    for (0..7) |mode| {
+    for (0..8) |mode| {
         var memory: local.sql_memory_budget = .{ .backing = a, .limit = 128 * 1024 * 1024 };
         const ma = memory.allocator();
         var context: u8 = 0;
@@ -2749,7 +2832,7 @@ test "external lake publication encoding lookahead spill and direct contribution
         // consumer. Lookahead must fit beside it or decline immediately.
         var producer: local.sql_parallel_scheduler.Execution = .{ .scheduler = &scheduler, .bytes = 8 * 1024 * 1024 };
         defer producer.pause();
-        if (mode >= 5) try producer.enter(std.testing.io);
+        if (mode >= 5 and mode < 7) try producer.enter(std.testing.io);
         var execution: local.sql_parallel_scheduler.Execution = .{ .scheduler = &scheduler, .bytes = if (mode >= 5) 8 * 1024 * 1024 else 32 * 1024 * 1024 };
         defer execution.pause();
         var phase: stores.ExecutionIo = .{ .execution = &execution, .io = std.testing.io };
@@ -2782,11 +2865,34 @@ test "external lake publication encoding lookahead spill and direct contribution
             try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
             continue;
         }
-        try flushWithOptions(&compactor, .{ .docs = docs }, .{}, .{ .target_segment_bytes = 1, .target_build_memory_bytes = 32 * 1024 * 1024 });
+        if (mode == 7) {
+            const encoder = try ma.create(EncoderPipeline);
+            encoder.* = .{ .compactor = &compactor, .analysis = .{} };
+            compactor.encoder = encoder;
+            for (0..3) |batch_index| {
+                var input_arena = std.heap.ArenaAllocator.init(ma);
+                const ia = input_arena.allocator();
+                const copied = try ia.dupe(local.introducer.TextDocument, docs[batch_index * 3 ..][0..3]);
+                for (copied) |*doc| {
+                    doc.id = try ia.dupe(u8, doc.id);
+                    doc.stored_data = try ia.dupe(u8, doc.stored_data);
+                    const fields = try ia.dupe(local.introducer.TextField, doc.text_fields);
+                    for (fields) |*field| {
+                        field.field_name = try ia.dupe(u8, field.field_name);
+                        field.text = try ia.dupe(u8, field.text);
+                    }
+                    doc.text_fields = fields;
+                }
+                const bytes = input_arena.queryCapacity();
+                try std.testing.expect(scheduler.reservePull(0, bytes));
+                try encoder.enqueue(.{ .docs = copied }, .{ .arena = input_arena, .leases = .{}, .scheduler = &scheduler, .reservation = bytes }, .{ .target_segment_bytes = 1, .target_build_memory_bytes = 32 * 1024 * 1024 });
+            }
+            try compactor.finishEncoding();
+        } else try flushWithOptions(&compactor, .{ .docs = docs }, .{}, .{ .target_segment_bytes = 1, .target_build_memory_bytes = 32 * 1024 * 1024 });
         try compactor.finish();
         store.vtable = original_vtable;
         try std.testing.expectEqual(@as(usize, 2), segments.items.len);
-        try std.testing.expectEqual(@as(usize, if (mode == 2 or mode == 5) 9 else 0), compactor.test_ahead_count);
+        try std.testing.expectEqual(@as(usize, if (mode == 2 or mode == 5 or mode == 7) 9 else 0), compactor.test_ahead_count);
         try std.testing.expectEqual(@as(u64, 0), scratch.live_bytes);
         try std.testing.expectEqual(@as(usize, 0), scratch.files);
         try std.testing.expectEqual(@as(u64, 0), output_scratch.live_bytes);

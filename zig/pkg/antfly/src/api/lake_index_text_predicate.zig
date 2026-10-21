@@ -699,7 +699,7 @@ fn PredicateResolver(comptime Set: type) type {
                 for (self.predicates.items[1..]) |*predicate| {
                     const count = candidates.boundedCardinality(4096) orelse return error.InvalidNativeLakeRowIndex;
                     if (count == 0) break;
-                    if (64 *| count >= predicate.work or !predicate.canProbeMembership()) {
+                    if (predicate.membershipWork(count) >= predicate.work or !predicate.canProbeMembership()) {
                         var next = try self.resolver.consume(self.a, predicate);
                         defer next.deinit();
                         candidates.andWith(&next);
@@ -743,7 +743,8 @@ fn PredicateResolver(comptime Set: type) type {
                 try self.resolver.context.ensureActive();
                 try self.resolver.read_context.ensureActive();
                 if (self.complete == null) {
-                    const cost = std.math.mul(u64, 64, self.predicates.items.len) catch std.math.maxInt(u64);
+                    var cost: u64 = 0;
+                    for (self.predicates.items) |predicate| cost +|= predicate.membershipWork(1);
                     var probe = self.predicates.items.len != 0 and cost <= self.budget -| self.spent;
                     for (self.predicates.items) |predicate| probe = probe and predicate.canProbeMembership();
                     if (probe) {
@@ -810,7 +811,9 @@ fn PredicateResolver(comptime Set: type) type {
                 }
                 result.budget = @min(work, rows.predicateScanWork(self.source, conditions.items) orelse std.math.maxInt(u64));
                 const selective = result.predicates.items.len != 0 and result.predicates.items[0].estimatedRows() <= 4096;
-                if (probe and !selective and result.budget > 64 *| result.predicates.items.len) return result;
+                var point_work: u64 = 0;
+                for (result.predicates.items) |predicate| point_work +|= predicate.membershipWork(1);
+                if (probe and !selective and result.budget > point_work) return result;
             }
             // Selective, unsupported or exhausted plans use the authoritative
             // exact planner. Small selections are ready before sparse navigation.
@@ -908,7 +911,6 @@ fn PredicateResolver(comptime Set: type) type {
             cache: LiveRowsCache = .{},
             materialized: ?Bitmap = null,
             spent_work: u64 = 0,
-            const point_work: u64 = 64;
             fn close(raw: *anyopaque) void {
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 if (self.materialized) |*bitmap| bitmap.deinit();
@@ -940,7 +942,7 @@ fn PredicateResolver(comptime Set: type) type {
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 try self.resolver.context.ensureActive();
                 if (self.materialized == null) {
-                    const work = if (candidates) |selected| std.math.mul(u64, selected.cardinality(), point_work) catch std.math.maxInt(u64) else std.math.maxInt(u64);
+                    const work = if (candidates) |selected| self.predicate.membershipWork(selected.cardinality()) else std.math.maxInt(u64);
                     if (candidates != null and work <= self.work_budget -| self.spent_work) {
                         self.spent_work +|= work;
                         var result = Bitmap.init(a);
@@ -986,7 +988,7 @@ fn PredicateResolver(comptime Set: type) type {
             }
             // A point-sized metadata predicate is cheaper to materialize than
             // even one reverse-tree probe. Preserve native scorer pushdown.
-            if (predicate.estimatedRows() == 0 or predicate.work <= ProducerOwner.point_work) {
+            if (predicate.estimatedRows() == 0 or predicate.work <= predicate.membershipWork(1)) {
                 const bitmap = try self.consume(a, &predicate);
                 predicate.deinit();
                 return .{ .bitmap = bitmap };

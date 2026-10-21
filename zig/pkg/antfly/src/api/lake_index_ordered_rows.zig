@@ -1080,6 +1080,26 @@ pub const Reader = struct {
     fn nextRecord(self: *Reader) !?tree.Cursor.Record {
         return if (self.preserve_path) self.cursor.?.nextWindow(self.window_upper) else self.cursor.?.next();
     }
+    /// Resolve physical identity through the reverse tree, then authenticate
+    /// the forward covering reference. Neither cursor changes scan position.
+    pub fn entryAtPhysical(self: *Reader, a: A, ref: rows.RowRef) !?Entry {
+        if (ref != .external) return error.InvalidNativeLakeRowIndex;
+        const row = ref.external;
+        if (!std.mem.eql(u8, row.source_id, self.root.source) or !std.mem.eql(u8, row.snapshot_id, self.root.snapshot) or row.identity_version != self.identityVersion()) return error.ExternalLakeSnapshotMismatch;
+        const physical = coordinate(try self.fileSlot(a, row.file_id), row);
+        var reverse = try tree.Cursor.init(a, self.pages.store(), self.root.reverse orelse return null, &physical, null);
+        defer reverse.deinit();
+        const reverse_record = (try reverse.next()) orelse return null;
+        if (!std.mem.startsWith(u8, reverse_record.key, &physical)) return null;
+        if (reverse_record.key.len < 32 or !std.mem.endsWith(u8, reverse_record.key, &physical)) return error.InvalidNativeLakeRowIndex;
+        const key = try a.dupe(u8, reverse_record.key[16..]);
+        var forward = try tree.Cursor.init(a, self.pages.store(), self.root.page, key, null);
+        defer forward.deinit();
+        const record = (try forward.next()) orelse return error.InvalidNativeLakeRowIndex;
+        if (!std.mem.eql(u8, record.key, key)) return error.InvalidNativeLakeRowIndex;
+        _ = try self.decode(a, record);
+        return .{ .key = key, .ref = ref, .cover = try coverReference(a, self.root.domain, record.value) };
+    }
     pub fn nextEntries(self: *Reader, a: A, max_rows: usize) ![]const Entry {
         if (max_rows == 0 or max_rows > 65536) return error.InvalidNativeLakeRowIndex;
         var entries: std.ArrayList(Entry) = .empty;
@@ -1647,6 +1667,18 @@ test "external lake ordered reuse streams beyond a page budget with bounded cove
     const entries = try reader.nextEntries(ca, count);
     try std.testing.expectEqual(@as(usize, count), entries.len);
     try std.testing.expect(!std.mem.eql(u8, entries[0].cover.?.block.artifact_id, entries[count - 1].cover.?.block.artifact_id));
+    for ([_]usize{ count - 1, 0, count / 2 }) |i| {
+        const selected = (try reader.entryAtPhysical(ca, entries[i].ref)).?;
+        try std.testing.expectEqualStrings(entries[i].key, selected.key);
+        try std.testing.expectEqualStrings(entries[i].cover.?.block.artifact_id, selected.cover.?.block.artifact_id);
+        try std.testing.expectEqual(entries[i].cover.?.row, selected.cover.?.row);
+    }
+    var missing = entries[0].ref;
+    missing.external.row_ordinal = count + 1;
+    try std.testing.expect(try reader.entryAtPhysical(ca, missing) == null);
+    var foreign = entries[0].ref;
+    foreign.external.snapshot_id = "foreign";
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, reader.entryAtPhysical(ca, foreign));
     try store.delete(entries[count - 1].cover.?.block.artifact_id);
     try std.testing.expectError(error.FileNotFound, validateReuseWithCache(a, store, root, .{}, .none, 1));
 }

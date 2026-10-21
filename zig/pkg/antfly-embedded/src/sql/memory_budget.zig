@@ -17,6 +17,10 @@
 //! The owner must have a stable address and outlive every allocated object.
 const std = @import("std");
 const Budget = @This();
+/// Transport-neutral classification of shared host admission. This callback
+/// never raises local limits and runs outside the budget's accounting lock.
+pub const Pressure = struct { ptr: *anyopaque, exhausted: *const fn (*anyopaque) bool };
+pressure: ?Pressure = null,
 backing: std.mem.Allocator,
 limit: usize,
 live: usize = 0,
@@ -50,8 +54,10 @@ pub fn allocator(self: *Budget) std.mem.Allocator {
 /// historical failure; restoring parent headroom can admit healthy new work.
 pub fn isLocallyExhausted(self: *Budget) bool {
     self.lock();
-    defer self.mutex.unlock();
-    return self.exhausted or self.admission_exhausted;
+    const exhausted = self.exhausted or self.admission_exhausted;
+    const pressure = self.pressure;
+    self.mutex.unlock();
+    return exhausted or if (pressure) |owner| owner.exhausted(owner.ptr) else false;
 }
 /// Temporary owners may bypass standard arenas without bypassing this budget
 /// or any enclosing budget/failure allocator. Returned objects must be freed
@@ -85,10 +91,11 @@ pub fn isExhausted(self: *Budget) bool {
     self.lock();
     const exhausted = self.exhausted or self.admission_exhausted;
     const backing = self.backing;
+    const pressure = self.pressure;
     self.mutex.unlock();
     // A child can be below its own limit when shared parent admission fails.
     // Preserve genuine allocator OOMs: only known Budget owners carry policy.
-    return exhausted or allocatorExhausted(backing);
+    return exhausted or (if (pressure) |owner| owner.exhausted(owner.ptr) else false) or allocatorExhausted(backing);
 }
 fn allocatorExhausted(a: std.mem.Allocator) bool {
     if (@import("parallel_scheduler.zig").LockedAllocator.parentAllocator(a)) |parent| return allocatorExhausted(parent);
@@ -442,4 +449,26 @@ test "SQL reclaimable scratch headroom follows quota owners behind regions" {
     try std.testing.expectError(error.OutOfMemory, nested.allocator().alloc(u8, 65));
     try std.testing.expect(nested.isExhausted());
     try std.testing.expectEqual(@as(usize, 512), parent.live);
+}
+
+test "SQL shared backing pressure propagates through nested execution budgets without classifying backing OOM" {
+    const Shared = struct {
+        denied: bool = false,
+        fn exhausted(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.denied;
+        }
+    };
+    var shared: Shared = .{};
+    var parent: Budget = .{ .backing = std.testing.allocator, .limit = 4096, .pressure = .{ .ptr = &shared, .exhausted = Shared.exhausted } };
+    var child: Budget = .{ .backing = parent.allocator(), .limit = 1024 };
+    try std.testing.expect(!child.isExhausted());
+    shared.denied = true;
+    try std.testing.expect(child.isExhausted());
+    shared.denied = false;
+    try std.testing.expect(!child.isExhausted());
+    var failures = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var backing: Budget = .{ .backing = failures.allocator(), .limit = 1024 };
+    try std.testing.expectError(error.OutOfMemory, backing.allocator().alloc(u8, 16));
+    try std.testing.expect(!backing.isExhausted());
 }

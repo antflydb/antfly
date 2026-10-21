@@ -151,13 +151,15 @@ pub const Summary = struct {
 /// in publication order. No per-term JSON, sort, or second dictionary pass.
 pub const Captured = struct {
     const Field = struct { name: []u8, begin: u64, end: u64 };
-    const header_bytes = 6;
+    const header_bytes = 10;
     a: A,
     manager: *local.sql_spill.Manager,
     phase: ?*const stores.IoPhase = null,
     file: ?local.sql_spill.File = null,
     buffer: [16 * 1024]u8 = undefined,
     used: usize = 0,
+    previous: std.ArrayList(u8) = .empty,
+    restart: u8 = 0,
     fields: std.ArrayList(Field) = .empty,
     term: ?[]const u8 = null,
     count: u64 = 0,
@@ -170,6 +172,7 @@ pub const Captured = struct {
     }
     pub fn deinit(self: *Captured) void {
         if (self.file) |*file| file.close();
+        self.previous.deinit(self.a);
         for (self.fields.items) |field| self.a.free(field.name);
         self.fields.deinit(self.a);
         self.a.destroy(self);
@@ -187,6 +190,8 @@ pub const Captured = struct {
                 if (self.file) |*file| file.close();
                 self.file = null;
                 self.used = 0;
+                self.previous.deinit(self.a);
+                self.previous = .empty;
                 self.term = null;
                 for (self.fields.items) |field| self.a.free(field.name);
                 self.fields.deinit(self.a);
@@ -208,6 +213,8 @@ pub const Captured = struct {
             const name = try self.a.dupe(u8, field);
             errdefer self.a.free(name);
             try self.fields.append(self.a, .{ .name = name, .begin = offset, .end = offset });
+            self.previous.clearRetainingCapacity();
+            self.restart = 0;
         }
         // The observer is synchronous: the writer retains this term until
         // finish returns. Only the per-field directory needs owned names.
@@ -240,11 +247,19 @@ pub const Captured = struct {
         var buffer: [Summary.max_bytes]u8 = undefined;
         const encoded = summary.encode(&buffer);
         var header: [header_bytes]u8 = undefined;
-        std.mem.writeInt(u32, header[0..4], @intCast(term.len), .little);
-        std.mem.writeInt(u16, header[4..6], @intCast(encoded.len), .little);
+        // Restart every 64 terms and at each field boundary. The frame remains
+        // sequential and private; durable summary keys/values do not change.
+        var prefix: usize = 0;
+        if (self.restart != 0) while (prefix < @min(self.previous.items.len, term.len) and self.previous.items[prefix] == term[prefix]) : (prefix += 1) {};
+        std.mem.writeInt(u32, header[0..4], @intCast(prefix), .little);
+        std.mem.writeInt(u32, header[4..8], @intCast(term.len - prefix), .little);
+        std.mem.writeInt(u16, header[8..10], @intCast(encoded.len), .little);
         try self.appendPart(&header);
-        try self.appendPart(term);
+        try self.appendPart(term[prefix..]);
         try self.appendPart(encoded);
+        try self.previous.resize(self.a, term.len);
+        @memcpy(self.previous.items, term);
+        self.restart = (self.restart + 1) % 64;
         self.fields.items[self.fields.items.len - 1].end = self.length();
         self.count += 1;
         self.term = null;
@@ -333,7 +348,8 @@ pub const Captured = struct {
             }
             pub fn next(self_: *@This()) !?tree.Cursor.Record {
                 const captured = self_.capture;
-                if (self_.key) |key| captured.a.free(key);
+                const previous = self_.key;
+                defer if (previous) |key| captured.a.free(key);
                 self_.key = null;
                 while (self_.field < captured.fields.items.len) {
                     const field = captured.fields.items[self_.field];
@@ -346,17 +362,21 @@ pub const Captured = struct {
                     if (offset > field.end or field.end - offset < header_bytes) return error.InvalidNativeLakeTextStatistics;
                     var header: [header_bytes]u8 = undefined;
                     try self_.read(offset, &header);
-                    const term_len = std.mem.readInt(u32, header[0..4], .little);
-                    const value_len = std.mem.readInt(u16, header[4..6], .little);
-                    if (value_len > self_.value.len or @as(u64, term_len) + value_len > field.end - offset - header_bytes or field.name.len +| term_len > tree.max_key_bytes - 4) return error.InvalidNativeLakeTextStatistics;
+                    const prefix = std.mem.readInt(u32, header[0..4], .little);
+                    const suffix = std.mem.readInt(u32, header[4..8], .little);
+                    const term_len = try std.math.add(usize, prefix, suffix);
+                    const value_len = std.mem.readInt(u16, header[8..10], .little);
+                    if (value_len > self_.value.len or @as(u64, suffix) + value_len > field.end - offset - header_bytes or field.name.len +| term_len > tree.max_key_bytes - 4) return error.InvalidNativeLakeTextStatistics;
+                    if (prefix != 0 and (offset == field.begin or previous == null or previous.?.len < 4 + field.name.len + prefix)) return error.InvalidNativeLakeTextStatistics;
                     const key = try captured.a.alloc(u8, 4 + field.name.len + term_len);
                     self_.key = key;
                     std.mem.writeInt(u32, key[0..4], @intCast(field.name.len), .big);
                     @memcpy(key[4..][0..field.name.len], field.name);
-                    try self_.read(offset + header_bytes, key[4 + field.name.len ..]);
-                    try self_.read(offset + header_bytes + term_len, self_.value[0..value_len]);
+                    if (prefix != 0) @memcpy(key[4 + field.name.len ..][0..prefix], previous.?[4 + field.name.len ..][0..prefix]);
+                    try self_.read(offset + header_bytes, key[4 + field.name.len + prefix ..]);
+                    try self_.read(offset + header_bytes + suffix, self_.value[0..value_len]);
                     _ = try Summary.decode(self_.value[0..value_len]);
-                    self_.offset = offset + header_bytes + term_len + value_len;
+                    self_.offset = offset + header_bytes + suffix + value_len;
                     const record: tree.Cursor.Record = .{ .key = key, .value = self_.value[0..value_len] };
                     try self_.consumer.record(record);
                     return record;
@@ -1785,4 +1805,29 @@ test "external lake captured summaries release private spills on every allocatio
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "external lake captured prefix frames bound repeated dictionary bytes and restart per field" {
+    const a = std.testing.allocator;
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    var context: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &context, .checkpoint = Check.call, .async_writes = false };
+    defer manager.deinit();
+    const captured = try Captured.create(a, &manager);
+    defer captured.deinit();
+    const observer = captured.observer();
+    const prefix: [200]u8 = @splat('a');
+    for ([_][]const u8{ "z", "body" }) |field| for (0..4096) |i| {
+        var term: [256]u8 = undefined;
+        const text = try std.fmt.bufPrint(&term, "{s}{d:0>8}", .{ prefix, i });
+        try observer.begin(observer.ptr, field, text);
+        try observer.finish(observer.ptr, 1, null, 3);
+    };
+    try captured.seal();
+    try std.testing.expect(!captured.disabled);
+    try std.testing.expect(captured.length() < 8192 * 64);
+    try std.testing.expectEqual(@as(u64, 8192), captured.count);
+    try std.testing.expectEqualStrings("z", captured.fields.items[0].name);
 }

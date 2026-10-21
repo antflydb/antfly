@@ -83,11 +83,30 @@ pub const Output = struct {
         try writer.write(.{ .columns = self.columns, .rows = self.rows, .sql_nulls = self.sql_nulls, .rows_affected = self.rows_affected, .command_tag = self.command_tag, .mutation_outcome = self.mutation_outcome, .ddl_receipt = self.ddl_receipt });
     }
 };
+/// An execution-scoped allocator whose control state outlives returned rows or
+/// a suspended stream. Owned execution entry points consume this capability on
+/// every path; the owner is released after the last execution allocation.
+pub const MemoryOwner = struct {
+    allocator: std.mem.Allocator,
+    pressure: ?MemoryBudget.Pressure = null,
+    ptr: *anyopaque,
+    release: *const fn (*anyopaque) void,
+
+    pub fn deinit(self: MemoryOwner) void {
+        self.release(self.ptr);
+    }
+    pub fn mapError(self: MemoryOwner, err: anyerror) anyerror {
+        if (err == error.OutOfMemory) if (self.pressure) |pressure|
+            if (pressure.exhausted(pressure.ptr)) return error.SqlWorkingMemoryLimitExceeded;
+        return err;
+    }
+};
+
 pub const Result = struct {
     state: *State,
     output: Output,
 
-    const State = struct { budget: MemoryBudget, arena: std.heap.ArenaAllocator, regex_execution: @import("regex_execution.zig") };
+    const State = struct { budget: MemoryBudget, arena: std.heap.ArenaAllocator, regex_execution: @import("regex_execution.zig"), owner: ?MemoryOwner };
 
     /// Includes retained result arena capacity and transient native page data.
     pub fn peakMemoryBytes(self: Result) usize {
@@ -103,15 +122,18 @@ pub const Result = struct {
 
     pub fn deinit(self: *Result) void {
         const backing = self.state.budget.backing;
+        const owner = self.state.owner;
         self.state.regex_execution.deinit();
         self.state.arena.deinit();
         std.debug.assert(self.state.budget.live == 0);
         backing.destroy(self.state);
+        if (owner) |retained| retained.deinit();
         self.* = undefined;
     }
 
     pub fn empty(alloc: std.mem.Allocator, command_tag: []const u8) !Result {
         const state = try alloc.create(State);
+        state.owner = null;
         state.budget = .{ .backing = alloc, .limit = (Limits{}).retained_bytes };
         state.regex_execution = .init(state.budget.allocator(), 16 * 1024 * 1024);
         state.arena = std.heap.ArenaAllocator.init(state.budget.allocator());
@@ -137,7 +159,20 @@ pub const Result = struct {
     }
 };
 
+pub fn executeOwned(owner: MemoryOwner, backend: catalog.Backend, compiled: *const compiler.Compiled, parameters: []const Json, limits: Limits) !Result {
+    var adopted = false;
+    defer if (!adopted) owner.deinit();
+    var result = executeInner(owner.allocator, backend, compiled, parameters, limits, owner) catch |err| return owner.mapError(err);
+    result.state.owner = owner;
+    adopted = true;
+    return result;
+}
+
 pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, parameters: []const Json, limits: Limits) !Result {
+    return executeInner(alloc, backend, compiled, parameters, limits, null);
+}
+
+fn executeInner(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, parameters: []const Json, limits: Limits, owner: ?MemoryOwner) !Result {
     if (limits.result_rows == 0 or limits.result_rows > 4096 or limits.mutation_rows == 0 or limits.mutation_rows > 4096 or
         limits.execution_batch_rows == 0 or limits.execution_batch_rows > 4096 or limits.page_rows == 0 or limits.page_rows > 4096 or limits.page_bytes == 0 or limits.scan_rows == 0) return error.InvalidSqlLimit;
     if (parameters.len != compiled.parameter_count) return error.InvalidSqlParameters;
@@ -153,7 +188,8 @@ pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *co
     }
     const memory = try limits.workingMemory();
     const state = try alloc.create(Result.State);
-    state.budget = .{ .backing = alloc, .limit = memory };
+    state.owner = null;
+    state.budget = .{ .backing = alloc, .limit = memory, .pressure = if (owner) |retained| retained.pressure else null };
     state.regex_execution = .init(state.budget.allocator(), @min(16 * 1024 * 1024, limits.retained_bytes));
     statement_backend.regex_execution = &state.regex_execution;
     state.arena = std.heap.ArenaAllocator.init(state.budget.allocator());
@@ -6193,4 +6229,26 @@ test "SQL finalized materialization page quota stays independent of decision out
         try std.testing.expectEqual(@as(usize, if (std.mem.indexOf(u8, query, "LIMIT") == null) 10 else if (std.mem.indexOf(u8, query, "LIMIT 9") != null) 9 else 3), result.output.rows.len);
         try std.testing.expectEqual(@as(usize, 1), driver.closes);
     }
+}
+
+test "SQL owned execution releases allocator capability after results and every allocation failure" {
+    const Case = struct {
+        fn release(raw: *anyopaque) void {
+            const calls: *usize = @ptrCast(@alignCast(raw));
+            calls.* += 1;
+        }
+        fn run(a: std.mem.Allocator) !void {
+            var fixture: TestBackend = .{};
+            var compiled = try compiler.compile(a, "SELECT 42 AS n", .{});
+            defer compiled.deinit();
+            var calls: usize = 0;
+            defer std.debug.assert(calls == 1);
+            const owner: MemoryOwner = .{ .allocator = a, .ptr = &calls, .release = release };
+            var result = try executeOwned(owner, fixture.iface(), &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 0), calls);
+            try std.testing.expectEqualStrings("42", result.output.rows[0][0].string);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

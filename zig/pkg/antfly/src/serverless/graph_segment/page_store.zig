@@ -204,7 +204,17 @@ pub const PageStore = struct {
 /// spill extents and one physical descriptor; no private reference is durable.
 pub const PrivatePages = struct {
     const spill = @import("antfly_local_sources").sql_spill;
-    const Run = struct { file: spill.File, heads: [256]u64 = @splat(0), token: [16]u8 };
+    const Run = struct {
+        file: spill.File,
+        index: ?spill.File = null,
+        capacity: usize = 0,
+        count: usize = 0,
+        token: [16]u8,
+        fn close(self: *Run) void {
+            if (self.index) |*index| index.close();
+            self.file.close();
+        }
+    };
     manager: *spill.Manager,
     domain: [32]u8,
     attempt: [16]u8,
@@ -213,9 +223,10 @@ pub const PrivatePages = struct {
     runs: [64]?*Run = @splat(null),
     generation: u64 = 0,
     current: ?usize = null,
+    index_probes: u64 = 0,
     pub fn deinit(self: *PrivatePages) void {
         for (&self.runs) |*run| if (run.*) |value| {
-            value.file.close();
+            value.close();
             self.manager.allocator().destroy(value);
             run.* = null;
         };
@@ -252,7 +263,7 @@ pub const PrivatePages = struct {
                 if (root) |ref| if (std.mem.eql(u8, &ref.attempt, &value.token)) break true;
             } else false;
             if (!keep) {
-                value.file.close();
+                value.close();
                 self.manager.allocator().destroy(value);
                 run.* = null;
                 if (self.current == i) self.current = null;
@@ -273,8 +284,53 @@ pub const PrivatePages = struct {
         if (self.phase) |phase| try phase.begin(phase.ptr, 1);
         return .{ .phase = self.phase };
     }
-    fn bucket(ref: tree.Ref) usize {
-        return std.mem.readInt(u16, ref.digest[0..2], .little) % 256;
+    const slot_bytes = 40;
+    const Slot = struct { position: u64, offset: u64 };
+    /// Half-full disk navigation scales without a per-page heap directory.
+    /// Rehashing commits replacement extents before retiring the old table.
+    fn indexSlot(self: *PrivatePages, index: *spill.File, capacity: usize, digest: [32]u8) !Slot {
+        var bucket = std.mem.readInt(u64, digest[0..8], .little) & (capacity - 1);
+        for (0..capacity) |_| {
+            const position = bucket * slot_bytes;
+            var bytes: [slot_bytes]u8 = undefined;
+            try index.readRaw(position, &bytes);
+            self.index_probes += 1;
+            const offset = std.mem.readInt(u64, bytes[32..40], .little);
+            if (offset == 0 or std.mem.eql(u8, bytes[0..32], &digest)) return .{ .position = position, .offset = offset };
+            bucket = (bucket + 1) & (capacity - 1);
+        }
+        return error.InvalidGraphPage;
+    }
+    fn growIndex(self: *PrivatePages, run: *Run) !void {
+        if (run.count + 1 <= run.capacity / 2) return;
+        const capacity = if (run.capacity == 0) 64 else try std.math.mul(usize, run.capacity, 2);
+        var index = try self.pool.?.create();
+        errdefer index.close();
+        const zeros: [4096]u8 = @splat(0);
+        const length = try std.math.mul(usize, capacity, slot_bytes);
+        var position: usize = 0;
+        while (position < length) {
+            const n = @min(zeros.len, length - position);
+            try index.writeRaw(position, zeros[0..n]);
+            position += n;
+        }
+        if (run.index) |*old| {
+            for (0..run.capacity) |ordinal| {
+                var bytes: [slot_bytes]u8 = undefined;
+                try old.readRaw(ordinal * slot_bytes, &bytes);
+                if (std.mem.readInt(u64, bytes[32..40], .little) == 0) continue;
+                const target = try self.indexSlot(&index, capacity, bytes[0..32].*);
+                try index.writeRaw(target.position, &bytes);
+            }
+            old.close();
+        }
+        run.index = index;
+        run.capacity = capacity;
+    }
+    fn indexedOffset(self: *PrivatePages, run: *Run, digest: [32]u8) !?u64 {
+        if (run.index == null) return null;
+        const found = try self.indexSlot(&run.index.?, run.capacity, digest);
+        return if (found.offset == 0) null else found.offset - 1;
     }
     fn find(self: *PrivatePages, ref: tree.Ref) !*Run {
         for (self.runs) |run| if (run) |value| {
@@ -293,14 +349,23 @@ pub const PrivatePages = struct {
     }
     fn append(self: *PrivatePages, ref: tree.Ref, bytes: []const u8) !void {
         const run = try self.find(ref);
+        const capacity = run.capacity;
+        const prior: ?Slot = if (run.index) |*index| try self.indexSlot(index, capacity, ref.digest) else null;
+        // Reusing an immutable page must not grow navigation or require more
+        // scratch capacity, even exactly at the index's growth threshold.
+        if (prior) |found| if (found.offset != 0) return;
+        try self.growIndex(run);
+        const target = if (run.capacity == capacity) prior.? else try self.indexSlot(&run.index.?, run.capacity, ref.digest);
         const file = &run.file;
         const offset = file.size;
         var header: [40]u8 = undefined;
         header[0..32].* = ref.digest;
-        std.mem.writeInt(u64, header[32..40], run.heads[bucket(ref)], .little);
+        std.mem.writeInt(u64, header[32..40], 0, .little);
         try file.writeRaw(offset, &header);
         try file.writeRaw(offset + header.len, bytes);
-        run.heads[bucket(ref)] = offset + 1;
+        std.mem.writeInt(u64, header[32..40], offset + 1, .little);
+        try run.index.?.writeRaw(target.position, &header);
+        run.count += 1;
     }
     fn get(raw: *anyopaque, a: std.mem.Allocator, ref: tree.Ref) ![]u8 {
         const self = owner(raw);
@@ -314,22 +379,15 @@ pub const PrivatePages = struct {
     }
     fn lookup(self: *PrivatePages, a: std.mem.Allocator, ref: tree.Ref) ![]u8 {
         const run = try self.find(ref);
-        var next = run.heads[bucket(ref)];
         const file = &run.file;
-        while (next != 0) {
-            const offset = next - 1;
-            var header: [40]u8 = undefined;
-            try file.readRaw(offset, &header);
-            if (std.mem.eql(u8, header[0..32], &ref.digest)) {
-                const bytes = try a.alloc(u8, ref.bytes);
-                errdefer a.free(bytes);
-                try file.readRaw(offset + header.len, bytes);
-                return bytes;
-            }
-            next = std.mem.readInt(u64, header[32..40], .little);
-            if (next != 0 and next - 1 >= offset) return error.InvalidGraphPage;
-        }
-        return error.FileNotFound;
+        const offset = (try self.indexedOffset(run, ref.digest)) orelse return error.FileNotFound;
+        var header: [40]u8 = undefined;
+        try file.readRaw(offset, &header);
+        if (!std.mem.eql(u8, header[0..32], &ref.digest)) return error.InvalidGraphPage;
+        const bytes = try a.alloc(u8, ref.bytes);
+        errdefer a.free(bytes);
+        try file.readRaw(offset + header.len, bytes);
+        return bytes;
     }
 };
 
@@ -1011,9 +1069,55 @@ test "serverless private graph pages authenticate spill records and release quot
         var large: [128 * 1024]u8 = @splat(1);
         try std.testing.expectError(error.SqlProgramLimitExceeded, tree.apply(a, storage, root, &.{.{ .key = "new", .value = &large }}));
         const run = try pages.find(root);
-        const offset = run.heads[PrivatePages.bucket(root)] - 1;
+        const offset = (try pages.indexedOffset(run, root.digest)).?;
         try run.file.writeRaw(offset + 40, "!");
         try std.testing.expectError(error.ArtifactIntegrityMismatch, tree.readPage(a, storage, root));
+    }
+    try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
+    try std.testing.expectEqual(@as(usize, 0), manager.files);
+}
+
+test "serverless private graph pages keep large run probes independent of run length" {
+    const local = @import("antfly_local_sources");
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var context: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &context, .checkpoint = Check.call, .async_writes = false };
+    defer manager.deinit();
+    {
+        var pages: PrivatePages = .{ .manager = &manager, .domain = @splat(7), .attempt = @splat(1) };
+        defer pages.deinit();
+        const storage = try PrivatePages.beginRun(&pages);
+        const refs_ = try a.alloc(tree.Ref, 8192);
+        defer a.free(refs_);
+        for (refs_, 0..) |*ref, i| {
+            var bytes: [128]u8 = @splat(0);
+            std.mem.writeInt(u64, bytes[0..8], i, .little);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(&bytes, &digest, .{});
+            ref.* = .{ .attempt = storage.attempt, .digest = digest, .bytes = bytes.len, .height = 0, .records = 1 };
+            try storage.put(storage.ptr, ref.*, &bytes);
+        }
+        const before = pages.index_probes;
+        for (refs_, 0..) |ref, i| {
+            const bytes = try storage.get(storage.ptr, a, ref);
+            defer a.free(bytes);
+            try std.testing.expectEqual(i, std.mem.readInt(u64, bytes[0..8], .little));
+        }
+        try std.testing.expect(pages.index_probes - before < refs_.len * 4);
+        // A duplicate immutable page needs no second payload record.
+        const run = try pages.find(refs_[0]);
+        const size = run.file.size;
+        const capacity = run.capacity;
+        const retained = manager.live_bytes;
+        const bytes = try storage.get(storage.ptr, a, refs_[0]);
+        defer a.free(bytes);
+        try storage.put(storage.ptr, refs_[0], bytes);
+        try std.testing.expectEqual(size, run.file.size);
+        try std.testing.expectEqual(capacity, run.capacity);
+        try std.testing.expectEqual(retained, manager.live_bytes);
     }
     try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
     try std.testing.expectEqual(@as(usize, 0), manager.files);

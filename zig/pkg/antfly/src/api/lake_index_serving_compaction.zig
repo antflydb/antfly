@@ -984,7 +984,9 @@ test "external lake global frontier summary scratch exhaustion preserves a fitti
     var check: u8 = 0;
     var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &check, .checkpoint = Check.call, .max_bytes = expected.len + 8192, .async_writes = false };
     defer manager.deinit();
-    var builder: Builder = .{ .a = a, .out = out, .store = &store, .context = .{ .io = std.testing.io }, .token = .none, .pages = undefined, .terms = undefined, .ownership = undefined, .source_routes = undefined, .ties = undefined, .metadata = undefined, .staging = &manager, .summary_staging = &manager, .pending_arena = undefined };
+    var summaries: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &check, .checkpoint = Check.call, .max_bytes = 1, .async_writes = false };
+    defer summaries.deinit();
+    var builder: Builder = .{ .a = a, .out = out, .store = &store, .context = .{ .io = std.testing.io }, .token = .none, .pages = undefined, .terms = undefined, .ownership = undefined, .source_routes = undefined, .ties = undefined, .metadata = undefined, .staging = &manager, .summary_staging = &summaries, .pending_arena = undefined };
     {
         const staged = try builder.merge(a, &inputs);
         defer staged.release();

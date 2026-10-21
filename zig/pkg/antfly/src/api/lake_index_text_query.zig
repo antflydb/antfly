@@ -2711,6 +2711,28 @@ const Execution = struct {
                 };
                 var request = self.request;
                 request.cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
+                const covered = @import("lake_index_sql_rows.zig").gatherCovering(a, self.server, self.table, self.source, request, .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context }, refs, fields) catch |err| switch (err) {
+                    error.SqlMemoryLimitExceeded, error.ArtifactReadBudgetExceeded => null,
+                    else => return err,
+                };
+                if (covered) |values| {
+                    defer {
+                        for (values) |value| if (value) |row| row.deinit();
+                        a.free(values);
+                    }
+                    for (values, window_positions) |value, position| {
+                        const row = value orelse return error.StoredDocMissing;
+                        if (T == types.ColumnSource) {
+                            result[position] = row.clone();
+                        } else {
+                            var covered_scratch = std.heap.ArenaAllocator.init(a);
+                            defer covered_scratch.deinit();
+                            const json = try row.value(&covered_scratch);
+                            if (T == std.json.Value) result[position] = try types.cloneJsonValue(a, json) else result[position] = try std.json.Stringify.valueAlloc(a, json, .{});
+                        }
+                    }
+                    break :hydrate;
+                }
                 const cursor = try local.sql_lake_cursor.openPinned(a, self.table, .{ .fields = fields, .row_refs = refs, .limit = @intCast(count) }, request, self.source);
                 defer cursor.close(cursor.ptr);
                 if (T == std.json.Value or T == types.ColumnSource) if (cursor.next_columns) |next_columns| {
@@ -4177,4 +4199,86 @@ test "external lake metadata navigation ordered pages share text membership and 
     }
     try std.testing.expectEqual(pin.snapshot.segments.len, patterns.builds);
     try std.testing.expect(patterns.hits >= 3);
+}
+
+test "external lake covering search hydration survives missing Parquet and preserves ranked typed delivery" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("lake-covering-result-hydration");
+    defer directory.cleanup();
+    var fs = try local.storage_object_storage.FilesystemObjectStorage.init(a, directory.path());
+    defer fs.deinit();
+    var client = fs.client();
+    try client.makeBucket("antfly");
+    const data = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{.{ .column_id = "amount", .field_id = 3, .values = &.{ 9007199254740993, 9007199254740994 } }}, &.{
+        .{ .column_id = "body", .field_id = 1, .converted_type = 0, .values = &.{ "a needle in the haystack", "second needle" } },
+        .{ .column_id = "label", .field_id = 2, .converted_type = 0, .values = &.{ "returned metadata", "other metadata" } },
+    });
+    defer a.free(data);
+    var put = try client.putObject("antfly", "part.parquet", data, .{});
+    put.deinit(a);
+    const schema_json = try std.fmt.allocPrint(a,
+        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"lake","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema"}},"relational_indexes":[{{"name":"amount_idx","keys":[{{"column":"amount"}}],"include_columns":["body","label"]}}],"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"amount":{{"type":"integer"}},"body":{{"type":"string"}},"label":{{"type":"string"}}}},"additionalProperties":false}}}}}}}}
+    , .{directory.path()});
+    defer a.free(schema_json);
+    var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema_json)).?;
+    defer binding.deinit(a);
+    var source = try local.serverless_query_lake_serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
+    defer source.deinit();
+    var store = try Store.openNative(a, null, null, false, .standalone, directory.path());
+    defer store.deinit();
+    var artifacts = store.artifactStore();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const publication = @import("lake_index_publication.zig");
+    var record: local.common_topology_records.TableRecord = .{ .table_id = 7, .name = "lake", .schema_json = schema_json, .indexes_json = "{}" };
+    record.lake_index_catalog_json = try publication.begin(ca, std.testing.io, record, &source, store.identity, .{}, 100, 20);
+    const Clock = struct {
+        fn now(_: *const anyopaque) !u64 {
+            return 101;
+        }
+    };
+    var clock: u8 = 0;
+    record.lake_index_catalog_json = try publication.build(ca, &artifacts, record, &source, store.identity, .{ .io = std.testing.io }, .none, .{ .ptr = &clock, .now_ms = Clock.now });
+    var catalog = try local.metadata_lake_index_catalog.parse(a, record.lake_index_catalog_json);
+    defer catalog.deinit();
+    try @import("lake_index_directory.zig").hydrate(catalog.arena.allocator(), artifacts, &catalog.value.published.?, .none, null);
+    const Hooks = struct {
+        fn read(_: *anyopaque, _: A, _: u64, _: local.api_operation.RequestContext) ![]u8 {
+            return error.TestUnexpectedResult;
+        }
+        fn mutate(_: *anyopaque, _: u64, _: u64, _: @import("../metadata/lake_index_lifecycle.zig").Mutation, _: local.api_operation.RequestContext) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var status_token: u8 = 0;
+    var server = server_api.ApiHttpServer.init(a, .{}, .{ .ptr = &status_token, .vtable = &.{ .status = undefined, .get_lake_index_lifecycle = Hooks.read, .mutate_lake_index_lifecycle = Hooks.mutate } }, null, null);
+    defer server.deinit();
+    var table = try server.sql_schema_cache.resolve(std.testing.io, ca, schema_json, 7, "lake");
+    table.external_indexes = .{ .schema_json = schema_json, .catalog_json = record.lake_index_catalog_json, .indexes_json = record.indexes_json, .desired = local.metadata_lake_index_catalog.desiredFingerprint(record) };
+    var owner: Execution = .{ .server = &server, .table = table, .source = &source, .store = &store, .domain = publication.uploadDomainWithNamespace(7, store.identity, catalog.value.published.?.namespace), .declarations = catalog.value.published.?.declarations, .context = .{ .io = std.testing.io }, .request = .{}, .schema_json = schema_json, .arena = ca };
+    defer owner.deinit();
+    const first = try local.storage_rowsource_identity.allocId(ca, .{ .external = .{ .source_id = source.inventory.source_id, .snapshot_id = source.inventory.snapshot_id, .file_id = source.inventory.files[0].file_id, .row_group_ordinal = 0, .row_ordinal = 0 } });
+    const second = try local.storage_rowsource_identity.allocId(ca, .{ .external = .{ .source_id = source.inventory.source_id, .snapshot_id = source.inventory.snapshot_id, .file_id = source.inventory.files[0].file_id, .row_group_ordinal = 0, .row_ordinal = 1 } });
+    try owner.files.put(ca, first[6..70], source.inventory.files[0].file_id);
+    try client.deleteObject("antfly", "part.parquet", .{});
+    var reads: ?u64 = null;
+    for (0..2) |_| {
+        const values = try Execution.loadSelected(types.ColumnSource, &owner, a, &.{ second, first, second }, &.{ "amount", "body" });
+        defer {
+            for (values) |value| if (value) |row| row.deinit();
+            a.free(values);
+        }
+        for (values, [_]i64{ 9007199254740994, 9007199254740993, 9007199254740994 }) |value, amount| {
+            var result_arena = std.heap.ArenaAllocator.init(a);
+            defer result_arena.deinit();
+            const json = try value.?.value(&result_arena);
+            try std.testing.expectEqual(amount, json.object.get("amount").?.integer);
+            try std.testing.expect(json.object.get("body").? == .string);
+            try std.testing.expect(value.?.page.columns[0].values == .i64);
+        }
+        const current = server.lake_read_cache.snapshot().provider_reads;
+        if (reads) |previous| try std.testing.expectEqual(previous, current);
+        reads = current;
+    }
 }

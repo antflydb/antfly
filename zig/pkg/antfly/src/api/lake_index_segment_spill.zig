@@ -23,6 +23,7 @@ pub const LocalSegment = struct {
     a: A,
     file: local.sql_spill.File,
     refs: usize = 1,
+    test_ahead_reads: if (@import("builtin").is_test) std.atomic.Value(usize) else void = if (@import("builtin").is_test) .init(0) else {},
     statistics: ?*@import("lake_index_text_statistics.zig").Captured = null,
     store: *stores.ArtifactStore,
     mutex: std.atomic.Mutex = .unlocked,
@@ -136,6 +137,21 @@ pub const LocalSegment = struct {
         defer phase.abort();
         self.file.readRaw(offset, target) catch |err| return phase.failed(err);
         try phase.finish();
+    }
+    /// Borrow a local immutable file through a separately admitted I/O task.
+    /// Provider-backed sources cannot acquire this capability accidentally.
+    pub fn readAheadSource(source_: local.index.SegmentSource) ?local.index.SegmentSource {
+        if (source_ != .ranges or source_.ranges.read_into != read) return null;
+        var result = source_;
+        result.ranges.read_into = readUnadmitted;
+        return result;
+    }
+    fn readUnadmitted(raw: *anyopaque, offset: u64, target_: []u8) !void {
+        const self: *LocalSegment = @ptrCast(@alignCast(raw));
+        if (@import("builtin").is_test) _ = self.test_ahead_reads.fetchAdd(1, .monotonic);
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        try self.file.readRaw(offset, target_);
     }
     fn close(_: *anyopaque) void {}
     pub fn source(self: *LocalSegment) local.index.SegmentSource {
