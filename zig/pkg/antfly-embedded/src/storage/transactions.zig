@@ -1629,9 +1629,13 @@ pub const TxnManager = struct {
     }
 
     fn capturePreparedIntentsInner(self: *TxnManager, alloc: Allocator, txn_id: TxnId, catalog_digest: [32]u8, mode: prepared_effects.Mode, control: ?read_control.Port) !PreparedIntentSnapshot {
+        return self.captureGuardedIntentsInner(alloc, txn_id, catalog_digest, mode, control, false);
+    }
+
+    fn captureGuardedIntentsInner(self: *TxnManager, alloc: Allocator, txn_id: TxnId, catalog_digest: [32]u8, mode: prepared_effects.Mode, control: ?read_control.Port, allow_aborted: bool) !PreparedIntentSnapshot {
         if (control) |owner| try owner.checkpoint();
         const record = try self.loadTransactionRecordWithAdmission(txn_id, control);
-        if (!record.prepared or record.intent_revision == 0 or record.status == .aborted) return error.PreparedEffectsRequired;
+        if (!record.prepared or record.intent_revision == 0 or (!allow_aborted and record.status == .aborted)) return error.PreparedEffectsRequired;
         var batch = try self.collectIntentBatchWithAdmission(alloc, txn_id, control);
         errdefer batch.deinit(alloc);
         if (batch.revision != record.intent_revision) return error.IntentSnapshotChanged;
@@ -4047,6 +4051,116 @@ pub fn validatePreparedReadGuardRecord(txn: anytype, receipt: prepared_effects.B
     if (resolved) {
         if (record.status == .pending or !record.intents_resolved_known or !record.intents_resolved) return error.InvalidTxnRecord;
     } else if (record.intents_resolved_known and record.intents_resolved) return error.InvalidTxnRecord;
+}
+
+/// Native input metadata is immutable while its accepted read certificate is
+/// installed. A logical key may contain arbitrary bytes, including another ID;
+/// decode the framing rather than looking for an ID at the end of the key.
+pub const PreparedInputKey = union(enum) { owner: TxnId, lock };
+pub fn preparedInputKey(selected: []const u8) !?PreparedInputKey {
+    if (std.mem.startsWith(u8, selected, intent_locks_prefix)) return .lock;
+    for ([_][]const u8{ intents_prefix, intent_members_prefix }) |prefix| {
+        if (!std.mem.startsWith(u8, selected, prefix)) continue;
+        if (selected.len < prefix.len + 17 or selected[prefix.len + 16] != ':') return error.InvalidTxnRecord;
+        return .{ .owner = selected[prefix.len..][0..16].* };
+    }
+    if (std.mem.startsWith(u8, selected, read_members_prefix)) {
+        if (selected.len < read_members_prefix.len + 16) return error.InvalidTxnRecord;
+        return .{ .owner = selected[read_members_prefix.len..][0..16].* };
+    }
+    for ([_][]const u8{ intent_keys_prefix, intent_admission_prefix, read_admission_prefix, schema_leases_prefix }) |prefix| {
+        if (!std.mem.startsWith(u8, selected, prefix)) continue;
+        if (selected.len != prefix.len + 16) return error.InvalidTxnRecord;
+        return .{ .owner = selected[prefix.len..][0..16].* };
+    }
+    return null;
+}
+pub fn isPreparedInputKey(selected: []const u8) bool {
+    for ([_][]const u8{ intents_prefix, intent_locks_prefix, intent_keys_prefix, intent_members_prefix, intent_admission_prefix, read_members_prefix, read_admission_prefix, schema_leases_prefix }) |prefix|
+        if (std.mem.startsWith(u8, selected, prefix)) return true;
+    return false;
+}
+
+test "prepared transaction effects input ownership uses prefix framing with binary suffixes and excludes acknowledgement progress" {
+    const id: TxnId = @splat(7);
+    const other: TxnId = @splat(9);
+    for ([_][]const u8{ intents_prefix, intent_members_prefix }) |prefix| {
+        const selected = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, &id, ":", "binary\x00:", &other });
+        defer std.testing.allocator.free(selected);
+        try std.testing.expectEqualDeep(PreparedInputKey{ .owner = id }, (try preparedInputKey(selected)).?);
+        selected[prefix.len + 16] = '!';
+        try std.testing.expectError(error.InvalidTxnRecord, preparedInputKey(selected));
+    }
+    const member = read_members_prefix ++ id ++ other;
+    try std.testing.expectEqualDeep(PreparedInputKey{ .owner = id }, (try preparedInputKey(member)).?);
+    const sidecar = intent_admission_prefix ++ id;
+    try std.testing.expectEqualDeep(PreparedInputKey{ .owner = id }, (try preparedInputKey(sidecar)).?);
+    const malformed = sidecar ++ ":";
+    try std.testing.expectError(error.InvalidTxnRecord, preparedInputKey(malformed));
+    try std.testing.expectEqualDeep(@as(PreparedInputKey, .lock), (try preparedInputKey(intent_locks_prefix ++ "row")).?);
+    for ([_][]const u8{ participant_index_prefix, resolved_index_prefix, resolved_participants_prefix }) |prefix| {
+        const selected = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, &id });
+        defer std.testing.allocator.free(selected);
+        try std.testing.expect(!isPreparedInputKey(selected));
+        try std.testing.expect((try preparedInputKey(selected)) == null);
+    }
+}
+
+/// A decision may advance without retiring guards. Keep the inputs to their
+/// digest, preparation identity and recovery role fixed until typed retirement.
+/// This validates identity preservation, not authority to choose the decision.
+pub fn validatePreparedReadGuardTransition(previous: []const u8, candidate: ?[]const u8) !void {
+    var before = try decodeRecord(previous);
+    const after = try decodeRecord(candidate orelse return error.IntentConflict);
+    inline for (.{ "status", "commit_version", "finalized_at", "replay_sequence", "intents_resolved", "intents_resolved_known" }) |field|
+        @field(before, field) = @field(after, field);
+    if (!std.meta.eql(before, after)) return error.IntentConflict;
+}
+
+/// Rebuild the accepted contract from actual retained inputs during restart.
+/// An unresolved ABORT still owns its inputs until atomic retirement, so it is
+/// checked without treating the terminal decision as a new preparation request.
+pub fn validatePreparedReadGuardInputs(a: Allocator, store: anytype, expected: prepared_effects.Contract, original: ?read_control.Port) !void {
+    var trace: MutationAdmissionTrace = .{};
+    validatePreparedReadGuardInputsInner(a, store, expected, trace.bind(original)) catch |cause| return trace.failure orelse cause;
+    if (trace.failure) |cause| return cause;
+}
+fn validatePreparedReadGuardInputsInner(a: Allocator, store: anytype, expected: prepared_effects.Contract, control: ?read_control.Port) !void {
+    if (control) |owner| try owner.checkpoint();
+    var manager = try TxnManager.init(a, store);
+    defer manager.deinit();
+    var actual = try manager.captureGuardedIntentsInner(a, expected.txn_id, expected.catalog_digest, expected.mode, control, true);
+    defer actual.deinit();
+    if (!std.meta.eql(expected, actual.contract)) return error.PreparedEffectsMismatch;
+    // A manifest/member index is an accelerator, not authority to hide raw
+    // imported intent rows. Compare its complete key set with the physical view.
+    var read = if (control) |owner| try store.beginReadTxnWithAdmission(.retain, owner) else try store.beginReadTxn();
+    defer read.abort();
+    var cursor = if (control) |owner| try read.openPhysicalCursorWithAdmission(owner) else try read.openPhysicalCursorAdapter();
+    defer cursor.close();
+    cursor.setKeysOnly();
+    var prefix: [intents_prefix.len + 17]u8 = undefined;
+    @memcpy(prefix[0 .. prefix.len - 1], &makeSidecarKey(intents_prefix, expected.txn_id));
+    prefix[prefix.len - 1] = ':';
+    var next = if (control) |owner| try cursor.seekAtOrAfterWithAdmission(&prefix, owner) else try cursor.seekAtOrAfter(&prefix);
+    var index: usize = 0;
+    const entries = actual.batch.owned_entries.?;
+    const intent_admission = @import("transaction_intent_admission.zig");
+    while (next) |row| : (next = if (control) |owner| try cursor.nextWithAdmission(owner) else try cursor.next()) {
+        if (!try intent_admission.hasPrefix(row.key, &prefix, control)) break;
+        if (index == entries.len or !try intent_admission.equalBytes(row.key, entries[index].key, control)) return error.PreparedEffectsMismatch;
+        index += 1;
+    }
+    if (index != entries.len) return error.PreparedEffectsMismatch;
+    for (entries) |entry| {
+        if (control) |owner| try owner.checkpoint();
+        const logical = entry.key[prefix.len..];
+        const selected = try manager.makeIntentLockKeyWithAdmission(logical, control);
+        defer a.free(selected);
+        const owner = try read.get(selected);
+        if (!std.mem.eql(u8, owner, &expected.txn_id)) return error.PreparedEffectsMismatch;
+    }
+    if (control) |owner| try owner.checkpoint();
 }
 
 fn decodeRecord(raw: []const u8) !TxnRecord {

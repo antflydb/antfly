@@ -22265,3 +22265,56 @@ migration/peer eligibility, normal required PREPARE drivers and the broader
 scheduler/session/tenant/whole-node/remote rollout remain open. The full goal
 remains active; strong required providers remain disabled. Full Linux
 qualification remains waived, and cross-engine performance is unproven.
+
+### Prepared input integrity behind semantic guards (2026-10-21)
+
+Semantic guards now preserve the actual input metadata behind their accepted
+digest: intent rows and lock ownership, intent manifests/members/admission,
+shared-read members/admission and schema leases. Exact byte retries remain
+legal. A different owner can still prepare independently. Both previous and
+candidate lock owners are checked, so a new lock cannot impersonate an already
+guarded owner. Fixed owner framing handles binary logical keys ending in another
+transaction ID. All five native mutation paths retain the first rejection;
+ignoring it cannot turn a later commit into success. Typed atomic retirement
+releases only the matching owner's input protection.
+
+Transaction records may advance decision/completion fields while preserving
+birth identity, preparation binding and recovery role. This is preservation of
+an established identity, not authentication of a global decision. Participant
+acknowledgement indexes remain outside the input fence: the real transaction API
+can acknowledge a peer idempotently while its local record remains pending and
+its read predicates and input locks remain protected.
+
+Guard admission and both startup audits now recompute the contract from retained
+intent bytes, transaction birth identity/revision and the schema lease. They
+independently compare the manifest's complete intent key set with a bounded
+physical-prefix cursor and verify every corresponding lock owner. A valid
+manifest cannot conceal an imported orphan intent. Registration rejects corrupt
+inputs before installing protection, rather than accepting a matching revision
+alone. Original admission checks govern hashing, key comparison and cursor work;
+all original NotFound/OOM/deadline failures propagate without publication.
+An unresolved ABORT can reopen with its intact inputs and retire them normally.
+
+Evidence is `prepared-input-guard-v3.json/log` plus
+`prepared-input-guard-v3-production-equivalence.json` in the cumulative receipts.
+V3 passes all four native commands, 60/60 build steps and 111 executions (60 DB
+and 43/1/7 error contracts), with unchanged source hashes and no skips, failures
+or leaks. V2 separately passes the 114 transaction/memory, 106 prepared-effects
+and 89 DocStore cases. Its aggregate build failed only on a DB fixture key-pointer
+typing error. The final change after V2 is confined to the semantic DB test
+fixture/tests: all 5,492 other input hashes, and that file's production prefix
+and suffix, are identical. Those 309 successful cases therefore qualify the
+unchanged production implementation; V3 executes the corrected/expanded DB
+cases. This gives 420 qualified case executions without repeating the unchanged
+transaction checkpoint sweep. V1 also exposed fixture key-pointer typing; its
+partial passes are not counted. Format, pinned generated-error and diff checks
+pass.
+
+The stronger fence adds no stored format, owner layout, reader floor or default
+activation change. It does not certify arbitrary raw concurrent writers, whole
+restore/migration/peer eligibility or complete live authority. Pure physical
+assembly before the global vote, progress-safe counter dependencies/deltas,
+executable recovery resources, derived-log quota, DB/execution lifetimes, normal
+required PREPARE orchestration and broader scheduler/session/tenant/whole-node/
+remote rollout remain open. The full goal remains active and strong required
+providers remain disabled. Full Linux qualification remains waived.

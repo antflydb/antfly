@@ -146843,6 +146843,9 @@ const SemanticReadGuardFixture = struct {
         try sealOwnerWithExtraRead(db, membership, owner_id, null);
     }
     fn sealOwnerWithExtraRead(db: *DB, membership: bool, owner_id: transactions_mod.TxnId, extra: ?[]const u8) !void {
+        try sealOwnerWithCohort(db, membership, owner_id, extra, &.{});
+    }
+    fn sealOwnerWithCohort(db: *DB, membership: bool, owner_id: transactions_mod.TxnId, extra: ?[]const u8, participants: []const []const u8) !void {
         const a = std.testing.allocator;
         const reads = @import("prepared_read_set.zig");
         const effects = @import("prepared_transaction_effects.zig");
@@ -146851,7 +146854,7 @@ const SemanticReadGuardFixture = struct {
         defer db.core.unlockApply();
         try doc_identity.writeNamespaceToStore(db.core.store, db.core.identity_namespace);
         try db.core.index_manager.aggregateAuthoritativeReaderVersion(db.core.store, @import("catalog/reader_versions.zig").prepared_read_guards_reader_version);
-        _ = try db.core.beginTransactionRequiringPreparedEffectsWithBinding(owner_id, 1, 1, &.{}, false, true, .{ .mode = .deferred }, binding, .{}, null);
+        _ = try db.core.beginTransactionRequiringPreparedEffectsWithBinding(owner_id, 1, 1, participants, false, true, .{ .mode = .deferred }, binding, .{}, null);
         if (db.core.store.get(a, point)) |existing| {
             a.free(existing);
         } else |cause| {
@@ -147015,12 +147018,176 @@ test "db prepared transaction effects required semantic registry excludes all na
     try std.testing.expectEqual(@as(u64, 0), (try @import("../publication_backlog.zig").load(&read)).?.bytes);
 }
 
+test "db prepared transaction effects required semantic registry admission validates actual inputs and original controls" {
+    const a = std.testing.allocator;
+    const F = SemanticReadGuardFixture;
+    const admission = @import("../../common/read_admission.zig");
+    var directory = try TestDirectory.init("semantic-read-registry-input-admission");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), F.options);
+    defer db.close();
+    try F.seal(&db, false);
+    const selected = "\x00\x00__txn_intents__:" ++ F.id ++ ":result";
+    const original = try db.core.store.get(a, selected);
+    defer a.free(original);
+    original[original.len - 1] ^= 1;
+    try db.core.store.put(selected, original);
+    try std.testing.expectError(error.PreparedEffectsMismatch, F.register(&db));
+    try std.testing.expectError(error.NotFound, db.core.store.get(a, &@import("../prepared_read_guards.zig").key(F.id)));
+    original[original.len - 1] ^= 1;
+    try db.core.store.put(selected, original);
+    const raw = try db.core.store.get(a, &transactions_mod.makePreparedEffectsKey(F.id));
+    defer a.free(raw);
+    const expected = (try @import("prepared_transaction_effects.zig").inspect(raw, null)).contract;
+    const Checks = struct {
+        calls: usize = 0,
+        stop: usize = std.math.maxInt(usize),
+        cause: anyerror = error.NotFound,
+        fn check(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == self.stop) return self.cause;
+        }
+        fn run(self: *@This(), database: *DB, contract: @import("prepared_transaction_effects.zig").Contract) !void {
+            var payload: admission.Payload = .{ .ptr = self, .vtable = &.{ .checkpoint = check } };
+            try transactions_mod.validatePreparedReadGuardInputs(std.testing.allocator, database.core.store, contract, admission.Port.init(&payload));
+        }
+    };
+    var baseline: Checks = .{};
+    try baseline.run(&db, expected);
+    for ([_]anyerror{ error.NotFound, error.OutOfMemory, error.DeadlineExceeded }) |cause| for (1..baseline.calls + 1) |stop| {
+        var checks: Checks = .{ .stop = stop, .cause = cause };
+        try std.testing.expectError(cause, checks.run(&db, expected));
+    };
+    try F.register(&db);
+    try F.resolve(&db, .aborted);
+}
+
+test "db prepared transaction effects required semantic registry preserves real participant acknowledgement progress" {
+    const a = std.testing.allocator;
+    const F = SemanticReadGuardFixture;
+    var directory = try TestDirectory.init("semantic-read-registry-cohort-ack");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), F.options);
+    defer db.close();
+    try F.sealOwnerWithCohort(&db, false, F.id, null, &.{"peer"});
+    try F.register(&db);
+    {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        var manager = try db.core.initTxnManager();
+        defer manager.deinit();
+        try manager.markParticipantResolved(F.id, "peer");
+        try manager.markParticipantResolved(F.id, "peer");
+        const remaining = try manager.getUnresolvedParticipants(a, F.id);
+        defer transactions_mod.freeParticipantList(a, remaining);
+        try std.testing.expectEqual(@as(usize, 0), remaining.len);
+        try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try manager.getTransactionStatus(F.id));
+    }
+    try std.testing.expectError(error.IntentConflict, db.core.store.delete("\x00\x00__txn_intent_locks__:result"));
+    try std.testing.expectError(error.IntentConflict, db.core.store.put(F.point, "still-protected"));
+    try F.resolve(&db, .aborted);
+    try db.core.store.put(F.point, "after-retirement");
+}
+
+test "db prepared transaction effects required semantic registry preserves actual input bytes and locks through every native writer" {
+    const a = std.testing.allocator;
+    const F = SemanticReadGuardFixture;
+    var directory = try TestDirectory.init("semantic-read-registry-input-mutations");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), F.options);
+    defer db.close();
+    try F.seal(&db, false);
+    try F.register(&db);
+    const selected_keys = [_][]const u8{
+        ("\x00\x00__txn_intents__:" ++ F.id ++ ":result"),
+        ("\x00\x00__txn_intent_members__:" ++ F.id ++ ":result"),
+        ("\x00\x00__txn_intent_keys__:" ++ F.id),
+        ("\x00\x00__txn_intent_admission__:" ++ F.id),
+        ("\x00\x00__txn_read_members__:" ++ F.id ++ "read"),
+        ("\x00\x00__txn_read_admission__:" ++ F.id),
+        ("\x00\x00__txn_schema_leases__:" ++ F.id),
+        "\x00\x00__txn_intent_locks__:result",
+    };
+    for (selected_keys) |selected| {
+        const before: ?[]u8 = db.core.store.get(a, selected) catch |cause| if (cause == error.NotFound) null else return cause;
+        defer if (before) |bytes| a.free(bytes);
+        if (before) |bytes| try db.core.store.put(selected, bytes);
+        for (0..5) |path| {
+            if ((path == 1 or path == 3) and before == null) continue;
+            if (path < 2) {
+                var txn = try db.core.store.beginWriteTxn();
+                defer txn.abort();
+                if (path == 0)
+                    try std.testing.expectError(error.IntentConflict, txn.put(selected, "tampered"))
+                else
+                    try std.testing.expectError(error.IntentConflict, txn.delete(selected));
+                try std.testing.expectError(error.IntentConflict, txn.commit());
+                try std.testing.expectError(error.IntentConflict, txn.commit());
+            } else {
+                var batch = try db.core.store.beginWriteBatch();
+                defer batch.abort();
+                switch (path) {
+                    2 => try std.testing.expectError(error.IntentConflict, batch.asTxn().put(selected, "tampered")),
+                    3 => try std.testing.expectError(error.IntentConflict, batch.asTxn().delete(selected)),
+                    4 => try std.testing.expectError(error.IntentConflict, batch.asTxn().appendPut(selected, "tampered")),
+                    else => unreachable,
+                }
+                try std.testing.expectError(error.IntentConflict, batch.commit());
+                try std.testing.expectError(error.IntentConflict, batch.commit());
+            }
+        }
+    }
+    // Both the old lock owner and a new candidate owner must be protected.
+    try std.testing.expectError(error.IntentConflict, db.core.store.put("\x00\x00__txn_intent_locks__:other", &F.id));
+    const record_key = transactions_mod.records_prefix ++ F.id;
+    const record = try db.core.store.get(a, record_key);
+    defer a.free(record);
+    record[1] ^= 1;
+    try std.testing.expectError(error.IntentConflict, db.core.store.put(record_key, record));
+    record[1] ^= 1;
+    try db.core.store.put(record_key, record);
+    // Other owners can still prepare while this owner retains its protection.
+    const other: types.TxnId = @splat(194);
+    try F.sealOwner(&db, false, other);
+    try F.registerOwner(&db, other);
+    try F.resolve(&db, .aborted);
+    try std.testing.expectError(error.IntentConflict, db.core.store.delete("\x00\x00__txn_intent_locks__:second-result"));
+    try F.resolveOwner(&db, .aborted, other);
+}
+
+test "db prepared transaction effects required semantic registry permits an unresolved decision and verifies its inputs after restart" {
+    const a = std.testing.allocator;
+    const F = SemanticReadGuardFixture;
+    var directory = try TestDirectory.init("semantic-read-registry-decision-inputs");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), F.options);
+    var live = true;
+    defer if (live) db.close();
+    try F.seal(&db, false);
+    try F.register(&db);
+    const selected = transactions_mod.records_prefix ++ F.id;
+    const record = try db.core.store.get(a, selected);
+    defer a.free(record);
+    // This exercises identity-preserving storage, not decision authentication.
+    // The real participant driver must supply its established abort authority.
+    record[0] = @backingInt(transactions_mod.TxnStatus.aborted);
+    try db.core.store.put(selected, record);
+    try std.testing.expectError(error.IntentConflict, db.core.store.put(F.point, "still-protected"));
+    db.close();
+    live = false;
+    db = try DB.open(a, directory.path(), F.options);
+    live = true;
+    try F.resolve(&db, .aborted);
+    try db.core.store.put(F.point, "after-retirement");
+}
+
 test "db prepared transaction effects required semantic registry audits imported recovery state before writable or readonly open" {
     const a = std.testing.allocator;
     const F = SemanticReadGuardFixture;
     const guards = @import("../prepared_read_guards.zig");
     const versions = @import("catalog/reader_versions.zig");
-    for (0..9) |damage| {
+    for (0..14) |damage| {
         var directory = try TestDirectory.init("semantic-read-registry-import-audit");
         defer directory.cleanup();
         var db = try DB.open(a, directory.path(), F.options);
@@ -147059,6 +147226,29 @@ test "db prepared transaction effects required semantic registry audits imported
                     try raw.put(guards.state_key, &state.encode());
                 },
                 8 => try raw.put(versions.replacement_reader_base_key, "15"),
+                9 => {
+                    const selected = "\x00\x00__txn_intents__:" ++ F.id ++ ":result";
+                    const original = try db.core.store.get(a, selected);
+                    defer a.free(original);
+                    original[original.len - 1] ^= 1;
+                    try raw.put(selected, original);
+                },
+                10 => try raw.delete("\x00\x00__txn_intent_locks__:result"),
+                11 => {
+                    const selected = "\x00\x00__txn_intents__:" ++ F.id ++ ":result";
+                    const original = try db.core.store.get(a, selected);
+                    defer a.free(original);
+                    const orphan = "\x00\x00__txn_intents__:" ++ F.id ++ ":orphan";
+                    try raw.put(orphan, original);
+                },
+                12 => {
+                    const selected = transactions_mod.records_prefix ++ F.id;
+                    const original = try db.core.store.get(a, selected);
+                    defer a.free(original);
+                    original[1] ^= 1;
+                    try raw.put(selected, original);
+                },
+                13 => try raw.put("\x00\x00__txn_intent_locks__:result", &@as([16]u8, @splat(194))),
                 else => unreachable,
             }
             try raw.commit();
@@ -147068,8 +147258,8 @@ test "db prepared transaction effects required semantic registry audits imported
         const expected: anyerror = switch (damage) {
             0, 1, 2, 7 => error.InvalidTxnRecord,
             3, 8 => error.PreparedTransactionProtocolDisabled,
-            4 => error.NotFound,
-            5 => error.PreparedEffectsMismatch,
+            4, 10 => error.NotFound,
+            5, 9, 11, 12, 13 => error.PreparedEffectsMismatch,
             6 => error.PreparedReadSetChanged,
             else => unreachable,
         };

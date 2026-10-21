@@ -225,6 +225,7 @@ fn validateRecovery(a: A, store: anytype, defer_payload: bool) !void {
     for (capture.records.items) |*record| {
         try bundleMatches(&txn, record, null);
         const inspection = try effects.inspect(try txn.get(&transactions.makePreparedEffectsKey(record.receipt.txn_id)), null);
+        try transactions.validatePreparedReadGuardInputs(a, store, inspection.contract, null);
         var observed = try reads.Durable.decode(a, try txn.get(&transactions.makePreparedReadObservationsKey(record.receipt.txn_id)), .{
             .contract = inspection.contract,
             .participant = record.receipt.binding,
@@ -508,7 +509,8 @@ pub const Capture = struct {
         const metadata = std.mem.startsWith(u8, selected, prefix) or std.mem.eql(u8, selected, state_key);
         const global = globalKey(selected);
         const bundle = bundleKey(selected);
-        if (!metadata and !dataKey(selected) and !global and !bundle) return;
+        const input = transactions.isPreparedInputKey(selected);
+        if (!metadata and !dataKey(selected) and !global and !bundle and !input) return;
         if (metadata) {
             const actor = self.installing orelse self.retiring orelse return error.InvalidTxnRecord;
             if (!std.mem.eql(u8, selected, state_key) and !std.mem.eql(u8, selected, &key(actor))) return error.InvalidTxnRecord;
@@ -516,6 +518,20 @@ pub const Capture = struct {
         try self.ensureLoaded(a, txn, debt, gate, null);
         if (metadata) {
             self.metadata_touched = true;
+            return;
+        }
+        if (input and self.state.records != 0) {
+            const previous: ?[]const u8 = txn.get(selected) catch |err| if (err == error.NotFound) null else return err;
+            if (previous == null and candidate == null) return;
+            if (previous) |before| if (candidate) |after| if (std.mem.eql(u8, before, after)) return;
+            switch ((try transactions.preparedInputKey(selected)).?) {
+                .owner => |id| try self.requireMutableInput(id),
+                .lock => for ([_]?[]const u8{ previous, candidate }) |raw| {
+                    const id = raw orelse continue;
+                    if (id.len != 16) return error.InvalidTxnRecord;
+                    try self.requireMutableInput(id[0..16].*);
+                },
+            }
             return;
         }
         if (global) {
@@ -536,7 +552,10 @@ pub const Capture = struct {
                 const id = record.receipt.txn_id;
                 if (std.mem.endsWith(u8, selected, &id)) {
                     if (self.retiring) |actor| if (std.meta.eql(actor, id)) return;
-                    if (std.mem.startsWith(u8, selected, transactions.records_prefix)) return;
+                    if (std.mem.startsWith(u8, selected, transactions.records_prefix)) {
+                        try transactions.validatePreparedReadGuardTransition(try txn.get(selected), candidate);
+                        return;
+                    }
                     return error.IntentConflict;
                 }
             };
@@ -551,6 +570,10 @@ pub const Capture = struct {
             errdefer a.free(owned);
             try self.mutations.put(a, owned, try txn.contains(selected));
         }
+    }
+    fn requireMutableInput(self: *const Capture, id: [16]u8) !void {
+        if (self.retiring) |actor| if (std.meta.eql(actor, id)) return;
+        for (self.records.items) |record| if (std.meta.eql(record.receipt.txn_id, id)) return error.IntentConflict;
     }
     /// The caller acquires the capture's gate before compiling observations.
     /// Admission is separate from data mutations; only owned bytes persist.

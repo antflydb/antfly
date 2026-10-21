@@ -2532,6 +2532,10 @@ pub const DBCore = struct {
         try batch.setReadGuardScope(.{ .txn_id = txn_id, .phase = .admission });
         try batch.prepareReadGuardRegistration(control);
         try @import("../prepared_read_guards.zig").requireFloors(batch.asTxn());
+        const effects = @import("prepared_transaction_effects.zig");
+        const frame = try batch.asTxn().get(&transactions_mod.makePreparedEffectsKey(txn_id));
+        const inspection = try effects.inspect(frame, control);
+        try transactions_mod.validatePreparedReadGuardInputs(self.alloc, self.store, inspection.contract, control);
         var compiled = try self.compilePreparedReadFootprint(self.alloc, txn_id, binding, control);
         defer compiled.deinit();
         const catalog = try self.preparedEffectsCatalogDigest(control);
