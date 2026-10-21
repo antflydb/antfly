@@ -1593,6 +1593,24 @@ test "table contract rejects malformed multi-source members" {
     }
 }
 
+test "table contract retains pinned embedding identity through table and index admission and responses" {
+    const a = std.testing.allocator;
+    const identity = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const index = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"google/embeddinggemma-2\",\"api_url\":\"http://localhost:8082\",\"model_identity\":\"" ++ identity ++ "\"}}";
+    var table = try parseCreateTableRequest(a, "{\"indexes\":{\"vectors\":" ++ index ++ "}}");
+    defer table.deinit(a);
+    var catalog = try std.json.parseFromSlice(std.json.Value, a, table.indexes_json.?, .{});
+    defer catalog.deinit();
+    try std.testing.expectEqualStrings(identity, catalog.value.object.get("vectors").?.object.get("embedder").?.object.get("model_identity").?.string);
+    const normalized = try parseCreateIndexRequest(a, "vectors", index);
+    defer a.free(normalized);
+    const response = try indexes_api.encodeCreatedIndexConfig(a, "vectors", normalized);
+    defer a.free(response);
+    var created = try std.json.parseFromSlice(std.json.Value, a, response, .{});
+    defer created.deinit();
+    try std.testing.expectEqualStrings(identity, created.value.object.get("embedder").?.object.get("model_identity").?.string);
+}
+
 test "table contract public response omits unknown nested provider fields" {
     const config_json = try parseCreateIndexRequest(
         std.testing.allocator,

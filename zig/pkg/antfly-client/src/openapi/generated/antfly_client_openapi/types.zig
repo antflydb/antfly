@@ -8015,6 +8015,8 @@ pub const CreatedProviderConfig = struct {
     provider: []const u8,
     /// Configured provider model when applicable.
     model: ?[]const u8 = null,
+    /// Pinned immutable embedding asset and recipe identity.
+    model_identity: ?[]const u8 = null,
     models: ?[]const []const u8 = null,
     project_id: ?[]const u8 = null,
     location: ?[]const u8 = null,
@@ -8039,6 +8041,7 @@ pub const CreatedProviderConfig = struct {
     pub const openApiFieldMetadata = .{
         .{ "provider", "provider", false },
         .{ "model", "model", true },
+        .{ "model_identity", "model_identity", true },
         .{ "models", "models", true },
         .{ "project_id", "project_id", true },
         .{ "location", "location", true },
@@ -8074,6 +8077,10 @@ pub const CreatedProviderConfig = struct {
         try jw.write(self.provider);
         if (self.model) |value| {
             try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.model_identity) |value| {
+            try jw.objectField("model_identity");
             try jw.write(value);
         }
         if (self.models) |value| {

@@ -4184,6 +4184,10 @@ pub const RepairCapacityCheck = struct {
 };
 
 pub const ArtifactRepairRunOptions = struct {
+    /// Lite's live coordinator may enqueue a bounded source page or retire a
+    /// proven canonical initial build. It must never construct/activate a
+    /// shadow while holding the short connection publication fence.
+    source_replay_only: bool = false,
     /// Absolute local catalog-admission deadline in the source routing clock.
     /// Background admission must not consume the quantum waiting for metadata.
     admission_deadline_ns: ?u64 = null,
