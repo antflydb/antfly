@@ -2488,6 +2488,37 @@ pub const DBCore = struct {
         try manager.sealPreparedEffectsWithReadObservations(txn_id, frame, catalog, mode, binding, .{ .namespace = namespace, .frame = raw, .replay_request = replay_request }, .{}, control);
     }
 
+    pub const PreparedReadFootprint = struct {
+        namespace: [24]u8,
+        receipt: @import("prepared_transaction_effects.zig").BoundReceipt,
+        predicates: @import("prepared_read_set.zig").Footprint,
+        pub fn deinit(self: *@This()) void {
+            self.predicates.deinit();
+            self.* = undefined;
+        }
+    };
+
+    /// Caller retains apply/catalog/route ownership and revalidates this receipt
+    /// at any later admission. This returns owned predicates, not a lease or vote.
+    /// Raw stopping rows can overlap control metadata; classify/refine those
+    /// dependencies before granting exclusion so mandatory progress can drain.
+    pub fn compilePreparedReadFootprint(self: *DBCore, alloc: Allocator, txn_id: transactions_mod.TxnId, binding: @import("prepared_transaction_effects.zig").Binding, original: ?@import("../../common/read_admission.zig").Port) !PreparedReadFootprint {
+        var trace: transactions_mod.MutationAdmissionTrace = .{};
+        return self.compilePreparedReadFootprintInner(alloc, txn_id, binding, trace.bind(original)) catch |err| return trace.failure orelse err;
+    }
+
+    fn compilePreparedReadFootprintInner(self: *DBCore, alloc: Allocator, txn_id: transactions_mod.TxnId, binding: @import("prepared_transaction_effects.zig").Binding, control: ?@import("../../common/read_admission.zig").Port) !PreparedReadFootprint {
+        try self.requirePreparedTransactionProtocol(control);
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        var namespace: [24]u8 = undefined;
+        @import("doc_identity.zig").encodeNamespace(&namespace, self.identity_namespace);
+        const receipt = try manager.getBoundPreparedSealReceipt(txn_id, binding, control);
+        var observed = (try manager.loadPreparedReadObservations(alloc, txn_id, namespace, binding, control)) orelse return error.PreparedEffectsRequired;
+        defer observed.deinit();
+        return .{ .namespace = namespace, .receipt = receipt, .predicates = try @import("prepared_read_set.zig").Footprint.compile(alloc, &observed, self.store, control) };
+    }
+
     pub fn resolveTransactionIntentsWithAcceptedEffects(self: *DBCore, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, commit_version: u64, extra_batch: transactions_mod.ResolutionExtraBatch, accepted: ?*const transactions_mod.PreparedEffects, control: ?@import("../../common/read_admission.zig").Port) !transactions_mod.ResolutionOutcome {
         var manager = try self.initTxnManager();
         defer manager.deinit();

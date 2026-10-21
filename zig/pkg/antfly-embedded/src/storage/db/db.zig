@@ -146675,8 +146675,16 @@ test "db prepared transaction effects required observation seal validates before
         var recovered = (try manager.loadPreparedReadObservations(a, id, namespace, binding, null)).?;
         defer recovered.deinit();
         try recovered.validate(db.core.store, null);
+        var compiled = try db.core.compilePreparedReadFootprint(a, id, binding, null);
+        defer compiled.deinit();
+        try std.testing.expectEqualDeep(namespace, compiled.namespace);
+        try std.testing.expectEqualDeep(binding, compiled.receipt.binding);
+        try std.testing.expectEqualDeep(try manager.getBoundPreparedSealReceipt(id, binding, null), compiled.receipt);
+        try std.testing.expect(try compiled.predicates.conflicts("read-input", null));
+        try std.testing.expect(!try compiled.predicates.conflicts("\x00\x00__txn_participant_ack__:peer", null));
         try db.core.store.put("read-input", "later");
         try std.testing.expectError(error.PreparedReadSetChanged, recovered.validate(db.core.store, null));
+        try std.testing.expectError(error.PreparedReadSetChanged, db.core.compilePreparedReadFootprint(a, id, binding, null));
         // Exclusion is not installed yet; abort must retire the observation
         // bytes even when their optimistic predicates no longer hold.
         try manager.resolveIntents(id, .aborted, 2);

@@ -6566,3 +6566,27 @@ dependency capture/pure assembly, executable recovery and derived-log funding,
 lifetimes, import/restore/raw-writer/restart/peer eligibility and the wider fair/
 default/session/tenant/remote rollout remain incomplete. Strong defaults off;
 full goal active; full Linux qualification waived; no push.
+
+### Read-conflict footprint compilation (2026-10-21)
+
+Owned normalized point/gap/boundary intervals now compile from validated reads
+on one immutable snapshot, with controlled comparisons/sort/binary lookup,
+65,536 descriptor and 64 MiB copied-key limits. LSM declares its exact bound/
+exhaustion semantics; unknown adapters remain conservative and non-snapshot
+readers are rejected. Logical external payloads and physical references remain
+distinct. Native57/owner115 fence the capability; ATROv1/reader14 are unchanged.
+Core recovery returns owned predicates with copied accepted receipt/namespace,
+and the native-reopen case rejects stale recompilation.
+
+read-footprint-compiler-v4 passes all four commands, 70/70 steps, 185 fresh
+cases (effects87/DB47/contracts43/1/7), 5491 unchanged source hashes, no skips/
+failures/leaks. See WORKLOAD_POOLING_IMPLEMENTATION.md's matching entry for
+scope, finite write-universe checks, controls, allocations and intermediate
+correction. This does not install writer exclusion or PREPARE authority.
+Classify/refine raw stopping/control dependencies before registering predicates
+so publisher/ACK/control progress remains possible. Atomic registration/recovery,
+writer enforcement and actor-bound retirement, complete live dependency capture/
+pure assembly, executable recovery/derived-log funding, lifetimes, raw/import/
+restore/restart/peer eligibility, normal required PREPARE and broader fair/default/
+session/tenant/remote rollout remain incomplete. Strong defaults off, full goal
+active; full Linux qualification waived; no push.

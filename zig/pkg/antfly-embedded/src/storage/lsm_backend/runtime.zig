@@ -708,6 +708,7 @@ pub fn BoundStore(comptime BackendType: type) type {
 
         pub fn capabilities(_: *@This()) backend_types.Capabilities {
             return .{
+                .semantic_cursor_bounds = true,
                 .ordered_ranges = true,
                 .reverse_ranges = true,
                 .cursors = true,

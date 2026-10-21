@@ -218,6 +218,10 @@ pub const Capabilities = struct {
     /// Owner stages prepared observation bytes and publication-backlog quota in
     /// one commit. This is accounting support, not read-conflict exclusion.
     accounted_prepared_observations: bool = false,
+    /// Snapshot cursors enforce an exclusive upper bound in both directions,
+    /// preserve position when changing it, and keep next/prev at null after
+    /// exhaustion until an explicit seek/first/last. Used to compile read gaps.
+    semantic_cursor_bounds: bool = false,
     ordered_ranges: bool = true,
     reverse_ranges: bool = false,
     cursors: bool = true,

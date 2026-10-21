@@ -21985,3 +21985,61 @@ eligibility and the wider fair/default/session/whole-node/tenant/remote rollout
 remain open. Full goal remains active. No public-consumer/provider-image/full-
 archive requalification; full Linux qualification remains waived. Single
 canonical worktree/branch/PR, normal hooks, no push.
+
+### Owned semantic read footprints (2026-10-21)
+
+prepared_read_set.Footprint.compile now replays/validates captured point reads
+and cursor programs on one immutable primary snapshot, then owns normalized
+key intervals for every observed point, gap and stopping boundary. Inclusive
+and exclusive endpoints, binary/NUL keys, unbounded ends, forward/reverse
+movement, empty/cleared upper bounds and exhausted cursor state are explicit.
+Logical observations resolve payloads through the same snapshot's point reader;
+physical observations fingerprint raw cursor values. No source key buffer,
+cursor, frame, payload session or control pointer survives compilation.
+
+The compiler checks at most 65,536 point/cursor/operation descriptors and copies
+at most 64 MiB of keys; caller allocator ownership and read/payload budgets stay
+separate. It rejects unsealed/poisoned/active programs, malformed operation
+shapes, unordered or non-snapshot readers and changed results. Controlled
+chunk comparisons, bottom-up merge sort and binary conflict lookup propagate
+every original rejection rather than swallowing cancellation in a comparator.
+Empty input needs no allocation or read. Allocation failure unwinds the arena.
+
+Backend semantic_cursor_bounds defaults false. LSM snapshot cursors explicitly
+guarantee exclusive bounds in both directions, unchanged position on bound
+updates and stable null next/prev after exhaustion. Unknown adapters use
+conservative footprints; an optimization hint is never assumed to fence a
+read. Native57/storage-owner115 fence the added capability. Reader14, ATROv1,
+API59/failure67/descriptorv29 and public error IDs remain unchanged.
+
+DBCore.compilePreparedReadFootprint loads the accepted bound observation seal
+for its actual namespace and supplied participant binding, validates reads and
+returns owned predicates plus copied namespace/BoundReceipt. The caller retains
+apply/catalog/route ownership and must revalidate the receipt at later admission.
+The real native-reopen test now exercises this path, checks exact receipt and
+namespace, excludes unrelated ACK keys and rejects recompilation after change.
+
+Six footprint cases cover exact point/NUL framing, forward/reverse boundaries,
+source retirement, first/last/seek/next/prev, bounds and exhaustion, a finite
+19-key binary universe of insert/replace/delete mutations with no missed
+result-changing write, undeclared memory cursor hints, real logical external
+payload resolution versus physical references, descriptor/input/capability
+limits, exhaustive allocations and all original NotFound/OOM/deadline checks.
+Final read-footprint-compiler-v4 has all four native commands exit0, 5491 input
+hashes unchanged, 70/70 steps and 185 fresh executions (effects87, required DB47,
+contracts43/1/7), no skips/failures/leaks. V1 passed the initial 183 cases; V2
+found a fixture const annotation; V3 passed 185 before Core recovery wiring; V4
+is authoritative. No full provider/public-consumer/archive qualification.
+
+This is a conflict-footprint compiler, not writer registration/exclusion or a
+PREPARE grant. Raw transcripts may include unused stopping rows or mandatory
+control metadata: classify/refine those dependencies before admission; never
+freeze publisher/ACK/control progress merely because a raw cursor touched it.
+Next atomically register/recover safe predicates, enforce every writer and bind
+retirement to the owning decision. Live core/cache/policy/table-catalog/opaque
+route capture, complete pure assembly, funded executable recovery RAM/CPU/I/O/
+dependencies and separate derived-log quota, DB/execution lifetimes, raw writer/
+import/restore/restart/peer eligibility, reader14 activation/normal required
+PREPARE and broader fair/default/session/whole-node/tenant/remote rollout remain
+incomplete. Strong defaults off; full goal active. Full Linux qualification
+remains waived. Canonical worktree/branch/PR retained, normal hooks, no push.

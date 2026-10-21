@@ -375,6 +375,10 @@ const Row = struct {
 pub const Kind = enum { seek_after, seek_before, next, prev, first, last, upper_bound, clear_upper_bound };
 const Operation = struct { kind: Kind, argument: []const u8, expected: ?Row };
 const Point = struct { key: []const u8, expected: ?Fingerprint };
+fn validOperationShape(operation: Operation) bool {
+    return !((operation.kind != .seek_after and operation.kind != .seek_before and operation.kind != .upper_bound and operation.argument.len != 0) or
+        ((operation.kind == .upper_bound or operation.kind == .clear_upper_bound) and operation.expected != null));
+}
 
 pub const Cursor = struct {
     allocator: A,
@@ -630,7 +634,7 @@ pub const Durable = struct {
             try writer.int(u8, @intFromBool(cursor.physical_payloads));
             try writer.int(u32, @intCast(cursor.operations.items.len));
             for (cursor.operations.items) |operation| {
-                if ((operation.kind != .seek_after and operation.kind != .seek_before and operation.kind != .upper_bound and operation.argument.len != 0) or ((operation.kind == .upper_bound or operation.kind == .clear_upper_bound) and operation.expected != null)) return error.InvalidArgument;
+                if (!validOperationShape(operation)) return error.InvalidArgument;
                 // Wire tags are explicit and independent of compiler enum tags.
                 try writer.int(u8, switch (operation.kind) {
                     .seek_after => 0,
@@ -768,7 +772,7 @@ pub const Durable = struct {
                 const argument = try reader.slice(alloc);
                 errdefer alloc.free(argument);
                 const row: ?Row = if (try reader.boolean()) .{ .key = try reader.fingerprint(), .value = try reader.fingerprint() } else null;
-                if ((kind != .seek_after and kind != .seek_before and kind != .upper_bound and argument.len != 0) or ((kind == .upper_bound or kind == .clear_upper_bound) and row != null)) return error.InvalidTxnRecord;
+                if (!validOperationShape(.{ .kind = kind, .argument = argument, .expected = row })) return error.InvalidTxnRecord;
                 cursor.operations.appendAssumeCapacity(.{ .kind = kind, .argument = argument, .expected = row });
             }
         }
@@ -776,5 +780,253 @@ pub const Durable = struct {
         try checkpoint(control, null);
         result.sealed = true;
         return result;
+    }
+};
+
+/// Owned over-approximation of writes that can change the captured results.
+/// This is not a lease. The caller must retain its apply/publication authority
+/// through compilation and eventual atomic admission. Raw cursor footprints can
+/// include stopping rows and control metadata; admission must reject or refine
+/// unsafe control dependencies rather than fencing mandatory progress.
+pub const Footprint = struct {
+    arena: std.heap.ArenaAllocator,
+    spans: []const Span,
+    pub const max_predicates = 65_536;
+    pub const max_key_bytes = 64 * 1024 * 1024;
+    pub const Span = struct {
+        lower: []const u8,
+        lower_inclusive: bool,
+        upper: ?[]const u8,
+        upper_inclusive: bool,
+    };
+    pub fn deinit(self: *Footprint) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+    pub fn conflicts(self: *const Footprint, key: []const u8, original: ?admission.Port) !bool {
+        var trace: admission.RejectionTrace = .{};
+        return self.conflictsInner(key, trace.bind(original)) catch |err| return trace.failure orelse err;
+    }
+    fn conflictsInner(self: *const Footprint, key: []const u8, control: ?admission.Port) !bool {
+        try checkpoint(control, null);
+        var lower: usize = 0;
+        var upper = self.spans.len;
+        while (lower < upper) {
+            const mid = lower + (upper - lower) / 2;
+            const span = self.spans[mid];
+            const order = try compare(span.lower, key, control);
+            if (order == .gt or (order == .eq and !span.lower_inclusive)) upper = mid else lower = mid + 1;
+        }
+        if (lower == 0) return false;
+        const span = self.spans[lower - 1];
+        const end = span.upper orelse return true;
+        const order = try compare(key, end, control);
+        return order == .lt or (order == .eq and span.upper_inclusive);
+    }
+    fn compare(left: []const u8, right: []const u8, control: ?admission.Port) !std.math.Order {
+        var offset: usize = 0;
+        const length = @min(left.len, right.len);
+        while (offset < length) {
+            try checkpoint(control, null);
+            const end = offset + @min(@as(usize, 4096), length - offset);
+            const order = std.mem.order(u8, left[offset..end], right[offset..end]);
+            if (order != .eq) return order;
+            offset = end;
+        }
+        try checkpoint(control, null);
+        return std.math.order(left.len, right.len);
+    }
+    const Builder = struct {
+        arena: std.heap.ArenaAllocator,
+        spans: std.ArrayListUnmanaged(Span) = .empty,
+        key_bytes: usize = 0,
+        control: ?admission.Port,
+        fn key(self: *@This(), bytes: []const u8) ![]const u8 {
+            self.key_bytes = std.math.add(usize, self.key_bytes, bytes.len) catch return error.TransactionTooLarge;
+            if (self.key_bytes > max_key_bytes) return error.TransactionTooLarge;
+            return copy(self.arena.allocator(), bytes, self.control, null);
+        }
+        fn add(self: *@This(), lower: []const u8, lower_inclusive: bool, upper: ?[]const u8, upper_inclusive: bool) !void {
+            try checkpoint(self.control, null);
+            if (upper) |end| {
+                const order = try compare(lower, end, self.control);
+                if (order == .gt or (order == .eq and (!lower_inclusive or !upper_inclusive))) return;
+            }
+            if (self.spans.items.len == max_predicates) return error.TransactionTooLarge;
+            try self.spans.append(self.arena.allocator(), .{ .lower = try self.key(lower), .lower_inclusive = lower_inclusive, .upper = if (upper) |end| try self.key(end) else null, .upper_inclusive = upper_inclusive });
+        }
+        fn less(self: *@This(), left: Span, right: Span) !bool {
+            const order = try compare(left.lower, right.lower, self.control);
+            return order == .lt or (order == .eq and left.lower_inclusive and !right.lower_inclusive);
+        }
+        fn normalize(self: *@This()) ![]const Span {
+            const count = self.spans.items.len;
+            if (count == 0) return &.{};
+            // Bottom-up merge sort can stop at every comparison on cancellation.
+            // No comparator swallows a rejection while completing an opaque sort.
+            var source = self.spans.items;
+            var target = try self.arena.allocator().alloc(Span, count);
+            var width: usize = 1;
+            while (width < count) : (width *= 2) {
+                var start: usize = 0;
+                while (start < count) : (start += 2 * width) {
+                    const middle = @min(start + width, count);
+                    const end = @min(start + 2 * width, count);
+                    var left = start;
+                    var right = middle;
+                    for (target[start..end]) |*out| {
+                        try checkpoint(self.control, null);
+                        if (left < middle and (right == end or !try self.less(source[right], source[left]))) {
+                            out.* = source[left];
+                            left += 1;
+                        } else {
+                            out.* = source[right];
+                            right += 1;
+                        }
+                    }
+                }
+                std.mem.swap([]Span, &source, &target);
+            }
+            var used: usize = 0;
+            for (source) |span| {
+                try checkpoint(self.control, null);
+                if (used != 0) {
+                    const previous = &source[used - 1];
+                    const overlap = if (previous.upper) |end| blk: {
+                        const order = try compare(end, span.lower, self.control);
+                        break :blk order == .gt or (order == .eq and (previous.upper_inclusive or span.lower_inclusive));
+                    } else true;
+                    if (overlap) {
+                        if (span.upper == null) {
+                            previous.upper = null;
+                            previous.upper_inclusive = false;
+                        } else if (previous.upper) |end| {
+                            const order = try compare(end, span.upper.?, self.control);
+                            if (order == .lt) {
+                                previous.upper = span.upper;
+                                previous.upper_inclusive = span.upper_inclusive;
+                            } else if (order == .eq) previous.upper_inclusive = previous.upper_inclusive or span.upper_inclusive;
+                        }
+                        continue;
+                    }
+                }
+                source[used] = span;
+                used += 1;
+            }
+            return source[0..used];
+        }
+    };
+
+    /// Replay on one immutable snapshot. Logical payload observations use point
+    /// resolution from that same snapshot; physical keys always come from its
+    /// raw cursor so a payload wrapper cannot hide the underlying cursor bounds.
+    pub fn compile(alloc: A, captured: *const Owned, store: *DocStore, original: ?admission.Port) !Footprint {
+        var trace: admission.RejectionTrace = .{};
+        return compileInner(alloc, captured, store, trace.bind(original)) catch |err| return trace.failure orelse err;
+    }
+    fn compileInner(alloc: A, captured: *const Owned, store: *DocStore, control: ?admission.Port) !Footprint {
+        try checkpoint(control, null);
+        if (!captured.sealed or captured.failure != null or captured.control != null) return error.InvalidArgument;
+        if (captured.points.items.len == 0 and captured.cursors.items.len == 0) return .{ .arena = std.heap.ArenaAllocator.init(alloc), .spans = &.{} };
+        var observations = std.math.add(usize, captured.points.items.len, captured.cursors.items.len) catch return error.TransactionTooLarge;
+        if (observations > max_predicates) return error.TransactionTooLarge;
+        for (captured.cursors.items) |program| {
+            try checkpoint(control, null);
+            if (program.active or program.control != null or program.failure != null) return error.InvalidArgument;
+            observations = std.math.add(usize, observations, program.operations.items.len) catch return error.TransactionTooLarge;
+            if (observations > max_predicates) return error.TransactionTooLarge;
+        }
+        const capabilities = store.runtime_store.capabilities();
+        if (!capabilities.ordered_ranges or capabilities.read_snapshots != .snapshot) return error.Unsupported;
+        var builder: Builder = .{ .arena = std.heap.ArenaAllocator.init(alloc), .control = control };
+        errdefer builder.arena.deinit();
+        var read = if (control) |owner| try store.beginReadTxnWithAdmission(.retain, owner) else try store.beginReadTxn();
+        defer read.abort();
+        for (captured.points.items) |point| {
+            try checkpoint(control, null);
+            const value = read.get(point.key) catch |err| if (err == error.NotFound) null else return err;
+            const actual = if (value) |bytes| try Fingerprint.of(bytes, control, null) else null;
+            if (!std.meta.eql(actual, point.expected)) return error.PreparedReadSetChanged;
+            try builder.add(point.key, true, point.key, true);
+        }
+        for (captured.cursors.items) |program| {
+            if (program.active) return error.InvalidArgument;
+            var cursor = try read.openPhysicalCursorAdapter();
+            defer cursor.close();
+            var position: ?[]const u8 = null;
+            var bound: ?[]const u8 = null;
+            for (program.operations.items) |operation| {
+                try checkpoint(control, null);
+                if (!validOperationShape(operation)) return error.InvalidArgument;
+                if (operation.kind == .upper_bound or operation.kind == .clear_upper_bound) {
+                    cursor.setUpperBound(if (operation.kind == .upper_bound) operation.argument else null);
+                    bound = if (capabilities.semantic_cursor_bounds and operation.kind == .upper_bound) operation.argument else null;
+                    if (!capabilities.semantic_cursor_bounds) position = null;
+                    continue;
+                }
+                const entry = switch (operation.kind) {
+                    .seek_after => try cursor.seekAtOrAfter(operation.argument),
+                    .seek_before => try cursor.seekAtOrBefore(operation.argument),
+                    .next => try cursor.next(),
+                    .prev => try cursor.prev(),
+                    .first => try cursor.first(),
+                    .last => try cursor.last(),
+                    .upper_bound, .clear_upper_bound => unreachable,
+                };
+                // Stabilize the returned key before point payload resolution or
+                // the next cursor move can retire a borrowed source buffer.
+                const selected = if (entry) |row| try builder.key(row.key) else null;
+                const actual: ?Row = if (entry) |row| .{ .key = try Fingerprint.of(selected.?, control, null), .value = try Fingerprint.of(if (program.physical_payloads) row.value else try read.get(selected.?), control, null) } else null;
+                if (!std.meta.eql(actual, operation.expected)) return error.PreparedReadSetChanged;
+                if (selected) |key| {
+                    if (bound) |end| if (try compare(key, end, control) != .lt) return error.InvalidTxnRecord;
+                }
+                switch (operation.kind) {
+                    .seek_after, .first => {
+                        const lower = if (operation.kind == .first) "" else operation.argument;
+                        if (selected) |key| if (try compare(key, lower, control) == .lt) return error.InvalidTxnRecord;
+                        try builder.add(lower, true, selected orelse bound, selected != null);
+                    },
+                    .seek_before, .last => {
+                        var upper = if (operation.kind == .last) bound else @as(?[]const u8, operation.argument);
+                        var inclusive = operation.kind == .seek_before;
+                        if (bound) |end| if (upper == null or try compare(upper.?, end, control) != .lt) {
+                            upper = end;
+                            inclusive = false;
+                        };
+                        if (selected) |key| if (upper) |end| {
+                            const order = try compare(key, end, control);
+                            if (order == .gt or (order == .eq and !inclusive)) return error.InvalidTxnRecord;
+                        };
+                        try builder.add(selected orelse "", true, upper, inclusive);
+                    },
+                    .next => {
+                        if (position) |lower| {
+                            if (selected) |key| if (try compare(key, lower, control) != .gt) return error.InvalidTxnRecord;
+                            try builder.add(lower, false, selected orelse bound, selected != null);
+                        } else if (!capabilities.semantic_cursor_bounds) {
+                            try builder.add("", true, null, false);
+                        } else if (selected != null) return error.InvalidTxnRecord;
+                    },
+                    .prev => {
+                        if (position) |upper_| {
+                            if (selected) |key| if (try compare(key, upper_, control) != .lt) return error.InvalidTxnRecord;
+                            var upper: ?[]const u8 = upper_;
+                            if (bound) |end| if (try compare(end, upper_, control) == .lt) {
+                                upper = end;
+                            };
+                            try builder.add(selected orelse "", true, upper, false);
+                        } else if (!capabilities.semantic_cursor_bounds) {
+                            try builder.add("", true, null, false);
+                        } else if (selected != null) return error.InvalidTxnRecord;
+                    },
+                    .upper_bound, .clear_upper_bound => unreachable,
+                }
+                position = selected;
+            }
+        }
+        const spans = try builder.normalize();
+        try checkpoint(control, null);
+        return .{ .arena = builder.arena, .spans = spans };
     }
 };

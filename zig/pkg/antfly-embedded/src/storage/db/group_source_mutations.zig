@@ -1294,3 +1294,310 @@ test "prepared transaction effects durable read observations freeze the v1 empty
     try std.testing.expectEqual(@as(usize, 0), decoded.points.items.len);
     try std.testing.expectEqual(@as(usize, 0), decoded.cursors.items.len);
 }
+
+const ReadFootprintTest = struct {
+    fn capture(a: A, store: *DocStore, mode: usize) !read_set.Owned {
+        var captured = read_set.Owned.init(a, null);
+        errdefer captured.deinit();
+        const reader = read_set.observe(store, &captured);
+        if (mode == 0) {
+            for ([_][]const u8{ "z", "p/c", "a", "p/a", "missing" }) |key| {
+                const value = reader.get(a, key) catch |err| if (err == error.NotFound) continue else return err;
+                a.free(value);
+            }
+        } else {
+            var cursor = try reader.openCursor(a, mode % 2 == 0);
+            defer cursor.close();
+            switch (mode) {
+                1 => {
+                    try cursor.setUpperBound("p/z");
+                    _ = try cursor.seekAtOrAfter("p/");
+                    _ = try cursor.next();
+                    _ = try cursor.next();
+                },
+                2 => {
+                    try cursor.setUpperBound("p/z");
+                    _ = try cursor.seekAtOrBefore("p/y");
+                    _ = try cursor.prev();
+                },
+                3 => {
+                    try cursor.setUpperBound("");
+                    _ = try cursor.first();
+                    try cursor.setUpperBound(null);
+                    _ = try cursor.first();
+                    _ = try cursor.next();
+                    _ = try cursor.last();
+                    _ = try cursor.prev();
+                    _ = try cursor.prev();
+                    _ = try cursor.prev();
+                    _ = try cursor.prev();
+                },
+                4 => {
+                    _ = try cursor.seekAtOrAfter("zz");
+                    _ = try cursor.next();
+                    _ = try cursor.prev();
+                },
+                else => unreachable,
+            }
+        }
+        try captured.finish();
+        return captured;
+    }
+    fn seed(store: *DocStore) !void {
+        for ([_][]const u8{ "a", "p/a", "p/c", "z" }) |key| try store.put(key, key);
+    }
+    fn changed(captured: *const read_set.Owned, store: *DocStore) !bool {
+        captured.validate(store, null) catch |err| return if (err == error.PreparedReadSetChanged) true else err;
+        return false;
+    }
+};
+
+test "prepared transaction effects read footprints preserve point framing forward reverse gaps and exclude unrelated control keys" {
+    const a = std.testing.allocator;
+    const H = ReadFootprintTest;
+    for (0..5) |mode| {
+        var fixture: ReadCaptureTest = .{};
+        try fixture.init();
+        defer fixture.deinit();
+        try H.seed(&fixture.store);
+        try std.testing.expect(fixture.store.runtime_store.capabilities().semantic_cursor_bounds);
+        var captured = try H.capture(a, &fixture.store, mode);
+        var live = true;
+        defer if (live) captured.deinit();
+        var footprint = try read_set.Footprint.compile(a, &captured, &fixture.store, null);
+        defer footprint.deinit();
+        captured.deinit();
+        live = false;
+        if (mode == 0) {
+            try std.testing.expectEqual(@as(usize, 5), footprint.spans.len);
+            try std.testing.expect(try footprint.conflicts("missing", null));
+            try std.testing.expect(!try footprint.conflicts("missing\x00", null));
+            try std.testing.expect(try footprint.conflicts("p/a", null));
+            try std.testing.expect(!try footprint.conflicts("p/a\x00", null));
+        } else if (mode == 1) {
+            try std.testing.expectEqual(@as(usize, 1), footprint.spans.len);
+            try std.testing.expectEqualStrings("p/", footprint.spans[0].lower);
+            try std.testing.expectEqualStrings("p/z", footprint.spans[0].upper.?);
+            try std.testing.expect(!footprint.spans[0].upper_inclusive);
+            for ([_][]const u8{ "p/", "p/a", "p/a\x00", "p/b", "p/y" }) |key| try std.testing.expect(try footprint.conflicts(key, null));
+            try std.testing.expect(!try footprint.conflicts("p/z", null));
+        } else if (mode == 2) {
+            try std.testing.expectEqual(@as(usize, 1), footprint.spans.len);
+            try std.testing.expectEqualStrings("p/a", footprint.spans[0].lower);
+            try std.testing.expectEqualStrings("p/y", footprint.spans[0].upper.?);
+            try std.testing.expect(footprint.spans[0].upper_inclusive);
+            try std.testing.expect(try footprint.conflicts("p/b", null));
+            try std.testing.expect(try footprint.conflicts("p/y", null));
+            try std.testing.expect(!try footprint.conflicts("p/0", null));
+        } else if (mode == 3) {
+            try std.testing.expect(try footprint.conflicts("", null));
+            try std.testing.expect(try footprint.conflicts("zz", null));
+        } else {
+            // An exhausted LSM cursor's next/prev stay null; they do not create
+            // a new global read dependency outside the failed seek's own gap.
+            try std.testing.expect(!try footprint.conflicts("q", null));
+            try std.testing.expect(try footprint.conflicts("zz", null));
+        }
+        if (mode != 3) try std.testing.expect(!try footprint.conflicts("\x00\x00__txn_participant_ack__:peer", null));
+    }
+}
+
+test "prepared transaction effects read footprints cover every result changing point write in a finite binary key universe" {
+    const a = std.testing.allocator;
+    const H = ReadFootprintTest;
+    const universe = [_][]const u8{ "", "\x00\x00__txn_participant_ack__:peer", "a", "a\x00", "b", "missing", "missing\x00", "p/", "p/0", "p/a", "p/a\x00", "p/b", "p/c", "p/y", "p/z", "q", "z", "z\x00", "zz" };
+    for (0..5) |mode| {
+        var fixture: ReadCaptureTest = .{};
+        try fixture.init();
+        defer fixture.deinit();
+        try H.seed(&fixture.store);
+        var captured = try H.capture(a, &fixture.store, mode);
+        defer captured.deinit();
+        var footprint = try read_set.Footprint.compile(a, &captured, &fixture.store, null);
+        defer footprint.deinit();
+        for (universe) |key| {
+            const old = fixture.store.get(a, key) catch |err| if (err == error.NotFound) null else return err;
+            defer if (old) |bytes| a.free(bytes);
+            const covered = try footprint.conflicts(key, null);
+            try fixture.store.put(key, "different");
+            if (try H.changed(&captured, &fixture.store)) try std.testing.expect(covered);
+            if (old) |bytes| try fixture.store.put(key, bytes) else try fixture.store.delete(key);
+            try captured.validate(&fixture.store, null);
+            if (old) |bytes| {
+                try fixture.store.delete(key);
+                if (try H.changed(&captured, &fixture.store)) try std.testing.expect(covered);
+                try fixture.store.put(key, bytes);
+                try captured.validate(&fixture.store, null);
+            }
+        }
+        try fixture.store.put("p/b", "changed before compilation");
+        if (try H.changed(&captured, &fixture.store)) try std.testing.expectError(error.PreparedReadSetChanged, read_set.Footprint.compile(a, &captured, &fixture.store, null));
+    }
+}
+
+test "prepared transaction effects read footprints conservatively handle backends without declared cursor bounds" {
+    const a = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(a, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    try ReadFootprintTest.seed(&store);
+    try std.testing.expect(!store.runtime_store.capabilities().semantic_cursor_bounds);
+    var captured = try ReadFootprintTest.capture(a, &store, 1);
+    defer captured.deinit();
+    var footprint = try read_set.Footprint.compile(a, &captured, &store, null);
+    defer footprint.deinit();
+    // This backend ignores the upper hint, so the transcript includes z. A
+    // compiler must never assume p/z stops the physical read on this adapter.
+    try std.testing.expect(try footprint.conflicts("p/y", null));
+    try std.testing.expect(try footprint.conflicts("z", null));
+    try std.testing.expect(!try footprint.conflicts("\x00\x00__txn_participant_ack__:peer", null));
+}
+
+test "prepared transaction effects read footprint compilation and lookup unwind original controls and every allocation" {
+    const a = std.testing.allocator;
+    const admission = @import("../../common/read_admission.zig");
+    const Checks = struct {
+        calls: usize = 0,
+        stop: usize = std.math.maxInt(usize),
+        cause: anyerror = error.NotFound,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == self.stop) return self.cause;
+        }
+        fn run(alloc: A, store: *DocStore, source: *const read_set.Owned, checks: ?*@This()) !void {
+            var payload: admission.Payload = .{ .ptr = checks orelse undefined, .vtable = &.{ .checkpoint = check } };
+            const control = if (checks != null) admission.Port.init(&payload) else null;
+            var footprint = try read_set.Footprint.compile(alloc, source, store, control);
+            defer footprint.deinit();
+            try std.testing.expect(try footprint.conflicts("p/a", control));
+            try std.testing.expect(!try footprint.conflicts("p/a\x00", control));
+        }
+    };
+    var fixture: ReadCaptureTest = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    try ReadFootprintTest.seed(&fixture.store);
+    var captured = try ReadFootprintTest.capture(a, &fixture.store, 0);
+    defer captured.deinit();
+    try std.testing.checkAllAllocationFailures(a, Checks.run, .{ &fixture.store, &captured, @as(?*Checks, null) });
+    var baseline: Checks = .{};
+    try Checks.run(a, &fixture.store, &captured, &baseline);
+    for ([_]anyerror{ error.NotFound, error.OutOfMemory, error.DeadlineExceeded }) |cause| for (1..baseline.calls + 1) |stop| {
+        var checks: Checks = .{ .stop = stop, .cause = cause };
+        try std.testing.expectError(cause, Checks.run(a, &fixture.store, &captured, &checks));
+    };
+    var empty = read_set.Owned.init(a, null);
+    defer empty.deinit();
+    try std.testing.expectError(error.InvalidArgument, read_set.Footprint.compile(a, &empty, &fixture.store, null));
+    try empty.finish();
+    var fixed = std.heap.FixedBufferAllocator.init(&.{});
+    var footprint = try read_set.Footprint.compile(fixed.allocator(), &empty, &fixture.store, null);
+    defer footprint.deinit();
+    try std.testing.expect(!try footprint.conflicts("any", null));
+}
+
+test "prepared transaction effects read footprints distinguish logical external payloads from physical reference bytes" {
+    const a = std.testing.allocator;
+    const payloads = @import("../artifact_payload.zig");
+    const codec = @import("enrichment/artifact_codec.zig");
+    const Payload = struct {
+        key: []const u8,
+        bytes: []const u8,
+        reference: payloads.Reference,
+        refs: usize = 0,
+        reads: usize = 0,
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs += 1;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.refs != 0);
+            self.refs -= 1;
+        }
+        fn prepare(_: *anyopaque, _: []const payloads.Prepared) !void {
+            return error.TestUnexpectedPayloadWrite;
+        }
+        fn resolve(raw: *anyopaque, alloc: A, key: []const u8, reference: payloads.Reference) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!std.mem.eql(u8, key, self.key) or !std.meta.eql(reference, self.reference)) return error.TestUnexpectedResult;
+            self.reads += 1;
+            return alloc.dupe(u8, self.bytes);
+        }
+    };
+    var fixture: ReadCaptureTest = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const key = try @import("../internal_keys.zig").embeddingArtifactKeyForDocumentAlloc(a, "doc", "vector");
+    defer a.free(key);
+    const bytes = try codec.encodeDenseEmbeddingAlloc(a, null, &.{ 1, 2, 3 });
+    defer a.free(bytes);
+    var payload: Payload = .{ .key = key, .bytes = bytes, .reference = try payloads.Reference.forArtifact(key, bytes) };
+    const encoded = payload.reference.encode();
+    {
+        // Low-level fixture setup selects a physical reference without invoking
+        // the DocStore payload writer or inventing a second logical postimage.
+        var writer = try fixture.store.runtime_store.beginWrite();
+        errdefer writer.abort();
+        try writer.put(key, &encoded);
+        try writer.commit();
+    }
+    fixture.store.configurePayloadPolicy(.{ .ptr = &payload, .vtable = &.{ .retain = Payload.retain, .release = Payload.release, .prepare = Payload.prepare, .resolve = Payload.resolve } }, false, null);
+    for ([_]bool{ false, true }) |physical| {
+        var captured = read_set.Owned.init(a, null);
+        defer captured.deinit();
+        {
+            var cursor = try read_set.observe(&fixture.store, &captured).openCursor(a, physical);
+            defer cursor.close();
+            const row = (try cursor.seekAtOrAfter(key)).?;
+            try std.testing.expectEqualSlices(u8, if (physical) &encoded else bytes, row.value);
+        }
+        try captured.finish();
+        try std.testing.expectEqual(@as(usize, 0), payload.refs);
+        const before = payload.reads;
+        var footprint = try read_set.Footprint.compile(a, &captured, &fixture.store, null);
+        defer footprint.deinit();
+        try std.testing.expectEqual(before + @as(usize, if (physical) 0 else 1), payload.reads);
+        try std.testing.expectEqual(@as(usize, 0), payload.refs);
+        try std.testing.expectEqual(@as(usize, 1), footprint.spans.len);
+        try std.testing.expect(try footprint.conflicts(key, null));
+    }
+}
+
+test "prepared transaction effects read footprints reject excessive descriptors invalid programs and non snapshot capabilities" {
+    const a = std.testing.allocator;
+    var fixture: ReadCaptureTest = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    var excessive = read_set.Owned.init(a, null);
+    defer excessive.deinit();
+    try excessive.points.ensureTotalCapacityPrecise(a, read_set.Footprint.max_predicates + 1);
+    for (0..read_set.Footprint.max_predicates + 1) |_| excessive.points.appendAssumeCapacity(.{ .key = "", .expected = null });
+    try excessive.finish();
+    var fixed = std.heap.FixedBufferAllocator.init(&.{});
+    try std.testing.expectError(error.TransactionTooLarge, read_set.Footprint.compile(fixed.allocator(), &excessive, &fixture.store, null));
+    var malformed = read_set.Owned.init(a, null);
+    defer malformed.deinit();
+    const program = try malformed.openCursor();
+    try program.record(.upper_bound, "p/z", .{ .key = "p/a", .value = "unexpected bound result" });
+    program.close();
+    try malformed.finish();
+    try std.testing.expectError(error.InvalidArgument, read_set.Footprint.compile(a, &malformed, &fixture.store, null));
+    const Capabilities = struct {
+        fn get(_: *anyopaque) @import("../backend_types.zig").Capabilities {
+            return .{ .read_snapshots = .read_committed };
+        }
+    };
+    const original_vtable = fixture.store.runtime_store.vtable;
+    var vtable = original_vtable.*;
+    vtable.capabilities = Capabilities.get;
+    fixture.store.runtime_store.vtable = &vtable;
+    defer fixture.store.runtime_store.vtable = original_vtable;
+    var observed = read_set.Owned.init(a, null);
+    defer observed.deinit();
+    try observed.recordPoint("absent", null);
+    try observed.finish();
+    try std.testing.expectError(error.Unsupported, read_set.Footprint.compile(a, &observed, &fixture.store, null));
+}

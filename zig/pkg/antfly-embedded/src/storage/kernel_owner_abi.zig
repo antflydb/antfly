@@ -26,7 +26,9 @@ const failure_abi = @import("runtime_failure_abi");
 // Reject prior native observations before interpreting their bound operations.
 // Accepted seals retain and account bound observations through recovery.
 // Reject owners which can silently drop that durable preparation state.
-pub const abi_version: u32 = 114;
+// Snapshot cursor semantics are explicit when compiling read-conflict gaps.
+// Reject older capability layouts before trusting those semantics.
+pub const abi_version: u32 = 115;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

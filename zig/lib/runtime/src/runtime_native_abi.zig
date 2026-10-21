@@ -86,7 +86,9 @@ const builtin = @import("builtin");
 // Reject prior native observations before interpreting their bound operations.
 // Accepted seals retain and account bound observations through recovery.
 // Reject owners which can silently drop that durable preparation state.
-pub const abi_version: u32 = 56;
+// Snapshot cursor semantics are explicit when compiling read-conflict gaps.
+// Reject older capability layouts before trusting those semantics.
+pub const abi_version: u32 = 57;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 
