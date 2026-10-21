@@ -483,6 +483,14 @@ antfly_error_code antfly_db_suppress_resolver_keys_json(antfly_db *db, antfly_sl
 antfly_error_code antfly_db_unsuppress_resolver_key_json(antfly_db *db, antfly_slice resolver_name, antfly_slice request_json, antfly_buffer *out);
 // Empty resolver_name lists active and retired identities with curation state.
 antfly_error_code antfly_db_resolver_reviews_json(antfly_db *db, antfly_slice request_json, antfly_buffer *out);
+/** Persistent entity proposal queue. Create is idempotent on action/key/into.
+ * List takes {state?,action?,cursor?,limit?}; decisions take {accept,options?,
+ * pin_distinct?,actor?,reason?}. Accept commits with per-resolver receipts;
+ * complete=false means retry the same decision to resume the fanout. */
+antfly_error_code antfly_db_propose_curation_json(antfly_db *db, antfly_slice entity_table, antfly_slice request_json, antfly_buffer *out);
+antfly_error_code antfly_db_list_curation_proposals_json(antfly_db *db, antfly_slice entity_table, antfly_slice request_json, antfly_buffer *out);
+antfly_error_code antfly_db_get_curation_proposal_json(antfly_db *db, antfly_slice entity_table, antfly_slice proposal_id, antfly_buffer *out);
+antfly_error_code antfly_db_decide_curation_proposal_json(antfly_db *db, antfly_slice entity_table, antfly_slice proposal_id, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_db_curate_entity_json(antfly_db *db, antfly_slice entity_table, antfly_slice entity_key, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_db_entity_merge_json(antfly_db *db, antfly_slice entity_table, antfly_slice entity_key, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_db_entity_unmerge_json(antfly_db *db, antfly_slice entity_table, antfly_slice entity_key, antfly_slice request_json, antfly_buffer *out);

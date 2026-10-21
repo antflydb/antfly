@@ -18,6 +18,7 @@
 //! atomically commits records, revision history, operation receipt and work.
 const std = @import("std");
 pub const types = @import("types.zig");
+pub const generation_policy = @import("generation.zig");
 const t = types;
 const A = std.mem.Allocator;
 const eql = std.mem.eql;
@@ -1072,6 +1073,7 @@ const Run = struct {
         if (request.to) |target| for (try self.identityMembers(target)) |name| {
             try affected_names.put(self.a, name, {});
         };
+        if (request.reason.len > t.max_text_bytes) return error.InvalidMemoryRequest;
         const plan = try curation.plan(self.a, try self.encode(stored.state), stored.redirects, stored.redirects, .{
             .action = switch (request.action) {
                 .merge => .merge,
@@ -1082,6 +1084,13 @@ const Run = struct {
             .from = if (request.action == .merge or request.action == .unmerge) request.from else null,
             .to = request.to,
             .keys = if (request.action == .suppress or request.action == .unsuppress) &.{request.from} else &.{},
+            .absorbed = switch (request.absorbed) {
+                .reject => .reject,
+                .release => .release,
+                .suppress => .suppress,
+            },
+            .actor = self.service.context.principal,
+            .reason = request.reason,
             .replace = request.replace,
             .pin_distinct = request.pin_distinct,
         });
@@ -1409,7 +1418,7 @@ const Run = struct {
         pending.attempts += 1;
         const generate = self.service.backend.generate orelse return error.MemoryCapabilityUnavailable;
         const generated = generate(self.service.backend.ptr, self.a, self.state.config, sources.items) catch |err| return self.processingFailure(path, &pending, receipt, err);
-        self.publishGenerated(pending, generated) catch |err| return self.processingFailure(path, &pending, receipt, err);
+        self.publishGenerated(pending, generated, sources.items) catch |err| return self.processingFailure(path, &pending, receipt, err);
         pending.phase = .succeeded;
         pending.assertions_ready = true;
         pending.error_code = null;
@@ -1429,22 +1438,10 @@ const Run = struct {
         receipt.assertions_ready = false;
         receipt.error_code = pending.error_code;
     }
-    fn checkGeneratedEvidence(self: *Run, pending: t.Operation, refs: []const t.EvidenceRef) !void {
-        _ = self;
-        for (refs) |ref| {
-            var found = false;
-            for (pending.inputs) |input| if (eql(u8, input, ref.id)) {
-                found = true;
-                break;
-            };
-            if (!found) for (pending.context_inputs) |input| if (eql(u8, input, ref.id)) {
-                found = true;
-                break;
-            };
-            if (!found) return error.MemoryUngroundedOutput;
-        }
-    }
-    fn publishGenerated(self: *Run, pending: t.Operation, generated: t.Generated) !void {
+    fn publishGenerated(self: *Run, pending: t.Operation, generated: t.Generated, sources: []const t.StoredEvidence) !void {
+        // Reconstruct ownership from immutable admitted evidence; never trust
+        // a model's producer label, kind, citations or branch ordering.
+        try (generation_policy.Plan{ .config = self.state.config, .sources = sources }).validatePublication(generated);
         var private_input = false;
         for ([_][]const []const u8{ pending.inputs, pending.context_inputs }) |inputs| for (inputs) |id| {
             const source = (try self.evidence(id)) orelse return error.MemoryForgotten;
@@ -1456,17 +1453,6 @@ const Run = struct {
             for (generated.assertions) |claim| if (claim.visibility == .team) return error.MemoryVisibilityConflict;
             for (generated.entities) |generated_entity| if (generated_entity.visibility == .team) return error.MemoryVisibilityConflict;
         }
-        // Every support branch and entity must be grounded in admitted inputs.
-        for (generated.assertions) |claim| {
-            var current_support = false;
-            for (claim.evidence) |ref| for (pending.inputs) |input| if (eql(u8, ref.id, input)) {
-                current_support = true;
-            };
-            if (!current_support) return error.MemoryUngroundedOutput;
-            try self.checkGeneratedEvidence(pending, claim.evidence);
-            for (claim.support_sets) |support| try self.checkGeneratedEvidence(pending, support.evidence);
-        }
-        for (generated.entities) |value| try self.checkGeneratedEvidence(pending, value.evidence);
         const input_count = pending.inputs.len + pending.context_inputs.len;
         const inputs = try self.a.alloc([]const u8, input_count);
         @memcpy(inputs[0..pending.inputs.len], pending.inputs);

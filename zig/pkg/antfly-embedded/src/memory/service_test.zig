@@ -596,10 +596,16 @@ test "memory alias writes reconcile with canonical facts and suppression is reve
     const recalled = try store.service("alice", true, 500).execute(a, .recall, "", "{\"subject\":\"right\",\"token_budget\":8192}", "");
     try std.testing.expect(std.mem.indexOf(u8, recalled, "Production uses Terraform") != null);
     try std.testing.expect(std.mem.indexOf(u8, recalled, "Production uses Helm") == null);
-    try discard(&store, .curate_entity, "", "{\"action\":\"suppress\",\"from\":\"right\",\"expected_revision\":7}", "suppress", 7);
+    try std.testing.expectError(error.SuppressedResolverRedirectTarget, store.service("alice", true, 7).execute(a, .curate_entity, "", "{\"action\":\"suppress\",\"from\":\"right\",\"expected_revision\":7}", "reject-absorbed"));
+    try discard(&store, .curate_entity, "", "{\"action\":\"suppress\",\"from\":\"right\",\"absorbed\":\"suppress\",\"reason\":\"Hide the entire identity group\",\"expected_revision\":7}", "suppress", 7);
     const hidden = try store.service("alice", true, 500).execute(a, .recall, "", "{\"token_budget\":8192}", "");
     try std.testing.expect(std.mem.indexOf(u8, hidden, "Production uses Terraform") == null);
     try discard(&store, .curate_entity, "", "{\"action\":\"unsuppress\",\"from\":\"right\",\"expected_revision\":8}", "unsuppress", 8);
+    // Suppressing absorbed aliases deliberately removes redirects. Restoring
+    // the target does not silently reattach or unsuppress its old aliases.
+    try std.testing.expectError(error.MemoryEntitySuppressed, store.service("alice", true, 500).execute(a, .resolve_entity, "left", "{}", ""));
+    try discard(&store, .curate_entity, "", "{\"action\":\"unsuppress\",\"from\":\"left\",\"expected_revision\":9}", "unsuppress-left", 9);
+    try discard(&store, .curate_entity, "", "{\"action\":\"merge\",\"from\":\"left\",\"to\":\"right\",\"expected_revision\":10}", "restore-merge", 10);
     const restored = try store.service("alice", true, 500).execute(a, .recall, "", "{\"subject\":\"right\",\"token_budget\":8192}", "");
     try std.testing.expect(std.mem.indexOf(u8, restored, "Production uses Terraform") != null);
 }
@@ -890,7 +896,7 @@ fn contextDerivedOutput(_: *anyopaque, a: A, _: m.types.Config, _: []const m.typ
 }
 fn contextDerivedSetup(store: *Store, expires: bool) !void {
     const a = store.arena.allocator();
-    const config: m.types.Config = .{ .processing = .hybrid, .features = .{ .assertion_distillation = true }, .models = .{ .generator = fake_model } };
+    const config: m.types.Config = .{ .processing = .hybrid, .features = .{ .assertion_distillation = true, .entity_extraction = true }, .models = .{ .generator = fake_model } };
     _ = try modelService(store, 1).execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
     const context: m.types.Evidence = .{ .id = "context", .source_id = "private-note", .source_version = "1", .text = "Private context secret", .expires_at = if (expires) 50 else null };
     _ = try store.service("context-owner", false, 2).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{context} }, .{}), "context");
@@ -1960,4 +1966,91 @@ test "memory external producer ownership covers every support branch and ingesti
             }
         }
     }
+}
+
+fn ownershipOutput(ptr: *anyopaque, a: A, _: m.types.Config, _: []const m.types.StoredEvidence) !m.types.Generated {
+    const store: *Store = @ptrCast(@alignCast(ptr));
+    if (store.failures == 7) {
+        const entities = try a.alloc(m.types.Entity, 1);
+        entities[0] = .{ .id = "enriched", .name = "External entity", .evidence = &.{.{ .id = "external" }} };
+        return .{ .entities = entities };
+    }
+    const claims = try a.alloc(m.types.Assertion, 1);
+    claims[0] = .{ .id = "generated", .subject = "production", .predicate = "guidance", .value = "Helm", .statement = "Generated guidance", .evidence = &.{.{ .id = "e1" }} };
+    switch (store.failures) {
+        0 => claims[0].evidence = &.{.{ .id = "external" }},
+        1 => claims[0].support_sets = &.{.{ .evidence = &.{.{ .id = "external" }} }},
+        2 => claims[0].support_sets = &.{.{ .evidence = &.{.{ .id = "context" }} }},
+        3 => {
+            claims[0].kind = .summary;
+            claims[0].evidence = &.{.{ .id = "external" }};
+        },
+        4 => claims[0].evidence = &.{ .{ .id = "e1" }, .{ .id = "external" }, .{ .id = "context" } },
+        5 => claims[0].support_sets = &.{.{ .evidence = &.{ .{ .id = "e1" }, .{ .id = "external" } } }},
+        6 => claims[0].evidence = &.{.{ .id = "context" }},
+        else => unreachable,
+    }
+    return .{ .assertions = claims };
+}
+
+test "memory generation stages enforce ownership at publication for every independent branch" {
+    for (0..8) |mode| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        const config: m.types.Config = .{ .processing = .hybrid, .features = .{ .assertion_distillation = true, .entity_extraction = true, .summaries = true }, .models = .{ .generator = fake_model } };
+        _ = try modelService(&store, 1).execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+        _ = try modelService(&store, 2).execute(a, .observe, "",
+            \\{"evidence":[{"id":"context","source_id":"prior","source_version":"1","text":"Prior context"}]}
+        , "context");
+        const accepted = try modelService(&store, 3).execute(a, .observe, "",
+            \\{"evidence":[{"id":"external","source_id":"client","source_version":"1","text":"Production uses Helm"},{"id":"e1","source_id":"managed","source_version":"1","text":"An unrelated managed observation","managed":true}],"context_evidence_ids":["context"],"assertions":[{"id":"client-claim","subject":"production","predicate":"deploys_with","value":"Helm","statement":"Production uses Helm","evidence":[{"id":"external"}]}]}
+        , "observe");
+        const operation = try std.json.parseFromSliceLeaky(m.types.Operation, a, accepted, .{});
+        store.failures = @intCast(mode);
+        var svc = modelService(&store, 4);
+        svc.backend.generate = ownershipOutput;
+        _ = try svc.execute(a, .advance, operation.id, "{}", "advance");
+        const status = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .operation, operation.id, "{}", ""), .{});
+        const rejected = mode < 3 or mode == 6;
+        try std.testing.expectEqual(if (rejected) m.types.Stage.pending else .succeeded, status.phase);
+        if (rejected) {
+            try std.testing.expectEqualStrings("MemoryUngroundedOutput", status.error_code.?);
+            try std.testing.expectEqual(@as(usize, 1), (try Store.scan(&store, a, "assertion/", null, 256)).rows.len);
+            try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "entity/", null, 256)).rows.len);
+            try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "generation-input/", null, 256)).rows.len);
+        } else if (mode == 7) {
+            _ = try svc.execute(a, .resolve_entity, "enriched", "{}", "");
+        } else {
+            _ = try svc.execute(a, .get, "generated", "{}", "");
+        }
+        _ = try svc.execute(a, .get, "client-claim", "{}", "");
+    }
+}
+
+test "memory generation plans mark client sources as distillation context and reject stage spoofing" {
+    const a = std.testing.allocator;
+    const config: m.types.Config = .{ .processing = .hybrid, .features = .{ .assertion_distillation = true, .entity_extraction = true, .summaries = true } };
+    const sources: []const m.types.StoredEvidence = &.{
+        .{ .evidence = .{ .id = "managed", .source_id = "m", .source_version = "1", .text = "Managed", .managed = true }, .owner = "alice", .recorded_at = 1, .revision = 1 },
+        .{ .evidence = .{ .id = "external", .source_id = "e", .source_version = "1", .text = "External" }, .owner = "alice", .recorded_at = 1, .revision = 1 },
+        .{ .context_only = true, .evidence = .{ .id = "context", .source_id = "c", .source_version = "1", .text = "Context", .managed = true }, .owner = "alice", .recorded_at = 1, .revision = 1 },
+    };
+    const plan: m.generation_policy.Plan = .{ .config = config, .sources = sources };
+    for ([_]m.generation_policy.Stage{ .entities, .distillation, .summaries }) |stage| {
+        const inputs = try plan.inputs(a, stage);
+        defer a.free(inputs);
+        try std.testing.expect(!inputs[0].context_only);
+        try std.testing.expectEqual(stage == .distillation, inputs[1].context_only);
+        try std.testing.expect(inputs[2].context_only);
+    }
+    try std.testing.expect(!sources[1].context_only); // Per-stage plans cannot mutate persisted ownership.
+    var claim: m.types.Assertion = .{ .id = "claim", .subject = "s", .predicate = "p", .value = "v", .statement = "Summary", .kind = .summary, .evidence = &.{.{ .id = "external" }} };
+    try std.testing.expectError(error.MemoryUngroundedOutput, plan.validateOutput(.distillation, .{ .assertions = &.{claim} }));
+    try plan.validateOutput(.summaries, .{ .assertions = &.{claim} });
+    claim.kind = .semantic;
+    try std.testing.expectError(error.MemoryUngroundedOutput, plan.validateOutput(.summaries, .{ .assertions = &.{claim} }));
+    try std.testing.expectError(error.MemoryUngroundedOutput, plan.validatePublication(.{ .assertions = &.{claim} }));
+    claim.evidence = &.{.{ .id = "unknown" }};
+    try std.testing.expectError(error.MemoryUngroundedOutput, plan.validatePublication(.{ .assertions = &.{claim} }));
 }

@@ -36,12 +36,12 @@ pub fn execute(guard: *@import("db.zig").HandleGuard, handle_ptr: ?*anyopaque, a
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
-    const request = try std.json.parseFromSliceLeaky(Request, a, request_json, .{ .ignore_unknown_fields = false });
+    const request = try std.json.parseFromSliceLeaky(Request, a, request_json, .{ .ignore_unknown_fields = false, .parse_numbers = false });
     const table = try std.fmt.allocPrint(a, "memory_{s}", .{space});
     const tables = @import("tables.zig");
     if (memory.mutates(request.action) and (request.idempotency_key.len == 0 or request.idempotency_key.len > 256)) return error.MemoryIdempotencyKeyRequired;
     if (request.action == .create) {
-        const config = try std.json.parseFromSliceLeaky(memory.types.Config, a, try std.json.Stringify.valueAlloc(a, request.body, .{}), .{ .ignore_unknown_fields = false });
+        const config = try std.json.parseFromSliceLeaky(memory.types.Config, a, try @import("antfly-json").stringifyValueAlloc(a, request.body), .{ .ignore_unknown_fields = false });
         try config.validate();
     }
     if (memory.mutates(request.action) and !h.liteOpenModeCanWrite(handle.open_mode)) return error.SqlReadOnlyTransaction;
@@ -88,5 +88,5 @@ pub fn execute(guard: *@import("db.zig").HandleGuard, handle_ptr: ?*anyopaque, a
     };
     var hooks: Hooks = .{ .guard = guard, .handle_ptr = handle_ptr, .adapter = &adapter, .table = table, .access = guard.access };
     var bridge: @import("../memory/models.zig").Bridge = .{ .base = adapter.backend(), .producer = runtime.producer(), .alloc = a, .inference_ptr = &hooks, .before_inference = Hooks.before, .after_inference = Hooks.after, .embedding_options = .{ .antfly_provider = handle.liteAntflyProvider(), .io = h.handleLockIo(), .source_table = table } };
-    return (memory.Service{ .backend = bridge.backend(), .context = context }).execute(alloc, request.action, request.id, try std.json.Stringify.valueAlloc(a, request.body, .{}), request.idempotency_key);
+    return (memory.Service{ .backend = bridge.backend(), .context = context }).execute(alloc, request.action, request.id, try @import("antfly-json").stringifyValueAlloc(a, request.body), request.idempotency_key);
 }

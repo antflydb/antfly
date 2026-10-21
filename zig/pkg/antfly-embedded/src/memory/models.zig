@@ -114,30 +114,28 @@ pub const Bridge = struct {
         const self: *Bridge = @ptrCast(@alignCast(ptr));
         var claims: std.ArrayList(t.Assertion) = .empty;
         var entities: std.ArrayList(t.Entity) = .empty;
+        const plan: service.generation_policy.Plan = .{ .config = config, .sources = inputs };
         const input = .{ .evidence = inputs, .ontology = config.predicates, .policy_version = config.policy_version, .ontology_version = config.ontology_version };
         if (config.features.entity_extraction) {
             const output = try self.produce(a, config, config.models.extractor orelse config.models.generator.?, t.Generated, "Extract canonical entities and explicitly supported aliases only. Preserve distinct homonyms using source/scope qualified IDs. Leave assertions empty.", input);
-            if (output.assertions.len != 0) return error.MemoryUngroundedOutput;
+            try plan.validateOutput(.entities, output);
             try entities.appendSlice(a, output.entities);
         }
-        var has_managed = false;
-        for (inputs) |source| if (source.evidence.managed and !source.context_only) {
-            has_managed = true;
-        };
-        if (config.features.assertion_distillation and has_managed) {
-            const output = try self.produce(a, config, config.models.generator.?, t.Generated, "Extract atomic durable, source-grounded memory assertions. Leave entities empty; entity extraction is a separate stage. Use canonical IDs from supplied entities when present.", .{ .evidence = inputs, .entities = entities.items, .ontology = config.predicates, .policy_version = config.policy_version });
-            if (output.entities.len != 0) return error.MemoryUngroundedOutput;
+        if (plan.enabled(.distillation) and plan.hasCurrent(.distillation)) {
+            const stage_inputs = try plan.inputs(a, .distillation);
+            const output = try self.produce(a, config, config.models.generator.?, t.Generated, "Extract atomic durable, source-grounded memory assertions. Leave entities empty; entity extraction is a separate stage. Use canonical IDs from supplied entities when present.", .{ .evidence = stage_inputs, .entities = entities.items, .ontology = config.predicates, .policy_version = config.policy_version });
+            try plan.validateOutput(.distillation, output);
             try claims.appendSlice(a, output.assertions);
         }
         if (config.features.summaries) {
             const output = try self.produce(a, config, config.models.generator.?, t.Generated, "Synthesize source-grounded summary or procedural assertions only. Procedures require explicit preconditions, ordered steps and supporting outcomes. Leave entities empty.", input);
-            if (output.entities.len != 0) return error.MemoryUngroundedOutput;
-            for (output.assertions) |claim| if (claim.kind != .summary and claim.kind != .procedural) return error.MemoryUngroundedOutput;
+            try plan.validateOutput(.summaries, output);
             try claims.appendSlice(a, output.assertions);
         }
         if (claims.items.len + entities.items.len > config.max_output_items) return error.MemoryInputTooLarge;
-        for (claims.items) |claim| if (claim.embedding != null) return error.MemoryUngroundedOutput;
-        return .{ .assertions = claims.items, .entities = entities.items };
+        const output: t.Generated = .{ .assertions = claims.items, .entities = entities.items };
+        try plan.validatePublication(output);
+        return output;
     }
     fn decide(ptr: *anyopaque, a: A, config: t.Config, incoming: t.Assertion, candidates: []const t.StoredAssertion) !t.ReconciliationDecision {
         const self: *Bridge = @ptrCast(@alignCast(ptr));

@@ -366,7 +366,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
                 .memory => blk: {
                     const space = jsonStringArg(args, "space") orelse return mcpError(alloc, "missing space");
                     const wire = jsonValueArg(args, "request") orelse return mcpError(alloc, "missing request");
-                    const input = std.json.parseFromSliceLeaky(@import("memory.zig").Request, alloc, try stringifyJsonValue(alloc, wire), .{ .ignore_unknown_fields = false }) catch return mcpError(alloc, "invalid memory request");
+                    const input = std.json.parseFromSliceLeaky(@import("memory.zig").Request, alloc, try @import("antfly-json").stringifyValueAlloc(alloc, wire), .{ .ignore_unknown_fields = false, .parse_numbers = false }) catch return mcpError(alloc, "invalid memory request");
                     var response = try ctx.server.executeMemoryService(space, input, ctx.authenticated_identity, .{});
                     defer response.deinit(ctx.server.alloc);
                     break :blk try mcpResultFromOwnedResponse(alloc, response);

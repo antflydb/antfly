@@ -5,6 +5,7 @@ from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
+from ..models.memory_entity_correction_absorbed import MemoryEntityCorrectionAbsorbed
 from ..models.memory_entity_correction_action import MemoryEntityCorrectionAction
 from ..types import UNSET, Unset
 
@@ -18,6 +19,8 @@ class MemoryEntityCorrection:
         action (MemoryEntityCorrectionAction):
         from_ (str):
         expected_revision (int):
+        absorbed (MemoryEntityCorrectionAbsorbed | Unset):
+        reason (str | Unset):
         to (None | str | Unset):
         replace (bool | Unset):
         pin_distinct (bool | Unset):
@@ -26,6 +29,8 @@ class MemoryEntityCorrection:
     action: MemoryEntityCorrectionAction
     from_: str
     expected_revision: int
+    absorbed: MemoryEntityCorrectionAbsorbed | Unset = UNSET
+    reason: str | Unset = UNSET
     to: None | str | Unset = UNSET
     replace: bool | Unset = UNSET
     pin_distinct: bool | Unset = UNSET
@@ -36,6 +41,12 @@ class MemoryEntityCorrection:
         from_ = self.from_
 
         expected_revision = self.expected_revision
+
+        absorbed: str | Unset = UNSET
+        if not isinstance(self.absorbed, Unset):
+            absorbed = self.absorbed.value
+
+        reason = self.reason
 
         to: None | str | Unset
         if isinstance(self.to, Unset):
@@ -56,6 +67,10 @@ class MemoryEntityCorrection:
                 "expected_revision": expected_revision,
             }
         )
+        if absorbed is not UNSET:
+            field_dict["absorbed"] = absorbed
+        if reason is not UNSET:
+            field_dict["reason"] = reason
         if to is not UNSET:
             field_dict["to"] = to
         if replace is not UNSET:
@@ -74,6 +89,15 @@ class MemoryEntityCorrection:
 
         expected_revision = d.pop("expected_revision")
 
+        _absorbed = d.pop("absorbed", UNSET)
+        absorbed: MemoryEntityCorrectionAbsorbed | Unset
+        if isinstance(_absorbed, Unset):
+            absorbed = UNSET
+        else:
+            absorbed = MemoryEntityCorrectionAbsorbed(_absorbed)
+
+        reason = d.pop("reason", UNSET)
+
         def _parse_to(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -91,6 +115,8 @@ class MemoryEntityCorrection:
             action=action,
             from_=from_,
             expected_revision=expected_revision,
+            absorbed=absorbed,
+            reason=reason,
             to=to,
             replace=replace,
             pin_distinct=pin_distinct,

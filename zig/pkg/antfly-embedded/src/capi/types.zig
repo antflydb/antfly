@@ -356,6 +356,8 @@ pub fn mapErrorContext(err: anyerror, context: []const u8) ErrorCode {
 }
 
 pub fn mapError(err: anyerror) ErrorCode {
+    if (err == error.StandaloneLiteCatalogRequiresApi)
+        return mapErrorContext(err, "this Lite catalog is owned by standalone; use antfly standalone and the /db/v1 API for catalog changes");
     const code = classifyError(err);
     if (comptime storage_engine.enabled) return recordError(code, @errorName(err));
     last_error_detail = @errorName(err);
@@ -379,7 +381,7 @@ fn classifyError(err: anyerror) ErrorCode {
         error.MemoryRetryExhausted => .stalled,
         error.MemoryEntitySuppressed => .not_found,
         error.InvalidMemoryRequest, error.InvalidMemoryAssertion, error.InvalidMemoryConfig, error.InvalidMemoryId, error.InvalidMemorySpan, error.InvalidMemoryCursor, error.MemoryIdempotencyKeyRequired, error.MemoryForgotten, error.MemoryEvidenceRequired, error.MemoryInvalidSupersession, error.MemoryUngroundedOutput, error.MemoryEmbeddingMismatch, error.MemoryEntityRequired, error.MemoryOntologyMismatch, error.MemoryDependencyMissing, error.MemoryDependencyCycle, error.MemoryDependencyStale, error.MemoryInputTooLarge, error.MemoryWorkLimit => .invalid_argument,
-        error.SqlFeatureNotSupported, error.UnsupportedOperation, error.UnsupportedResolverCatalogVersion, error.UnsupportedDatabaseReaderVersion => .unsupported,
+        error.StandaloneLiteCatalogRequiresApi, error.SqlFeatureNotSupported, error.UnsupportedOperation, error.UnsupportedResolverCatalogVersion, error.UnsupportedDatabaseReaderVersion => .unsupported,
         error.IntentConflict, error.DecisionConflict, error.SchemaInUse => .intent_conflict,
         error.TxnNotFound => .txn_not_found,
         error.NotFound, error.IndexNotFound, error.TableNotFound => .not_found,

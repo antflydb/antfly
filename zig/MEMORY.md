@@ -37,7 +37,7 @@ operations belong to the service. Embedded raw access remains the database owner
 authority, rather than an authentication boundary between local principals.
 
 Native provisioning uses a distinct body-bound administrative metadata call and
-requires topology protocol 36; old metadata must reject it before private data is
+requires topology protocol 38; old metadata must reject it before private data is
 published. Upgrade every public ingress and metadata peer before enabling spaces.
 The private catalog protocol preserves ownership across restart and projections;
 unsupported catalog providers fail closed instead of creating an ordinary table.
@@ -683,6 +683,17 @@ and every alternative support set. Client-produced assertions cannot cite manage
 evidence in any branch, whether submitted with new observations or through the
 assertions endpoint. The managed executor supplies its internal producer context
 to the same validator; a client-supplied producer label cannot select that path.
+Managed generation has stage-specific ownership plans, reconstructed from immutable
+observation metadata at execution and publication. Distillation marks client-owned
+observations as context-only; they may disambiguate a claim but cannot independently
+support a second authoritative extraction stream. Every primary and alternative
+support branch must cite a current managed observation. Entity enrichment and
+summary/procedural synthesis may use current client-owned observations. Prior
+context never supplies a current root for any stage. The shared stage validator
+rejects cross-stage output kinds before aggregation and rechecks the final output
+before publication; neither model-authored kinds nor producer labels grant a stage.
+The full admitted inference input plan remains a conjunctive privacy/retention
+dependency, including inputs used only as context.
 
 Codex initially uses external or hybrid mode: its authenticated model client supplies claims, while Antfly handles enabled indexing/entity processing and deliberately migrated reconciliation. Existing Codex settling, forgetting, source-note ownership, and access rules remain explicit compatibility requirements.
 
@@ -970,3 +981,31 @@ The proposed assertion model adds structured subject/predicate/value, explicit s
 - [ ] Test fork/revert lineage, imported old threads, and later-arriving contradictory evidence.
 - [ ] Exercise direct embedded and `/memory/v1` remote integration paths, including model-free external assertions, shared native policy semantics, explicit capability checks, and no HTTP/WASM runtime dependency in the embedded path.
 - [ ] Keep the integration's fresh-CODEX_HOME persistence gate and application-state behavior unchanged by the memory migration.
+
+
+### Main integration and constrained-output follow-up (#1223)
+
+The native memory branch incorporates main through `6e014d9b45`, including merged
+[#1223](https://github.com/antflydb/antfly/pull/1223). Memory continues to use shared
+constrained-producer schema admission, exact-number validation, bounded JSON
+ownership, and provider qualification; it does not maintain a second schema
+validator, prior-artifact scanner, renderer, or credential sanitizer. Memory's
+explicit bounded evidence/context plan remains independent of the generic prior
+artifact window. Its model bindings contain qualified role identities rather than
+arbitrary provider credential/configuration trees. HTTP and embedded request
+boundaries preserve numeric tokens before typed native parsing, matching #1223's
+lossless numeric contract. HTTP, MCP and embedded adapters serialize dynamic memory
+bodies with the shared iterative JSON writer, so deeply nested invalid fields
+reach normal typed admission instead of exhausting the serialization stack.
+Regressions exercise 6,000 nested levels with an extreme numeric literal through
+HTTP and the embedded C ABI.
+
+Main now uses topology versions 36–37 for curation provenance and durable proposal
+queues. Native service ownership therefore requires version **38** independently
+of resolver-namespace support (37); older peers cannot admit private memory tables.
+Memory identity corrections forward the authenticated actor and supplied reason
+to shared curation. Suppressing an identity with absorbed aliases defaults to
+`absorbed: reject`; callers explicitly choose `release` or `suppress`. Shared
+curation removes the affected redirects. Unsuppressing a target does not silently
+reattach or unsuppress its former aliases; restoration is explicit and revision
+fenced. These choices share the resolver semantics introduced on main.

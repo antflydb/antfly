@@ -10284,7 +10284,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/ResolverUnmergeRequest'
+              $ref: '#/components/schemas/EntitySuppressRequest'
       responses:
         '200':
           description: Completed result
@@ -11398,7 +11398,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/ResolverUnmergeRequest'
+              $ref: '#/components/schemas/EntitySuppressRequest'
       responses:
         '200':
           description: Completed result
@@ -11502,6 +11502,572 @@ paths:
           description: Resolver owner is busy; retry with backoff
         '503':
           description: Metadata or storage owner is unavailable; retry is safe
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/curation/proposals:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: proposeCuration
+      tags:
+        - resolver_curation
+      summary: proposeCuration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CurationProposalRequest'
+      responses:
+        '200':
+          description: Completed curation operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurationProposal'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Revision or terminal decision conflict
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    get:
+      operationId: listCurationProposals
+      tags:
+        - resolver_curation
+      summary: listCurationProposals
+      parameters:
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: action
+          in: query
+          schema:
+            type: string
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Completed curation operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurationProposalPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Revision or terminal decision conflict
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/curation/proposals/{proposalId}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: proposalId
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getCurationProposal
+      tags:
+        - resolver_curation
+      summary: getCurationProposal
+      responses:
+        '200':
+          description: Completed curation operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurationProposal'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Revision or terminal decision conflict
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/curation/proposals/{proposalId}:accept:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: proposalId
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: acceptCurationProposal
+      tags:
+        - resolver_curation
+      summary: acceptCurationProposal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CurationProposalDecisionRequest'
+      responses:
+        '200':
+          description: Completed curation operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurationProposalDecisionResult'
+        '202':
+          description: Accepted; resolver replay remains in progress
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurationProposalDecisionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Revision or terminal decision conflict
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/curation/proposals/{proposalId}:reject:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: proposalId
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: rejectCurationProposal
+      tags:
+        - resolver_curation
+      summary: rejectCurationProposal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CurationProposalDecisionRequest'
+      responses:
+        '200':
+          description: Completed curation operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurationProposalDecisionResult'
+        '202':
+          description: Accepted; resolver replay remains in progress
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurationProposalDecisionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Revision or terminal decision conflict
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/entities/{key}:distinct:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: key
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: pinEntitiesDistinct
+      tags:
+        - resolver_curation
+      summary: pinEntitiesDistinct
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EntityDistinctRequest'
+      responses:
+        '200':
+          description: Completed curation operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EntityCurationResult'
+        '202':
+          description: Accepted; resolver replay remains in progress
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EntityCurationResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Revision or terminal decision conflict
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: namespaceName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: namespaceProposeCuration
+      tags:
+        - resolver_curation
+      summary: proposeCuration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CurationProposalRequest'
+      responses:
+        '200':
+          description: Completed curation operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurationProposal'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Revision or terminal decision conflict
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    get:
+      operationId: namespaceListCurationProposals
+      tags:
+        - resolver_curation
+      summary: listCurationProposals
+      parameters:
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: action
+          in: query
+          schema:
+            type: string
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Completed curation operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurationProposalPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Revision or terminal decision conflict
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: namespaceName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: proposalId
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: namespaceGetCurationProposal
+      tags:
+        - resolver_curation
+      summary: getCurationProposal
+      responses:
+        '200':
+          description: Completed curation operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurationProposal'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Revision or terminal decision conflict
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:accept:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: namespaceName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: proposalId
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: namespaceAcceptCurationProposal
+      tags:
+        - resolver_curation
+      summary: acceptCurationProposal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CurationProposalDecisionRequest'
+      responses:
+        '200':
+          description: Completed curation operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurationProposalDecisionResult'
+        '202':
+          description: Accepted; resolver replay remains in progress
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurationProposalDecisionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Revision or terminal decision conflict
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:reject:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: namespaceName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: proposalId
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: namespaceRejectCurationProposal
+      tags:
+        - resolver_curation
+      summary: rejectCurationProposal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CurationProposalDecisionRequest'
+      responses:
+        '200':
+          description: Completed curation operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurationProposalDecisionResult'
+        '202':
+          description: Accepted; resolver replay remains in progress
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurationProposalDecisionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Revision or terminal decision conflict
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:distinct:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: namespaceName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: key
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: namespacePinEntitiesDistinct
+      tags:
+        - resolver_curation
+      summary: pinEntitiesDistinct
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EntityDistinctRequest'
+      responses:
+        '200':
+          description: Completed curation operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EntityCurationResult'
+        '202':
+          description: Accepted; resolver replay remains in progress
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EntityCurationResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Revision or terminal decision conflict
+        '500':
+          $ref: '#/components/responses/InternalServerError'
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -42554,6 +43120,39 @@ components:
           items:
             type: string
             pattern: ^[0-9]+$
+    CurationOrigin:
+      type: object
+      description: Server-owned provenance. Clients supply actor and reason on writes. Zero time/revision
+        denote legacy records whose creation is unknown.
+      properties:
+        origin:
+          type: string
+          enum:
+            - manual
+            - adjudicator
+            - review
+            - cascade
+            - config
+        actor:
+          type: string
+          maxLength: 256
+          description: UTF-8 client attribution, limited to 256 bytes.
+        reason:
+          type: string
+          maxLength: 4096
+          description: UTF-8 explanation, limited to 4096 bytes.
+        created_at_ms:
+          type: integer
+          format: uint64
+        revision:
+          type: integer
+          format: uint64
+        proposal_id:
+          type: string
+          nullable: true
+        cascade_from:
+          type: string
+          nullable: true
     ResolverRedirect:
       type: object
       required:
@@ -42564,6 +43163,40 @@ components:
           type: string
         target:
           type: string
+        origin:
+          $ref: '#/components/schemas/CurationOrigin'
+    CurationSuppressionEntry:
+      type: object
+      required:
+        - key
+        - origin
+      properties:
+        key:
+          type: string
+        origin:
+          $ref: '#/components/schemas/CurationOrigin'
+    RuntimeResolverSuppression:
+      type: object
+      properties:
+        keys:
+          type: array
+          items:
+            type: string
+        texts:
+          type: array
+          items:
+            type: string
+        min_text_chars:
+          type: integer
+          format: uint32
+        entries:
+          type: array
+          items:
+            $ref: '#/components/schemas/CurationSuppressionEntry'
+        text_entries:
+          type: array
+          items:
+            $ref: '#/components/schemas/CurationSuppressionEntry'
     ResolverDistinctPair:
       type: object
       required:
@@ -42574,6 +43207,8 @@ components:
           type: string
         to:
           type: string
+        origin:
+          $ref: '#/components/schemas/CurationOrigin'
     ResolverCurationState:
       type: object
       properties:
@@ -42582,7 +43217,7 @@ components:
           enum:
             - 1
         suppress:
-          $ref: '#/components/schemas/GraphResolverSuppressionConfig'
+          $ref: '#/components/schemas/RuntimeResolverSuppression'
         distinct:
           type: array
           items:
@@ -42988,6 +43623,12 @@ components:
         - from
         - to
       properties:
+        actor:
+          type: string
+          maxLength: 256
+        reason:
+          type: string
+          maxLength: 4096
         from:
           type: string
           minLength: 1
@@ -43017,6 +43658,12 @@ components:
       type: object
       additionalProperties: false
       properties:
+        actor:
+          type: string
+          maxLength: 256
+        reason:
+          type: string
+          maxLength: 4096
         pin_distinct:
           type: boolean
           default: false
@@ -43039,7 +43686,7 @@ components:
         configured:
           $ref: '#/components/schemas/GraphResolverSuppressionConfig'
         runtime:
-          $ref: '#/components/schemas/GraphResolverSuppressionConfig'
+          $ref: '#/components/schemas/RuntimeResolverSuppression'
         revision:
           type: integer
           format: uint64
@@ -43067,6 +43714,12 @@ components:
       description: Add keys or normalized texts. The add/remove form updates both sets in one revision.
         Runtime removals do not override declarative suppression.
       properties:
+        actor:
+          type: string
+          maxLength: 256
+        reason:
+          type: string
+          maxLength: 4096
         keys:
           type: array
           maxItems: 100000
@@ -43146,6 +43799,12 @@ components:
       required:
         - decision
       properties:
+        actor:
+          type: string
+          maxLength: 256
+        reason:
+          type: string
+          maxLength: 4096
         decision:
           type: string
           enum:
@@ -43203,6 +43862,21 @@ components:
               revision:
                 type: integer
                 format: uint64
+              absorbed:
+                type: array
+                items:
+                  type: object
+                  required:
+                    - key
+                    - disposition
+                  properties:
+                    key:
+                      type: string
+                    disposition:
+                      type: string
+                      enum:
+                        - release
+                        - suppress
               changed:
                 type: boolean
               replay_sequence:
@@ -43232,6 +43906,16 @@ components:
       required:
         - into
       properties:
+        expected_revision:
+          type: integer
+          format: uint64
+          x-go-type-skip-optional-pointer: false
+        actor:
+          type: string
+          maxLength: 256
+        reason:
+          type: string
+          maxLength: 4096
         into:
           type: string
           minLength: 1
@@ -43241,6 +43925,219 @@ components:
         pin_distinct:
           type: boolean
           default: false
+        wait:
+          $ref: '#/components/schemas/ResolverWait'
+    EntitySuppressRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        absorbed:
+          type: string
+          enum:
+            - reject
+            - release
+            - suppress
+          default: reject
+          description: Reject absorbed keys, release all transitive redirect sources, or suppress them
+            with cascade provenance. Unsuppress never restores redirects.
+        pin_distinct:
+          type: boolean
+          default: false
+          description: With absorbed=release, pin each released source distinct from the target.
+        actor:
+          type: string
+          maxLength: 256
+        reason:
+          type: string
+          maxLength: 4096
+        expected_revision:
+          type: integer
+          format: uint64
+          x-go-type-skip-optional-pointer: false
+        wait:
+          $ref: '#/components/schemas/ResolverWait'
+    CurationProposalOptions:
+      type: object
+      additionalProperties: false
+      properties:
+        replace:
+          type: boolean
+          default: false
+        pin_distinct:
+          type: boolean
+          default: false
+        absorbed:
+          type: string
+          enum:
+            - reject
+            - release
+            - suppress
+          default: reject
+    CurationProposalRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - action
+        - key
+      properties:
+        action:
+          type: string
+          enum:
+            - merge
+            - unmerge
+            - suppress
+            - unsuppress
+            - distinct
+        key:
+          type: string
+          minLength: 1
+          maxLength: 16384
+        into:
+          type: string
+          nullable: true
+        options:
+          $ref: '#/components/schemas/CurationProposalOptions'
+        confidence:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        evidence:
+          type: object
+          additionalProperties: true
+          nullable: true
+          description: At most 16 KiB, 4096 values and depth 32.
+        actor:
+          type: string
+          maxLength: 256
+        reason:
+          type: string
+          maxLength: 4096
+    CurationProposal:
+      type: object
+      required:
+        - id
+        - action
+        - key
+        - state
+        - origin
+      properties:
+        id:
+          type: string
+        action:
+          type: string
+          enum:
+            - merge
+            - unmerge
+            - suppress
+            - unsuppress
+            - distinct
+        key:
+          type: string
+        into:
+          type: string
+          nullable: true
+        options:
+          $ref: '#/components/schemas/CurationProposalOptions'
+        confidence:
+          type: number
+          format: double
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        evidence:
+          type: object
+          additionalProperties: true
+          nullable: true
+        origin:
+          $ref: '#/components/schemas/CurationOrigin'
+        state:
+          type: string
+          enum:
+            - open
+            - accepted
+            - rejected
+            - superseded
+        decided:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/CurationOrigin'
+    CurationProposalPage:
+      type: object
+      required:
+        - proposals
+      properties:
+        proposals:
+          type: array
+          items:
+            $ref: '#/components/schemas/CurationProposal'
+        next_cursor:
+          type: string
+          nullable: true
+    CurationProposalDecisionRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        options:
+          allOf:
+            - $ref: '#/components/schemas/CurationProposalOptions'
+          x-go-type-skip-optional-pointer: false
+        pin_distinct:
+          type: boolean
+          default: false
+          description: On rejection of a merge, pin the proposed pair distinct in the same commit.
+        actor:
+          type: string
+          maxLength: 256
+        reason:
+          type: string
+          maxLength: 4096
+        expected_revision:
+          type: integer
+          format: uint64
+          x-go-type-skip-optional-pointer: false
+        wait:
+          $ref: '#/components/schemas/ResolverWait'
+    CurationProposalDecisionResult:
+      type: object
+      properties:
+        proposal:
+          $ref: '#/components/schemas/CurationProposal'
+        complete:
+          type: boolean
+        changed:
+          type: boolean
+        atomicity:
+          type: string
+          enum:
+            - namespace
+            - resolver
+        applied:
+          type: boolean
+        results:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+    EntityDistinctRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - into
+      properties:
+        expected_revision:
+          type: integer
+          format: uint64
+          x-go-type-skip-optional-pointer: false
+        into:
+          type: string
+        actor:
+          type: string
+          maxLength: 256
+        reason:
+          type: string
+          maxLength: 4096
         wait:
           $ref: '#/components/schemas/ResolverWait'
     InferenceError:
@@ -47751,6 +48648,14 @@ components:
     MemoryEntityCorrection:
       type: object
       properties:
+        absorbed:
+          type: string
+          enum:
+            - reject
+            - release
+            - suppress
+        reason:
+          type: string
         action:
           type: string
           enum:

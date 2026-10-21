@@ -47,6 +47,7 @@ pub fn create(ctx: Context) Suite {
         .filters = main_test_filters,
         .test_runner = runtime_filter_test_runner,
     });
+    tests.root_module.strip = ctx.strip;
     tests.root_module.addImport("build_info", ctx.graph.build_info_mod);
     tests.root_module.addImport("antfly_decisions", ctx.graph.inference_mod.import_table.get("antfly_decisions").?);
     tests.root_module.addImport("antfly_structured", ctx.graph.inference_mod.import_table.get("antfly_structured").?);
@@ -128,6 +129,7 @@ pub fn create(ctx: Context) Suite {
         .filters = main_test_filters,
         .test_runner = runtime_filter_test_runner,
     });
+    cli_tests.root_module.strip = ctx.strip;
     cli_tests.root_module.addImport("build_info", ctx.graph.build_info_mod);
     cli_tests.root_module.addImport("inference", ctx.graph.inference_mod);
     cli_tests.root_module.addImport("build_options", ctx.graph.build_options_mod);

@@ -24165,12 +24165,7 @@ pub const DataServer = struct {
                     try context.ensureWithRuntime(.{ .io = &borrow, .memory_limit_bytes = cfg.process_memory_limit_bytes });
                 } else try context.ensure();
                 storage_kernel_context = context;
-                const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(
-                    alloc,
-                    cfg.api_server_cfg.remote_content,
-                );
-                defer alloc.free(security_json);
-                try storage_kernel_context.?.configureRemoteContentSecurity(security_json);
+                try storage_kernel_context.?.configureRemoteContent(cfg.api_server_cfg.remote_content);
                 try storage_kernel_context.?.configureSecrets(cfg.api_server_cfg.secret_store);
                 if (cfg.api_server_cfg.node_config != null and cfg.api_server_cfg.node_config.?.storage.artifacts.connection != null) {
                     const retained_setup = try @import("../api/native_query_repository.zig").Repository.setupJsonAlloc(alloc, cfg.api_server_cfg.node_config, cfg.api_server_cfg.deployment_mode, cfg.api_server_cfg.native_lake_artifact_base_dir);
@@ -31129,9 +31124,7 @@ pub fn runFromIterator(
             .memory_limit_bytes = process_memory_limit_bytes,
         });
         process_storage_kernel_context = context;
-        const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
-        defer alloc.free(security_json);
-        try process_storage_kernel_context.?.configureRemoteContentSecurity(security_json);
+        try process_storage_kernel_context.?.configureRemoteContent(remote_content);
         try process_storage_kernel_context.?.configureSecrets(if (secret_store_initialized) &secret_store else null);
         if (loaded_config) |*cfg| if (cfg.storage.artifacts.connection != null) {
             const retained_setup = try @import("../api/native_query_repository.zig").Repository.setupJsonAlloc(alloc, cfg, .distributed, null);

@@ -289,6 +289,8 @@ test "memory model-free defaults and feature admission" {
 }
 
 pub const EntityCorrection = struct {
+    absorbed: enum { reject, release, suppress } = .reject,
+    reason: []const u8 = "",
     action: enum { merge, unmerge, suppress, unsuppress },
     from: []const u8,
     to: ?[]const u8 = null,

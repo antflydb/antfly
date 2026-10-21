@@ -798,10 +798,11 @@ class AntflyClient:
 
         self.memory = MemoryOperations(self)
         self.indexes = IndexOperations(self)
-        from .resolvers import EntityOperations, ResolverOperations
+        from .resolvers import CurationProposalOperations, EntityOperations, ResolverOperations
 
         self.resolvers = ResolverOperations(self)
         self.entities = EntityOperations(self)
+        self.curation_proposals = CurationProposalOperations(self)
 
     def _request(
         self,

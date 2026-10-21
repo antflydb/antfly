@@ -361,7 +361,7 @@ test "video Metal preparation admission denies before submit and retains output 
     try first.wait(std.testing.io, .{});
     try first.releaseSource();
     try first.releaseSource();
-    const output_bytes = first.geometry.values() * @sizeOf(f32);
+    const output_bytes = std.mem.alignForward(usize, first.geometry.values() * @sizeOf(f32), 16384);
     try std.testing.expectEqual(media.admission.Resources{ .device_bytes = 1024 * 1024 + output_bytes }, pool.snapshot());
     var second = try metal.submitRgba(a, &pixels, 13, 7, options, .{});
     // Destruction fences even when the caller never waited for completion.
