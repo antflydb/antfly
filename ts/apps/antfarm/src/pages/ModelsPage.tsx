@@ -125,22 +125,22 @@ function modelProvider(model: InferenceModel): string {
 
 function runtimeStatus(runtime: ModelInstancesForModel | undefined) {
   if (!runtime) return { label: "Available", tone: "text-muted-foreground" };
-  if (runtime.runtimes.some((item) => item.active_handles > 0)) {
-    return { label: "In use", tone: "af-status-text-info" };
-  }
   if (
     runtime.load_state === "loading" ||
     runtime.runtimes.some((item) => item.state === "loading")
   ) {
     return { label: "Loading", tone: "af-status-text-warning" };
   }
+  if (runtime.runtimes.some((item) => item.active_handles > 0)) {
+    return { label: "In use", tone: "af-status-text-info" };
+  }
   if (runtime.runtimes.length > 0) return { label: "Loaded", tone: "af-status-text-success" };
   return { label: "Available", tone: "text-muted-foreground" };
 }
 
 function runtimeInstanceLabel(instance: ModelInstance): string {
-  if (instance.active_handles > 0) return "In use";
   if (instance.state === "loading") return "Loading";
+  if (instance.active_handles > 0) return "In use";
   return "Loaded";
 }
 
@@ -741,8 +741,8 @@ const ModelDetailSheet: React.FC<{
                       title={
                         instance.startup_managed
                           ? "Startup-managed models cannot be unloaded here"
-                          : instance.active_handles > 0 || instance.active_handles > 0
-                            ? "Wait for active requests to finish"
+                          : instance.unload_blocked_reason === "in_use"
+                            ? "Model is busy; try again when idle"
                             : undefined
                       }
                       onClick={() => void onUnload(instance.id).catch(() => undefined)}

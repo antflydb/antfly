@@ -365,6 +365,35 @@ test.describe("AI workflow routes", () => {
     expect(actions).toEqual(["load", "unload"]);
   });
 
+  test("loading instances stay labeled Loading while they have load waiters", async ({ page }) => {
+    await page.route("**/ai/v1/models/instances", (route) =>
+      route.fulfill({
+        json: {
+          object: "list",
+          data: [
+            {
+              id: "loading-1",
+              model: "mock-embed",
+              tasks: ["embedder"],
+              state: "loading",
+              active_handles: 1,
+              startup_managed: false,
+              unloadable: false,
+              unload_blocked_reason: "loading",
+              residency_mode: "backend_managed",
+              idle_ms: 0,
+            },
+          ],
+        },
+      })
+    );
+    await page.goto("/inference/models");
+    await page.getByRole("button", { name: "View details for mock-embed", exact: true }).click();
+    const details = page.getByRole("dialog");
+    await expect(details.getByText("Loading", { exact: true })).toHaveCount(2);
+    await expect(details.getByRole("button", { name: "Unload", exact: true })).toBeDisabled();
+  });
+
   test("built-in chunking does not offer model lifecycle actions", async ({ page }) => {
     await page.goto("/inference/models");
     await page.getByRole("button", { name: "View details for fixed" }).click();
