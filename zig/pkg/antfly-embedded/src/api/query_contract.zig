@@ -19773,3 +19773,18 @@ test "logical query canonical execution rejects removed public controls" {
         } else |_| {}
     }
 }
+
+test "logical query generated canonical bool preserves nested clauses and boost" {
+    const a = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"bool":{"must":{"contains":"needle","field":"content"},"should":[{"equals":"exact","field":"title"}],"minimum_should_match":1,"boost":2}}
+    , .{});
+    defer parsed.deinit();
+    const query = try parseGeneratedBleveTextQuery(a, parsed.value);
+    defer freeTextQuery(a, query);
+    try std.testing.expect(query == .bool_query);
+    try std.testing.expectEqual(@as(usize, 1), query.bool_query.must.len);
+    try std.testing.expectEqual(@as(usize, 1), query.bool_query.should.len);
+    try std.testing.expectEqual(@as(u32, 1), query.bool_query.min_should);
+    try std.testing.expectEqual(@as(f32, 2), query.bool_query.boost);
+}
