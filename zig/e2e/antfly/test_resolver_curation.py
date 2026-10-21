@@ -442,11 +442,16 @@ def test_entity_merge_adopts_matching_local_policy(request, monkeypatch, raft, p
 
 
 @pytest.mark.parametrize("action", ["merge", "suppress"])
-def test_runtime_entity_curation_preserves_future_promotion(stateful_api, action):
+@pytest.mark.parametrize("raft", [False, True], ids=["standalone", "raft"])
+def test_runtime_entity_curation_preserves_future_promotion(
+    request, monkeypatch, action, raft
+):
     """Curation before any destination row exists must retain a usable sink."""
     from helpers import wait_until
 
-    api = stateful_api
+    if raft:
+        monkeypatch.setenv("ANTFLY_E2E_STATEFUL_RAFT", "1")
+    api = request.getfixturevalue("stateful_api")
     suffix = uuid4().hex[:8]
     destination, source = f"live_entities_{suffix}", f"live_notes_{suffix}"
     api.create_table(destination)
