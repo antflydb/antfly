@@ -91,7 +91,16 @@ pub const Space = struct {
         } else if (inputs != 0) return error.InvalidLogicalRowIdentity;
     }
 };
-pub const Translation = struct { forward: tree.Ref, reverse: tree.Ref };
+pub const Translation = struct {
+    forward: tree.Ref,
+    reverse: tree.Ref,
+    /// Historical maps embed rank. New maps share current.by_order so a
+    /// coordinate change cannot rewrite ranks for every unaffected row.
+    ranked: bool = true,
+    pub fn jsonStringify(self: Translation, writer: anytype) !void {
+        if (self.ranked) try writer.write(.{ .forward = self.forward, .reverse = self.reverse }) else try writer.write(.{ .forward = self.forward, .reverse = self.reverse, .ranked = false });
+    }
+};
 pub const ReusedIndex = struct {
     name: []const u8,
     space: Space,
@@ -137,7 +146,7 @@ pub const Root = struct {
             if (entry.translation) |translation| {
                 try translation.forward.validate();
                 try translation.reverse.validate();
-                if (translation.forward.records != self.current.rows or translation.reverse.records != self.current.rows or entry.space.file_slots == null or self.current.file_slots == null) return error.InvalidLogicalRowIdentity;
+                if (translation.forward.records != self.current.rows or translation.reverse.records != self.current.rows or (!translation.ranked and self.current.by_order == null) or entry.space.file_slots == null or self.current.file_slots == null) return error.InvalidLogicalRowIdentity;
             }
         }
         if (self.hasRelocation()) {
@@ -572,9 +581,9 @@ pub const Reader = struct {
     pub const Translated = struct { coordinate: Coordinate, rank: u64 };
     pub fn translateAt(self: *Reader, a: A, translation: Translation, coordinate: Coordinate, forward: bool) !Translated {
         const key = coordinate.encode();
-        const bytes = (try self.lookup(a, if (forward) translation.forward else translation.reverse, &key, if (forward) 24 else 16)) orelse return error.InvalidLogicalRowIdentity;
+        const bytes = (try self.lookup(a, if (forward) translation.forward else translation.reverse, &key, if (forward and translation.ranked) 24 else 16)) orelse return error.InvalidLogicalRowIdentity;
         defer a.free(bytes);
-        return .{ .coordinate = try Coordinate.decode(bytes[0..16]), .rank = if (forward) std.mem.readInt(u64, bytes[16..24], .big) else 0 };
+        return .{ .coordinate = try Coordinate.decode(bytes[0..16]), .rank = if (forward and translation.ranked) std.mem.readInt(u64, bytes[16..24], .big) else std.math.maxInt(u64) };
     }
     pub fn translateDenseMany(self: *Reader, a: A, translation: Translation, coordinates: []const Coordinate, forward: bool) ![]Translated {
         var scratch = std.heap.ArenaAllocator.init(a);
@@ -586,10 +595,10 @@ pub const Reader = struct {
             key.* = coordinate.encode();
             pointer.* = key;
         }
-        const values = try self.lookupMany(sa, if (forward) translation.forward else translation.reverse, pointers, if (forward) 24 else 16);
+        const values = try self.lookupMany(sa, if (forward) translation.forward else translation.reverse, pointers, if (forward and translation.ranked) 24 else 16);
         const result = try a.alloc(Translated, coordinates.len);
         errdefer a.free(result);
-        for (values, result) |bytes, *value| value.* = .{ .coordinate = try Coordinate.decode(bytes[0..16]), .rank = if (forward) std.mem.readInt(u64, bytes[16..24], .big) else 0 };
+        for (values, result) |bytes, *value| value.* = .{ .coordinate = try Coordinate.decode(bytes[0..16]), .rank = if (forward and translation.ranked) std.mem.readInt(u64, bytes[16..24], .big) else std.math.maxInt(u64) };
         return result;
     }
     pub fn canonicalRank(self: *Reader, a: A, space: Space, resolved: Resolved) !u64 {

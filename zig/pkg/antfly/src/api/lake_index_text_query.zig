@@ -481,8 +481,8 @@ const Execution = struct {
     }
     fn selectSparseConstraints(raw: *anyopaque, a: A, lookup: types.SparseOrdinalLookup) !?types.SparseOrdinalSelection {
         const self: *Execution = @ptrCast(@alignCast(raw));
-        if (self.relocated()) return null;
         if (self.overlay != null or self.active_recent) return null;
+        if (self.relocated()) return try self.selectRelocatedConstraints(a, lookup);
         var result: types.SparseOrdinalSelection = .{};
         errdefer result.deinit();
         if (self.vector_include_provider) |provider| if (provider.complete == null) {
@@ -505,6 +505,44 @@ const Execution = struct {
             }
             return err;
         };
+        return result;
+    }
+    fn relocatedSelection(self: *Execution, a: A, provider: ?*@import("lake_index_text_predicate.zig").PhysicalResolver.Membership, selected: ?*const @import("lake_index_physical_set.zig").Set, allowance: *local.serverless_query_lake_serving.ServingSource.TranslationAllowance) !?@import("lake_index_physical_set.zig").Set {
+        if (provider) |membership| if (try membership.indexSpaceSelection(a, self.index_resolver)) |set| return set;
+        const current = selected orelse return null;
+        return try @import("lake_index_text_predicate.zig").indexSelection(a, self.source, self.index_resolver, current, allowance);
+    }
+    fn selectRelocatedConstraints(self: *Execution, a: A, lookup: types.SparseOrdinalLookup) !types.SparseOrdinalSelection {
+        var result = try types.SparseOrdinalSelection.initBounded(a, 4 * 1024 * 1024);
+        var keep = false;
+        defer if (!keep) result.deinit();
+        var allowance: local.serverless_query_lake_serving.ServingSource.TranslationAllowance = .{};
+        var included: ?@import("lake_index_physical_set.zig").Set = null;
+        defer if (included) |*set| set.deinit();
+        var excluded: ?@import("lake_index_physical_set.zig").Set = null;
+        defer if (excluded) |*set| set.deinit();
+        const wa = result.allocator();
+        included = self.relocatedSelection(wa, if (self.vector_include_provider) |*provider| provider else null, self.includeSet(), &allowance) catch |err| {
+            if (err == error.QueryCandidateBudgetExceeded or (err == error.OutOfMemory and result.budget.?.exhausted)) return .{ .residual = true, .deferred = lookup.native_range != null };
+            return err;
+        };
+        if ((self.vector_include_provider != null or self.includeSet() != null) and included == null) return .{ .residual = true, .deferred = lookup.native_range != null };
+        excluded = self.relocatedSelection(wa, if (self.vector_exclude_provider) |*provider| provider else null, self.excludeSet(), &allowance) catch |err| {
+            if (err == error.QueryCandidateBudgetExceeded or (err == error.OutOfMemory and result.budget.?.exhausted)) return .{ .residual = true, .deferred = lookup.native_range != null };
+            return err;
+        };
+        const residual = self.vector_exclude_provider != null and excluded == null;
+        var direct = self.*;
+        direct.vector_include = included;
+        direct.vector_exclude = excluded;
+        direct.vector_include_provider = null;
+        direct.vector_exclude_provider = null;
+        direct.planSparseSets(&result, lookup) catch |err| {
+            if (err == error.OrdinalPlanningBudgetExceeded or (err == error.OutOfMemory and result.budget.?.exhausted)) return .{ .residual = true, .deferred = lookup.native_range != null };
+            return err;
+        };
+        result.residual = residual;
+        keep = true;
         return result;
     }
     fn planSparseSets(self: *Execution, result: *types.SparseOrdinalSelection, lookup: types.SparseOrdinalLookup) !void {
@@ -561,10 +599,11 @@ const Execution = struct {
     }
     fn selectSparseRange(raw: *anyopaque, a: A, lookup: types.SparseOrdinalLookup, first: u32, last: u32) !?types.SparseOrdinalSelection {
         const self: *Execution = @ptrCast(@alignCast(raw));
-        if (self.relocated()) return null;
         if (self.overlay != null or self.active_recent) return null;
-        if (self.vector_include_provider) |provider| if (provider.complete == null) return null;
-        if (self.vector_exclude_provider) |provider| if (provider.complete == null) return null;
+        if (!self.relocated()) {
+            if (self.vector_include_provider) |provider| if (provider.complete == null) return null;
+            if (self.vector_exclude_provider) |provider| if (provider.complete == null) return null;
+        }
         if (lookup.native_range == null) return null;
         var result: types.SparseOrdinalSelection = .{ .include = .init(a) };
         errdefer result.deinit();
@@ -1437,7 +1476,8 @@ const Execution = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = self.server, .table = self.table, .source = self.source, .context = self.request, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
-        var candidates = (try resolver.selectiveCandidates(a, json, std.math.maxInt(usize))) orelse return null;
+        var allowance: local.serverless_query_lake_serving.ServingSource.TranslationAllowance = .{};
+        var candidates = (try resolver.selectiveCandidates(a, json, if (self.relocated()) 4096 else std.math.maxInt(usize), &allowance)) orelse return null;
         defer candidates.deinit();
         const tree = @import("../serverless/graph_segment/page_tree.zig");
         var store = self.store.artifactStore();
@@ -1448,7 +1488,7 @@ const Execution = struct {
         defer cache.deinit();
         var index_candidates: ?@import("lake_index_physical_set.zig").Set = null;
         defer if (index_candidates) |*set| set.deinit();
-        if (self.relocated()) index_candidates = try @import("lake_index_text_predicate.zig").indexSelection(a, self.source, self.index_resolver, &candidates);
+        if (self.relocated()) index_candidates = try @import("lake_index_text_predicate.zig").indexSelection(a, self.source, self.index_resolver, &candidates, &allowance);
         const source_id = if (self.index_resolver) |resolver_| resolver_.source else self.source.inventory.source_id;
         const snapshot_id = if (self.index_resolver) |resolver_| resolver_.snapshot else self.source.inventory.snapshot_id;
         const selected = try @import("lake_index_source_routes.zig").select(a, cache.store(), root, store, cached, token, if (index_candidates) |*set| set else &candidates, source_id, snapshot_id);
@@ -3387,6 +3427,7 @@ test "external lake sparse predicate planning defers broad masks and subtracts s
     var source: local.serverless_query_lake_serving.ServingSource = undefined;
     source.row_resolver = null;
     var execution: Execution = undefined;
+    execution.index_resolver = null;
     execution.source = &source;
     execution.result_allocator = a;
     execution.navigation = null;
@@ -3441,6 +3482,7 @@ test "external lake sparse predicate planning translates broad blocks within wor
     var source: local.serverless_query_lake_serving.ServingSource = undefined;
     source.row_resolver = null;
     var execution: Execution = undefined;
+    execution.index_resolver = null;
     execution.source = &source;
     execution.result_allocator = a;
     execution.navigation = null;
@@ -3524,6 +3566,7 @@ test "external lake sparse predicate planning defers exhausted masks to exact na
     const Bitmap = local.encoding_roaring.RoaringBitmap;
     const Set = @import("lake_index_physical_set.zig").Set;
     var execution: Execution = undefined;
+    execution.index_resolver = null;
     execution.navigation = null;
     execution.overlay = null;
     execution.active_recent = false;
@@ -3613,6 +3656,7 @@ test "external lake sparse predicate planning preflights effective windows and p
     var source: local.serverless_query_lake_serving.ServingSource = undefined;
     source.row_resolver = null;
     var execution: Execution = undefined;
+    execution.index_resolver = null;
     execution.source = &source;
     execution.result_allocator = a;
     execution.navigation = null;
@@ -4083,6 +4127,7 @@ test "external lake bounded WAL unit hydration chooses exact recent partition" {
     const second_decl: Declared = .{ .name = "vectors", .binding = undefined, .artifact = .{ .kind = .vector_segment, .metadata_version = 2, .artifact_id = &second_artifact, .checksum = second_artifact[7..71], .byte_len = 1 } };
     const runs = [_]vectors.Run{ .{ .prefix = '7', .digest = @splat(1), .declarations = &.{first_decl} }, .{ .prefix = 'd', .digest = @splat(2), .declarations = &.{second_decl} } };
     var execution: Execution = undefined;
+    execution.index_resolver = null;
     execution.navigation = null;
     execution.context = .{ .io = std.testing.io };
     execution.arena = sa;
@@ -4379,4 +4424,110 @@ test "external lake covering search hydration survives missing Parquet and prese
         if (reads) |previous| try std.testing.expectEqual(previous, current);
         reads = current;
     }
+}
+
+test "external lake relocated sparse predicates translate selective masks and defer broad native windows" {
+    const a = std.testing.allocator;
+    const Set = @import("lake_index_physical_set.zig").Set;
+    const RowRef = local.storage_rowsource_types.RowRef;
+    const Serving = local.serverless_query_lake_serving.ServingSource;
+    const Bitmap = local.encoding_roaring.RoaringBitmap;
+    const Mock = struct {
+        translated: usize = 0,
+        points: usize = 0,
+        fn from(_: *anyopaque, _: A, ref: RowRef) !RowRef {
+            var result = ref;
+            result.external.snapshot_id = "current";
+            result.external.file_id = "current-file";
+            result.external.row_ordinal -= 100;
+            return result;
+        }
+        fn to(_: *anyopaque, _: A, ref: RowRef) !RowRef {
+            var result = ref;
+            result.external.snapshot_id = "old";
+            result.external.file_id = "old-file";
+            result.external.row_ordinal += 100;
+            return result;
+        }
+        fn many(raw: *anyopaque, alloc: A, refs: []const RowRef, forward: bool, allowance: *Serving.TranslationAllowance) ![]const RowRef {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (refs.len > allowance.remaining_rows) return error.QueryCandidateBudgetExceeded;
+            allowance.remaining_rows -= refs.len;
+            self.translated += refs.len;
+            const result = try alloc.alloc(RowRef, refs.len);
+            for (refs, result) |ref, *out| out.* = if (forward) try from(raw, alloc, ref) else try to(raw, alloc, ref);
+            return result;
+        }
+        fn file(_: *anyopaque, _: A, _: []const u8) !?[]const u8 {
+            return "old-file";
+        }
+        fn digest(_: *anyopaque, _: A, _: []const u8) ![]const u8 {
+            return "0000000000000000000000000000000000000000000000000000000000000000";
+        }
+        fn rank(_: *anyopaque, _: A, _: RowRef) !u64 {
+            return error.UnexpectedRankLookup;
+        }
+        fn close(_: *anyopaque) void {}
+        fn one(raw: *anyopaque, key: []const u8) !?u32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.points += 1;
+            const coordinate = try @import("lake_index_native_state.zig").coordinates(key);
+            return @intCast(coordinate.row - 100);
+        }
+        fn block(_: *anyopaque, _: A, _: []const u8, _: u32, _: *const Bitmap, _: *Bitmap) !bool {
+            return false;
+        }
+        fn range(_: *anyopaque, _: A, first: u32, last: u32, filter: types.SparseOrdinalKeyFilter, result: *Bitmap) !bool {
+            var ordinal = first;
+            while (ordinal <= last) : (ordinal += 1) {
+                var buffer: [96]u8 = undefined;
+                const key = try std.fmt.bufPrint(&buffer, "lake2:{s}:00000000:{x:0>16}", .{ try digest(undefined, undefined, ""), @as(u64, ordinal) + 100 });
+                if (try filter.allowsKey(key)) try result.add(ordinal);
+            }
+            return true;
+        }
+    };
+    var mock: Mock = .{};
+    var source: Serving = undefined;
+    source.inventory.source_id = @constCast("source");
+    source.inventory.snapshot_id = @constCast("current");
+    source.inventory.row_identity_version = 1;
+    source.row_resolver = null;
+    var execution: Execution = .{ .server = undefined, .source = &source, .store = undefined, .domain = @splat(0), .declarations = &.{}, .context = .{ .io = std.testing.io }, .request = .{}, .schema_json = "", .arena = a, .result_allocator = a, .table = undefined };
+    execution.index_resolver = .{ .ptr = &mock, .source = "source", .snapshot = "old", .current_source = "source", .current_snapshot = "current", .rows = 100000, .from_index = Mock.from, .to_index = Mock.to, .file = Mock.file, .digest = Mock.digest, .tie_rank = Mock.rank, .close = Mock.close, .translate_many_bounded = Mock.many };
+    execution.vector_include = Set.init(a);
+    defer execution.vector_include.?.deinit();
+    execution.vector_exclude = Set.init(a);
+    defer execution.vector_exclude.?.deinit();
+    try execution.vector_include.?.addRow("current-file", 0, 7);
+    try execution.vector_include.?.addRow("current-file", 0, 9);
+    try execution.vector_exclude.?.addRow("current-file", 0, 9);
+    const lookup: types.SparseOrdinalLookup = .{ .ptr = &mock, .one = Mock.one, .block = Mock.block, .native_range = Mock.range };
+    var selective = (try Execution.selectSparseConstraints(&execution, a, lookup)).?;
+    defer selective.deinit();
+    try std.testing.expect(!selective.residual and selective.include.?.contains(7) and !selective.include.?.contains(9));
+    try std.testing.expectEqual(@as(usize, 1), selective.include.?.cardinality());
+    try std.testing.expectEqual(@as(usize, 3), mock.translated);
+    try std.testing.expectEqual(@as(usize, 1), mock.points);
+    const Failure = struct {
+        fn run(alloc: A, owner: *Execution, native: types.SparseOrdinalLookup) !void {
+            var selected = (try Execution.selectSparseConstraints(owner, alloc, native)).?;
+            defer selected.deinit();
+            try std.testing.expect(selected.include.?.contains(7));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Failure.run, .{ &execution, lookup });
+    try execution.vector_include.?.addBlock(.{ .file = "current-file", .group = 0, .base = 0, .selection = .{ .interval = .{ .lower = 0, .count = 100000 } } });
+    mock.translated = 0;
+    mock.points = 0;
+    var broad = (try Execution.selectSparseConstraints(&execution, a, lookup)).?;
+    defer broad.deinit();
+    try std.testing.expect(broad.residual and broad.deferred and broad.include == null);
+    try std.testing.expectEqual(@as(usize, 0), mock.translated);
+    try std.testing.expectEqual(@as(usize, 0), mock.points);
+    var window = (try Execution.selectSparseRange(&execution, a, lookup, 0, 11)).?;
+    defer window.deinit();
+    try window.prepareRead();
+    try std.testing.expectEqual(@as(usize, 11), window.include.?.cardinality());
+    try std.testing.expect(window.include.?.contains(7) and !window.include.?.contains(9));
 }

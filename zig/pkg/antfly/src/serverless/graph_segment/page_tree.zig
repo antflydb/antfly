@@ -1188,6 +1188,48 @@ pub fn equivalent(alloc: Allocator, store: Store, left: ?Ref, right: ?Ref, optio
     return (try r.next()) == null;
 }
 
+/// Visit changed records in key order, pruning identical authenticated COW
+/// subtrees. A rebalanced boundary uses an exact merge of bounded cursors.
+/// The visitor borrows records only until change returns.
+pub fn visitDifferences(alloc: Allocator, store: Store, left: ?Ref, right: ?Ref, visitor: anytype) anyerror!void {
+    try store.check(store.ptr);
+    if (left == null and right == null) return;
+    if (left) |l| try l.validate();
+    if (right) |r| try r.validate();
+    if (left != null and right != null) {
+        const lref = left.?;
+        const rref = right.?;
+        if (lref.bytes == rref.bytes and lref.height == rref.height and lref.records == rref.records and std.mem.eql(u8, &lref.digest, &rref.digest)) return;
+        if (lref.height == rref.height and lref.height != 0) {
+            var l = try readPage(alloc, store, lref);
+            defer l.deinit(alloc);
+            var r = try readPage(alloc, store, rref);
+            defer r.deinit(alloc);
+            const aligned = if (l.entries.len != r.entries.len) false else blk: {
+                for (l.entries, r.entries) |le, re| if (!std.mem.eql(u8, le.key, re.key)) break :blk false;
+                break :blk true;
+            };
+            if (aligned) {
+                for (l.entries, r.entries) |le, re| try visitDifferences(alloc, store, le.child, re.child, visitor);
+                return;
+            }
+        }
+    }
+    var l = try Cursor.init(alloc, store, left, "", null);
+    defer l.deinit();
+    var r = try Cursor.init(alloc, store, right, "", null);
+    defer r.deinit();
+    var le = try l.next();
+    var re = try r.next();
+    while (le != null or re != null) {
+        try store.check(store.ptr);
+        const order: std.math.Order = if (le == null) .gt else if (re == null) .lt else std.mem.order(u8, le.?.key, re.?.key);
+        if (order != .eq or !std.mem.eql(u8, le.?.value, re.?.value)) try visitor.change(if (order != .gt) le else null, if (order != .lt) re else null);
+        if (order != .gt) le = try l.next();
+        if (order != .lt) re = try r.next();
+    }
+}
+
 /// Ordered half-open range scan. Memory is bounded by (height + 1) pages, not
 /// degree or graph size. Returned records borrow the cursor until next/deinit.
 pub const Cursor = struct {
@@ -2808,4 +2850,71 @@ test "external lake range equivalence skips unchanged COW branches and handles r
     try std.testing.expectEqual(@as(usize, 0), backing.reads);
     backing.canceled = true;
     try std.testing.expectError(error.Canceled, equivalent(a, backing.store(), root, root, .{}));
+}
+
+test "external lake changed tree traversal skips COW ranges and reports rebalance insertions and deletions" {
+    const a = std.testing.allocator;
+    var backing: TestStore = .{ .alloc = a };
+    defer backing.deinit();
+    const count = 2000;
+    const names = try a.alloc([8]u8, count + 1);
+    defer a.free(names);
+    const changes = try a.alloc(Mutation, count);
+    defer a.free(changes);
+    const value: [128]u8 = @splat(42);
+    for (names, 0..) |*name, i| std.mem.writeInt(u64, name, i, .big);
+    for (changes, names[0..count]) |*change, *name| change.* = .{ .key = name, .value = &value };
+    const root = (try apply(a, backing.store(), null, changes)).?;
+    const altered: [128]u8 = @splat(43);
+    const updated = (try apply(a, backing.store(), root, &.{.{ .key = &names[1000], .value = &altered }})).?;
+    const Visitor = struct {
+        calls: usize = 0,
+        expected: []const u64,
+        removed: bool = false,
+        pub fn change(self: *@This(), left: ?Cursor.Record, right: ?Cursor.Record) !void {
+            const record = if (self.removed) left.? else right.?;
+            try std.testing.expect(self.calls < self.expected.len);
+            try std.testing.expectEqual(self.expected[self.calls], std.mem.readInt(u64, record.key[0..8], .big));
+            self.calls += 1;
+        }
+    };
+    var visitor: Visitor = .{ .expected = &.{1000} };
+    backing.reads = 0;
+    try visitDifferences(a, backing.store(), root, updated, &visitor);
+    try std.testing.expectEqual(@as(usize, 1), visitor.calls);
+    try std.testing.expect(backing.reads < 20);
+    var relocated = root;
+    relocated.attempt = @splat(9);
+    visitor.calls = 0;
+    backing.reads = 0;
+    try visitDifferences(a, backing.store(), root, relocated, &visitor);
+    try std.testing.expectEqual(@as(usize, 0), visitor.calls);
+    try std.testing.expectEqual(@as(usize, 0), backing.reads);
+    const appended = (try apply(a, backing.store(), updated, &.{.{ .key = &names[count], .value = &value }})).?;
+    const removed = (try apply(a, backing.store(), appended, &.{.{ .key = &names[17], .value = null }})).?;
+    const Mixed = struct {
+        calls: usize = 0,
+        pub fn change(self: *@This(), left: ?Cursor.Record, right: ?Cursor.Record) !void {
+            const expected: [3]u64 = .{ 17, 1000, count };
+            const record = left orelse right.?;
+            try std.testing.expect(self.calls < expected.len);
+            try std.testing.expectEqual(expected[self.calls], std.mem.readInt(u64, record.key[0..8], .big));
+            if (self.calls == 0) try std.testing.expect(right == null);
+            if (self.calls == 2) try std.testing.expect(left == null);
+            self.calls += 1;
+        }
+    };
+    var mixed: Mixed = .{};
+    try visitDifferences(a, backing.store(), root, removed, &mixed);
+    try std.testing.expectEqual(@as(usize, 3), mixed.calls);
+    const Failure = struct {
+        fn run(alloc: Allocator, store: Store, old: Ref, next: Ref) !void {
+            var visit: Mixed = .{};
+            try visitDifferences(alloc, store, old, next, &visit);
+            try std.testing.expectEqual(@as(usize, 3), visit.calls);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Failure.run, .{ backing.store(), root, removed });
+    backing.canceled = true;
+    try std.testing.expectError(error.Canceled, visitDifferences(a, backing.store(), root, root, &visitor));
 }

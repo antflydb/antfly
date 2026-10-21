@@ -167,28 +167,43 @@ so collision verification retains authenticated paths across rows.
 Reuse proofs compare authenticated tree ranges and skip identical copy-on-write
 subtrees. Equal authenticated page contents can skip evidence reads even when
 upload attempt addresses differ. Changes to tree shape use an exact ordered
-comparison. Unchanged per-index input trees therefore need no repeated leaf scan. Compact maps for
-multiple original coordinate spaces share one attempt-private current-rank tree;
-only the final maps and their embedded ranks enter the publication closure.
-The rank cache reserves 8 MiB of node retained state and one quarter of the
-configured translation spill allowance; map sorting uses the remaining three
-quarters. Admission failure retires this optional scratch and keeps the ID-map
-reader fallback. Rank-cache buffers never borrow a completed worker's allocator.
+comparison. Unchanged per-index input trees therefore need no repeated leaf scan.
+New compact translations contain only 16-byte source and destination coordinates;
+canonical rank stays in the current ordered membership tree. A later rewrite
+compares the previous and current authenticated ID trees, skips unchanged COW
+subtrees and applies only changed addresses to the prior forward/reverse maps.
+Value-only changes leave those maps intact. Swapped addresses resolve removals
+before final insertions across every spill run. First construction and upgrades
+from historical rank-bearing maps still use bounded spill sorting. Admission
+failure keeps the authenticated ID-map reader fallback.
 
-A bounded optional construction pass joins verified IDs into compact forward and
-reverse trees keyed by 16-byte coordinates. Forward entries also store canonical
-rank, eliminating an additional rank-tree walk for score ties. Batch translation
-sorts probes and retains cursor paths; duplicate inputs share work. When the
-compact pass declines admission, readers use the authenticated ID maps instead.
-Shared decoded-page leases avoid repeated parsing and authentication of immutable
-pages, while every access still checks the pinned reader's authority and deadline.
-No query materializes the complete row map. Covering hydration groups requested
-rows by block and reads each authenticated block once, preserving result order.
+Batch translation sorts probes and retains cursor paths; duplicate inputs share
+work. Each operation owns its cursor/page-cache state. Shared decoded-page leases
+avoid repeated parsing and authentication of immutable pages. The owner mutex
+covers budget accounting, tiny memo updates and metadata installation; remote
+map reads and cold navigation loads run outside it. Every access still checks
+the pinned reader's authority and deadline. No query materializes the complete
+row map. Covering hydration groups requested rows by block and reads each
+authenticated block once, preserving result order.
+
+Optional predicate planning admits at most 4,096 relocated rows and 16 MiB of
+map reads across both metadata-to-current and current-to-text conversion, reserving 32 MiB of the remaining query
+allowance for required execution. Broad predicates decline before expansion.
+Optional readers can borrow shared decoded pages but never lead a shared cache
+flight with a narrower planning budget. A declined prepass cannot propagate its
+local quota failure into a concurrent required reader. Text falls back to exact
+candidate-window membership. Sparse vectors intersect compressed native ordinal
+masks directly when metadata shares the authenticated index space, use bounded
+reverse translation for selective current-space masks, and evaluate broad
+predicates in reached native ordinal windows. Include/exclude masks share one
+conversion allowance and are published only when complete; backing allocation
+failures and cancellation propagate.
 
 Reader leases, GC traversal, cloud publication certificates, startup navigation
 warming and recovery include all current and original navigation/map roots and
-compact translations. Protocol 67 fences readers that cannot interpret scoped
-index bindings. Reconciliation probes bounded unique navigation roots. A deeper
+compact translations. Protocol 68 fences readers that cannot interpret rank-free
+coordinate maps. Historical rank-bearing map certificates retain their original
+serialization and remain readable. Reconciliation probes bounded unique navigation roots. A deeper
 reader failure records a generation- and publication-token-bound repair hint;
 the coordinator rebuilds that publication without reuse. Stale hints cannot
 invalidate a later publication. Hints are process-local and are rediscovered by a
@@ -202,6 +217,42 @@ set needs explicit membership/delta support in each consumer. Worst-case map
 publication and proof comparisons still scale with row count; unchanged
 authenticated subtrees skip verification reads. Cross-file rewrite savings must
 be measured against this verification/publication cost.
+
+## Native delta reuse across membership changes
+
+The remaining expensive case is a changed logical ID set after relocation.
+Coordinate translation alone cannot make a native checkpoint reusable here:
+postings, term/document frequencies, vector membership, ordered covering tuples
+and algebraic contributions all describe the old live set.
+
+Prefer index-local logical fragments backed by the existing native per-file
+mutation and contribution machinery. A fragment census assigns stable logical
+IDs to bounded fragments independently of physical Parquet files. Unchanged
+fragment inputs retain native state. New/changed/deleted inputs rebuild the
+affected fragment, using native removal/addition paths so text collection
+statistics and algebraic retractions stay exact. Publication seals a complete
+new index address space and its map to current physical rows. This avoids
+query-time unions of an unbounded number of overlays and avoids inventing a
+second statistics implementation for tombstoned base postings.
+
+Fragment ownership must be explicit and durable. Never hash an ID into a finite
+row ordinal without collision verification, retain a removed address as live,
+or equate source offsets with logical membership. Split oversized fragments
+under publication admission; retain stable unaffected fragment boundaries.
+Fragment-local reordering is safe only when that fragment's complete native
+contribution is replaced in the same commit. Per-index recipes and shared
+aggregate cohorts still control which fragment inputs can reuse state.
+
+Construction needs a bounded projected spool that routes current source rows to
+those logical fragments once, shared across native builders, rather than a
+physical-source scan for each fragment. Publication admission must account for
+this spool, coordinate maps and native mutations together. If it declines,
+ordinary complete rebuilding remains available. Delta census, maps, contribution
+roots and native checkpoints enter the same reader protocol, publication
+certificate, lease and GC closure. Independent Parquet and Iceberg writers must
+exercise append, removal, input updates, mixed relocation and restart against a
+fresh-build oracle before this path can replace rebasing. This fragment path is
+not implemented by the coordinate-map changes above.
 
 ## Staged extensions
 
@@ -235,7 +286,9 @@ indexed filters, sorting, forward/backward paging, covering/highlight fields,
 dense/sparse membership and SQL aggregation. The Iceberg parameter participates
 in `e2e-full`. Native tests cover spill bounds, duplicate keys, proof tampering,
 flattening, reader-safe GC, certificate binding, cancellation, allocation failures,
-and missing derived navigation. Sparse scores use the existing per-block 8-bit
+missing derived navigation, incremental coordinate swaps, zero-work map reuse,
+parallel cold-page reads, bounded optional read admission and relocated sparse
+predicate fallback. Sparse scores use the existing per-block 8-bit
 quantization tolerance; physical rebuilds need not choose identical block scales.
 
 Further qualification should exercise Parquet and Iceberg rewrites that preserve rows, arbitrarily

@@ -3687,7 +3687,8 @@ keys, missing rows or changed indexed values force rebuild/update. Query readers
 must apply the same mapping to text, scalar predicates, deletes, covering values
 and public identity; a text-only mapping would be incorrect. The current
 stable-key implementation applies these boundaries to scoped resolver views,
-compact coordinate/rank maps, batched predicate translation and covering delivery.
+persistent coordinate maps with shared canonical ordering, budgeted batched
+predicate translation, parallel map readers and covering delivery.
 Trusted-producer mapping adapters and reuse across changed logical ID sets remain
 staged in the linked identity design.
 

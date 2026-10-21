@@ -173,8 +173,15 @@ const Owner = struct {
         }
     }
     fn mapRefs(self: *Owner, a: A, refs: []const local.storage_rowsource_types.RowRef) ![]const local.storage_rowsource_types.RowRef {
-        if (!self.isRelocated()) return refs;
+        return self.mapRefsLimited(a, refs, null);
+    }
+    fn mapRefsLimited(self: *Owner, a: A, refs: []const local.storage_rowsource_types.RowRef, allowance: ?*local.serverless_query_lake_serving.ServingSource.TranslationAllowance) ![]const local.storage_rowsource_types.RowRef {
+        if (!self.isRelocated() or refs.len == 0) return refs;
         const resolver = self.row_resolver.?;
+        if (allowance) |limited| {
+            const translate = resolver.translate_many_bounded orelse return error.QueryCandidateBudgetExceeded;
+            return translate(resolver.ptr, a, refs, true, limited);
+        }
         if (resolver.translate_many) |translate| return translate(resolver.ptr, a, refs, true);
         const result = try a.alloc(local.storage_rowsource_types.RowRef, refs.len);
         for (refs, result) |ref, *target| target.* = try resolver.from_index(resolver.ptr, a, ref);
@@ -598,6 +605,15 @@ pub const Predicate = struct {
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
         try owner.read_context.ensureActive();
         return owner.mapRefs(a, try owner.reader.nextPhysical(a, count, owner.predicate_lower, owner.predicate_upper));
+    }
+    /// Optional publication-pack planning shares its conversion allowance
+    /// across metadata->current and current->text index coordinate spaces.
+    pub fn nextPhysicalBounded(self: *Predicate, a: A, count: usize, allowance: *local.serverless_query_lake_serving.ServingSource.TranslationAllowance) ![]const local.storage_rowsource_types.RowRef {
+        if (self.scan) return error.QueryCandidateBudgetExceeded;
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        try owner.read_context.ensureActive();
+        const refs = try owner.reader.nextPhysical(a, count, owner.predicate_lower, owner.predicate_upper);
+        return owner.mapRefsLimited(a, refs, allowance);
     }
     pub fn next(self: *Predicate, a: A, count: usize) ![]const local.storage_rowsource_types.RowRef {
         if (self.scan) while (true) {
@@ -2160,4 +2176,43 @@ test "external lake compressed predicates require the exact authenticated coordi
     try std.testing.expect(predicate.blocksMatch(null));
     owner.reader.root.predicates = null;
     try std.testing.expect(!predicate.blocksMatch(resolver));
+}
+
+test "external lake optional predicate source translation requires bounded capability" {
+    const Serving = local.serverless_query_lake_serving.ServingSource;
+    const RowRef = local.storage_rowsource_types.RowRef;
+    const Mock = struct {
+        calls: usize = 0,
+        fn bounded(raw: *anyopaque, _: A, refs: []const RowRef, forward: bool, allowance: *Serving.TranslationAllowance) ![]const RowRef {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(forward);
+            if (refs.len > allowance.remaining_rows) return error.QueryCandidateBudgetExceeded;
+            allowance.remaining_rows -= refs.len;
+            self.calls += 1;
+            return refs;
+        }
+        fn required(_: *anyopaque, _: A, _: []const RowRef, _: bool) ![]const RowRef {
+            return error.UnexpectedUnboundedTranslation;
+        }
+    };
+    var mock: Mock = .{};
+    var owner: Owner = undefined;
+    var resolver: Serving.RowResolver = undefined;
+    resolver.ptr = &mock;
+    resolver.relocated = true;
+    resolver.translate_many_bounded = Mock.bounded;
+    resolver.translate_many = Mock.required;
+    owner.row_resolver = resolver;
+    const refs: []const RowRef = &.{.{ .external = .{ .source_id = "source", .snapshot_id = "old", .file_id = "file", .row_group_ordinal = 0, .row_ordinal = 7 } }};
+    var allowance: Serving.TranslationAllowance = .{ .remaining_rows = 1 };
+    _ = try owner.mapRefsLimited(std.testing.allocator, refs, &allowance);
+    try std.testing.expectEqual(@as(u64, 0), allowance.remaining_rows);
+    try std.testing.expectEqual(@as(usize, 1), mock.calls);
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, owner.mapRefsLimited(std.testing.allocator, refs, &allowance));
+    try std.testing.expectEqual(@as(usize, 1), mock.calls);
+    resolver.translate_many_bounded = null;
+    owner.row_resolver = resolver;
+    allowance.remaining_rows = 1;
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, owner.mapRefsLimited(std.testing.allocator, refs, &allowance));
+    try std.testing.expectEqual(@as(usize, 1), mock.calls);
 }

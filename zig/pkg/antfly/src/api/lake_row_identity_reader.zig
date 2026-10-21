@@ -32,14 +32,18 @@ const Binding = struct {
     original_slots: [16]?Slot = @splat(null),
     current_slots: [16]?Slot = @splat(null),
     const Slot = struct { file: [32]u8, slot: u32 };
-    fn slot(self: *Binding, a: A, space: identity.Space, file_id: []const u8, original: bool) !u32 {
+    fn slot(self: *Binding, a: A, reader_: *identity.Reader, space: identity.Space, file_id: []const u8, original: bool) !u32 {
         const digest_ = @import("lake_row_identity_delta.zig").fileKey(file_id);
         const cache = if (original) &self.original_slots else &self.current_slots;
         const bucket = digest_[0] % cache.len;
-        if (cache[bucket]) |cached| if (std.mem.eql(u8, &cached.file, &digest_)) return cached.slot;
-        var value = self.reader();
-        const number = try value.fileSlot(a, space, file_id);
+        try self.owner.lock();
+        const cached = cache[bucket];
+        self.owner.mutex.unlock();
+        if (cached) |value| if (std.mem.eql(u8, &value.file, &digest_)) return value.slot;
+        const number = try reader_.fileSlot(a, space, file_id);
+        try self.owner.lock();
         cache[bucket] = .{ .file = digest_, .slot = number };
+        self.owner.mutex.unlock();
         return number;
     }
     fn from(raw: *anyopaque) *Binding {
@@ -53,43 +57,52 @@ const Binding = struct {
         const self = from(raw);
         return self.resolve(a, ref, false) catch |err| return self.owner.failed(err);
     }
-    fn reader(self: *Binding) identity.Reader {
+    fn reader(self: *Binding, lane: *ReadLane) identity.Reader {
         var value = self.owner.reader;
+        value.pages = &lane.pages;
+        value.cache = &lane.cache;
         value.root.indexes = self.space;
         value.verify_values = self.owner.reader.root.reused.len == 0;
         return value;
     }
     fn resolve(self: *Binding, a: A, ref: RowRef, forward: bool) !RowRef {
         const owner = self.owner;
-        try owner.lock();
-        defer owner.mutex.unlock();
         const source = if (forward) self.space else owner.reader.root.current;
         if (!sameCut(source, ref)) return error.ExternalLakeSnapshotMismatch;
         if (!self.relocated) return ownRef(a, ref);
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
-        var value = self.reader();
+        var lane: ReadLane = undefined;
+        lane.init(owner, scratch.allocator(), null);
+        defer lane.deinit();
+        var value = self.reader(&lane);
         if (self.translation) |translation| {
-            const number = try self.slot(scratch.allocator(), source, ref.external.file_id, forward);
+            const number = try self.slot(scratch.allocator(), &value, source, ref.external.file_id, forward);
             const mapped = value.translateAt(scratch.allocator(), translation, .{ .file = number, .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal }, forward) catch |err| return owner.failed(err);
             const target_space = if (forward) value.root.current else self.space;
-            const version = if (forward) owner.identity_version else (try owner.navigationFor(self.space)).root.public_identity_version;
+            const version = if (forward) owner.identity_version else (try self.nav(scratch.allocator())).root.public_identity_version;
             var result = try value.coordinateReference(a, target_space, mapped.coordinate);
             result.external.identity_version = version;
             return result;
         }
         const possible = (if (forward) value.fromIndex(scratch.allocator(), ref.external.file_id, ref.external.row_group_ordinal, ref.external.row_ordinal) else value.toIndex(scratch.allocator(), ref.external.file_id, ref.external.row_group_ordinal, ref.external.row_ordinal)) catch |err| return owner.failed(err);
         const resolved = possible orelse return owner.failed(error.InvalidLogicalRowIdentity);
-        const version = if (forward) owner.identity_version else (try owner.navigationFor(self.space)).root.public_identity_version;
+        const version = if (forward) owner.identity_version else (try self.nav(scratch.allocator())).root.public_identity_version;
         var result = try value.reference(a, if (forward) value.root.current else self.space, resolved);
         result.external.identity_version = version;
         return result;
     }
     fn translateMany(raw: *anyopaque, a: A, refs: []const RowRef, forward: bool) ![]const RowRef {
         const self = from(raw);
-        return self.translateManyInner(a, refs, forward) catch |err| return self.owner.failed(err);
+        return self.translateManyInner(a, refs, forward, null) catch |err| return self.owner.failed(err);
     }
-    fn translateManyInner(self: *Binding, a: A, refs: []const RowRef, forward: bool) ![]const RowRef {
+    fn translateManyBounded(raw: *anyopaque, a: A, refs: []const RowRef, forward: bool, allowance: *Source.TranslationAllowance) ![]const RowRef {
+        const self = from(raw);
+        if (refs.len > allowance.remaining_rows) return error.QueryCandidateBudgetExceeded;
+        allowance.remaining_rows -= refs.len;
+        return self.translateManyInner(a, refs, forward, allowance) catch |err| return self.owner.failed(err);
+    }
+    fn translateManyInner(self: *Binding, a: A, refs: []const RowRef, forward: bool, allowance: ?*Source.TranslationAllowance) ![]const RowRef {
         const owner = self.owner;
         const result = try a.alloc(RowRef, refs.len);
         var initialized: usize = 0;
@@ -104,8 +117,6 @@ const Binding = struct {
         var begin: usize = 0;
         while (begin < refs.len) {
             const end = @min(refs.len, begin + 256);
-            try owner.lock();
-            defer owner.mutex.unlock();
             var scratch = std.heap.ArenaAllocator.init(a);
             defer scratch.deinit();
             const source = if (forward) self.space else owner.reader.root.current;
@@ -118,24 +129,26 @@ const Binding = struct {
                 begin = end;
                 continue;
             }
-            var reader_ = self.reader();
+            var lane: ReadLane = undefined;
+            lane.init(owner, scratch.allocator(), allowance);
+            defer lane.deinit();
+            var reader_ = self.reader(&lane);
             if (self.translation) |translation| {
                 const coordinates = try scratch.allocator().alloc(identity.logical.Coordinate, end - begin);
-                for (refs[begin..end], coordinates) |ref, *coordinate| coordinate.* = .{ .file = try self.slot(scratch.allocator(), source, ref.external.file_id, forward), .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal };
+                for (refs[begin..end], coordinates) |ref, *coordinate| coordinate.* = .{ .file = try self.slot(scratch.allocator(), &reader_, source, ref.external.file_id, forward), .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal };
                 const mapped = reader_.translateDenseMany(scratch.allocator(), translation, coordinates, forward) catch |err| return owner.failed(err);
-                try self.materialize(a, scratch.allocator(), mapped, result[begin..end], forward, &initialized);
+                try self.materialize(a, scratch.allocator(), &reader_, mapped, result[begin..end], forward, &initialized);
             } else {
                 const rows = reader_.translateMany(scratch.allocator(), refs[begin..end], forward) catch |err| return owner.failed(err);
-                try self.materialize(a, scratch.allocator(), rows, result[begin..end], forward, &initialized);
+                try self.materialize(a, scratch.allocator(), &reader_, rows, result[begin..end], forward, &initialized);
             }
             begin = end;
         }
         return result;
     }
-    fn materialize(self: *Binding, a: A, scratch: A, rows: anytype, targets: []RowRef, forward: bool, initialized: *usize) !void {
-        var reader_ = self.reader();
+    fn materialize(self: *Binding, a: A, scratch: A, reader_: *identity.Reader, rows: anytype, targets: []RowRef, forward: bool, initialized: *usize) !void {
         const target_space = if (forward) reader_.root.current else self.space;
-        const version = if (forward) self.owner.identity_version else (try self.owner.navigationFor(self.space)).root.public_identity_version;
+        const version = if (forward) self.owner.identity_version else (try self.nav(scratch)).root.public_identity_version;
         var files: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
         for (rows, targets) |row, *target| {
             const slot_ = try files.getOrPut(scratch, row.coordinate.file);
@@ -150,15 +163,17 @@ const Binding = struct {
     }
     fn tieRankInner(self: *Binding, a: A, ref: RowRef) !u64 {
         const owner = self.owner;
-        try owner.lock();
-        defer owner.mutex.unlock();
         if (!sameCut(self.space, ref)) return error.ExternalLakeSnapshotMismatch;
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
-        var value = self.reader();
+        var lane: ReadLane = undefined;
+        lane.init(owner, scratch.allocator(), null);
+        defer lane.deinit();
+        var value = self.reader(&lane);
         if (self.translation) |translation| {
-            const number = try self.slot(scratch.allocator(), self.space, ref.external.file_id, true);
+            const number = try self.slot(scratch.allocator(), &value, self.space, ref.external.file_id, true);
             const translated = value.translateAt(scratch.allocator(), translation, .{ .file = number, .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal }, true) catch |err| return owner.failed(err);
+            if (!translation.ranked) return value.canonicalRank(scratch.allocator(), value.root.current, .{ .state = undefined, .coordinate = translated.coordinate, .tie_rank = 0 });
             if (translated.rank >= value.root.current.rows) return owner.failed(error.InvalidLogicalRowIdentity);
             return translated.rank;
         }
@@ -172,18 +187,16 @@ const Binding = struct {
     }
     fn file(raw: *anyopaque, a: A, digest_: []const u8) !?[]const u8 {
         const self = from(raw);
-        const resolver = try self.nav();
+        const resolver = try self.nav(a);
         return resolver.file(a, digest_, false) catch |err| return self.owner.failed(err);
     }
     fn digest(raw: *anyopaque, a: A, file_: []const u8) ![]const u8 {
         const self = from(raw);
-        const resolver = try self.nav();
+        const resolver = try self.nav(a);
         return resolver.digest(a, file_) catch |err| return self.owner.failed(err);
     }
-    fn nav(self: *Binding) !*navigation.Resolver {
-        try self.owner.lock();
-        defer self.owner.mutex.unlock();
-        return self.owner.navigationFor(self.space);
+    fn nav(self: *Binding, a: A) !*navigation.Resolver {
+        return self.owner.navigationFor(a, self.space);
     }
     fn close(_: *anyopaque) void {}
     fn capability(self: *Binding) Source.RowResolver {
@@ -196,7 +209,7 @@ const Binding = struct {
         }
         var space: [32]u8 = undefined;
         hash.final(&space);
-        return .{ .ptr = self, .source = self.space.source, .snapshot = self.space.snapshot, .current_source = self.owner.reader.root.current.source, .current_snapshot = self.owner.reader.root.current.snapshot, .rows = self.owner.reader.root.current.rows, .relocated = self.relocated, .coordinate_space = space, .from_index = fromIndex, .to_index = toIndex, .file = file, .digest = digest, .tie_rank = tieRank, .translate_many = translateMany, .close = close };
+        return .{ .ptr = self, .source = self.space.source, .snapshot = self.space.snapshot, .current_source = self.owner.reader.root.current.source, .current_snapshot = self.owner.reader.root.current.snapshot, .rows = self.owner.reader.root.current.rows, .relocated = self.relocated, .coordinate_space = space, .from_index = fromIndex, .to_index = toIndex, .file = file, .digest = digest, .tie_rank = tieRank, .translate_many = translateMany, .translate_many_bounded = translateManyBounded, .close = close };
     }
 };
 fn sameCut(space: identity.Space, ref: RowRef) bool {
@@ -274,6 +287,10 @@ const Owner = struct {
         const self: *Owner = @ptrCast(@alignCast(raw));
         return Binding.translateMany(&self.default_binding, a, refs, forward);
     }
+    fn translateManyBounded(raw: *anyopaque, a: A, refs: []const RowRef, forward: bool, allowance: *Source.TranslationAllowance) ![]const RowRef {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        return Binding.translateManyBounded(&self.default_binding, a, refs, forward, allowance);
+    }
     fn bindIndex(raw: *anyopaque, name: []const u8) !Source.RowResolver {
         const self: *Owner = @ptrCast(@alignCast(raw));
         try self.lock();
@@ -294,77 +311,53 @@ const Owner = struct {
         try self.bindings.put(self.a, key, binding);
         return binding.capability();
     }
-    fn navigationFor(self: *Owner, space: identity.Space) !*navigation.Resolver {
+    fn navigationFor(self: *Owner, a: A, space: identity.Space) !*navigation.Resolver {
+        try self.cached.context.ensureActive();
         const ref = space.navigation orelse return error.InvalidLogicalRowIdentity;
         if (std.mem.eql(u8, ref.artifact_id, self.reader.root.indexSpace().navigation.?.artifact_id)) return &self.navigation;
-        if (self.navigations.get(ref.artifact_id)) |resolver| return resolver;
-        const root = navigation.load(self.arena.allocator(), self.artifacts, ref, self.pages.cancellation, self.cached) catch |err| return self.failed(err);
+        try self.lock();
+        const existing = self.navigations.get(ref.artifact_id);
+        self.mutex.unlock();
+        if (existing) |resolver| return resolver;
+        // Load with operation-owned scratch outside the publication mutex.
+        // Installation copies only small immutable metadata while locked, so
+        // a cold index space cannot serialize unrelated map readers.
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const root = navigation.load(scratch.allocator(), self.artifacts, ref, self.pages.cancellation, self.cached) catch |err| return self.failed(err);
         if (!std.mem.eql(u8, &root.domain, &self.reader.root.domain) or !std.mem.eql(u8, root.source, space.source) or !std.mem.eql(u8, root.snapshot, space.snapshot) or root.count != space.liveFiles()) return error.InvalidLogicalRowIdentity;
+        try self.lock();
+        defer self.mutex.unlock();
+        if (self.navigations.get(ref.artifact_id)) |resolver| return resolver;
+        const oa = self.arena.allocator();
+        const encoded = try std.json.Stringify.valueAlloc(oa, root, .{});
+        const owned = try std.json.parseFromSliceLeaky(navigation.Root, oa, encoded, .{ .allocate = .alloc_always });
         const resolver = try self.a.create(navigation.Resolver);
         errdefer self.a.destroy(resolver);
-        resolver.* = .{ .root = root, .store = self.artifacts, .cached = self.cached, .token = self.pages.cancellation };
+        resolver.* = .{ .root = owned, .store = self.artifacts, .cached = self.cached, .token = self.pages.cancellation };
         try self.navigations.put(self.a, ref.artifact_id, resolver);
         return resolver;
     }
-    const DecodedPage = struct { page: @import("../serverless/graph_segment/page_tree.zig").Page };
-    fn decodedPage(raw: *anyopaque, a: A, ref: @import("../serverless/graph_segment/page_tree.zig").Ref) !@import("../serverless/graph_segment/page_tree.zig").Page {
-        const self: *Owner = @ptrCast(@alignCast(raw));
-        const tree = @import("../serverless/graph_segment/page_tree.zig");
-        try self.cached.context.ensureActive();
-        try self.pages.cancellation.check();
-        var hash = std.crypto.hash.Blake3.init(.{});
-        hash.update("native-lake-row-map-decoded-page-v1");
-        hash.update(&self.cached.scope);
-        hash.update(&self.reader.root.domain);
-        hash.update(&ref.digest);
-        hash.update(&ref.attempt);
-        var shape: [13]u8 = undefined;
-        std.mem.writeInt(u32, shape[0..4], ref.bytes, .big);
-        shape[4] = ref.height;
-        std.mem.writeInt(u64, shape[5..13], ref.records, .big);
-        hash.update(&shape);
-        var key: [32]u8 = undefined;
-        hash.final(&key);
-        const Loader = struct {
-            owner: *Owner,
-            ref: tree.Ref,
-            fn load(raw_: *anyopaque, item: *local.serverless_query_lake_decoded_cache.Item) !void {
-                const self_: *@This() = @ptrCast(@alignCast(raw_));
-                const out = item.arena.allocator();
-                const value = out.create(DecodedPage) catch |err| {
-                    if (err == error.OutOfMemory and item.budget.isLocallyExhausted()) return error.SqlMemoryLimitExceeded;
-                    return err;
-                };
-                value.* = .{ .page = tree.readPage(out, self_.owner.pages.store(), self_.ref) catch |err| {
-                    if (err == error.OutOfMemory and item.budget.isLocallyExhausted()) return error.SqlMemoryLimitExceeded;
-                    return err;
-                } };
-                item.payload = .{ .extension = value };
-            }
-            fn release(owner: *anyopaque, item: *anyopaque) void {
-                const lease: local.serverless_query_lake_decoded_cache.Lease = .{ .cache = @ptrCast(@alignCast(owner)), .item = @ptrCast(@alignCast(item)) };
-                lease.release();
-            }
-        };
-        var loader: Loader = .{ .owner = self, .ref = ref };
-        const cache = &self.cached.cache.decoded;
-        const lease = cache.acquire(key, cache.max_loading_bytes, self.cached.context, .{ .ptr = &loader, .load = Loader.load }) catch |err| {
-            if (err != error.SqlMemoryLimitExceeded) return self.failed(err);
-            try self.cached.context.ensureActive();
-            return tree.readPage(a, self.pages.store(), ref) catch |failure| return self.failed(failure);
-        };
-        errdefer lease.release();
-        try self.cached.context.ensureActive();
-        const value: *const DecodedPage = @ptrCast(@alignCast(lease.item.payload.extension));
-        var page = value.page;
-        page.lease = .{ .owner = lease.cache, .item = lease.item, .release = Loader.release };
-        return page;
+    fn charge(self: *Owner, amount: u64, allowance: ?*Source.TranslationAllowance) !void {
+        try self.lock();
+        defer self.mutex.unlock();
+        if (allowance) |limited| {
+            if (amount > limited.remaining_reads or amount > self.reads -| limited.required_reserve) return error.QueryCandidateBudgetExceeded;
+            limited.remaining_reads -= amount;
+        }
+        try @import("../serverless/artifacts/store.zig").chargeReadBudget(&self.reads, amount);
     }
-    fn readPage(raw: *anyopaque, a: A, store: *@import("../serverless/artifacts/store.zig").ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, _: [32]u8, token: @import("antfly_cancellation").CancellationToken, budget: *u64) ![]u8 {
+    fn decodedPage(raw: *anyopaque, a: A, ref: @import("../serverless/graph_segment/page_tree.zig").Ref) !@import("../serverless/graph_segment/page_tree.zig").Page {
+        var lane: ReadLane = undefined;
+        lane.init(@ptrCast(@alignCast(raw)), a, null);
+        defer lane.deinit();
+        return ReadLane.decodedPage(&lane, a, ref);
+    }
+    fn readPage(raw: *anyopaque, a: A, store: *@import("../serverless/artifacts/store.zig").ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, _: [32]u8, token: @import("antfly_cancellation").CancellationToken, _: *u64) ![]u8 {
         const self: *Owner = @ptrCast(@alignCast(raw));
         try self.cached.context.ensureActive();
         if (offset != 0 or length != ref.byte_len) return error.InvalidLogicalRowIdentity;
-        try @import("../serverless/artifacts/store.zig").chargeReadBudget(budget, length);
+        try self.charge(length, null);
         return @import("lake_index_aggregate_artifact.zig").readArtifact(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, self.cached) catch |err| return self.failed(err);
     }
     fn close(raw: *anyopaque) void {
@@ -388,6 +381,100 @@ const Owner = struct {
         self.lease.deinit();
         self.arena.deinit();
         a.destroy(self);
+    }
+};
+
+/// Mutable cursor/cache state belongs to one synchronous operation, while
+/// authenticated decoded pages and publication authority remain shared.
+const ReadLane = struct {
+    owner: *Owner,
+    allowance: ?*Source.TranslationAllowance,
+    pages: @import("../serverless/graph_segment/page_store.zig").PageStore = undefined,
+    cache: @import("../serverless/graph_segment/page_tree.zig").Cache = undefined,
+    unused_reads: u64 = 0,
+    unused_writes: u64 = 0,
+    fn init(self: *ReadLane, owner_: *Owner, a: A, allowance: ?*Source.TranslationAllowance) void {
+        self.* = .{ .owner = owner_, .allowance = allowance };
+        self.pages = .{ .domain = owner_.reader.root.domain, .artifacts = &owner_.artifacts, .cancellation = owner_.pages.cancellation, .remaining_read_bytes = &self.unused_reads, .remaining_write_bytes = &self.unused_writes, .read_cache = .{ .ptr = self, .read = readPage } };
+        var storage = self.pages.store();
+        storage.decoded_page = .{ .ptr = self, .read = decodedPage };
+        self.cache = .{ .alloc = a, .underlying = storage, .max_bytes = 256 * 1024 };
+    }
+    fn deinit(self: *ReadLane) void {
+        self.cache.deinit();
+    }
+    fn readPage(raw: *anyopaque, a: A, store: *@import("../serverless/artifacts/store.zig").ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, _: [32]u8, token: @import("antfly_cancellation").CancellationToken, _: *u64) ![]u8 {
+        const self: *ReadLane = @ptrCast(@alignCast(raw));
+        try self.owner.cached.context.ensureActive();
+        if (offset != 0 or length != ref.byte_len) return error.InvalidLogicalRowIdentity;
+        try self.owner.charge(length, self.allowance);
+        return @import("lake_index_aggregate_artifact.zig").readArtifact(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, self.owner.cached) catch |err| return self.owner.failed(err);
+    }
+    const DecodedPage = struct { page: @import("../serverless/graph_segment/page_tree.zig").Page };
+    fn decodedPage(raw: *anyopaque, a: A, ref: @import("../serverless/graph_segment/page_tree.zig").Ref) !@import("../serverless/graph_segment/page_tree.zig").Page {
+        const lane: *ReadLane = @ptrCast(@alignCast(raw));
+        const self = lane.owner;
+        const tree = @import("../serverless/graph_segment/page_tree.zig");
+        try self.cached.context.ensureActive();
+        try self.pages.cancellation.check();
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("native-lake-row-map-decoded-page-v1");
+        hash.update(&self.cached.scope);
+        hash.update(&self.reader.root.domain);
+        hash.update(&ref.digest);
+        hash.update(&ref.attempt);
+        var shape: [13]u8 = undefined;
+        std.mem.writeInt(u32, shape[0..4], ref.bytes, .big);
+        shape[4] = ref.height;
+        std.mem.writeInt(u64, shape[5..13], ref.records, .big);
+        hash.update(&shape);
+        var key: [32]u8 = undefined;
+        hash.final(&key);
+        const Loader = struct {
+            lane: *ReadLane,
+            ref: tree.Ref,
+            fn load(raw_: *anyopaque, item: *local.serverless_query_lake_decoded_cache.Item) !void {
+                const self_: *@This() = @ptrCast(@alignCast(raw_));
+                const out = item.arena.allocator();
+                const value = out.create(DecodedPage) catch |err| {
+                    if (err == error.OutOfMemory and item.budget.isLocallyExhausted()) return error.SqlMemoryLimitExceeded;
+                    return err;
+                };
+                value.* = .{ .page = tree.readPage(out, self_.lane.pages.store(), self_.ref) catch |err| {
+                    if (err == error.OutOfMemory and item.budget.isLocallyExhausted()) return error.SqlMemoryLimitExceeded;
+                    return err;
+                } };
+                item.payload = .{ .extension = value };
+            }
+            fn release(owner: *anyopaque, item: *anyopaque) void {
+                const lease: local.serverless_query_lake_decoded_cache.Lease = .{ .cache = @ptrCast(@alignCast(owner)), .item = @ptrCast(@alignCast(item)) };
+                lease.release();
+            }
+        };
+        var loader: Loader = .{ .lane = lane, .ref = ref };
+        const cache = &self.cached.cache.decoded;
+        // Optional planning never leads a shared flight with its narrower
+        // allowance: required readers must not inherit a planner's decline.
+        if (lane.allowance != null) {
+            if (cache.lookup(key)) |lease| {
+                const value: *const DecodedPage = @ptrCast(@alignCast(lease.item.payload.extension));
+                var page = value.page;
+                page.lease = .{ .owner = lease.cache, .item = lease.item, .release = Loader.release };
+                return page;
+            }
+            return tree.readPage(a, lane.pages.store(), ref);
+        }
+        const lease = cache.acquire(key, cache.max_loading_bytes, self.cached.context, .{ .ptr = &loader, .load = Loader.load }) catch |err| {
+            if (err != error.SqlMemoryLimitExceeded) return self.failed(err);
+            try self.cached.context.ensureActive();
+            return tree.readPage(a, lane.pages.store(), ref) catch |failure| return self.failed(failure);
+        };
+        errdefer lease.release();
+        try self.cached.context.ensureActive();
+        const value: *const DecodedPage = @ptrCast(@alignCast(lease.item.payload.extension));
+        var page = value.page;
+        page.lease = .{ .owner = lease.cache, .item = lease.item, .release = Loader.release };
+        return page;
     }
 };
 
@@ -448,6 +535,7 @@ pub fn install(table_id: u64, source: *Source, store: *Store, publication: local
     resolver.digest = Owner.digest;
     resolver.tie_rank = Owner.tieRank;
     resolver.translate_many = Owner.translateMany;
+    resolver.translate_many_bounded = Owner.translateManyBounded;
     resolver.bind_index = Owner.bindIndex;
     resolver.close = Owner.close;
     source.row_resolver = resolver;
@@ -500,6 +588,58 @@ test "external lake index scoped views distinguish same snapshot labels and immu
         owner.bindings.deinit(a);
         owner.arena.deinit();
     }
+    // Distinct cold map pages must overlap provider reads. The old owner-wide
+    // lock serialized this path even when query lanes had independent cursors.
+    const Probe = struct {
+        var active: *@This() = undefined;
+        backend: @import("../serverless/artifacts/store.zig").ArtifactStore,
+        current: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        fn read(_: *anyopaque, alloc: A, id: []const u8, maximum: usize, token: @import("antfly_cancellation").CancellationToken) ![]u8 {
+            const self = active;
+            const current_ = self.current.fetchAdd(1, .acq_rel) + 1;
+            defer _ = self.current.fetchSub(1, .acq_rel);
+            _ = self.peak.fetchMax(current_, .acq_rel);
+            const deadline = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+            while (self.peak.load(.acquire) < 2) {
+                if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.UnexpectedSerializedRead;
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            }
+            const bytes = try self.backend.getAllocWithCancellationUsingAllocator(alloc, id, token);
+            errdefer alloc.free(bytes);
+            if (bytes.len > maximum) return error.ArtifactTooLarge;
+            return bytes;
+        }
+        fn run(binding: *Binding, expected: u64, failure: *?anyerror) void {
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            const ref: RowRef = .{ .external = .{ .source_id = "source", .snapshot_id = "same", .file_id = "file", .row_group_ordinal = 0, .row_ordinal = 0 } };
+            const result = Binding.fromIndex(binding, scratch.allocator(), ref) catch |err| {
+                failure.* = err;
+                return;
+            };
+            if (result.external.row_ordinal != expected) failure.* = error.TestUnexpectedResult;
+        }
+    };
+    var probe: Probe = .{ .backend = artifacts };
+    Probe.active = &probe;
+    var vtable = artifacts.vtable.*;
+    vtable.get_bounded_alloc_with_cancellation = Probe.read;
+    owner.artifacts.vtable = &vtable;
+    owner.cached.context.io = std.testing.io;
+    {
+        var failures: [2]?anyerror = @splat(null);
+        var group: std.Io.Group = .init;
+        defer group.cancel(std.testing.io);
+        var left: Binding = .{ .owner = &owner, .space = old.current, .relocated = true };
+        var right: Binding = .{ .owner = &owner, .space = current.current, .relocated = true };
+        try group.concurrent(std.testing.io, Probe.run, .{ &left, 1, &failures[0] });
+        try group.concurrent(std.testing.io, Probe.run, .{ &right, 0, &failures[1] });
+        try group.await(std.testing.io);
+        for (failures) |failure| if (failure) |err| return err;
+    }
+    try std.testing.expectEqual(@as(usize, 2), probe.peak.load(.acquire));
+    owner.artifacts.vtable = artifacts.vtable;
     // Parsed immutable pages are shared across seeks; current authority still
     // applies to a warm hit. Cache pressure falls back to the required read.
     var first_page = try Owner.decodedPage(&owner, a, current.current.by_id.?);
@@ -523,6 +663,15 @@ test "external lake index scoped views distinguish same snapshot labels and immu
     var output = std.heap.ArenaAllocator.init(a);
     defer output.deinit();
     const oa = output.allocator();
+    // Make the required-versus-optional admission check cold, independently
+    // of which pages the parallel translation above happened to warm.
+    serving_cache.deinit();
+    serving_cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    serving_cache.decoded.max_loading_bytes = 0;
+    var declined: Source.TranslationAllowance = .{ .remaining_reads = 0, .required_reserve = 0 };
+    const before = owner.reads;
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, body.translate_many_bounded.?(body.ptr, oa, &.{ref}, true, &declined));
+    try std.testing.expectEqual(before, owner.reads);
     const mapped = try body.from_index(body.ptr, oa, ref);
     const direct = try cover.from_index(cover.ptr, oa, ref);
     try std.testing.expectEqual(@as(u64, 1), mapped.external.row_ordinal);
@@ -534,4 +683,24 @@ test "external lake index scoped views distinguish same snapshot labels and immu
     try std.testing.expectEqual(@as(u64, 1), batch[1].external.row_ordinal);
     body.close(body.ptr); // A borrowed view cannot destroy its shared owner.
     try std.testing.expectEqual(@as(u64, 1), (try body.from_index(body.ptr, oa, ref)).external.row_ordinal);
+}
+
+test "external lake row-map optional admission preserves required reads and cancellation" {
+    var owner: Owner = undefined;
+    owner.mutex = .unlocked;
+    owner.reads = 1024;
+    owner.cached.context = .{};
+    var allowance: Source.TranslationAllowance = .{ .remaining_reads = 128, .required_reserve = 512 };
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, owner.charge(129, &allowance));
+    try std.testing.expectEqual(@as(u64, 1024), owner.reads);
+    try owner.charge(128, &allowance);
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, owner.charge(1, &allowance));
+    try owner.charge(700, null);
+    try std.testing.expectEqual(@as(u64, 196), owner.reads);
+    allowance.remaining_reads = 1024;
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, owner.charge(1, &allowance));
+    try std.testing.expectEqual(@as(u64, 196), owner.reads);
+    owner.cached.context.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, owner.charge(1, null));
+    try std.testing.expectEqual(@as(u64, 196), owner.reads);
 }

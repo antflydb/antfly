@@ -53,6 +53,7 @@ test {
     _ = @import("api/lake_index_native_text.zig");
     _ = @import("api/lake_row_identity_delta.zig");
     _ = @import("api/lake_row_translations.zig");
+    _ = @import("api/lake_row_translation_delta.zig");
     _ = @import("api/lake_row_fingerprints.zig");
     _ = @import("api/lake_index_repairs.zig");
     _ = @import("api/lake_index_navigation_warming.zig");

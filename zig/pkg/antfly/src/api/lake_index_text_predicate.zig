@@ -27,10 +27,14 @@ const Compiled = Graph.CompiledPatternFilter;
 
 /// Translate a complete physical selection in bounded tiles before deriving
 /// index-space pack/ordinal supersets. Residual predicates still use current rows.
-pub fn indexSelection(a: A, source: *local.serverless_query_lake_serving.ServingSource, binding: ?local.serverless_query_lake_serving.ServingSource.RowResolver, selected: *const @import("lake_index_physical_set.zig").Set) !@import("lake_index_physical_set.zig").Set {
-    return indexSelectionCut(a, source.inventory.source_id, source.inventory.snapshot_id, binding, selected);
+pub fn indexSelection(a: A, source: *local.serverless_query_lake_serving.ServingSource, binding: ?local.serverless_query_lake_serving.ServingSource.RowResolver, selected: *const @import("lake_index_physical_set.zig").Set, allowance: *local.serverless_query_lake_serving.ServingSource.TranslationAllowance) !@import("lake_index_physical_set.zig").Set {
+    if (selected.boundedCardinality(@intCast(allowance.remaining_rows)) == null) return error.QueryCandidateBudgetExceeded;
+    return indexSelectionCutLimited(a, source.inventory.source_id, source.inventory.snapshot_id, binding, selected, allowance);
 }
 fn indexSelectionCut(a: A, source_id: []const u8, snapshot_id: []const u8, binding: ?local.serverless_query_lake_serving.ServingSource.RowResolver, selected: *const @import("lake_index_physical_set.zig").Set) !@import("lake_index_physical_set.zig").Set {
+    return indexSelectionCutLimited(a, source_id, snapshot_id, binding, selected, null);
+}
+fn indexSelectionCutLimited(a: A, source_id: []const u8, snapshot_id: []const u8, binding: ?local.serverless_query_lake_serving.ServingSource.RowResolver, selected: *const @import("lake_index_physical_set.zig").Set, allowance: ?*local.serverless_query_lake_serving.ServingSource.TranslationAllowance) !@import("lake_index_physical_set.zig").Set {
     const Set = @import("lake_index_physical_set.zig").Set;
     const RowRef = local.storage_rowsource_types.RowRef;
     var result = Set.init(a);
@@ -48,7 +52,7 @@ fn indexSelectionCut(a: A, source_id: []const u8, snapshot_id: []const u8, bindi
                 refs[count] = .{ .external = .{ .source_id = source_id, .snapshot_id = snapshot_id, .file_id = file.key_ptr.*, .row_group_ordinal = block.key_ptr.group, .row_ordinal = (@as(u64, block.key_ptr.high) << 32) | low } };
                 count += 1;
                 if (count == refs.len) {
-                    const mapped = try indexBatch(scratch.allocator(), binding, refs[0..count]);
+                    const mapped = try indexBatch(scratch.allocator(), binding, refs[0..count], allowance);
                     for (mapped) |ref| try result.addRow(ref.external.file_id, ref.external.row_group_ordinal, ref.external.row_ordinal);
                     _ = scratch.reset(.retain_capacity);
                     count = 0;
@@ -56,13 +60,17 @@ fn indexSelectionCut(a: A, source_id: []const u8, snapshot_id: []const u8, bindi
             }
         }
     }
-    const mapped = try indexBatch(scratch.allocator(), binding, refs[0..count]);
+    const mapped = try indexBatch(scratch.allocator(), binding, refs[0..count], allowance);
     for (mapped) |ref| try result.addRow(ref.external.file_id, ref.external.row_group_ordinal, ref.external.row_ordinal);
     return result;
 }
 
-fn indexBatch(a: A, binding: ?local.serverless_query_lake_serving.ServingSource.RowResolver, refs: []const local.storage_rowsource_types.RowRef) ![]const local.storage_rowsource_types.RowRef {
+fn indexBatch(a: A, binding: ?local.serverless_query_lake_serving.ServingSource.RowResolver, refs: []const local.storage_rowsource_types.RowRef, allowance: ?*local.serverless_query_lake_serving.ServingSource.TranslationAllowance) ![]const local.storage_rowsource_types.RowRef {
     const resolver = binding orelse return refs;
+    if (allowance) |limited| {
+        const translate = resolver.translate_many_bounded orelse return error.QueryCandidateBudgetExceeded;
+        return translate(resolver.ptr, a, refs, false, limited);
+    }
     if (resolver.translate_many) |translate| return translate(resolver.ptr, a, refs, false);
     const result = try a.alloc(local.storage_rowsource_types.RowRef, refs.len);
     for (refs, result) |ref, *target| target.* = try resolver.to_index(resolver.ptr, a, ref);
@@ -787,6 +795,33 @@ fn PredicateResolver(comptime Set: type) type {
                 for (self.predicates.items) |*predicate| predicate.deinit();
                 self.predicates.clearRetainingCapacity();
             }
+            /// Reopen an exact compound predicate rather than consuming the
+            /// adaptive membership cursor. Shared original coordinates keep
+            /// broad native selections compressed through vector admission.
+            pub fn indexSpaceSelection(self: *@This(), a: A, target: ?local.serverless_query_lake_serving.ServingSource.RowResolver) !?PhysicalSet {
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                const ca = arena.allocator();
+                const parsed = try std.json.parseFromSliceLeaky(std.json.Value, ca, self.json, .{});
+                const compiled = try Graph.compilePatternFilter(ca, parsed);
+                var conditions: std.ArrayList(Condition) = .empty;
+                if (!try collectConditions(ca, compiled, &conditions, 0)) return null;
+                var predicate = (try rows.tryOpenPredicateWithContext(a, self.resolver.server, self.resolver.table, conditions.items, self.resolver.context, self.resolver.source, self.resolver.pinned)) orelse return null;
+                defer predicate.deinit();
+                if (!predicate.blocksMatch(target)) return null;
+                var result = PhysicalSet.init(a);
+                errdefer result.deinit();
+                var window = std.heap.ArenaAllocator.init(a);
+                defer window.deinit();
+                while (true) {
+                    try self.resolver.read_context.ensureActive();
+                    _ = window.reset(.free_all);
+                    const blocks = try predicate.nextBlocks(window.allocator());
+                    if (blocks.len == 0) break;
+                    for (blocks) |block| try result.addBlock(block);
+                }
+                return result;
+            }
             fn materialize(self: *@This()) !void {
                 if (self.complete != null) return;
                 // A selective exact driver is cheaper than walking a broad
@@ -970,14 +1005,31 @@ fn PredicateResolver(comptime Set: type) type {
             }
             return best;
         }
-        pub fn selectiveCandidates(self: Self, a: A, json: []const u8, limit: usize) !?PhysicalSet {
+        pub fn selectiveCandidates(self: Self, a: A, json: []const u8, limit: usize, allowance: *local.serverless_query_lake_serving.ServingSource.TranslationAllowance) !?PhysicalSet {
             var best = (try self.selectivePredicate(a, json, limit)) orelse return null;
             defer best.deinit();
-            var result = try self.consume(a, &best);
-            if (result.boundedCardinality(limit) == null) {
-                result.deinit();
-                return null;
+            if (best.hasBlocks()) {
+                var result = try self.consume(a, &best);
+                if (result.boundedCardinality(limit) == null) {
+                    result.deinit();
+                    return null;
+                }
+                return result;
             }
+            var result = PhysicalSet.init(a);
+            var keep = false;
+            defer if (!keep) result.deinit();
+            var window = std.heap.ArenaAllocator.init(a);
+            defer window.deinit();
+            while (true) {
+                try self.read_context.ensureActive();
+                _ = window.reset(.free_all);
+                const refs = try best.nextPhysicalBounded(window.allocator(), 256, allowance);
+                if (refs.len == 0) break;
+                for (refs) |ref| try result.addRow(ref.external.file_id, ref.external.row_group_ordinal, ref.external.row_ordinal);
+                if (result.boundedCardinality(limit) == null) return null;
+            }
+            keep = true;
             return result;
         }
 

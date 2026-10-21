@@ -441,15 +441,18 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
             pages.admitPublication();
             var bindings = try row_identity_api.proveIndexReuse(a, na, &pages, previous, identity.*, published.declarations);
             if (bindings.len != 0) {
-                var rank_cache: @import("lake_row_translations.zig").RankCache = .{};
-                defer rank_cache.deinit();
                 for (bindings, 0..) |*binding_, index| {
                     var prior_translation: ?row_identity_api.Translation = null;
                     for (bindings[0..index]) |earlier| if (earlier.translation != null and earlier.space.by_id != null and binding_.space.by_id != null and earlier.space.by_id.?.eql(binding_.space.by_id.?)) {
                         prior_translation = earlier.translation;
                         break;
                     };
-                    binding_.translation = if (prior_translation) |translation| translation else try @import("lake_row_translations.zig").buildUsingCache(a, &pages, binding_.space, identity.current, context, identity_spill_bytes, &rank_cache);
+                    var previous_translation: ?row_identity_api.Translation = null;
+                    for (previous.reused) |old_binding| if (old_binding.translation != null and old_binding.space.by_id != null and binding_.space.by_id != null and old_binding.space.by_id.?.eql(binding_.space.by_id.?)) {
+                        previous_translation = old_binding.translation;
+                        break;
+                    };
+                    binding_.translation = if (prior_translation) |translation| translation else try @import("lake_row_translation_delta.zig").build(a, &pages, binding_.space, identity.current, if (previous_translation != null) previous.current else null, previous_translation, context, identity_spill_bytes);
                 }
                 var prospective = identity.*;
                 prospective.reused = bindings;

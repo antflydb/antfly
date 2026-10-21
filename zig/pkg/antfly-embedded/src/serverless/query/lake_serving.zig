@@ -384,6 +384,13 @@ pub const ServingSource = struct {
 
     /// Query-owned translation for one verified, publication-bound index cut.
     /// Parallel views borrow it until they have joined their parent source.
+    /// Operation-owned allowance shared by optional coordinate conversions.
+    /// Required execution retains its own admission and remaining read reserve.
+    pub const TranslationAllowance = struct {
+        remaining_rows: u64 = 4096,
+        remaining_reads: u64 = 16 * 1024 * 1024,
+        required_reserve: u64 = 32 * 1024 * 1024,
+    };
     pub const RowResolver = struct {
         ptr: *anyopaque,
         source: []const u8,
@@ -397,6 +404,7 @@ pub const ServingSource = struct {
         digest: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror![]const u8,
         tie_rank: *const fn (*anyopaque, std.mem.Allocator, @import("../../storage/rowsource/types.zig").RowRef) anyerror!u64,
         translate_many: ?*const fn (*anyopaque, std.mem.Allocator, []const @import("../../storage/rowsource/types.zig").RowRef, bool) anyerror![]const @import("../../storage/rowsource/types.zig").RowRef = null,
+        translate_many_bounded: ?*const fn (*anyopaque, std.mem.Allocator, []const @import("../../storage/rowsource/types.zig").RowRef, bool, *TranslationAllowance) anyerror![]const @import("../../storage/rowsource/types.zig").RowRef = null,
         bind_index: ?*const fn (*anyopaque, []const u8) anyerror!RowResolver = null,
         relocated: bool = true,
         /// Authenticated identity for compressed index-space intersections.

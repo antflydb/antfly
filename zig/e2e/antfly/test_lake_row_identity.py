@@ -359,6 +359,26 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                     "limit": 7,
                 },
             ]
+            # Exercise native vector admission in original index coordinates,
+            # including include-minus-exclude and a broad ordered predicate.
+            for vector in requests_[-2:]:
+                requests_.extend(
+                    [
+                        dict(
+                            vector,
+                            filter_query={
+                                "term": {"path": "/id", "value": base + 17}
+                            },
+                        ),
+                        dict(
+                            vector,
+                            filter_query={"range": {"path": "/id", "gte": base + 17}},
+                            exclusion_query={
+                                "term": {"path": "/id", "value": base + 23}
+                            },
+                        ),
+                    ]
+                )
             for request in requests_:
                 actual = call("POST", "/tables/logical/query", request)
                 expected = call("POST", f"/tables/{oracle}/query", request)
