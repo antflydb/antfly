@@ -156,7 +156,8 @@ fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight
         report.format_version = header.format_version;
         var native = false;
         if (header.format_version == backup_codec.format_version) {
-            var root = try backup_bundle_io.readManifestFromFile(allocator, io, source, initial.size);
+            const max_block_bytes = std.math.cast(usize, options.max_expanded_bytes) orelse std.math.maxInt(usize);
+            var root = try backup_bundle_io.readManifestFromFileLimited(allocator, io, source, initial.size, max_block_bytes);
             defer root.deinit();
             if (root.value.mode != .full) return error.BackupBaseRequired;
             try backup_bundle.validateReadablePayloadFeatures(root.value);
@@ -173,7 +174,7 @@ fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight
                 const scratch = try temporaryPreparationPath(allocator, io, "antfly-inspect-", "");
                 defer allocator.free(scratch);
                 defer std.Io.Dir.cwd().deleteTree(io, scratch) catch {};
-                try backup_bundle_io.extractNativeFileToStagingDirectoryCancellable(allocator, io, source, initial.size, scratch, options.cancellation);
+                try backup_bundle_io.extractNativeFileToStagingDirectoryCancellableLimited(allocator, io, source, initial.size, scratch, options.cancellation, max_block_bytes);
                 var manifest = try backups_api.readManifest(allocator, scratch, root.value.backup_id);
                 defer manifest.deinit(allocator);
                 if (manifest.format != .native or !std.mem.eql(u8, manifest.table_name, root.value.table_name)) return error.BackupArtifactFormatMismatch;
@@ -181,7 +182,7 @@ fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight
                 // per-shard catalogs. Inspect it independently before all shards.
                 var inspector: preflight.Inspector = .{ .allocator = allocator, .report = report, .options = options };
                 defer inspector.deinit();
-                try inspector.metadataJson(manifest.indexes_json);
+                try inspector.indexCatalogJson(manifest.indexes_json);
                 try inspector.replicationSourcesJson(manifest.replication_sources_json);
                 for (manifest.shards) |shard| {
                     try options.cancellation.check();
@@ -316,9 +317,9 @@ pub fn inspectEmbeddedLite(allocator: Allocator, io: std.Io, backend: *lite_back
 fn inspectPortableCatalogs(allocator: Allocator, io: std.Io, file: std.Io.File, options: preflight.Options, report: *preflight.Report, catalogs: InspectionCatalogs) !portable_backup.FileInspection {
     var inspector: preflight.Inspector = .{ .allocator = allocator, .report = report, .options = options };
     defer inspector.deinit();
-    if (catalogs.indexes_json.len != 0) try inspector.metadataJson(catalogs.indexes_json);
+    if (catalogs.indexes_json.len != 0) try inspector.indexCatalogJson(catalogs.indexes_json);
     if (catalogs.replication_sources_json.len != 0) try inspector.replicationSourcesJson(catalogs.replication_sources_json);
-    return portable_backup.inspectPortableFileBlocks(allocator, io, file, .{ .metadata_first = true, .max_input_bytes = options.max_input_bytes, .max_logical_bytes = options.max_expanded_bytes, .cancellation = options.cancellation }, &inspector, preflight.Inspector.visit);
+    return portable_backup.inspectPortableFileBlocks(allocator, io, file, .{ .metadata_first = true, .max_input_bytes = options.max_input_bytes, .max_logical_bytes = options.max_expanded_bytes, .max_metadata_bytes = options.max_metadata_bytes, .max_document_bytes = options.max_document_bytes, .cancellation = options.cancellation }, &inspector, preflight.Inspector.visit);
 }
 
 pub fn defaultBackupIdAlloc(allocator: Allocator, path: []const u8) ![]u8 {
@@ -2585,8 +2586,8 @@ test "backup preflight native multishard scans later shards and table producers"
         .description = "",
         .schema_json = "{}",
         .read_schema_json = "",
-        .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"${secret:native-pg}\",\"postgres_table\":\"public.users\"}]",
-        .indexes_json = "{\"enrichments\":[{\"name\":\"pdf\",\"kind\":\"asset\",\"field\":\"media\",\"producer\":{\"type\":\"reader\"}}]}",
+        .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"${secret:replication.pg}\",\"postgres_table\":\"public.documents\"}]",
+        .indexes_json = "{\"default\":{\"type\":\"embeddings\",\"field\":\"media\",\"dimension\":3,\"embedder\":{\"model\":\"mock\"}},\"enrichments\":[{\"name\":\"pdf\",\"kind\":\"asset\",\"field\":\"media\",\"producer\":{\"type\":\"reader\"}}]}",
         .shards = &shards,
     };
     try backups_api.writeManifest(a, root, &manifest);
@@ -2606,8 +2607,9 @@ test "backup preflight native multishard scans later shards and table producers"
     try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("inventory").?.object.get("documents").?.integer);
     try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("inventory").?.object.get("shards").?.integer);
     try std.testing.expect(std.mem.indexOf(u8, json, "source_local") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "replication_source") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "native-pg") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"model\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"replication_source\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "replication.pg") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"document_id\":\"z\"") != null);
 }
 
@@ -2686,6 +2688,219 @@ test "backup preflight relational rows use archived schema for active media fiel
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scan_complete\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "source_local") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "row:late") != null);
+    const limited = try inspectInputJsonAlloc(a, path, null, .{ .max_document_bytes = 1 });
+    defer a.free(limited);
+    try std.testing.expect(std.mem.indexOf(u8, limited, "\"failure_code\":\"limit_exceeded\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, limited, "\"scan_complete\":false") != null);
+}
+
+test "backup preflight document decompression respects expanded byte limit" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const compressed = "\x28\xb5\x2f\xfd\x04\x58\x94\x00\x00\x50\x7b\x22\x62\x6f\x64\x79\x22\x3a\x22\x61\x01\x00\xf3\xff\x39\x40\x02\x02\x00\x10\x61\x59\x00\x00\x61\x61\x61\x61\x61\x61\x61\x61\x61\x22\x7d\x14\x68\xf4\x0a";
+    const decoded = try backup_codec.decompressZstd(a, compressed);
+    defer a.free(decoded);
+    try std.testing.expectEqual(@as(usize, 262155), decoded.len);
+    var archive: std.ArrayListUnmanaged(u8) = .empty;
+    defer archive.deinit(a);
+    try backup_codec.writeHeader(&archive, a, .{ .format_version = backup_codec.legacy_format_version, .flags = 0, .created_at_ns = 0, .backup_id = @splat(0), .table_count = 1, .shard_count = 1 });
+    const payload = try backup_codec.encodeDocumentBatch(a, &.{.{ .key = "doc", .value_flags = backup_codec.doc_value_flag_compressed, .value = compressed, .timestamp_ns = 0 }});
+    defer a.free(payload);
+    try backup_codec.writeBlock(&archive, a, .document_batch, payload);
+    // This proves the input itself is accepted by the shared restore reader.
+    try portable_backup.validatePortable(a, archive.items);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(io, "compressed.afb", .{ .read = true });
+    defer file.close(io);
+    try file.writePositionalAll(io, archive.items, 0);
+    const path = try tmp.dir.realPathFileAlloc(io, "compressed.afb", a);
+    defer a.free(path);
+    const json = try inspectInputJsonAlloc(a, path, "{\"version\":1,\"configuration_id\":\"empty\"}", .{ .max_expanded_bytes = 4096 });
+    defer a.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "limit_exceeded") != null);
+    var counter: InspectionCounter = .{};
+    try std.testing.expectError(error.BackupExpansionLimitExceeded, portable_backup.inspectPortableFileBlocks(a, io, file, .{ .max_logical_bytes = 4096 }, &counter, InspectionCounter.visit));
+    try std.testing.expectEqual(@as(usize, 0), counter.blocks);
+    const inspected = try portable_backup.inspectPortableFileBlocks(a, io, file, .{}, &counter, InspectionCounter.visit);
+    try std.testing.expect(inspected.logical_bytes >= decoded.len);
+    counter = .{};
+    _ = try portable_backup.inspectPortableFileBlocks(a, io, file, .{ .max_logical_bytes = inspected.logical_bytes }, &counter, InspectionCounter.visit);
+    try std.testing.expectEqual(@as(u64, 1), counter.documents);
+    counter = .{};
+    try std.testing.expectError(error.BackupExpansionLimitExceeded, portable_backup.inspectPortableFileBlocks(a, io, file, .{ .max_logical_bytes = inspected.logical_bytes - 1 }, &counter, InspectionCounter.visit));
+    try std.testing.expectEqual(@as(usize, 0), counter.blocks);
+    const document_limited = try inspectInputJsonAlloc(a, path, null, .{ .max_document_bytes = 4096 });
+    defer a.free(document_limited);
+    try std.testing.expect(std.mem.indexOf(u8, document_limited, "\"failure_code\":\"limit_exceeded\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, document_limited, "\"scan_complete\":false") != null);
+}
+
+test "backup preflight bounds outer expansion before allocation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    // Stream-compressed DocumentBatch: one doc with {"body":"<32 MiB of a>"}.
+    // The Zstd frame has no declared content size, so admission must bound
+    // decoder output rather than relying on a frame-header size check.
+    const compressed = "\x28\xb5\x2f\xfd\x04\x58\x14\x01\x00\xd0\x01\x00\x00\x00\x03\x00\x00\x00\x64\x6f\x63\x00\x0b\x00\x00\x02\x7b\x22\x62\x6f\x64\x79\x22\x3a\x22\x61\x01\x00\x8e\xff\xe7\x60\x0c\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x44\x00\x00\x00\x01\x00\xfd\xff\xcd\x0b\x10\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x44\x00\x00\x00\x01\x00\xfd\xff\xcd\x0b\x10\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x44\x00\x00\x00\x01\x00\xfd\xff\xcd\x0b\x10\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x02\x00\x10\x61\x85\x00\x00\x50\x22\x7d\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x5d\x0a\x10\xef\xb6\x4c\xc8";
+    const decoded_size = 33554467;
+    var archive: std.ArrayListUnmanaged(u8) = .empty;
+    defer archive.deinit(a);
+    try backup_codec.writeHeader(&archive, a, .{ .format_version = backup_codec.legacy_format_version, .flags = 0, .created_at_ns = 0, .backup_id = @splat(0), .table_count = 1, .shard_count = 1 });
+    var envelope: [6]u8 = undefined;
+    envelope[0] = @backingInt(backup_codec.BlockType.document_batch);
+    envelope[1] = backup_codec.block_flag_compressed;
+    std.mem.writeInt(u32, envelope[2..6], compressed.len, .little);
+    const Crc = @import("antfly_hash").Crc32;
+    var crc = Crc.init();
+    crc.update(&envelope);
+    crc.update(compressed);
+    try archive.appendSlice(a, &envelope);
+    try archive.appendSlice(a, compressed);
+    var checksum: [4]u8 = undefined;
+    std.mem.writeInt(u32, &checksum, crc.final(), .little);
+    try archive.appendSlice(a, &checksum);
+    try portable_backup.validatePortable(a, archive.items);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(io, "outer.afb", .{ .read = true });
+    defer file.close(io);
+    try file.writePositionalAll(io, archive.items, 0);
+    const memory = try a.alloc(u8, 16 * 1024 * 1024);
+    defer a.free(memory);
+    var bounded = std.heap.FixedBufferAllocator.init(memory);
+    var counter: InspectionCounter = .{};
+    try std.testing.expectError(error.BackupExpansionLimitExceeded, portable_backup.inspectPortableFileBlocks(bounded.allocator(), io, file, .{ .max_logical_bytes = 4096 }, &counter, InspectionCounter.visit));
+    try std.testing.expectEqual(@as(usize, 0), counter.blocks);
+    _ = try portable_backup.inspectPortableFileBlocks(a, io, file, .{ .max_logical_bytes = decoded_size }, &counter, InspectionCounter.visit);
+    try std.testing.expectEqual(@as(u64, 1), counter.documents);
+    counter = .{};
+    try std.testing.expectError(error.BackupExpansionLimitExceeded, portable_backup.inspectPortableFileBlocks(a, io, file, .{ .max_logical_bytes = decoded_size - 1 }, &counter, InspectionCounter.visit));
+    try std.testing.expectEqual(@as(usize, 0), counter.blocks);
+    var slice = backup_codec.SliceReader.init(archive.items);
+    _ = try slice.readHeader();
+    try std.testing.expectError(error.BackupExpansionLimitExceeded, slice.readBlockLimited(a, 4096));
+}
+
+test "backup preflight metadata admission precedes validation and permits bounded aggregate batches" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const value = try a.alloc(u8, 64 * 1024);
+    defer a.free(value);
+    @memset(value, ' ');
+    value[0] = '[';
+    value[value.len - 1] = ']';
+    const payload = try backup_codec.encodeKeyValueBatch(a, &.{
+        .{ .key = "\x00\x00__metadata__:enrichments", .value = value },
+        .{ .key = "\x00\x00__metadata__:resolvers", .value = value },
+    });
+    defer a.free(payload);
+    var archive: std.ArrayListUnmanaged(u8) = .empty;
+    defer archive.deinit(a);
+    try backup_codec.writeHeader(&archive, a, .{ .format_version = backup_codec.legacy_format_version, .flags = 0, .created_at_ns = 0, .backup_id = @splat(0), .table_count = 1, .shard_count = 1 });
+    try backup_codec.writeBlock(&archive, a, .metadata_batch, payload);
+    try portable_backup.validatePortable(a, archive.items);
+    var file = try tmp.dir.createFile(io, "metadata.afb", .{ .read = true });
+    defer file.close(io);
+    try file.writePositionalAll(io, archive.items, 0);
+    var counter: InspectionCounter = .{};
+    try std.testing.expectError(error.BackupExpansionLimitExceeded, portable_backup.inspectPortableFileBlocks(a, io, file, .{ .max_metadata_bytes = value.len - 1 }, &counter, InspectionCounter.visit));
+    try std.testing.expectEqual(@as(usize, 0), counter.blocks);
+    _ = try portable_backup.inspectPortableFileBlocks(a, io, file, .{ .max_metadata_bytes = value.len }, &counter, InspectionCounter.visit);
+    try std.testing.expectEqual(@as(usize, 1), counter.blocks);
+    const path = try tmp.dir.realPathFileAlloc(io, "metadata.afb", a);
+    defer a.free(path);
+    const limited = try inspectInputJsonAlloc(a, path, null, .{ .max_metadata_bytes = value.len - 1 });
+    defer a.free(limited);
+    try std.testing.expect(std.mem.indexOf(u8, limited, "\"failure_code\":\"limit_exceeded\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, limited, "\"scan_complete\":false") != null);
+    const admitted = try inspectInputJsonAlloc(a, path, "{\"version\":1,\"configuration_id\":\"empty\"}", .{ .max_metadata_bytes = value.len });
+    defer a.free(admitted);
+    try std.testing.expect(std.mem.indexOf(u8, admitted, "\"scan_complete\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, admitted, "\"compatibility\":{\"verdict\":\"compatible\"") != null);
+}
+
+test "backup preflight artifact document admission precedes validation with exact record limits" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const doc = try a.dupe(u8, "doc");
+    defer a.free(doc);
+    const doc2 = try a.dupe(u8, "doc2");
+    defer a.free(doc2);
+    const name = try a.dupe(u8, "retained");
+    defer a.free(name);
+    const value = try a.alloc(u8, 8192);
+    defer a.free(value);
+    @memset(value, 'a');
+    const prefix = "{\"text\":\"";
+    @memcpy(value[0..prefix.len], prefix);
+    @memcpy(value[value.len - 2 ..], "\"}");
+    for ([_]db_types.ArtifactKind{ .asset, .chunk }) |kind| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const key = try @import("../db/artifact_ids.zig").artifactPublicIdAlloc(a, .{ .document_id = doc, .name = name, .kind = kind, .chunk_id = if (kind == .chunk) 1 else null });
+        defer a.free(key);
+        const key2 = try @import("../db/artifact_ids.zig").artifactPublicIdAlloc(a, .{ .document_id = doc2, .name = name, .kind = kind, .chunk_id = if (kind == .chunk) 1 else null });
+        defer a.free(key2);
+        const payload = try backup_codec.encodeKeyValueBatch(a, &.{ .{ .key = key, .value = value }, .{ .key = key2, .value = value } });
+        defer a.free(payload);
+        var archive: std.ArrayListUnmanaged(u8) = .empty;
+        defer archive.deinit(a);
+        try backup_codec.writeHeader(&archive, a, .{ .format_version = backup_codec.legacy_format_version, .flags = 0, .created_at_ns = 0, .backup_id = @splat(0), .table_count = 1, .shard_count = 1 });
+        try backup_codec.writeBlock(&archive, a, if (kind == .chunk) .chunk_batch else .artifact_batch, payload);
+        try portable_backup.validatePortable(a, archive.items);
+        var file = try tmp.dir.createFile(io, "artifacts.afb", .{ .read = true });
+        defer file.close(io);
+        try file.writePositionalAll(io, archive.items, 0);
+        var counter: InspectionCounter = .{};
+        try std.testing.expectError(error.BackupExpansionLimitExceeded, portable_backup.inspectPortableFileBlocks(a, io, file, .{ .max_document_bytes = value.len - 1 }, &counter, InspectionCounter.visit));
+        try std.testing.expectEqual(@as(usize, 0), counter.blocks);
+        _ = try portable_backup.inspectPortableFileBlocks(a, io, file, .{ .max_document_bytes = value.len }, &counter, InspectionCounter.visit);
+        try std.testing.expectEqual(@as(usize, 1), counter.blocks);
+        const path = try tmp.dir.realPathFileAlloc(io, "artifacts.afb", a);
+        defer a.free(path);
+        const limited = try inspectInputJsonAlloc(a, path, null, .{ .max_document_bytes = value.len - 1 });
+        defer a.free(limited);
+        try std.testing.expect(std.mem.indexOf(u8, limited, "\"failure_code\":\"limit_exceeded\"") != null);
+        const admitted = try inspectInputJsonAlloc(a, path, "{\"version\":1,\"configuration_id\":\"empty\"}", .{ .max_document_bytes = value.len });
+        defer a.free(admitted);
+        try std.testing.expect(std.mem.indexOf(u8, admitted, "\"scan_complete\":true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, admitted, "\"compatibility\":{\"verdict\":\"compatible\"") != null);
+    }
+}
+
+test "backup preflight document limit preserves authored vector artifact validation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const doc = try a.dupe(u8, "doc");
+    defer a.free(doc);
+    const name = try a.dupe(u8, "vectors");
+    defer a.free(name);
+    const key = try @import("../db/artifact_ids.zig").artifactPublicIdAlloc(a, .{ .document_id = doc, .name = name, .kind = .embedding });
+    defer a.free(key);
+    const value = try @import("../db/enrichment/artifact_codec.zig").encodeAuthoredDenseEmbeddingAlloc(a, &.{ 1, 2 });
+    defer a.free(value);
+    const payload = try backup_codec.encodeKeyValueBatch(a, &.{.{ .key = key, .value = value }});
+    defer a.free(payload);
+    var archive: std.ArrayListUnmanaged(u8) = .empty;
+    defer archive.deinit(a);
+    try backup_codec.writeHeader(&archive, a, .{ .format_version = backup_codec.legacy_format_version, .flags = 0, .created_at_ns = 0, .backup_id = @splat(0), .table_count = 1, .shard_count = 1 });
+    try backup_codec.writeBlock(&archive, a, .artifact_batch, payload);
+    try portable_backup.validatePortable(a, archive.items);
+    var file = try tmp.dir.createFile(io, "vector.afb", .{ .read = true });
+    defer file.close(io);
+    try file.writePositionalAll(io, archive.items, 0);
+    const path = try tmp.dir.realPathFileAlloc(io, "vector.afb", a);
+    defer a.free(path);
+    const json = try inspectInputJsonAlloc(a, path, null, .{ .max_document_bytes = 1 });
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scan_complete\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"model\"") != null);
 }
 
 test "lite restore staging refuses binary-only or mismatched schemas before ownership transfer" {
@@ -2770,4 +2985,115 @@ test "lite restore staging standalone adoption preserves full text incarnation a
     }
     try std.testing.expectError(error.UnsupportedEmbeddedLiteTables, embeddedTableDefinition(a, lite.backend.native_runtime_store.?));
     try lite.backend.requireEmbeddedCatalogOwnership();
+}
+
+test "backup preflight Lite and portable preserve resolver and model media dependencies" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const lite_path = try std.fs.path.join(a, &.{ root, "dependencies.aflite" });
+    defer a.free(lite_path);
+    const portable_path = try std.fs.path.join(a, &.{ root, "dependencies.afb2" });
+    defer a.free(portable_path);
+    const policy =
+        \\{"decider":{"provider":"antfly","model":"fixture","api_key":"private-key"},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Are these the same entity?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9}}
+    ;
+    const resolvers = @import("../db/catalog/resolver_catalog.zig");
+    const cfg: resolvers.ResolverConfig = .{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{_entity.text}}", .scorer_json = "{\"comparisons\":[]}", .adjudicate_json = policy };
+    try cfg.validate();
+    const resolver_json = try resolvers.serializeCatalog(a, &.{cfg});
+    defer a.free(resolver_json);
+    const producers = @import("../db/catalog/enrichment_catalog.zig");
+    const enrichment_json = try producers.serializeCatalog(a, &.{.{ .name = "chunks", .kind = .chunk, .source_field = "body", .chunker_json = "{\"provider\":\"antfly\",\"embedding\":{\"model\":\"media-model\",\"dimensions\":3}}" }});
+    defer a.free(enrichment_json);
+    {
+        var lite = try LiteDb.createWithOptions(a, lite_path, true, .{ .fsync = false });
+        defer lite.close();
+        try lite.db.core.store.put("\x00\x00__metadata__:resolvers", resolver_json);
+        try lite.db.core.store.put("\x00\x00__metadata__:enrichments", enrichment_json);
+        const key = try internal_keys.documentKeyAlloc(a, "clip");
+        defer a.free(key);
+        try lite.db.core.store.put(key, "{\"body\":{\"type\":\"source\",\"uri\":\"s3://bucket/clip.mp4\",\"mime_type\":\"video/mp4\",\"version\":\"immutable-v1\",\"version_kind\":\"s3_version_id\",\"length\":419430400}}");
+        var file = try tmp.dir.createFile(io, "dependencies.afb2", .{});
+        defer file.close(io);
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        try portable_backup.exportPortableToWriter(a, lite.db.core.store, &writer.interface);
+        try writer.end();
+    }
+    for ([_][]const u8{ lite_path, portable_path }) |path| {
+        const json = try inspectInputJsonAlloc(a, path, "{\"version\":1,\"configuration_id\":\"empty-destination\"}", .{});
+        defer a.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"scan_complete\":true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"producer_model\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"model\"") != null);
+        // The connection inventory contains both the frozen model credential
+        // and the source bucket; neither raw value may escape into the report.
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"field\":\"body\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"verdict\":\"unknown\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "private-key") == null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "s3://bucket") == null);
+    }
+}
+
+test "backup preflight Lite and portable reject unpinned sources despite complete capabilities" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const lite_path = try std.fs.path.join(a, &.{ root, "unpinned.aflite" });
+    defer a.free(lite_path);
+    const portable_path = try std.fs.path.join(a, &.{ root, "unpinned.afb2" });
+    defer a.free(portable_path);
+    const catalog = try @import("../db/catalog/enrichment_catalog.zig").serializeCatalog(a, &.{.{ .name = "chunks", .kind = .chunk, .source_field = "body", .chunker_json = "{\"provider\":\"antfly\",\"embedding\":{\"model\":\"media-model\",\"dimensions\":3}}" }});
+    defer a.free(catalog);
+    {
+        var lite = try LiteDb.createWithOptions(a, lite_path, true, .{ .fsync = false });
+        defer lite.close();
+        try lite.db.core.store.put("\x00\x00__metadata__:enrichments", catalog);
+        const key = try internal_keys.documentKeyAlloc(a, "clip");
+        defer a.free(key);
+        try lite.db.core.store.put(key, "{\"body\":{\"type\":\"source\",\"uri\":\"https://example.org/clip.mp4\",\"mime_type\":\"video/mp4\",\"version\":\"\",\"length\":1024}}");
+        var file = try tmp.dir.createFile(io, "unpinned.afb2", .{});
+        defer file.close(io);
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        try portable_backup.exportPortableToWriter(a, lite.db.core.store, &writer.interface);
+        try writer.end();
+    }
+    for ([_][]const u8{ lite_path, portable_path }) |path| {
+        const inventory = try inspectInputJsonAlloc(a, path, null, .{});
+        defer a.free(inventory);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, inventory, .{});
+        defer parsed.deinit();
+        const requirements = parsed.value.object.get("inventory").?.object.get("requirements").?.array.items;
+        const caps = try a.alloc(preflight.Capability, requirements.len);
+        defer a.free(caps);
+        for (requirements, caps) |requirement, *cap| cap.* = .{
+            .requirement_sha256 = requirement.object.get("sha256").?.string,
+            .supported = true,
+            .query_embedding = true,
+            .future_ingestion = true,
+            .model_revision_verified = true,
+            .preprocessing_verified = true,
+            .vector_space_verified = true,
+            .dimensions = @intCast(requirement.object.get("dimensions").?.integer),
+        };
+        const evidence = try std.json.Stringify.valueAlloc(a, preflight.Destination{ .version = 1, .configuration_id = "all-evidence", .requirements = caps }, .{});
+        defer a.free(evidence);
+        const json = try inspectInputJsonAlloc(a, path, evidence, .{});
+        defer a.free(json);
+        var result = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer result.deinit();
+        const completeness = result.value.object.get("completeness").?;
+        try std.testing.expect(completeness.object.get("scan_complete").?.bool);
+        try std.testing.expect(!completeness.object.get("dependency_analysis_complete").?.bool);
+        try std.testing.expectEqualStrings("blocked", result.value.object.get("compatibility").?.object.get("verdict").?.string);
+        try std.testing.expect(result.value.object.get("source").?.object.get("sha256").? == .string);
+    }
 }

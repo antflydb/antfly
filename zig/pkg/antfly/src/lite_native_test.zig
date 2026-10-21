@@ -14,6 +14,7 @@
 // limitations.
 
 test {
+    _ = @import("antfly_local_sources").storage_lite_backup_preflight;
     _ = @import("standalone/backup_inspection.zig");
     _ = @import("antfly_local_sources").storage_lite_backend;
     _ = @import("antfly_local_sources").storage_lite_conformance_test;

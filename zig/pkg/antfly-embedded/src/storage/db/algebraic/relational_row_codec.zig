@@ -659,6 +659,42 @@ pub fn reconstructOrdinalValueWithLayoutAlloc(
     return try reconstructParsedOrdinalValueAlloc(alloc, parsed, table_schema);
 }
 
+/// Measure through the same cell writer as ordinary reconstruction. Packed
+/// strings, vectors and arrays can expand in JSON; encoded row length is not
+/// an admission bound for the logical document.
+pub fn reconstructOrdinalValueWithLayoutLimitedAlloc(
+    alloc: Allocator,
+    value: []const u8,
+    table_schema: runtime_schema.TableSchema,
+    layout: *const PhysicalLayout,
+    max_bytes: usize,
+) ![]u8 {
+    const parsed = try parseOrdinalWithLayoutRead(value, table_schema, layout);
+    var counter = std.Io.Writer.Discarding.init(&.{});
+    try counter.writer.writeByte('{');
+    var iterator = OrdinalCellIterator{ .parsed = parsed, .table_schema = table_schema };
+    var comma = false;
+    while (try iterator.next()) |cell| {
+        try writeCellMember(alloc, &counter.writer, cell, comma);
+        if (counter.fullCount() >= max_bytes) return error.StreamTooLong; // reserve closing brace
+        comma = true;
+    }
+    try counter.writer.writeByte('}');
+    if (counter.fullCount() > max_bytes) return error.StreamTooLong;
+    const output = try alloc.alloc(u8, @intCast(counter.fullCount()));
+    errdefer alloc.free(output);
+    var writer = std.Io.Writer.fixed(output);
+    try writer.writeByte('{');
+    iterator = .{ .parsed = parsed, .table_schema = table_schema };
+    comma = false;
+    while (try iterator.next()) |cell| {
+        try writeCellMember(alloc, &writer, cell, comma);
+        comma = true;
+    }
+    try writer.writeByte('}');
+    return output;
+}
+
 /// Logical JSON source plus its already-decoded tree for callers that need
 /// both representations without reparsing the reconstructed document.
 pub const MaterializedOrdinalDocument = struct {
@@ -3518,4 +3554,25 @@ test "ordinal native SQL projection avoids public array envelope allocations" {
     // independent of allocator size classes and exact arena growth policy.
     try std.testing.expect(peaks[1] < peaks[0] / 2);
     std.debug.print("SQL array boundary: stored={d} public_peak={d} native_peak={d}\n", .{ payload.len, peaks[0], peaks[1] });
+}
+
+test "backup preflight relational JSON admission measures expanded strings before allocation" {
+    const a = std.testing.allocator;
+    const columns = [_]runtime_schema.RelationalColumn{.{ .name = "body", .path = "body", .column_type = .string }};
+    const schema: runtime_schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    const text: [1024]u8 = @splat(1);
+    const cells = [_]Cell{.{ .ordinal = 0, .path = "body", .value_type = .bytes_val, .value = .{ .bytes_val = &text } }};
+    const encoded = try serializeOrdinal(a, schema.version, &columns, &cells, @as([semantic_hash_len]u8, @splat(0x44)));
+    defer a.free(encoded);
+    var layout = try PhysicalLayout.init(a, schema);
+    defer layout.deinit();
+    const expected = try reconstructOrdinalValueWithLayoutAlloc(a, encoded, schema, &layout);
+    defer a.free(expected);
+    try std.testing.expect(expected.len > encoded.len);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.StreamTooLong, reconstructOrdinalValueWithLayoutLimitedAlloc(failing.allocator(), encoded, schema, &layout, expected.len - 1));
+    const actual = try reconstructOrdinalValueWithLayoutLimitedAlloc(a, encoded, schema, &layout, expected.len);
+    defer a.free(actual);
+    try std.testing.expectEqualStrings(expected, actual);
+    try std.testing.expectError(error.OutOfMemory, reconstructOrdinalValueWithLayoutLimitedAlloc(failing.allocator(), encoded, schema, &layout, expected.len));
 }

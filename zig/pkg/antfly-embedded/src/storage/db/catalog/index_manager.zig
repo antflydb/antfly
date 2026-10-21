@@ -15397,7 +15397,7 @@ pub const IndexManager = struct {
                 if (request.source_field.len > 0) alloc.free(request.source_field);
                 if (request.source_template.len > 0) alloc.free(request.source_template);
                 if (request.upstream_artifact_name.len > 0) alloc.free(request.upstream_artifact_name);
-                request.source_field = try alloc.dupe(u8, "_group_unit.text");
+                request.source_field = try alloc.dupe(u8, enrichment_types.grouped_source_field);
                 request.source_template = "";
                 request.upstream_artifact_name = "";
                 request.input_kind = if (request.chunk_size > 0 or request.chunker_json.len > 0) .inline_chunks else .document;
@@ -16789,19 +16789,7 @@ pub const IndexManager = struct {
     }
 
     fn assetGroupRoot(self: *const IndexManager, name: []const u8) []const u8 {
-        var current = name;
-        var depth: usize = 0;
-        while (current.len > 0 and depth <= self.enrichments.items.len) : (depth += 1) {
-            var found: ?*const enrichment_catalog.EnrichmentConfig = null;
-            for (self.enrichments.items) |*cfg| if (std.mem.eql(u8, cfg.name, current)) {
-                found = cfg;
-                break;
-            };
-            const cfg = found orelse return "";
-            if (cfg.group_source_json.len > 0) return cfg.name;
-            current = cfg.source_artifact_name;
-        }
-        return "";
+        return enrichment_types.groupRoot(self.enrichments.items, name) orelse "";
     }
 
     fn assetSourceSupportsUnitGrouping(self: *const IndexManager, artifact_name: []const u8) bool {

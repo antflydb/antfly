@@ -165,6 +165,7 @@ else:
         (self.root / "lib").symlink_to(zig_root / "lib", target_is_directory=True)
         for relative in (
             "build_test_filters.zig",
+            "pkg/inference/build/decision_modules.zig",
             "tools/build_support.zig",
             "tools/capi_exports.py",
             "pkg/inference/build/decision_modules.zig",
@@ -172,6 +173,14 @@ else:
             destination = self.root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(zig_root / relative, destination)
+
+    def test_native_build_support_includes_decision_module(self):
+        self.copy_native_build_support()
+        relative = Path("pkg/inference/build/decision_modules.zig")
+        zig_root = Path(__file__).resolve().parents[1]
+        self.assertEqual(
+            (self.root / relative).read_bytes(), (zig_root / relative).read_bytes()
+        )
 
     @unittest.skipUnless(shutil.which("zig"), "Zig compiler required")
     def test_release_metadata_is_linked_once_per_final_image(self):

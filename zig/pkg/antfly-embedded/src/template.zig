@@ -38,6 +38,9 @@ const Helper = hbs.Helper;
 const HelperContext = hbs.HelperContext;
 const HelperMap = hbs.HelperMap;
 
+/// Named credential argument consumed by the remote-content helpers.
+pub const remote_credentials_argument = "credentials";
+
 /// Render a Handlebars template against a JSON document.
 /// The document is parsed as JSON and its top-level fields become template variables.
 /// Internal fields starting with "_" (like _embeddings) are excluded.
@@ -269,7 +272,7 @@ fn eqHelper(ctx: HelperContext) anyerror!Value {
 
 /// GenKit dotprompt media directive: {{media url=imageDataURI}}
 /// Returns: <<<dotprompt:media:url {url}>>>
-fn mediaHelper(ctx: HelperContext) anyerror!Value {
+pub fn mediaHelper(ctx: HelperContext) anyerror!Value {
     const url = ctx.hash.get("url") orelse return .{ .string = "" };
     const url_str = switch (url) {
         .string => |s| s,
@@ -442,67 +445,78 @@ pub fn stripErrorDirectives(alloc: Allocator, text: []const u8) ![]const u8 {
 
 pub const ContentPart = @import("antfly_template_content").ContentPart;
 
+/// Borrowed text/media segmentation before inline payload decoding. Callers
+/// strip error directives first, just as textToParts does.
+pub const TextPartIterator = struct {
+    text: []const u8,
+    pos: usize = 0,
+
+    pub fn next(self: *@This()) ?ContentPart {
+        const prefix = "<<<dotprompt:media:url ";
+        while (self.pos < self.text.len) {
+            const start = std.mem.indexOfPos(u8, self.text, self.pos, prefix) orelse self.text.len;
+            if (start > self.pos) {
+                const segment = std.mem.trim(u8, self.text[self.pos..start], &std.ascii.whitespace);
+                self.pos = start;
+                if (segment.len > 0) return .{ .text = segment };
+                continue;
+            }
+            const begin = start + prefix.len;
+            const end = std.mem.indexOfPos(u8, self.text, begin, ">>>") orelse {
+                const segment = std.mem.trim(u8, self.text[self.pos..], &std.ascii.whitespace);
+                self.pos = self.text.len;
+                return .{ .text = segment };
+            };
+            self.pos = end + 3;
+            return .{ .media_url = self.text[begin..end] };
+        }
+        return null;
+    }
+};
+
 /// Parse a rendered template string into content parts.
 /// Splits on <<<dotprompt:media:url ...>>> directives.
 /// Error directives are stripped. Text segments between markers become text parts.
 /// Data URIs in media markers are parsed into binary parts.
 /// Caller owns all returned slices.
 pub fn textToParts(alloc: Allocator, text: []const u8) ![]ContentPart {
-    // First strip error directives
     const cleaned = try stripErrorDirectives(alloc, text);
     defer alloc.free(cleaned);
-
-    const media_prefix = "<<<dotprompt:media:url ";
-    const media_suffix = ">>>";
-
     var parts = std.ArrayListUnmanaged(ContentPart).empty;
-    var pos: usize = 0;
-
-    while (pos < cleaned.len) {
-        const marker_start = std.mem.indexOfPos(u8, cleaned, pos, media_prefix) orelse {
-            // No more markers — rest is text
-            const segment = std.mem.trim(u8, cleaned[pos..], &std.ascii.whitespace);
-            if (segment.len > 0) {
-                try parts.append(alloc, .{ .text = try alloc.dupe(u8, segment) });
-            }
-            break;
+    errdefer {
+        for (parts.items) |part| switch (part) {
+            .text, .media_url => |value| alloc.free(value),
+            .binary => |value| {
+                alloc.free(value.mime_type);
+                alloc.free(value.data);
+            },
         };
-
-        // Text before marker
-        if (marker_start > pos) {
-            const segment = std.mem.trim(u8, cleaned[pos..marker_start], &std.ascii.whitespace);
-            if (segment.len > 0) {
-                try parts.append(alloc, .{ .text = try alloc.dupe(u8, segment) });
-            }
-        }
-
-        const url_start = marker_start + media_prefix.len;
-        const marker_end = std.mem.indexOfPos(u8, cleaned, url_start, media_suffix) orelse {
-            // Unterminated marker — treat rest as text
-            const segment = std.mem.trim(u8, cleaned[pos..], &std.ascii.whitespace);
-            if (segment.len > 0) {
-                try parts.append(alloc, .{ .text = try alloc.dupe(u8, segment) });
-            }
-            break;
-        };
-
-        const url = cleaned[url_start..marker_end];
-
-        if (data_uri.hasScheme(url)) {
-            // Parse data URI into binary content
-            if (parseDataURI(alloc, url)) |binary| {
-                try parts.append(alloc, .{ .binary = binary });
-            } else |_| {
-                // Failed to parse — keep as media_url
-                try parts.append(alloc, .{ .media_url = try alloc.dupe(u8, url) });
-            }
-        } else {
-            try parts.append(alloc, .{ .media_url = try alloc.dupe(u8, url) });
-        }
-
-        pos = marker_end + media_suffix.len;
+        parts.deinit(alloc);
     }
-
+    var iterator: TextPartIterator = .{ .text = cleaned };
+    while (iterator.next()) |part| switch (part) {
+        .text => |value| {
+            const owned = try alloc.dupe(u8, value);
+            errdefer alloc.free(owned);
+            try parts.append(alloc, .{ .text = owned });
+        },
+        .media_url => |url| {
+            if (data_uri.hasScheme(url)) {
+                if (parseDataURI(alloc, url)) |binary| {
+                    errdefer {
+                        alloc.free(binary.mime_type);
+                        alloc.free(binary.data);
+                    }
+                    try parts.append(alloc, .{ .binary = binary });
+                    continue;
+                } else |err| if (err == error.OutOfMemory) return err;
+            }
+            const owned = try alloc.dupe(u8, url);
+            errdefer alloc.free(owned);
+            try parts.append(alloc, .{ .media_url = owned });
+        },
+        .binary => unreachable,
+    };
     return try parts.toOwnedSlice(alloc);
 }
 
@@ -646,7 +660,7 @@ fn transcribeAudioHelper(ctx: HelperContext) anyerror!Value {
 // ============================================================================
 
 /// Convert JSON without consuming the call stack for nested model output.
-fn jsonToValue(arena: Allocator, json: std.json.Value) Allocator.Error!Value {
+pub fn jsonToValue(arena: Allocator, json: std.json.Value) Allocator.Error!Value {
     const Work = struct { source: std.json.Value, target: *Value };
     var result: Value = undefined;
     var pending: std.ArrayList(Work) = .empty;
@@ -1114,4 +1128,13 @@ test "template numeric literals compare exactly with document numbers" {
     const with_helpers = try renderDocumentWithHelpers(a, source, doc, &helpers);
     defer a.free(with_helpers);
     try std.testing.expectEqualStrings(expected, with_helpers);
+}
+
+test "textToParts keeps unterminated media as text without repeating its prefix" {
+    const a = std.testing.allocator;
+    const parts = try textToParts(a, "prompt <<<dotprompt:media:url unfinished");
+    defer freeContentParts(a, parts);
+    try std.testing.expectEqual(@as(usize, 2), parts.len);
+    try std.testing.expectEqualStrings("prompt", parts[0].text);
+    try std.testing.expectEqualStrings("<<<dotprompt:media:url unfinished", parts[1].text);
 }

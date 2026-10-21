@@ -246,7 +246,7 @@ pub fn renderJsonToPartsWithConfig(
     return try template_mod.textToParts(alloc, rendered);
 }
 
-fn validateRenderedTemplate(alloc: Allocator, rendered: []const u8) !void {
+pub fn validateRenderedTemplate(alloc: Allocator, rendered: []const u8) !void {
     const directives = try template_mod.parseErrorDirectives(alloc, rendered);
     defer template_mod.freeErrorDirectives(alloc, directives);
     if (directives.len == 0) return;
@@ -490,7 +490,7 @@ fn remotePdfHelperImpl(ctx: hbs.HelperContext) anyerror!hbs.Value {
 }
 
 fn credentialName(ctx: hbs.HelperContext) !?[]const u8 {
-    const value = ctx.hash.get("credentials") orelse return null;
+    const value = ctx.hash.get(template_mod.remote_credentials_argument) orelse return null;
     return switch (value) {
         .string => |text| if (text.len > 0) text else error.InvalidCredentialName,
         else => error.InvalidCredentialName,
