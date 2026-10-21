@@ -44,6 +44,7 @@ const batch_api = @import("antfly_local_sources").api_batch;
 const cluster_api_http = @import("cluster_api_http.zig");
 const public_table_http = @import("public_table_http.zig");
 const query_request_diagnostics = @import("query_request_diagnostics.zig");
+const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
 const graph_wire_envelope = @import("antfly_local_sources").api_graph_wire_envelope;
 const linear_merge_api = @import("linear_merge.zig");
 const cluster = @import("cluster.zig");
@@ -14196,6 +14197,7 @@ pub const ApiHttpServer = struct {
             error.GraphAnchorFilterRequiresIndex => return error.GraphAnchorFilterRequiresIndex,
             error.GraphMatchOperationLimitExceeded => return error.GraphMatchOperationLimitExceeded,
             error.GraphQueryModeUnsupported => return error.GraphQueryModeUnsupported,
+            error.GraphStartIdentityRequired => return error.GraphStartIdentityRequired,
             error.GraphExternalAliasDocumentFilterUnsupported => return error.GraphExternalAliasDocumentFilterUnsupported,
             error.GraphExternalAliasSourceUnsupported => return error.GraphExternalAliasSourceUnsupported,
             error.GraphReverseVariablePathUnsupported => return error.GraphReverseVariablePathUnsupported,
@@ -14270,15 +14272,13 @@ pub const ApiHttpServer = struct {
         var local_catalog = CatalogQueryResolver{ .arena = catalog_arena.allocator() };
         const resolver = catalog_resolver orelse &local_catalog;
 
-        const ReadInput = struct { read_requirements: ?@import("antfly_local_sources").sql_read_requirements.Requirements = null, lake_read: ?struct { wait_ms: u32 = 5000 } = null };
+        const ReadInput = struct { read_requirements: ?@import("antfly_local_sources").sql_read_requirements.Requirements = null };
         var read_input = std.json.parseFromSlice(ReadInput, alloc, body, .{ .ignore_unknown_fields = true }) catch return error.InvalidQueryRequest;
         defer read_input.deinit();
         if (read_input.value.read_requirements) |read| {
-            if (read_input.value.lake_read != null) return error.InvalidQueryRequest;
             read.validate(.search) catch |err| return if (err == error.UnsupportedReadVisibility) error.UnsupportedQueryRequest else error.InvalidQueryRequest;
         }
-        if (read_input.value.lake_read) |read| if (read.wait_ms > 60000) return error.InvalidQueryRequest;
-        const retry_timeout_ns: u64 = if (read_input.value.read_requirements) |read| @as(u64, read.wait_ms orelse 5000) * std.time.ns_per_ms else if (read_input.value.lake_read) |read| @as(u64, read.wait_ms) * std.time.ns_per_ms else if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
+        const retry_timeout_ns: u64 = if (read_input.value.read_requirements) |read| @as(u64, read.wait_ms orelse 5000) * std.time.ns_per_ms else if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
         const retry_poll_ns = 50 * std.time.ns_per_ms;
         const retry_io = self.sharedApiIo();
         const start_ns = retryMonotonicNs(retry_io);
@@ -14542,6 +14542,7 @@ pub const ApiHttpServer = struct {
                 error.GraphAnchorFilterRequiresIndex,
                 error.GraphMatchOperationLimitExceeded,
                 error.GraphQueryModeUnsupported,
+                error.GraphStartIdentityRequired,
                 error.GraphExternalAliasDocumentFilterUnsupported,
                 error.GraphExternalAliasSourceUnsupported,
                 error.GraphReverseVariablePathUnsupported,
@@ -14614,6 +14615,7 @@ pub const ApiHttpServer = struct {
             error.GraphAnchorFilterRequiresIndex,
             error.GraphMatchOperationLimitExceeded,
             error.GraphQueryModeUnsupported,
+            error.GraphStartIdentityRequired,
             error.GraphExternalAliasDocumentFilterUnsupported,
             error.GraphExternalAliasSourceUnsupported,
             error.GraphReverseVariablePathUnsupported,
@@ -14731,6 +14733,7 @@ pub const ApiHttpServer = struct {
             error.GraphAnchorFilterRequiresIndex,
             error.GraphMatchOperationLimitExceeded,
             error.GraphQueryModeUnsupported,
+            error.GraphStartIdentityRequired,
             error.GraphExternalAliasDocumentFilterUnsupported,
             error.GraphExternalAliasSourceUnsupported,
             error.GraphReverseVariablePathUnsupported,
@@ -15072,7 +15075,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn validateSupportedForeignPublicQueryRequest(request: anytype) !void {
-        if (request.lake_read != null or request.read_requirements != null) return error.UnsupportedQueryRequest;
+        if (request.read_requirements != null) return error.UnsupportedQueryRequest;
         if (request.full_text_search != null) return error.UnsupportedQueryRequest;
         if (request.full_text_index != null) return error.UnsupportedQueryRequest;
         if (request.semantic_search != null) return error.UnsupportedQueryRequest;
@@ -15242,6 +15245,7 @@ pub const ApiHttpServer = struct {
             try ensureRequestDeadline(deadline);
         }
         query_req.req.cancellation = cancellation;
+        if (query_req.req.graph_queries.len > 0) query_req.req.graph_query_diagnostic_sink = graph_query_diagnostic.sink();
         query_req.req.response_table_name = response_label;
         if (query_req.req.remote_snapshot == null and (query_req.req.order_by.len != 0 or query_req.req.search_after.len != 0 or query_req.req.search_before.len != 0)) {
             if (query_req.req.search_after.len != 0 or query_req.req.search_before.len != 0) return error.CatalogGenerationChanged;
@@ -22215,6 +22219,11 @@ pub const ApiHttpServer = struct {
                 try public_table_http.graphMatchOperationLimitExceededBody(self.alloc, body),
                 false,
             ),
+            error.GraphStartIdentityRequired => contextual_operations.jsonWithStatus(
+                422,
+                try public_table_http.graphQueryCapabilityUnsupportedBody(self.alloc, body, "qualified_start_identity_required"),
+                false,
+            ),
             error.GraphQueryModeUnsupported => contextual_operations.jsonWithStatus(
                 422,
                 try public_table_http.graphQueryUnsupportedBody(self.alloc, body),
@@ -22242,8 +22251,8 @@ pub const ApiHttpServer = struct {
             error.EmbedRateLimited => try contextualQueryDependencyErrorResponse(self.alloc, 429, "query_embedding_rate_limited", "query embedding rate limited", true),
             error.EmbedTransientFailure => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .query_embedding_temporarily_unavailable),
             error.EmbedUpstreamFailure => try contextualQueryDependencyErrorResponse(self.alloc, 502, "query_embedding_upstream_failure", "query embedding provider failed", false),
-            error.ValueSearchRequiresScan => try contextualQueryDependencyErrorResponse(self.alloc, 422, "value_search_requires_scan", "no compatible indexed candidate plan; explicitly permit scans with value_search_execution.allow_scan", false),
-            error.ValueSearchLimitExceeded => try contextualQueryDependencyErrorResponse(self.alloc, 422, "value_search_limit_exceeded", "logical value search exceeded its verification budget", false),
+            error.ValueSearchRequiresScan => try contextualQueryDependencyErrorResponse(self.alloc, 422, "value_verification_requires_scan", "no compatible indexed candidate plan; explicitly permit scans with execution.value_verification.allow_scan", false),
+            error.ValueSearchLimitExceeded => try contextualQueryDependencyErrorResponse(self.alloc, 422, "value_verification_limit_exceeded", "logical value search exceeded its verification budget", false),
             error.DecisionLimitExceeded => try contextualQueryDependencyErrorResponse(self.alloc, 422, "decision_limit_exceeded", "decision evaluation budget exceeded", false),
             error.UnknownDecider, error.InvalidDeciderConfig, error.InvalidDecisionSpecification, error.InvalidFunctionExpression, error.FunctionTypeMismatch, error.UnknownFunctionBinding, error.CyclicFunctionBinding, error.UnknownQueryFunction => try contextualQueryDependencyErrorResponse(self.alloc, 400, "invalid_decision_evaluation", "invalid decision evaluation", false),
             error.DecisionProviderUnavailable, error.MissingDecisionApiKey => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .decision_provider_unavailable),
@@ -58255,6 +58264,7 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
         stress_reads: usize = 0,
         incompatible_last_page: bool = false,
         destination_cut_changed: bool = false,
+        destination_cut_failures: u8 = 0,
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
@@ -58308,6 +58318,10 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
             const input = call.resolver_catalog_read;
             if (input.expected_revision) |revision| try std.testing.expectEqual(self.commits, revision);
             if (self.destination_cut_changed and input.mode == .table and std.mem.eql(u8, input.table_name, "entities")) return error.CatalogGenerationChanged;
+            if (input.mode == .table and std.mem.eql(u8, input.table_name, "entities") and self.destination_cut_failures != 0) {
+                self.destination_cut_failures -= 1;
+                return error.CatalogGenerationChanged;
+            }
             const wire = @import("../metadata/resolver_catalog_read.zig");
             if (input.mode == .table and std.mem.eql(u8, input.table_name, "source")) {
                 if (self.observation_failure) |err| return err;
@@ -58402,7 +58416,12 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
         server.source = source.narrowIface();
     }
     try Run.call(&server, .list, "source", "", "", "", 200);
+    // A transient destination-cut race retries from a fresh source cut, while
+    // persistent races above fail closed and explicit curation conflicts do
+    // not retry. Exactly one mutation commits.
+    source.destination_cut_failures = 1;
     try Run.call(&server, .merge, "source", "concepts", "", "{\"from\":\"concept/a\",\"to\":\"concept/b\"}", 202);
+    try std.testing.expectEqual(@as(u8, 0), source.destination_cut_failures);
     try Run.call(&server, .merge, "source", "concepts", "", "{\"from\":\"concept/a\",\"to\":\"concept/b\"}", 202);
     try std.testing.expectEqual(@as(u64, 1), source.commits);
     try Run.call(&server, .suppress, "source", "concepts", "", "{\"keys\":[\"concept/b\"]}", 400);

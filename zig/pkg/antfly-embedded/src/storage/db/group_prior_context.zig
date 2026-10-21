@@ -19,6 +19,14 @@ const std = @import("std");
 const groups = @import("group_sources.zig");
 const A = std.mem.Allocator;
 const V = std.json.Value;
+
+/// Borrow the collection rendered by prior-context consumers. Keep offline
+/// dependency inspection and execution aligned for single values, arrays and
+/// producer outputs wrapped in an `items` envelope.
+pub fn artifactCollection(value: V) V {
+    return if (value == .object) value.object.get("items") orelse value else value;
+}
+
 pub const Position = struct {
     ordinal: i64,
     segment: []const u8,

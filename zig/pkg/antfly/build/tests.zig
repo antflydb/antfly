@@ -738,6 +738,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "AFB2 relationship inventory requires reader version three",
             "document batch round-trip",
             "file reader detects same-size archive replacement between passes",
+            "bounded block readers reject stored payload before allocation and accept exact limits",
             "AFB2 manifest separates representation from snapshot mode",
             "AFB2 manifest rejects ambiguous delta and traversal paths",
             "AFB2 delta base binds inventory and identity to one canonical manifest",
@@ -1302,6 +1303,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "media part item embedding",
         "PDF render budget reserves the complete invocation peak",
         "semantic query planning reuses equivalent embeddings",
+        "local owner conditional batch wire retains predicates without exposing remote authority",
+        "system catalog cached capabilities retain shorthand scalar source names",
         "batch parser preserves oversized value errors",
         "batch parser accepts raw payload value under public request cap",
         "public batch parser rejects non-object documents while internal replay remains opaque",
@@ -2211,7 +2214,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lite_native_test_step.dependOn(&run_lite_native_tests.step);
     const backup_preflight_tests = b.addTest(.{
         .root_module = lite_native_test_mod,
-        .filters = &.{ "backup preflight", "lite restore staging", "storage.backup_bundle_io.", "storage.backup_bundle." },
+        .filters = &.{ "backup preflight", "canonical JSON", "lite restore staging", "storage.backup_bundle_io.", "storage.backup_bundle." },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("backup-preflight-test", "Verify read-only backup dependency inspection and preparation").dependOn(&addFilteredTestRunArtifact(b, backup_preflight_tests).step);
@@ -5866,6 +5869,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     integration_test_step.dependOn(&run_maintenance_worker_tests.step);
 
     const graph_metric_fan_in_filters = [_][]const u8{
+        "graph capability diagnostic forwards into its owning request across bindings",
+        "incoming resolver qualification recognizes the owning logical table",
         "local graph metric reads reject invalid freshness without leaking",
         "query parser accepts direct graph metric reads",
         "query parser accepts graph metric rerank",
@@ -6697,6 +6702,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.status_projection.",
             "storage.db.document_collectors.",
             "storage.db.graph_endpoint_resolutions.",
+            "storage.db.graph_mention_projection.",
             "storage.db.graph_field_plan.",
             "storage.db.owned_keys.",
             "storage.db.read_projection.",
@@ -6919,6 +6925,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.derived_log_test_root.",
             "storage.docstore.",
             "storage.enrichment.",
+            "storage.engine.",
+            "storage.logical_source.",
+            "storage.document_projection.",
             "storage.filesystem_capacity.",
             "storage.generation_publication.",
             "storage.hbc_adapter.",

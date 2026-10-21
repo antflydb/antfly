@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 81;
+pub const abi_version: u32 = 82;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1010,6 +1010,7 @@ pub const EntityUpsert = extern struct {
     key: BorrowedBytes = .{},
     doc_json: BorrowedBytes = .{},
     delete: u8 = 0,
+    skip_if_missing: u8 = 0,
 };
 pub const EntityUpsertFn = *const fn (
     ?*anyopaque,
@@ -1023,10 +1024,13 @@ pub const EntityUpsertBatchFn = *const fn (
     u64,
 ) callconv(.c) Status;
 
+pub const EntitySupportsCurationFn = *const fn (?*anyopaque, *u8) callconv(.c) Status;
+
 pub const EntitySinkConfig = extern struct {
     callback_ctx: ?*anyopaque = null,
     upsert_fn: ?EntityUpsertFn = null,
     upsert_batch_fn: ?EntityUpsertBatchFn = null,
+    supports_curation_fn: ?EntitySupportsCurationFn = null,
 };
 
 pub const PromotionOwnerFn = *const fn (?*anyopaque, u64) callconv(.c) u8;

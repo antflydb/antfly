@@ -20286,11 +20286,12 @@ pub const DB = struct {
         var guard = try cut.lock(self.alloc, io, self.core.path, control.token());
         var guarded = true;
         defer if (guarded) guard.deinit();
+        var source_proof: ?[32]u8 = null;
         const local_exists = try snapshotPathExists(io, path);
         const local_usable = if (local_exists) validated: {
             // Local files are a cache of the retained generation. Validate
             // under the parent guard before trusting directory existence.
-            cut.validate(self.alloc, io, path, request, origin, control.token()) catch |err| switch (err) {
+            source_proof = cut.validateWithSourceProof(self.alloc, io, path, request, origin, control.token()) catch |err| switch (err) {
                 error.CatalogGenerationChanged => break :validated false,
                 else => return err,
             };
@@ -20327,7 +20328,7 @@ pub const DB = struct {
             try repository.recover(io, path, request, origin, control.token());
             errdefer std.Io.Dir.cwd().deleteTree(io, path) catch {};
             try self.admitQueryCut(io, cache_id, control.token());
-            try cut.validate(self.alloc, io, path, request, origin, control.token());
+            source_proof = try cut.validateWithSourceProof(self.alloc, io, path, request, origin, control.token());
         } else return error.CatalogGenerationChanged;
         var reader = try cut.readLease(self.alloc, io, self.core.path, cache_id, control.token());
         guard.deinit();
@@ -20342,7 +20343,7 @@ pub const DB = struct {
         });
         errdefer readonly.close();
         try control.token().check();
-        readonly.retained_value_scope = @import("../../search/value_membership.zig").Scope.init(self.core.path, request.id, origin, request.expires_ms);
+        readonly.retained_value_scope = @import("../../search/value_membership.zig").Scope.init(self.core.path, request.id, origin, request.expires_ms).withSourceProof(source_proof);
         readonly.retained_query_lease = reader;
         transferred = true;
         return readonly;
@@ -26469,6 +26470,7 @@ pub const DB = struct {
         // Index projection alone cannot advance resolver/promotion targets:
         // otherwise the last publication waits forever for another base write.
         notifyResolverReplayRuntimesForCatalog(batch_ctx.index_manager, batch_ctx.resolution_runtime, batch_ctx.promotion_runtime, sequence);
+        if (command.producer_kind == .resolver) if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
         if (self.executor.hasWorkers()) self.executor.forceSequence(sequence) else {
             prepared_value.batch.sequence = sequence;
             try self.lockApplyForPortableRuntime();
@@ -51565,6 +51567,12 @@ fn appendDerivedBatchRecordContextWithAdmissions(ctx: *const BatchExecutionConte
     DB.notifyQueryVisibilityTargetAdvancedScopedContext(ctx, sequence, sync_targets);
     releaseReplicationMutationShared(&replication_mutation);
     try deferred_replication_gates.waitForDurabilityAndAuthority(ctx.replication_write_gate);
+    if (work != null) {
+        // Maintenance can append after the last foreground notification. Wake
+        // the consumer only after the request and its dispatch marker are
+        // durable; queue admission alone never credits producer completion.
+        if (ctx.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
+    }
     return sequence;
 }
 
@@ -135141,6 +135149,9 @@ test "db ordered artifact inventory producer dispatch is durable and never compl
     for (0..2) |pass| {
         var db = try DB.open(alloc, path, options);
         defer db.close();
+        // Keep the consumer paused so the wakeup can be inspected without
+        // another write or a polling worker concealing a lost notification.
+        try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
         if (pass == 0) {
             try db.setSchemaJson(alloc, "{}");
             try db.addEnrichment(.{ .name = "extraction", .kind = .asset, .field = "body", .content_type = "application/json" });
@@ -135203,6 +135214,7 @@ test "db ordered artifact inventory producer dispatch is durable and never compl
             expected_sequence = db.core.store.lastReplaySequence(0);
             expected_dispatch_sequence = expected_sequence;
             try std.testing.expect(expected_sequence > before);
+            try std.testing.expectEqual(expected_sequence, db.enrichment_runtime.?.stats().target_sequence);
         }
         _ = try db.advanceArtifactProducerWorkPage();
         try std.testing.expectEqual(expected_sequence, db.core.store.lastReplaySequence(0));
@@ -135228,6 +135240,7 @@ test "db ordered artifact inventory producer dispatch is durable and never compl
             try std.testing.expect(try db.advanceArtifactProducerWorkPage());
             const retried_sequence = db.core.store.lastReplaySequence(0);
             try std.testing.expect(retried_sequence > expected_sequence);
+            try std.testing.expectEqual(retried_sequence, db.enrichment_runtime.?.stats().target_sequence);
             expected_sequence = retried_sequence;
             var read = try db.core.store.beginReadTxn();
             defer read.abort();

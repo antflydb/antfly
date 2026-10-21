@@ -45,7 +45,7 @@ const View = struct {
         try request.object.put(self.a, "remote_snapshot", .{ .string = self.leaves[leaf].token });
         if (self.read_options) |options| {
             if (options.object.get("read_requirements")) |selected| try request.object.put(self.a, "read_requirements", selected);
-            if (options.object.get("lake_read")) |selected| try request.object.put(self.a, "lake_read", selected);
+            if (options.object.get("execution")) |selected| try request.object.put(self.a, "execution", selected);
         }
         var response = try self.run(self.ptr, self.a, self.leaves[leaf].table, try std.json.Stringify.valueAlloc(self.a, request, .{}));
         defer response.deinit(self.a);

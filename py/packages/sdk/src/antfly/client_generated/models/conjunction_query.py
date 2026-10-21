@@ -11,6 +11,7 @@ from ..types import UNSET, Unset
 if TYPE_CHECKING:
     from ..models.autocomplete_query import AutocompleteQuery
     from ..models.bool_field_query import BoolFieldQuery
+    from ..models.bool_query import BoolQuery
     from ..models.boolean_query import BooleanQuery
     from ..models.contains_query import ContainsQuery
     from ..models.date_range_string_query import DateRangeStringQuery
@@ -47,8 +48,8 @@ T = TypeVar("T", bound="ConjunctionQuery")
 class ConjunctionQuery:
     """
     Attributes:
-        conjuncts (list[AutocompleteQuery | BooleanQuery | BoolFieldQuery | ConjunctionQuery | ContainsQuery |
-            DateRangeStringQuery | DisjunctionQuery | DocIdQuery | EqualsQuery | FuzzyQuery | GeoBoundingBoxQuery |
+        conjuncts (list[AutocompleteQuery | BooleanQuery | BoolFieldQuery | BoolQuery | ConjunctionQuery | ContainsQuery
+            | DateRangeStringQuery | DisjunctionQuery | DocIdQuery | EqualsQuery | FuzzyQuery | GeoBoundingBoxQuery |
             GeoBoundingPolygonQuery | GeoDistanceQuery | GeoShapeQuery | IPRangeQuery | MatchAllQuery | MatchesQuery |
             MatchNoneQuery | MatchPhraseQuery | MatchQuery | MultiMatchQuery | MultiPhraseQuery | NumericRangeQuery |
             PhraseQuery | PrefixQuery | QueryStringQuery | RegexpQuery | TermQuery | TermRangeQuery | WildcardQuery]):
@@ -60,6 +61,7 @@ class ConjunctionQuery:
         AutocompleteQuery
         | BooleanQuery
         | BoolFieldQuery
+        | BoolQuery
         | ConjunctionQuery
         | ContainsQuery
         | DateRangeStringQuery
@@ -94,6 +96,7 @@ class ConjunctionQuery:
     def to_dict(self) -> dict[str, Any]:
         from ..models.autocomplete_query import AutocompleteQuery
         from ..models.bool_field_query import BoolFieldQuery
+        from ..models.bool_query import BoolQuery
         from ..models.boolean_query import BooleanQuery
         from ..models.contains_query import ContainsQuery
         from ..models.date_range_string_query import DateRangeStringQuery
@@ -160,6 +163,8 @@ class ConjunctionQuery:
                 conjuncts_item = conjuncts_item_data.to_dict()
             elif isinstance(conjuncts_item_data, DateRangeStringQuery):
                 conjuncts_item = conjuncts_item_data.to_dict()
+            elif isinstance(conjuncts_item_data, BoolQuery):
+                conjuncts_item = conjuncts_item_data.to_dict()
             elif isinstance(conjuncts_item_data, BooleanQuery):
                 conjuncts_item = conjuncts_item_data.to_dict()
             elif isinstance(conjuncts_item_data, ConjunctionQuery):
@@ -209,6 +214,7 @@ class ConjunctionQuery:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.autocomplete_query import AutocompleteQuery
         from ..models.bool_field_query import BoolFieldQuery
+        from ..models.bool_query import BoolQuery
         from ..models.boolean_query import BooleanQuery
         from ..models.contains_query import ContainsQuery
         from ..models.date_range_string_query import DateRangeStringQuery
@@ -248,6 +254,7 @@ class ConjunctionQuery:
                 AutocompleteQuery
                 | BooleanQuery
                 | BoolFieldQuery
+                | BoolQuery
                 | ConjunctionQuery
                 | ContainsQuery
                 | DateRangeStringQuery
@@ -423,7 +430,7 @@ class ConjunctionQuery:
                 try:
                     if not isinstance(data, dict):
                         raise TypeError()
-                    componentsschemas_query_type_18 = BooleanQuery.from_dict(data)
+                    componentsschemas_query_type_18 = BoolQuery.from_dict(data)
 
                     return componentsschemas_query_type_18
                 except (TypeError, ValueError, AttributeError, KeyError):
@@ -431,7 +438,7 @@ class ConjunctionQuery:
                 try:
                     if not isinstance(data, dict):
                         raise TypeError()
-                    componentsschemas_query_type_19 = ConjunctionQuery.from_dict(data)
+                    componentsschemas_query_type_19 = BooleanQuery.from_dict(data)
 
                     return componentsschemas_query_type_19
                 except (TypeError, ValueError, AttributeError, KeyError):
@@ -439,7 +446,7 @@ class ConjunctionQuery:
                 try:
                     if not isinstance(data, dict):
                         raise TypeError()
-                    componentsschemas_query_type_20 = DisjunctionQuery.from_dict(data)
+                    componentsschemas_query_type_20 = ConjunctionQuery.from_dict(data)
 
                     return componentsschemas_query_type_20
                 except (TypeError, ValueError, AttributeError, KeyError):
@@ -447,7 +454,7 @@ class ConjunctionQuery:
                 try:
                     if not isinstance(data, dict):
                         raise TypeError()
-                    componentsschemas_query_type_21 = MatchAllQuery.from_dict(data)
+                    componentsschemas_query_type_21 = DisjunctionQuery.from_dict(data)
 
                     return componentsschemas_query_type_21
                 except (TypeError, ValueError, AttributeError, KeyError):
@@ -455,7 +462,7 @@ class ConjunctionQuery:
                 try:
                     if not isinstance(data, dict):
                         raise TypeError()
-                    componentsschemas_query_type_22 = MatchNoneQuery.from_dict(data)
+                    componentsschemas_query_type_22 = MatchAllQuery.from_dict(data)
 
                     return componentsschemas_query_type_22
                 except (TypeError, ValueError, AttributeError, KeyError):
@@ -463,7 +470,7 @@ class ConjunctionQuery:
                 try:
                     if not isinstance(data, dict):
                         raise TypeError()
-                    componentsschemas_query_type_23 = DocIdQuery.from_dict(data)
+                    componentsschemas_query_type_23 = MatchNoneQuery.from_dict(data)
 
                     return componentsschemas_query_type_23
                 except (TypeError, ValueError, AttributeError, KeyError):
@@ -471,7 +478,7 @@ class ConjunctionQuery:
                 try:
                     if not isinstance(data, dict):
                         raise TypeError()
-                    componentsschemas_query_type_24 = BoolFieldQuery.from_dict(data)
+                    componentsschemas_query_type_24 = DocIdQuery.from_dict(data)
 
                     return componentsschemas_query_type_24
                 except (TypeError, ValueError, AttributeError, KeyError):
@@ -479,7 +486,7 @@ class ConjunctionQuery:
                 try:
                     if not isinstance(data, dict):
                         raise TypeError()
-                    componentsschemas_query_type_25 = IPRangeQuery.from_dict(data)
+                    componentsschemas_query_type_25 = BoolFieldQuery.from_dict(data)
 
                     return componentsschemas_query_type_25
                 except (TypeError, ValueError, AttributeError, KeyError):
@@ -487,7 +494,7 @@ class ConjunctionQuery:
                 try:
                     if not isinstance(data, dict):
                         raise TypeError()
-                    componentsschemas_query_type_26 = GeoBoundingBoxQuery.from_dict(data)
+                    componentsschemas_query_type_26 = IPRangeQuery.from_dict(data)
 
                     return componentsschemas_query_type_26
                 except (TypeError, ValueError, AttributeError, KeyError):
@@ -495,7 +502,7 @@ class ConjunctionQuery:
                 try:
                     if not isinstance(data, dict):
                         raise TypeError()
-                    componentsschemas_query_type_27 = GeoDistanceQuery.from_dict(data)
+                    componentsschemas_query_type_27 = GeoBoundingBoxQuery.from_dict(data)
 
                     return componentsschemas_query_type_27
                 except (TypeError, ValueError, AttributeError, KeyError):
@@ -503,16 +510,24 @@ class ConjunctionQuery:
                 try:
                     if not isinstance(data, dict):
                         raise TypeError()
-                    componentsschemas_query_type_28 = GeoBoundingPolygonQuery.from_dict(data)
+                    componentsschemas_query_type_28 = GeoDistanceQuery.from_dict(data)
 
                     return componentsschemas_query_type_28
                 except (TypeError, ValueError, AttributeError, KeyError):
                     pass
+                try:
+                    if not isinstance(data, dict):
+                        raise TypeError()
+                    componentsschemas_query_type_29 = GeoBoundingPolygonQuery.from_dict(data)
+
+                    return componentsschemas_query_type_29
+                except (TypeError, ValueError, AttributeError, KeyError):
+                    pass
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_type_29 = GeoShapeQuery.from_dict(data)
+                componentsschemas_query_type_30 = GeoShapeQuery.from_dict(data)
 
-                return componentsschemas_query_type_29
+                return componentsschemas_query_type_30
 
             conjuncts_item = _parse_conjuncts_item(conjuncts_item_data)
 
