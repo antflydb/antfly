@@ -195,6 +195,13 @@ func TestMemoryNativeIntegerDomainsRoundTrip(t *testing.T) {
 	if correction.ExpectedRevision != math.MaxUint64 {
 		t.Fatalf("uint64 revision lost: %v", correction.ExpectedRevision)
 	}
+	var configure MemoryConfigureRequest
+	if err := json.Unmarshal([]byte(`{"expected_revision":18446744073709551615,"config":{}}`), &configure); err != nil {
+		t.Fatal(err)
+	}
+	if configure.ExpectedRevision != math.MaxUint64 {
+		t.Fatalf("uint64 configuration fence lost: %v", configure.ExpectedRevision)
+	}
 	var request MemoryRecallRequest
 	if err := json.Unmarshal([]byte(`{"known_at":-9223372036854775808,"valid_at":9223372036854775807}`), &request); err != nil {
 		t.Fatal(err)

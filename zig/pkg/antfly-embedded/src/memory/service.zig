@@ -19,6 +19,7 @@
 const std = @import("std");
 pub const types = @import("types.zig");
 pub const generation_policy = @import("generation.zig");
+pub const operations = @import("operations.zig");
 const t = types;
 const prov = t.provenance;
 const A = std.mem.Allocator;
@@ -94,13 +95,8 @@ pub const Context = struct {
         if (self.check_fn) |call| try call(self.check_ptr.?);
     }
 };
-pub const Action = enum { create, inspect, configure, observe, assertions, recall, get, history, correct, forget, outcome, operation, advance, list, entities, curate_entity, resolve_entity, evidence, stage_embeddings, configuration, explain };
-pub fn mutates(action: Action) bool {
-    return switch (action) {
-        .inspect, .recall, .get, .history, .operation, .list, .entities, .resolve_entity, .evidence, .configuration, .explain => false,
-        else => true,
-    };
-}
+pub const Action = operations.Action;
+pub const mutates = operations.mutates;
 pub const Service = struct {
     backend: Backend,
     context: Context,
@@ -171,7 +167,7 @@ pub const Service = struct {
             .inspect => output = try run.encode(.{ .state = .{ .table_id = run.state.table_id, .database = run.state.database, .namespace = run.state.namespace, .space = run.state.space, .config = run.state.config, .pending_config = run.state.pending_config, .revision = run.state.revision, .owner = run.state.owner, .created_at = run.state.created_at }, .capabilities = .{ .native = true, .model_free = true, .generator_available = self.backend.generate != null, .embedder_available = self.backend.embed != null } }),
             .configure => {
                 try run.requireAdmin();
-                const request = try parse(struct { expected_revision: u64, config: t.Config }, a, body);
+                const request = try parse(operations.Configure, a, body);
                 if (request.expected_revision != run.state.revision - 1) return error.MemoryRevisionConflict;
                 var config = request.config;
                 // Admission revisions are durable and never reused, including failed
@@ -226,13 +222,13 @@ pub const Service = struct {
                 if (!eql(u8, receipt.owner, self.context.principal) and !self.context.admin) return error.Forbidden;
                 output = try run.encode(publicOperation(receipt));
             },
-            .history => output = try run.history(id, try parse(struct { cursor: ?[]const u8 = null, limit: u16 = 64 }, a, body)),
+            .history => output = try run.history(id, try parse(operations.Page, a, body)),
             .recall => output = try run.recall(try parse(t.Recall, a, body)),
             .list => output = try run.enumerate(try parse(t.Recall, a, body)),
             .stage_embeddings => try run.stageEmbeddings(try parse(t.EmbeddingBatch, a, body)),
             .curate_entity => try run.curateEntity(try parse(t.EntityCorrection, a, body)),
             .resolve_entity => output = try run.resolveEntity(id),
-            .entities => output = try run.entityList(try parse(struct { cursor: ?[]const u8 = null, limit: u16 = 64 }, a, body)),
+            .entities => output = try run.entityList(try parse(operations.Page, a, body)),
         }
         if (mutates(action)) {
             try run.recordDecision(op);

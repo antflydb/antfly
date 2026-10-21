@@ -1370,7 +1370,7 @@ pub const AntflyApiHandler = struct {
             try self.registerProbes(server);
         }
 
-        const mcp_paths = [_][]const u8{ routes.mcp_v1, routes.mcp_v1_prefix ++ "*" };
+        const mcp_paths = [_][]const u8{ routes.mcp_v1, routes.mcp_v1_prefix ++ "*", routes.memory_mcp_v1 };
         const mcp_handler = httpx.Handler.bind(self, mcpRoute);
         inline for (mcp_paths) |path| {
             try server.get(path, mcp_handler);
@@ -1920,7 +1920,8 @@ pub const AntflyApiHandler = struct {
         };
         const path = ctx.request.uri.path;
         var extension_name: ?[]const u8 = null;
-        var endpoint_path: []const u8 = routes.mcp_v1;
+        const is_memory = std.mem.eql(u8, path, routes.memory_mcp_v1);
+        var endpoint_path: []const u8 = if (is_memory) routes.memory_mcp_v1 else routes.mcp_v1;
         if (std.mem.startsWith(u8, path, routes.mcp_v1_extension_profiles_prefix)) {
             const profile = path[routes.mcp_v1_extension_profiles_prefix.len..];
             if (!std.mem.eql(u8, profile, "copilot"))
@@ -1931,6 +1932,7 @@ pub const AntflyApiHandler = struct {
         }
         const body = (try ctx.body()) orelse "";
         const request = protocol_adapters.McpRequest{
+            .context = operationContext(ctx, authenticated_identity),
             .method = method,
             .endpoint_path = endpoint_path,
             .authorization = ctx.header("authorization"),
@@ -1939,7 +1941,9 @@ pub const AntflyApiHandler = struct {
             .last_event_id = ctx.header(mcp.last_event_id_header),
             .body = body,
         };
-        var response = if (extension_name) |name|
+        var response = if (is_memory)
+            try protocol_adapters.executeMemoryMcpRequest(self.api_server, request, authenticated_identity)
+        else if (extension_name) |name|
             try protocol_adapters.executeExtensionMcpRequest(self.api_server, request, authenticated_identity, name)
         else
             try protocol_adapters.executeMcpRequest(self.api_server, request, authenticated_identity);
@@ -10551,6 +10555,7 @@ const LookupStatusSource = struct {
 
 /// Test metadata authority shared by direct and HTTP schema route regressions.
 pub const SchemaUpdateStatusSource = struct {
+    memory_logical_name: ?[]const u8 = null,
     table_name: []const u8 = "docs",
     projection_wait_calls: std.atomic.Value(u32) = .init(0),
     schema_json: ?[]const u8 = null,
@@ -10580,14 +10585,14 @@ pub const SchemaUpdateStatusSource = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const owned: system_catalog.ResolvedTable = .{ .table_id = 7, .name = self.table_name, .native_service = .memory };
         return switch (call) {
-            .resolve => |target| std.json.Stringify.valueAlloc(a, @as(?system_catalog.ResolvedTable, if (std.mem.eql(u8, target.table, self.table_name)) owned else null), .{}),
+            .resolve => |target| std.json.Stringify.valueAlloc(a, @as(?system_catalog.ResolvedTable, if (std.mem.eql(u8, target.table, self.memory_logical_name orelse self.table_name)) owned else null), .{}),
             .resolve_many => |request| blk: {
                 const tables = try a.alloc(?system_catalog.ResolvedTable, request.targets.len);
                 defer a.free(tables);
-                for (request.targets, tables) |target, *slot| slot.* = if (std.mem.eql(u8, target.table, self.table_name)) owned else null;
+                for (request.targets, tables) |target, *slot| slot.* = if (std.mem.eql(u8, target.table, self.memory_logical_name orelse self.table_name)) owned else null;
                 const names = try a.alloc(?[]const u8, request.storage_names.len);
                 defer a.free(names);
-                for (request.storage_names, names) |name, *slot| slot.* = if (std.mem.eql(u8, name, self.table_name)) self.table_name else null;
+                for (request.storage_names, names) |name, *slot| slot.* = if (std.mem.eql(u8, name, self.table_name)) self.memory_logical_name orelse self.table_name else null;
                 break :blk std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = 1, .tables = tables, .logical_names = names }, .{});
             },
             .query_definition => std.json.Stringify.valueAlloc(a, system_catalog.QueryDefinition{ .native_service = .memory, .table_id = 7, .schema_json = tables_api.default_schema_json, .read_schema_json = "", .indexes_json = tables_api.default_indexes_json }, .{}),
@@ -18014,32 +18019,32 @@ test "native memory HTTP and MCP share persistent storage and private provenance
     defer visible.deinit(a);
     try std.testing.expectEqual(@as(u16, 200), visible.status);
     try std.testing.expect(std.mem.indexOf(u8, visible.body, "Production uses Terraform") != null);
-    var initialized = try @import("protocol_adapters.zig").executeMcpRequest(&api, .{
+    var initialized = try @import("protocol_adapters.zig").executeMemoryMcpRequest(&api, .{
         .method = .post,
-        .endpoint_path = "/mcp/v1",
+        .endpoint_path = "/memory/v1/mcp",
         .body = "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"memory-test\",\"version\":\"1\"}}}",
     }, @as(?AuthenticatedIdentity, null));
     defer initialized.deinit(a);
     const session_id = for (initialized.headers) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, "mcp-session-id")) break header.value;
     } else return error.TestExpectedEqual;
-    var mcp_response = try @import("protocol_adapters.zig").executeMcpRequest(&api, .{
+    var mcp_response = try @import("protocol_adapters.zig").executeMemoryMcpRequest(&api, .{
         .method = .post,
-        .endpoint_path = "/mcp/v1",
+        .endpoint_path = "/memory/v1/mcp",
         .session_id = session_id,
-        .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"memory\",\"arguments\":{\"space\":\"team\",\"request\":{\"action\":\"get\",\"id\":\"a1\"}}}}",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_get\",\"arguments\":{\"space\":\"team\",\"id\":\"a1\"}}}",
     }, @as(?AuthenticatedIdentity, null));
     defer mcp_response.deinit(a);
     try std.testing.expectEqual(@as(u16, 200), mcp_response.status);
     try std.testing.expect(std.mem.indexOf(u8, mcp_response.body, "Production uses Terraform") != null);
     // Verify exact integer-valued decimal tokens through the actual MCP
     // ingress and the native policy, rather than only the tool adapter.
-    var exact_observation = try @import("protocol_adapters.zig").executeMcpRequest(&api, .{
+    var exact_observation = try @import("protocol_adapters.zig").executeMemoryMcpRequest(&api, .{
         .method = .post,
-        .endpoint_path = "/mcp/v1",
+        .endpoint_path = "/memory/v1/mcp",
         .session_id = session_id,
         .body =
-        \\{"jsonrpc":"2.0","id":9007199254740993.0,"method":"tools/call","params":{"name":"memory","arguments":{"space":"team","request":{"action":"assertions","idempotency_key":"exact-mcp","body":{"assertions":[{"id":"exact","subject":"counter","predicate":"value","value":"Exact","statement":"Exact business boundary","valid_from":9007199254740993.0,"evidence":[{"id":"e1"}]}]}}}}}
+        \\{"jsonrpc":"2.0","id":9007199254740993.0,"method":"tools/call","params":{"name":"memory_assertions","arguments":{"space":"team","idempotency_key":"exact-mcp","body":{"assertions":[{"id":"exact","subject":"counter","predicate":"value","value":"Exact","statement":"Exact business boundary","valid_from":9007199254740993.0,"evidence":[{"id":"e1"}]}]}}}}
         ,
     }, @as(?AuthenticatedIdentity, null));
     defer exact_observation.deinit(a);
@@ -18143,4 +18148,134 @@ test "resolver curation HTTP destination checks ignore opaque control metadata" 
     try std.testing.expect(try graphResolverDestinationsAllowedInConfig(null, payload));
     const actual = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"graph\":{\"resolvers\":false}}", .{});
     try std.testing.expectError(error.InvalidCreateTableRequest, graphResolverDestinationsAllowedInConfig(null, actual));
+}
+
+test "native memory dedicated MCP and HTTP authorize scoped credentials across catalog aliases" {
+    const a = std.testing.allocator;
+    const module = @import("memory.zig");
+    var auth = try initTestAuthManager(a);
+    try bindTestAuthManager(a, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+    var grant = try usermgr.Permission.initOwned(a, .table, "memory_team", .admin);
+    defer grant.deinit(a);
+    var alice = try auth.manager.createUser("memory_alice", "secret", &.{grant});
+    defer alice.deinit(a);
+    var read_grant = try usermgr.Permission.initOwned(a, .table, "memory_team", .read);
+    defer read_grant.deinit(a);
+    var bob = try auth.manager.createUser("memory_bob", "secret", &.{read_grant});
+    defer bob.deinit(a);
+    const authorization = try encodeBasicAuthorization(a, "memory_alice", "secret");
+    defer a.free(authorization);
+    const read_authorization = try encodeBasicAuthorization(a, "memory_bob", "secret");
+    defer a.free(read_authorization);
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("memory-mcp-scoped");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const context: module.memory.Context = .{ .table_id = 7, .principal = "memory_alice", .admin = true, .now_ms = 1, .space = "team" };
+    var native: module.engine.Native(db_mod.DB) = .{ .db = &db, .context = context };
+    a.free(try (module.memory.Service{ .backend = native.backend(), .context = context }).execute(a, .create, "", "{}", "create"));
+    const physical = "table:0123456789abcdef0123456789abcdef";
+    var reads = table_reads.BoundTableReadSource.init(physical, 7001, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
+    var writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init(physical, &db);
+    var source: SchemaUpdateStatusSource = .{ .table_name = physical, .memory_logical_name = "memory_team" };
+    var api = ApiHttpServer.init(a, .{ .auth_enabled = true, .user_manager = &auth.manager }, source.memoryIface(), reads.source(), writes.source());
+    defer api.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.init(a, &api);
+    defer server.deinit();
+    var io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io.deinit();
+    var client = httpx.Client.initWithConfig(a, io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try server.baseUrl(a);
+    defer a.free(base);
+    const memory_url = try std.fmt.allocPrint(a, "{s}/memory/v1/mcp", .{base});
+    defer a.free(memory_url);
+    const database_url = try std.fmt.allocPrint(a, "{s}/mcp/v1", .{base});
+    defer a.free(database_url);
+    const inspect_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team", .{base});
+    defer a.free(inspect_url);
+    const headers = [_][2][]const u8{ .{ "authorization", authorization }, .{ "content-type", "application/json" } };
+    var inspected = try requestWithRetry(&client, io.io(), .GET, inspect_url, "", &headers, 20);
+    defer inspected.deinit();
+    try std.testing.expectEqual(@as(u16, 200), inspected.status.code);
+    const initialize = "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}";
+    var initialized = try requestWithRetry(&client, io.io(), .POST, memory_url, initialize, &headers, 20);
+    defer initialized.deinit();
+    try std.testing.expectEqual(@as(u16, 200), initialized.status.code);
+    const session = initialized.headers.get("mcp-session-id") orelse return error.TestUnexpectedResult;
+    const session_headers = [_][2][]const u8{ .{ "authorization", authorization }, .{ "content-type", "application/json" }, .{ "mcp-session-id", session } };
+    const list = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}";
+    var discovered = try requestWithRetry(&client, io.io(), .POST, memory_url, list, &session_headers, 20);
+    defer discovered.deinit();
+    try std.testing.expectEqual(@as(u16, 200), discovered.status.code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, discovered.body.?, .{ .parse_numbers = false });
+    defer parsed.deinit();
+    const tools = parsed.value.object.get("result").?.object.get("tools").?.array.items;
+    try std.testing.expectEqual(@typeInfo(module.memory.Action).@"enum".field_names.len, tools.len);
+    var assertions_schema_seen = false;
+    for (tools) |tool| {
+        const name = tool.object.get("name").?.string;
+        try std.testing.expect(std.mem.startsWith(u8, name, "memory_"));
+        if (std.mem.eql(u8, name, "memory_assertions")) {
+            const body = tool.object.get("inputSchema").?.object.get("properties").?.object.get("body").?;
+            try std.testing.expect(body.object.get("properties").?.object.contains("assertions"));
+            assertions_schema_seen = true;
+        }
+    }
+    try std.testing.expect(assertions_schema_seen);
+    // The authenticated scoped owner can mutate through the typed MCP adapter.
+    const observation =
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_observe","arguments":{"space":"team","idempotency_key":"observe","body":{"evidence":[{"id":"e1","source_id":"owner-note","source_version":"1","text":"Private owner evidence"}],"assertions":[{"id":"a1","subject":"owner","predicate":"preference","value":"private","statement":"Private owner evidence","evidence":[{"id":"e1"}]}]}}}}
+    ;
+    var observed = try requestWithRetry(&client, io.io(), .POST, memory_url, observation, &session_headers, 20);
+    defer observed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), observed.status.code);
+    if (std.mem.indexOf(u8, observed.body.?, "\"isError\":true") != null) std.debug.print("memory scoped MCP observation: {s}\n", .{observed.body.?});
+    try std.testing.expect(std.mem.indexOf(u8, observed.body.?, "\"isError\":true") == null);
+    const get = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_get\",\"arguments\":{\"space\":\"team\",\"id\":\"a1\"}}}";
+    var recalled = try requestWithRetry(&client, io.io(), .POST, memory_url, get, &session_headers, 20);
+    defer recalled.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, recalled.body.?, "Private owner evidence") != null);
+    // A second scoped reader cannot see private owner provenance or discover
+    // write/admin tools, even while reusing a valid transport session.
+    const reader_headers = [_][2][]const u8{ .{ "authorization", read_authorization }, .{ "content-type", "application/json" }, .{ "mcp-session-id", session } };
+    var denied = try requestWithRetry(&client, io.io(), .POST, memory_url, get, &reader_headers, 20);
+    defer denied.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, denied.body.?, "Forbidden") != null);
+    try std.testing.expect(std.mem.indexOf(u8, denied.body.?, "Private owner evidence") == null);
+    var reader_tools = try requestWithRetry(&client, io.io(), .POST, memory_url, list, &reader_headers, 20);
+    defer reader_tools.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, reader_tools.body.?, "memory_get") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reader_tools.body.?, "memory_observe") == null);
+    // Both endpoint catalogs and their sessions are isolated.
+    var wrong_session = try requestWithRetry(&client, io.io(), .POST, database_url, list, &session_headers, 20);
+    defer wrong_session.deinit();
+    try std.testing.expectEqual(@as(u16, 404), wrong_session.status.code);
+    var db_initialized = try requestWithRetry(&client, io.io(), .POST, database_url, initialize, &headers, 20);
+    defer db_initialized.deinit();
+    const db_session = db_initialized.headers.get("mcp-session-id") orelse return error.TestUnexpectedResult;
+    const db_headers = [_][2][]const u8{ .{ "authorization", authorization }, .{ "content-type", "application/json" }, .{ "mcp-session-id", db_session } };
+    var database_tools = try requestWithRetry(&client, io.io(), .POST, database_url, list, &db_headers, 20);
+    defer database_tools.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, database_tools.body.?, "memory_") == null);
+    var database_unknown = try requestWithRetry(&client, io.io(), .POST, database_url, get, &db_headers, 20);
+    defer database_unknown.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, database_unknown.body.?, "Private owner evidence") == null);
+    try std.testing.expect(std.mem.indexOf(u8, database_unknown.body.?, "isError") != null or std.mem.indexOf(u8, database_unknown.body.?, "error") != null);
+    var reverse_session = try requestWithRetry(&client, io.io(), .POST, memory_url, list, &db_headers, 20);
+    defer reverse_session.deinit();
+    try std.testing.expectEqual(@as(u16, 404), reverse_session.status.code);
+    var stream = try requestWithRetry(&client, io.io(), .GET, memory_url, "", &session_headers, 20);
+    defer stream.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, stream.body.?, "data: /memory/v1/mcp") != null);
+    var closed = try requestWithRetry(&client, io.io(), .DELETE, memory_url, "", &session_headers, 20);
+    defer closed.deinit();
+    try std.testing.expectEqual(@as(u16, 202), closed.status.code);
+    var expired = try requestWithRetry(&client, io.io(), .POST, memory_url, list, &session_headers, 20);
+    defer expired.deinit();
+    try std.testing.expectEqual(@as(u16, 404), expired.status.code);
 }

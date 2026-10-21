@@ -49638,6 +49638,21 @@ components:
           nullable: true
           x-go-type-skip-optional-pointer: false
       additionalProperties: false
+    MemoryConfigureRequest:
+      type: object
+      properties:
+        expected_revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        config:
+          $ref: '#/components/schemas/MemorySpaceConfig'
+      required:
+        - expected_revision
+        - config
+      additionalProperties: false
     MemoryEvidence:
       type: object
       properties:
@@ -52977,18 +52992,6 @@ components:
         space:
           type: string
           maxLength: 128
-        config:
-          $ref: '#/components/schemas/MemorySpaceConfig'
-    MemoryConfigureRequest:
-      type: object
-      additionalProperties: false
-      required:
-        - expected_revision
-        - config
-      properties:
-        expected_revision:
-          type: integer
-          format: int64
         config:
           $ref: '#/components/schemas/MemorySpaceConfig'
     MemoryResult:

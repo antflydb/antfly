@@ -170,10 +170,35 @@ an older event cannot invalidate an artifact regenerated after that change.
 HTTP routes live under `/memory/v1/spaces/{space}`. Use
 `X-Antfly-Database` and `X-Antfly-Namespace` for catalog scope (defaults:
 `default` and `public`). These headers select resources, never identity or grants.
-MCP's native `memory` tool takes `{space, request}`; request contains `action`,
-`id`, `body`, `idempotency_key`, and optional `database`/`namespace`. It calls the
-same native server ingress as HTTP. Embedded SDKs call `antfly_db_memory_json`
-with the action/body envelope directly, with no HTTP server or Wasmtime runtime.
+Memory MCP lives at **`/memory/v1/mcp`**, separately from the general database
+MCP server at `/mcp/v1`. Each native action below has a typed `memory_<action>`
+tool, including evidence retrieval, configuration history, entity curation and
+external embedding staging. Arguments contain `space`, optional `database` and
+`namespace`, a resource `id` where applicable, and the action's typed `body`.
+Mutations require `idempotency_key`. For example:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_recall","arguments":{"space":"team","body":{"query":"deployment guidance","token_budget":2048}}}}
+```
+
+The endpoint owns the memory API major version; tool names do not repeat `v1`.
+MCP protocol negotiation is independent of memory API versioning. Both MCP
+servers reuse the native protocol transport, but expose separate tool catalogs
+and endpoint-local session stores: a session from one endpoint cannot be used or
+closed through the other. Both support POST, GET event streams and DELETE session
+closure. The database endpoint does not expose memory tools or the former opaque
+`memory` action dispatcher. A memory client opts into only the memory catalog.
+
+Schemas are generated from `memory/operations.zig` and the same payload types
+parsed by the policy, including exact integer domains, scalar defaults and
+mutation idempotency requirements. REST and MCP share the native server ingress,
+which constructs read/write capabilities over its owned, catalog-projected
+credential and preserves request deadlines and cancellation. Logical table grants
+therefore authorize resolved storage aliases without requiring wildcard access;
+publication still rechecks live permissions and row-policy support.
+
+Embedded SDKs call `antfly_db_memory_json` with the action/body envelope directly,
+with no HTTP server or Wasmtime runtime.
 
 | HTTP suffix | Native action | Behavior |
 | --- | --- | --- |

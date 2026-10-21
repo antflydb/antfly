@@ -4010,6 +4010,7 @@ pub const ApiHttpServer = struct {
     backup_cohort_recovery_cursor: [192]u8 = undefined,
     backup_cohort_recovery_cursor_len: usize = 0,
     mcp_sessions: mcp.InMemorySessionStore = .{},
+    memory_mcp_sessions: mcp.InMemorySessionStore = .{},
     a2a_tasks: a2a.InMemoryTaskStore = .{},
     connections_cache: connections_api.Cache = .{ .alloc = undefined },
     local_resource_manager: resource_manager_mod.ResourceManager,
@@ -4259,6 +4260,9 @@ pub const ApiHttpServer = struct {
             .lake_read_cache = @import("antfly_local_sources").serverless_query_lake_serving_cache.Cache.initWithMemoryLimit(owner_alloc, if (cfg.node_config) |config| config.lake_cache.max_memory_bytes else 64 * 1024 * 1024),
             .embedding_provider_runtime = managed_embedder.ProviderRuntime.init(owner_alloc, api_io),
             .mcp_sessions = mcp.InMemorySessionStore.initWithOptions(owner_alloc, api_io, .{
+                .now_ns_fn = protocolStoreNowNs,
+            }),
+            .memory_mcp_sessions = mcp.InMemorySessionStore.initWithOptions(owner_alloc, api_io, .{
                 .now_ns_fn = protocolStoreNowNs,
             }),
             .a2a_tasks = a2a.InMemoryTaskStore.initWithOptions(owner_alloc, api_io, .{
@@ -4774,6 +4778,7 @@ pub const ApiHttpServer = struct {
         self.backup_maintenance_queue.deinit(self.owner_alloc);
         self.backup_maintenance_mutex.unlock();
         self.mcp_sessions.deinit(self.owner_alloc);
+        self.memory_mcp_sessions.deinit(self.owner_alloc);
         self.a2a_tasks.deinit(self.owner_alloc);
         self.txn_sessions.deinit(self.alloc);
         self.memory_work_cursors.deinit(self.alloc);
@@ -21502,6 +21507,22 @@ pub const ApiHttpServer = struct {
         }
     };
 
+    /// Capabilities borrow the owned credential that catalog resolution projects.
+    /// The original HTTP credential cannot authorize opaque storage aliases, and
+    /// non-HTTP adapters do not supply HTTP-specific authorization callbacks.
+    const MemoryIngressCredential = struct {
+        fn read(ptr: *const anyopaque, table: []const u8) bool {
+            const identity: *const ?AuthenticatedIdentity = @ptrCast(@alignCast(ptr));
+            const value = identity.* orelse return true;
+            return permissionsAllow(value.permissions, .table, table, .read);
+        }
+        fn write(ptr: *const anyopaque, table: []const u8) bool {
+            const identity: *const ?AuthenticatedIdentity = @ptrCast(@alignCast(ptr));
+            const value = identity.* orelse return true;
+            return permissionsAllow(value.permissions, .table, table, .write);
+        }
+    };
+
     /// Native memory ingress shared by HTTP and MCP. Authentication stays at
     /// the ingress; catalog grants and provenance policy are enforced here.
     pub fn executeMemoryService(self: *ApiHttpServer, space: []const u8, input: @import("memory.zig").Request, borrowed_identity: ?AuthenticatedIdentity, borrowed_context: api_operation.RequestContext) !contextual_operations.OwnedResponse {
@@ -21530,6 +21551,8 @@ pub const ApiHttpServer = struct {
         var request = borrowed_context;
         request.native_service = .memory;
         request.row_policy_credential = &identity;
+        request.table_read_authorization = .{ .ptr = &identity, .allows = MemoryIngressCredential.read };
+        request.table_write_authorization = .{ .ptr = &identity, .allows = MemoryIngressCredential.write };
         request.principal = if (identity) |value| .{ .kind = .user, .subject = value.username } else null;
         const required: usermgr.PermissionType = if (!module.memory.mutates(input.action)) .read else if (module.memory.actionGrant(input.action) == .admin or (input.action == .advance and input.id.len == 0)) .admin else .write;
         if (input.action == .create) {

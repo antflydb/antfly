@@ -32,6 +32,7 @@ pub fn main(init: std.process.Init) !void {
         .{ "ProvenanceOrigin", t.provenance.Origin },
         .{ "MemoryExplainRequest", t.provenance.ExplainRequest },
         .{ "MemorySpaceConfig", t.Config },
+        .{ "MemoryConfigureRequest", @import("operations.zig").Configure },
         .{ "MemoryEvidence", t.Evidence },
         .{ "MemoryAssertion", t.Assertion },
         .{ "MemoryObservationRequest", t.ObservationRequest },
@@ -50,6 +51,7 @@ pub fn main(init: std.process.Init) !void {
         .{ "MemoryEntityPage", t.EntityPage },
         .{ "MemoryInspection", t.Inspection },
     }) |entry| try schemas.put(a, entry[0], try schema.wire(entry[1], a));
+    try schemas.put(a, "_memory_mcp_tools", try @import("operations.zig").mcpTools(a));
     const bytes = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = schemas }, .{ .whitespace = .indent_2 });
     var buffer: [4096]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &buffer);

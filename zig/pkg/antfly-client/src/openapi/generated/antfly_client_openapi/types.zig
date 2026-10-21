@@ -32664,7 +32664,7 @@ pub const MemoryAssertionRequest = struct {
 };
 
 pub const MemoryConfigureRequest = struct {
-    expected_revision: i64,
+    expected_revision: u64,
     config: MemorySpaceConfig,
 };
 

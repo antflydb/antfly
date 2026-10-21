@@ -32,3 +32,9 @@ ordinary-table rows and typed provenance links. Keep `retrieved`, `used`, and
 `supported_by` separate. Writing a trace row alone does not admit a memory. See
 [the shared provenance design](../../zig/MEMORY.md#shared-native-provenance-and-recorded-explanations)
 for authorization, retention, source-change behavior, and completeness flags.
+
+MCP clients connect to `/memory/v1/mcp`. Discover typed `memory_observe`,
+`memory_recall`, `memory_explain` and the other native actions with `tools/list`.
+Arguments use `{space, body}` plus `id` for resource operations and
+`idempotency_key` for mutations. Memory tools and sessions are separate from the
+ordinary database MCP server at `/mcp/v1`.

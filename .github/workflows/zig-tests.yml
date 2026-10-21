@@ -289,6 +289,7 @@ jobs:
             scripts/yaml_to_json.py \
             scripts/generate_graph_identifier_policy.py \
             scripts/generate_mcp_schema_fragments.py \
+            scripts/generate_memory_openapi.py \
             scripts/pyproject.toml \
             scripts/uv.lock \
             scripts/ci/test_zig_validation_scope.py \

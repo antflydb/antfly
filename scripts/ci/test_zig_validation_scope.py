@@ -297,6 +297,7 @@ class ZigValidationScopeTests(unittest.TestCase):
             "CHANGES_RESULT": "success",
             "X86_64_RESULT": "success",
             "ARM64_CODEC_RESULT": "success",
+            "GREP_RESULT": "success",
             "WASM_RESULT": "success",
             "LITE_MODEL_RESULT": "success",
             "REQUIRE_LITE_MODELS": "true",
@@ -306,6 +307,7 @@ class ZigValidationScopeTests(unittest.TestCase):
             "CHANGES_RESULT",
             "X86_64_RESULT",
             "ARM64_CODEC_RESULT",
+            "GREP_RESULT",
             "WASM_RESULT",
             "LITE_MODEL_RESULT",
         ):
@@ -350,6 +352,7 @@ class ZigValidationScopeTests(unittest.TestCase):
             "scripts/yaml_to_json.py",
             "scripts/generate_graph_identifier_policy.py",
             "scripts/generate_mcp_schema_fragments.py",
+            "scripts/generate_memory_openapi.py",
             "scripts/pyproject.toml",
             "scripts/uv.lock",
             "specs/openapi/new-owner/nested/new-schema.yaml",

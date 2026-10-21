@@ -27,7 +27,6 @@ const max_mcp_sample_documents_limit: i64 = 100;
 const mcp_tool_result_too_large_text = "Antfly produced more data than this MCP client can safely consume. Reduce limit and fields, avoid _chunks.*, or return direct matches with an explicit queryRequest.hierarchy object and bounded ancestor projections.";
 
 const McpToolKind = enum {
-    memory,
     create_table,
     drop_table,
     list_tables,
@@ -129,10 +128,6 @@ const mcp_capabilities_description_json =
 ;
 
 const mcp_tool_specs = [_]McpToolSpec{
-    .{ .kind = .memory, .name = "memory", .description = "Native evidence-backed temporal memory. Supply space and request with action, body, id, idempotency_key. Actions: create, inspect, configure, observe, assertions, recall, list, get, history, explain, correct, forget, outcome, operation, advance, entities. Mutations require idempotency_key; permissions follow the selected action.", .permission = .read, .wildcard_table = true, .fields = &.{
-        .{ .name = "space", .schema_type = .string, .required = true },
-        .{ .name = "request", .schema_type = .object, .required = true },
-    } },
     .{
         .kind = .create_table,
         .name = "create_table",
@@ -330,6 +325,7 @@ const ExtensionRuntimeBinding = struct {
 pub const McpRequest = struct {
     method: contextual_operations.Method,
     endpoint_path: []const u8,
+    context: @import("antfly_local_sources").api_operation.RequestContext = .{},
     authorization: ?[]const u8 = null,
     trusted_principal: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
@@ -363,14 +359,6 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
                 return mcpError(alloc, "permission denied");
             }
             return switch (ctx.spec.kind) {
-                .memory => blk: {
-                    const space = jsonStringArg(args, "space") orelse return mcpError(alloc, "missing space");
-                    const wire = jsonValueArg(args, "request") orelse return mcpError(alloc, "missing request");
-                    const input = std.json.parseFromSliceLeaky(@import("memory.zig").Request, alloc, try @import("antfly-json").stringifyValueAlloc(alloc, wire), .{ .ignore_unknown_fields = false, .parse_numbers = false }) catch return mcpError(alloc, "invalid memory request");
-                    var response = try ctx.server.executeMemoryService(space, input, ctx.authenticated_identity, .{});
-                    defer response.deinit(ctx.server.alloc);
-                    break :blk try mcpResultFromOwnedResponse(alloc, response);
-                },
                 .create_table => try ctx.createTable(alloc, args),
                 .drop_table => try ctx.tableOperation(alloc, args, "tableName", .drop_table),
                 .list_tables => try ctx.executeOperation(alloc, .list_tables),
@@ -709,6 +697,64 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         });
     }
 
+    return executeMcpTransport(server_ptr, &protocol_server, request);
+}
+
+/// Domain-specific discovery and sessions; transport remains shared with the
+/// database and extension MCP servers. No memory tools enter their catalogs.
+pub fn executeMemoryMcpRequest(server_ptr: anytype, request: McpRequest, authenticated_identity: anytype) !contextual_operations.OwnedResponse {
+    const memory_api = @import("memory.zig");
+    const tools = @import("generated/mcp_memory_tools.zig").tools;
+    const Context = struct {
+        server: @TypeOf(server_ptr),
+        identity: @TypeOf(authenticated_identity),
+        request: @import("antfly_local_sources").api_operation.RequestContext,
+        action: memory_api.memory.Action,
+
+        fn call(ptr: *anyopaque, a: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const Arguments = struct {
+                space: []const u8,
+                database: []const u8 = "default",
+                namespace: []const u8 = "public",
+                id: []const u8 = "",
+                body: std.json.Value = .{ .object = .empty },
+                idempotency_key: []const u8 = "",
+            };
+            const input = std.json.parseFromSliceLeaky(Arguments, a, try @import("antfly-json").stringifyValueAlloc(a, args), .{ .ignore_unknown_fields = false, .parse_numbers = false }) catch return mcpError(a, "invalid memory tool arguments");
+            if (memory_api.memory.operations.idRequired(self.action) and input.id.len == 0) return mcpError(a, "missing memory resource id");
+            var response = try self.server.executeMemoryService(input.space, .{
+                .database = input.database,
+                .namespace = input.namespace,
+                .action = self.action,
+                .id = input.id,
+                .body = input.body,
+                .idempotency_key = input.idempotency_key,
+            }, self.identity, self.request);
+            defer response.deinit(self.server.alloc);
+            return mcpResultFromOwnedResponse(a, response);
+        }
+    };
+    var contexts: [tools.len]Context = undefined;
+    var protocol_server: mcp.Server = .{
+        .implementation = .{ .name = "antfly-memory", .version = "1.0.0" },
+        .session_store = server_ptr.memory_mcp_sessions.iface(),
+        .max_tool_result_bytes = server_ptr.cfg.mcp_max_tool_result_bytes,
+        .tool_result_too_large_text = "Memory result exceeds the MCP response budget. Reduce limit, token_budget or explanation bounds and retry.",
+    };
+    defer protocol_server.deinit(server_ptr.alloc);
+    inline for (tools, 0..) |tool, i| {
+        const action = comptime @field(memory_api.memory.Action, tool.action);
+        contexts[i] = .{ .server = server_ptr, .identity = authenticated_identity, .request = request.context, .action = action };
+        const permission: McpToolPermission = if (!memory_api.memory.mutates(action)) .read else if (memory_api.memory.actionGrant(action) == .admin) .admin else .write;
+        if (mcpPermissionVisibleForIdentity(permission, authenticated_identity)) {
+            try protocol_server.addTool(server_ptr.alloc, .{ .name = tool.name, .description = tool.description, .input_schema_json = tool.input_schema_json, .handler = .{ .ptr = &contexts[i], .call_fn = Context.call } });
+        }
+    }
+    return executeMcpTransport(server_ptr, &protocol_server, request);
+}
+
+fn executeMcpTransport(server_ptr: anytype, protocol_server: *mcp.Server, request: McpRequest) !contextual_operations.OwnedResponse {
     var transport = switch (request.method) {
         .get => protocol_server.handleStreamableHttpGetWithSession(
             server_ptr.alloc,
@@ -736,11 +782,12 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
 }
 
 fn mcpToolVisibleForIdentity(spec: McpToolSpec, authenticated_identity: anytype) bool {
+    return mcpPermissionVisibleForIdentity(spec.permission, authenticated_identity);
+}
+
+fn mcpPermissionVisibleForIdentity(permission: McpToolPermission, authenticated_identity: anytype) bool {
     const identity = authenticated_identity orelse return true;
-    const required = permissionTypeForMcpTool(spec.permission) orelse return true;
-    if (spec.wildcard_table) {
-        return identityHasAnyPermission(identity.permissions, .table, required);
-    }
+    const required = permissionTypeForMcpTool(permission) orelse return true;
     return identityHasAnyPermission(identity.permissions, .table, required);
 }
 

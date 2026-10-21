@@ -23836,6 +23836,11 @@ export interface components {
              */
             retention_ms?: number | null;
         };
+        MemoryConfigureRequest: {
+            /** Format: uint64 */
+            expected_revision: number;
+            config: components["schemas"]["MemorySpaceConfig"];
+        };
         MemoryEvidence: {
             id: string;
             source_id?: string;
@@ -25171,11 +25176,6 @@ export interface components {
         MemoryCreateSpaceRequest: {
             space: string;
             config?: components["schemas"]["MemorySpaceConfig"];
-        };
-        MemoryConfigureRequest: {
-            /** Format: int64 */
-            expected_revision: number;
-            config: components["schemas"]["MemorySpaceConfig"];
         };
         /** @description Space state, a memory/history page, or recall with items, revision, completeness, token bounds and cursor. Temporal status is authoritative, not inferred from retrieved candidates. */
         MemoryResult: {
