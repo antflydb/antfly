@@ -326,7 +326,7 @@ pub const Runtime = struct {
         self.last_reload_failed = true;
     }
 
-    fn acquireAdapter(context: *anyopaque) ?scraping.RemoteContentConfig.Snapshot {
+    fn acquireAdapter(context: *anyopaque) anyerror!scraping.RemoteContentConfig.Snapshot {
         const self: *Runtime = @ptrCast(@alignCast(context));
         return self.acquire();
     }
@@ -553,7 +553,7 @@ test "remote content runtime publishes validated snapshots and retains readers" 
     var facade = scraping.RemoteContentConfig{};
     runtime.attach(&facade);
 
-    var held = facade.acquire();
+    var held = try facade.acquire();
     defer held.deinit();
     try std.testing.expectEqualStrings("primary", held.config.default_s3.?);
     const initial_health = runtime.health();
@@ -573,7 +573,7 @@ test "remote content runtime publishes validated snapshots and retains readers" 
     try std.testing.expect(!std.mem.eql(u8, &initial_health.hash, &replacement_image.hash));
     try std.testing.expect(runtime.refreshIfChanged());
 
-    var current = facade.acquire();
+    var current = try facade.acquire();
     defer current.deinit();
     try std.testing.expectEqualStrings("archive", current.config.default_s3.?);
     try std.testing.expectEqualStrings("primary", held.config.default_s3.?);
@@ -587,7 +587,10 @@ test "remote content runtime publishes validated snapshots and retains readers" 
 
         fn run(self: *@This()) void {
             while (!self.stop.load(.acquire)) {
-                var snapshot = self.facade.acquire();
+                var snapshot = self.facade.acquire() catch {
+                    self.invalid.store(true, .release);
+                    return;
+                };
                 const name = snapshot.config.default_s3 orelse "";
                 if (!std.mem.eql(u8, name, "primary") and !std.mem.eql(u8, name, "archive")) {
                     self.invalid.store(true, .release);
@@ -613,7 +616,7 @@ test "remote content runtime publishes validated snapshots and retains readers" 
         \\{"remote_content":{"default_s3":"primary","s3":{"primary":{"access_key_id":"access","secret_access_key":"secret"}}}}
     );
     try std.testing.expect(runtime.refreshIfChanged());
-    var published_again = facade.acquire();
+    var published_again = try facade.acquire();
     published_again.deinit();
     while (concurrent_reader.reads.load(.acquire) < 40) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     concurrent_reader.stop.store(true, .release);
@@ -623,7 +626,7 @@ test "remote content runtime publishes validated snapshots and retains readers" 
 
     try writeTestConfigAtomically(path, "{not-json");
     try std.testing.expect(!runtime.refreshIfChanged());
-    var after_malformed = facade.acquire();
+    var after_malformed = try facade.acquire();
     defer after_malformed.deinit();
     try std.testing.expectEqualStrings("primary", after_malformed.config.default_s3.?);
     const stale_health = runtime.health();
@@ -654,7 +657,7 @@ test "remote content runtime rejects incomplete and startup-only replacements" {
         \\{"health_port":8082,"remote_content":{"default_s3":"archive","s3":{"archive":{"access_key_id":"access","secret_access_key":"secret"}}}}
     );
     try std.testing.expect(!runtime.refreshIfChanged());
-    var after_static_change = facade.acquire();
+    var after_static_change = try facade.acquire();
     defer after_static_change.deinit();
     try std.testing.expectEqualStrings("primary", after_static_change.config.default_s3.?);
     const static_failure = runtime.health();
@@ -668,7 +671,7 @@ test "remote content runtime rejects incomplete and startup-only replacements" {
         \\{"health_port":8081,"remote_content":{"default_s3":"missing","s3":{}}}
     );
     try std.testing.expect(!runtime.refreshIfChanged());
-    var after_incomplete = facade.acquire();
+    var after_incomplete = try facade.acquire();
     defer after_incomplete.deinit();
     try std.testing.expectEqualStrings("primary", after_incomplete.config.default_s3.?);
     try std.testing.expect(runtime.health().stale_snapshot);
@@ -679,7 +682,7 @@ test "remote content runtime rejects incomplete and startup-only replacements" {
         \\{"health_port":8081,"remote_content":{"security":{"nat64_prefixes":["2001:470::/72"]},"default_s3":"archive","s3":{"archive":{}}}}
     );
     try std.testing.expect(!runtime.refreshIfChanged());
-    var after_invalid_nat64 = facade.acquire();
+    var after_invalid_nat64 = try facade.acquire();
     defer after_invalid_nat64.deinit();
     try std.testing.expectEqualStrings("primary", after_invalid_nat64.config.default_s3.?);
     try std.testing.expect(runtime.health().stale_snapshot);
@@ -692,7 +695,7 @@ test "remote content runtime rejects incomplete and startup-only replacements" {
         \\{"health_port":8081,"remote_content":{"default_s3":"archive","s3":{"archive":{}}}}
     );
     try std.testing.expect(runtime.refreshIfChanged());
-    var recovered = facade.acquire();
+    var recovered = try facade.acquire();
     defer recovered.deinit();
     try std.testing.expectEqualStrings("archive", recovered.config.default_s3.?);
     const recovered_health = runtime.health();

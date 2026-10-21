@@ -19,6 +19,16 @@ const std = @import("std");
 const source = @import("online_source_contract.zig");
 const pages = @import("merge_page_contract.zig");
 pub const Side = enum { donor, receiver };
+// Relative budgets cross hosts; monotonic timestamps do not. Leave time for
+// the owner to return its bounded observation before the caller abandons it.
+pub const remaining_ms_header = "X-Antfly-Online-Merge-Remaining-Ms";
+pub const server_response_reserve_ms: u32 = 50;
+pub const max_server_budget_ms: u32 = 5_000;
+pub fn serverBudgetMs(transport_timeout_ms: u32) !u32 {
+    if (transport_timeout_ms <= server_response_reserve_ms) return error.DeadlineExceeded;
+    return @min(transport_timeout_ms - server_response_reserve_ms, max_server_budget_ms);
+}
+
 pub const max_request_bytes = 8 * 1024 * 1024;
 pub const max_response_bytes = 32 * 1024 * 1024;
 pub const SnapshotRequest = struct { receipt: pages.Progress, certificate: @import("../source_snapshot.zig").Certificate };
@@ -195,4 +205,11 @@ test "relational index system online IO inline receipts enforce durable decode b
     try (Request{ .scope = scope, .operation = .{ .tail = invalid } }).validate();
     invalid.snapshot_position = .{ .object = 0, .offset = 4, .remaining = 0 };
     try std.testing.expectError(error.InvalidMergePage, (Request{ .scope = scope, .operation = .{ .tail = invalid } }).validate());
+}
+
+test "online merge transport budgets reserve response time and reject exhausted turns" {
+    try std.testing.expectEqual(@as(u32, 950), try serverBudgetMs(1000));
+    try std.testing.expectEqual(@as(u32, 5000), try serverBudgetMs(30000));
+    try std.testing.expectEqual(@as(u32, 1), try serverBudgetMs(51));
+    for ([_]u32{ 0, 1, 49, 50 }) |budget| try std.testing.expectError(error.DeadlineExceeded, serverBudgetMs(budget));
 }

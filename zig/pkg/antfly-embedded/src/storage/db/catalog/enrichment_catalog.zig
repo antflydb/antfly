@@ -32,6 +32,8 @@ pub const EnrichmentConfig = struct {
     /// instead of extracting a single source_field.
     source_template: []const u8 = "",
     source_artifact_name: []const u8 = "",
+    group_source_json: []const u8 = "",
+    prior_context_json: []const u8 = "",
     embedding_input: enrichment_types.EmbeddingInput = .text,
     expected_dims: u32 = 0,
     vector_space: []const u8 = "",
@@ -50,28 +52,19 @@ pub const EnrichmentConfig = struct {
     graph_inline_managed: ?bool = null,
 
     pub fn clone(alloc: Allocator, cfg: EnrichmentConfig) !EnrichmentConfig {
-        return .{
-            .graph_inline_managed = cfg.graph_inline_managed,
-            .name = try alloc.dupe(u8, cfg.name),
-            .kind = cfg.kind,
-            .source_field = try alloc.dupe(u8, cfg.source_field),
-            .source_template = if (cfg.source_template.len > 0) try alloc.dupe(u8, cfg.source_template) else "",
-            .source_artifact_name = if (cfg.source_artifact_name.len > 0) try alloc.dupe(u8, cfg.source_artifact_name) else "",
-            .embedding_input = cfg.embedding_input,
-            .expected_dims = cfg.expected_dims,
-            .vector_space = if (cfg.vector_space.len > 0) try alloc.dupe(u8, cfg.vector_space) else "",
-            .chunk_size = cfg.chunk_size,
-            .chunk_overlap = cfg.chunk_overlap,
-            .chunker_json = if (cfg.chunker_json.len > 0) try alloc.dupe(u8, cfg.chunker_json) else "",
-            .full_text_index = cfg.full_text_index,
-            .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
-            .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
-            .neighbor_context_json = if (cfg.neighbor_context_json.len > 0) try alloc.dupe(u8, cfg.neighbor_context_json) else "",
-            .execution_json = if (cfg.execution_json.len > 0) try alloc.dupe(u8, cfg.execution_json) else "",
-        };
+        var out = cfg;
+        inline for (.{ "name", "source_field", "source_template", "source_artifact_name", "group_source_json", "prior_context_json", "vector_space", "chunker_json", "content_type", "producer_json", "neighbor_context_json", "execution_json" }) |field| @field(out, field) = "";
+        errdefer out.deinit(alloc);
+        inline for (.{ "name", "source_field", "source_template", "source_artifact_name", "group_source_json", "prior_context_json", "vector_space", "chunker_json", "content_type", "producer_json", "neighbor_context_json", "execution_json" }) |field| {
+            const value = @field(cfg, field);
+            if (value.len > 0) @field(out, field) = try alloc.dupe(u8, value);
+        }
+        return out;
     }
 
     pub fn deinit(self: *EnrichmentConfig, alloc: Allocator) void {
+        if (self.group_source_json.len > 0) alloc.free(self.group_source_json);
+        if (self.prior_context_json.len > 0) alloc.free(self.prior_context_json);
         alloc.free(@constCast(self.name));
         alloc.free(@constCast(self.source_field));
         if (self.source_template.len > 0) alloc.free(@constCast(self.source_template));

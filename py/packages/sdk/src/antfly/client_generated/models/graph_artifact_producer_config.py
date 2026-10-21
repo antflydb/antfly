@@ -9,8 +9,8 @@ from ..models.graph_artifact_producer_config_kind import GraphArtifactProducerCo
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.enrichment_producer_config import EnrichmentProducerConfig
     from ..models.execution_policy import ExecutionPolicy
-    from ..models.graph_artifact_producer_config_producer import GraphArtifactProducerConfigProducer
     from ..models.graph_artifact_producer_config_producer_json import GraphArtifactProducerConfigProducerJson
     from ..models.graph_artifact_producer_source_config import GraphArtifactProducerSourceConfig
 
@@ -30,8 +30,7 @@ class GraphArtifactProducerConfig:
         content_type (str | Unset):
         execution (ExecutionPolicy | Unset): Non-semantic execution policy for one producer or index maintenance
             operation. These fields tune how work is batched and do not change generated artifact identity.
-        producer (GraphArtifactProducerConfigProducer | Unset): Write-only producer configuration. Cannot be combined
-            with producer_json.
+        producer (EnrichmentProducerConfig | Unset):
         producer_json (GraphArtifactProducerConfigProducerJson | Unset): Write-only producer configuration; it may
             contain credentials and is never returned.
     """
@@ -41,7 +40,7 @@ class GraphArtifactProducerConfig:
     source: GraphArtifactProducerSourceConfig
     content_type: str | Unset = UNSET
     execution: ExecutionPolicy | Unset = UNSET
-    producer: GraphArtifactProducerConfigProducer | Unset = UNSET
+    producer: EnrichmentProducerConfig | Unset = UNSET
     producer_json: GraphArtifactProducerConfigProducerJson | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
@@ -87,8 +86,8 @@ class GraphArtifactProducerConfig:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.enrichment_producer_config import EnrichmentProducerConfig
         from ..models.execution_policy import ExecutionPolicy
-        from ..models.graph_artifact_producer_config_producer import GraphArtifactProducerConfigProducer
         from ..models.graph_artifact_producer_config_producer_json import GraphArtifactProducerConfigProducerJson
         from ..models.graph_artifact_producer_source_config import GraphArtifactProducerSourceConfig
 
@@ -109,11 +108,11 @@ class GraphArtifactProducerConfig:
             execution = ExecutionPolicy.from_dict(_execution)
 
         _producer = d.pop("producer", UNSET)
-        producer: GraphArtifactProducerConfigProducer | Unset
+        producer: EnrichmentProducerConfig | Unset
         if isinstance(_producer, Unset):
             producer = UNSET
         else:
-            producer = GraphArtifactProducerConfigProducer.from_dict(_producer)
+            producer = EnrichmentProducerConfig.from_dict(_producer)
 
         _producer_json = d.pop("producer_json", UNSET)
         producer_json: GraphArtifactProducerConfigProducerJson | Unset

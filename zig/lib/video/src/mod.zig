@@ -14,6 +14,7 @@
 // limitations under the License.
 
 pub const live_coordinator = @import("live_coordinator.zig");
+pub const validated_frames = @import("validated_frames.zig");
 pub const live_windows = @import("live_windows.zig");
 pub const transport_avc = @import("transport_avc.zig");
 pub const h264_pictures = @import("h264_pictures.zig");

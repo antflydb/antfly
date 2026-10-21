@@ -31,6 +31,94 @@ components:
         lat:
           type: number
           format: double
+    EqualsQuery:
+      type: object
+      additionalProperties: false
+      description: |
+        Whole string equality on the original logical field value.
+        No normalization is applied. Case-sensitive by default; case_sensitive=false
+        uses Unicode simple case folding, not locale-specific or multi-character folding.
+        Missing, null, and non-string values do not match. Arrays use any-element
+        semantics; a match never spans array elements. Indexes select conservative
+        candidates and original values are verified before counting and pagination.
+      required: [equals, field]
+      properties:
+        equals:
+          type: string
+        field:
+          type: string
+          minLength: 1
+          description: Logical source field path, not a companion index name.
+        case_sensitive:
+          type: boolean
+          default: true
+          x-go-type-skip-optional-pointer: false
+        boost:
+          $ref: '#/components/schemas/Boost'
+    ContainsQuery:
+      type: object
+      additionalProperties: false
+      description: |
+        Contiguous substring search on the original logical field value, including whitespace and punctuation.
+        No normalization is applied. Case-sensitive by default; case_sensitive=false
+        uses Unicode simple case folding, not locale-specific or multi-character folding.
+        Missing, null, and non-string values do not match. Arrays use any-element
+        semantics; a match never spans array elements. Indexes select conservative
+        candidates and original values are verified before counting and pagination.
+      required: [contains, field]
+      properties:
+        contains:
+          type: string
+        field:
+          type: string
+          minLength: 1
+          description: Logical source field path, not a companion index name.
+        case_sensitive:
+          type: boolean
+          default: true
+          x-go-type-skip-optional-pointer: false
+        boost:
+          $ref: '#/components/schemas/Boost'
+    MatchesQuery:
+      type: object
+      additionalProperties: false
+      description: |
+        Unanchored native Unicode regular expression search on the original logical field value. Anchors refer to each complete value; indexed-term regexp semantics are unchanged.
+        No normalization is applied. Case-sensitive by default; case_sensitive=false
+        uses Unicode simple case folding, not locale-specific or multi-character folding.
+        Missing, null, and non-string values do not match. Arrays use any-element
+        semantics; a match never spans array elements. Indexes select conservative
+        candidates and original values are verified before counting and pagination.
+      required: [matches, field]
+      properties:
+        matches:
+          type: string
+        field:
+          type: string
+          minLength: 1
+          description: Logical source field path, not a companion index name.
+        case_sensitive:
+          type: boolean
+          default: true
+          x-go-type-skip-optional-pointer: false
+        boost:
+          $ref: '#/components/schemas/Boost'
+    AutocompleteQuery:
+      type: object
+      additionalProperties: false
+      description: |
+        Analyzed bool-prefix search on a logical field. The planner selects
+        declared search-as-you-type root, shingle and prefix representations.
+        Requires a compatible representation; never silently becomes raw prefix search.
+      required: [autocomplete, field]
+      properties:
+        autocomplete:
+          type: string
+        field:
+          type: string
+          minLength: 1
+        boost:
+          $ref: '#/components/schemas/Boost'
     TermQuery:
       type: object
       properties:
@@ -510,6 +598,10 @@ components:
     #    - k
     Query:
       oneOf:
+        - $ref: "#/components/schemas/EqualsQuery"
+        - $ref: "#/components/schemas/ContainsQuery"
+        - $ref: "#/components/schemas/MatchesQuery"
+        - $ref: "#/components/schemas/AutocompleteQuery"
         - $ref: "#/components/schemas/TermQuery"
         - $ref: "#/components/schemas/MatchQuery"
         - $ref: "#/components/schemas/MultiMatchQuery"

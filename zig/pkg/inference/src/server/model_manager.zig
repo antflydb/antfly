@@ -2593,6 +2593,7 @@ pub const LoadedModel = struct {
     /// state within a loaded model. Keep one model-local lane while allowing
     /// independent models to overlap.
     target_inference_run_lock: std.atomic.Mutex = .unlocked,
+    embedding_cohort_scheduler: @import("../runtime/embedding_scheduler.zig").Scheduler = .{},
     /// CUDA boundary requests execute serially on this session. Queue before
     /// reserving their full device scratch ceiling, without holding a provider
     /// lock during admission/eviction. Every waiter retains a ModelHandle.
@@ -2704,9 +2705,11 @@ pub const LoadedModel = struct {
     }
 
     pub fn getTokenizer(self: *LoadedModel) tokenizer_mod.Tokenizer {
-        if (self.hf_tok) |ht| return ht.tokenizer();
-        if (self.sp_tok) |sp| return sp.tokenizer();
-        unreachable;
+        var tokenizer = if (self.hf_tok) |ht| ht.tokenizer() else if (self.sp_tok) |sp| sp.tokenizer() else unreachable;
+        // Managed tokenizers are immutable for this loaded model generation.
+        // A pinned handle keeps both tokenizer and backend provider alive.
+        tokenizer.cache_identity = if (self.embedding_identity) |signature| std.hash.Wyhash.hash(0, &signature) else null;
+        return tokenizer;
     }
 
     pub fn getEmbeddingPrototypeCache(self: *LoadedModel, limits: runtime.tier.memory.Limits, control: InferenceExecutionControl) !*@import("../extractors/embedding_prototypes.zig").Cache {
@@ -8113,6 +8116,7 @@ pub const ModelManager = struct {
             .resource_lease = loaded_session.resource_lease,
         };
         model.session.execution_gate = &model.target_inference_run_lock;
+        if (session_factory.getEmbeddingGemma2Config(model.session) != null) model.session.cohort_scheduler = &model.embedding_cohort_scheduler;
 
         // Keep publication behind the same cooperative boundary as expensive
         // construction. An abandoned manager task should release its fully
@@ -14162,6 +14166,14 @@ test "chunk planning survives metadata-only re-pulls and rejects changed tokeniz
     try tmp.dir.deleteFile(io, "linked.json");
     try std.testing.expectEqual(snapshot.digest, try model.chunkPlanningIdentity());
     try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "changed!" });
+    // Some Linux filesystems give successive same-size writes identical
+    // mtime/ctime values within one clock tick. Exercise content revalidation
+    // with an observable generation change without sleeping or making warm
+    // planning reread tokenizer/model contents on every request.
+    var changed = try tmp.dir.openFile(io, "tokenizer.json", .{ .mode = .read_write });
+    defer changed.close(io);
+    const stat = try changed.stat(io);
+    try changed.setTimestamps(io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(stat.mtime.toNanoseconds() + std.time.ns_per_s) } });
     try std.testing.expectError(error.ModelArtifactsChanging, model.chunkPlanningIdentity());
 }
 

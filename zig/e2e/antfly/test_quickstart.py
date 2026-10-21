@@ -2332,6 +2332,53 @@ def test_public_managed_antfly_embeddinggemma2_embedder_smoke(
 
 
 @pytest.mark.real_model
+def test_embeddinggemma2_metadata_changes_preserve_loaded_identity(
+    embeddinggemma2_model_available, real_embeddinggemma2_backup_api
+):
+    """A ctime-only invalidation must revalidate once without poisoning serving."""
+    api = real_embeddinggemma2_backup_api
+    model_dir = embeddinggemma2_model_available
+    warm = api.inference_embed(EMBEDDINGGEMMA2_MODEL, "metadata identity probe")
+    identity = warm["model_identity"]
+    expected = warm["data"][0]["embedding"]
+    weights = model_dir / "model.safetensors"
+    before = weights.stat()
+    link = model_dir / f".identity-revalidation-{time.time_ns()}"
+    try:
+        os.link(weights, link)
+    finally:
+        link.unlink(missing_ok=True)
+    after = weights.stat()
+    assert (before.st_ino, before.st_size, before.st_mtime_ns) == (
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    )
+    assert before.st_ctime_ns != after.st_ctime_ns
+
+    # Use independent connections: the fixture's shared Session serializes
+    # callers and would hide concurrent snapshot revalidation failures.
+    def embed(_):
+        response = requests.post(
+            api.url.removesuffix("/db/v1") + "/ai/v1/embed",
+            json={
+                "model": EMBEDDINGGEMMA2_MODEL,
+                "model_identity": identity,
+                "input": "metadata identity probe",
+            },
+            timeout=120,
+        )
+        assert response.ok, (response.status_code, response.text, api.debug_logs())
+        value = response.json()
+        assert value["model_identity"] == identity
+        assert value["data"][0]["embedding"] == pytest.approx(expected)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(embed, range(4)))
+    embed(None)
+
+
+@pytest.mark.real_model
 def test_public_managed_antfly_embeddinggemma2_chunked_full_index_pipeline(
     real_embeddinggemma2_backup_api,
 ):

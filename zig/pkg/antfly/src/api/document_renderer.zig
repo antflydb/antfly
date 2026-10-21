@@ -219,6 +219,7 @@ fn toJson(arena: Allocator, value: hbs.Value) Allocator.Error!std.json.Value {
         .boolean => |b| .{ .bool = b },
         .integer => |i| .{ .integer = i },
         .float => |f| .{ .float = f },
+        .number_string => |raw| .{ .number_string = raw },
         .string, .safe_string => |s| .{ .string = s },
         .array => |items| blk: {
             var array = std.json.Array.init(arena);
@@ -306,4 +307,15 @@ test "validateTemplate rejects invalid templates and helper options" {
     try std.testing.expectError(error.InvalidDocumentRenderer, validateTemplate(std.testing.allocator, "{{encodeToon this.fields indent=this.fields.indent}}"));
     try std.testing.expectError(error.InvalidDocumentRenderer, validateTemplate(std.testing.allocator, "{{encodeToon this.fields lengthMarker=false}}"));
     try validateTemplate(std.testing.allocator, "{{#if this.fields.title}}{{encodeToon this.fields indent=4 delimiter=\"tab\"}}{{/if}}");
+}
+
+test "document_renderer encodeToon preserves exact numeric literals" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var source: std.json.ObjectMap = .empty;
+    try source.put(arena.allocator(), "id", .{ .number_string = "9007199254740993.0" });
+    try source.put(arena.allocator(), "tiny", .{ .number_string = "1e-400" });
+    const rendered = try renderTemplate(std.testing.allocator, "{{encodeToon fields}}", "doc:1", 1, source);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expectEqualStrings("id: 9007199254740993.0\ntiny: 1e-400", rendered);
 }

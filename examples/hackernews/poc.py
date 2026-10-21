@@ -67,21 +67,66 @@ def lake_metric_deltas(before, after):
 
 
 def lake_phase_profile(delta, elapsed_ms):
+    text_phases = (
+        "text_directory",
+        "text_inventory",
+        "text_opening",
+        "text_term_plan",
+        "text_navigation",
+        "text_postings",
+        "text_cursor",
+        "cursor_retention",
+        "result_delivery",
+    )
+    text_values = {
+        phase + "_ms": delta[f"antfly_lake_query_{phase}_nanoseconds_total"] / 1_000_000
+        for phase in text_phases
+        if f"antfly_lake_query_{phase}_nanoseconds_total" in delta
+    }
+    text_scope = "Text phases are inclusive and can overlap through bounded prefetch. Opening includes reader validation and collection setup on corpus-cache misses. Postings includes nested acquisition callbacks. Do not sum nested phases."
     keys = {
         phase: f'antfly_lake_query_phase_nanoseconds_total{{phase="{phase}"}}'
         for phase in ("total", "publication", "search", "hydration", "delivery")
     }
     if not all(key in delta for key in keys.values()):
-        return None
+        # Native-only metrics expose inclusive scopes without phase labels.
+        if not all(
+            f"antfly_lake_query_{phase}_nanoseconds_total" in delta
+            for phase in ("total", "ranking")
+        ):
+            return None
+        phases = (
+            "total",
+            "source",
+            "publication",
+            "index",
+            "ranking",
+            "hydration",
+            "highlight",
+        )
+        values = {
+            phase + "_ms": delta[f"antfly_lake_query_{phase}_nanoseconds_total"]
+            / 1_000_000
+            for phase in phases
+            if f"antfly_lake_query_{phase}_nanoseconds_total" in delta
+        }
+        return {
+            **values,
+            **text_values,
+            "outside_lake_ms": round(elapsed_ms - values["total_ms"], 3),
+            "scope": "Serial process counter interval. " + text_scope,
+        }
     values = {phase: delta[key] / 1_000_000 for phase, key in keys.items()}
     return {
+        **text_values,
         "total_ms": values["total"],
         "pre_search_ms": values["publication"],
         "search_ms": values["search"],
         "post_search_ms": values["delivery"],
         "hydration_ms": values["hydration"],
         "outside_lake_ms": round(elapsed_ms - values["total"], 3),
-        "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative.",
+        "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        + (" " + text_scope if text_values else ""),
     }
 
 
@@ -375,6 +420,17 @@ def main():
         action="store_true",
         help="Stop after publication, remove this state's cache, then measure",
     )
+    parser.add_argument(
+        "--process-memory-budget-mb",
+        type=int,
+        default=0,
+        help="Fixed native process envelope; 0 preserves auto-detection",
+    )
+    parser.add_argument(
+        "--immediate-first-query",
+        action="store_true",
+        help="Skip pre-query metric-refresh sleeps for the first archive query",
+    )
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--workload-terms", nargs="+", default=[])
@@ -435,6 +491,8 @@ def main():
         parser.error("query port must leave a valid adjacent health port")
     if not 0 <= args.cursor_pages <= 100:
         parser.error("cursor pages must be between zero and 100")
+    if args.process_memory_budget_mb < 0:
+        parser.error("Process memory budget must be nonnegative")
     if args.repeats < 1 or args.concurrency < 1:
         parser.error("repeats and concurrency must be positive")
     if args.expected_rows < 2 or args.build_timeout < 1:
@@ -554,6 +612,10 @@ def main():
             "--models-dir",
             str(args.state / "empty-models"),
         ]
+        if args.process_memory_budget_mb:
+            command.extend(
+                ["--process-memory-budget-mb", str(args.process_memory_budget_mb)]
+            )
         if args.docker:
             container = "hn-comparison-" + uuid.uuid4().hex
             command[0] = "/app/antfly"
@@ -697,6 +759,8 @@ def main():
             "cursor_initial",
             "cursor_depth_restart",
         } or phase.startswith("composed_cold.")
+        if args.immediate_first_query and phase == "cold":
+            serial_profile = False
         metrics_before = lake_metrics() if serial_profile else None
         before = resource_counters()
         started = time.monotonic()
@@ -840,7 +904,7 @@ def main():
         if not args.disable_navigation_warming:
             readiness = call("GET", "/tables/hn_archive_poc/indexes/body_text")
             assert readiness["status"]["readiness"]["queryable"], readiness
-        if args.disable_navigation_warming:
+        if args.disable_navigation_warming and not args.immediate_first_query:
             baseline_metrics = lake_metrics()
             assert (
                 baseline_metrics.get("antfly_lake_navigation_warming_attempts_total", 0)
@@ -1304,6 +1368,8 @@ def main():
             "metadata_indexes": metadata_columns,
             "metadata_indexes_queryable": list(metadata_status),
             "cold_cache_cleared_after_publication": args.cold_cache,
+            "first_query_without_metric_refresh_delay": args.immediate_first_query,
+            "process_memory_budget_mb": args.process_memory_budget_mb,
             "navigation_warming_enabled": not args.disable_navigation_warming,
             "startup_samples_ms": startup_samples_ms,
             "engine_child_peak_rss_bytes": engine_peak_rss_bytes,

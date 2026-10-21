@@ -505,6 +505,12 @@ exposing the table. Shard split, merge, and movement must transfer the same
 logical ownership and recovery evidence; no imported primary reference may
 depend on an unretained file in the old shard.
 
+Shared exact-vector projection coverage is certified by embedding artifact family
+and dimension. Recreating an external index with a different dimension selects
+only compatible artifacts, and compaction maintains an independent certificate
+for each vector space. Older name-only certificates cannot certify a new vector space; maintenance
+rebuilds coverage at a pinned source boundary.
+
 ## Code map
 
 

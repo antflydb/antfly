@@ -152,3 +152,28 @@ pub fn stageInputRestoreBackup(
         .table_name = result.table_name_ptr[0..result.table_name_len],
     };
 }
+
+/// The CLI sees only JSON across the existing storage codegen boundary.
+pub const InspectContext = extern struct {
+    input_ptr: [*]const u8,
+    input_len: usize,
+    destination_ptr: ?[*]const u8,
+    destination_len: usize,
+    max_input_bytes: u64,
+    max_expanded_bytes: u64,
+    result_ptr: *?[*]u8,
+    result_len: *usize,
+};
+extern fn antfly_backup_preflight(context: *const InspectContext) callconv(.c) c_int;
+extern fn antfly_backup_preflight_free(ptr: [*]u8, len: usize) callconv(.c) void;
+
+pub fn inspectInputJsonAlloc(allocator: std.mem.Allocator, input: []const u8, destination: ?[]const u8, max_input_bytes: u64, max_expanded_bytes: u64) ![]u8 {
+    if (comptime use_direct_implementation) return @import("backup_inspection.zig").inspectInputJsonAlloc(allocator, input, destination, .{ .max_input_bytes = max_input_bytes, .max_expanded_bytes = max_expanded_bytes });
+    var ptr: ?[*]u8 = null;
+    var len: usize = 0;
+    const status = antfly_backup_preflight(&.{ .input_ptr = input.ptr, .input_len = input.len, .destination_ptr = if (destination) |d| d.ptr else null, .destination_len = if (destination) |d| d.len else 0, .max_input_bytes = max_input_bytes, .max_expanded_bytes = max_expanded_bytes, .result_ptr = &ptr, .result_len = &len });
+    if (status != Status.ok) return if (status == Status.out_of_memory) error.OutOfMemory else error.InvalidPreflightRequest;
+    const bytes = (ptr orelse return error.InvalidPreflightResponse)[0..len];
+    defer antfly_backup_preflight_free(bytes.ptr, bytes.len);
+    return allocator.dupe(u8, bytes);
+}

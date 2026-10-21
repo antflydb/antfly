@@ -163,7 +163,7 @@ const Precompiled = struct {
         var output: std.ArrayListUnmanaged(u8) = .empty;
         errdefer output.deinit(allocator);
         try output.ensureTotalCapacity(allocator, text.len);
-        var graphemes = @import("grapheme.zig").Iterator{ .text = text };
+        var graphemes = @import("antfly_grapheme").Iterator{ .text = text };
         while (try graphemes.next()) |cluster| {
             // Match the reference's short-grapheme rule exactly, including
             // its six-byte cutoff. Longer clusters normalize each codepoint.

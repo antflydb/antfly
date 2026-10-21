@@ -255,6 +255,11 @@ pub const VTable = struct {
     listIndexes: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome([]types.IndexConfig),
     listEnrichments: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome([]types.EnrichmentConfig),
     listResolvers: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome([]@import("db/catalog/index_manager.zig").ResolverConfig),
+    curateResolverJsonAlloc: *const fn (self: *DB, alloc: std.mem.Allocator, name: []const u8, request_json: []const u8) Outcome([]u8),
+    resolverCurationJsonAlloc: *const fn (self: *DB, alloc: std.mem.Allocator, name: []const u8) Outcome([]u8),
+    resolverReviewsJsonAlloc: *const fn (self: *DB, alloc: std.mem.Allocator, request_json: []const u8) Outcome([]u8),
+    listResolverIdentities: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome([]@import("db/catalog/resolver_catalog.zig").ResolverConfig),
+    consumeResolverMetadataDrop: *const fn (self: *DB, alloc: std.mem.Allocator, identity: @import("db/resolver_curation.zig").MetadataIdentity) Outcome(void),
     pendingWorkStats: *const fn (self: *DB) Outcome(@import("db/core.zig").PendingWorkStats),
     runArtifactRepairMetadataMaintenanceUntilIdle: *const fn (self: *DB) Outcome(void),
     publishVectorBlockBasesOnline: *const fn (self: *DB, options: @import("db/catalog/index_manager.zig").IndexManager.OnlineVectorBlockPublicationOptions) Outcome(usize),
@@ -424,6 +429,7 @@ pub const VTable = struct {
     admitManagedIndex: *const fn (self: *DB, cfg: types.IndexConfig) Outcome(?u128),
     waitForSyncLevelWithCancellation: *const fn (self: *DB, sync_level: types.SyncLevel, sequence: u64, sync_targets: @import("db/execution_resources.zig").ManagedSyncTargets, cancellation: types.CancellationToken, skip_enrichment_runtime_wait: bool) Outcome(void),
     waitForResolvedTransactionSyncWithCancellation: *const fn (self: *DB, sync_level: types.SyncLevel, sequence: u64, cancellation: types.CancellationToken) Outcome(void),
+    waitForResolvedTransactionSyncTargetWithCancellation: *const fn (self: *DB, sync_level: types.SyncLevel, sequence: *u64, phase: *u8, cancellation: types.CancellationToken) Outcome(void),
     enrichmentStart: *const fn (self: *@import("db/enrichment/enrichment_runtime.zig").EnrichmentRuntime) Outcome(void),
     enrichmentReloadDurableState: *const fn (self: *@import("db/enrichment/enrichment_runtime.zig").EnrichmentRuntime) Outcome(void),
     enrichmentResumeFrom: *const fn (self: *@import("db/enrichment/enrichment_runtime.zig").EnrichmentRuntime, sequence: u64, target_sequence: u64) Outcome(void),
@@ -544,6 +550,7 @@ pub const VTable = struct {
     runBackgroundTurnWithCancellation: *const fn (*DB, types.CancellationToken, bool) Outcome(bool),
     runBackgroundMaintenanceWithCancellation: *const fn (*DB, types.CancellationToken) Outcome(bool),
     registry: *const fn () Outcome(*anyopaque),
+    writeValidateGroupedSourceBatch: *const fn (std.mem.Allocator, *DB, []const types.BatchWrite, []const []const u8, []const types.DocumentTransform) Outcome(void),
 };
 pub const Boundary = callback.Boundary(VTable);
 pub const FieldLayout = extern struct { name: [*:0]const u8, type_name: [*:0]const u8, offset: usize, size: usize, alignment: usize };
@@ -560,7 +567,7 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
     return &Holder.fields;
 }
 pub const Descriptor = extern struct {
-    version: u32 = 25,
+    version: u32 = 29,
     table_layout: native.TypeContract,
     db_layout: native.TypeContract,
     core_layout: native.TypeContract,
@@ -632,25 +639,48 @@ pub const resource_manager_layout = blk: {
     @setEvalBranchQuota(100_000);
     break :blk native.TypeContract.of(@import("resource_manager.zig").ResourceManager);
 };
-extern fn antfly_storage_engine_get_descriptor_v25() callconv(.c) *const Descriptor;
+extern fn antfly_storage_engine_get_descriptor_v29() callconv(.c) *const Descriptor;
 fn Result(comptime name: []const u8) type {
     const Function = @typeInfo(@FieldType(VTable, name)).pointer.child;
     const Wire = @typeInfo(Function).@"fn".return_type.?;
     return anyerror!@FieldType(Wire, "value");
 }
+// libc's allocation family is process-wide, but each native compilation owns
+// a distinct std allocator vtable. Canonicalize only that exact stateless root
+// so owner-local optional admission can recognize it. Never peel a quota,
+// tracking, arena, failure or other custom allocator at this boundary.
+extern fn antfly_storage_engine_c_allocator_v1() callconv(.c) ?*const Allocator;
+fn ownerAllocator(value: Allocator) Allocator {
+    if (comptime enabled and @import("builtin").link_libc) {
+        if (value.vtable == std.heap.c_allocator.vtable) {
+            if (antfly_storage_engine_c_allocator_v1()) |owned| return owned.*;
+        }
+    }
+    return value;
+}
+
+test "logical query engine allocator normalization preserves custom quotas" {
+    var constrained = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const input = constrained.allocator();
+    const output = ownerAllocator(input);
+    try std.testing.expect(input.ptr == output.ptr and input.vtable == output.vtable);
+}
+
 pub fn call(comptime name: []const u8, args: anytype) Result(name) {
-    const descriptor = antfly_storage_engine_get_descriptor_v25();
+    const descriptor = antfly_storage_engine_get_descriptor_v29();
     try validateDescriptor(descriptor);
     // Individual hidden accessors let final links discard unused operations.
     // A global table would retain every physical operation in every consumer.
-    const getter = @extern(*const fn () callconv(.c) *const anyopaque, .{ .name = "antfly_storage_engine_" ++ name ++ "_v25" });
+    const getter = @extern(*const fn () callconv(.c) *const anyopaque, .{ .name = "antfly_storage_engine_" ++ name ++ "_v29" });
     const method: @FieldType(VTable, name) = @ptrCast(@alignCast(getter()));
     const Function = @typeInfo(@FieldType(VTable, name)).pointer.child;
     const Args = std.meta.ArgsTuple(Function);
     var wire_args: Args = undefined;
     inline for (@typeInfo(Args).@"struct".field_names, @typeInfo(Args).@"struct".field_types) |field, T| {
         const value = @field(args, field);
-        @field(wire_args, field) = if (comptime T == native.IoBorrow and @TypeOf(value) == std.Io)
+        @field(wire_args, field) = if (comptime T == Allocator)
+            ownerAllocator(value)
+        else if (comptime T == native.IoBorrow and @TypeOf(value) == std.Io)
             native.IoBorrow.init(&value)
         else if (comptime T == ?native.IoBorrow and @TypeOf(value) == ?std.Io)
             if (value) |io| native.IoBorrow.init(&io) else null
@@ -676,10 +706,10 @@ pub fn call(comptime name: []const u8, args: anytype) Result(name) {
 }
 
 pub fn descriptorForValidation() *const Descriptor {
-    return antfly_storage_engine_get_descriptor_v25();
+    return antfly_storage_engine_get_descriptor_v29();
 }
 pub fn validateDescriptor(descriptor: *const Descriptor) !void {
-    if (descriptor.version != 25 or !descriptor.table_layout.matches(table_layout) or
+    if (descriptor.version != 29 or !descriptor.table_layout.matches(table_layout) or
         !descriptor.db_layout.matches(db_layout) or !descriptor.core_layout.matches(core_layout) or
         !descriptor.handle_layout.matches(handle_layout) or !descriptor.registry_layout.matches(registry_layout) or
         !descriptor.backend_runtime_layout.matches(backend_runtime_layout) or

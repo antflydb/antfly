@@ -5197,6 +5197,9 @@ pub const vtable_impl = ComputeBackend.VTable{
     .gqaPagedAttention = &gqaPagedAttentionOp,
     .fromFloat32 = &fromFloat32Op,
     .fromFloat32Shape = &fromFloat32ShapeOp,
+    .fromBorrowedFloat32Shape = &fromBorrowedFloat32ShapeOp,
+    .hostFloat32Read = &hostFloat32ReadOp,
+    .hostFloat32Write = &hostFloat32WriteOp,
     .fromInt32Shape = &fromInt32ShapeOp,
     .fromConstantBytes = &fromConstantBytesOp,
     .convertDType = &convertDTypeOp,
@@ -36439,16 +36442,17 @@ fn embeddingHeadPrepareOp(ctx: *anyopaque, input: CT, weight: ?CT, gather: ?CT, 
     defer self.allocator.free(positions);
     for (0..p.rows) |row| {
         if (self.io) |io| try io.checkCancel();
-        const src_row = if (ids) |values| blk: {
+        const index = if (ids) |values| blk: {
             const value = values[row];
-            if (!std.math.isFinite(value) or value < 0 or value >= @as(f32, @floatFromInt(p.source_rows)) or @trunc(value) != value) return error.InvalidTensorShape;
+            if (!std.math.isFinite(value) or value < 0 or value >= @as(f32, @floatFromInt(if (p.gather == 2) p.sequence else p.source_rows)) or @trunc(value) != value) return error.InvalidTensorShape;
             break :blk @as(usize, @intFromFloat(value));
         } else row;
+        const src_row = if (p.gather == 2) row else index;
         if (src_row >= p.source_rows) return error.InvalidTensorShape;
         for (0..p.heads) |h| {
             const src = src_row * p.stride + p.start + h / (p.heads / p.source_heads) * p.dim;
             @memcpy(out[(row * p.heads + h) * p.dim ..][0..p.dim], source[src..][0..p.dim]);
-            if (p.rotate != 0) positions[row * p.heads + h] = src_row % p.sequence;
+            if (p.rotate != 0) positions[row * p.heads + h] = if (p.gather == 2) index else src_row % p.sequence;
         }
     }
     const ones: [512]f32 = @splat(1);
@@ -38398,17 +38402,19 @@ fn visionNormRopeOp(ctx: *anyopaque, input: CT, weight: CT, p: ops.VisionNormRop
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const data = getData(input);
     const w = getData(weight);
-    if (p.rows == 0 or p.head_dim == 0 or p.head_dim % 4 != 0 or p.hidden % p.head_dim != 0 or p.grid_x == 0 or p.grid_y == 0 or p.theta <= 0 or data.len != @as(usize, p.rows) * p.hidden or w.len != p.head_dim) return error.InvalidTensorShape;
-    const out = try self.allocator.alloc(f32, data.len);
+    const stride: usize = if (p.stride == 0) p.hidden else p.stride;
+    if (p.start > stride or p.hidden > stride - p.start or p.rotate > 1 or p.weighted > 1) return error.InvalidTensorShape;
+    if (p.rows == 0 or p.head_dim == 0 or p.head_dim % 4 != 0 or p.hidden % p.head_dim != 0 or p.grid_x == 0 or p.grid_y == 0 or p.theta <= 0 or data.len != @as(usize, p.rows) * stride or w.len != p.head_dim) return error.InvalidTensorShape;
+    const out = try self.allocator.alloc(f32, @as(usize, p.rows) * p.hidden);
     var owns_output = true;
     errdefer if (owns_output) self.allocator.free(out);
     const quarter = p.head_dim / 4;
     // The spatial angles are independent of head, batch and layer weights.
     // Evaluate each axis/position once, rather than per head and output lane.
     const positions = try std.math.add(usize, p.grid_x, p.grid_y);
-    const trig = try self.allocator.alloc(f32, try std.math.mul(usize, positions, quarter * 2));
+    const trig = try self.allocator.alloc(f32, if (p.rotate == 0) 0 else try std.math.mul(usize, positions, quarter * 2));
     defer self.allocator.free(trig);
-    for (0..quarter) |j| {
+    if (p.rotate != 0) for (0..quarter) |j| {
         const freq = 1 / std.math.pow(f32, p.theta, @as(f32, @floatFromInt(2 * j)) / @as(f32, @floatFromInt(p.head_dim / 2)));
         for (0..2) |axis| {
             const count = if (axis == 0) p.grid_x else p.grid_y;
@@ -38419,14 +38425,19 @@ fn visionNormRopeOp(ctx: *anyopaque, input: CT, weight: CT, p: ops.VisionNormRop
                 trig[((first + position) * quarter + j) * 2 + 1] = @sin(angle);
             }
         }
-    }
+    };
     for (0..p.rows) |row| {
         if (self.io) |io| try io.checkCancel();
         for (0..p.hidden / p.head_dim) |head| {
-            const base = row * p.hidden + head * p.head_dim;
+            const base = row * stride + p.start + head * p.head_dim;
+            const destination = row * p.hidden + head * p.head_dim;
             var sum: f32 = 0;
             for (data[base..][0..p.head_dim]) |x| sum += x * x;
             const inv = 1 / @sqrt(sum / @as(f32, @floatFromInt(p.head_dim)) + p.eps);
+            if (p.rotate == 0) {
+                for (0..p.head_dim) |d| out[destination + d] = data[base + d] * inv * (if (p.weighted != 0) w[d] else 1) * p.scale;
+                continue;
+            }
             for (0..2) |axis| for (0..quarter) |j| {
                 const ai = axis * 2 * quarter + j;
                 const bi = ai + quarter;
@@ -38434,10 +38445,10 @@ fn visionNormRopeOp(ctx: *anyopaque, input: CT, weight: CT, p: ops.VisionNormRop
                 const offset = (((if (axis == 0) @as(usize, 0) else p.grid_x) + position) * quarter + j) * 2;
                 const cosine = trig[offset];
                 const sine = trig[offset + 1];
-                const x = data[base + ai] * inv * w[ai];
-                const y = data[base + bi] * inv * w[bi];
-                out[base + ai] = (x * cosine - y * sine) * p.scale;
-                out[base + bi] = (y * cosine + x * sine) * p.scale;
+                const x = data[base + ai] * inv * (if (p.weighted != 0) w[ai] else 1);
+                const y = data[base + bi] * inv * (if (p.weighted != 0) w[bi] else 1);
+                out[destination + ai] = (x * cosine - y * sine) * p.scale;
+                out[destination + bi] = (y * cosine + x * sine) * p.scale;
             };
         }
     }
@@ -42088,6 +42099,26 @@ fn maskedBceWithLogitsBackwardOp(ctx: *anyopaque, request: *const ops.MaskedBceW
     raw_output = null;
     errdefer freeTensor(self, result);
     return self.withLogicalShape(result, request.logits_shape);
+}
+
+fn fromBorrowedFloat32ShapeOp(ctx: *anyopaque, data: []const f32, shape: []const i32) !CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const result = try self.makeBuf(@constCast(data), false);
+    errdefer freeTensor(self, result);
+    var logical: [8]i64 = undefined;
+    if (shape.len == 0 or shape.len > logical.len) return error.InvalidTensorShape;
+    for (shape, logical[0..shape.len]) |dim, *dest| dest.* = dim;
+    return self.withLogicalShape(result, logical[0..shape.len]);
+}
+fn hostFloat32ReadOp(_: *anyopaque, tensor: CT) !?[]const f32 {
+    const buf = toBuf(tensor);
+    if (buf.view_strides != null or buf.source_tensor != null or buf.quantized_storage != null or buf.data.len == 0) return null;
+    return try getDataChecked(tensor);
+}
+fn hostFloat32WriteOp(ctx: *anyopaque, tensor: CT) !?[]f32 {
+    const buf = toBuf(tensor);
+    if (!buf.owned or buf.tensor_refs != 1 or buf.retained_parent != null or buf.lazy_entry != null or buf.weight_handle_name != null or (buf.shared_data_refcount != null and buf.shared_data_refcount.?.* != 1)) return null;
+    return if (try hostFloat32ReadOp(ctx, tensor)) |data| @constCast(data) else null;
 }
 
 fn fromFloat32ShapeOp(ctx: *anyopaque, data: []const f32, shape: []const i32) anyerror!CT {
@@ -54342,4 +54373,30 @@ test "embeddinggemma2 canonical CPU panels own typed grouped weights without den
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{false});
     try Case.run(std.testing.allocator, true);
+}
+
+test "embeddinggemma2 video host borrows avoid copies and writable views reject shared ownership" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer store.deinitOwned();
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var values = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const borrowed = try cb.fromBorrowedFloat32Shape(&values, &.{ 2, 3 });
+    try std.testing.expectEqual(values[0..].ptr, (try cb.hostFloat32Read(borrowed)).?.ptr);
+    try std.testing.expectEqual(@as(?[]f32, null), try cb.hostFloat32Write(borrowed));
+    try std.testing.expectError(error.InvalidShape, cb.fromBorrowedFloat32Shape(&values, &.{ 3, 3 }));
+    cb.free(borrowed); // Borrowed stack storage remains caller owned.
+    try std.testing.expectEqual(@as(f32, 6), values[5]);
+    const output = (try cb.allocUninitF32Shape(&.{ 2, 3 })).?;
+    const target = (try cb.hostFloat32Write(output)).?;
+    @memcpy(target, &values);
+    const view = try cb.sliceRows2D(a, output, 1, 1, 3);
+    try std.testing.expectEqual(@as(?[]f32, null), try cb.hostFloat32Write(output));
+    try std.testing.expectEqual(@as(?[]f32, null), try cb.hostFloat32Write(view));
+    try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6 }, (try cb.hostFloat32Read(view)).?);
+    cb.free(output); // The retained row still owns the parent allocation.
+    try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6 }, (try cb.hostFloat32Read(view)).?);
+    cb.free(view);
 }

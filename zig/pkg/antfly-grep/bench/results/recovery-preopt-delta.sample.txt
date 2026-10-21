@@ -1,0 +1,459 @@
+Analysis of sampling profile-macos (pid 98718) every 1 millisecond
+Process:         profile-macos [98718]
+Path:            /Users/USER/*/profile-macos
+Load Address:    0x1049c8000
+Identifier:      profile-macos
+Version:         0
+Code Type:       ARM64
+Platform:        macOS
+Parent Process:  Python [98645]
+Target Type:     live task
+
+Date/Time:       2026-10-19 08:32:24.930 -0700
+Launch Time:     2026-10-19 08:32:24.785 -0700
+OS Version:      macOS 27.0.1 (26A434)
+Report Version:  7
+Analysis Tool:   /usr/bin/sample
+
+Physical footprint:         5936K
+Physical footprint (peak):  5936K
+Idle exit:                  untracked
+----
+
+Call graph:
+    1884 Thread_42671507   DispatchQueue_1: com.apple.main-thread  (serial)
+    + 1884 start  (in dyld) + 6688  [0x18367be80]
+    +   1884 main  (in profile-macos) + 824  [0x1049c9aa0]  start.zig:754
+    +     1884 main.run  (in profile-macos) + 32200  [0x1049ebd50]  main.zig:299
+    +       935 workspace.serve__func_137  (in profile-macos) + 1432  [0x104c841f8]  workspace.zig:76
+    +       ! 935 Io.Reader.peekDelimiterInclusive  (in profile-macos) + 432  [0x104a04110]  Reader.zig:853
+    +       !   935 Io.Reader.fillMore  (in profile-macos) + 68  [0x104a042ac]  Reader.zig:1157
+    +       !     935 Io.File.Reader.readVec  (in profile-macos) + 88  [0x1049f2f7c]  Reader.zig:235
+    +       !       935 Io.File.Reader.readVecStreaming  (in profile-macos) + 232  [0x1049f3454]  Reader.zig:282
+    +       !         934 Io.Threaded.operate  (in profile-macos) + 1324  [0x104a204d0]  Threaded.zig:2544
+    +       !         : 934 readv  (in libsystem_kernel.dylib) + 8  [0x183a1be60]
+    +       !         1 Io.Threaded.operate  (in profile-macos) + 1324  [0x104a204d0]  Threaded.zig:2544
+    +       850 workspace.serve__func_137  (in profile-macos) + 8808  [0x104c85ec8]  workspace.zig:153
+    +       ! 849 workspace_store.Generation.captureJournal  (in profile-macos) + 68  [0x104c5a20c]  workspace_store.zig:113
+    +       ! : 346 workspace_store.Generation.captureJournalInner  (in profile-macos) + 5544  [0x104c57acc]  workspace_store.zig:156
+    +       ! : | 107 workspace_store.Collector.addFile  (in profile-macos) + 1500  [0x104c4c47c]  workspace_store.zig:1200
+    +       ! : | + 104 workspace_store.Collector.finishRead  (in profile-macos) + 156  [0x104c4b298]  workspace_store.zig:1208
+    +       ! : | + ! 104 source_watch.Watch.poll  (in profile-macos) + 140  [0x104abc8b8]  source_watch.zig:301
+    +       ! : | + !   104 kevent  (in libsystem_kernel.dylib) + 8  [0x183a12fcc]
+    +       ! : | + 1 workspace_store.Collector.finishRead  (in profile-macos) + 256  [0x104c4b2fc]  workspace_store.zig:1208
+    +       ! : | + 1 workspace_store.Collector.finishRead  (in profile-macos) + 416  [0x104c4b39c]  workspace_store.zig:1212
+    +       ! : | + 1 workspace_store.Collector.finishRead  (in profile-macos) + 492  [0x104c4b3e8]  workspace_store.zig:1213
+    +       ! : | +   1 workspace_store.Collector.finishRead  (in profile-macos) + 492  [0x104c4b3e8]  workspace_store.zig:1213
+    +       ! : | +     1 mem.eqlBytes  (in profile-macos) + 200  [0x104ba103c]  mem.zig:0
+    +       ! : | 104 workspace_store.Collector.addFile  (in profile-macos) + 484  [0x104c4c084]  workspace_store.zig:1142
+    +       ! : | + 104 Io.Threaded.dirOpenFilePosix  (in profile-macos) + 432  [0x104a1cd1c]  Threaded.zig:4968
+    +       ! : | +   104 openat  (in libsystem_kernel.dylib) + 76  [0x183a29850]
+    +       ! : | +     104 __openat  (in libsystem_kernel.dylib) + 8,4  [0x183a0e5a8,0x183a0e5a4]
+    +       ! : | 104 workspace_store.Collector.addFile  (in profile-macos) + 1696  [0x104c4c540]  workspace_store.zig:1178
+    +       ! : | + 101 source_watch.Watch.armKind  (in profile-macos) + 472  [0x104abbd08]  source_watch.zig:156
+    +       ! : | + ! 101 source_watch.Watch.poll  (in profile-macos) + 140  [0x104abc8b8]  source_watch.zig:301
+    +       ! : | + !   101 kevent  (in libsystem_kernel.dylib) + 8  [0x183a12fcc]
+    +       ! : | + 1 source_watch.Watch.armKind  (in profile-macos) + 1204  [0x104abbfe4]  source_watch.zig:0
+    +       ! : | + 1 source_watch.Watch.armKind  (in profile-macos) + 100  [0x104abbb94]  source_watch.zig:150
+    +       ! : | + ! 1 fstat  (in libsystem_kernel.dylib) + 8  [0x183a1b43c]
+    +       ! : | + 1 source_watch.Watch.armKind  (in profile-macos) + 168  [0x104abbbd8]  source_watch.zig:155
+    +       ! : | 17 workspace_store.Collector.addFile  (in profile-macos) + 1460  [0x104c4c454]  workspace_store.zig:1197
+    +       ! : | + 15 workspace_store.readBlob__func_3447  (in profile-macos) + 120  [0x104c4bcfc]  workspace_store.zig:945
+    +       ! : | + ! 15 Io.Threaded.fileReadPositional  (in profile-macos) + 224  [0x104a18c2c]  Threaded.zig:10206
+    +       ! : | + !   15 preadv  (in libsystem_kernel.dylib) + 8  [0x183a1bd84]
+    +       ! : | + 2 workspace_store.readBlob__func_3447  (in profile-macos) + 188  [0x104c4bd40]  workspace_store.zig:946
+    +       ! : | +   2 Io.Threaded.fileStatPosix  (in profile-macos) + 136  [0x104a1a0fc]  Threaded.zig:3988
+    +       ! : | +     2 fstat  (in libsystem_kernel.dylib) + 8  [0x183a1b43c]
+    +       ! : | 6 workspace_store.Collector.addFile  (in profile-macos) + 1536  [0x104c4c4a0]  workspace_store.zig:1151
+    +       ! : | + 5 Io.Threaded.fileClose  (in profile-macos) + 44  [0x104a1a018]  Threaded.zig:9895
+    +       ! : | + ! 5 __close_nocancel  (in libsystem_kernel.dylib) + 8  [0x183a0e57c]
+    +       ! : | + 1 Io.Threaded.fileClose  (in profile-macos) + 0  [0x104a19fec]  Threaded.zig:9891
+    +       ! : | 3 workspace_store.Collector.addFile  (in profile-macos) + 248,224  [0x104c4bf98,0x104c4bf80]  workspace_store.zig:1123
+    +       ! : | 3 workspace_store.Collector.addFile  (in profile-macos) + 604  [0x104c4c0fc]  workspace_store.zig:1152
+    +       ! : | + 3 Io.Threaded.fileStatPosix  (in profile-macos) + 136  [0x104a1a0fc]  Threaded.zig:3988
+    +       ! : | +   3 fstat  (in libsystem_kernel.dylib) + 8  [0x183a1b43c]
+    +       ! : | 1 workspace_store.Collector.addFile  (in profile-macos) + 940  [0x104c4c24c]  workspace_store.zig:1165
+    +       ! : | 1 workspace_store.Collector.addFile  (in profile-macos) + 1284  [0x104c4c3a4]  workspace_store.zig:1186
+    +       ! : |   1 heap.c_allocator_impl.alloc  (in profile-macos) + 64  [0x104cf9b54]  heap.zig:239
+    +       ! : |     1 _posix_memalign  (in libsystem_malloc.dylib) + 8  [0x1838793f8]
+    +       ! : 183 workspace_store.Generation.captureJournalInner  (in profile-macos) + 208  [0x104c565f4]  workspace_store.zig:134
+    +       ! : | 183 source_watch.Watch.poll  (in profile-macos) + 140  [0x104abc8b8]  source_watch.zig:301
+    +       ! : |   183 kevent  (in libsystem_kernel.dylib) + 8  [0x183a12fcc]
+    +       ! : 128 workspace_store.Generation.captureJournalInner  (in profile-macos) + 192  [0x104c565e4]  workspace_store.zig:133
+    +       ! : | 128 source_watch.Watch.beginRefresh  (in profile-macos) + 44  [0x104ca0674]  source_watch.zig:101
+    +       ! : |   127 source_watch.Watch.poll  (in profile-macos) + 140  [0x104abc8b8]  source_watch.zig:301
+    +       ! : |   + 127 kevent  (in libsystem_kernel.dylib) + 8  [0x183a12fcc]
+    +       ! : |   1 source_watch.Watch.poll  (in profile-macos) + 48  [0x104abc85c]  source_watch.zig:0
+    +       ! : 88 workspace_store.Generation.captureJournalInner  (in profile-macos) + 8040  [0x104c5848c]  workspace_store.zig:156
+    +       ! : | 87 source_watch.Watch.poll  (in profile-macos) + 140  [0x104abc8b8]  source_watch.zig:301
+    +       ! : | + 87 kevent  (in libsystem_kernel.dylib) + 8  [0x183a12fcc]
+    +       ! : | 1 source_watch.Watch.poll  (in profile-macos) + 140  [0x104abc8b8]  source_watch.zig:302
+    +       ! : 88 workspace_store.Generation.captureJournalInner  (in profile-macos) + 8048  [0x104c58494]  workspace_store.zig:156
+    +       ! : | 88 source_watch.Watch.poll  (in profile-macos) + 140  [0x104abc8b8]  source_watch.zig:301
+    +       ! : |   88 kevent  (in libsystem_kernel.dylib) + 8  [0x183a12fcc]
+    +       ! : 3 workspace_store.Generation.captureJournalInner  (in profile-macos) + 3540,60  [0x104c572f8,0x104c56560]  workspace_store.zig:0
+    +       ! : 3 workspace_store.Generation.captureJournalInner  (in profile-macos) + 4320  [0x104c57604]  workspace_store.zig:156
+    +       ! : | 2 heap.ArenaAllocator.alloc  (in profile-macos) + 752  [0x104cc0f20]  ArenaAllocator.zig:520
+    +       ! : | + 2 bounded.Budget.alloc  (in profile-macos) + 64  [0x104bb5a84]  bounded.zig:42
+    +       ! : | +   2 xzm_malloc_zone_malloc_type_malloc_tc  (in libsystem_malloc.dylib) + 0  [0x1838733cc]
+    +       ! : | 1 heap.ArenaAllocator.alloc  (in profile-macos) + 708  [0x104cc0ef4]  ArenaAllocator.zig:0
+    +       ! : 2 workspace_store.Generation.captureJournalInner  (in profile-macos) + 6412  [0x104c57e30]  workspace_store.zig:156
+    +       ! : | 2 inventory.put  (in profile-macos) + 224  [0x104c4cda8]  inventory.zig:94
+    +       ! : |   2 inventory.put  (in profile-macos) + 224  [0x104c4cda8]  inventory.zig:94
+    +       ! : |     2 inventory.put  (in profile-macos) + 224  [0x104c4cda8]  inventory.zig:94
+    +       ! : |       2 inventory.put  (in profile-macos) + 224  [0x104c4cda8]  inventory.zig:94
+    +       ! : |         2 inventory.put  (in profile-macos) + 224  [0x104c4cda8]  inventory.zig:94
+    +       ! : |           1 inventory.put  (in profile-macos) + 108  [0x104c4cd34]  inventory.zig:91
+    +       ! : |           1 inventory.put  (in profile-macos) + 152  [0x104c4cd60]  inventory.zig:92
+    +       ! : |             1 inventory.make  (in profile-macos) + 492  [0x104c4cb88]  inventory.zig:77
+    +       ! : 2 workspace_store.Generation.captureJournalInner  (in profile-macos) + 12240  [0x104c594f4]  workspace_store.zig:156
+    +       ! : | 2 workspace_store.Generation.freeChanges  (in profile-macos) + 108  [0x104c9e6a4]  workspace_store.zig:826
+    +       ! : |   2 bounded.Budget.free  (in profile-macos) + 36  [0x104bb5920]  bounded.zig:61
+    +       ! : |     1 _xzm_free_tc  (in libsystem_malloc.dylib) + 216  [0x183875950]
+    +       ! : |     1 xzm_malloc_zone_try_free_default_tc  (in libsystem_malloc.dylib) + 0  [0x183874440]
+    +       ! : 1 workspace_store.Generation.captureJournalInner  (in profile-macos) + 216  [0x104c565fc]  workspace_store.zig:134
+    +       ! : 1 workspace_store.Generation.captureJournalInner  (in profile-macos) + 12564  [0x104c59638]  workspace_store.zig:156
+    +       ! : | 1 workspace_store.Generation.unlinkDirectory  (in profile-macos) + 160  [0x104c9c238]  workspace_store.zig:302
+    +       ! : 1 workspace_store.Generation.captureJournalInner  (in profile-macos) + 12828  [0x104c59740]  workspace_store.zig:156
+    +       ! : | 1 inventory.release  (in profile-macos) + 4  [0x104c9fbf4]  inventory.zig:39
+    +       ! : 1 workspace_store.Generation.captureJournalInner  (in profile-macos) + 12948  [0x104c597b8]  workspace_store.zig:156
+    +       ! : | 1 ???  (in profile-macos)  load address 0x1049c8000 + 0x333f2c  [0x104cfbf2c]
+    +       ! : |   1 compiler_rt.udivmod.udivmod__func_187  (in profile-macos) + 0  [0x104cfbbc8]  udivmod.zig:1451
+    +       ! : 1 workspace_store.Generation.captureJournalInner  (in profile-macos) + 13372  [0x104c59960]  workspace_store.zig:156
+    +       ! : | 1 heap.ArenaAllocator.deinit  (in profile-macos) + 72  [0x1049cacb0]  ArenaAllocator.zig:59
+    +       ! : |   1 bounded.Budget.free  (in profile-macos) + 36  [0x104bb5920]  bounded.zig:61
+    +       ! : |     1 __xzm_xzone_free_to_freelist_chunk  (in libsystem_malloc.dylib) + 424  [0x18387182c]
+    +       ! : |       1 mach_absolute_time  (in libsystem_kernel.dylib) + 112  [0x183a0d0fc]
+    +       ! : 1 workspace_store.Generation.captureJournalInner  (in profile-macos) + 4000  [0x104c574c4]  workspace_store.zig:156
+    +       ! 1 workspace.serve__func_137  (in profile-macos) + 8808  [0x104c85ec8]  workspace.zig:153
+    +       53 workspace.serve__func_137  (in profile-macos) + 10524  [0x104c8657c]  workspace.zig:178
+    +       ! 41 workspace.registered__func_3554  (in profile-macos) + 11840  [0x104c8ad4c]  workspace.zig:300
+    +       ! : 26 root.Search.run  (in profile-macos) + 18772  [0x104a94224]  root.zig:774
+    +       ! : | 14 root.Search.file  (in profile-macos) + 1940  [0x104a6c07c]  root.zig:1529
+    +       ! : | + 14 root.Search.processBytes  (in profile-macos) + 968  [0x104a6b854]  root.zig:1939
+    +       ! : | +   9 root.Search.stream  (in profile-macos) + 11492  [0x104a63cf4]  root.zig:2343
+    +       ! : | +   ! 5 root.Search.emit  (in profile-macos) + 996  [0x104a327e8]  root.zig:3574
+    +       ! : | +   ! : 3 root.Search.jsonBegin  (in profile-macos) + 1128  [0x104a2834c]  root.zig:3965
+    +       ! : | +   ! : | 2 root.Search.encodeJson__func_828  (in profile-macos) + 3680  [0x104a271b4]  root.zig:4079
+    +       ! : | +   ! : | + 1 json.Stringify.write__func_1129  (in profile-macos) + 976  [0x104a9eac0]  Stringify.zig:475
+    +       ! : | +   ! : | + ! 1 json.Stringify.encodeJsonString  (in profile-macos) + 172  [0x104a9a4c4]  Stringify.zig:672
+    +       ! : | +   ! : | + !   1 json.Stringify.encodeJsonStringChars  (in profile-macos) + 660  [0x104a9a7f0]  Stringify.zig:702
+    +       ! : | +   ! : | + 1 json.Stringify.write__func_1129  (in profile-macos) + 1104  [0x104a9eb40]  Stringify.zig:477
+    +       ! : | +   ! : | +   1 json.Stringify.write__func_1106  (in profile-macos) + 100  [0x104a9a12c]  Stringify.zig:507
+    +       ! : | +   ! : | +     1 json.Stringify.encodeJsonString  (in profile-macos) + 172  [0x104a9a4c4]  Stringify.zig:672
+    +       ! : | +   ! : | +       1 json.Stringify.encodeJsonStringChars  (in profile-macos) + 700  [0x104a9a818]  Stringify.zig:703
+    +       ! : | +   ! : | 1 root.Search.encodeJson__func_828  (in profile-macos) + 3428  [0x104a270b8]  root.zig:4079
+    +       ! : | +   ! : |   1 json.Stringify.write__func_1106  (in profile-macos) + 100  [0x104a9a12c]  Stringify.zig:507
+    +       ! : | +   ! : |     1 json.Stringify.encodeJsonString  (in profile-macos) + 172  [0x104a9a4c4]  Stringify.zig:672
+    +       ! : | +   ! : |       1 json.Stringify.encodeJsonStringChars  (in profile-macos) + 660  [0x104a9a7f0]  Stringify.zig:702
+    +       ! : | +   ! : 2 root.Search.jsonBegin  (in profile-macos) + 1152  [0x104a28364]  root.zig:0
+    +       ! : | +   ! :   2 Io.Writer.defaultFlush  (in profile-macos) + 72  [0x1049f2da4]  Writer.zig:394
+    +       ! : | +   ! :     2 root.Search.OutputWriter.drain  (in profile-macos) + 64  [0x104c380fc]  root.zig:3802
+    +       ! : | +   ! :       1 root.Search.write  (in profile-macos) + 628  [0x104a25458]  root.zig:3457
+    +       ! : | +   ! :       1 root.Search.write  (in profile-macos) + 924  [0x104a25580]  root.zig:3462
+    +       ! : | +   ! :         1 _realloc  (in libsystem_malloc.dylib) + 456  [0x183879358]
+    +       ! : | +   ! :           1 _malloc_zone_realloc  (in libsystem_malloc.dylib) + 148  [0x183878b2c]
+    +       ! : | +   ! :             1 xzm_malloc_zone_malloc_type_realloc  (in libsystem_malloc.dylib) + 1028  [0x183869414]
+    +       ! : | +   ! :               1 __xzm_xzone_free_to_freelist_chunk  (in libsystem_malloc.dylib) + 124  [0x183871700]
+    +       ! : | +   ! 3 root.Search.emit  (in profile-macos) + 9332  [0x104a34878]  root.zig:3582
+    +       ! : | +   ! : 1 json.Stringify.encodeJsonString  (in profile-macos) + 308  [0x104a9a54c]  Stringify.zig:0
+    +       ! : | +   ! : 1 root.Search.encodeJson__func_859  (in profile-macos) + 1648  [0x104a2be4c]  root.zig:4079
+    +       ! : | +   ! : | 1 json.Stringify.write__func_3259  (in profile-macos) + 700  [0x104c330b8]  Stringify.zig:450
+    +       ! : | +   ! : |   1 root.Search.JsonSubmatches.item  (in profile-macos) + 124  [0x104c31d94]  root.zig:3766
+    +       ! : | +   ! : 1 root.Search.encodeJson__func_859  (in profile-macos) + 4160  [0x104a2c81c]  root.zig:4079
+    +       ! : | +   ! :   1 json.Stringify.write__func_1106  (in profile-macos) + 100  [0x104a9a12c]  Stringify.zig:507
+    +       ! : | +   ! :     1 json.Stringify.encodeJsonString  (in profile-macos) + 172  [0x104a9a4c4]  Stringify.zig:672
+    +       ! : | +   ! :       1 json.Stringify.encodeJsonStringChars  (in profile-macos) + 684  [0x104a9a808]  Stringify.zig:703
+    +       ! : | +   ! 1 root.Search.emit  (in profile-macos) + 0  [0x104a32404]  root.zig:3517
+    +       ! : | +   1 root.Search.stream  (in profile-macos) + 14536  [0x104a648d8]  root.zig:2111
+    +       ! : | +   ! 1 _free  (in libsystem_malloc.dylib) + 96  [0x183879170]
+    +       ! : | +   1 root.Search.stream  (in profile-macos) + 14116  [0x104a64734]  root.zig:2112
+    +       ! : | +   1 root.Search.stream  (in profile-macos) + 1152  [0x104a61490]  root.zig:2142
+    +       ! : | +   ! 1 mem.findScalar__func_74  (in profile-macos) + 164  [0x104cbdc24]  mem.zig:1288
+    +       ! : | +   1 root.Search.stream  (in profile-macos) + 1228  [0x104a614dc]  root.zig:2155
+    +       ! : | +   1 root.Search.stream  (in profile-macos) + 12080  [0x104a63f40]  root.zig:2214
+    +       ! : | +     1 matcher.Matcher.count  (in profile-macos) + 200  [0x104a5d810]  matcher.zig:416
+    +       ! : | +       1 matcher.Matcher.find  (in profile-macos) + 188  [0x104c3325c]  matcher.zig:213
+    +       ! : | +         1 literal.find  (in profile-macos) + 768  [0x104ba1cfc]  literal.zig:242
+    +       ! : | +           1 literal.findExact  (in profile-macos) + 1644  [0x104ba1704]  literal.zig:74
+    +       ! : | 5 root.Search.file  (in profile-macos) + 296  [0x104a6ba10]  root.zig:1477
+    +       ! : | + 2 document.localUriAt  (in profile-macos) + 72  [0x104a3e640]  document.zig:112
+    +       ! : | + ! 1 fs.path.resolveAlloc  (in profile-macos) + 952  [0x104c286d8]  path.zig:884
+    +       ! : | + ! : 1 _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib) + 472  [0x18386cc24]
+    +       ! : | + ! 1 fs.path.resolveAlloc  (in profile-macos) + 760  [0x104c28618]  path.zig:884
+    +       ! : | + 2 document.localUriAt  (in profile-macos) + 352  [0x104a3e758]  document.zig:118
+    +       ! : | + ! 2 Io.Writer.Allocating.drain  (in profile-macos) + 340  [0x104cf9284]  Writer.zig:2845
+    +       ! : | + !   2 _realloc  (in libsystem_malloc.dylib) + 456  [0x183879358]
+    +       ! : | + !     2 _malloc_zone_realloc  (in libsystem_malloc.dylib) + 148  [0x183878b2c]
+    +       ! : | + !       2 xzm_malloc_zone_malloc_type_realloc  (in libsystem_malloc.dylib) + 1028  [0x183869414]
+    +       ! : | + !         1 __xzm_xzone_free_to_freelist_chunk  (in libsystem_malloc.dylib) + 68  [0x1838716c8]
+    +       ! : | + !         1 _xzm_free  (in libsystem_malloc.dylib) + 80  [0x183870750]
+    +       ! : | + 1 document.localUriAt  (in profile-macos) + 432  [0x104a3e7a8]  document.zig:118
+    +       ! : | 5 root.Search.file  (in profile-macos) + 12688  [0x104a6ea78]  root.zig:1534
+    +       ! : | + 2 root.Search.jsonEnd  (in profile-macos) + 380  [0x104a38674]  root.zig:3975
+    +       ! : | + ! 1 Io.Writer.printFloat__func_1164  (in profile-macos) + 608  [0x104aa0018]  Writer.zig:1724
+    +       ! : | + ! : 1 fmt.float.round__func_1175  (in profile-macos) + 160  [0x104aa148c]  float.zig:141
+    +       ! : | + ! 1 Io.Writer.printFloat__func_1164  (in profile-macos) + 1308  [0x104aa02d4]  Writer.zig:1724
+    +       ! : | + 2 root.Search.jsonEnd  (in profile-macos) + 1676  [0x104a38b84]  root.zig:3978
+    +       ! : | + ! 1 root.Search.encodeJson__func_884  (in profile-macos) + 1856  [0x104a36cc0]  root.zig:4079
+    +       ! : | + ! : 1 json.Stringify.write__func_3189  (in profile-macos) + 536  [0x104c2ed6c]  Stringify.zig:477
+    +       ! : | + ! :   1 json.Stringify.encodeJsonString  (in profile-macos) + 172  [0x104a9a4c4]  Stringify.zig:672
+    +       ! : | + ! :     1 json.Stringify.encodeJsonStringChars  (in profile-macos) + 660  [0x104a9a7f0]  Stringify.zig:702
+    +       ! : | + ! 1 root.Search.encodeJson__func_884  (in profile-macos) + 1656  [0x104a36bf8]  root.zig:4079
+    +       ! : | + 1 root.Search.jsonEnd  (in profile-macos) + 68  [0x104a3853c]  root.zig:3971
+    +       ! : | 1 root.Search.file  (in profile-macos) + 13712  [0x104a6ee78]  root.zig:0
+    +       ! : | + 1 __xzm_xzone_free_to_freelist_chunk  (in libsystem_malloc.dylib) + 424  [0x18387182c]
+    +       ! : | +   1 mach_absolute_time  (in libsystem_kernel.dylib) + 108  [0x183a0d0f8]
+    +       ! : | 1 root.Search.file  (in profile-macos) + 1076  [0x104a6bd1c]  root.zig:1495
+    +       ! : |   1 Io.Threaded.now  (in profile-macos) + 48  [0x104a11d6c]  Threaded.zig:11775
+    +       ! : |     1 clock_gettime  (in libsystem_c.dylib) + 60  [0x1838e8100]
+    +       ! : |       1 ???  (in <unknown binary>)  [0x18b2a277c]
+    +       ! : 7 root.Search.run  (in profile-macos) + 27460  [0x104a96414]  root.zig:791
+    +       ! : | 4 root.Search.finish  (in profile-macos) + 9820  [0x104a3c680]  root.zig:830
+    +       ! : | + 1 root.Search.encodeJson__func_910.Envelope.jsonStringify  (in profile-macos) + 13908  [0x104c2e714]  root.zig:4054
+    +       ! : | + ! 1 json.Stringify.encodeJsonString  (in profile-macos) + 172  [0x104a9a4c4]  Stringify.zig:672
+    +       ! : | + !   1 json.Stringify.encodeJsonStringChars  (in profile-macos) + 660  [0x104a9a7f0]  Stringify.zig:702
+    +       ! : | + 1 root.Search.encodeJson__func_910.Envelope.jsonStringify  (in profile-macos) + 5012  [0x104c2c454]  root.zig:4055
+    +       ! : | + ! 1 json.Stringify.encodeJsonString  (in profile-macos) + 172  [0x104a9a4c4]  Stringify.zig:672
+    +       ! : | + !   1 json.Stringify.encodeJsonStringChars  (in profile-macos) + 684  [0x104a9a808]  Stringify.zig:703
+    +       ! : | + 1 root.Search.encodeJson__func_910.Envelope.jsonStringify  (in profile-macos) + 5192  [0x104c2c508]  root.zig:4055
+    +       ! : | + ! 1 json.Stringify.write__func_1123  (in profile-macos) + 148  [0x104aa372c]  Stringify.zig:359
+    +       ! : | + 1 root.Search.encodeJson__func_910.Envelope.jsonStringify  (in profile-macos) + 6256  [0x104c2c930]  root.zig:4055
+    +       ! : | +   1 json.Stringify.encodeJsonString  (in profile-macos) + 172  [0x104a9a4c4]  Stringify.zig:672
+    +       ! : | +     1 json.Stringify.encodeJsonStringChars  (in profile-macos) + 660  [0x104a9a7f0]  Stringify.zig:702
+    +       ! : | 2 root.Search.finish  (in profile-macos) + 9020  [0x104a3c360]  root.zig:833
+    +       ! : | + 2 Io.Threaded.operate  (in profile-macos) + 180  [0x104a20058]  Threaded.zig:2550
+    +       ! : | +   2 Io.Threaded.fileWriteStreaming  (in profile-macos) + 904  [0x104a19e6c]  Threaded.zig:11056
+    +       ! : | +     2 writev  (in libsystem_kernel.dylib) + 8  [0x183a10b90]
+    +       ! : | 1 root.Search.finish  (in profile-macos) + 220  [0x104a3a100]  root.zig:828
+    +       ! : |   1 _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib) + 376  [0x18386cbc4]
+    +       ! : 1 root.Search.run  (in profile-macos) + 4304  [0x104a909a0]  root.zig:626
+    +       ! : | 1 json.Stringify.write__func_1106  (in profile-macos) + 100  [0x104a9a12c]  Stringify.zig:507
+    +       ! : |   1 json.Stringify.encodeJsonString  (in profile-macos) + 172  [0x104a9a4c4]  Stringify.zig:672
+    +       ! : |     1 json.Stringify.encodeJsonStringChars  (in profile-macos) + 1072  [0x104a9a98c]  Stringify.zig:715
+    +       ! : |       1 Io.Writer.Allocating.drain  (in profile-macos) + 340  [0x104cf9284]  Writer.zig:2845
+    +       ! : |         1 _realloc  (in libsystem_malloc.dylib) + 456  [0x183879358]
+    +       ! : |           1 _malloc_zone_realloc  (in libsystem_malloc.dylib) + 48  [0x183878ac8]
+    +       ! : 1 root.Search.run  (in profile-macos) + 4420  [0x104a90a14]  root.zig:626
+    +       ! : | 1 json.Stringify.write__func_1106  (in profile-macos) + 100  [0x104a9a12c]  Stringify.zig:507
+    +       ! : |   1 json.Stringify.encodeJsonString  (in profile-macos) + 172  [0x104a9a4c4]  Stringify.zig:672
+    +       ! : |     1 json.Stringify.encodeJsonStringChars  (in profile-macos) + 700  [0x104a9a818]  Stringify.zig:703
+    +       ! : 1 root.Search.run  (in profile-macos) + 4496  [0x104a90a60]  root.zig:626
+    +       ! : | 1 json.Stringify.write__func_1153  (in profile-macos) + 168  [0x104a9fd00]  Stringify.zig:359
+    +       ! : |   1 Io.Writer.printIntAny__func_697  (in profile-macos) + 0  [0x104a151b8]  Writer.zig:1641
+    +       ! : 1 root.Search.run  (in profile-macos) + 4748  [0x104a90b5c]  root.zig:626
+    +       ! : | 1 json.Stringify.write__func_3223  (in profile-macos) + 260  [0x104c30294]  Stringify.zig:450
+    +       ! : |   1 json.Stringify.write__func_1106  (in profile-macos) + 100  [0x104a9a12c]  Stringify.zig:507
+    +       ! : |     1 json.Stringify.encodeJsonString  (in profile-macos) + 172  [0x104a9a4c4]  Stringify.zig:672
+    +       ! : |       1 json.Stringify.encodeJsonStringChars  (in profile-macos) + 660  [0x104a9a7f0]  Stringify.zig:702
+    +       ! : 1 root.Search.run  (in profile-macos) + 5736  [0x104a90f38]  root.zig:626
+    +       ! : | 1 __xzm_xzone_free_to_freelist_chunk  (in libsystem_malloc.dylib) + 424  [0x18387182c]
+    +       ! : |   1 mach_absolute_time  (in libsystem_kernel.dylib) + 108  [0x183a0d0f8]
+    +       ! : 1 root.Search.run  (in profile-macos) + 5208  [0x104a90d28]  root.zig:626
+    +       ! : 1 root.Search.run  (in profile-macos) + 8616  [0x104a91a78]  root.zig:723
+    +       ! : 1 root.Search.run  (in profile-macos) + 8776  [0x104a91b18]  root.zig:727
+    +       ! :   1 root.Search.file  (in profile-macos) + 0  [0x104a6b8e8]  root.zig:1438
+    +       ! 3 workspace.registered__func_3554  (in profile-macos) + 20508  [0x104c8cf28]  workspace.zig:314
+    +       ! : 3 Io.Threaded.operate  (in profile-macos) + 180  [0x104a20058]  Threaded.zig:2550
+    +       ! :   3 Io.Threaded.fileWriteStreaming  (in profile-macos) + 904  [0x104a19e6c]  Threaded.zig:11056
+    +       ! :     3 writev  (in libsystem_kernel.dylib) + 8  [0x183a10b90]
+    +       ! 1 workspace.registered__func_3554  (in profile-macos) + 6448  [0x104c8983c]  workspace.zig:228
+    +       ! : 1 ???  (in profile-macos)  load address 0x1049c8000 + 0x332124  [0x104cfa124]
+    +       ! 1 workspace.registered__func_3554  (in profile-macos) + 18256  [0x104c8c65c]  workspace.zig:229
+    +       ! : 1 root.Search.deinit  (in profile-macos) + 1428  [0x104a244ec]  root.zig:592
+    +       ! :   1 decision.Client.deinit  (in profile-macos) + 232  [0x104ca2728]  decision.zig:112
+    +       ! :     1 client.client.Client.deinit  (in profile-macos) + 88  [0x104ac4f6c]  client.zig:996
+    +       ! :       1 Io.Threaded.futexWake  (in profile-macos) + 60  [0x104a20a18]  Threaded.zig:2537
+    +       ! :         1 __ulock_wake  (in libsystem_kernel.dylib) + 8  [0x183a0ebc8]
+    +       ! 1 workspace.registered__func_3554  (in profile-macos) + 11824  [0x104c8ad3c]  workspace.zig:298
+    +       ! : 1 ???  (in <unknown binary>)  [0x18b2a30ac]
+    +       ! 1 workspace.registered__func_3554  (in profile-macos) + 18100  [0x104c8c5c0]  workspace.zig:299
+    +       ! : 1 __platform_sigaction  (in libsystem_platform.dylib) + 108  [0x183a5b43c]
+    +       ! :   1 __sigaction  (in libsystem_kernel.dylib) + 8  [0x183a13480]
+    +       ! 1 workspace.registered__func_3554  (in profile-macos) + 19388  [0x104c8cac8]  workspace.zig:314
+    +       ! : 1 json.Stringify.write__func_1106  (in profile-macos) + 60  [0x104a9a104]  Stringify.zig:506
+    +       ! :   1 unicode.utf8ValidateSlice  (in profile-macos) + 272  [0x104c4a4e8]  unicode.zig:0
+    +       ! 1 workspace.registered__func_3554  (in profile-macos) + 19528  [0x104c8cb54]  workspace.zig:314
+    +       ! : 1 json.Stringify.write__func_1106  (in profile-macos) + 100  [0x104a9a12c]  Stringify.zig:507
+    +       ! :   1 json.Stringify.encodeJsonString  (in profile-macos) + 172  [0x104a9a4c4]  Stringify.zig:672
+    +       ! :     1 json.Stringify.encodeJsonStringChars  (in profile-macos) + 700  [0x104a9a818]  Stringify.zig:703
+    +       ! 1 workspace.registered__func_3554  (in profile-macos) + 20312  [0x104c8ce64]  workspace.zig:314
+    +       ! : 1 root.Search.write  (in profile-macos) + 1012  [0x104a255d8]  root.zig:3462
+    +       ! :   1 ???  (in profile-macos)  load address 0x1049c8000 + 0x33216c  [0x104cfa16c]
+    +       ! 1 workspace.registered__func_3554  (in profile-macos) + 20724  [0x104c8d000]  workspace.zig:317
+    +       ! 1 workspace.registered__func_3554  (in profile-macos) + 17900  [0x104c8c4f8]  workspace.zig:324
+    +       21 workspace.serve__func_137  (in profile-macos) + 9888  [0x104c86300]  workspace.zig:160
+    +       ! 14 workspace.ready  (in profile-macos) + 404  [0x104c5a3ec]  workspace.zig:191
+    +       ! : 14 Io.Threaded.operate  (in profile-macos) + 180  [0x104a20058]  Threaded.zig:2550
+    +       ! :   14 Io.Threaded.fileWriteStreaming  (in profile-macos) + 904  [0x104a19e6c]  Threaded.zig:11056
+    +       ! :     14 writev  (in libsystem_kernel.dylib) + 8  [0x183a10b90]
+    +       ! 7 workspace.ready  (in profile-macos) + 216  [0x104c5a330]  workspace.zig:191
+    +       !   2 json.Stringify.value__func_3459  (in profile-macos) + 328  [0x104c924fc]  Stringify.zig:575
+    +       !   | 2 json.Stringify.encodeJsonString  (in profile-macos) + 172  [0x104a9a4c4]  Stringify.zig:672
+    +       !   |   2 json.Stringify.encodeJsonStringChars  (in profile-macos) + 672,692  [0x104a9a7fc,0x104a9a810]  Stringify.zig:703
+    +       !   1 json.Stringify.value__func_3459  (in profile-macos) + 364  [0x104c92520]  Stringify.zig:575
+    +       !   | 1 json.Stringify.write__func_1106  (in profile-macos) + 100  [0x104a9a12c]  Stringify.zig:507
+    +       !   |   1 json.Stringify.encodeJsonString  (in profile-macos) + 20  [0x104a9a42c]  Stringify.zig:670
+    +       !   1 json.Stringify.value__func_3459  (in profile-macos) + 932  [0x104c92758]  Stringify.zig:575
+    +       !   | 1 json.Stringify.write__func_1106  (in profile-macos) + 60  [0x104a9a104]  Stringify.zig:506
+    +       !   |   1 unicode.utf8ValidateSlice  (in profile-macos) + 52  [0x104c4a40c]  unicode.zig:232
+    +       !   1 json.Stringify.value__func_3459  (in profile-macos) + 980  [0x104c92788]  Stringify.zig:575
+    +       !   | 1 json.Stringify.encodeJsonString  (in profile-macos) + 172  [0x104a9a4c4]  Stringify.zig:672
+    +       !   |   1 json.Stringify.encodeJsonStringChars  (in profile-macos) + 660  [0x104a9a7f0]  Stringify.zig:702
+    +       !   1 json.Stringify.value__func_3459  (in profile-macos) + 2240  [0x104c92c74]  Stringify.zig:575
+    +       !   | 1 json.Stringify.encodeJsonString  (in profile-macos) + 172  [0x104a9a4c4]  Stringify.zig:672
+    +       !   |   1 json.Stringify.encodeJsonStringChars  (in profile-macos) + 672  [0x104a9a7fc]  Stringify.zig:703
+    +       !   1 json.Stringify.value__func_3459  (in profile-macos) + 1992  [0x104c92b7c]  Stringify.zig:575
+    +       13 workspace.serve__func_137  (in profile-macos) + 10360  [0x104c864d8]  workspace.zig:177
+    +       ! 12 workspace.emit__func_3551  (in profile-macos) + 288  [0x104c81c18]  workspace.zig:36
+    +       ! : 12 Io.Threaded.operate  (in profile-macos) + 180  [0x104a20058]  Threaded.zig:2550
+    +       ! :   12 Io.Threaded.fileWriteStreaming  (in profile-macos) + 904  [0x104a19e6c]  Threaded.zig:11056
+    +       ! :     12 writev  (in libsystem_kernel.dylib) + 8  [0x183a10b90]
+    +       ! 1 workspace.emit__func_3551  (in profile-macos) + 100  [0x104c81b5c]  workspace.zig:28
+    +       !   1 json.Stringify.value__func_3552  (in profile-macos) + 292  [0x104c8daa8]  Stringify.zig:575
+    +       !     1 json.Stringify.write__func_1106  (in profile-macos) + 60  [0x104a9a104]  Stringify.zig:506
+    +       !       1 unicode.utf8ValidateSlice  (in profile-macos) + 96  [0x104c4a438]  unicode.zig:232
+    +       3 workspace.serve__func_137  (in profile-macos) + 9760  [0x104c86280]  workspace.zig:78
+    +       ! 3 heap.ArenaAllocator.deinit  (in profile-macos) + 72  [0x1049cacb0]  ArenaAllocator.zig:59
+    +       !   2 __xzm_xzone_free_to_freelist_chunk  (in libsystem_malloc.dylib) + 424  [0x18387182c]
+    +       !   : 2 mach_absolute_time  (in libsystem_kernel.dylib) + 108  [0x183a0d0f8]
+    +       !   1 heap.c_allocator_impl.free  (in profile-macos) + 0  [0x104cf9b6c]  heap.zig:324
+    +       3 workspace.serve__func_137  (in profile-macos) + 1656  [0x104c842d8]  workspace.zig:81
+    +       ! 3 json.Scanner.next  (in profile-macos) + 5836  [0x104ad485c]  Scanner.zig:328
+    +       !   2 BitStack.push  (in profile-macos) + 308  [0x104ad7908]  BitStack.zig:31
+    +       !   : 1 heap.ArenaAllocator.alloc  (in profile-macos) + 264  [0x104cc0d38]  ArenaAllocator.zig:397
+    +       !   : | 1 heap.c_allocator_impl.resize  (in profile-macos) + 32  [0x104cf9c18]  heap.zig:278
+    +       !   : |   1 malloc_size  (in libsystem_malloc.dylib) + 124  [0x183840208]
+    +       !   : |     1 xzm_malloc_zone_size  (in libsystem_malloc.dylib) + 460  [0x1838684d0]
+    +       !   : 1 heap.ArenaAllocator.alloc  (in profile-macos) + 1152  [0x104cc10b0]  ArenaAllocator.zig:542
+    +       !   1 BitStack.push  (in profile-macos) + 372  [0x104ad7948]  BitStack.zig:31
+    +       2 workspace.serve__func_137  (in profile-macos) + 1712  [0x104c84310]  workspace.zig:81
+    +       ! 1 json.Scanner.nextAllocMax  (in profile-macos) + 0  [0x104ad6540]  Scanner.zig:130
+    +       ! 1 workspace.serve__func_137  (in profile-macos) + 1836  [0x104c8438c]  workspace.zig:81
+    +       1 workspace.serve__func_137  (in profile-macos) + 7760  [0x104c85ab0]  workspace.zig:111
+    +       ! 1 workspace.serve__func_137  (in profile-macos) + 7764  [0x104c85ab4]  workspace.zig:0
+    +       1 workspace.serve__func_137  (in profile-macos) + 10668  [0x104c8660c]  workspace.zig:182
+    +       ! 1 workspace.emit__func_3563  (in profile-macos) + 100  [0x104c83268]  workspace.zig:28
+    +       !   1 json.Stringify.value__func_3564  (in profile-macos) + 416  [0x104c8769c]  Stringify.zig:575
+    +       !     1 json.Stringify.encodeJsonString  (in profile-macos) + 268  [0x104a9a524]  Stringify.zig:673
+    +       1 workspace.serve__func_137  (in profile-macos) + 3600  [0x104c84a70]  workspace.zig:81
+    +       ! 1 json.static.innerParse__func_2255  (in profile-macos) + 328  [0x104b613b4]  static.zig:246
+    +       !   1 fmt.parseInt__func_195  (in profile-macos) + 348  [0x104a0605c]  fmt.zig:323
+    +       1 workspace.serve__func_137  (in profile-macos) + 4980  [0x104c84fd4]  workspace.zig:81
+    +         1 workspace.serve__func_137  (in profile-macos) + 7596  [0x104c85a0c]  workspace.zig:103
+    1884 Thread_42671519
+    + 1884 thread_start  (in libsystem_pthread.dylib) + 8  [0x183a4ccec]
+    +   1884 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x183a51d00]
+    +     1884 Thread.PosixThreadImpl.spawn__func_3799.Instance.entryFn  (in profile-macos) + 224  [0x104ca2ac8]  Thread.zig:753
+    +       1884 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    1884 Thread_42671520
+      1884 thread_start  (in libsystem_pthread.dylib) + 8  [0x183a4ccec]
+        1884 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x183a51d00]
+          1884 Thread.PosixThreadImpl.spawn__func_3799.Instance.entryFn  (in profile-macos) + 224  [0x104ca2ac8]  Thread.zig:753
+            1884 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+
+Total number in stack (recursive counted multiple, when >=5):
+        15       json.Stringify.encodeJsonString  (in profile-macos) + 172  [0x104a9a4c4]  Stringify.zig:672
+        8       json.Stringify.write__func_1106  (in profile-macos) + 100  [0x104a9a12c]  Stringify.zig:507
+        7       json.Stringify.encodeJsonStringChars  (in profile-macos) + 0  [0x104a9a55c]  Stringify.zig:702
+        7       json.Stringify.encodeJsonStringChars  (in profile-macos) + 0  [0x104a9a55c]  Stringify.zig:703
+        6       kevent  (in libsystem_kernel.dylib) + 0  [0x183a12fc4]
+        6       source_watch.Watch.poll  (in profile-macos) + 140  [0x104abc8b8]  source_watch.zig:301
+        5       inventory.put  (in profile-macos) + 224  [0x104c4cda8]  inventory.zig:94
+
+Sort by top of stack, same collapsed (when >= 5):
+        __ulock_wait2  (in libsystem_kernel.dylib)        3768
+        readv  (in libsystem_kernel.dylib)        934
+        kevent  (in libsystem_kernel.dylib)        690
+        __openat  (in libsystem_kernel.dylib)        104
+        writev  (in libsystem_kernel.dylib)        31
+        json.Stringify.encodeJsonStringChars  (in profile-macos)        15
+        preadv  (in libsystem_kernel.dylib)        15
+        fstat  (in libsystem_kernel.dylib)        6
+        __close_nocancel  (in libsystem_kernel.dylib)        5
+        mach_absolute_time  (in libsystem_kernel.dylib)        5
+        workspace_store.Generation.captureJournalInner  (in profile-macos)        5
+
+Binary Images:
+       0x1049c8000 -        0x105108c77 +profile-macos (0) <95D24153-4B7E-389A-AE43-BE48CF32591A> /Users/*/profile-macos
+       0x1835c8000 -        0x1836175f7  libobjc.A.dylib (973.1) <C0680DF6-9900-3C29-A071-95A031686EF8> /usr/lib/libobjc.A.dylib
+       0x183618000 -        0x18362223f  libsharedcache.dylib (0) <BBF95357-BEBF-3D89-8900-2BBB14A667C5> /usr/lib/libsharedcache.dylib
+       0x183623000 -        0x183649d3b  libdyld.dylib (27062) <62863BCA-DD60-3D32-A9DB-89099BA6F3D7> /usr/lib/system/libdyld.dylib
+       0x18364a000 -        0x1837096e3  dyld (1.0.0 - 27062) <D341DDCB-7969-3A9C-8E03-0CF4751398A9> /usr/lib/dyld
+       0x18370a000 -        0x18370d01f  libsystem_blocks.dylib (98.1) <6F304731-D95D-3501-B4AD-F2934F7F2446> /usr/lib/system/libsystem_blocks.dylib
+       0x18370e000 -        0x1837630df  libxpc.dylib (3298.1.1) <0791121F-B5FC-3F84-BF04-115E86D2D882> /usr/lib/system/libxpc.dylib
+       0x183764000 -        0x183783c13  libsystem_trace.dylib (1966.1.1) <B48A8E3E-A12A-3342-8321-428B555E965E> /usr/lib/system/libsystem_trace.dylib
+       0x183784000 -        0x183838f27  libcorecrypto.dylib (2109.0.22) <807AA6C9-5D8A-3CA5-B4CE-FACE5296EF6A> /usr/lib/system/libcorecrypto.dylib
+       0x183839000 -        0x18388ec5f  libsystem_malloc.dylib (886.0.8) <2339CB57-FE5A-3154-A206-A76059C749EB> /usr/lib/system/libsystem_malloc.dylib
+       0x18388f000 -        0x1838d519f  libdispatch.dylib (1605.0.2) <022BF08F-0B3A-3225-9E65-16D1553CE90D> /usr/lib/system/libdispatch.dylib
+       0x1838d6000 -        0x1838d8d2b  libsystem_featureflags.dylib (108) <20C1CAB2-1F13-3426-8146-9CAE9FF2A33D> /usr/lib/system/libsystem_featureflags.dylib
+       0x1838d9000 -        0x18395bca3  libsystem_c.dylib (1786.0.3) <FBA7B23E-AA60-3A90-9AA4-A7A2E0AD63EE> /usr/lib/system/libsystem_c.dylib
+       0x18395c000 -        0x1839f1033  libc++.1.dylib (2200.27) <1E9BA4AA-B5DA-3CF3-80AC-4B880049573F> /usr/lib/libc++.1.dylib
+       0x1839f2000 -        0x183a0beff  libc++abi.dylib (2200.27) <A21743EE-6E1C-3E74-97EA-7AF793DE4BDF> /usr/lib/libc++abi.dylib
+       0x183a0c000 -        0x183a4a9ab  libsystem_kernel.dylib (13432.1.9) <F63BF418-8F75-34A4-AAF1-8CAF2B9B6A05> /usr/lib/system/libsystem_kernel.dylib
+       0x183a4b000 -        0x183a5791b  libsystem_pthread.dylib (553.0.1) <5A1828C3-CBC2-3B85-BD07-C8ED10021A41> /usr/lib/system/libsystem_pthread.dylib
+       0x183a58000 -        0x183a614f3  libsystem_platform.dylib (402.0.1.0.1) <080E4444-A0FB-3913-9756-4E470015F32F> /usr/lib/system/libsystem_platform.dylib
+       0x183a62000 -        0x183a90903  libsystem_info.dylib (603) <BC387AEB-1CEF-3513-92D7-D7F913596711> /usr/lib/system/libsystem_info.dylib
+       0x187bba000 -        0x187bc3b13  libsystem_darwin.dylib (1786.0.3) <4E66C888-993C-3E6A-A8DA-A949C01C5B67> /usr/lib/system/libsystem_darwin.dylib
+       0x188014000 -        0x188025b8b  libsystem_notify.dylib (368) <58FD36D8-37A7-311C-80F2-8E64DD8710CF> /usr/lib/system/libsystem_notify.dylib
+       0x18a171000 -        0x18a18bd93  libsystem_networkextension.dylib (2340.1.2) <22E1D190-486F-324F-ABA4-F36AB841BFE9> /usr/lib/system/libsystem_networkextension.dylib
+       0x18a219000 -        0x18a230247  libsystem_asl.dylib (409) <B4D449B7-A821-3A9A-8019-E917B291F10A> /usr/lib/system/libsystem_asl.dylib
+       0x18b1c4000 -        0x18b1c4f2f  libobjcMsgSend.dylib (973.1) <41179EDE-DC97-3BBE-8848-6400D12C1436> /usr/lib/objc/libobjcMsgSend.dylib
+       0x18c310000 -        0x18c317edf  libsystem_symptoms.dylib (2394.0.4) <60EE7884-9F4E-3184-A6AC-FA40A7A0297D> /usr/lib/system/libsystem_symptoms.dylib
+       0x1906a8000 -        0x1906e2aeb  libsystem_containermanager.dylib (833.0.8.0.1) <08A57205-555D-3792-8931-9D5B585AF326> /usr/lib/system/libsystem_containermanager.dylib
+       0x191cfb000 -        0x191cff317  libsystem_configuration.dylib (1446) <F3EB66A7-7A24-3AE5-B6E8-9A37BB00F119> /usr/lib/system/libsystem_configuration.dylib
+       0x191d00000 -        0x191d06e03  libsystem_sandbox.dylib (3051.0.52) <1E892B56-092E-3832-BDE3-DCE356D7A4FA> /usr/lib/system/libsystem_sandbox.dylib
+       0x1931c4000 -        0x1931c4f2f  libobjcMsgSend1.dylib (973.1) <B40D9B2A-E1EE-37ED-8004-711A1F263DE1> /usr/lib/objc/libobjcMsgSend1.dylib
+       0x1938e4000 -        0x1938e6f93  libquarantine.dylib (217.0.4) <7FD4AE22-86EF-382B-83F5-ADF9336C1160> /usr/lib/system/libquarantine.dylib
+       0x193ff6000 -        0x193ffc1e7  libsystem_coreservices.dylib (203) <57248E07-11A5-3857-918E-4A3A63B69FE8> /usr/lib/system/libsystem_coreservices.dylib
+       0x1945be000 -        0x1945fbb27  libsystem_m.dylib (3326.0.1) <A3FB340F-3ED5-30F4-8B64-9D5860F64D35> /usr/lib/system/libsystem_m.dylib
+       0x1945fd000 -        0x1946004f7  libmacho.dylib (27062) <50DEADEC-3E99-3519-AFC3-4A3FEB3F14C3> /usr/lib/system/libmacho.dylib
+       0x19461a000 -        0x194626707  libcommonCrypto.dylib (600041) <41C99F45-C5E6-39DB-B1F2-A1BEA9D242A4> /usr/lib/system/libcommonCrypto.dylib
+       0x194627000 -        0x194630c87  libunwind.dylib (2200.5) <3070AB81-B082-39E8-8A00-EF88DDE9AC47> /usr/lib/system/libunwind.dylib
+       0x194638000 -        0x1946427eb  libcopyfile.dylib (260.0.3) <72D95AF9-BF5E-3A84-81A6-BCC5BDB99857> /usr/lib/system/libcopyfile.dylib
+       0x194643000 -        0x1946468bf  libcompiler_rt.dylib (103.4) <DFB5CE7F-A36E-36AA-BECE-1392D3D43607> /usr/lib/system/libcompiler_rt.dylib
+       0x194647000 -        0x19464c077  libsystem_collections.dylib (1786.0.3) <1E8022D4-5A37-3A7A-8936-603E6FA88358> /usr/lib/system/libsystem_collections.dylib
+       0x19464d000 -        0x19464ff1f  libsystem_secinit.dylib (182) <DE037464-4C5D-3E96-A33F-2A4557CC6A20> /usr/lib/system/libsystem_secinit.dylib
+       0x194650000 -        0x19465297f  libremovefile.dylib (96) <E6E6DFCF-6B2C-3F30-A59D-816CAB1190CE> /usr/lib/system/libremovefile.dylib
+       0x194653000 -        0x194653e27  libkeymgr.dylib (31) <5EC997EF-3ADA-360B-9FCD-5F940C83FA4E> /usr/lib/system/libkeymgr.dylib
+       0x194654000 -        0x19465caf7  libsystem_dnssd.dylib (3111.0.5.0.1) <DE22096F-1E5B-3D6E-8164-771582DD6391> /usr/lib/system/libsystem_dnssd.dylib
+       0x19465d000 -        0x194661f1b  libcache.dylib (95) <80BAE197-E285-3F6E-A1EE-B77FE37D7E5D> /usr/lib/system/libcache.dylib
+       0x194662000 -        0x1946638f3  libSystem.B.dylib (1359) <4FDC9AA6-B344-37FE-B8C6-A4C94A038F57> /usr/lib/libSystem.B.dylib
+       0x19b1c4000 -        0x19b1c4f2f  libobjcMsgSend2.dylib (973.1) <BD27A84B-C9AE-3282-BBEA-3B6119837B5A> /usr/lib/objc/libobjcMsgSend2.dylib
+       0x1a31c4000 -        0x1a31c4f2f  libobjcMsgSend3.dylib (973.1) <C0860D68-DDFC-3BD7-8B06-DB0645CBBED4> /usr/lib/objc/libobjcMsgSend3.dylib
+       0x1ab1c4000 -        0x1ab1c4f2f  libobjcMsgSend4.dylib (973.1) <A6153BF5-622B-3B01-81B6-F64A365EF613> /usr/lib/objc/libobjcMsgSend4.dylib
+       0x1b31c4000 -        0x1b31c4f2f  libobjcMsgSend5.dylib (973.1) <3913A71C-B29A-3AEA-820B-BEC40AC1861A> /usr/lib/objc/libobjcMsgSend5.dylib
+       0x1bb1c4000 -        0x1bb1c4f2f  libobjcMsgSend6.dylib (973.1) <9BC523A3-E167-3F6C-8CAE-0F3EBA671791> /usr/lib/objc/libobjcMsgSend6.dylib
+       0x1c31c4000 -        0x1c31c4f2f  libobjcMsgSend7.dylib (973.1) <248B7BCE-5B4C-34C7-A340-43D5228628C5> /usr/lib/objc/libobjcMsgSend7.dylib
+       0x1cb1c4000 -        0x1cb1c4f2f  libobjcMsgSend8.dylib (973.1) <3E041BAD-A8E8-3069-B741-78CD1A45B176> /usr/lib/objc/libobjcMsgSend8.dylib
+       0x1d31c4000 -        0x1d31c4f2f  libobjcMsgSend9.dylib (973.1) <34A67969-21A0-39D6-BB81-8FDA5A2409DB> /usr/lib/objc/libobjcMsgSend9.dylib
+       0x1db1c4000 -        0x1db1c4f2f  libobjcMsgSend10.dylib (973.1) <678186C0-8EAD-3B35-8CBB-00285B41E4A0> /usr/lib/objc/libobjcMsgSend10.dylib
+       0x1e31c4000 -        0x1e31c4f2f  libobjcMsgSend11.dylib (973.1) <E05CB08C-E956-36FA-8967-AE8E346A8D2C> /usr/lib/objc/libobjcMsgSend11.dylib
+       0x20b1c4000 -        0x20b1c4f2f  libobjcMsgSend12.dylib (973.1) <10AB03AA-FF1F-3FDC-9DFB-BFC40042C501> /usr/lib/objc/libobjcMsgSend12.dylib
+       0x2131c4000 -        0x2131c4f2f  libobjcMsgSend13.dylib (973.1) <ABF53427-FA6F-3D0D-8F9D-7AD795CA5C92> /usr/lib/objc/libobjcMsgSend13.dylib
+       0x21b1c4000 -        0x21b1c4f2f  libobjcMsgSend14.dylib (973.1) <9A844C46-A6DA-34D4-8EBF-2AD775C30684> /usr/lib/objc/libobjcMsgSend14.dylib
+       0x2231c4000 -        0x2231c4f2f  libobjcMsgSend15.dylib (973.1) <7C995666-2B2D-3284-AA0A-EBF7C922838E> /usr/lib/objc/libobjcMsgSend15.dylib
+       0x22b1c4000 -        0x22b1c4f2f  libobjcMsgSend16.dylib (973.1) <B6C0E14B-53AE-3E22-9ED5-1729C49F46F2> /usr/lib/objc/libobjcMsgSend16.dylib
+       0x2331c4000 -        0x2331c4f2f  libobjcMsgSend17.dylib (973.1) <07B4CF85-251B-301B-832B-20B315A59E19> /usr/lib/objc/libobjcMsgSend17.dylib
+       0x23b1c4000 -        0x23b1c4f2f  libobjcMsgSend18.dylib (973.1) <43E575B7-04DB-3999-A633-1A3B638BA6E3> /usr/lib/objc/libobjcMsgSend18.dylib
+       0x2431c4000 -        0x2431c4f2f  libobjcMsgSend19.dylib (973.1) <736F4D85-76F7-3B28-8D87-C07E8F7A0EF4> /usr/lib/objc/libobjcMsgSend19.dylib
+       0x24b1c4000 -        0x24b1c4f2f  libobjcMsgSend20.dylib (973.1) <74E67C8B-6BCA-3184-A18E-A97F370052C6> /usr/lib/objc/libobjcMsgSend20.dylib
+       0x2531c4000 -        0x2531c4f2f  libobjcMsgSend21.dylib (973.1) <CC0D732F-98E7-3888-9E15-70984DA2FB04> /usr/lib/objc/libobjcMsgSend21.dylib
+       0x25b1c4000 -        0x25b1c4f2f  libobjcMsgSend22.dylib (973.1) <85A60286-5DE3-32BA-B18C-2A498B065C88> /usr/lib/objc/libobjcMsgSend22.dylib
+       0x2631c4000 -        0x2631c4f2f  libobjcMsgSend23.dylib (973.1) <5452A0D2-6B19-39BE-ADDD-80B7BCDE3A98> /usr/lib/objc/libobjcMsgSend23.dylib
+       0x26b1c4000 -        0x26b1c4f2f  libobjcMsgSend24.dylib (973.1) <94BBF2D6-722B-350D-8557-4D25A8E8D53A> /usr/lib/objc/libobjcMsgSend24.dylib
+       0x2731c4000 -        0x2731c4f2f  libobjcMsgSend25.dylib (973.1) <35481387-5A8E-3AE4-86A6-94CEB3CC8726> /usr/lib/objc/libobjcMsgSend25.dylib
+       0x28b1c4000 -        0x28b1c4f2f  libobjcMsgSend26.dylib (973.1) <9E0C8664-E7F4-39D1-AAFC-BD92B255E4E8> /usr/lib/objc/libobjcMsgSend26.dylib
+       0x2931c4000 -        0x2931c4f2f  libobjcMsgSend27.dylib (973.1) <FD424935-55A9-3650-955A-EED3441A1D19> /usr/lib/objc/libobjcMsgSend27.dylib
+       0x29b1c4000 -        0x29b1c4f2f  libobjcMsgSend28.dylib (973.1) <09BA7B97-7DF7-3C7F-932A-B6847662FC49> /usr/lib/objc/libobjcMsgSend28.dylib
+       0x2a31c4000 -        0x2a31c4f2f  libobjcMsgSend29.dylib (973.1) <36D5BA3F-2139-30B0-8558-556764BE9813> /usr/lib/objc/libobjcMsgSend29.dylib
+       0x2ab1c4000 -        0x2ab1c4f2f  libobjcMsgSend30.dylib (973.1) <9F05564A-9D12-372C-98FC-E9F0E6BE4F04> /usr/lib/objc/libobjcMsgSend30.dylib
+       0x2afede000 -        0x2afee4fe5  libRosetta.dylib (385) <E359944B-D230-33F9-A04E-0C3B17C3326E> /usr/lib/libRosetta.dylib
+       0x2b08cd000 -        0x2b08d075b  libsystem_darwindirectory.dylib (129.0.1) <61264923-2AA5-3658-B8C4-550C71E9D4B3> /usr/lib/system/libsystem_darwindirectory.dylib
+       0x2b08d1000 -        0x2b08dbd9b  libsystem_eligibility.dylib (446.1.3) <EDDE8E9C-A2CF-3931-BBB3-321CB852EB30> /usr/lib/system/libsystem_eligibility.dylib
+       0x2b08dc000 -        0x2b08e542b  libsystem_sanitizers.dylib (32) <7138ED99-7AA0-34EA-B35B-20EF6ADB1EED> /usr/lib/system/libsystem_sanitizers.dylib
+       0x2b08e6000 -        0x2b08e6a13  libsystem_trial.dylib (511) <6AE48824-EC44-3A8C-B501-BE57DBE892E7> /usr/lib/system/libsystem_trial.dylib
+       0x2b31c4000 -        0x2b31c4f2f  libobjcMsgSend31.dylib (973.1) <0985E20F-78C3-3466-A2B2-DBB95F7104A3> /usr/lib/objc/libobjcMsgSend31.dylib
+       0x2bb1c4000 -        0x2bb1c4f2f  libobjcMsgSend32.dylib (973.1) <0D309D58-D576-3E5D-AD4B-6D55AB491702> /usr/lib/objc/libobjcMsgSend32.dylib
+       0x2c31c4000 -        0x2c31c4f2f  libobjcMsgSend33.dylib (973.1) <346E0484-48FA-369B-8A64-93B5F5341CFE> /usr/lib/objc/libobjcMsgSend33.dylib
+       0x2cb1c4000 -        0x2cb1c4f2f  libobjcMsgSend34.dylib (973.1) <6A31F809-BCBE-3E01-A367-E91FDACCE324> /usr/lib/objc/libobjcMsgSend34.dylib

@@ -38,6 +38,11 @@ test {
     _ = @import("api/lake_sql_integration_test.zig");
     _ = @import("api/lake_index_row_source.zig");
     _ = @import("api/lake_index_publication.zig");
+    _ = @import("api/lake_index_build_replay.zig");
+    _ = @import("api/lake_index_publication_builders.zig");
+    _ = @import("api/lake_index_build_pipeline.zig");
+    _ = @import("api/lake_index_build_units.zig");
+    _ = @import("api/lake_index_owned_batch.zig");
     _ = @import("api/lake_index_store.zig");
     _ = @import("api/lake_index_coordinator.zig");
     _ = @import("api/lake_index_selection.zig");
@@ -45,6 +50,8 @@ test {
     _ = @import("api/lake_index_gc.zig");
     _ = @import("api/lake_index_ordered_rows.zig");
     _ = @import("api/lake_index_native_files.zig");
+    _ = @import("api/lake_index_native_directory.zig");
+    _ = @import("api/lake_index_metadata_ownership.zig");
     _ = @import("api/lake_index_native_rows.zig");
     _ = @import("api/lake_index_native_state.zig");
     _ = @import("api/lake_index_incremental_test.zig");
@@ -53,10 +60,13 @@ test {
     _ = @import("api/lake_index_text_query.zig");
     _ = @import("api/lake_index_text_best_first.zig");
     _ = @import("api/lake_index_text_compaction.zig");
+    _ = @import("api/lake_index_text_statistics.zig");
     _ = @import("api/lake_query_metrics.zig");
     _ = @import("api/lake_index_search_filter.zig");
     _ = @import("metadata/lake_index_lifecycle.zig");
     _ = @import("api/lake_index_aggregate_artifact.zig");
+    _ = @import("api/lake_index_aggregate_keys.zig");
+    _ = @import("api/lake_index_aggregate_record.zig");
     _ = @import("api/lake_index_aggregate_composition.zig");
     _ = @import("api/lake_index_names.zig");
     _ = @import("api/lake_index_native_aggregates.zig");

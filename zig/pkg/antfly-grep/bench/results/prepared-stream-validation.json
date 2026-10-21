@@ -1,0 +1,96 @@
+{
+  "base_commit": "82ea997ae33a53513b4593308579eedb524df440",
+  "sources_sha256": {
+    "zig/pkg/antfly-grep/bench/cache_scale.py": "2b6f5347546bb0af154a3c6a61c8028150e3d3980b4b1862f1d25611e0cdfabf",
+    "zig/pkg/antfly-grep/src/artifact_cache.zig": "a782fb4676c18702115ebc50086cfbcf6094d90b7650663b3c995c90be94a599",
+    "zig/pkg/antfly-grep/src/budget.zig": "4faad44b6573eef2805bdfaf24047e320492dc0e59e53c02f2606e053ff91c19",
+    "zig/pkg/antfly-grep/src/evidence.zig": "c78be52539f83924cc9a945746811101fef69df6c25ee005923df01603c91da5",
+    "zig/pkg/antfly-grep/src/main.zig": "a3098ed61f96ec7288736c00faa7e41a2b6ae09bf8c6768bd72b932fb586aa10",
+    "zig/pkg/antfly-grep/src/options.zig": "70d3ac5b7c09d5e74ffb0412467cc1cd1fc8d3ace673475bf41f7c4ac20f3316",
+    "zig/pkg/antfly-grep/src/regions.zig": "386bd5f38042ad5374b3c27cbda2244ed28e7d3430233541852a0dba9cbeea6d",
+    "zig/pkg/antfly-grep/src/root.zig": "3b52b16c61c32897205e61c091834da7c8d729b067e6465fe68b7981b6014e66",
+    "zig/pkg/antfly-grep/src/source_cache.zig": "d2cab4b80269a5468786a7a49ccb187ecacb490c9be6f3e6c7c4e193e00cee35",
+    "zig/pkg/antfly-grep/src/source_views.zig": "532df9432c76b7e09aad2dc347bb0bf8cd1b0efcff347091b84a641db2262cae",
+    "zig/pkg/antfly-grep/src/spill.zig": "57833b2200e003be41bc8c31a8c2f05c647a208a60be25d5c0214679c6af1c5c",
+    "zig/pkg/antfly-grep/src/temporary.zig": "c735fdf5d64e26c53bef0afb08d85f1ed4830770a92248fa4570e4db5a21fcb1",
+    "zig/pkg/antfly-grep/src/tooling.zig": "6fb1fb667f81abee5cf57969824232fff612bd6579906cc9c80dcad4f5e76a62",
+    "zig/pkg/antfly-grep/tests/test_cli.py": "b63db7c1d5cf84cb2be66412c0a62b552b2af42be8e98b761e6d6e434d4e52f0",
+    "zig/pkg/antfly-grep/bench/output_pipeline.py": "7de7711d61a1ba7ad1abe297c69051321c11f3e9349c25a9d9a8e898ed101f13"
+  },
+  "binaries": {
+    "macos-arm64": {
+      "sha256": "916e251d1a4cca0da2aae84d14a829e9826c2a7320226d5b21062c1915478832",
+      "bytes": 6709832
+    },
+    "linux-arm64": {
+      "sha256": "a8a213a6db07eb0a1ce153a4ded5d91db5685ec52163865dd7efc39d9588987f",
+      "bytes": 6708672
+    },
+    "windows-x86_64": {
+      "sha256": "4c60cbd585fdaf48f42a98e6aa77ec50cba39bb0abee1be3134d2ae877c642ed",
+      "bytes": 7532032
+    }
+  },
+  "validation": {
+    "macos_cli": {
+      "tests": 175,
+      "skipped": 2,
+      "passed": true
+    },
+    "linux_cli": {
+      "tests": 175,
+      "skipped": 1,
+      "passed": true,
+      "environment": "two-CPU ARM64 Linux Docker VM on same Mac"
+    },
+    "native_unit_hardening_tooling": "zig build grep-test passed, including generated tooling parity",
+    "release_safe": {
+      "source_views_and_artifacts": 5,
+      "external_sort_and_budget": 2,
+      "passed": true
+    },
+    "linux_malformed_input": {
+      "tests": 6,
+      "passed": true
+    },
+    "differential": {
+      "cases": 1000,
+      "seed": 1164,
+      "failures": 0,
+      "timeouts": 0,
+      "oracle": "ripgrep 15.2 / PCRE2 10.45"
+    },
+    "windows": "x86_64 cross-compilation passed; runtime not qualified",
+    "packaging": {
+      "tests": 1,
+      "passed": true
+    },
+    "apache_boundary": {
+      "source_files": 2077,
+      "passed": true
+    },
+    "boundary_checker": {
+      "tests": 35,
+      "passed": true
+    },
+    "zig_format": "passed",
+    "ruff": "check and format passed"
+  },
+  "contracts": {
+    "source_format": "V3 unchanged; positive content-addressed snapshots share 4 MiB, oversized buckets read selected records",
+    "score_format": "V10 unchanged",
+    "ranking": "finite heap retained; unlimited results use 256 KiB payload prefix and 512 KiB key target before spill; allocator capacity and file worker scratch additional",
+    "scratch": "1 GiB default max-spill-bytes shared with triage inventory; zero unlimited; exhaustion emits completed records, partial summary, exit 2",
+    "discovery": "bounded queue; count-triggered triage uses inventory, finite region budgets serialize file admission",
+    "timing": "per-file processing plus its actual rendering, excludes other candidates waiting"
+  },
+  "limitations": [
+    "Warm synthetic fixture benchmarks on one shared macOS host; provider requests zero on measured warm runs, no billed tokens or relevance measured",
+    "Source-cache bucket collisions can still cause preparation misses/reparses; source_parses measures actual work",
+    "Finite-K source snapshot caching adds a few MiB RSS; unlimited ranking substantially reduces retained output memory",
+    "Linux correctness in VM; no independent Linux hardware, cold-cache or constrained physical-host benchmark",
+    "Existing real-server scenarios were not rerun in this follow-up; indexed HTTP fixture tests passed",
+    "Full upstream PCRE2/JIT and exhaustive ripgrep behavior remain unproven; Windows runtime unqualified"
+  ],
+  "fixture_library_sha256": "eedb9c880bf1771db18c1d7b41f3513bd76e2d3c2a810155f5ee96b515930cc7"
+}

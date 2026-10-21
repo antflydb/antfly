@@ -1,0 +1,1115 @@
+Analysis of sampling antfly-grep (pid 10564) every 1 millisecond
+Process:         antfly-grep [10564]
+Path:            /Users/USER/*/antfly-grep
+Load Address:    0x100fd0000
+Identifier:      antfly-grep
+Version:         0
+Code Type:       ARM64
+Platform:        macOS
+Parent Process:  Python [10540]
+Target Type:     live task
+
+Date/Time:       2026-10-16 16:43:10.700 -0700
+Launch Time:     2026-10-16 16:43:10.636 -0700
+OS Version:      macOS 27.0.1 (26A434)
+Report Version:  7
+Analysis Tool:   /usr/bin/sample
+----
+
+Call graph:
+    190 Thread_29135420   DispatchQueue_1: com.apple.main-thread  (serial)
+    + 190 start  (in dyld) + 6688  [0x18367be80]
+    +   190 main  (in antfly-grep) + 824  [0x100fd1aa0]  start.zig:754
+    +     190 main.run  (in antfly-grep) + 27908  [0x100ff97d0]  main.zig:284
+    +       184 root.Search.run  (in antfly-grep) + 6144  [0x101073b00]  root.zig:171
+    +       ! 184 root.Search.searchPath  (in antfly-grep) + 4900  [0x101071c84]  root.zig:580
+    +       !   182 discovery.Discovery.walk__func_930  (in antfly-grep) + 2520  [0x1010b6cfc]  discovery.zig:275
+    +       !   : 171 discovery.Discovery.walk__func_930  (in antfly-grep) + 2520  [0x1010b6cfc]  discovery.zig:275
+    +       !   : | 154 discovery.Discovery.walk__func_930  (in antfly-grep) + 2520  [0x1010b6cfc]  discovery.zig:275
+    +       !   : | + 130 discovery.Discovery.walk__func_930  (in antfly-grep) + 2520  [0x1010b6cfc]  discovery.zig:275
+    +       !   : | + ! 89 discovery.Discovery.walk__func_930  (in antfly-grep) + 2520  [0x1010b6cfc]  discovery.zig:275
+    +       !   : | + ! : 53 discovery.Discovery.walk__func_930  (in antfly-grep) + 2520  [0x1010b6cfc]  discovery.zig:275
+    +       !   : | + ! : | 47 discovery.Discovery.walk__func_930  (in antfly-grep) + 2520  [0x1010b6cfc]  discovery.zig:275
+    +       !   : | + ! : | + 27 discovery.Discovery.walk__func_930  (in antfly-grep) + 1352  [0x1010b686c]  discovery.zig:269
+    +       !   : | + ! : | + ! 18 discovery.Discovery.allowed  (in antfly-grep) + 1208  [0x101032e5c]  discovery.zig:295
+    +       !   : | + ! : | + ! : 6 mod.PreparedPattern.matches  (in antfly-grep) + 448  [0x101159a88]  mod.zig:131
+    +       !   : | + ! : | + ! : | 2 mod.PreparedPattern.expand  (in antfly-grep) + 372  [0x101159ddc]  mod.zig:0
+    +       !   : | + ! : | + ! : | 2 mod.PreparedPattern.expand  (in antfly-grep) + 424  [0x101159e10]  mod.zig:148
+    +       !   : | + ! : | + ! : | 2 mod.PreparedPattern.expand  (in antfly-grep) + 368  [0x101159dd8]  mod.zig:151
+    +       !   : | + ! : | + ! : 3 mod.PreparedPattern.matches  (in antfly-grep) + 300  [0x1011599f4]  mod.zig:117
+    +       !   : | + ! : | + ! : | 1 mod.PreparedPattern.expand  (in antfly-grep) + 592  [0x101159eb8]  mod.zig:0
+    +       !   : | + ! : | + ! : | 1 mod.PreparedPattern.expand  (in antfly-grep) + 0  [0x101159c68]  mod.zig:140
+    +       !   : | + ! : | + ! : | 1 mod.PreparedPattern.expand  (in antfly-grep) + 564  [0x101159e9c]  mod.zig:148
+    +       !   : | + ! : | + ! : 3 mod.PreparedPattern.matches  (in antfly-grep) + 388  [0x101159a4c]  mod.zig:120
+    +       !   : | + ! : | + ! : | 3 _platform_memset  (in libsystem_platform.dylib) + 200,180  [0x183a5bb58,0x183a5bb44]
+    +       !   : | + ! : | + ! : 2 mod.PreparedPattern.matches  (in antfly-grep) + 416,528  [0x101159a68,0x101159ad8]  mod.zig:131
+    +       !   : | + ! : | + ! : 1 discovery.Discovery.allowed  (in antfly-grep) + 1376  [0x101032f04]  discovery.zig:295
+    +       !   : | + ! : | + ! : 1 mod.PreparedPattern.matches  (in antfly-grep) + 236  [0x1011599b4]  mod.zig:108
+    +       !   : | + ! : | + ! : | 1 _platform_memset  (in libsystem_platform.dylib) + 200  [0x183a5bb58]
+    +       !   : | + ! : | + ! : 1 mod.PreparedPattern.matches  (in antfly-grep) + 388  [0x101159a4c]  mod.zig:121
+    +       !   : | + ! : | + ! : 1 mod.PreparedPattern.matches  (in antfly-grep) + 572  [0x101159b04]  mod.zig:134
+    +       !   : | + ! : | + ! 9 discovery.Discovery.allowed  (in antfly-grep) + 1072  [0x101032dd4]  discovery.zig:295
+    +       !   : | + ! : | + !   4 mod.PreparedPattern.matches  (in antfly-grep) + 448  [0x101159a88]  mod.zig:131
+    +       !   : | + ! : | + !   | 2 mod.PreparedPattern.expand  (in antfly-grep) + 424  [0x101159e10]  mod.zig:148
+    +       !   : | + ! : | + !   | 1 mod.PreparedPattern.expand  (in antfly-grep) + 0  [0x101159c68]  mod.zig:140
+    +       !   : | + ! : | + !   | 1 mod.PreparedPattern.expand  (in antfly-grep) + 104  [0x101159cd0]  mod.zig:147
+    +       !   : | + ! : | + !   1 mod.PreparedPattern.matches  (in antfly-grep) + 300  [0x1011599f4]  mod.zig:117
+    +       !   : | + ! : | + !   | 1 mod.PreparedPattern.expand  (in antfly-grep) + 512  [0x101159e68]  mod.zig:145
+    +       !   : | + ! : | + !   1 mod.PreparedPattern.matches  (in antfly-grep) + 332  [0x101159a14]  mod.zig:118
+    +       !   : | + ! : | + !   1 mod.PreparedPattern.matches  (in antfly-grep) + 388  [0x101159a4c]  mod.zig:120
+    +       !   : | + ! : | + !   | 1 _platform_memset  (in libsystem_platform.dylib) + 180  [0x183a5bb44]
+    +       !   : | + ! : | + !   1 mod.PreparedPattern.matches  (in antfly-grep) + 480  [0x101159aa8]  mod.zig:125
+    +       !   : | + ! : | + !   1 mod.PreparedPattern.matches  (in antfly-grep) + 572  [0x101159b04]  mod.zig:134
+    +       !   : | + ! : | + 10 discovery.Discovery.walk__func_930  (in antfly-grep) + 2520  [0x1010b6cfc]  discovery.zig:275
+    +       !   : | + ! : | + ! 8 discovery.Discovery.walk__func_930  (in antfly-grep) + 1352  [0x1010b686c]  discovery.zig:269
+    +       !   : | + ! : | + ! : 5 discovery.Discovery.allowed  (in antfly-grep) + 1208  [0x101032e5c]  discovery.zig:295
+    +       !   : | + ! : | + ! : | 2 mod.PreparedPattern.matches  (in antfly-grep) + 448  [0x101159a88]  mod.zig:131
+    +       !   : | + ! : | + ! : | + 1 mod.PreparedPattern.expand  (in antfly-grep) + 0  [0x101159c68]  mod.zig:140
+    +       !   : | + ! : | + ! : | + 1 mod.PreparedPattern.expand  (in antfly-grep) + 424  [0x101159e10]  mod.zig:148
+    +       !   : | + ! : | + ! : | 1 mod.PreparedPattern.matches  (in antfly-grep) + 580  [0x101159b0c]  mod.zig:0
+    +       !   : | + ! : | + ! : | 1 mod.PreparedPattern.matches  (in antfly-grep) + 300  [0x1011599f4]  mod.zig:117
+    +       !   : | + ! : | + ! : | + 1 mod.PreparedPattern.expand  (in antfly-grep) + 24  [0x101159c80]  mod.zig:142
+    +       !   : | + ! : | + ! : | 1 mod.PreparedPattern.matches  (in antfly-grep) + 388  [0x101159a4c]  mod.zig:120
+    +       !   : | + ! : | + ! : |   1 DYLD-STUB$$bzero  (in antfly-grep) + 4  [0x10124152c]
+    +       !   : | + ! : | + ! : 3 discovery.Discovery.allowed  (in antfly-grep) + 1072  [0x101032dd4]  discovery.zig:295
+    +       !   : | + ! : | + ! :   1 mod.PreparedPattern.matches  (in antfly-grep) + 388  [0x101159a4c]  mod.zig:120
+    +       !   : | + ! : | + ! :   + 1 _platform_memset  (in libsystem_platform.dylib) + 200  [0x183a5bb58]
+    +       !   : | + ! : | + ! :   1 mod.PreparedPattern.matches  (in antfly-grep) + 448  [0x101159a88]  mod.zig:131
+    +       !   : | + ! : | + ! :   + 1 mod.PreparedPattern.expand  (in antfly-grep) + 396  [0x101159df4]  mod.zig:147
+    +       !   : | + ! : | + ! :   1 mod.PreparedPattern.matches  (in antfly-grep) + 416  [0x101159a68]  mod.zig:131
+    +       !   : | + ! : | + ! 1 discovery.Discovery.walk__func_930  (in antfly-grep) + 512  [0x1010b6524]  discovery.zig:246
+    +       !   : | + ! : | + ! : 1 discovery.Discovery.loadDirectory  (in antfly-grep) + 320  [0x10106c5b0]  discovery.zig:474
+    +       !   : | + ! : | + ! :   1 discovery.Discovery.load  (in antfly-grep) + 104  [0x10106b424]  discovery.zig:477
+    +       !   : | + ! : | + ! :     1 Io.Dir.readFileAlloc  (in antfly-grep) + 100  [0x101203778]  Dir.zig:1342
+    +       !   : | + ! : | + ! :       1 Io.Threaded.dirOpenFilePosix  (in antfly-grep) + 432  [0x10102a608]  Threaded.zig:4968
+    +       !   : | + ! : | + ! :         1 openat  (in libsystem_kernel.dylib) + 76  [0x183a29850]
+    +       !   : | + ! : | + ! :           1 __openat  (in libsystem_kernel.dylib) + 8  [0x183a0e5a8]
+    +       !   : | + ! : | + ! 1 discovery.Discovery.walk__func_930  (in antfly-grep) + 596  [0x1010b6578]  discovery.zig:248
+    +       !   : | + ! : | + !   1 Io.Threaded.dirOpenDirPosix  (in antfly-grep) + 296  [0x10102a244]  Threaded.zig:5402
+    +       !   : | + ! : | + !     1 openat  (in libsystem_kernel.dylib) + 76  [0x183a29850]
+    +       !   : | + ! : | + !       1 __openat  (in libsystem_kernel.dylib) + 8  [0x183a0e5a8]
+    +       !   : | + ! : | + 7 discovery.Discovery.walk__func_930  (in antfly-grep) + 2660  [0x1010b6d88]  discovery.zig:277
+    +       !   : | + ! : | + ! 6 root.Search.file  (in antfly-grep) + 1880  [0x10106e52c]  root.zig:601
+    +       !   : | + ! : | + ! : 6 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    +       !   : | + ! : | + ! 1 root.Search.file  (in antfly-grep) + 10980  [0x1010708b8]  root.zig:601
+    +       !   : | + ! : | + !   1 Io.Threaded.futexWake  (in antfly-grep) + 60  [0x10102e300]  Threaded.zig:2537
+    +       !   : | + ! : | + !     1 __ulock_wake  (in libsystem_kernel.dylib) + 8  [0x183a0ebc8]
+    +       !   : | + ! : | + 2 discovery.Discovery.walk__func_930  (in antfly-grep) + 704  [0x1010b65e4]  discovery.zig:251
+    +       !   : | + ! : | + ! 2 Io.Threaded.dirReadDarwin  (in antfly-grep) + 292  [0x101029edc]  Threaded.zig:5701
+    +       !   : | + ! : | + !   2 __getdirentries64  (in libsystem_kernel.dylib) + 8  [0x183a0e9c0]
+    +       !   : | + ! : | + 1 discovery.Discovery.walk__func_930  (in antfly-grep) + 596  [0x1010b6578]  discovery.zig:248
+    +       !   : | + ! : | +   1 Io.Threaded.dirOpenDirPosix  (in antfly-grep) + 296  [0x10102a244]  Threaded.zig:5402
+    +       !   : | + ! : | +     1 openat  (in libsystem_kernel.dylib) + 76  [0x183a29850]
+    +       !   : | + ! : | +       1 __openat  (in libsystem_kernel.dylib) + 8  [0x183a0e5a8]
+    +       !   : | + ! : | 3 discovery.Discovery.walk__func_930  (in antfly-grep) + 1352  [0x1010b686c]  discovery.zig:269
+    +       !   : | + ! : | + 3 discovery.Discovery.allowed  (in antfly-grep) + 1208  [0x101032e5c]  discovery.zig:295
+    +       !   : | + ! : | +   1 mod.PreparedPattern.matches  (in antfly-grep) + 388  [0x101159a4c]  mod.zig:120
+    +       !   : | + ! : | +   ! 1 _platform_memset  (in libsystem_platform.dylib) + 196  [0x183a5bb54]
+    +       !   : | + ! : | +   1 mod.PreparedPattern.matches  (in antfly-grep) + 456  [0x101159a90]  mod.zig:122
+    +       !   : | + ! : | +   1 mod.PreparedPattern.matches  (in antfly-grep) + 572  [0x101159b04]  mod.zig:134
+    +       !   : | + ! : | 2 discovery.Discovery.walk__func_930  (in antfly-grep) + 596  [0x1010b6578]  discovery.zig:248
+    +       !   : | + ! : | + 2 Io.Threaded.dirOpenDirPosix  (in antfly-grep) + 296  [0x10102a244]  Threaded.zig:5402
+    +       !   : | + ! : | +   2 openat  (in libsystem_kernel.dylib) + 76  [0x183a29850]
+    +       !   : | + ! : | +     2 __openat  (in libsystem_kernel.dylib) + 8  [0x183a0e5a8]
+    +       !   : | + ! : | 1 discovery.Discovery.walk__func_930  (in antfly-grep) + 2660  [0x1010b6d88]  discovery.zig:277
+    +       !   : | + ! : |   1 root.Search.file  (in antfly-grep) + 1880  [0x10106e52c]  root.zig:601
+    +       !   : | + ! : |     1 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    +       !   : | + ! : 23 discovery.Discovery.walk__func_930  (in antfly-grep) + 2660  [0x1010b6d88]  discovery.zig:277
+    +       !   : | + ! : | 21 root.Search.file  (in antfly-grep) + 1880  [0x10106e52c]  root.zig:601
+    +       !   : | + ! : | + 21 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    +       !   : | + ! : | 1 root.Search.file  (in antfly-grep) + 10188  [0x1010705a0]  root.zig:601
+    +       !   : | + ! : | + 1 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    +       !   : | + ! : | 1 root.Search.file  (in antfly-grep) + 10980  [0x1010708b8]  root.zig:601
+    +       !   : | + ! : |   1 Io.Threaded.futexWake  (in antfly-grep) + 60  [0x10102e300]  Threaded.zig:2537
+    +       !   : | + ! : |     1 __ulock_wake  (in libsystem_kernel.dylib) + 8  [0x183a0ebc8]
+    +       !   : | + ! : 6 discovery.Discovery.walk__func_930  (in antfly-grep) + 1352  [0x1010b686c]  discovery.zig:269
+    +       !   : | + ! : | 3 discovery.Discovery.allowed  (in antfly-grep) + 1072  [0x101032dd4]  discovery.zig:295
+    +       !   : | + ! : | + 1 mod.PreparedPattern.matches  (in antfly-grep) + 456  [0x101159a90]  mod.zig:122
+    +       !   : | + ! : | + 1 mod.PreparedPattern.matches  (in antfly-grep) + 416  [0x101159a68]  mod.zig:131
+    +       !   : | + ! : | + 1 mod.PreparedPattern.matches  (in antfly-grep) + 552  [0x101159af0]  mod.zig:134
+    +       !   : | + ! : | 3 discovery.Discovery.allowed  (in antfly-grep) + 1208  [0x101032e5c]  discovery.zig:295
+    +       !   : | + ! : |   1 discovery.Discovery.allowed  (in antfly-grep) + 1216  [0x101032e64]  discovery.zig:295
+    +       !   : | + ! : |   1 mod.PreparedPattern.matches  (in antfly-grep) + 300  [0x1011599f4]  mod.zig:117
+    +       !   : | + ! : |   ! 1 mod.PreparedPattern.expand  (in antfly-grep) + 592  [0x101159eb8]  mod.zig:0
+    +       !   : | + ! : |   1 mod.PreparedPattern.matches  (in antfly-grep) + 332  [0x101159a14]  mod.zig:118
+    +       !   : | + ! : 2 discovery.Discovery.walk__func_930  (in antfly-grep) + 512  [0x1010b6524]  discovery.zig:246
+    +       !   : | + ! : | 2 discovery.Discovery.loadDirectory  (in antfly-grep) + 184  [0x10106c528]  discovery.zig:469
+    +       !   : | + ! : |   2 discovery.Discovery.load  (in antfly-grep) + 104  [0x10106b424]  discovery.zig:477
+    +       !   : | + ! : |     2 Io.Dir.readFileAlloc  (in antfly-grep) + 100  [0x101203778]  Dir.zig:1342
+    +       !   : | + ! : |       2 Io.Threaded.dirOpenFilePosix  (in antfly-grep) + 432  [0x10102a608]  Threaded.zig:4968
+    +       !   : | + ! : |         2 openat  (in libsystem_kernel.dylib) + 76  [0x183a29850]
+    +       !   : | + ! : |           2 __openat  (in libsystem_kernel.dylib) + 8  [0x183a0e5a8]
+    +       !   : | + ! : 2 discovery.Discovery.walk__func_930  (in antfly-grep) + 596  [0x1010b6578]  discovery.zig:248
+    +       !   : | + ! : | 2 Io.Threaded.dirOpenDirPosix  (in antfly-grep) + 296  [0x10102a244]  Threaded.zig:5402
+    +       !   : | + ! : |   2 openat  (in libsystem_kernel.dylib) + 76  [0x183a29850]
+    +       !   : | + ! : |     2 __openat  (in libsystem_kernel.dylib) + 8  [0x183a0e5a8]
+    +       !   : | + ! : 2 discovery.Discovery.walk__func_930  (in antfly-grep) + 704  [0x1010b65e4]  discovery.zig:251
+    +       !   : | + ! : | 2 Io.Threaded.dirReadDarwin  (in antfly-grep) + 292  [0x101029edc]  Threaded.zig:5701
+    +       !   : | + ! : |   2 __getdirentries64  (in libsystem_kernel.dylib) + 8  [0x183a0e9c0]
+    +       !   : | + ! : 1 discovery.Discovery.walk__func_930  (in antfly-grep) + 2760  [0x1010b6dec]  discovery.zig:255
+    +       !   : | + ! :   1 __xzm_xzone_free_to_freelist_chunk  (in libsystem_malloc.dylib) + 424  [0x18387182c]
+    +       !   : | + ! :     1 mach_absolute_time  (in libsystem_kernel.dylib) + 108  [0x183a0d0f8]
+    +       !   : | + ! 21 discovery.Discovery.walk__func_930  (in antfly-grep) + 2660  [0x1010b6d88]  discovery.zig:277
+    +       !   : | + ! : 21 root.Search.file  (in antfly-grep) + 1880  [0x10106e52c]  root.zig:601
+    +       !   : | + ! :   21 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    +       !   : | + ! 10 discovery.Discovery.walk__func_930  (in antfly-grep) + 1352  [0x1010b686c]  discovery.zig:269
+    +       !   : | + ! : 7 discovery.Discovery.allowed  (in antfly-grep) + 1208  [0x101032e5c]  discovery.zig:295
+    +       !   : | + ! : | 3 mod.PreparedPattern.matches  (in antfly-grep) + 388  [0x101159a4c]  mod.zig:120
+    +       !   : | + ! : | + 2 _platform_memset  (in libsystem_platform.dylib) + 180,200  [0x183a5bb44,0x183a5bb58]
+    +       !   : | + ! : | + 1 DYLD-STUB$$bzero  (in antfly-grep) + 4  [0x10124152c]
+    +       !   : | + ! : | 1 mod.PreparedPattern.matches  (in antfly-grep) + 236  [0x1011599b4]  mod.zig:108
+    +       !   : | + ! : | + 1 _platform_memset  (in libsystem_platform.dylib) + 200  [0x183a5bb58]
+    +       !   : | + ! : | 1 mod.PreparedPattern.matches  (in antfly-grep) + 456  [0x101159a90]  mod.zig:122
+    +       !   : | + ! : | 1 mod.PreparedPattern.matches  (in antfly-grep) + 468  [0x101159a9c]  mod.zig:123
+    +       !   : | + ! : | 1 mod.PreparedPattern.matches  (in antfly-grep) + 448  [0x101159a88]  mod.zig:131
+    +       !   : | + ! : |   1 mod.PreparedPattern.expand  (in antfly-grep) + 372  [0x101159ddc]  mod.zig:0
+    +       !   : | + ! : 3 discovery.Discovery.allowed  (in antfly-grep) + 1072  [0x101032dd4]  discovery.zig:295
+    +       !   : | + ! :   2 mod.PreparedPattern.matches  (in antfly-grep) + 448  [0x101159a88]  mod.zig:131
+    +       !   : | + ! :   + 1 mod.PreparedPattern.expand  (in antfly-grep) + 372  [0x101159ddc]  mod.zig:0
+    +       !   : | + ! :   + 1 mod.PreparedPattern.expand  (in antfly-grep) + 424  [0x101159e10]  mod.zig:148
+    +       !   : | + ! :   1 mod.PreparedPattern.matches  (in antfly-grep) + 304  [0x1011599f8]  mod.zig:118
+    +       !   : | + ! 5 discovery.Discovery.walk__func_930  (in antfly-grep) + 596  [0x1010b6578]  discovery.zig:248
+    +       !   : | + ! : 5 Io.Threaded.dirOpenDirPosix  (in antfly-grep) + 296  [0x10102a244]  Threaded.zig:5402
+    +       !   : | + ! :   5 openat  (in libsystem_kernel.dylib) + 76  [0x183a29850]
+    +       !   : | + ! :     5 __openat  (in libsystem_kernel.dylib) + 8  [0x183a0e5a8]
+    +       !   : | + ! 3 discovery.Discovery.walk__func_930  (in antfly-grep) + 2728  [0x1010b6dcc]  discovery.zig:257
+    +       !   : | + ! : 3 heap.c_allocator_impl.free  (in antfly-grep) + 0  [0x10123e9f4]  heap.zig:324
+    +       !   : | + ! 1 discovery.Discovery.walk__func_930  (in antfly-grep) + 512  [0x1010b6524]  discovery.zig:246
+    +       !   : | + ! : 1 discovery.Discovery.loadDirectory  (in antfly-grep) + 184  [0x10106c528]  discovery.zig:469
+    +       !   : | + ! :   1 discovery.Discovery.load  (in antfly-grep) + 104  [0x10106b424]  discovery.zig:477
+    +       !   : | + ! :     1 Io.Dir.readFileAlloc  (in antfly-grep) + 100  [0x101203778]  Dir.zig:1342
+    +       !   : | + ! :       1 Io.Threaded.dirOpenFilePosix  (in antfly-grep) + 432  [0x10102a608]  Threaded.zig:4968
+    +       !   : | + ! :         1 openat  (in libsystem_kernel.dylib) + 76  [0x183a29850]
+    +       !   : | + ! :           1 __openat  (in libsystem_kernel.dylib) + 8  [0x183a0e5a8]
+    +       !   : | + ! 1 discovery.Discovery.walk__func_930  (in antfly-grep) + 704  [0x1010b65e4]  discovery.zig:251
+    +       !   : | + !   1 Io.Threaded.dirReadDarwin  (in antfly-grep) + 292  [0x101029edc]  Threaded.zig:5701
+    +       !   : | + !     1 __getdirentries64  (in libsystem_kernel.dylib) + 8  [0x183a0e9c0]
+    +       !   : | + 15 discovery.Discovery.walk__func_930  (in antfly-grep) + 2660  [0x1010b6d88]  discovery.zig:277
+    +       !   : | + ! 15 root.Search.file  (in antfly-grep) + 1880  [0x10106e52c]  root.zig:601
+    +       !   : | + !   15 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    +       !   : | + 8 discovery.Discovery.walk__func_930  (in antfly-grep) + 1352  [0x1010b686c]  discovery.zig:269
+    +       !   : | + ! 7 discovery.Discovery.allowed  (in antfly-grep) + 1208  [0x101032e5c]  discovery.zig:295
+    +       !   : | + ! : 2 mod.PreparedPattern.matches  (in antfly-grep) + 300  [0x1011599f4]  mod.zig:117
+    +       !   : | + ! : | 1 mod.PreparedPattern.expand  (in antfly-grep) + 528  [0x101159e78]  mod.zig:147
+    +       !   : | + ! : | 1 mod.PreparedPattern.expand  (in antfly-grep) + 564  [0x101159e9c]  mod.zig:148
+    +       !   : | + ! : 2 mod.PreparedPattern.matches  (in antfly-grep) + 448  [0x101159a88]  mod.zig:131
+    +       !   : | + ! : | 1 mod.PreparedPattern.expand  (in antfly-grep) + 644  [0x101159eec]  mod.zig:0
+    +       !   : | + ! : | 1 mod.PreparedPattern.expand  (in antfly-grep) + 368  [0x101159dd8]  mod.zig:151
+    +       !   : | + ! : 1 discovery.Discovery.allowed  (in antfly-grep) + 1168  [0x101032e34]  discovery.zig:295
+    +       !   : | + ! : 1 mod.PreparedPattern.matches  (in antfly-grep) + 236  [0x1011599b4]  mod.zig:108
+    +       !   : | + ! : | 1 _platform_memset  (in libsystem_platform.dylib) + 208  [0x183a5bb60]
+    +       !   : | + ! : 1 mod.PreparedPattern.matches  (in antfly-grep) + 332  [0x101159a14]  mod.zig:118
+    +       !   : | + ! 1 discovery.Discovery.allowed  (in antfly-grep) + 1072  [0x101032dd4]  discovery.zig:295
+    +       !   : | + !   1 mod.PreparedPattern.matches  (in antfly-grep) + 388  [0x101159a4c]  mod.zig:120
+    +       !   : | + !     1 _platform_memset  (in libsystem_platform.dylib) + 176  [0x183a5bb40]
+    +       !   : | + 1 discovery.Discovery.walk__func_930  (in antfly-grep) + 596  [0x1010b6578]  discovery.zig:248
+    +       !   : | +   1 Io.Threaded.dirOpenDirPosix  (in antfly-grep) + 296  [0x10102a244]  Threaded.zig:5402
+    +       !   : | +     1 openat  (in libsystem_kernel.dylib) + 76  [0x183a29850]
+    +       !   : | +       1 __openat  (in libsystem_kernel.dylib) + 8  [0x183a0e5a8]
+    +       !   : | 11 discovery.Discovery.walk__func_930  (in antfly-grep) + 2660  [0x1010b6d88]  discovery.zig:277
+    +       !   : | + 10 root.Search.file  (in antfly-grep) + 1880  [0x10106e52c]  root.zig:601
+    +       !   : | + ! 10 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    +       !   : | + 1 root.Search.file  (in antfly-grep) + 2056  [0x10106e5dc]  root.zig:601
+    +       !   : | +   1 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    +       !   : | 4 discovery.Discovery.walk__func_930  (in antfly-grep) + 596  [0x1010b6578]  discovery.zig:248
+    +       !   : | + 4 Io.Threaded.dirOpenDirPosix  (in antfly-grep) + 296  [0x10102a244]  Threaded.zig:5402
+    +       !   : | +   4 openat  (in libsystem_kernel.dylib) + 76  [0x183a29850]
+    +       !   : | +     4 __openat  (in libsystem_kernel.dylib) + 8  [0x183a0e5a8]
+    +       !   : | 1 discovery.Discovery.walk__func_930  (in antfly-grep) + 704  [0x1010b65e4]  discovery.zig:251
+    +       !   : | + 1 Io.Threaded.dirReadDarwin  (in antfly-grep) + 292  [0x101029edc]  Threaded.zig:5701
+    +       !   : | +   1 __getdirentries64  (in libsystem_kernel.dylib) + 8  [0x183a0e9c0]
+    +       !   : | 1 discovery.Discovery.walk__func_930  (in antfly-grep) + 1352  [0x1010b686c]  discovery.zig:269
+    +       !   : |   1 discovery.Discovery.allowed  (in antfly-grep) + 1208  [0x101032e5c]  discovery.zig:295
+    +       !   : |     1 mod.PreparedPattern.matches  (in antfly-grep) + 448  [0x101159a88]  mod.zig:131
+    +       !   : |       1 mod.PreparedPattern.expand  (in antfly-grep) + 344  [0x101159dc0]  mod.zig:0
+    +       !   : 5 discovery.Discovery.walk__func_930  (in antfly-grep) + 2660  [0x1010b6d88]  discovery.zig:277
+    +       !   : | 5 root.Search.file  (in antfly-grep) + 1880  [0x10106e52c]  root.zig:601
+    +       !   : |   5 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    +       !   : 3 discovery.Discovery.walk__func_930  (in antfly-grep) + 1352  [0x1010b686c]  discovery.zig:269
+    +       !   : | 2 discovery.Discovery.allowed  (in antfly-grep) + 1072  [0x101032dd4]  discovery.zig:295
+    +       !   : | + 2 mod.PreparedPattern.matches  (in antfly-grep) + 448  [0x101159a88]  mod.zig:131
+    +       !   : | +   1 mod.PreparedPattern.expand  (in antfly-grep) + 372  [0x101159ddc]  mod.zig:0
+    +       !   : | +   1 mod.PreparedPattern.expand  (in antfly-grep) + 476  [0x101159e44]  mod.zig:164
+    +       !   : | 1 discovery.Discovery.allowed  (in antfly-grep) + 1208  [0x101032e5c]  discovery.zig:295
+    +       !   : |   1 mod.PreparedPattern.matches  (in antfly-grep) + 356  [0x101159a2c]  mod.zig:119
+    +       !   : 1 discovery.Discovery.walk__func_930  (in antfly-grep) + 512  [0x1010b6524]  discovery.zig:246
+    +       !   : | 1 discovery.Discovery.loadDirectory  (in antfly-grep) + 320  [0x10106c5b0]  discovery.zig:474
+    +       !   : |   1 discovery.Discovery.load  (in antfly-grep) + 104  [0x10106b424]  discovery.zig:477
+    +       !   : |     1 Io.Dir.readFileAlloc  (in antfly-grep) + 100  [0x101203778]  Dir.zig:1342
+    +       !   : |       1 Io.Threaded.dirOpenFilePosix  (in antfly-grep) + 432  [0x10102a608]  Threaded.zig:4968
+    +       !   : |         1 openat  (in libsystem_kernel.dylib) + 76  [0x183a29850]
+    +       !   : |           1 __openat  (in libsystem_kernel.dylib) + 28  [0x183a0e5bc]
+    +       !   : |             1 cerror  (in libsystem_kernel.dylib) + 52  [0x183a0e600]
+    +       !   : |               1 cerror_nocancel  (in libsystem_kernel.dylib) + 4  [0x183a0d5e4]
+    +       !   : 1 discovery.Discovery.walk__func_930  (in antfly-grep) + 596  [0x1010b6578]  discovery.zig:248
+    +       !   : | 1 Io.Threaded.dirOpenDirPosix  (in antfly-grep) + 296  [0x10102a244]  Threaded.zig:5402
+    +       !   : |   1 openat  (in libsystem_kernel.dylib) + 76  [0x183a29850]
+    +       !   : |     1 __openat  (in libsystem_kernel.dylib) + 8  [0x183a0e5a8]
+    +       !   : 1 discovery.Discovery.walk__func_930  (in antfly-grep) + 704  [0x1010b65e4]  discovery.zig:251
+    +       !   :   1 Io.Threaded.dirReadDarwin  (in antfly-grep) + 292  [0x101029edc]  Threaded.zig:5701
+    +       !   :     1 __getdirentries64  (in libsystem_kernel.dylib) + 8  [0x183a0e9c0]
+    +       !   1 discovery.Discovery.walk__func_930  (in antfly-grep) + 772  [0x1010b6628]  discovery.zig:252
+    +       !   1 discovery.Discovery.walk__func_930  (in antfly-grep) + 2660  [0x1010b6d88]  discovery.zig:277
+    +       !     1 root.Search.file  (in antfly-grep) + 2056  [0x10106e5dc]  root.zig:601
+    +       !       1 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    +       6 root.Search.run  (in antfly-grep) + 12084  [0x101075234]  root.zig:177
+    +         6 root.Search.Pipeline.finish  (in antfly-grep) + 68  [0x10106a348]  root.zig:396
+    +           6 _pthread_join  (in libsystem_pthread.dylib) + 620  [0x183a5403c]
+    +             6 __ulock_wait  (in libsystem_kernel.dylib) + 8  [0x183a0eaf4]
+    190 Thread_29135426
+    + 190 thread_start  (in libsystem_pthread.dylib) + 8  [0x183a4ccec]
+    +   190 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x183a51d00]
+    +     190 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 1120  [0x10115af24]  Thread.zig:753
+    +       189 root.Search.file  (in antfly-grep) + 8008  [0x10106fd1c]  root.zig:624
+    +       ! 189 root.Search.streamInput  (in antfly-grep) + 152  [0x10106a980]  root.zig:1023
+    +       !   134 root.Search.stream  (in antfly-grep) + 2400,2408,...  [0x10105e414,0x10105e41c,...]  root.zig:1115
+    +       !   32 root.Search.stream  (in antfly-grep) + 8812  [0x10105fd20]  root.zig:1149
+    +       !   : 28 matcher.Matcher.matches  (in antfly-grep) + 1508,1516,...  [0x101049160,0x101049168,...]  matcher.zig:306
+    +       !   : 2 matcher.Matcher.matches  (in antfly-grep) + 220,268  [0x101048c58,0x101048c88]  matcher.zig:0
+    +       !   : 1 matcher.Matcher.matches  (in antfly-grep) + 12  [0x101048b88]  matcher.zig:290
+    +       !   : 1 matcher.Matcher.matches  (in antfly-grep) + 376  [0x101048cf4]  matcher.zig:296
+    +       !   11 root.Search.stream  (in antfly-grep) + 1968  [0x10105e264]  root.zig:1099
+    +       !   : 3 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 96,68  [0x100fffb90,0x100fffb74]  Reader.zig:1033
+    +       !   : 2 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 580  [0x100fffd74]  Reader.zig:0
+    +       !   : 2 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 104,192  [0x100fffb98,0x100fffbf0]  Reader.zig:1037
+    +       !   : 2 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 664,712  [0x100fffdc8,0x100fffdf8]  Reader.zig:1038
+    +       !   : 1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 504  [0x100fffd28]  Reader.zig:1033
+    +       !   : | 1 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+    +       !   : |   1 Io.Reader.defaultReadVec  (in antfly-grep) + 84  [0x101000018]  Reader.zig:470
+    +       !   : |     1 root.Search.BinaryReader.stream  (in antfly-grep) + 1160  [0x1010bcb2c]  root.zig:988
+    +       !   : |       1 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+    +       !   : |         1 Io.File.Reader.readVec  (in antfly-grep) + 104  [0x101000864]  Reader.zig:234
+    +       !   : |           1 Io.File.Reader.readVecPositional  (in antfly-grep) + 232  [0x101000eac]  Reader.zig:246
+    +       !   : |             1 Io.Threaded.fileReadPositional  (in antfly-grep) + 224  [0x101026518]  Threaded.zig:10206
+    +       !   : |               1 preadv  (in libsystem_kernel.dylib) + 8  [0x183a1bd84]
+    +       !   : 1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 704  [0x100fffdf0]  Reader.zig:1038
+    +       !   :   1 ???  (in antfly-grep)  load address 0x100fd0000 + 0x26ef48  [0x10123ef48]
+    +       !   2 root.Search.stream  (in antfly-grep) + 8776  [0x10105fcfc]  root.zig:1148
+    +       !   1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 840  [0x100fffe78]  Reader.zig:0
+    +       !   1 heap.ArenaAllocator.reset  (in antfly-grep) + 680  [0x101001418]  ArenaAllocator.zig:0
+    +       !   1 root.Search.stream  (in antfly-grep) + 10984  [0x10106059c]  root.zig:0
+    +       !   1 root.Search.stream  (in antfly-grep) + 816  [0x10105dde4]  root.zig:1061
+    +       !   1 root.Search.stream  (in antfly-grep) + 828  [0x10105ddf0]  root.zig:1062
+    +       !   1 root.Search.stream  (in antfly-grep) + 840  [0x10105ddfc]  root.zig:1063
+    +       !   : 1 heap.ArenaAllocator.reset  (in antfly-grep) + 4  [0x101001174]  ArenaAllocator.zig:112
+    +       !   1 root.Search.stream  (in antfly-grep) + 2228  [0x10105e368]  root.zig:1111
+    +       !   1 root.Search.stream  (in antfly-grep) + 2432  [0x10105e434]  root.zig:1121
+    +       !   1 root.Search.stream  (in antfly-grep) + 8812  [0x10105fd20]  root.zig:1149
+    +       !   1 root.Search.stream  (in antfly-grep) + 6612  [0x10105f488]  root.zig:1174
+    +       1 root.Search.file  (in antfly-grep) + 7756  [0x10106fc20]  root.zig:624
+    +         1 Io.Threaded.dirOpenFilePosix  (in antfly-grep) + 432  [0x10102a608]  Threaded.zig:4968
+    +           1 openat  (in libsystem_kernel.dylib) + 76  [0x183a29850]
+    +             1 __openat  (in libsystem_kernel.dylib) + 8  [0x183a0e5a8]
+    188 Thread_29135423
+    + 188 thread_start  (in libsystem_pthread.dylib) + 8  [0x183a4ccec]
+    +   188 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x183a51d00]
+    +     167 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 1120  [0x10115af24]  Thread.zig:753
+    +     ! 139 root.Search.file  (in antfly-grep) + 8008  [0x10106fd1c]  root.zig:624
+    +     ! : 139 root.Search.streamInput  (in antfly-grep) + 152  [0x10106a980]  root.zig:1023
+    +     ! :   103 root.Search.stream  (in antfly-grep) + 2400,2408  [0x10105e414,0x10105e41c]  root.zig:1115
+    +     ! :   27 root.Search.stream  (in antfly-grep) + 8812  [0x10105fd20]  root.zig:1149
+    +     ! :   | 23 matcher.Matcher.matches  (in antfly-grep) + 1524,1536,...  [0x101049170,0x10104917c,...]  matcher.zig:306
+    +     ! :   | 3 matcher.Matcher.matches  (in antfly-grep) + 268  [0x101048c88]  matcher.zig:0
+    +     ! :   | 1 matcher.Matcher.matches  (in antfly-grep) + 316  [0x101048cb8]  matcher.zig:295
+    +     ! :   2 root.Search.stream  (in antfly-grep) + 10988  [0x1010605a0]  root.zig:0
+    +     ! :   2 root.Search.stream  (in antfly-grep) + 840  [0x10105ddfc]  root.zig:1063
+    +     ! :   | 1 heap.ArenaAllocator.reset  (in antfly-grep) + 16  [0x101001180]  ArenaAllocator.zig:112
+    +     ! :   | 1 heap.ArenaAllocator.reset  (in antfly-grep) + 32  [0x101001190]  ArenaAllocator.zig:143
+    +     ! :   2 root.Search.stream  (in antfly-grep) + 2152  [0x10105e31c]  root.zig:1111
+    +     ! :   1 matcher.Matcher.matches  (in antfly-grep) + 2348  [0x1010494a8]  matcher.zig:0
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 11472  [0x101060784]  root.zig:1066
+    +     ! :   | 1 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+    +     ! :   |   1 Io.Reader.defaultReadVec  (in antfly-grep) + 84  [0x101000018]  Reader.zig:470
+    +     ! :   |     1 root.Search.BinaryReader.stream  (in antfly-grep) + 1160  [0x1010bcb2c]  root.zig:988
+    +     ! :   |       1 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+    +     ! :   |         1 Io.File.Reader.readVec  (in antfly-grep) + 104  [0x101000864]  Reader.zig:234
+    +     ! :   |           1 Io.File.Reader.readVecPositional  (in antfly-grep) + 232  [0x101000eac]  Reader.zig:246
+    +     ! :   |             1 Io.Threaded.fileReadPositional  (in antfly-grep) + 224  [0x101026518]  Threaded.zig:10206
+    +     ! :   |               1 preadv  (in libsystem_kernel.dylib) + 8  [0x183a1bd84]
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 1968  [0x10105e264]  root.zig:1099
+    +     ! :     1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 656  [0x100fffdc0]  Reader.zig:1038
+    +     ! 25 root.Search.file  (in antfly-grep) + 7756  [0x10106fc20]  root.zig:624
+    +     ! : 25 Io.Threaded.dirOpenFilePosix  (in antfly-grep) + 432  [0x10102a608]  Threaded.zig:4968
+    +     ! :   25 openat  (in libsystem_kernel.dylib) + 76  [0x183a29850]
+    +     ! :     25 __openat  (in libsystem_kernel.dylib) + 8  [0x183a0e5a8]
+    +     ! 1 root.Search.file  (in antfly-grep) + 7868  [0x10106fc90]  root.zig:624
+    +     ! : 1 _xzm_malloc_large_huge  (in libsystem_malloc.dylib) + 1024  [0x18386c4e4]
+    +     ! :   1 _os_unfair_lock_lock_slow  (in libsystem_platform.dylib) + 172  [0x183a59aa0]
+    +     ! :     1 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    +     ! 1 root.Search.file  (in antfly-grep) + 7988  [0x10106fd08]  root.zig:624
+    +     ! : 1 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+    +     ! :   1 Io.File.Reader.readVec  (in antfly-grep) + 104  [0x101000864]  Reader.zig:234
+    +     ! :     1 Io.File.Reader.readVecPositional  (in antfly-grep) + 232  [0x101000eac]  Reader.zig:246
+    +     ! :       1 Io.Threaded.fileReadPositional  (in antfly-grep) + 224  [0x101026518]  Threaded.zig:10206
+    +     ! :         1 preadv  (in libsystem_kernel.dylib) + 8  [0x183a1bd84]
+    +     ! 1 root.Search.file  (in antfly-grep) + 8200  [0x10106fddc]  root.zig:624
+    +     !   1 Io.Threaded.fileClose  (in antfly-grep) + 44  [0x101027904]  Threaded.zig:9895
+    +     !     1 __close_nocancel  (in libsystem_kernel.dylib) + 8  [0x183a0e57c]
+    +     21 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 828  [0x10115ae00]  Thread.zig:753
+    +       20 root.Search.Queue.pop  (in antfly-grep) + 284  [0x1010bd5f0]  root.zig:352
+    +       : 20 root.Search.Queue.pop  (in antfly-grep) + 284  [0x1010bd5f0]  root.zig:352
+    +       :   20 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    +       1 root.Search.Queue.pop  (in antfly-grep) + 616  [0x1010bd73c]  root.zig:350
+    +         1 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    188 Thread_29135424
+    + 188 thread_start  (in libsystem_pthread.dylib) + 8  [0x183a4ccec]
+    +   188 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x183a51d00]
+    +     177 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 1120  [0x10115af24]  Thread.zig:753
+    +     ! 139 root.Search.file  (in antfly-grep) + 8008  [0x10106fd1c]  root.zig:624
+    +     ! : 139 root.Search.streamInput  (in antfly-grep) + 152  [0x10106a980]  root.zig:1023
+    +     ! :   121 root.Search.stream  (in antfly-grep) + 2400,2408  [0x10105e414,0x10105e41c]  root.zig:1115
+    +     ! :   12 root.Search.stream  (in antfly-grep) + 8812  [0x10105fd20]  root.zig:1149
+    +     ! :   | 12 matcher.Matcher.matches  (in antfly-grep) + 1524,1536,...  [0x101049170,0x10104917c,...]  matcher.zig:306
+    +     ! :   4 root.Search.stream  (in antfly-grep) + 1968  [0x10105e264]  root.zig:1099
+    +     ! :   | 3 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 800  [0x100fffe50]  Reader.zig:1039
+    +     ! :   | 1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 192  [0x100fffbf0]  Reader.zig:1037
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 11472  [0x101060784]  root.zig:1066
+    +     ! :   | 1 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+    +     ! :   |   1 Io.Reader.defaultReadVec  (in antfly-grep) + 84  [0x101000018]  Reader.zig:470
+    +     ! :   |     1 root.Search.BinaryReader.stream  (in antfly-grep) + 1160  [0x1010bcb2c]  root.zig:988
+    +     ! :   |       1 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+    +     ! :   |         1 Io.File.Reader.readVec  (in antfly-grep) + 104  [0x101000864]  Reader.zig:234
+    +     ! :   |           1 Io.File.Reader.readVecPositional  (in antfly-grep) + 232  [0x101000eac]  Reader.zig:246
+    +     ! :   |             1 Io.Threaded.fileReadPositional  (in antfly-grep) + 224  [0x101026518]  Threaded.zig:10206
+    +     ! :   |               1 preadv  (in libsystem_kernel.dylib) + 8  [0x183a1bd84]
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 8792  [0x10105fd0c]  root.zig:1149
+    +     ! 33 root.Search.file  (in antfly-grep) + 7756  [0x10106fc20]  root.zig:624
+    +     ! : 33 Io.Threaded.dirOpenFilePosix  (in antfly-grep) + 432  [0x10102a608]  Threaded.zig:4968
+    +     ! :   33 openat  (in libsystem_kernel.dylib) + 76  [0x183a29850]
+    +     ! :     33 __openat  (in libsystem_kernel.dylib) + 8  [0x183a0e5a8]
+    +     ! 4 root.Search.file  (in antfly-grep) + 2344  [0x10106e6fc]  root.zig:613
+    +     ! : 4 Io.Threaded.now  (in antfly-grep) + 48  [0x10101f658]  Threaded.zig:11775
+    +     ! :   4 clock_gettime  (in libsystem_c.dylib) + 256  [0x1838e81c4]
+    +     ! :     4 gettimeofday  (in libsystem_c.dylib) + 56  [0x1838dfefc]
+    +     ! :       4 __commpage_gettimeofday_internal  (in libsystem_kernel.dylib) + 44  [0x183a0ec20]
+    +     ! :         4 mach_absolute_time  (in libsystem_kernel.dylib) + 108  [0x183a0d0f8]
+    +     ! 1 root.Search.file  (in antfly-grep) + 7808  [0x10106fc54]  root.zig:624
+    +     !   1 Io.Threaded.fileStatPosix  (in antfly-grep) + 136  [0x1010279e8]  Threaded.zig:3988
+    +     !     1 fstat  (in libsystem_kernel.dylib) + 8  [0x183a1b43c]
+    +     11 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 828  [0x10115ae00]  Thread.zig:753
+    +       11 root.Search.Queue.pop  (in antfly-grep) + 284  [0x1010bd5f0]  root.zig:352
+    +         11 root.Search.Queue.pop  (in antfly-grep) + 284  [0x1010bd5f0]  root.zig:352
+    +           11 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    188 Thread_29135425
+    + 188 thread_start  (in libsystem_pthread.dylib) + 8  [0x183a4ccec]
+    +   188 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x183a51d00]
+    +     177 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 1120  [0x10115af24]  Thread.zig:753
+    +     ! 136 root.Search.file  (in antfly-grep) + 8008  [0x10106fd1c]  root.zig:624
+    +     ! : 136 root.Search.streamInput  (in antfly-grep) + 152  [0x10106a980]  root.zig:1023
+    +     ! :   109 root.Search.stream  (in antfly-grep) + 2400,2408  [0x10105e414,0x10105e41c]  root.zig:1115
+    +     ! :   17 root.Search.stream  (in antfly-grep) + 8812  [0x10105fd20]  root.zig:1149
+    +     ! :   | 15 matcher.Matcher.matches  (in antfly-grep) + 1516,1536,...  [0x101049168,0x10104917c,...]  matcher.zig:306
+    +     ! :   | 2 matcher.Matcher.matches  (in antfly-grep) + 308  [0x101048cb0]  matcher.zig:0
+    +     ! :   7 root.Search.stream  (in antfly-grep) + 1968  [0x10105e264]  root.zig:1099
+    +     ! :   | 5 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 168,160,...  [0x100fffbd8,0x100fffbd0,...]  Reader.zig:1037
+    +     ! :   | 1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 820  [0x100fffe64]  Reader.zig:0
+    +     ! :   | 1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 96  [0x100fffb90]  Reader.zig:1033
+    +     ! :   1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 836  [0x100fffe74]  Reader.zig:0
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 2348  [0x10105e3e0]  root.zig:0
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 828  [0x10105ddf0]  root.zig:1062
+    +     ! 29 root.Search.file  (in antfly-grep) + 7756  [0x10106fc20]  root.zig:624
+    +     ! : 29 Io.Threaded.dirOpenFilePosix  (in antfly-grep) + 432  [0x10102a608]  Threaded.zig:4968
+    +     ! :   29 openat  (in libsystem_kernel.dylib) + 76  [0x183a29850]
+    +     ! :     29 __openat  (in libsystem_kernel.dylib) + 8  [0x183a0e5a8]
+    +     ! 8 root.Search.file  (in antfly-grep) + 8200  [0x10106fddc]  root.zig:624
+    +     ! : 8 Io.Threaded.fileClose  (in antfly-grep) + 44  [0x101027904]  Threaded.zig:9895
+    +     ! :   8 __close_nocancel  (in libsystem_kernel.dylib) + 8  [0x183a0e57c]
+    +     ! 2 root.Search.file  (in antfly-grep) + 7868  [0x10106fc90]  root.zig:624
+    +     ! : 2 _xzm_malloc_large_huge  (in libsystem_malloc.dylib) + 968  [0x18386c4ac]
+    +     ! :   1 xzm_segment_group_alloc_chunk  (in libsystem_malloc.dylib) + 536  [0x18384c910]
+    +     ! :   | 1 _os_unfair_lock_lock_slow  (in libsystem_platform.dylib) + 172  [0x183a59aa0]
+    +     ! :   |   1 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    +     ! :   1 xzm_segment_group_alloc_chunk  (in libsystem_malloc.dylib) + 600  [0x18384c950]
+    +     ! :     1 _os_unfair_lock_unlock_slow  (in libsystem_platform.dylib) + 56  [0x183a59b9c]
+    +     ! :       1 __ulock_wake  (in libsystem_kernel.dylib) + 8  [0x183a0ebc8]
+    +     ! 2 root.Search.file  (in antfly-grep) + 8044  [0x10106fd40]  root.zig:624
+    +     !   1 _os_unfair_lock_unlock_slow  (in libsystem_platform.dylib) + 56  [0x183a59b9c]
+    +     !   | 1 __ulock_wake  (in libsystem_kernel.dylib) + 8  [0x183a0ebc8]
+    +     !   1 xzm_segment_group_free_chunk  (in libsystem_malloc.dylib) + 624  [0x18384d6c8]
+    +     !     1 _xzm_segment_group_segment_span_free_coalesce  (in libsystem_malloc.dylib) + 248  [0x18384dccc]
+    +     !       1 _xzm_segment_group_span_mark_used  (in libsystem_malloc.dylib) + 124  [0x18384f718]
+    +     !         1 _xzm_reclaim_mark_used  (in libsystem_malloc.dylib) + 124  [0x18384c318]
+    +     !           1 _xzm_reclaim_mark_used_locked  (in libsystem_malloc.dylib) + 60  [0x18384ee24]
+    +     !             1 mach_vm_reclaim_try_cancel  (in libsystem_kernel.dylib) + 260  [0x183a206b8]
+    +     !               1 mach_absolute_time  (in libsystem_kernel.dylib) + 108  [0x183a0d0f8]
+    +     10 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 828  [0x10115ae00]  Thread.zig:753
+    +     ! 9 root.Search.Queue.pop  (in antfly-grep) + 284  [0x1010bd5f0]  root.zig:352
+    +     ! : 9 root.Search.Queue.pop  (in antfly-grep) + 284  [0x1010bd5f0]  root.zig:352
+    +     ! :   9 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    +     ! 1 root.Search.Queue.pop  (in antfly-grep) + 616  [0x1010bd73c]  root.zig:350
+    +     !   1 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    +     1 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 1292  [0x10115afd0]  Thread.zig:753
+    +       1 Io.Writer.defaultFlush  (in antfly-grep) + 72  [0x10100067c]  Writer.zig:394
+    +         1 root.Search.Parallel.StreamingSink.drain  (in antfly-grep) + 68  [0x10115b884]  root.zig:446
+    +           1 root.Search.Parallel.StreamingSink.send  (in antfly-grep) + 452  [0x10115bae4]  root.zig:431
+    +             1 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    188 Thread_29135427
+    + 188 thread_start  (in libsystem_pthread.dylib) + 8  [0x183a4ccec]
+    +   188 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x183a51d00]
+    +     180 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 1120  [0x10115af24]  Thread.zig:753
+    +     ! 147 root.Search.file  (in antfly-grep) + 8008  [0x10106fd1c]  root.zig:624
+    +     ! : 147 root.Search.streamInput  (in antfly-grep) + 152  [0x10106a980]  root.zig:1023
+    +     ! :   111 root.Search.stream  (in antfly-grep) + 2400,2408  [0x10105e414,0x10105e41c]  root.zig:1115
+    +     ! :   16 root.Search.stream  (in antfly-grep) + 8812  [0x10105fd20]  root.zig:1149
+    +     ! :   | 15 matcher.Matcher.matches  (in antfly-grep) + 1508,1516,...  [0x101049160,0x101049168,...]  matcher.zig:306
+    +     ! :   | 1 matcher.Matcher.matches  (in antfly-grep) + 308  [0x101048cb0]  matcher.zig:0
+    +     ! :   8 root.Search.stream  (in antfly-grep) + 11472  [0x101060784]  root.zig:1066
+    +     ! :   | 8 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+    +     ! :   |   8 Io.Reader.defaultReadVec  (in antfly-grep) + 84  [0x101000018]  Reader.zig:470
+    +     ! :   |     7 root.Search.BinaryReader.stream  (in antfly-grep) + 1160  [0x1010bcb2c]  root.zig:988
+    +     ! :   |     + 7 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+    +     ! :   |     +   7 Io.File.Reader.readVec  (in antfly-grep) + 104  [0x101000864]  Reader.zig:234
+    +     ! :   |     +     7 Io.File.Reader.readVecPositional  (in antfly-grep) + 232  [0x101000eac]  Reader.zig:246
+    +     ! :   |     +       7 Io.Threaded.fileReadPositional  (in antfly-grep) + 224  [0x101026518]  Threaded.zig:10206
+    +     ! :   |     +         7 preadv  (in libsystem_kernel.dylib) + 8  [0x183a1bd84]
+    +     ! :   |     1 root.Search.BinaryReader.stream  (in antfly-grep) + 1040  [0x1010bcab4]  root.zig:1010
+    +     ! :   |       1 ???  (in antfly-grep)  load address 0x100fd0000 + 0x26efa8  [0x10123efa8]
+    +     ! :   7 root.Search.stream  (in antfly-grep) + 1968  [0x10105e264]  root.zig:1099
+    +     ! :   | 3 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 580,56  [0x100fffd74,0x100fffb68]  Reader.zig:0
+    +     ! :   | 1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 24  [0x100fffb48]  Reader.zig:1030
+    +     ! :   | 1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 504  [0x100fffd28]  Reader.zig:1033
+    +     ! :   | + 1 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+    +     ! :   | +   1 Io.Reader.defaultReadVec  (in antfly-grep) + 84  [0x101000018]  Reader.zig:470
+    +     ! :   | +     1 root.Search.BinaryReader.stream  (in antfly-grep) + 176  [0x1010bc754]  root.zig:993
+    +     ! :   | 1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 96  [0x100fffb90]  Reader.zig:1033
+    +     ! :   | 1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 704  [0x100fffdf0]  Reader.zig:1038
+    +     ! :   |   1 ???  (in antfly-grep)  load address 0x100fd0000 + 0x26ef84  [0x10123ef84]
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 10956  [0x101060580]  root.zig:0
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 840  [0x10105ddfc]  root.zig:1063
+    +     ! :   | 1 heap.ArenaAllocator.reset  (in antfly-grep) + 404  [0x101001304]  ArenaAllocator.zig:156
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 2120  [0x10105e2fc]  root.zig:1108
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 2500  [0x10105e478]  root.zig:1122
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 8768  [0x10105fcf4]  root.zig:1148
+    +     ! 27 root.Search.file  (in antfly-grep) + 7756  [0x10106fc20]  root.zig:624
+    +     ! : 27 Io.Threaded.dirOpenFilePosix  (in antfly-grep) + 432  [0x10102a608]  Threaded.zig:4968
+    +     ! :   26 openat  (in libsystem_kernel.dylib) + 76  [0x183a29850]
+    +     ! :   | 26 __openat  (in libsystem_kernel.dylib) + 8  [0x183a0e5a8]
+    +     ! :   1 openat  (in libsystem_kernel.dylib) + 76  [0x183a29850]
+    +     ! 3 root.Search.file  (in antfly-grep) + 7868  [0x10106fc90]  root.zig:624
+    +     ! : 3 _xzm_malloc_large_huge  (in libsystem_malloc.dylib) + 968  [0x18386c4ac]
+    +     ! :   3 xzm_segment_group_alloc_chunk  (in libsystem_malloc.dylib) + 536  [0x18384c910]
+    +     ! :     3 _os_unfair_lock_lock_slow  (in libsystem_platform.dylib) + 172  [0x183a59aa0]
+    +     ! :       3 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    +     ! 1 root.Search.file  (in antfly-grep) + 2344  [0x10106e6fc]  root.zig:613
+    +     ! : 1 Io.Threaded.now  (in antfly-grep) + 116  [0x10101f69c]  Threaded.zig:11772
+    +     ! 1 root.Search.file  (in antfly-grep) + 7988  [0x10106fd08]  root.zig:624
+    +     ! : 1 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+    +     ! :   1 Io.File.Reader.readVec  (in antfly-grep) + 104  [0x101000864]  Reader.zig:234
+    +     ! :     1 Io.File.Reader.readVecPositional  (in antfly-grep) + 232  [0x101000eac]  Reader.zig:246
+    +     ! :       1 Io.Threaded.fileReadPositional  (in antfly-grep) + 224  [0x101026518]  Threaded.zig:10206
+    +     ! :         1 preadv  (in libsystem_kernel.dylib) + 8  [0x183a1bd84]
+    +     ! 1 root.Search.file  (in antfly-grep) + 8200  [0x10106fddc]  root.zig:624
+    +     !   1 Io.Threaded.fileClose  (in antfly-grep) + 44  [0x101027904]  Threaded.zig:9895
+    +     !     1 __close_nocancel  (in libsystem_kernel.dylib) + 8  [0x183a0e57c]
+    +     8 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 828  [0x10115ae00]  Thread.zig:753
+    +       8 root.Search.Queue.pop  (in antfly-grep) + 284  [0x1010bd5f0]  root.zig:352
+    +         8 root.Search.Queue.pop  (in antfly-grep) + 284  [0x1010bd5f0]  root.zig:352
+    +           8 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    188 Thread_29135428
+    + 188 thread_start  (in libsystem_pthread.dylib) + 8  [0x183a4ccec]
+    +   188 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x183a51d00]
+    +     184 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 1120  [0x10115af24]  Thread.zig:753
+    +     ! 176 root.Search.file  (in antfly-grep) + 8008  [0x10106fd1c]  root.zig:624
+    +     ! : 176 root.Search.streamInput  (in antfly-grep) + 152  [0x10106a980]  root.zig:1023
+    +     ! :   121 root.Search.stream  (in antfly-grep) + 2400,2408,...  [0x10105e414,0x10105e41c,...]  root.zig:1115
+    +     ! :   38 root.Search.stream  (in antfly-grep) + 8812  [0x10105fd20]  root.zig:1149
+    +     ! :   | 29 matcher.Matcher.matches  (in antfly-grep) + 1516,1508,...  [0x101049168,0x101049160,...]  matcher.zig:306
+    +     ! :   | 9 matcher.Matcher.matches  (in antfly-grep) + 268,208  [0x101048c88,0x101048c4c]  matcher.zig:0
+    +     ! :   6 root.Search.stream  (in antfly-grep) + 1968  [0x10105e264]  root.zig:1099
+    +     ! :   | 2 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 580  [0x100fffd74]  Reader.zig:0
+    +     ! :   | 2 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 280,640  [0x100fffc48,0x100fffdb0]  Reader.zig:1037
+    +     ! :   | 1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 768  [0x100fffe30]  Reader.zig:1038
+    +     ! :   | + 1 Io.Writer.Allocating.drain  (in antfly-grep) + 340  [0x10123e10c]  Writer.zig:2845
+    +     ! :   | +   1 _realloc  (in libsystem_malloc.dylib) + 456  [0x183879358]
+    +     ! :   | +     1 _malloc_zone_realloc  (in libsystem_malloc.dylib) + 60  [0x183878ad4]
+    +     ! :   | 1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 712  [0x100fffdf8]  Reader.zig:1038
+    +     ! :   2 root.Search.stream  (in antfly-grep) + 11472  [0x101060784]  root.zig:1066
+    +     ! :   | 2 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+    +     ! :   |   2 Io.Reader.defaultReadVec  (in antfly-grep) + 84  [0x101000018]  Reader.zig:470
+    +     ! :   |     2 root.Search.BinaryReader.stream  (in antfly-grep) + 1160  [0x1010bcb2c]  root.zig:988
+    +     ! :   |       2 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+    +     ! :   |         2 Io.File.Reader.readVec  (in antfly-grep) + 104  [0x101000864]  Reader.zig:234
+    +     ! :   |           1 Io.File.Reader.readVecPositional  (in antfly-grep) + 232  [0x101000eac]  Reader.zig:246
+    +     ! :   |           + 1 Io.Threaded.fileReadPositional  (in antfly-grep) + 224  [0x101026518]  Threaded.zig:10206
+    +     ! :   |           +   1 preadv  (in libsystem_kernel.dylib) + 8  [0x183a1bd84]
+    +     ! :   |           1 Io.File.Reader.readVecPositional  (in antfly-grep) + 204  [0x101000e90]  Reader.zig:246
+    +     ! :   2 root.Search.stream  (in antfly-grep) + 1888,1968  [0x10105e214,0x10105e264]  root.zig:1099
+    +     ! :   2 root.Search.stream  (in antfly-grep) + 10996  [0x1010605a8]  root.zig:1260
+    +     ! :   1 heap.ArenaAllocator.reset  (in antfly-grep) + 680  [0x101001418]  ArenaAllocator.zig:0
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 10956  [0x101060580]  root.zig:0
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 816  [0x10105dde4]  root.zig:1061
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 2500  [0x10105e478]  root.zig:1122
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 8812  [0x10105fd20]  root.zig:1149
+    +     ! 6 root.Search.file  (in antfly-grep) + 7756  [0x10106fc20]  root.zig:624
+    +     ! : 6 Io.Threaded.dirOpenFilePosix  (in antfly-grep) + 432  [0x10102a608]  Threaded.zig:4968
+    +     ! :   5 openat  (in libsystem_kernel.dylib) + 76  [0x183a29850]
+    +     ! :   | 5 __openat  (in libsystem_kernel.dylib) + 8  [0x183a0e5a8]
+    +     ! :   1 DYLD-STUB$$openat  (in antfly-grep) + 0  [0x1012416fc]
+    +     ! 1 root.Search.file  (in antfly-grep) + 7808  [0x10106fc54]  root.zig:624
+    +     ! : 1 Io.Threaded.fileStatPosix  (in antfly-grep) + 136  [0x1010279e8]  Threaded.zig:3988
+    +     ! :   1 fstat  (in libsystem_kernel.dylib) + 8  [0x183a1b43c]
+    +     ! 1 root.Search.file  (in antfly-grep) + 8200  [0x10106fddc]  root.zig:624
+    +     !   1 Io.Threaded.fileClose  (in antfly-grep) + 44  [0x101027904]  Threaded.zig:9895
+    +     !     1 __close_nocancel  (in libsystem_kernel.dylib) + 8  [0x183a0e57c]
+    +     3 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 828  [0x10115ae00]  Thread.zig:753
+    +     ! 3 root.Search.Queue.pop  (in antfly-grep) + 284  [0x1010bd5f0]  root.zig:352
+    +     !   3 root.Search.Queue.pop  (in antfly-grep) + 284  [0x1010bd5f0]  root.zig:352
+    +     !     3 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    +     1 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 1292  [0x10115afd0]  Thread.zig:753
+    +       1 Io.Writer.defaultFlush  (in antfly-grep) + 72  [0x10100067c]  Writer.zig:394
+    +         1 root.Search.Parallel.StreamingSink.drain  (in antfly-grep) + 68  [0x10115b884]  root.zig:446
+    +           1 root.Search.Parallel.StreamingSink.send  (in antfly-grep) + 452  [0x10115bae4]  root.zig:431
+    +             1 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    188 Thread_29135429
+    + 188 thread_start  (in libsystem_pthread.dylib) + 8  [0x183a4ccec]
+    +   188 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x183a51d00]
+    +     168 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 1120  [0x10115af24]  Thread.zig:753
+    +     ! 138 root.Search.file  (in antfly-grep) + 8008  [0x10106fd1c]  root.zig:624
+    +     ! : 138 root.Search.streamInput  (in antfly-grep) + 152  [0x10106a980]  root.zig:1023
+    +     ! :   89 root.Search.stream  (in antfly-grep) + 2400,2408  [0x10105e414,0x10105e41c]  root.zig:1115
+    +     ! :   31 root.Search.stream  (in antfly-grep) + 8812  [0x10105fd20]  root.zig:1149
+    +     ! :   | 29 matcher.Matcher.matches  (in antfly-grep) + 1516,1524,...  [0x101049168,0x101049170,...]  matcher.zig:306
+    +     ! :   | 1 matcher.Matcher.matches  (in antfly-grep) + 268  [0x101048c88]  matcher.zig:0
+    +     ! :   | 1 matcher.Matcher.matches  (in antfly-grep) + 168  [0x101048c24]  matcher.zig:293
+    +     ! :   7 root.Search.stream  (in antfly-grep) + 1968  [0x10105e264]  root.zig:1099
+    +     ! :   | 2 ???  (in antfly-grep)  load address 0x100fd0000 + 0x26ef30  [0x10123ef30]
+    +     ! :   | 2 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 768  [0x100fffe30]  Reader.zig:1038
+    +     ! :   | + 2 Io.Writer.Allocating.drain  (in antfly-grep) + 340  [0x10123e10c]  Writer.zig:2845
+    +     ! :   | +   2 _realloc  (in libsystem_malloc.dylib) + 456  [0x183879358]
+    +     ! :   | +     2 _malloc_zone_realloc  (in libsystem_malloc.dylib) + 60  [0x183878ad4]
+    +     ! :   | 1 ???  (in antfly-grep)  load address 0x100fd0000 + 0x26ee90  [0x10123ee90]
+    +     ! :   | 1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 0  [0x100fffb30]  Reader.zig:1030
+    +     ! :   | 1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 504  [0x100fffd28]  Reader.zig:1033
+    +     ! :   |   1 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+    +     ! :   |     1 Io.Reader.defaultReadVec  (in antfly-grep) + 84  [0x101000018]  Reader.zig:470
+    +     ! :   |       1 root.Search.BinaryReader.stream  (in antfly-grep) + 1040  [0x1010bcab4]  root.zig:1010
+    +     ! :   |         1 ???  (in antfly-grep)  load address 0x100fd0000 + 0x26efac  [0x10123efac]
+    +     ! :   5 root.Search.stream  (in antfly-grep) + 2432,2492  [0x10105e434,0x10105e470]  root.zig:1121
+    +     ! :   3 root.Search.stream  (in antfly-grep) + 11472  [0x101060784]  root.zig:1066
+    +     ! :   | 3 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+    +     ! :   |   3 Io.Reader.defaultReadVec  (in antfly-grep) + 84  [0x101000018]  Reader.zig:470
+    +     ! :   |     3 root.Search.BinaryReader.stream  (in antfly-grep) + 1160  [0x1010bcb2c]  root.zig:988
+    +     ! :   |       3 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+    +     ! :   |         3 Io.File.Reader.readVec  (in antfly-grep) + 104  [0x101000864]  Reader.zig:234
+    +     ! :   |           3 Io.File.Reader.readVecPositional  (in antfly-grep) + 232  [0x101000eac]  Reader.zig:246
+    +     ! :   |             3 Io.Threaded.fileReadPositional  (in antfly-grep) + 224  [0x101026518]  Threaded.zig:10206
+    +     ! :   |               3 preadv  (in libsystem_kernel.dylib) + 8  [0x183a1bd84]
+    +     ! :   1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 840  [0x100fffe78]  Reader.zig:0
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 816  [0x10105dde4]  root.zig:1061
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 5664  [0x10105f0d4]  root.zig:1142
+    +     ! 13 root.Search.file  (in antfly-grep) + 7756  [0x10106fc20]  root.zig:624
+    +     ! : 13 Io.Threaded.dirOpenFilePosix  (in antfly-grep) + 432  [0x10102a608]  Threaded.zig:4968
+    +     ! :   13 openat  (in libsystem_kernel.dylib) + 76  [0x183a29850]
+    +     ! :     13 __openat  (in libsystem_kernel.dylib) + 8  [0x183a0e5a8]
+    +     ! 10 root.Search.file  (in antfly-grep) + 7868  [0x10106fc90]  root.zig:624
+    +     ! : 10 _xzm_malloc_large_huge  (in libsystem_malloc.dylib) + 968  [0x18386c4ac]
+    +     ! :   10 xzm_segment_group_alloc_chunk  (in libsystem_malloc.dylib) + 600  [0x18384c950]
+    +     ! :     10 _os_unfair_lock_unlock_slow  (in libsystem_platform.dylib) + 56  [0x183a59b9c]
+    +     ! :       10 __ulock_wake  (in libsystem_kernel.dylib) + 8  [0x183a0ebc8]
+    +     ! 3 root.Search.file  (in antfly-grep) + 8044  [0x10106fd40]  root.zig:624
+    +     ! : 3 _os_unfair_lock_unlock_slow  (in libsystem_platform.dylib) + 56  [0x183a59b9c]
+    +     ! :   3 __ulock_wake  (in libsystem_kernel.dylib) + 8  [0x183a0ebc8]
+    +     ! 2 root.Search.file  (in antfly-grep) + 7808  [0x10106fc54]  root.zig:624
+    +     ! : 2 Io.Threaded.fileStatPosix  (in antfly-grep) + 136  [0x1010279e8]  Threaded.zig:3988
+    +     ! :   2 fstat  (in libsystem_kernel.dylib) + 8  [0x183a1b43c]
+    +     ! 2 root.Search.file  (in antfly-grep) + 7988  [0x10106fd08]  root.zig:624
+    +     !   2 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+    +     !     2 Io.File.Reader.readVec  (in antfly-grep) + 104  [0x101000864]  Reader.zig:234
+    +     !       2 Io.File.Reader.readVecPositional  (in antfly-grep) + 232  [0x101000eac]  Reader.zig:246
+    +     !         2 Io.Threaded.fileReadPositional  (in antfly-grep) + 224  [0x101026518]  Threaded.zig:10206
+    +     !           2 preadv  (in libsystem_kernel.dylib) + 8  [0x183a1bd84]
+    +     18 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 828  [0x10115ae00]  Thread.zig:753
+    +     ! 18 root.Search.Queue.pop  (in antfly-grep) + 284  [0x1010bd5f0]  root.zig:352
+    +     !   18 root.Search.Queue.pop  (in antfly-grep) + 284  [0x1010bd5f0]  root.zig:352
+    +     !     18 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    +     1 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 1408  [0x10115b044]  Thread.zig:753
+    +     ! 1 Io.Threaded.operate  (in antfly-grep) + 180  [0x10102d940]  Threaded.zig:2550
+    +     !   1 Io.Threaded.fileWriteStreaming  (in antfly-grep) + 904  [0x101027758]  Threaded.zig:11056
+    +     !     1 writev  (in libsystem_kernel.dylib) + 8  [0x183a10b90]
+    +     1 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 1072  [0x10115aef4]  Thread.zig:753
+    188 Thread_29135430
+    + 188 thread_start  (in libsystem_pthread.dylib) + 8  [0x183a4ccec]
+    +   188 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x183a51d00]
+    +     174 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 1120  [0x10115af24]  Thread.zig:753
+    +     ! 131 root.Search.file  (in antfly-grep) + 8008  [0x10106fd1c]  root.zig:624
+    +     ! : 131 root.Search.streamInput  (in antfly-grep) + 152  [0x10106a980]  root.zig:1023
+    +     ! :   58 root.Search.stream  (in antfly-grep) + 8812  [0x10105fd20]  root.zig:1149
+    +     ! :   | 56 matcher.Matcher.matches  (in antfly-grep) + 1552,1516,...  [0x10104918c,0x101049168,...]  matcher.zig:306
+    +     ! :   | 1 matcher.Matcher.matches  (in antfly-grep) + 168  [0x101048c24]  matcher.zig:293
+    +     ! :   | 1 matcher.Matcher.matches  (in antfly-grep) + 1580  [0x1010491a8]  matcher.zig:306
+    +     ! :   |   1 dfa.Dfa.transition  (in antfly-grep) + 244  [0x1010dedc4]  dfa.zig:0
+    +     ! :   53 root.Search.stream  (in antfly-grep) + 2400,2408  [0x10105e414,0x10105e41c]  root.zig:1115
+    +     ! :   7 root.Search.stream  (in antfly-grep) + 1968  [0x10105e264]  root.zig:1099
+    +     ! :   | 3 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 620  [0x100fffd9c]  Reader.zig:1037
+    +     ! :   | 1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 580  [0x100fffd74]  Reader.zig:0
+    +     ! :   | 1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 0  [0x100fffb30]  Reader.zig:1030
+    +     ! :   | 1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 96  [0x100fffb90]  Reader.zig:1033
+    +     ! :   | 1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 664  [0x100fffdc8]  Reader.zig:1038
+    +     ! :   5 root.Search.stream  (in antfly-grep) + 10400  [0x101060354]  array_list.zig:0
+    +     ! :   3 root.Search.stream  (in antfly-grep) + 2432  [0x10105e434]  root.zig:1121
+    +     ! :   2 root.Search.stream  (in antfly-grep) + 8960  [0x10105fdb4]  root.zig:1231
+    +     ! :   1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 840  [0x100fffe78]  Reader.zig:0
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 2348  [0x10105e3e0]  root.zig:0
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 11472  [0x101060784]  root.zig:1066
+    +     ! :     1 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+    +     ! :       1 Io.Reader.defaultReadVec  (in antfly-grep) + 84  [0x101000018]  Reader.zig:470
+    +     ! :         1 root.Search.BinaryReader.stream  (in antfly-grep) + 1160  [0x1010bcb2c]  root.zig:988
+    +     ! :           1 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+    +     ! :             1 Io.File.Reader.readVec  (in antfly-grep) + 104  [0x101000864]  Reader.zig:234
+    +     ! :               1 Io.File.Reader.readVecPositional  (in antfly-grep) + 232  [0x101000eac]  Reader.zig:246
+    +     ! :                 1 Io.Threaded.fileReadPositional  (in antfly-grep) + 224  [0x101026518]  Threaded.zig:10206
+    +     ! :                   1 preadv  (in libsystem_kernel.dylib) + 8  [0x183a1bd84]
+    +     ! 38 root.Search.file  (in antfly-grep) + 7756  [0x10106fc20]  root.zig:624
+    +     ! : 38 Io.Threaded.dirOpenFilePosix  (in antfly-grep) + 432  [0x10102a608]  Threaded.zig:4968
+    +     ! :   38 openat  (in libsystem_kernel.dylib) + 76  [0x183a29850]
+    +     ! :     38 __openat  (in libsystem_kernel.dylib) + 8  [0x183a0e5a8]
+    +     ! 2 root.Search.file  (in antfly-grep) + 7808  [0x10106fc54]  root.zig:624
+    +     ! : 2 Io.Threaded.fileStatPosix  (in antfly-grep) + 136  [0x1010279e8]  Threaded.zig:3988
+    +     ! :   2 fstat  (in libsystem_kernel.dylib) + 8  [0x183a1b43c]
+    +     ! 1 root.Search.file  (in antfly-grep) + 7868  [0x10106fc90]  root.zig:624
+    +     ! : 1 _xzm_malloc_large_huge  (in libsystem_malloc.dylib) + 968  [0x18386c4ac]
+    +     ! :   1 xzm_segment_group_alloc_chunk  (in libsystem_malloc.dylib) + 536  [0x18384c910]
+    +     ! :     1 _os_unfair_lock_lock_slow  (in libsystem_platform.dylib) + 172  [0x183a59aa0]
+    +     ! :       1 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    +     ! 1 root.Search.file  (in antfly-grep) + 8044  [0x10106fd40]  root.zig:624
+    +     ! : 1 xzm_segment_group_free_chunk  (in libsystem_malloc.dylib) + 604  [0x18384d6b4]
+    +     ! :   1 _os_unfair_lock_lock_slow  (in libsystem_platform.dylib) + 172  [0x183a59aa0]
+    +     ! :     1 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    +     ! 1 root.Search.file  (in antfly-grep) + 8200  [0x10106fddc]  root.zig:624
+    +     !   1 Io.Threaded.fileClose  (in antfly-grep) + 44  [0x101027904]  Threaded.zig:9895
+    +     !     1 __close_nocancel  (in libsystem_kernel.dylib) + 8  [0x183a0e57c]
+    +     13 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 828  [0x10115ae00]  Thread.zig:753
+    +     ! 12 root.Search.Queue.pop  (in antfly-grep) + 284  [0x1010bd5f0]  root.zig:352
+    +     ! : 12 root.Search.Queue.pop  (in antfly-grep) + 284  [0x1010bd5f0]  root.zig:352
+    +     ! :   12 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    +     ! 1 root.Search.Queue.pop  (in antfly-grep) + 680  [0x1010bd77c]  root.zig:357
+    +     !   1 Io.Threaded.futexWake  (in antfly-grep) + 60  [0x10102e300]  Threaded.zig:2537
+    +     !     1 __ulock_wake  (in libsystem_kernel.dylib) + 8  [0x183a0ebc8]
+    +     1 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 1292  [0x10115afd0]  Thread.zig:753
+    +       1 Io.Writer.defaultFlush  (in antfly-grep) + 0  [0x101000634]  Writer.zig:392
+    188 Thread_29135431
+    + 188 thread_start  (in libsystem_pthread.dylib) + 8  [0x183a4ccec]
+    +   188 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x183a51d00]
+    +     176 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 1120  [0x10115af24]  Thread.zig:753
+    +     ! 156 root.Search.file  (in antfly-grep) + 8008  [0x10106fd1c]  root.zig:624
+    +     ! : 156 root.Search.streamInput  (in antfly-grep) + 152  [0x10106a980]  root.zig:1023
+    +     ! :   76 root.Search.stream  (in antfly-grep) + 2400,2408  [0x10105e414,0x10105e41c]  root.zig:1115
+    +     ! :   54 root.Search.stream  (in antfly-grep) + 8812  [0x10105fd20]  root.zig:1149
+    +     ! :   | 52 matcher.Matcher.matches  (in antfly-grep) + 1516,1552,...  [0x101049168,0x10104918c,...]  matcher.zig:306
+    +     ! :   | 1 matcher.Matcher.matches  (in antfly-grep) + 268  [0x101048c88]  matcher.zig:0
+    +     ! :   | 1 matcher.Matcher.matches  (in antfly-grep) + 60  [0x101048bb8]  matcher.zig:291
+    +     ! :   13 root.Search.stream  (in antfly-grep) + 1968  [0x10105e264]  root.zig:1099
+    +     ! :   | 9 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 192,620,...  [0x100fffbf0,0x100fffd9c,...]  Reader.zig:1037
+    +     ! :   | 2 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 56,580  [0x100fffb68,0x100fffd74]  Reader.zig:0
+    +     ! :   | 1 ???  (in antfly-grep)  load address 0x100fd0000 + 0x26ee90  [0x10123ee90]
+    +     ! :   | 1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 664  [0x100fffdc8]  Reader.zig:1038
+    +     ! :   4 root.Search.stream  (in antfly-grep) + 13112  [0x101060dec]  root.zig:1051
+    +     ! :   | 4 __xzm_xzone_free_to_freelist_chunk  (in libsystem_malloc.dylib) + 0  [0x183871684]
+    +     ! :   2 root.Search.stream  (in antfly-grep) + 8820  [0x10105fd28]  root.zig:0
+    +     ! :   2 root.Search.stream  (in antfly-grep) + 8960  [0x10105fdb4]  root.zig:1231
+    +     ! :   1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 848  [0x100fffe80]  Reader.zig:0
+    +     ! :   1 heap.ArenaAllocator.reset  (in antfly-grep) + 680  [0x101001418]  ArenaAllocator.zig:0
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 10972  [0x101060590]  root.zig:1061
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 11472  [0x101060784]  root.zig:1066
+    +     ! :   | 1 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+    +     ! :   |   1 Io.Reader.defaultReadVec  (in antfly-grep) + 84  [0x101000018]  Reader.zig:470
+    +     ! :   |     1 root.Search.BinaryReader.stream  (in antfly-grep) + 1160  [0x1010bcb2c]  root.zig:988
+    +     ! :   |       1 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+    +     ! :   |         1 Io.File.Reader.readVec  (in antfly-grep) + 104  [0x101000864]  Reader.zig:234
+    +     ! :   |           1 Io.File.Reader.readVecPositional  (in antfly-grep) + 232  [0x101000eac]  Reader.zig:246
+    +     ! :   |             1 Io.Threaded.fileReadPositional  (in antfly-grep) + 224  [0x101026518]  Threaded.zig:10206
+    +     ! :   |               1 preadv  (in libsystem_kernel.dylib) + 8  [0x183a1bd84]
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 10932  [0x101060568]  root.zig:1280
+    +     ! 10 root.Search.file  (in antfly-grep) + 7868  [0x10106fc90]  root.zig:624
+    +     ! : 10 _xzm_malloc_large_huge  (in libsystem_malloc.dylib) + 968  [0x18386c4ac]
+    +     ! :   10 xzm_segment_group_alloc_chunk  (in libsystem_malloc.dylib) + 536  [0x18384c910]
+    +     ! :     10 _os_unfair_lock_lock_slow  (in libsystem_platform.dylib) + 172  [0x183a59aa0]
+    +     ! :       10 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    +     ! 7 root.Search.file  (in antfly-grep) + 7756  [0x10106fc20]  root.zig:624
+    +     ! : 7 Io.Threaded.dirOpenFilePosix  (in antfly-grep) + 432  [0x10102a608]  Threaded.zig:4968
+    +     ! :   7 openat  (in libsystem_kernel.dylib) + 76  [0x183a29850]
+    +     ! :     7 __openat  (in libsystem_kernel.dylib) + 8  [0x183a0e5a8]
+    +     ! 2 root.Search.file  (in antfly-grep) + 8200  [0x10106fddc]  root.zig:624
+    +     ! : 2 Io.Threaded.fileClose  (in antfly-grep) + 44  [0x101027904]  Threaded.zig:9895
+    +     ! :   2 __close_nocancel  (in libsystem_kernel.dylib) + 8  [0x183a0e57c]
+    +     ! 1 root.Search.file  (in antfly-grep) + 7988  [0x10106fd08]  root.zig:624
+    +     !   1 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+    +     !     1 Io.File.Reader.readVec  (in antfly-grep) + 104  [0x101000864]  Reader.zig:234
+    +     !       1 Io.File.Reader.readVecPositional  (in antfly-grep) + 232  [0x101000eac]  Reader.zig:246
+    +     !         1 Io.Threaded.fileReadPositional  (in antfly-grep) + 224  [0x101026518]  Threaded.zig:10206
+    +     !           1 preadv  (in libsystem_kernel.dylib) + 8  [0x183a1bd84]
+    +     12 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 828  [0x10115ae00]  Thread.zig:753
+    +       10 root.Search.Queue.pop  (in antfly-grep) + 284  [0x1010bd5f0]  root.zig:352
+    +       : 10 root.Search.Queue.pop  (in antfly-grep) + 284  [0x1010bd5f0]  root.zig:352
+    +       :   10 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    +       1 root.Search.Queue.pop  (in antfly-grep) + 616  [0x1010bd73c]  root.zig:350
+    +       : 1 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    +       1 root.Search.Queue.pop  (in antfly-grep) + 584  [0x1010bd71c]  root.zig:351
+    +         1 Io.Threaded.futexWake  (in antfly-grep) + 60  [0x10102e300]  Threaded.zig:2537
+    +           1 __ulock_wake  (in libsystem_kernel.dylib) + 8  [0x183a0ebc8]
+    188 Thread_29135432
+    + 188 thread_start  (in libsystem_pthread.dylib) + 8  [0x183a4ccec]
+    +   188 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x183a51d00]
+    +     167 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 1120  [0x10115af24]  Thread.zig:753
+    +     ! 136 root.Search.file  (in antfly-grep) + 8008  [0x10106fd1c]  root.zig:624
+    +     ! : 136 root.Search.streamInput  (in antfly-grep) + 152  [0x10106a980]  root.zig:1023
+    +     ! :   87 root.Search.stream  (in antfly-grep) + 2400,2408  [0x10105e414,0x10105e41c]  root.zig:1115
+    +     ! :   44 root.Search.stream  (in antfly-grep) + 8812  [0x10105fd20]  root.zig:1149
+    +     ! :   | 38 matcher.Matcher.matches  (in antfly-grep) + 1552,1516,...  [0x10104918c,0x101049168,...]  matcher.zig:306
+    +     ! :   | 3 matcher.Matcher.matches  (in antfly-grep) + 268,2324  [0x101048c88,0x101049490]  matcher.zig:0
+    +     ! :   | 3 matcher.Matcher.matches  (in antfly-grep) + 20  [0x101048b90]  matcher.zig:290
+    +     ! :   1 matcher.Matcher.matches  (in antfly-grep) + 2348  [0x1010494a8]  matcher.zig:0
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 11472  [0x101060784]  root.zig:1066
+    +     ! :   | 1 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+    +     ! :   |   1 Io.Reader.defaultReadVec  (in antfly-grep) + 84  [0x101000018]  Reader.zig:470
+    +     ! :   |     1 root.Search.BinaryReader.stream  (in antfly-grep) + 1160  [0x1010bcb2c]  root.zig:988
+    +     ! :   |       1 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+    +     ! :   |         1 Io.File.Reader.readVec  (in antfly-grep) + 104  [0x101000864]  Reader.zig:234
+    +     ! :   |           1 Io.File.Reader.readVecPositional  (in antfly-grep) + 232  [0x101000eac]  Reader.zig:246
+    +     ! :   |             1 Io.Threaded.fileReadPositional  (in antfly-grep) + 224  [0x101026518]  Threaded.zig:10206
+    +     ! :   |               1 preadv  (in libsystem_kernel.dylib) + 4  [0x183a1bd80]
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 1968  [0x10105e264]  root.zig:1099
+    +     ! :   | 1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 656  [0x100fffdc0]  Reader.zig:1038
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 2248  [0x10105e37c]  root.zig:1113
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 8960  [0x10105fdb4]  root.zig:1231
+    +     ! 26 root.Search.file  (in antfly-grep) + 7756  [0x10106fc20]  root.zig:624
+    +     ! : 26 Io.Threaded.dirOpenFilePosix  (in antfly-grep) + 432  [0x10102a608]  Threaded.zig:4968
+    +     ! :   26 openat  (in libsystem_kernel.dylib) + 76  [0x183a29850]
+    +     ! :     26 __openat  (in libsystem_kernel.dylib) + 8  [0x183a0e5a8]
+    +     ! 2 root.Search.file  (in antfly-grep) + 7808  [0x10106fc54]  root.zig:624
+    +     ! : 2 Io.Threaded.fileStatPosix  (in antfly-grep) + 136  [0x1010279e8]  Threaded.zig:3988
+    +     ! :   2 fstat  (in libsystem_kernel.dylib) + 8  [0x183a1b43c]
+    +     ! 1 root.Search.file  (in antfly-grep) + 2344  [0x10106e6fc]  root.zig:613
+    +     ! : 1 Io.Threaded.now  (in antfly-grep) + 116  [0x10101f69c]  Threaded.zig:11772
+    +     ! 1 root.Search.file  (in antfly-grep) + 7988  [0x10106fd08]  root.zig:624
+    +     ! : 1 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+    +     ! :   1 Io.File.Reader.readVec  (in antfly-grep) + 104  [0x101000864]  Reader.zig:234
+    +     ! :     1 Io.File.Reader.readVecPositional  (in antfly-grep) + 232  [0x101000eac]  Reader.zig:246
+    +     ! :       1 Io.Threaded.fileReadPositional  (in antfly-grep) + 224  [0x101026518]  Threaded.zig:10206
+    +     ! :         1 preadv  (in libsystem_kernel.dylib) + 8  [0x183a1bd84]
+    +     ! 1 root.Search.file  (in antfly-grep) + 8044  [0x10106fd40]  root.zig:624
+    +     !   1 _xzm_free_large_huge  (in libsystem_malloc.dylib) + 48  [0x183872a78]
+    +     21 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 828  [0x10115ae00]  Thread.zig:753
+    +       15 root.Search.Queue.pop  (in antfly-grep) + 284  [0x1010bd5f0]  root.zig:352
+    +       : 15 root.Search.Queue.pop  (in antfly-grep) + 284  [0x1010bd5f0]  root.zig:352
+    +       :   15 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    +       6 root.Search.Queue.pop  (in antfly-grep) + 584  [0x1010bd71c]  root.zig:351
+    +         6 Io.Threaded.futexWake  (in antfly-grep) + 60  [0x10102e300]  Threaded.zig:2537
+    +           6 __ulock_wake  (in libsystem_kernel.dylib) + 8  [0x183a0ebc8]
+    188 Thread_29135433
+    + 188 thread_start  (in libsystem_pthread.dylib) + 8  [0x183a4ccec]
+    +   188 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x183a51d00]
+    +     177 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 1120  [0x10115af24]  Thread.zig:753
+    +     ! 158 root.Search.file  (in antfly-grep) + 8008  [0x10106fd1c]  root.zig:624
+    +     ! : 158 root.Search.streamInput  (in antfly-grep) + 152  [0x10106a980]  root.zig:1023
+    +     ! :   62 root.Search.stream  (in antfly-grep) + 2400,2352  [0x10105e414,0x10105e3e4]  root.zig:1115
+    +     ! :   53 root.Search.stream  (in antfly-grep) + 8812  [0x10105fd20]  root.zig:1149
+    +     ! :   | 43 matcher.Matcher.matches  (in antfly-grep) + 1552,1508,...  [0x10104918c,0x101049160,...]  matcher.zig:306
+    +     ! :   | 8 matcher.Matcher.matches  (in antfly-grep) + 268,308,...  [0x101048c88,0x101048cb0,...]  matcher.zig:0
+    +     ! :   | 1 matcher.Matcher.matches  (in antfly-grep) + 376  [0x101048cf4]  matcher.zig:296
+    +     ! :   | 1 matcher.Matcher.matches  (in antfly-grep) + 2252  [0x101049448]  matcher.zig:318
+    +     ! :   14 root.Search.stream  (in antfly-grep) + 1968  [0x10105e264]  root.zig:1099
+    +     ! :   | 4 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 580,56  [0x100fffd74,0x100fffb68]  Reader.zig:0
+    +     ! :   | 4 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 620,104  [0x100fffd9c,0x100fffb98]  Reader.zig:1037
+    +     ! :   | 1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 24  [0x100fffb48]  Reader.zig:1030
+    +     ! :   | 1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 504  [0x100fffd28]  Reader.zig:1033
+    +     ! :   | + 1 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+    +     ! :   | +   1 Io.Reader.defaultReadVec  (in antfly-grep) + 84  [0x101000018]  Reader.zig:470
+    +     ! :   | +     1 root.Search.BinaryReader.stream  (in antfly-grep) + 1160  [0x1010bcb2c]  root.zig:988
+    +     ! :   | +       1 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+    +     ! :   | +         1 Io.File.Reader.readVec  (in antfly-grep) + 104  [0x101000864]  Reader.zig:234
+    +     ! :   | +           1 Io.File.Reader.readVecPositional  (in antfly-grep) + 232  [0x101000eac]  Reader.zig:246
+    +     ! :   | +             1 Io.Threaded.fileReadPositional  (in antfly-grep) + 224  [0x101026518]  Threaded.zig:10206
+    +     ! :   | +               1 preadv  (in libsystem_kernel.dylib) + 8  [0x183a1bd84]
+    +     ! :   | 1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 704  [0x100fffdf0]  Reader.zig:1038
+    +     ! :   | + 1 ???  (in antfly-grep)  load address 0x100fd0000 + 0x26eff4  [0x10123eff4]
+    +     ! :   | 1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 768  [0x100fffe30]  Reader.zig:1038
+    +     ! :   | + 1 Io.Writer.Allocating.drain  (in antfly-grep) + 340  [0x10123e10c]  Writer.zig:2845
+    +     ! :   | +   1 _realloc  (in libsystem_malloc.dylib) + 456  [0x183879358]
+    +     ! :   | +     1 _malloc_zone_realloc  (in libsystem_malloc.dylib) + 148  [0x183878b2c]
+    +     ! :   | +       1 xzm_malloc_zone_malloc_type_realloc  (in libsystem_malloc.dylib) + 1028  [0x183869414]
+    +     ! :   | +         1 __xzm_xzone_free_to_freelist_chunk  (in libsystem_malloc.dylib) + 372  [0x1838717f8]
+    +     ! :   | 1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 656  [0x100fffdc0]  Reader.zig:1038
+    +     ! :   | 1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 800  [0x100fffe50]  Reader.zig:1039
+    +     ! :   6 root.Search.stream  (in antfly-grep) + 10972,816  [0x101060590,0x10105dde4]  root.zig:1061
+    +     ! :   5 root.Search.stream  (in antfly-grep) + 2432,2492  [0x10105e434,0x10105e470]  root.zig:1121
+    +     ! :   4 root.Search.stream  (in antfly-grep) + 1796  [0x10105e1b8]  root.zig:1090
+    +     ! :   3 heap.ArenaAllocator.reset  (in antfly-grep) + 680  [0x101001418]  ArenaAllocator.zig:0
+    +     ! :   3 root.Search.stream  (in antfly-grep) + 2348,2468,...  [0x10105e3e0,0x10105e458,...]  root.zig:0
+    +     ! :   2 root.Search.stream  (in antfly-grep) + 2152,2232  [0x10105e31c,0x10105e36c]  root.zig:1111
+    +     ! :   1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 824  [0x100fffe68]  Reader.zig:0
+    +     ! :   1 matcher.Matcher.matches  (in antfly-grep) + 2352  [0x1010494ac]  matcher.zig:0
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 856  [0x10105de0c]  root.zig:1065
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 1888  [0x10105e214]  root.zig:1099
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 8812  [0x10105fd20]  root.zig:1149
+    +     ! :   1 root.Search.stream  (in antfly-grep) + 8852  [0x10105fd48]  root.zig:1174
+    +     ! 13 root.Search.file  (in antfly-grep) + 7756  [0x10106fc20]  root.zig:624
+    +     ! : 13 Io.Threaded.dirOpenFilePosix  (in antfly-grep) + 432  [0x10102a608]  Threaded.zig:4968
+    +     ! :   13 openat  (in libsystem_kernel.dylib) + 76  [0x183a29850]
+    +     ! :     13 __openat  (in libsystem_kernel.dylib) + 8  [0x183a0e5a8]
+    +     ! 4 root.Search.file  (in antfly-grep) + 7868  [0x10106fc90]  root.zig:624
+    +     ! : 4 _xzm_malloc_large_huge  (in libsystem_malloc.dylib) + 968  [0x18386c4ac]
+    +     ! :   4 xzm_segment_group_alloc_chunk  (in libsystem_malloc.dylib) + 536  [0x18384c910]
+    +     ! :     4 _os_unfair_lock_lock_slow  (in libsystem_platform.dylib) + 172  [0x183a59aa0]
+    +     ! :       4 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    +     ! 1 root.Search.file  (in antfly-grep) + 7808  [0x10106fc54]  root.zig:624
+    +     ! : 1 Io.Threaded.fileStatPosix  (in antfly-grep) + 136  [0x1010279e8]  Threaded.zig:3988
+    +     ! :   1 fstat  (in libsystem_kernel.dylib) + 8  [0x183a1b43c]
+    +     ! 1 root.Search.file  (in antfly-grep) + 8200  [0x10106fddc]  root.zig:624
+    +     !   1 Io.Threaded.fileClose  (in antfly-grep) + 44  [0x101027904]  Threaded.zig:9895
+    +     !     1 __close_nocancel  (in libsystem_kernel.dylib) + 8  [0x183a0e57c]
+    +     9 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 828  [0x10115ae00]  Thread.zig:753
+    +     ! 9 root.Search.Queue.pop  (in antfly-grep) + 284  [0x1010bd5f0]  root.zig:352
+    +     !   9 root.Search.Queue.pop  (in antfly-grep) + 284  [0x1010bd5f0]  root.zig:352
+    +     !     9 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+    +     1 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 1408  [0x10115b044]  Thread.zig:753
+    +     ! 1 Io.Threaded.operate  (in antfly-grep) + 180  [0x10102d940]  Threaded.zig:2550
+    +     !   1 Io.Threaded.fileWriteStreaming  (in antfly-grep) + 904  [0x101027758]  Threaded.zig:11056
+    +     !     1 writev  (in libsystem_kernel.dylib) + 8  [0x183a10b90]
+    +     1 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 980  [0x10115ae98]  Thread.zig:753
+    188 Thread_29135434
+      188 thread_start  (in libsystem_pthread.dylib) + 8  [0x183a4ccec]
+        188 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x183a51d00]
+          175 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 1120  [0x10115af24]  Thread.zig:753
+          ! 144 root.Search.file  (in antfly-grep) + 8008  [0x10106fd1c]  root.zig:624
+          ! : 144 root.Search.streamInput  (in antfly-grep) + 152  [0x10106a980]  root.zig:1023
+          ! :   76 root.Search.stream  (in antfly-grep) + 8812  [0x10105fd20]  root.zig:1149
+          ! :   | 61 matcher.Matcher.matches  (in antfly-grep) + 1552,1524,...  [0x10104918c,0x101049170,...]  matcher.zig:306
+          ! :   | 14 matcher.Matcher.matches  (in antfly-grep) + 268,204,...  [0x101048c88,0x101048c48,...]  matcher.zig:0
+          ! :   | 1 matcher.Matcher.matches  (in antfly-grep) + 1772  [0x101049268]  matcher.zig:306
+          ! :   |   1 dfa.Dfa.transition  (in antfly-grep) + 1040  [0x1010df0e0]  dfa.zig:141
+          ! :   33 root.Search.stream  (in antfly-grep) + 2400  [0x10105e414]  root.zig:1115
+          ! :   9 root.Search.stream  (in antfly-grep) + 2476  [0x10105e460]  root.zig:0
+          ! :   8 root.Search.stream  (in antfly-grep) + 2432  [0x10105e434]  root.zig:1121
+          ! :   7 root.Search.stream  (in antfly-grep) + 1968  [0x10105e264]  root.zig:1099
+          ! :   | 5 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 168,620,...  [0x100fffbd8,0x100fffd9c,...]  Reader.zig:1037
+          ! :   | 1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 580  [0x100fffd74]  Reader.zig:0
+          ! :   | 1 Io.Reader.streamDelimiterLimit  (in antfly-grep) + 96  [0x100fffb90]  Reader.zig:1033
+          ! :   3 root.Search.stream  (in antfly-grep) + 11472  [0x101060784]  root.zig:1066
+          ! :   | 3 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+          ! :   |   3 Io.Reader.defaultReadVec  (in antfly-grep) + 84  [0x101000018]  Reader.zig:470
+          ! :   |     3 root.Search.BinaryReader.stream  (in antfly-grep) + 1160  [0x1010bcb2c]  root.zig:988
+          ! :   |       3 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+          ! :   |         3 Io.File.Reader.readVec  (in antfly-grep) + 104  [0x101000864]  Reader.zig:234
+          ! :   |           3 Io.File.Reader.readVecPositional  (in antfly-grep) + 232  [0x101000eac]  Reader.zig:246
+          ! :   |             3 Io.Threaded.fileReadPositional  (in antfly-grep) + 224  [0x101026518]  Threaded.zig:10206
+          ! :   |               3 preadv  (in libsystem_kernel.dylib) + 8  [0x183a1bd84]
+          ! :   2 heap.ArenaAllocator.reset  (in antfly-grep) + 680  [0x101001418]  ArenaAllocator.zig:0
+          ! :   1 matcher.Matcher.matches  (in antfly-grep) + 2352  [0x1010494ac]  matcher.zig:0
+          ! :   1 root.Search.stream  (in antfly-grep) + 1892  [0x10105e218]  root.zig:1099
+          ! :   1 root.Search.stream  (in antfly-grep) + 4252  [0x10105eb50]  root.zig:1142
+          ! :   1 root.Search.stream  (in antfly-grep) + 8768  [0x10105fcf4]  root.zig:1148
+          ! :   1 root.Search.stream  (in antfly-grep) + 8792  [0x10105fd0c]  root.zig:1149
+          ! :   1 root.Search.stream  (in antfly-grep) + 8960  [0x10105fdb4]  root.zig:1231
+          ! 18 root.Search.file  (in antfly-grep) + 7756  [0x10106fc20]  root.zig:624
+          ! : 18 Io.Threaded.dirOpenFilePosix  (in antfly-grep) + 432  [0x10102a608]  Threaded.zig:4968
+          ! :   17 openat  (in libsystem_kernel.dylib) + 76  [0x183a29850]
+          ! :   | 17 __openat  (in libsystem_kernel.dylib) + 8  [0x183a0e5a8]
+          ! :   1 openat  (in libsystem_kernel.dylib) + 188  [0x183a298c0]
+          ! 4 root.Search.file  (in antfly-grep) + 7868  [0x10106fc90]  root.zig:624
+          ! : 4 _xzm_malloc_large_huge  (in libsystem_malloc.dylib) + 968  [0x18386c4ac]
+          ! :   4 xzm_segment_group_alloc_chunk  (in libsystem_malloc.dylib) + 536  [0x18384c910]
+          ! :     4 _os_unfair_lock_lock_slow  (in libsystem_platform.dylib) + 172  [0x183a59aa0]
+          ! :       4 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+          ! 4 root.Search.file  (in antfly-grep) + 8044  [0x10106fd40]  root.zig:624
+          ! : 2 _xzm_free_large_huge  (in libsystem_malloc.dylib) + 68  [0x183872a8c]
+          ! : | 2 _os_unfair_lock_lock_slow  (in libsystem_platform.dylib) + 172  [0x183a59aa0]
+          ! : |   2 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+          ! : 1 _os_unfair_lock_unlock_slow  (in libsystem_platform.dylib) + 56  [0x183a59b9c]
+          ! : | 1 __ulock_wake  (in libsystem_kernel.dylib) + 8  [0x183a0ebc8]
+          ! : 1 xzm_segment_group_free_chunk  (in libsystem_malloc.dylib) + 624  [0x18384d6c8]
+          ! :   1 _xzm_segment_group_segment_span_free_coalesce  (in libsystem_malloc.dylib) + 248  [0x18384dccc]
+          ! :     1 _xzm_segment_group_span_mark_used  (in libsystem_malloc.dylib) + 124  [0x18384f718]
+          ! :       1 _xzm_reclaim_mark_used  (in libsystem_malloc.dylib) + 124  [0x18384c318]
+          ! :         1 _xzm_reclaim_mark_used_locked  (in libsystem_malloc.dylib) + 60  [0x18384ee24]
+          ! :           1 mach_vm_reclaim_try_cancel  (in libsystem_kernel.dylib) + 260  [0x183a206b8]
+          ! :             1 mach_absolute_time  (in libsystem_kernel.dylib) + 108  [0x183a0d0f8]
+          ! 3 root.Search.file  (in antfly-grep) + 7808  [0x10106fc54]  root.zig:624
+          ! : 3 Io.Threaded.fileStatPosix  (in antfly-grep) + 136  [0x1010279e8]  Threaded.zig:3988
+          ! :   3 fstat  (in libsystem_kernel.dylib) + 8  [0x183a1b43c]
+          ! 1 root.Search.file  (in antfly-grep) + 7988  [0x10106fd08]  root.zig:624
+          ! : 1 Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+          ! :   1 Io.File.Reader.readVec  (in antfly-grep) + 104  [0x101000864]  Reader.zig:234
+          ! :     1 Io.File.Reader.readVecPositional  (in antfly-grep) + 232  [0x101000eac]  Reader.zig:246
+          ! :       1 Io.Threaded.fileReadPositional  (in antfly-grep) + 224  [0x101026518]  Threaded.zig:10206
+          ! :         1 preadv  (in libsystem_kernel.dylib) + 8  [0x183a1bd84]
+          ! 1 root.Search.file  (in antfly-grep) + 8200  [0x10106fddc]  root.zig:624
+          !   1 Io.Threaded.fileClose  (in antfly-grep) + 44  [0x101027904]  Threaded.zig:9895
+          !     1 __close_nocancel  (in libsystem_kernel.dylib) + 8  [0x183a0e57c]
+          13 Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 828  [0x10115ae00]  Thread.zig:753
+            12 root.Search.Queue.pop  (in antfly-grep) + 284  [0x1010bd5f0]  root.zig:352
+            : 12 root.Search.Queue.pop  (in antfly-grep) + 284  [0x1010bd5f0]  root.zig:352
+            :   12 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+            1 root.Search.Queue.pop  (in antfly-grep) + 512  [0x1010bd6d4]  root.zig:350
+              1 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183a1ad9c]
+
+Total number in stack (recursive counted multiple, when >=5):
+        36       __ulock_wait2  (in libsystem_kernel.dylib) + 0  [0x183a1ad94]
+        30       Io.Reader.fillUnbuffered  (in antfly-grep) + 96  [0x100ffff48]  Reader.zig:1146
+        24       openat  (in libsystem_kernel.dylib) + 76  [0x183a29850]
+        23       __openat  (in libsystem_kernel.dylib) + 0  [0x183a0e5a0]
+        22       root.Search.Queue.pop  (in antfly-grep) + 284  [0x1010bd5f0]  root.zig:352
+        17       Io.File.Reader.readVec  (in antfly-grep) + 104  [0x101000864]  Reader.zig:234
+        17       Io.File.Reader.readVecPositional  (in antfly-grep) + 232  [0x101000eac]  Reader.zig:246
+        17       Io.Threaded.fileReadPositional  (in antfly-grep) + 224  [0x101026518]  Threaded.zig:10206
+        17       preadv  (in libsystem_kernel.dylib) + 0  [0x183a1bd7c]
+        16       Io.Threaded.dirOpenFilePosix  (in antfly-grep) + 432  [0x10102a608]  Threaded.zig:4968
+        14       Io.Reader.streamDelimiterLimit  (in antfly-grep) + 0  [0x100fffb30]  Reader.zig:0
+        14       matcher.Matcher.matches  (in antfly-grep) + 0  [0x101048b7c]  matcher.zig:0
+        13       Io.Reader.defaultReadVec  (in antfly-grep) + 84  [0x101000018]  Reader.zig:470
+        12       Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 1120  [0x10115af24]  Thread.zig:753
+        12       _pthread_start  (in libsystem_pthread.dylib) + 136  [0x183a51d00]
+        12       matcher.Matcher.matches  (in antfly-grep) + 0  [0x101048b7c]  matcher.zig:306
+        12       root.Search.file  (in antfly-grep) + 7756  [0x10106fc20]  root.zig:624
+        12       root.Search.file  (in antfly-grep) + 8008  [0x10106fd1c]  root.zig:624
+        12       root.Search.stream  (in antfly-grep) + 0  [0x10105dab4]  root.zig:1115
+        12       root.Search.stream  (in antfly-grep) + 1968  [0x10105e264]  root.zig:1099
+        12       root.Search.stream  (in antfly-grep) + 8812  [0x10105fd20]  root.zig:1149
+        12       root.Search.streamInput  (in antfly-grep) + 152  [0x10106a980]  root.zig:1023
+        12       thread_start  (in libsystem_pthread.dylib) + 8  [0x183a4ccec]
+        11       Thread.PosixThreadImpl.spawn__func_2001.Instance.entryFn  (in antfly-grep) + 828  [0x10115ae00]  Thread.zig:753
+        11       root.Search.BinaryReader.stream  (in antfly-grep) + 1160  [0x1010bcb2c]  root.zig:988
+        10       __ulock_wake  (in libsystem_kernel.dylib) + 0  [0x183a0ebc0]
+        9       _os_unfair_lock_lock_slow  (in libsystem_platform.dylib) + 172  [0x183a59aa0]
+        9       _platform_memset  (in libsystem_platform.dylib) + 0  [0x183a5ba90]
+        9       mod.PreparedPattern.matches  (in antfly-grep) + 448  [0x101159a88]  mod.zig:131
+        9       root.Search.stream  (in antfly-grep) + 0  [0x10105dab4]  root.zig:0
+        9       root.Search.stream  (in antfly-grep) + 11472  [0x101060784]  root.zig:1066
+        8       Io.Reader.streamDelimiterLimit  (in antfly-grep) + 0  [0x100fffb30]  Reader.zig:1037
+        8       Io.Threaded.dirOpenDirPosix  (in antfly-grep) + 296  [0x10102a244]  Threaded.zig:5402
+        8       Io.Threaded.fileClose  (in antfly-grep) + 44  [0x101027904]  Threaded.zig:9895
+        8       __close_nocancel  (in libsystem_kernel.dylib) + 0  [0x183a0e574]
+        8       discovery.Discovery.allowed  (in antfly-grep) + 1208  [0x101032e5c]  discovery.zig:295
+        8       discovery.Discovery.walk__func_930  (in antfly-grep) + 1352  [0x1010b686c]  discovery.zig:269
+        8       discovery.Discovery.walk__func_930  (in antfly-grep) + 2520  [0x1010b6cfc]  discovery.zig:275
+        8       discovery.Discovery.walk__func_930  (in antfly-grep) + 2660  [0x1010b6d88]  discovery.zig:277
+        8       discovery.Discovery.walk__func_930  (in antfly-grep) + 596  [0x1010b6578]  discovery.zig:248
+        8       mod.PreparedPattern.expand  (in antfly-grep) + 0  [0x101159c68]  mod.zig:0
+        8       root.Search.file  (in antfly-grep) + 7868  [0x10106fc90]  root.zig:624
+        8       root.Search.file  (in antfly-grep) + 8200  [0x10106fddc]  root.zig:624
+        7       Io.Reader.streamDelimiterLimit  (in antfly-grep) + 0  [0x100fffb30]  Reader.zig:1038
+        7       Io.Threaded.fileStatPosix  (in antfly-grep) + 136  [0x1010279e8]  Threaded.zig:3988
+        7       _xzm_malloc_large_huge  (in libsystem_malloc.dylib) + 968  [0x18386c4ac]
+        7       fstat  (in libsystem_kernel.dylib) + 0  [0x183a1b434]
+        7       mod.PreparedPattern.matches  (in antfly-grep) + 388  [0x101159a4c]  mod.zig:120
+        7       root.Search.file  (in antfly-grep) + 1880  [0x10106e52c]  root.zig:601
+        7       root.Search.file  (in antfly-grep) + 7808  [0x10106fc54]  root.zig:624
+        6       discovery.Discovery.allowed  (in antfly-grep) + 1072  [0x101032dd4]  discovery.zig:295
+        6       mod.PreparedPattern.expand  (in antfly-grep) + 0  [0x101159c68]  mod.zig:148
+        6       root.Search.file  (in antfly-grep) + 7988  [0x10106fd08]  root.zig:624
+        6       xzm_segment_group_alloc_chunk  (in libsystem_malloc.dylib) + 536  [0x18384c910]
+        5       Io.Reader.streamDelimiterLimit  (in antfly-grep) + 0  [0x100fffb30]  Reader.zig:1033
+        5       Io.Threaded.dirReadDarwin  (in antfly-grep) + 292  [0x101029edc]  Threaded.zig:5701
+        5       Io.Threaded.futexWake  (in antfly-grep) + 60  [0x10102e300]  Threaded.zig:2537
+        5       __getdirentries64  (in libsystem_kernel.dylib) + 0  [0x183a0e9b8]
+        5       _os_unfair_lock_unlock_slow  (in libsystem_platform.dylib) + 56  [0x183a59b9c]
+        5       discovery.Discovery.walk__func_930  (in antfly-grep) + 704  [0x1010b65e4]  discovery.zig:251
+        5       heap.ArenaAllocator.reset  (in antfly-grep) + 0  [0x101001170]  ArenaAllocator.zig:0
+        5       mod.PreparedPattern.matches  (in antfly-grep) + 300  [0x1011599f4]  mod.zig:117
+        5       root.Search.file  (in antfly-grep) + 8044  [0x10106fd40]  root.zig:624
+        5       root.Search.stream  (in antfly-grep) + 0  [0x10105dab4]  root.zig:1061
+        5       root.Search.stream  (in antfly-grep) + 0  [0x10105dab4]  root.zig:1121
+        5       root.Search.stream  (in antfly-grep) + 0  [0x10105dab4]  root.zig:1149
+
+Sort by top of stack, same collapsed (when >= 5):
+        root.Search.stream  (in antfly-grep)        1199
+        matcher.Matcher.matches  (in antfly-grep)        460
+        __openat  (in libsystem_kernel.dylib)        254
+        __ulock_wait2  (in libsystem_kernel.dylib)        242
+        Io.Reader.streamDelimiterLimit  (in antfly-grep)        76
+        mod.PreparedPattern.expand  (in antfly-grep)        29
+        preadv  (in libsystem_kernel.dylib)        28
+        __ulock_wake  (in libsystem_kernel.dylib)        26
+        mod.PreparedPattern.matches  (in antfly-grep)        20
+        __close_nocancel  (in libsystem_kernel.dylib)        16
+        _platform_memset  (in libsystem_platform.dylib)        12
+        fstat  (in libsystem_kernel.dylib)        12
+        heap.ArenaAllocator.reset  (in antfly-grep)        12
+        __getdirentries64  (in libsystem_kernel.dylib)        7
+        mach_absolute_time  (in libsystem_kernel.dylib)        7
+        __ulock_wait  (in libsystem_kernel.dylib)        6
+        __xzm_xzone_free_to_freelist_chunk  (in libsystem_malloc.dylib)        5
+
+Binary Images:
+       0x100fd0000 -        0x1015ec317 +antfly-grep (0) <3AB5D1F4-4A85-3149-91B2-E9BEB8BCFB28> /Users/*/antfly-grep
+       0x1835c8000 -        0x1836175f7  libobjc.A.dylib (973.1) <C0680DF6-9900-3C29-A071-95A031686EF8> /usr/lib/libobjc.A.dylib
+       0x183618000 -        0x18362223f  libsharedcache.dylib (0) <BBF95357-BEBF-3D89-8900-2BBB14A667C5> /usr/lib/libsharedcache.dylib
+       0x183623000 -        0x183649d3b  libdyld.dylib (27062) <62863BCA-DD60-3D32-A9DB-89099BA6F3D7> /usr/lib/system/libdyld.dylib
+       0x18364a000 -        0x1837096e3  dyld (1.0.0 - 27062) <D341DDCB-7969-3A9C-8E03-0CF4751398A9> /usr/lib/dyld
+       0x18370a000 -        0x18370d01f  libsystem_blocks.dylib (98.1) <6F304731-D95D-3501-B4AD-F2934F7F2446> /usr/lib/system/libsystem_blocks.dylib
+       0x18370e000 -        0x1837630df  libxpc.dylib (3298.1.1) <0791121F-B5FC-3F84-BF04-115E86D2D882> /usr/lib/system/libxpc.dylib
+       0x183764000 -        0x183783c13  libsystem_trace.dylib (1966.1.1) <B48A8E3E-A12A-3342-8321-428B555E965E> /usr/lib/system/libsystem_trace.dylib
+       0x183784000 -        0x183838f27  libcorecrypto.dylib (2109.0.22) <807AA6C9-5D8A-3CA5-B4CE-FACE5296EF6A> /usr/lib/system/libcorecrypto.dylib
+       0x183839000 -        0x18388ec5f  libsystem_malloc.dylib (886.0.8) <2339CB57-FE5A-3154-A206-A76059C749EB> /usr/lib/system/libsystem_malloc.dylib
+       0x18388f000 -        0x1838d519f  libdispatch.dylib (1605.0.2) <022BF08F-0B3A-3225-9E65-16D1553CE90D> /usr/lib/system/libdispatch.dylib
+       0x1838d6000 -        0x1838d8d2b  libsystem_featureflags.dylib (108) <20C1CAB2-1F13-3426-8146-9CAE9FF2A33D> /usr/lib/system/libsystem_featureflags.dylib
+       0x1838d9000 -        0x18395bca3  libsystem_c.dylib (1786.0.3) <FBA7B23E-AA60-3A90-9AA4-A7A2E0AD63EE> /usr/lib/system/libsystem_c.dylib
+       0x18395c000 -        0x1839f1033  libc++.1.dylib (2200.27) <1E9BA4AA-B5DA-3CF3-80AC-4B880049573F> /usr/lib/libc++.1.dylib
+       0x1839f2000 -        0x183a0beff  libc++abi.dylib (2200.27) <A21743EE-6E1C-3E74-97EA-7AF793DE4BDF> /usr/lib/libc++abi.dylib
+       0x183a0c000 -        0x183a4a9ab  libsystem_kernel.dylib (13432.1.9) <F63BF418-8F75-34A4-AAF1-8CAF2B9B6A05> /usr/lib/system/libsystem_kernel.dylib
+       0x183a4b000 -        0x183a5791b  libsystem_pthread.dylib (553.0.1) <5A1828C3-CBC2-3B85-BD07-C8ED10021A41> /usr/lib/system/libsystem_pthread.dylib
+       0x183a58000 -        0x183a614f3  libsystem_platform.dylib (402.0.1.0.1) <080E4444-A0FB-3913-9756-4E470015F32F> /usr/lib/system/libsystem_platform.dylib
+       0x183a62000 -        0x183a90903  libsystem_info.dylib (603) <BC387AEB-1CEF-3513-92D7-D7F913596711> /usr/lib/system/libsystem_info.dylib
+       0x187bba000 -        0x187bc3b13  libsystem_darwin.dylib (1786.0.3) <4E66C888-993C-3E6A-A8DA-A949C01C5B67> /usr/lib/system/libsystem_darwin.dylib
+       0x188014000 -        0x188025b8b  libsystem_notify.dylib (368) <58FD36D8-37A7-311C-80F2-8E64DD8710CF> /usr/lib/system/libsystem_notify.dylib
+       0x18a171000 -        0x18a18bd93  libsystem_networkextension.dylib (2340.1.2) <22E1D190-486F-324F-ABA4-F36AB841BFE9> /usr/lib/system/libsystem_networkextension.dylib
+       0x18a219000 -        0x18a230247  libsystem_asl.dylib (409) <B4D449B7-A821-3A9A-8019-E917B291F10A> /usr/lib/system/libsystem_asl.dylib
+       0x18b1c4000 -        0x18b1c4f2f  libobjcMsgSend.dylib (973.1) <41179EDE-DC97-3BBE-8848-6400D12C1436> /usr/lib/objc/libobjcMsgSend.dylib
+       0x18c310000 -        0x18c317edf  libsystem_symptoms.dylib (2394.0.4) <60EE7884-9F4E-3184-A6AC-FA40A7A0297D> /usr/lib/system/libsystem_symptoms.dylib
+       0x1906a8000 -        0x1906e2aeb  libsystem_containermanager.dylib (833.0.8.0.1) <08A57205-555D-3792-8931-9D5B585AF326> /usr/lib/system/libsystem_containermanager.dylib
+       0x191cfb000 -        0x191cff317  libsystem_configuration.dylib (1446) <F3EB66A7-7A24-3AE5-B6E8-9A37BB00F119> /usr/lib/system/libsystem_configuration.dylib
+       0x191d00000 -        0x191d06e03  libsystem_sandbox.dylib (3051.0.52) <1E892B56-092E-3832-BDE3-DCE356D7A4FA> /usr/lib/system/libsystem_sandbox.dylib
+       0x1931c4000 -        0x1931c4f2f  libobjcMsgSend1.dylib (973.1) <B40D9B2A-E1EE-37ED-8004-711A1F263DE1> /usr/lib/objc/libobjcMsgSend1.dylib
+       0x1938e4000 -        0x1938e6f93  libquarantine.dylib (217.0.4) <7FD4AE22-86EF-382B-83F5-ADF9336C1160> /usr/lib/system/libquarantine.dylib
+       0x193ff6000 -        0x193ffc1e7  libsystem_coreservices.dylib (203) <57248E07-11A5-3857-918E-4A3A63B69FE8> /usr/lib/system/libsystem_coreservices.dylib
+       0x1945be000 -        0x1945fbb27  libsystem_m.dylib (3326.0.1) <A3FB340F-3ED5-30F4-8B64-9D5860F64D35> /usr/lib/system/libsystem_m.dylib
+       0x1945fd000 -        0x1946004f7  libmacho.dylib (27062) <50DEADEC-3E99-3519-AFC3-4A3FEB3F14C3> /usr/lib/system/libmacho.dylib
+       0x19461a000 -        0x194626707  libcommonCrypto.dylib (600041) <41C99F45-C5E6-39DB-B1F2-A1BEA9D242A4> /usr/lib/system/libcommonCrypto.dylib
+       0x194627000 -        0x194630c87  libunwind.dylib (2200.5) <3070AB81-B082-39E8-8A00-EF88DDE9AC47> /usr/lib/system/libunwind.dylib
+       0x194638000 -        0x1946427eb  libcopyfile.dylib (260.0.3) <72D95AF9-BF5E-3A84-81A6-BCC5BDB99857> /usr/lib/system/libcopyfile.dylib
+       0x194643000 -        0x1946468bf  libcompiler_rt.dylib (103.4) <DFB5CE7F-A36E-36AA-BECE-1392D3D43607> /usr/lib/system/libcompiler_rt.dylib
+       0x194647000 -        0x19464c077  libsystem_collections.dylib (1786.0.3) <1E8022D4-5A37-3A7A-8936-603E6FA88358> /usr/lib/system/libsystem_collections.dylib
+       0x19464d000 -        0x19464ff1f  libsystem_secinit.dylib (182) <DE037464-4C5D-3E96-A33F-2A4557CC6A20> /usr/lib/system/libsystem_secinit.dylib
+       0x194650000 -        0x19465297f  libremovefile.dylib (96) <E6E6DFCF-6B2C-3F30-A59D-816CAB1190CE> /usr/lib/system/libremovefile.dylib
+       0x194653000 -        0x194653e27  libkeymgr.dylib (31) <5EC997EF-3ADA-360B-9FCD-5F940C83FA4E> /usr/lib/system/libkeymgr.dylib
+       0x194654000 -        0x19465caf7  libsystem_dnssd.dylib (3111.0.5.0.1) <DE22096F-1E5B-3D6E-8164-771582DD6391> /usr/lib/system/libsystem_dnssd.dylib
+       0x19465d000 -        0x194661f1b  libcache.dylib (95) <80BAE197-E285-3F6E-A1EE-B77FE37D7E5D> /usr/lib/system/libcache.dylib
+       0x194662000 -        0x1946638f3  libSystem.B.dylib (1359) <4FDC9AA6-B344-37FE-B8C6-A4C94A038F57> /usr/lib/libSystem.B.dylib
+       0x19b1c4000 -        0x19b1c4f2f  libobjcMsgSend2.dylib (973.1) <BD27A84B-C9AE-3282-BBEA-3B6119837B5A> /usr/lib/objc/libobjcMsgSend2.dylib
+       0x1a31c4000 -        0x1a31c4f2f  libobjcMsgSend3.dylib (973.1) <C0860D68-DDFC-3BD7-8B06-DB0645CBBED4> /usr/lib/objc/libobjcMsgSend3.dylib
+       0x1ab1c4000 -        0x1ab1c4f2f  libobjcMsgSend4.dylib (973.1) <A6153BF5-622B-3B01-81B6-F64A365EF613> /usr/lib/objc/libobjcMsgSend4.dylib
+       0x1b31c4000 -        0x1b31c4f2f  libobjcMsgSend5.dylib (973.1) <3913A71C-B29A-3AEA-820B-BEC40AC1861A> /usr/lib/objc/libobjcMsgSend5.dylib
+       0x1bb1c4000 -        0x1bb1c4f2f  libobjcMsgSend6.dylib (973.1) <9BC523A3-E167-3F6C-8CAE-0F3EBA671791> /usr/lib/objc/libobjcMsgSend6.dylib
+       0x1c31c4000 -        0x1c31c4f2f  libobjcMsgSend7.dylib (973.1) <248B7BCE-5B4C-34C7-A340-43D5228628C5> /usr/lib/objc/libobjcMsgSend7.dylib
+       0x1cb1c4000 -        0x1cb1c4f2f  libobjcMsgSend8.dylib (973.1) <3E041BAD-A8E8-3069-B741-78CD1A45B176> /usr/lib/objc/libobjcMsgSend8.dylib
+       0x1d31c4000 -        0x1d31c4f2f  libobjcMsgSend9.dylib (973.1) <34A67969-21A0-39D6-BB81-8FDA5A2409DB> /usr/lib/objc/libobjcMsgSend9.dylib
+       0x1db1c4000 -        0x1db1c4f2f  libobjcMsgSend10.dylib (973.1) <678186C0-8EAD-3B35-8CBB-00285B41E4A0> /usr/lib/objc/libobjcMsgSend10.dylib
+       0x1e31c4000 -        0x1e31c4f2f  libobjcMsgSend11.dylib (973.1) <E05CB08C-E956-36FA-8967-AE8E346A8D2C> /usr/lib/objc/libobjcMsgSend11.dylib
+       0x20b1c4000 -        0x20b1c4f2f  libobjcMsgSend12.dylib (973.1) <10AB03AA-FF1F-3FDC-9DFB-BFC40042C501> /usr/lib/objc/libobjcMsgSend12.dylib
+       0x2131c4000 -        0x2131c4f2f  libobjcMsgSend13.dylib (973.1) <ABF53427-FA6F-3D0D-8F9D-7AD795CA5C92> /usr/lib/objc/libobjcMsgSend13.dylib
+       0x21b1c4000 -        0x21b1c4f2f  libobjcMsgSend14.dylib (973.1) <9A844C46-A6DA-34D4-8EBF-2AD775C30684> /usr/lib/objc/libobjcMsgSend14.dylib
+       0x2231c4000 -        0x2231c4f2f  libobjcMsgSend15.dylib (973.1) <7C995666-2B2D-3284-AA0A-EBF7C922838E> /usr/lib/objc/libobjcMsgSend15.dylib
+       0x22b1c4000 -        0x22b1c4f2f  libobjcMsgSend16.dylib (973.1) <B6C0E14B-53AE-3E22-9ED5-1729C49F46F2> /usr/lib/objc/libobjcMsgSend16.dylib
+       0x2331c4000 -        0x2331c4f2f  libobjcMsgSend17.dylib (973.1) <07B4CF85-251B-301B-832B-20B315A59E19> /usr/lib/objc/libobjcMsgSend17.dylib
+       0x23b1c4000 -        0x23b1c4f2f  libobjcMsgSend18.dylib (973.1) <43E575B7-04DB-3999-A633-1A3B638BA6E3> /usr/lib/objc/libobjcMsgSend18.dylib
+       0x2431c4000 -        0x2431c4f2f  libobjcMsgSend19.dylib (973.1) <736F4D85-76F7-3B28-8D87-C07E8F7A0EF4> /usr/lib/objc/libobjcMsgSend19.dylib
+       0x24b1c4000 -        0x24b1c4f2f  libobjcMsgSend20.dylib (973.1) <74E67C8B-6BCA-3184-A18E-A97F370052C6> /usr/lib/objc/libobjcMsgSend20.dylib
+       0x2531c4000 -        0x2531c4f2f  libobjcMsgSend21.dylib (973.1) <CC0D732F-98E7-3888-9E15-70984DA2FB04> /usr/lib/objc/libobjcMsgSend21.dylib
+       0x25b1c4000 -        0x25b1c4f2f  libobjcMsgSend22.dylib (973.1) <85A60286-5DE3-32BA-B18C-2A498B065C88> /usr/lib/objc/libobjcMsgSend22.dylib
+       0x2631c4000 -        0x2631c4f2f  libobjcMsgSend23.dylib (973.1) <5452A0D2-6B19-39BE-ADDD-80B7BCDE3A98> /usr/lib/objc/libobjcMsgSend23.dylib
+       0x26b1c4000 -        0x26b1c4f2f  libobjcMsgSend24.dylib (973.1) <94BBF2D6-722B-350D-8557-4D25A8E8D53A> /usr/lib/objc/libobjcMsgSend24.dylib
+       0x2731c4000 -        0x2731c4f2f  libobjcMsgSend25.dylib (973.1) <35481387-5A8E-3AE4-86A6-94CEB3CC8726> /usr/lib/objc/libobjcMsgSend25.dylib
+       0x28b1c4000 -        0x28b1c4f2f  libobjcMsgSend26.dylib (973.1) <9E0C8664-E7F4-39D1-AAFC-BD92B255E4E8> /usr/lib/objc/libobjcMsgSend26.dylib
+       0x2931c4000 -        0x2931c4f2f  libobjcMsgSend27.dylib (973.1) <FD424935-55A9-3650-955A-EED3441A1D19> /usr/lib/objc/libobjcMsgSend27.dylib
+       0x29b1c4000 -        0x29b1c4f2f  libobjcMsgSend28.dylib (973.1) <09BA7B97-7DF7-3C7F-932A-B6847662FC49> /usr/lib/objc/libobjcMsgSend28.dylib
+       0x2a31c4000 -        0x2a31c4f2f  libobjcMsgSend29.dylib (973.1) <36D5BA3F-2139-30B0-8558-556764BE9813> /usr/lib/objc/libobjcMsgSend29.dylib
+       0x2ab1c4000 -        0x2ab1c4f2f  libobjcMsgSend30.dylib (973.1) <9F05564A-9D12-372C-98FC-E9F0E6BE4F04> /usr/lib/objc/libobjcMsgSend30.dylib
+       0x2afede000 -        0x2afee4fe5  libRosetta.dylib (385) <E359944B-D230-33F9-A04E-0C3B17C3326E> /usr/lib/libRosetta.dylib
+       0x2b08cd000 -        0x2b08d075b  libsystem_darwindirectory.dylib (129.0.1) <61264923-2AA5-3658-B8C4-550C71E9D4B3> /usr/lib/system/libsystem_darwindirectory.dylib
+       0x2b08d1000 -        0x2b08dbd9b  libsystem_eligibility.dylib (446.1.3) <EDDE8E9C-A2CF-3931-BBB3-321CB852EB30> /usr/lib/system/libsystem_eligibility.dylib
+       0x2b08dc000 -        0x2b08e542b  libsystem_sanitizers.dylib (32) <7138ED99-7AA0-34EA-B35B-20EF6ADB1EED> /usr/lib/system/libsystem_sanitizers.dylib
+       0x2b08e6000 -        0x2b08e6a13  libsystem_trial.dylib (511) <6AE48824-EC44-3A8C-B501-BE57DBE892E7> /usr/lib/system/libsystem_trial.dylib
+       0x2b31c4000 -        0x2b31c4f2f  libobjcMsgSend31.dylib (973.1) <0985E20F-78C3-3466-A2B2-DBB95F7104A3> /usr/lib/objc/libobjcMsgSend31.dylib
+       0x2bb1c4000 -        0x2bb1c4f2f  libobjcMsgSend32.dylib (973.1) <0D309D58-D576-3E5D-AD4B-6D55AB491702> /usr/lib/objc/libobjcMsgSend32.dylib
+       0x2c31c4000 -        0x2c31c4f2f  libobjcMsgSend33.dylib (973.1) <346E0484-48FA-369B-8A64-93B5F5341CFE> /usr/lib/objc/libobjcMsgSend33.dylib
+       0x2cb1c4000 -        0x2cb1c4f2f  libobjcMsgSend34.dylib (973.1) <6A31F809-BCBE-3E01-A367-E91FDACCE324> /usr/lib/objc/libobjcMsgSend34.dylib

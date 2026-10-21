@@ -1,0 +1,4593 @@
+{
+  "measurement": "Qualify changed-path lexical delivery against complete baseline results.\n\nWarm filesystem/process data. Forced refresh is excluded from query timings.\nThe client applies each patch transactionally, binds compact file IDs to source\nidentities, and compares its materialized result with the baseline full delivery.\nGC is collected before each pair. Both requests finish before either O(N) oracle\nview is updated, avoiding verification work between paired request timings.",
+  "host": "Linux-7.0.14-linuxkit-aarch64-with-glibc2.41",
+  "cpu_count": 14,
+  "cgroup_cpu_max": "200000 100000",
+  "files": 10000,
+  "binaries": {
+    "current": {
+      "sha256": "097f270a39dc87c25216a17df7ec33dd4c5c2dd405c52132f6df663ee19c8cf4"
+    },
+    "baseline": {
+      "sha256": "815e00d7e84da867d80aa25e65d538222a01c45eb83961b726a3ceccd5666237"
+    }
+  },
+  "trials": [
+    {
+      "load_average": [
+        0.03271484375,
+        0.1015625,
+        0.09375
+      ],
+      "query_order": [
+        "baseline",
+        "current"
+      ],
+      "baseline": {
+        "seconds": 0.00016620801761746407,
+        "response_bytes": 2957,
+        "first_event_seconds": 0.0001337919384241104,
+        "producer_seconds": 2.6375e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 26375,
+              "human": "0.000026s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98895,
+              "bytes_printed": 1546,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98895,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 8.025e-05,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "current": {
+        "seconds": 0.0002232920378446579,
+        "response_bytes": 2957,
+        "first_event_seconds": 0.00019220903050154448,
+        "producer_seconds": 2.5167e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 25167,
+              "human": "0.000025s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98895,
+              "bytes_printed": 1546,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98895,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 7.1083e-05,
+        "main_thread_runqueue_seconds": 7.375e-06
+      }
+    },
+    {
+      "load_average": [
+        0.03271484375,
+        0.1015625,
+        0.09375
+      ],
+      "query_order": [
+        "current",
+        "baseline"
+      ],
+      "current": {
+        "seconds": 0.0006135409930720925,
+        "response_bytes": 2959,
+        "first_event_seconds": 0.0005843749968335032,
+        "producer_seconds": 0.000474708,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 474708,
+              "human": "0.000475s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98895,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98895,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000528959,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "baseline": {
+        "seconds": 0.0006907909410074353,
+        "response_bytes": 2958,
+        "first_event_seconds": 0.0006668330170214176,
+        "producer_seconds": 0.000595084,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 595084,
+              "human": "0.000595s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98895,
+              "bytes_printed": 1546,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98895,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000636,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    },
+    {
+      "load_average": [
+        0.03271484375,
+        0.1015625,
+        0.09375
+      ],
+      "query_order": [
+        "baseline",
+        "current"
+      ],
+      "baseline": {
+        "seconds": 0.00020754197612404823,
+        "response_bytes": 2957,
+        "first_event_seconds": 0.00017324998043477535,
+        "producer_seconds": 2.7833e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 27833,
+              "human": "0.000028s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98895,
+              "bytes_printed": 1546,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98895,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 9.075e-05,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "current": {
+        "seconds": 0.0001296249683946371,
+        "response_bytes": 2957,
+        "first_event_seconds": 0.00010533398017287254,
+        "producer_seconds": 2.6417e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 26417,
+              "human": "0.000026s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98895,
+              "bytes_printed": 1546,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98895,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 6.85e-05,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    },
+    {
+      "load_average": [
+        0.03271484375,
+        0.1015625,
+        0.09375
+      ],
+      "query_order": [
+        "current",
+        "baseline"
+      ],
+      "current": {
+        "seconds": 0.0005977499531581998,
+        "response_bytes": 2959,
+        "first_event_seconds": 0.0005678749876096845,
+        "producer_seconds": 0.000460333,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 460333,
+              "human": "0.000460s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98895,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98895,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000520084,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "baseline": {
+        "seconds": 0.0006682910025119781,
+        "response_bytes": 2958,
+        "first_event_seconds": 0.0006369579350575805,
+        "producer_seconds": 0.000540583,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 540583,
+              "human": "0.000541s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98895,
+              "bytes_printed": 1546,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98895,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000585083,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    },
+    {
+      "load_average": [
+        0.03271484375,
+        0.1015625,
+        0.09375
+      ],
+      "query_order": [
+        "baseline",
+        "current"
+      ],
+      "baseline": {
+        "seconds": 0.00017962499987334013,
+        "response_bytes": 2957,
+        "first_event_seconds": 0.000145082944072783,
+        "producer_seconds": 4.225e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 42250,
+              "human": "0.000042s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98895,
+              "bytes_printed": 1546,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98895,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 9.7875e-05,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "current": {
+        "seconds": 0.00013595889322459698,
+        "response_bytes": 2957,
+        "first_event_seconds": 0.00011137500405311584,
+        "producer_seconds": 2.9292e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 29292,
+              "human": "0.000029s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98895,
+              "bytes_printed": 1546,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98895,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 7.8417e-05,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    },
+    {
+      "load_average": [
+        0.03271484375,
+        0.1015625,
+        0.09375
+      ],
+      "query_order": [
+        "current",
+        "baseline"
+      ],
+      "current": {
+        "seconds": 0.0006655000615864992,
+        "response_bytes": 2959,
+        "first_event_seconds": 0.0006342920241877437,
+        "producer_seconds": 0.000519125,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 519125,
+              "human": "0.000519s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98895,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98895,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.0005745,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "baseline": {
+        "seconds": 0.0009242088999599218,
+        "response_bytes": 2958,
+        "first_event_seconds": 0.0008922499837353826,
+        "producer_seconds": 0.000793167,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 793167,
+              "human": "0.000793s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98895,
+              "bytes_printed": 1546,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98895,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000842,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    },
+    {
+      "load_average": [
+        0.03271484375,
+        0.1015625,
+        0.09375
+      ],
+      "query_order": [
+        "baseline",
+        "current"
+      ],
+      "baseline": {
+        "seconds": 0.0001581660471856594,
+        "response_bytes": 2957,
+        "first_event_seconds": 0.00012383307330310345,
+        "producer_seconds": 3.0167e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 30167,
+              "human": "0.000030s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98895,
+              "bytes_printed": 1546,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98895,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 8.4292e-05,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "current": {
+        "seconds": 0.0001228339970111847,
+        "response_bytes": 2957,
+        "first_event_seconds": 0.00010000006295740604,
+        "producer_seconds": 2.6334e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 26334,
+              "human": "0.000026s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98895,
+              "bytes_printed": 1546,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98895,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 6.5208e-05,
+        "main_thread_runqueue_seconds": 6.583e-06
+      }
+    },
+    {
+      "load_average": [
+        0.03271484375,
+        0.1015625,
+        0.09375
+      ],
+      "query_order": [
+        "current",
+        "baseline"
+      ],
+      "current": {
+        "seconds": 0.0008311249548569322,
+        "response_bytes": 2959,
+        "first_event_seconds": 0.0007980830268934369,
+        "producer_seconds": 0.000672167,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 672167,
+              "human": "0.000672s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98895,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98895,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000729625,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "baseline": {
+        "seconds": 0.0007462080102413893,
+        "response_bytes": 2958,
+        "first_event_seconds": 0.0007201669504866004,
+        "producer_seconds": 0.000637584,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 637584,
+              "human": "0.000638s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98895,
+              "bytes_printed": 1546,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98895,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.0006845,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    },
+    {
+      "load_average": [
+        0.03271484375,
+        0.1015625,
+        0.09375
+      ],
+      "query_order": [
+        "baseline",
+        "current"
+      ],
+      "baseline": {
+        "seconds": 0.0002810830483213067,
+        "response_bytes": 2957,
+        "first_event_seconds": 0.0002470830222591758,
+        "producer_seconds": 3.8584e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 38584,
+              "human": "0.000039s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98895,
+              "bytes_printed": 1546,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98895,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 9.4833e-05,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "current": {
+        "seconds": 0.00014708307571709156,
+        "response_bytes": 2957,
+        "first_event_seconds": 0.00011479109525680542,
+        "producer_seconds": 3.0667e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 30667,
+              "human": "0.000031s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98895,
+              "bytes_printed": 1546,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98895,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 7.9208e-05,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    },
+    {
+      "load_average": [
+        0.1103515625,
+        0.11669921875,
+        0.0986328125
+      ],
+      "query_order": [
+        "current",
+        "baseline"
+      ],
+      "current": {
+        "seconds": 0.0006947920192033052,
+        "response_bytes": 2959,
+        "first_event_seconds": 0.0006637090118601918,
+        "producer_seconds": 0.000540625,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 540625,
+              "human": "0.000541s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98895,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98895,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000599625,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "baseline": {
+        "seconds": 0.0007071669679135084,
+        "response_bytes": 2958,
+        "first_event_seconds": 0.0006792920175939798,
+        "producer_seconds": 0.000609125,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 609125,
+              "human": "0.000609s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98895,
+              "bytes_printed": 1546,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98895,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000650625,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    },
+    {
+      "load_average": [
+        0.1103515625,
+        0.11669921875,
+        0.0986328125
+      ],
+      "query_order": [
+        "baseline",
+        "current"
+      ],
+      "baseline": {
+        "seconds": 0.00017862499225884676,
+        "response_bytes": 2958,
+        "first_event_seconds": 0.00014645792543888092,
+        "producer_seconds": 3.3875e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 33875,
+              "human": "0.000034s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 8.9833e-05,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "current": {
+        "seconds": 0.00012541597243398428,
+        "response_bytes": 2958,
+        "first_event_seconds": 0.0001022910000756383,
+        "producer_seconds": 2.6833e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 26833,
+              "human": "0.000027s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 6.9584e-05,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    },
+    {
+      "load_average": [
+        0.1103515625,
+        0.11669921875,
+        0.0986328125
+      ],
+      "query_order": [
+        "current",
+        "baseline"
+      ],
+      "current": {
+        "seconds": 0.0007240839768201113,
+        "response_bytes": 2960,
+        "first_event_seconds": 0.0006888339994475245,
+        "producer_seconds": 0.00055825,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 558250,
+              "human": "0.000558s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1548,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000625959,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "baseline": {
+        "seconds": 0.0006698749493807554,
+        "response_bytes": 2959,
+        "first_event_seconds": 0.00064316694624722,
+        "producer_seconds": 0.000560666,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 560666,
+              "human": "0.000561s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.00060525,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    },
+    {
+      "load_average": [
+        0.1103515625,
+        0.11669921875,
+        0.0986328125
+      ],
+      "query_order": [
+        "baseline",
+        "current"
+      ],
+      "baseline": {
+        "seconds": 0.000204416923224926,
+        "response_bytes": 2958,
+        "first_event_seconds": 0.00017262494657188654,
+        "producer_seconds": 4e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 40000,
+              "human": "0.000040s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000109708,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "current": {
+        "seconds": 0.00012745801359415054,
+        "response_bytes": 2958,
+        "first_event_seconds": 0.00010304106399416924,
+        "producer_seconds": 3.0875e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 30875,
+              "human": "0.000031s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 7.4041e-05,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    },
+    {
+      "load_average": [
+        0.1103515625,
+        0.11669921875,
+        0.0986328125
+      ],
+      "query_order": [
+        "current",
+        "baseline"
+      ],
+      "current": {
+        "seconds": 0.0007574589690193534,
+        "response_bytes": 2960,
+        "first_event_seconds": 0.0007186670554801822,
+        "producer_seconds": 0.000548458,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 548458,
+              "human": "0.000548s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1548,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000616042,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "baseline": {
+        "seconds": 0.0008212910033762455,
+        "response_bytes": 2959,
+        "first_event_seconds": 0.0007832080591470003,
+        "producer_seconds": 0.000685042,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 685042,
+              "human": "0.000685s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000737084,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    },
+    {
+      "load_average": [
+        0.1103515625,
+        0.11669921875,
+        0.0986328125
+      ],
+      "query_order": [
+        "baseline",
+        "current"
+      ],
+      "baseline": {
+        "seconds": 0.0001853330759331584,
+        "response_bytes": 2958,
+        "first_event_seconds": 0.00014816701877862215,
+        "producer_seconds": 3.1916e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 31916,
+              "human": "0.000032s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 9.5292e-05,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "current": {
+        "seconds": 0.00012283294927328825,
+        "response_bytes": 2958,
+        "first_event_seconds": 9.908294305205345e-05,
+        "producer_seconds": 2.7833e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 27833,
+              "human": "0.000028s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 6.8e-05,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    },
+    {
+      "load_average": [
+        0.1103515625,
+        0.11669921875,
+        0.0986328125
+      ],
+      "query_order": [
+        "current",
+        "baseline"
+      ],
+      "current": {
+        "seconds": 0.0005730409175157547,
+        "response_bytes": 2960,
+        "first_event_seconds": 0.0005436659557744861,
+        "producer_seconds": 0.000447291,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 447291,
+              "human": "0.000447s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1548,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.0005005,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "baseline": {
+        "seconds": 0.000735041918233037,
+        "response_bytes": 2959,
+        "first_event_seconds": 0.0007095419568940997,
+        "producer_seconds": 0.00063475,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 634750,
+              "human": "0.000635s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000678292,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    },
+    {
+      "load_average": [
+        0.1103515625,
+        0.11669921875,
+        0.0986328125
+      ],
+      "query_order": [
+        "baseline",
+        "current"
+      ],
+      "baseline": {
+        "seconds": 0.00018520804587751627,
+        "response_bytes": 2958,
+        "first_event_seconds": 0.00015358300879597664,
+        "producer_seconds": 3.4375e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 34375,
+              "human": "0.000034s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 9.0208e-05,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "current": {
+        "seconds": 0.00013279193080961704,
+        "response_bytes": 2958,
+        "first_event_seconds": 0.00010629196185618639,
+        "producer_seconds": 2.8792e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 28792,
+              "human": "0.000029s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 7.15e-05,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    },
+    {
+      "load_average": [
+        0.1103515625,
+        0.11669921875,
+        0.0986328125
+      ],
+      "query_order": [
+        "current",
+        "baseline"
+      ],
+      "current": {
+        "seconds": 0.0007449580589309335,
+        "response_bytes": 2960,
+        "first_event_seconds": 0.0007104160031303763,
+        "producer_seconds": 0.000588792,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 588792,
+              "human": "0.000589s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1548,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000643167,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "baseline": {
+        "seconds": 0.0008822910021990538,
+        "response_bytes": 2959,
+        "first_event_seconds": 0.0008482909761369228,
+        "producer_seconds": 0.000760167,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 760167,
+              "human": "0.000760s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000808542,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    },
+    {
+      "load_average": [
+        0.1103515625,
+        0.11669921875,
+        0.0986328125
+      ],
+      "query_order": [
+        "baseline",
+        "current"
+      ],
+      "baseline": {
+        "seconds": 0.00025504198856651783,
+        "response_bytes": 2958,
+        "first_event_seconds": 0.00021612492855638266,
+        "producer_seconds": 3.4625e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 34625,
+              "human": "0.000035s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 9.9375e-05,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "current": {
+        "seconds": 0.0001467919209972024,
+        "response_bytes": 2958,
+        "first_event_seconds": 0.00010720791760832071,
+        "producer_seconds": 3.3e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 33000,
+              "human": "0.000033s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 8.0042e-05,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    },
+    {
+      "load_average": [
+        0.1103515625,
+        0.11669921875,
+        0.0986328125
+      ],
+      "query_order": [
+        "current",
+        "baseline"
+      ],
+      "current": {
+        "seconds": 0.0007572079775854945,
+        "response_bytes": 2960,
+        "first_event_seconds": 0.0007197079248726368,
+        "producer_seconds": 0.000579833,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 579833,
+              "human": "0.000580s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1548,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000654875,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "baseline": {
+        "seconds": 0.0006779159884899855,
+        "response_bytes": 2959,
+        "first_event_seconds": 0.0006509580416604877,
+        "producer_seconds": 0.000548959,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 548959,
+              "human": "0.000549s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000601375,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    },
+    {
+      "load_average": [
+        0.1103515625,
+        0.11669921875,
+        0.0986328125
+      ],
+      "query_order": [
+        "baseline",
+        "current"
+      ],
+      "baseline": {
+        "seconds": 0.0002719589974731207,
+        "response_bytes": 2958,
+        "first_event_seconds": 0.00020374997984617949,
+        "producer_seconds": 4.4833e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 44833,
+              "human": "0.000045s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000126292,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "current": {
+        "seconds": 0.00013687496539205313,
+        "response_bytes": 2958,
+        "first_event_seconds": 0.00011087500024586916,
+        "producer_seconds": 3.0542e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 30542,
+              "human": "0.000031s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 7.25e-05,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    },
+    {
+      "load_average": [
+        0.1103515625,
+        0.11669921875,
+        0.0986328125
+      ],
+      "query_order": [
+        "current",
+        "baseline"
+      ],
+      "current": {
+        "seconds": 0.0006386670283973217,
+        "response_bytes": 2960,
+        "first_event_seconds": 0.0006061249878257513,
+        "producer_seconds": 0.000495042,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 495042,
+              "human": "0.000495s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1548,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000550209,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "baseline": {
+        "seconds": 0.0008635420817881823,
+        "response_bytes": 2959,
+        "first_event_seconds": 0.0008328340481966734,
+        "producer_seconds": 0.000722208,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 722208,
+              "human": "0.000722s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000788791,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    },
+    {
+      "load_average": [
+        0.1103515625,
+        0.11669921875,
+        0.0986328125
+      ],
+      "query_order": [
+        "baseline",
+        "current"
+      ],
+      "baseline": {
+        "seconds": 0.00021841691341251135,
+        "response_bytes": 2958,
+        "first_event_seconds": 0.0001812089467421174,
+        "producer_seconds": 3.2792e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 32792,
+              "human": "0.000033s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 9.6e-05,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "current": {
+        "seconds": 0.0001348339719697833,
+        "response_bytes": 2958,
+        "first_event_seconds": 0.00011095893569290638,
+        "producer_seconds": 3.1792e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 31792,
+              "human": "0.000032s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 7.3584e-05,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    },
+    {
+      "load_average": [
+        0.1103515625,
+        0.11669921875,
+        0.0986328125
+      ],
+      "query_order": [
+        "current",
+        "baseline"
+      ],
+      "current": {
+        "seconds": 0.0006198750343173742,
+        "response_bytes": 2960,
+        "first_event_seconds": 0.000589334056712687,
+        "producer_seconds": 0.000487167,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 487167,
+              "human": "0.000487s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1548,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000541375,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "baseline": {
+        "seconds": 0.0007990410085767508,
+        "response_bytes": 2959,
+        "first_event_seconds": 0.0007670829072594643,
+        "producer_seconds": 0.000672875,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 672875,
+              "human": "0.000673s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000718458,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    },
+    {
+      "load_average": [
+        0.1103515625,
+        0.11669921875,
+        0.0986328125
+      ],
+      "query_order": [
+        "baseline",
+        "current"
+      ],
+      "baseline": {
+        "seconds": 0.00020845804829150438,
+        "response_bytes": 2958,
+        "first_event_seconds": 0.00017570797353982925,
+        "producer_seconds": 4.4208e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 44208,
+              "human": "0.000044s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000113459,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "current": {
+        "seconds": 0.000144458026625216,
+        "response_bytes": 2958,
+        "first_event_seconds": 0.00012029195204377174,
+        "producer_seconds": 3.3417e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 33417,
+              "human": "0.000033s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 7.6875e-05,
+        "main_thread_runqueue_seconds": 7.416e-06
+      }
+    },
+    {
+      "load_average": [
+        0.1103515625,
+        0.11669921875,
+        0.0986328125
+      ],
+      "query_order": [
+        "current",
+        "baseline"
+      ],
+      "current": {
+        "seconds": 0.0008338330080732703,
+        "response_bytes": 2960,
+        "first_event_seconds": 0.0007969579892233014,
+        "producer_seconds": 0.000658458,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 658458,
+              "human": "0.000658s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1548,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000740042,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "baseline": {
+        "seconds": 0.0006439159624278545,
+        "response_bytes": 2959,
+        "first_event_seconds": 0.0006137079326435924,
+        "producer_seconds": 0.000516708,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 516708,
+              "human": "0.000517s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000560834,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    },
+    {
+      "load_average": [
+        0.1103515625,
+        0.11669921875,
+        0.0986328125
+      ],
+      "query_order": [
+        "baseline",
+        "current"
+      ],
+      "baseline": {
+        "seconds": 0.00019283301662653685,
+        "response_bytes": 2958,
+        "first_event_seconds": 0.00016083300579339266,
+        "producer_seconds": 3.7834e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 37834,
+              "human": "0.000038s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 9.45e-05,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "current": {
+        "seconds": 0.0001348749501630664,
+        "response_bytes": 2958,
+        "first_event_seconds": 0.00010766694322228432,
+        "producer_seconds": 3.3792e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 33792,
+              "human": "0.000034s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 8.2334e-05,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    },
+    {
+      "load_average": [
+        0.1103515625,
+        0.11669921875,
+        0.0986328125
+      ],
+      "query_order": [
+        "current",
+        "baseline"
+      ],
+      "current": {
+        "seconds": 0.0008669169619679451,
+        "response_bytes": 2960,
+        "first_event_seconds": 0.0008324999362230301,
+        "producer_seconds": 0.000693875,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 693875,
+              "human": "0.000694s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1548,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000754667,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "baseline": {
+        "seconds": 0.0009429589845240116,
+        "response_bytes": 2959,
+        "first_event_seconds": 0.0009159590117633343,
+        "producer_seconds": 0.000822417,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 822417,
+              "human": "0.000822s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000868791,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    },
+    {
+      "load_average": [
+        0.1103515625,
+        0.11669921875,
+        0.0986328125
+      ],
+      "query_order": [
+        "baseline",
+        "current"
+      ],
+      "baseline": {
+        "seconds": 0.0001920829527080059,
+        "response_bytes": 2958,
+        "first_event_seconds": 0.00015816697850823402,
+        "producer_seconds": 3.2625e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 32625,
+              "human": "0.000033s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 9.0458e-05,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "current": {
+        "seconds": 0.00017854198813438416,
+        "response_bytes": 2958,
+        "first_event_seconds": 0.00014570809435099363,
+        "producer_seconds": 3.8208e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 38208,
+              "human": "0.000038s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 9.025e-05,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    },
+    {
+      "load_average": [
+        0.1103515625,
+        0.11669921875,
+        0.0986328125
+      ],
+      "query_order": [
+        "current",
+        "baseline"
+      ],
+      "current": {
+        "seconds": 0.0006027080817148089,
+        "response_bytes": 2960,
+        "first_event_seconds": 0.0005724160000681877,
+        "producer_seconds": 0.000455375,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 455375,
+              "human": "0.000455s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1548,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000514833,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "baseline": {
+        "seconds": 0.0007191670592874289,
+        "response_bytes": 2959,
+        "first_event_seconds": 0.0006887080380693078,
+        "producer_seconds": 0.000606667,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 606667,
+              "human": "0.000607s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 0.000652666,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    },
+    {
+      "load_average": [
+        0.1103515625,
+        0.11669921875,
+        0.0986328125
+      ],
+      "query_order": [
+        "baseline",
+        "current"
+      ],
+      "baseline": {
+        "seconds": 0.00016941700596362352,
+        "response_bytes": 2958,
+        "first_event_seconds": 0.00013037491589784622,
+        "producer_seconds": 3.5291e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 35291,
+              "human": "0.000035s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 9.075e-05,
+        "main_thread_runqueue_seconds": 0.0
+      },
+      "current": {
+        "seconds": 0.00012804102152585983,
+        "response_bytes": 2958,
+        "first_event_seconds": 0.00010637508239597082,
+        "producer_seconds": 3.0875e-05,
+        "summary": {
+          "type": "summary",
+          "data": {
+            "elapsed_total": {
+              "secs": 0,
+              "nanos": 30875,
+              "human": "0.000031s"
+            },
+            "stats": {
+              "elapsed": {
+                "secs": 0,
+                "nanos": 0,
+                "human": "0.000000s"
+              },
+              "searches": 10000,
+              "searches_with_match": 10000,
+              "bytes_searched": 98896,
+              "bytes_printed": 1547,
+              "matched_lines": 10000,
+              "matches": 10000
+            }
+          },
+          "stats": {
+            "lexical_entries_visited": 1,
+            "lexical_index_admissions": 0,
+            "lexical_index_admission_failures": 0,
+            "lexical_index_admission_skips": 0,
+            "lexical_cache_hits": 0,
+            "lexical_files_evaluated": 1,
+            "index_requests": 0,
+            "incremental_cache_hits": 0,
+            "incremental_files_evaluated": 0,
+            "incremental_results_materialized": 0,
+            "query_cache_hits": 0,
+            "file_evaluation_cache_hits": 0,
+            "source_cache_hits": 0,
+            "source_parses": 0,
+            "files": 10000,
+            "bytes": 98896,
+            "matches": 10000,
+            "reading_leads": 0,
+            "occurrences": 10000,
+            "occurrences_exact": true,
+            "files_with_matches": 10000,
+            "regions_considered": 0,
+            "regions_evaluated": 0,
+            "errors": 0,
+            "skipped_paths": 0,
+            "invalid_utf8_files": 0,
+            "complete": true
+          },
+          "requests": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "request_bytes": 0,
+          "request_inputs": 0,
+          "peak_request_bytes": 0,
+          "cache_hits": 0,
+          "result_schema_version": 2
+        },
+        "main_thread_cpu_seconds": 7.4e-05,
+        "main_thread_runqueue_seconds": 0.0
+      }
+    }
+  ],
+  "cpu_counter_source": "/proc/PID/schedstat (main thread; sampled outside request timing)",
+  "median": {
+    "current": {
+      "seconds": 0.0002232920378446579,
+      "producer_seconds": 3.8208e-05,
+      "first_event_seconds": 0.00019220903050154448,
+      "response_bytes": 2958,
+      "main_thread_cpu_seconds": 9.025e-05,
+      "main_thread_runqueue_seconds": 0.0
+    },
+    "baseline": {
+      "seconds": 0.0002810830483213067,
+      "producer_seconds": 4.4833e-05,
+      "first_event_seconds": 0.0002470830222591758,
+      "response_bytes": 2958,
+      "main_thread_cpu_seconds": 0.000126292,
+      "main_thread_runqueue_seconds": 0.0
+    }
+  }
+}

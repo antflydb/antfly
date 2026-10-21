@@ -230,6 +230,26 @@ pub fn parseConfigFromSlice(alloc: Allocator, raw: []const u8) !Config {
     return try configFromOpenApi(alloc, parsed.value);
 }
 
+test "antfly model identity survives config admission cloning and serialization" {
+    const a = std.testing.allocator;
+    const identity = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const raw = "{\"provider\":\"antfly\",\"model\":\"google/embeddinggemma-2\",\"api_url\":\"http://localhost:8082\",\"model_identity\":\"" ++ identity ++ "\"}";
+    var config = try parseConfigFromSlice(a, raw);
+    defer config.deinit(a);
+    var cloned = try config.clone(a);
+    defer cloned.deinit(a);
+    const encoded = try stringifyAlloc(a, cloned);
+    defer a.free(encoded);
+    var restored = try parseConfigFromSlice(a, encoded);
+    defer restored.deinit(a);
+    try std.testing.expectEqualStrings(identity, restored.model_identity);
+    try std.testing.expectEqualStrings(config.url, restored.url);
+    inline for (.{ "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }) |invalid| {
+        try std.testing.expectError(error.InvalidEmbedderConfig, parseConfigFromSlice(a, "{\"provider\":\"antfly\",\"model\":\"m\",\"model_identity\":\"" ++ invalid ++ "\"}"));
+    }
+    try std.testing.expectError(error.InvalidEmbedderConfig, parseConfigFromSlice(a, "{\"provider\":\"openai\",\"model\":\"m\",\"model_identity\":\"" ++ identity ++ "\"}"));
+}
+
 pub fn parseConfigFromValue(alloc: Allocator, value: json.Value) !Config {
     const parsed = try json.parseFromValue(openapi.EmbedderConfig, alloc, value, .{});
     defer parsed.deinit();

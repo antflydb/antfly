@@ -71,6 +71,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "empty activation page validates source catalog without probing external parents",
         "SQL API cross-table MERGE retains both source and target range proofs",
         "api http server authenticates bounded online merge owner routes",
+        "online merge ingress bounds owner work using the transport clock",
         "online merge private standalone rewrite port pins authority and never fabricates Raft coordinates",
         "online merge private port fences owners cancellation and deadlines before dispatch",
         "online merge private port preserves source recovery errors through foreign runtime dispatch",

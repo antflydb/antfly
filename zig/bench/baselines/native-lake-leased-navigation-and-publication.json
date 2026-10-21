@@ -1,0 +1,99 @@
+{
+  "base_commit": "ff1a686da80dd03b9533bfeac37fd5a428442ef6",
+  "merged_main": "beb332c973eaf78876f9ef798d3d959fe41f307d",
+  "zig_version": "0.17.0",
+  "build": "Debug",
+  "scope": "Deterministic correctness and allocation/write-amplification regressions; no archive-scale latency, RSS, cloud-provider or DuckDB parity claim.",
+  "cached_borrowed_numeric": {
+    "exact_input": "9007199254740993.1200",
+    "requested_results": 16384,
+    "output_budget_bytes": 4194304,
+    "before_sum": {
+      "completed_results": 10057,
+      "peak_bytes": 3744698,
+      "termination": "OutOfMemory"
+    },
+    "after_sum": {
+      "completed_results": 16384,
+      "peak_bytes": 962324
+    },
+    "after_avg": {
+      "completed_results": 16384,
+      "peak_bytes": 869998
+    },
+    "shared_memo_immutable": true
+  },
+  "public_navigation_windows": {
+    "files": 1024,
+    "key_bytes": 32,
+    "value_bytes": 64,
+    "admitted_window_files": 64,
+    "before_per_file": {
+      "page_writes": 4367,
+      "encoded_bytes": 60064754
+    },
+    "after_per_window": {
+      "page_writes": 121,
+      "encoded_bytes": 1817317
+    },
+    "exact_cardinality_and_values": true
+  },
+  "disjoint_tree_join": {
+    "records": 24000,
+    "value_bytes": 128,
+    "written_bytes": 8218,
+    "page_reads": 6,
+    "verified": [
+      "reversed ranges",
+      "unequal heights",
+      "overlapping envelopes decline without writes",
+      "original attempt identities",
+      "ordered exact records",
+      "allocation failures"
+    ]
+  },
+  "decoded_navigation": {
+    "warm_request_allocations": 0,
+    "warm_bytes_and_entries_share_identity": true,
+    "read_quota_charged_on_hits": true,
+    "cache_workspace_decline_preserves_required_read": true,
+    "max_resident_bytes": 4194304,
+    "max_loading_bytes": 8388608,
+    "max_loaders": 4
+  },
+  "archive_comparison": {
+    "status": "not_run",
+    "reason": "The 142577-row HN fixture is not on this machine; real-provider qualification remains deferred."
+  },
+  "aggregate_serving_frame": {
+    "groups": 512,
+    "unselected_value_bytes_per_group": 8192,
+    "output_budget_bytes": 524288,
+    "output_peak_bytes": 122684,
+    "owned_minimum_survives_reader_close": true,
+    "prefetch_enabled": true
+  },
+  "measurement_base_main": "833e2ffa40959498707390fe10ab5f92bf1bf68a",
+  "validation": {
+    "lake_integration_before_main_merge": {
+      "shared_passed": 382,
+      "native_passed": 580,
+      "failed": 0,
+      "leaked": 0
+    },
+    "cached_numeric_cases_passed": 1,
+    "navigation_and_frame_cases_passed": 3,
+    "post_merge_graph_page_cases_passed": 25,
+    "post_merge_real_parquet_iceberg_e2e_passed": 22,
+    "post_merge_e2e_seconds": 214.81,
+    "final_server_build": "Debug, stripped; Zig 0.17.0",
+    "checks": [
+      "Zig formatting",
+      "license headers",
+      "Apache boundary",
+      "source catalogue",
+      "regenerated inference error catalogue",
+      "git diff --check"
+    ]
+  }
+}

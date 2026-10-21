@@ -36,7 +36,7 @@ fn entry(entity: std.json.Value) !?struct { local: []const u8, ref: std.json.Val
     if (entity != .object) return error.InvalidResolutionArtifact;
     const decision = entity.object.get("decision") orelse return error.InvalidResolutionArtifact;
     if (decision != .string) return error.InvalidResolutionArtifact;
-    if (std.mem.eql(u8, decision.string, "review") or std.mem.eql(u8, decision.string, "reject")) return null;
+    if (std.mem.eql(u8, decision.string, "suppressed") or std.mem.eql(u8, decision.string, "review") or std.mem.eql(u8, decision.string, "reject")) return null;
     if (!std.mem.eql(u8, decision.string, "new") and !std.mem.eql(u8, decision.string, "match")) return error.InvalidResolutionArtifact;
     const local = entity.object.get("local_id") orelse return error.InvalidResolutionArtifact;
     const ref = entity.object.get("doc_ref") orelse return error.InvalidResolutionArtifact;

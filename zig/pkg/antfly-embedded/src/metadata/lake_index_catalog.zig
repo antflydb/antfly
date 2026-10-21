@@ -26,7 +26,7 @@ pub const Digest = [32]u8;
 pub const Token = [16]u8;
 pub const DirectoryRef = struct { artifact_id: []const u8, checksum: []const u8, byte_len: u64, count: u32 };
 pub const max_directory_artifacts: usize = 4096;
-pub const native_reader_protocol: u16 = 54;
+pub const native_reader_protocol: u16 = 65;
 
 // Catalog envelopes must remain readable so reconciliation can replace older
 // derived formats. Serving still requires the current reader protocol.
@@ -76,7 +76,11 @@ pub const Attempt = struct {
         if (self.generation == 0 or std.mem.allEqual(u8, &self.token, 0) or self.lease_expires_at_ms <= self.started_at_ms) return error.InvalidLakeIndexCatalog;
     }
 };
+pub const ReductionRange = struct { first: Digest, last: Digest, files: u32 };
 pub const FileContribution = struct {
+    /// Authenticated Patricia-tree bounds permit path-copy file updates.
+    /// Absent on legacy reductions; those reconcile once before delta reuse.
+    radix: ?ReductionRange = null,
     file: Digest,
     recipe: Digest,
     name: []const u8,

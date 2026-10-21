@@ -114,7 +114,7 @@ pub const Capture = struct {
             return;
         }
         const artifact = publication.guardedArtifactKey(key);
-        if (!artifact and !keys.isStoredDocumentRowKey(key) and !keys.isTtlKey(key)) return;
+        if (!artifact and !keys.isStoredSourceRowKey(key) and !keys.isTtlKey(key)) return;
         if (self.staged) return error.RetainedEffectsMixedControl;
         if (!self.checked) {
             self.selected = try publication.authority(txn);

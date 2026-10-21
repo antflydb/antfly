@@ -187,6 +187,26 @@ test "ordered artifact inventory completion control preserves bounded binary cla
         }
     };
     try std.testing.checkAllAllocationFailures(alloc, Harness.run, .{bytes});
+    // The compact transport has a distinct completion discriminator. Dropping
+    // this domain changes the authenticated digest and stalls grouped work.
+    var grouped = command;
+    const group_document = try @import("group_source_identity.zig").anchor(alloc, 1, @splat(2), @splat(3));
+    defer alloc.free(group_document);
+    grouped.completion.?.document_key = group_document;
+    grouped.completion.?.group_producers = true;
+    grouped.publication_digest = grouped.digest();
+    try grouped.validate(alloc);
+    const grouped_bytes = try codec.encodeAlloc(alloc, grouped);
+    defer alloc.free(grouped_bytes);
+    var grouped_decoded = try codec.decodeBorrowed(alloc, grouped_bytes);
+    defer grouped_decoded.deinit();
+    try std.testing.expectEqualDeep(grouped, grouped_decoded.command);
+    try grouped_decoded.command.validate(alloc);
+    const grouped_json = try std.json.Stringify.valueAlloc(alloc, grouped, .{});
+    defer alloc.free(grouped_json);
+    var grouped_parsed = try std.json.parseFromSlice(publication.Command, alloc, grouped_json, .{});
+    defer grouped_parsed.deinit();
+    try std.testing.expectEqualDeep(grouped, grouped_parsed.value);
 }
 
 test "ordered artifact inventory census control binds binary identity limits and receiver claims" {

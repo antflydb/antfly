@@ -32,9 +32,11 @@ const raw_mod = @import("raw.zig");
 pub const testing = @import("testing.zig");
 
 test {
+    _ = @import("lossless.zig");
     _ = testing;
     _ = raw_mod;
     _ = @import("validate_typed.zig");
+    _ = @import("string_scan.zig");
 }
 
 const Allocator = std.mem.Allocator;
@@ -51,6 +53,7 @@ pub const Scanner = std.json.Scanner;
 pub const validate = std.json.validate;
 pub const validateTyped = @import("validate_typed.zig").validateTyped;
 pub const scanValue = @import("validate_typed.zig").scanValue;
+pub const value_strings = @import("string_scan.zig");
 pub const ValueScanner = @import("validate_typed.zig").ValueScanner;
 pub const ObjectKeyWorkspace = @import("object_key_workspace.zig").ObjectKeyWorkspace;
 pub const MemberObserver = @import("validate_typed.zig").MemberObserver;
@@ -69,6 +72,10 @@ pub const Parsed = std.json.Parsed;
 pub const parseFromTokenSource = std.json.parseFromTokenSource;
 pub const parseFromTokenSourceLeaky = std.json.parseFromTokenSourceLeaky;
 pub const innerParse = std.json.innerParse;
+pub const parseValueLossless = @import("lossless.zig").parse;
+pub const parseValueLosslessLeaky = @import("lossless.zig").parseLeaky;
+pub const stringifyValueAlloc = @import("lossless.zig").stringify;
+
 pub const parseFromValue = std.json.parseFromValue;
 pub const parseFromValueLeaky = std.json.parseFromValueLeaky;
 pub const innerParseFromValue = std.json.innerParseFromValue;

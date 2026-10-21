@@ -1,0 +1,347 @@
+{
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "architecture": "arm64",
+  "load_average": [
+    10.3515625,
+    15.7822265625,
+    44.4052734375
+  ],
+  "mib": 32,
+  "rounds": 3,
+  "binaries": {
+    "antfly-grep": {
+      "path": "/private/tmp/antfly-grep-native-verified/bin/antfly-grep",
+      "sha256": "ee6a3882b0f00cda78c7f492758f227cada483e6b7cae23dc8be68dfde18fdb5",
+      "version": "antfly-grep 0.1.0\nZig 0.17.0 fast\nnative regex, PCRE-style VM, compression, encoding"
+    },
+    "ripgrep": {
+      "path": "/Users/ajroetker/.codex/packages/app-server-daemon/releases/0.163.0-aarch64-apple-darwin/codex-path/rg",
+      "sha256": "27d09e29c478fddbfc750a2cb5fd06965bad0ea223e776f8667160a0de63c6e4",
+      "version": "ripgrep 15.2.0 (rev e89fff89ac)\n\nfeatures:+pcre2\nsimd(compile):+NEON\nsimd(runtime):+NEON\n\nPCRE2 10.45 is available (JIT is available)"
+    }
+  },
+  "cases": {
+    "literal-miss": {
+      "antfly-grep": {
+        "seconds": 0.014439666992984712,
+        "mib_per_second": 2216.1165981481395,
+        "peak_rss_kib": 35296.0,
+        "runs": [
+          {
+            "seconds": 0.014439666992984712,
+            "peak_rss_kib": 35296.0,
+            "exit": 1
+          },
+          {
+            "seconds": 0.014715541037730873,
+            "peak_rss_kib": 35296.0,
+            "exit": 1
+          },
+          {
+            "seconds": 0.014084666967391968,
+            "peak_rss_kib": 35296.0,
+            "exit": 1
+          }
+        ]
+      },
+      "ripgrep": {
+        "seconds": 0.007861958001740277,
+        "mib_per_second": 4070.2310655694073,
+        "peak_rss_kib": 3888.0,
+        "runs": [
+          {
+            "seconds": 0.007861958001740277,
+            "peak_rss_kib": 3888.0,
+            "exit": 1
+          },
+          {
+            "seconds": 0.007642457960173488,
+            "peak_rss_kib": 3824.0,
+            "exit": 1
+          },
+          {
+            "seconds": 0.007932874956168234,
+            "peak_rss_kib": 3872.0,
+            "exit": 1
+          }
+        ]
+      }
+    },
+    "regex-prefix-miss": {
+      "antfly-grep": {
+        "seconds": 0.027372750104404986,
+        "mib_per_second": 1169.0453305872115,
+        "peak_rss_kib": 35296.0,
+        "runs": [
+          {
+            "seconds": 0.027372750104404986,
+            "peak_rss_kib": 35296.0,
+            "exit": 1
+          },
+          {
+            "seconds": 0.02716337505262345,
+            "peak_rss_kib": 35296.0,
+            "exit": 1
+          },
+          {
+            "seconds": 0.02757645898964256,
+            "peak_rss_kib": 35296.0,
+            "exit": 1
+          }
+        ]
+      },
+      "ripgrep": {
+        "seconds": 0.008113707997836173,
+        "mib_per_second": 3943.9410074184652,
+        "peak_rss_kib": 4224.0,
+        "runs": [
+          {
+            "seconds": 0.007937832968309522,
+            "peak_rss_kib": 4208.0,
+            "exit": 1
+          },
+          {
+            "seconds": 0.008113707997836173,
+            "peak_rss_kib": 4224.0,
+            "exit": 1
+          },
+          {
+            "seconds": 0.008122375002130866,
+            "peak_rss_kib": 4208.0,
+            "exit": 1
+          }
+        ]
+      }
+    },
+    "regex-prefix-hit": {
+      "antfly-grep": {
+        "seconds": 0.016639082925394177,
+        "mib_per_second": 1923.1820550667264,
+        "peak_rss_kib": 35328.0,
+        "runs": [
+          {
+            "seconds": 0.016639082925394177,
+            "peak_rss_kib": 35328.0,
+            "exit": 0
+          },
+          {
+            "seconds": 0.016376082901842892,
+            "peak_rss_kib": 35328.0,
+            "exit": 0
+          },
+          {
+            "seconds": 0.016837457893416286,
+            "peak_rss_kib": 35328.0,
+            "exit": 0
+          }
+        ]
+      },
+      "ripgrep": {
+        "seconds": 0.008024750044569373,
+        "mib_per_second": 3987.6613623050794,
+        "peak_rss_kib": 4304.0,
+        "runs": [
+          {
+            "seconds": 0.008024750044569373,
+            "peak_rss_kib": 4272.0,
+            "exit": 0
+          },
+          {
+            "seconds": 0.007949249935336411,
+            "peak_rss_kib": 4272.0,
+            "exit": 0
+          },
+          {
+            "seconds": 0.008090500021353364,
+            "peak_rss_kib": 4304.0,
+            "exit": 0
+          }
+        ]
+      }
+    },
+    "casefold-literal": {
+      "antfly-grep": {
+        "seconds": 0.1301940840203315,
+        "mib_per_second": 245.7867877459627,
+        "peak_rss_kib": 35552.0,
+        "runs": [
+          {
+            "seconds": 0.1301940840203315,
+            "peak_rss_kib": 35520.0,
+            "exit": 0
+          },
+          {
+            "seconds": 0.13150491705164313,
+            "peak_rss_kib": 35552.0,
+            "exit": 0
+          },
+          {
+            "seconds": 0.12996058305725455,
+            "peak_rss_kib": 35520.0,
+            "exit": 0
+          }
+        ]
+      },
+      "ripgrep": {
+        "seconds": 0.04201262502465397,
+        "mib_per_second": 761.6754648419833,
+        "peak_rss_kib": 4896.0,
+        "runs": [
+          {
+            "seconds": 0.04201262502465397,
+            "peak_rss_kib": 4896.0,
+            "exit": 0
+          },
+          {
+            "seconds": 0.04053516697604209,
+            "peak_rss_kib": 4816.0,
+            "exit": 0
+          },
+          {
+            "seconds": 0.05767016706522554,
+            "peak_rss_kib": 4720.0,
+            "exit": 0
+          }
+        ]
+      }
+    },
+    "unicode-word": {
+      "antfly-grep": {
+        "seconds": 0.22107991599477828,
+        "mib_per_second": 149.56869774012824,
+        "peak_rss_kib": 36736.0,
+        "runs": [
+          {
+            "seconds": 0.22178579191677272,
+            "peak_rss_kib": 36720.0,
+            "exit": 0
+          },
+          {
+            "seconds": 0.22107991599477828,
+            "peak_rss_kib": 36720.0,
+            "exit": 0
+          },
+          {
+            "seconds": 0.2177835420006886,
+            "peak_rss_kib": 36736.0,
+            "exit": 0
+          }
+        ]
+      },
+      "ripgrep": {
+        "seconds": 0.15965087490621954,
+        "mib_per_second": 207.11840853524666,
+        "peak_rss_kib": 4720.0,
+        "runs": [
+          {
+            "seconds": 0.15523766702972353,
+            "peak_rss_kib": 4688.0,
+            "exit": 0
+          },
+          {
+            "seconds": 0.1597482090583071,
+            "peak_rss_kib": 4720.0,
+            "exit": 0
+          },
+          {
+            "seconds": 0.15965087490621954,
+            "peak_rss_kib": 4640.0,
+            "exit": 0
+          }
+        ]
+      }
+    },
+    "small-files": {
+      "antfly-grep": {
+        "seconds": 0.02245187503285706,
+        "mib_per_second": 11.217161734064506,
+        "peak_rss_kib": 3392.0,
+        "runs": [
+          {
+            "seconds": 0.02245187503285706,
+            "peak_rss_kib": 3376.0,
+            "exit": 0
+          },
+          {
+            "seconds": 0.02162175008561462,
+            "peak_rss_kib": 3392.0,
+            "exit": 0
+          },
+          {
+            "seconds": 0.023140541976317763,
+            "peak_rss_kib": 3360.0,
+            "exit": 0
+          }
+        ]
+      },
+      "ripgrep": {
+        "seconds": 0.023189791943877935,
+        "mib_per_second": 10.86022307082619,
+        "peak_rss_kib": 4672.0,
+        "runs": [
+          {
+            "seconds": 0.023189791943877935,
+            "peak_rss_kib": 4672.0,
+            "exit": 0
+          },
+          {
+            "seconds": 0.02173445897642523,
+            "peak_rss_kib": 4672.0,
+            "exit": 0
+          },
+          {
+            "seconds": 0.02364291704725474,
+            "peak_rss_kib": 4608.0,
+            "exit": 0
+          }
+        ]
+      }
+    },
+    "mmap-literal": {
+      "antfly-grep": {
+        "seconds": 0.014290791936218739,
+        "mib_per_second": 2239.203106287213,
+        "peak_rss_kib": 35312.0,
+        "runs": [
+          {
+            "seconds": 0.014290791936218739,
+            "peak_rss_kib": 35296.0,
+            "exit": 1
+          },
+          {
+            "seconds": 0.014903875067830086,
+            "peak_rss_kib": 35312.0,
+            "exit": 1
+          },
+          {
+            "seconds": 0.013966375030577183,
+            "peak_rss_kib": 35296.0,
+            "exit": 1
+          }
+        ]
+      },
+      "ripgrep": {
+        "seconds": 0.007752625038847327,
+        "mib_per_second": 4127.632322540787,
+        "peak_rss_kib": 3888.0,
+        "runs": [
+          {
+            "seconds": 0.008614124963060021,
+            "peak_rss_kib": 3872.0,
+            "exit": 1
+          },
+          {
+            "seconds": 0.007752625038847327,
+            "peak_rss_kib": 3888.0,
+            "exit": 1
+          },
+          {
+            "seconds": 0.007456208928488195,
+            "peak_rss_kib": 3872.0,
+            "exit": 1
+          }
+        ]
+      }
+    }
+  }
+}

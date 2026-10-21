@@ -246,6 +246,24 @@ fn partition(b: *std.Build, executable: *std.Build.Step.Compile) ?*std.Build.Ste
     return artifact;
 }
 
+const LocalInstall = struct {
+    consumer: *std.Build.Step.Compile,
+    step: *std.Build.Step,
+    basename: []const u8,
+    installed: bool = false,
+};
+var local_installs: std.ArrayList(LocalInstall) = .empty;
+
+/// Install the physical implementation owner, after source bindings finalize.
+/// Installing the consumer alone silently omits named-dependency tests.
+pub fn installLocalArtifact(b: *std.Build, consumer: *std.Build.Step.Compile, step_name: []const u8, description: []const u8, basename: []const u8) void {
+    local_installs.append(b.allocator, .{
+        .consumer = consumer,
+        .step = b.step(step_name, description),
+        .basename = basename,
+    }) catch @panic("OOM");
+}
+
 /// Aggregate selection rules describe the original consumer surface. Apply the
 /// same exclusions to its local partition, whose physical root is the catalog.
 pub fn consumerFor(artifact: *std.Build.Step.Compile) *std.Build.Step.Compile {
@@ -325,6 +343,12 @@ fn hasInventory(run: *std.Build.Step.Run, artifact: *std.Build.Step.Compile, fla
 }
 
 pub fn add(b: *std.Build) void {
+    for (local_installs.items) |*install| {
+        if (install.installed) continue;
+        const local = partition(b, install.consumer) orelse @panic("portable tests require a local implementation owner");
+        install.step.dependOn(&b.addInstallArtifact(local, .{ .dest_sub_path = install.basename }).step);
+        install.installed = true;
+    }
     var runs: std.ArrayList(*std.Build.Step.Run) = .empty;
     var visited = std.AutoHashMap(*std.Build.Step, void).init(b.allocator);
     for (b.top_level_steps.values()) |top| collect(&top.step, &runs, &visited, b.allocator);

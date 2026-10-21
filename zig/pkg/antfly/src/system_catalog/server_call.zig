@@ -108,6 +108,7 @@ pub const Call = union(enum) {
     table_status: TableStatusTarget,
     write_validation: []const u8,
     write_validation_revision: void,
+    resolver_catalog_read: @import("../metadata/resolver_catalog_read.zig").Request,
 
     pub fn requiresAdministrativeGrant(self: @This()) bool {
         return switch (self) {

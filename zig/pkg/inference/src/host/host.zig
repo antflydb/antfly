@@ -3104,6 +3104,8 @@ fn localModelCapabilitiesInScope(
             inference_work.PromptPolicy,
             inference.server.resolvedTaskPromptPolicy(@tagName(task)),
         ).?,
+        .generation_grammar_v1 = task == .generate and inference.server.resolvedExecutorKind("generate", &manifest) == .native_generation,
+        .generation_token_logprobs_v1 = task == .generate and inference.server.resolvedExecutorKind("generate", &manifest) == .native_generation,
         .borrowed_attachments = task == .read or task == .generate or task == .embed or task == .extract,
         .borrowed_rasters = (task == .read and manifest.native_arch_hint == .florence) or
             (task == .embed and modalities.image),
@@ -3120,14 +3122,15 @@ fn localModelCapabilitiesInScope(
             try result.accepted_mime_types.add(mime_type);
         }
     }
-    if (task == .embed) {
-        result.model_aware_chunking_v1 = true;
+    if (task == .embed) result.model_aware_chunking_v1 = true;
+    if (task == .embed or task == .generate) {
         // Identity inspection reads the receipt/manifest, never model weights.
         // Prefer the immutable loaded generation if it already exists.
         if (node.model_manager.acquireLoadedModel(model_path)) |cached| {
             var loaded = cached;
             defer loaded.release();
             result.model_revision = loaded.get().resolution_revision;
+            if (result.model_revision == null and task == .generate) result.model_revision = try node.model_manager.modelIdentityForManifest(model_path, manifest);
         } else {
             result.model_revision = try node.model_manager.modelIdentityForManifest(model_path, manifest);
         }

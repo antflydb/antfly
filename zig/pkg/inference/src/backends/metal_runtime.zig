@@ -3124,14 +3124,14 @@ pub fn decoderRuntimePackedGeluMultiply(self: anytype, input: MetalTensor, rows:
 }
 pub extern fn termite_metal_decode_runtime_packed_gelu(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, output: ?*anyopaque, output_offset: usize, rows: u32, width: u32) c_int;
 
-pub fn decoderRuntimeEmbeddingHeadPrepare(self: anytype, input: MetalTensor, weight: MetalTensor, gather: MetalTensor, p: @import("../ops/ops.zig").EmbeddingHeadParams) !MetalTensor {
+pub fn decoderRuntimeEmbeddingHeadPrepare(self: anytype, input: MetalTensor, weight: MetalTensor, gather: MetalTensor, p: @import("../ops/ops.zig").EmbeddingHeadParams, rotary: ?MetalTensor) !MetalTensor {
     const runtime = self.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
     var output = try MetalTensor.deviceAllocate(runtime, @as(usize, p.rows) * p.heads * p.dim * @sizeOf(f32), .private, &.{ @intCast(p.rows * p.heads), @intCast(p.dim) });
     errdefer output.deinit();
-    if (termite_metal_decode_runtime_embedding_head_prepare(runtime, input.deviceHandle(), input.deviceByteOffset(), weight.deviceHandle(), weight.deviceByteOffset(), gather.deviceHandle(), gather.deviceByteOffset(), output.deviceHandle(), output.deviceByteOffset(), &p) != 0) return error.MetalKernelDispatchFailed;
+    if (termite_metal_decode_runtime_embedding_head_prepare(runtime, input.deviceHandle(), input.deviceByteOffset(), weight.deviceHandle(), weight.deviceByteOffset(), gather.deviceHandle(), gather.deviceByteOffset(), output.deviceHandle(), output.deviceByteOffset(), if (rotary) |table| table.deviceHandle() else null, if (rotary) |table| table.deviceByteOffset() else 0, &p) != 0) return error.MetalKernelDispatchFailed;
     return output;
 }
-pub extern fn termite_metal_decode_runtime_embedding_head_prepare(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, weight: ?*anyopaque, weight_offset: usize, gather: ?*anyopaque, gather_offset: usize, output: ?*anyopaque, output_offset: usize, p: *const @import("../ops/ops.zig").EmbeddingHeadParams) c_int;
+pub extern fn termite_metal_decode_runtime_embedding_head_prepare(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, weight: ?*anyopaque, weight_offset: usize, gather: ?*anyopaque, gather_offset: usize, output: ?*anyopaque, output_offset: usize, rotary: ?*anyopaque, rotary_offset: usize, p: *const @import("../ops/ops.zig").EmbeddingHeadParams) c_int;
 
 // Select by work per item rather than total cohort rows. Tiny envelopes
 // avoid multiple MPS transitions; bounded local envelopes benefit from GEMM
@@ -3222,17 +3222,19 @@ pub fn decoderRuntimeApplyMrope(self: anytype, request: anytype) !?MetalTensor {
 /// Applies Qwen3-VL vision RoPE with axis-major height/width positions.
 /// This is intentionally device-only: the projector must not silently copy
 /// Q/K through host memory on the production Metal route.
-pub fn decoderRuntimeVisionNormRope(self: anytype, input: MetalTensor, weight: MetalTensor, p: anytype) !?MetalTensor {
+pub fn decoderRuntimeVisionNormRope(self: anytype, input: MetalTensor, weight: MetalTensor, p: anytype, rotary: ?MetalTensor) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (!input.isDevice() or !weight.isDevice() or input.dtype != .f32 or weight.dtype != .f32) return null;
-    if (p.rows == 0 or p.head_dim == 0 or p.head_dim % 4 != 0 or p.hidden % p.head_dim != 0 or p.grid_x == 0 or p.grid_y == 0 or p.theta <= 0 or input.elemCount() != @as(usize, p.rows) * p.hidden or weight.elemCount() != p.head_dim) return error.InvalidTensorShape;
-    var output = try MetalTensor.deviceAllocate(runtime, input.elemCount() * @sizeOf(f32), .private, input.shape());
+    const stride: usize = if (p.stride == 0) p.hidden else p.stride;
+    if (p.start > stride or p.hidden > stride - p.start or p.rotate > 1 or p.weighted > 1) return error.InvalidTensorShape;
+    if (p.rows == 0 or p.head_dim == 0 or p.head_dim % 4 != 0 or p.hidden % p.head_dim != 0 or p.grid_x == 0 or p.grid_y == 0 or p.theta <= 0 or input.elemCount() != @as(usize, p.rows) * (if (p.stride == 0) p.hidden else p.stride) or weight.elemCount() != p.head_dim) return error.InvalidTensorShape;
+    var output = try MetalTensor.deviceAllocate(runtime, @as(usize, p.rows) * p.hidden * @sizeOf(f32), .private, &.{ @intCast(p.rows), @intCast(p.hidden) });
     errdefer output.deinit();
-    const rc = termite_metal_decode_runtime_vision_norm_rope(runtime, input.deviceHandle(), input.deviceByteOffset(), weight.deviceHandle(), weight.deviceByteOffset(), output.deviceHandle(), output.deviceByteOffset(), &p);
+    const rc = termite_metal_decode_runtime_vision_norm_rope(runtime, input.deviceHandle(), input.deviceByteOffset(), weight.deviceHandle(), weight.deviceByteOffset(), output.deviceHandle(), output.deviceByteOffset(), if (rotary) |table| table.deviceHandle() else null, if (rotary) |table| table.deviceByteOffset() else 0, &p);
     if (rc != 0) return error.UnsupportedPrimitiveOp;
     return output;
 }
-extern fn termite_metal_decode_runtime_vision_norm_rope(runtime: ?*anyopaque, input: ?*anyopaque, input_offset: usize, weight: ?*anyopaque, weight_offset: usize, output: ?*anyopaque, output_offset: usize, params: *const @import("../ops/ops.zig").VisionNormRopeParams) c_int;
+pub extern fn termite_metal_decode_runtime_vision_norm_rope(runtime: ?*anyopaque, input: ?*anyopaque, input_offset: usize, weight: ?*anyopaque, weight_offset: usize, output: ?*anyopaque, output_offset: usize, rotary: ?*anyopaque, rotary_offset: usize, params: *const @import("../ops/ops.zig").VisionNormRopeParams) c_int;
 
 pub fn decoderRuntimeApplyVisionRope(self: anytype, request: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
@@ -10512,7 +10514,9 @@ pub fn decoderRuntimeGemma4AudioLocalAttention(
     const hidden: usize = params.hidden;
     if (rows == 0 or hidden == 0) return null;
     const elems = rows * hidden;
-    if (q.elemCount() != elems or k.elemCount() != elems or v.elemCount() != elems) return null;
+    const source_elems = if (params.qkv_stride != 0) rows * params.qkv_stride else elems;
+    if (params.qkv_stride != 0 and params.qkv_stride != hidden * 3) return error.InvalidTensorShape;
+    if (q.elemCount() != source_elems or k.elemCount() != source_elems or v.elemCount() != source_elems) return null;
     if (rel.elemCount() != @as(usize, params.context_left) * hidden) return null;
     if (q_scales.elemCount() != params.head_dim or valid.elemCount() != rows) return null;
     const shape = [_]i32{ @intCast(rows), @intCast(hidden) };
@@ -19282,6 +19286,14 @@ pub extern fn termite_metal_buffer_copy(
     dst_offset: usize,
     length: usize,
 ) c_int;
+pub const BufferGatherSource = extern struct {
+    device: ?*anyopaque = null,
+    host: ?*const anyopaque = null,
+    source_offset: usize = 0,
+    destination_offset: usize,
+    length: usize,
+};
+pub extern fn termite_metal_buffer_gather(runtime: ?*RawMetalDecodeRuntime, destination: *anyopaque, sources: [*]const BufferGatherSource, count: usize) c_int;
 pub extern fn termite_metal_buffer_copy_pair(
     runtime: ?*RawMetalDecodeRuntime,
     src_a_handle: ?*anyopaque,
@@ -23139,6 +23151,9 @@ pub const RawGemma4AudioAttentionParams = extern struct {
     logit_cap: f32,
     invalid_value: f32,
     reserved_f: f32 = 0,
+    qkv_stride: u32 = 0,
+    qkv_flags: u32 = 0,
+    qkv_bounds: [6]f32 = @splat(0),
 };
 pub extern fn termite_metal_decode_runtime_gemma4_audio_clamp_device(
     runtime: ?*RawMetalDecodeRuntime,
@@ -49542,3 +49557,62 @@ pub fn decoderRuntimeAudioClampInto(self: anytype, input: MetalTensor, output: M
 }
 
 pub extern fn antfly_metal_audio_replay_scope(runtime: ?*RawMetalDecodeRuntime, enabled: c_int) c_int;
+
+pub extern fn antfly_metal_masked_mean_batch(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, metadata: [*]const i64, sequence: usize, width: usize, dimensions: usize, batch: usize, output: ?*anyopaque, output_offset: usize, normalize: bool, segmented: bool) c_int;
+
+pub extern fn antfly_metal_compose_rows(runtime: ?*RawMetalDecodeRuntime, wrappers: ?*anyopaque, wrappers_offset: usize, wrappers_rows: usize, media: ?*anyopaque, media_offset: usize, media_rows: usize, map: [*]const i32, rows: usize, width: usize, output: ?*anyopaque, output_offset: usize) c_int;
+
+pub extern fn antfly_metal_linear_plan_builds(runtime: ?*RawMetalDecodeRuntime) u64;
+
+test "embeddinggemma2 Metal multiplication plans retain full tiles tails and descriptors across shape switches" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const Fill = struct {
+        fn fill(_: ?*anyopaque, output: [*c]f32, count: usize) callconv(.c) c_int {
+            @memset(output[0..count], 0.25);
+            return 0;
+        }
+    };
+    var bias: [64]f32 = @splat(0);
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_linear_generated_f32(runtime, 0, &bias, 64, 64, 1, null, Fill.fill));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prefer_linear_mps(runtime, 0));
+    provider.raw_linear_slot_kinds[0] = .dense;
+    provider.raw_linear_slots_prepared[0] = true;
+    provider.raw_linear_slot_in_dims[0] = 64;
+    provider.raw_linear_slot_out_dims[0] = 64;
+    var builds: u64 = 0;
+    for (0..3) |iteration| {
+        for ([_]usize{ 512, 440, 1, 128 }) |rows| {
+            const values = try std.testing.allocator.alloc(f32, rows * 64);
+            defer std.testing.allocator.free(values);
+            @memset(values, 1);
+            var input = try testDeviceTensorFromSlice(runtime, values, &.{ @intCast(rows), 64 });
+            defer input.deinit();
+            var output = try MetalTensor.deviceAllocate(runtime, rows * 64 * 4, .private, &.{ @intCast(rows), 64 });
+            defer output.deinit();
+            try std.testing.expect(try decoderRuntimeApplyAudioLinearInto(&provider, 0, input, rows, 64, 64, output));
+            for (try output.toHostSlice()) |v| try std.testing.expectApproxEqAbs(@as(f32, 16), v, 1e-5);
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_release_linear_views(runtime, 1));
+        }
+        const current = antfly_metal_linear_plan_builds(runtime);
+        if (iteration == 0) {
+            try std.testing.expectEqual(@as(u64, 4), current);
+            builds = current;
+        } else try std.testing.expectEqual(builds, current);
+    }
+    // Replacing a slot discards plans/descriptors tied to the old dimensions.
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_linear_generated_f32(runtime, 0, &bias, 64, 64, 1, null, Fill.fill));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prefer_linear_mps(runtime, 0));
+    var input = try testDeviceTensorFromSlice(runtime, &@as([64]f32, @splat(1)), &.{ 1, 64 });
+    defer input.deinit();
+    var output = try MetalTensor.deviceAllocate(runtime, 64 * 4, .private, &.{ 1, 64 });
+    defer output.deinit();
+    try std.testing.expect(try decoderRuntimeApplyAudioLinearInto(&provider, 0, input, 1, 64, 64, output));
+    try std.testing.expectEqual(builds + 1, antfly_metal_linear_plan_builds(runtime));
+}
+
+pub extern fn antfly_metal_rotary_table(runtime: ?*RawMetalDecodeRuntime, output: ?*anyopaque, offset: usize, dim: u32, x: u32, y: u32, theta: f32, vision: u32) c_int;
+
+pub extern fn antfly_metal_video_position(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, output: ?*anyopaque, output_offset: usize, rows: u32, grid_x: u32, grid_y: u32, axis: u32) c_int;

@@ -79,6 +79,15 @@ class LiteralSourceOwnership(unittest.TestCase):
         local = measurement.ZIG_ROOT / "pkg/antfly-embedded/src"
         catalog = local / "source_catalog_control.zig"
         self.assertEqual(catalog.read_text(), measurement.control_catalog_contents())
+        # These are control contracts; a new transitive physical import must
+        # fail this small check rather than silently hiding their exports.
+        for name in (
+            "common_config",
+            "api_local_backups",
+            "storage_db_resolver_curation",
+            "metadata_local_index_reconcile",
+        ):
+            self.assertIn(f"pub const {name} =", catalog.read_text())
         for relative in ("storage/db/db.zig", "storage/query.zig", "storage/write.zig"):
             with self.subTest(source=relative):
                 self.assertIsNone(

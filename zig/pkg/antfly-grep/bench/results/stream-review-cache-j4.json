@@ -1,0 +1,224 @@
+{
+  "evaluation": "synthetic_decision_transport_fixture",
+  "limitations": "Constant scores; no model quality, provider tokens, or actual cost measured.",
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "cache": true,
+  "jobs": 4,
+  "keep_alive": false,
+  "source_sha256": "00218309d26d7a20827581e28d6f8e1d55cac7f5f6311adc58faa62fa65c470d",
+  "source_bytes": 80810,
+  "lines": 2048,
+  "batch_size": 8,
+  "binaries": {
+    "antfly-grep": {
+      "sha256": "a0c151c3fcfa004971b9bdea3b0468b3303a8db97062ef2a429b96e6d8266b08",
+      "runs": [
+        {
+          "seconds": 0.010576916000000214,
+          "output_sha256": "7ea149c020f0924c0a767eef8e9a73d371ddbb6bd7bdd6cc2c0b78c405f51357",
+          "requests": 0,
+          "connections": 0,
+          "request_bytes": 0,
+          "state_bytes": 0,
+          "questions": 0
+        },
+        {
+          "seconds": 0.010499916000000109,
+          "output_sha256": "7ea149c020f0924c0a767eef8e9a73d371ddbb6bd7bdd6cc2c0b78c405f51357",
+          "requests": 0,
+          "connections": 0,
+          "request_bytes": 0,
+          "state_bytes": 0,
+          "questions": 0
+        },
+        {
+          "seconds": 0.010658874999999846,
+          "output_sha256": "7ea149c020f0924c0a767eef8e9a73d371ddbb6bd7bdd6cc2c0b78c405f51357",
+          "requests": 0,
+          "connections": 0,
+          "request_bytes": 0,
+          "state_bytes": 0,
+          "questions": 0
+        },
+        {
+          "seconds": 0.011442374999999672,
+          "output_sha256": "7ea149c020f0924c0a767eef8e9a73d371ddbb6bd7bdd6cc2c0b78c405f51357",
+          "requests": 0,
+          "connections": 0,
+          "request_bytes": 0,
+          "state_bytes": 0,
+          "questions": 0
+        },
+        {
+          "seconds": 0.010402374999999964,
+          "output_sha256": "7ea149c020f0924c0a767eef8e9a73d371ddbb6bd7bdd6cc2c0b78c405f51357",
+          "requests": 0,
+          "connections": 0,
+          "request_bytes": 0,
+          "state_bytes": 0,
+          "questions": 0
+        },
+        {
+          "seconds": 0.010442166999999891,
+          "output_sha256": "7ea149c020f0924c0a767eef8e9a73d371ddbb6bd7bdd6cc2c0b78c405f51357",
+          "requests": 0,
+          "connections": 0,
+          "request_bytes": 0,
+          "state_bytes": 0,
+          "questions": 0
+        },
+        {
+          "seconds": 0.011499791999999953,
+          "output_sha256": "7ea149c020f0924c0a767eef8e9a73d371ddbb6bd7bdd6cc2c0b78c405f51357",
+          "requests": 0,
+          "connections": 0,
+          "request_bytes": 0,
+          "state_bytes": 0,
+          "questions": 0
+        },
+        {
+          "seconds": 0.01073941600000028,
+          "output_sha256": "7ea149c020f0924c0a767eef8e9a73d371ddbb6bd7bdd6cc2c0b78c405f51357",
+          "requests": 0,
+          "connections": 0,
+          "request_bytes": 0,
+          "state_bytes": 0,
+          "questions": 0
+        },
+        {
+          "seconds": 0.010354500000000044,
+          "output_sha256": "7ea149c020f0924c0a767eef8e9a73d371ddbb6bd7bdd6cc2c0b78c405f51357",
+          "requests": 0,
+          "connections": 0,
+          "request_bytes": 0,
+          "state_bytes": 0,
+          "questions": 0
+        },
+        {
+          "seconds": 0.010151874999999588,
+          "output_sha256": "7ea149c020f0924c0a767eef8e9a73d371ddbb6bd7bdd6cc2c0b78c405f51357",
+          "requests": 0,
+          "connections": 0,
+          "request_bytes": 0,
+          "state_bytes": 0,
+          "questions": 0
+        },
+        {
+          "seconds": 0.010750249999999628,
+          "output_sha256": "7ea149c020f0924c0a767eef8e9a73d371ddbb6bd7bdd6cc2c0b78c405f51357",
+          "requests": 0,
+          "connections": 0,
+          "request_bytes": 0,
+          "state_bytes": 0,
+          "questions": 0
+        }
+      ],
+      "median_seconds": 0.010576916000000214
+    },
+    "baseline": {
+      "sha256": "abaca853e733c85c56286043ff302fb1558e89b246c31e29b6d8dae07456ca85",
+      "runs": [
+        {
+          "seconds": 0.013867416000000077,
+          "output_sha256": "7ea149c020f0924c0a767eef8e9a73d371ddbb6bd7bdd6cc2c0b78c405f51357",
+          "requests": 0,
+          "connections": 0,
+          "request_bytes": 0,
+          "state_bytes": 0,
+          "questions": 0
+        },
+        {
+          "seconds": 0.013197125000000032,
+          "output_sha256": "7ea149c020f0924c0a767eef8e9a73d371ddbb6bd7bdd6cc2c0b78c405f51357",
+          "requests": 0,
+          "connections": 0,
+          "request_bytes": 0,
+          "state_bytes": 0,
+          "questions": 0
+        },
+        {
+          "seconds": 0.012552250000000154,
+          "output_sha256": "7ea149c020f0924c0a767eef8e9a73d371ddbb6bd7bdd6cc2c0b78c405f51357",
+          "requests": 0,
+          "connections": 0,
+          "request_bytes": 0,
+          "state_bytes": 0,
+          "questions": 0
+        },
+        {
+          "seconds": 0.012349374999999885,
+          "output_sha256": "7ea149c020f0924c0a767eef8e9a73d371ddbb6bd7bdd6cc2c0b78c405f51357",
+          "requests": 0,
+          "connections": 0,
+          "request_bytes": 0,
+          "state_bytes": 0,
+          "questions": 0
+        },
+        {
+          "seconds": 0.012423167000000124,
+          "output_sha256": "7ea149c020f0924c0a767eef8e9a73d371ddbb6bd7bdd6cc2c0b78c405f51357",
+          "requests": 0,
+          "connections": 0,
+          "request_bytes": 0,
+          "state_bytes": 0,
+          "questions": 0
+        },
+        {
+          "seconds": 0.01495566600000009,
+          "output_sha256": "7ea149c020f0924c0a767eef8e9a73d371ddbb6bd7bdd6cc2c0b78c405f51357",
+          "requests": 0,
+          "connections": 0,
+          "request_bytes": 0,
+          "state_bytes": 0,
+          "questions": 0
+        },
+        {
+          "seconds": 0.012382082999999877,
+          "output_sha256": "7ea149c020f0924c0a767eef8e9a73d371ddbb6bd7bdd6cc2c0b78c405f51357",
+          "requests": 0,
+          "connections": 0,
+          "request_bytes": 0,
+          "state_bytes": 0,
+          "questions": 0
+        },
+        {
+          "seconds": 0.012120832999999998,
+          "output_sha256": "7ea149c020f0924c0a767eef8e9a73d371ddbb6bd7bdd6cc2c0b78c405f51357",
+          "requests": 0,
+          "connections": 0,
+          "request_bytes": 0,
+          "state_bytes": 0,
+          "questions": 0
+        },
+        {
+          "seconds": 0.01178708400000028,
+          "output_sha256": "7ea149c020f0924c0a767eef8e9a73d371ddbb6bd7bdd6cc2c0b78c405f51357",
+          "requests": 0,
+          "connections": 0,
+          "request_bytes": 0,
+          "state_bytes": 0,
+          "questions": 0
+        },
+        {
+          "seconds": 0.012128999999999834,
+          "output_sha256": "7ea149c020f0924c0a767eef8e9a73d371ddbb6bd7bdd6cc2c0b78c405f51357",
+          "requests": 0,
+          "connections": 0,
+          "request_bytes": 0,
+          "state_bytes": 0,
+          "questions": 0
+        },
+        {
+          "seconds": 0.012483334000000124,
+          "output_sha256": "7ea149c020f0924c0a767eef8e9a73d371ddbb6bd7bdd6cc2c0b78c405f51357",
+          "requests": 0,
+          "connections": 0,
+          "request_bytes": 0,
+          "state_bytes": 0,
+          "questions": 0
+        }
+      ],
+      "median_seconds": 0.012423167000000124
+    }
+  }
+}

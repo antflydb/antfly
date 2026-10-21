@@ -111,15 +111,15 @@ pub fn mergeSearchResultsWithRuntimeSchema(
     limit: u32,
     runtime_schema: ?runtime_schema_mod.TableSchema,
 ) !db_mod.types.SearchResult {
-    if (req.hierarchy_children != null) {
-        return try mergeHierarchyChildrenSearchResults(alloc, req, results, offset, limit);
-    }
-
-    if (requestReturnsHierarchyUnitGroups(req)) {
-        return try mergeHierarchyUnitSearchResults(alloc, req, results, offset, limit, runtime_schema);
-    }
-
-    return try mergeGenericSearchResultsWithRuntimeSchema(alloc, req, results, offset, limit, runtime_schema);
+    var merged = if (req.hierarchy_children != null)
+        try mergeHierarchyChildrenSearchResults(alloc, req, results, offset, limit)
+    else if (requestReturnsHierarchyUnitGroups(req))
+        try mergeHierarchyUnitSearchResults(alloc, req, results, offset, limit, runtime_schema)
+    else
+        try mergeGenericSearchResultsWithRuntimeSchema(alloc, req, results, offset, limit, runtime_schema);
+    errdefer merged.deinit();
+    if (req.profile) merged.value_search_profile_json = try @import("../search/value_query.zig").mergeProfilesAlloc(alloc, results);
+    return merged;
 }
 
 fn mergeGenericSearchResultsWithRuntimeSchema(
@@ -928,6 +928,7 @@ fn queryIsScoreBearing(query: db_mod.types.Query) bool {
 
 fn textQueryIsScoreBearing(query: db_mod.types.TextQuery) bool {
     return switch (query) {
+        .value, .autocomplete => true,
         .phrase,
         .multi_phrase,
         .term,

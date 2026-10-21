@@ -11,9 +11,11 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.chunker_config import ChunkerConfig
-    from ..models.enrichment_config_producer import EnrichmentConfigProducer
     from ..models.enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
+    from ..models.enrichment_producer_config import EnrichmentProducerConfig
     from ..models.execution_policy import ExecutionPolicy
+    from ..models.grouped_artifact_source import GroupedArtifactSource
+    from ..models.prior_artifact_context import PriorArtifactContext
     from ..models.transcriber_enrichment_config import TranscriberEnrichmentConfig
 
 
@@ -28,6 +30,8 @@ class EnrichmentConfig:
         Attributes:
             name (str): Stable generated artifact name.
             kind (EnrichmentKind): Managed generated artifact kind.
+            source (GroupedArtifactSource | Unset):
+            prior_context (PriorArtifactContext | Unset):
             field (str | Unset): Source field to read from the source document or source artifact payload.
             template (str | Unset): Optional template for generated text input.
             source_artifact_name (str | Unset): Existing artifact stream this enrichment consumes. Chunk enrichments may
@@ -48,11 +52,7 @@ class EnrichmentConfig:
             full_text_index (bool | Unset): When true on a chunk or asset enrichment, route generated text into the table's
                 default full-text index. Default: False.
             content_type (str | Unset): Produced asset content type for asset enrichments.
-            producer (EnrichmentConfigProducer | Unset): Write-only producer configuration. Cannot be combined with
-                producer_json or transcriber. Decision producers use type=decision and config={version, decider, questions},
-                where decider is a frozen Antfly or Jev DeciderConfig. Outputs include answers, usage, resolved model,
-                specification hash, version, and source fingerprint. Change version or specification to rebuild through the
-                enrichment lifecycle.
+            producer (EnrichmentProducerConfig | Unset):
             producer_json (str | Unset): Write-only serialized producer configuration. For managed embedding enrichments
                 Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded.
             neighbor_context (EnrichmentNeighborContextConfig | Unset): Bounded sample of the document's same-shard graph
@@ -86,6 +86,8 @@ class EnrichmentConfig:
 
     name: str
     kind: EnrichmentKind
+    source: GroupedArtifactSource | Unset = UNSET
+    prior_context: PriorArtifactContext | Unset = UNSET
     field: str | Unset = UNSET
     template: str | Unset = UNSET
     source_artifact_name: str | Unset = UNSET
@@ -97,7 +99,7 @@ class EnrichmentConfig:
     chunker_json: str | Unset = UNSET
     full_text_index: bool | Unset = False
     content_type: str | Unset = UNSET
-    producer: EnrichmentConfigProducer | Unset = UNSET
+    producer: EnrichmentProducerConfig | Unset = UNSET
     producer_json: str | Unset = UNSET
     neighbor_context: EnrichmentNeighborContextConfig | Unset = UNSET
     execution: ExecutionPolicy | Unset = UNSET
@@ -108,6 +110,14 @@ class EnrichmentConfig:
         name = self.name
 
         kind = self.kind.value
+
+        source: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.source, Unset):
+            source = self.source.to_dict()
+
+        prior_context: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.prior_context, Unset):
+            prior_context = self.prior_context.to_dict()
 
         field = self.field
 
@@ -159,6 +169,10 @@ class EnrichmentConfig:
                 "kind": kind,
             }
         )
+        if source is not UNSET:
+            field_dict["source"] = source
+        if prior_context is not UNSET:
+            field_dict["prior_context"] = prior_context
         if field is not UNSET:
             field_dict["field"] = field
         if template is not UNSET:
@@ -197,15 +211,31 @@ class EnrichmentConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.chunker_config import ChunkerConfig
-        from ..models.enrichment_config_producer import EnrichmentConfigProducer
         from ..models.enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
+        from ..models.enrichment_producer_config import EnrichmentProducerConfig
         from ..models.execution_policy import ExecutionPolicy
+        from ..models.grouped_artifact_source import GroupedArtifactSource
+        from ..models.prior_artifact_context import PriorArtifactContext
         from ..models.transcriber_enrichment_config import TranscriberEnrichmentConfig
 
         d = dict(src_dict)
         name = d.pop("name")
 
         kind = EnrichmentKind(d.pop("kind"))
+
+        _source = d.pop("source", UNSET)
+        source: GroupedArtifactSource | Unset
+        if isinstance(_source, Unset):
+            source = UNSET
+        else:
+            source = GroupedArtifactSource.from_dict(_source)
+
+        _prior_context = d.pop("prior_context", UNSET)
+        prior_context: PriorArtifactContext | Unset
+        if isinstance(_prior_context, Unset):
+            prior_context = UNSET
+        else:
+            prior_context = PriorArtifactContext.from_dict(_prior_context)
 
         field = d.pop("field", UNSET)
 
@@ -235,11 +265,11 @@ class EnrichmentConfig:
         content_type = d.pop("content_type", UNSET)
 
         _producer = d.pop("producer", UNSET)
-        producer: EnrichmentConfigProducer | Unset
+        producer: EnrichmentProducerConfig | Unset
         if isinstance(_producer, Unset):
             producer = UNSET
         else:
-            producer = EnrichmentConfigProducer.from_dict(_producer)
+            producer = EnrichmentProducerConfig.from_dict(_producer)
 
         producer_json = d.pop("producer_json", UNSET)
 
@@ -267,6 +297,8 @@ class EnrichmentConfig:
         enrichment_config = cls(
             name=name,
             kind=kind,
+            source=source,
+            prior_context=prior_context,
             field=field,
             template=template,
             source_artifact_name=source_artifact_name,

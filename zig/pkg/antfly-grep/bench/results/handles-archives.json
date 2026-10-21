@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "reproducible_mtime": 42,
+  "targets": {
+    "macos": {
+      "archive_sha256": "a37b6850fcde07cfb2a8f3202559d67587a3ba66c966ee09f4f2354c6915e8e5",
+      "binary_sha256": "8717dba9ac14cc21914094b7107cb418421e6deab66bf8a511eefe819982807c",
+      "binary_size": 7284776,
+      "verified_members_sha256": {
+        "README.md": "484d4ba0ffe81ca10035a3d99e1c6ed56e785ff9c972d0ab305a90b0ea96a5bd",
+        "share/antfly-grep/README.md": "484d4ba0ffe81ca10035a3d99e1c6ed56e785ff9c972d0ab305a90b0ea96a5bd",
+        "share/antfly-grep/COMPATIBILITY.md": "34ea3a5cd36c3cc654a40e079a52a932212ce0ecb86f2c89f426342fcffbbbf5",
+        "THIRD_PARTY_NOTICES.md": "f662ce409fbc95a7dca92aeddc9da2150369a9b482803627a81dbbc34479a364",
+        "LICENSE": "e56aea6e2b9b30b1008326f604dee4afa8c88f44a6dea7e3719592ed987b80c4",
+        "share/antfly-grep/schema/document-v1.json": "2c6e245dffefe476c140affcaee976c5cc047eeacb75fc31965557697bb91147",
+        "share/antfly-grep/schema/tables.example.json": "d1159896495f4becde17cf514de22f4205363fe5da0139a39ca2252c7096b165",
+        "share/antfly-grep/schema/tables-v1.json": "4f8eeb8176e4887ec2e90b28694a6378ceac37710985774c625a5002c2c207c6",
+        "share/antfly-grep/schema/workspace-request-v1.json": "586a8512ad2cc9c7f4ccdd16788aeab852d47beff340dd1eea548f4c70aa5e71",
+        "completions/antfly-grep.ps1": "2a36533d499ac1ee4e35aa10392a551065087539d7d8539f672151f9fd2477db",
+        "completions/antfly-grep.zsh": "ada73b78850e6df3569366e2d0ca8c15a881db87fe1d56826073136f4d82db99",
+        "completions/antfly-grep.bash": "54cc6aa01f4fbfb71eadc9cdc9a3309eea7a9d48e3ac314e0a420b6d71babf63",
+        "share/man/man1/antfly-grep.1": "51bb42b4d07b724f389af370e469549419b6d748eae72cb189cc485165fe9d4e",
+        "completions/antfly-grep.fish": "2c86fb8be81121d9a569501737b1f9c6dd1ce909c75aa4bf8c25703dba0b4c2d"
+      },
+      "member_count": 51,
+      "runtime_tested": true,
+      "linux_environment": null
+    },
+    "linux": {
+      "archive_sha256": "907035d630294e676174d4ce33f8218bc60122f07d739a7443d832cf9271fba1",
+      "binary_sha256": "ea00455edbbce3b9392ae2fd28aeacf7139f96db4f624b0e0681e8fad015a70e",
+      "binary_size": 7280760,
+      "verified_members_sha256": {
+        "README.md": "484d4ba0ffe81ca10035a3d99e1c6ed56e785ff9c972d0ab305a90b0ea96a5bd",
+        "share/antfly-grep/README.md": "484d4ba0ffe81ca10035a3d99e1c6ed56e785ff9c972d0ab305a90b0ea96a5bd",
+        "share/antfly-grep/COMPATIBILITY.md": "34ea3a5cd36c3cc654a40e079a52a932212ce0ecb86f2c89f426342fcffbbbf5",
+        "THIRD_PARTY_NOTICES.md": "f662ce409fbc95a7dca92aeddc9da2150369a9b482803627a81dbbc34479a364",
+        "LICENSE": "e56aea6e2b9b30b1008326f604dee4afa8c88f44a6dea7e3719592ed987b80c4",
+        "share/antfly-grep/schema/document-v1.json": "2c6e245dffefe476c140affcaee976c5cc047eeacb75fc31965557697bb91147",
+        "share/antfly-grep/schema/tables.example.json": "d1159896495f4becde17cf514de22f4205363fe5da0139a39ca2252c7096b165",
+        "share/antfly-grep/schema/tables-v1.json": "4f8eeb8176e4887ec2e90b28694a6378ceac37710985774c625a5002c2c207c6",
+        "share/antfly-grep/schema/workspace-request-v1.json": "586a8512ad2cc9c7f4ccdd16788aeab852d47beff340dd1eea548f4c70aa5e71",
+        "completions/antfly-grep.ps1": "2a36533d499ac1ee4e35aa10392a551065087539d7d8539f672151f9fd2477db",
+        "completions/antfly-grep.zsh": "ada73b78850e6df3569366e2d0ca8c15a881db87fe1d56826073136f4d82db99",
+        "completions/antfly-grep.bash": "54cc6aa01f4fbfb71eadc9cdc9a3309eea7a9d48e3ac314e0a420b6d71babf63",
+        "share/man/man1/antfly-grep.1": "51bb42b4d07b724f389af370e469549419b6d748eae72cb189cc485165fe9d4e",
+        "completions/antfly-grep.fish": "2c86fb8be81121d9a569501737b1f9c6dd1ce909c75aa4bf8c25703dba0b4c2d"
+      },
+      "member_count": 51,
+      "runtime_tested": true,
+      "linux_environment": "ARM64 Docker VM, two CPUs"
+    },
+    "windows": {
+      "archive_sha256": "01dcfb13807de3d04a7c0c5b5687baf2e46e0f8eee012ab922da2a81fc28a906",
+      "binary_sha256": "1bb1a8a7dc47e745eafaf146b1e8136f708bfece1b99a04f8d36ba572bfedb05",
+      "binary_size": 8172032,
+      "verified_members_sha256": {
+        "README.md": "484d4ba0ffe81ca10035a3d99e1c6ed56e785ff9c972d0ab305a90b0ea96a5bd",
+        "share/antfly-grep/README.md": "484d4ba0ffe81ca10035a3d99e1c6ed56e785ff9c972d0ab305a90b0ea96a5bd",
+        "share/antfly-grep/COMPATIBILITY.md": "34ea3a5cd36c3cc654a40e079a52a932212ce0ecb86f2c89f426342fcffbbbf5",
+        "THIRD_PARTY_NOTICES.md": "f662ce409fbc95a7dca92aeddc9da2150369a9b482803627a81dbbc34479a364",
+        "LICENSE": "e56aea6e2b9b30b1008326f604dee4afa8c88f44a6dea7e3719592ed987b80c4",
+        "share/antfly-grep/schema/document-v1.json": "2c6e245dffefe476c140affcaee976c5cc047eeacb75fc31965557697bb91147",
+        "share/antfly-grep/schema/tables.example.json": "d1159896495f4becde17cf514de22f4205363fe5da0139a39ca2252c7096b165",
+        "share/antfly-grep/schema/tables-v1.json": "4f8eeb8176e4887ec2e90b28694a6378ceac37710985774c625a5002c2c207c6",
+        "share/antfly-grep/schema/workspace-request-v1.json": "586a8512ad2cc9c7f4ccdd16788aeab852d47beff340dd1eea548f4c70aa5e71",
+        "completions/antfly-grep.ps1": "2a36533d499ac1ee4e35aa10392a551065087539d7d8539f672151f9fd2477db",
+        "completions/antfly-grep.zsh": "ada73b78850e6df3569366e2d0ca8c15a881db87fe1d56826073136f4d82db99",
+        "completions/antfly-grep.bash": "54cc6aa01f4fbfb71eadc9cdc9a3309eea7a9d48e3ac314e0a420b6d71babf63",
+        "share/man/man1/antfly-grep.1": "51bb42b4d07b724f389af370e469549419b6d748eae72cb189cc485165fe9d4e",
+        "completions/antfly-grep.fish": "2c86fb8be81121d9a569501737b1f9c6dd1ce909c75aa4bf8c25703dba0b4c2d"
+      },
+      "member_count": 51,
+      "runtime_tested": false,
+      "linux_environment": null
+    }
+  }
+}

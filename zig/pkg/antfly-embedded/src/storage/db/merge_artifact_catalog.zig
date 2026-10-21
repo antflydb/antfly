@@ -67,13 +67,13 @@ pub const Cache = struct {
 pub fn validateCheckpoint(checkpoint: anytype) !void {
     const catalogs = checkpoint.page_source_catalogs orelse {
         if (checkpoint.page_source) |source| if (source.artifact_catalog) |binding|
-            if (binding.effect_protocol == 15) return error.InvalidMergeCheckpoint;
+            if (binding.effect_protocol >= 15) return error.InvalidMergeCheckpoint;
         return;
     };
     if (checkpoint.kind != .accept and checkpoint.kind != .begin_copy) return error.InvalidMergeCheckpoint;
     const source = checkpoint.page_source orelse return error.InvalidMergeCheckpoint;
     const binding = source.artifact_catalog orelse return error.InvalidMergeCheckpoint;
-    if (!binding.valid() or binding.effect_protocol != 15 or checkpoint.page_receiver_namespace == null or
+    if (!binding.valid() or binding.effect_protocol < 15 or checkpoint.page_receiver_namespace == null or
         catalogs.indexes.len > 1024 * 1024 or catalogs.enrichments.len > 1024 * 1024 or catalogs.resolvers.len > 1024 * 1024 or
         catalogs.indexes.len + catalogs.enrichments.len + catalogs.resolvers.len > 1024 * 1024 or
         !std.mem.eql(u8, &catalogs.digest(), &binding.digest)) return error.InvalidMergeCheckpoint;

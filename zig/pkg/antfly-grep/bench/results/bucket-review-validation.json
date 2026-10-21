@@ -1,0 +1,151 @@
+{
+  "base_commit": "d1078f9584ccf02b93c45bfafc2ae2cf4e8008f0",
+  "recorded_at": "2026-10-17T19:00:00.487265+00:00",
+  "host": {
+    "platform": "macOS-27.0.1-arm64-arm-64bit",
+    "compiler": "0.17.0"
+  },
+  "build": {
+    "optimize": "ReleaseFast",
+    "strip": true,
+    "grep_only": true
+  },
+  "binaries": {
+    "macos-arm64": {
+      "sha256": "523090a7471c437a4d43d6c7e55e84c70ade20a8367da8891c64236b4e52de3e",
+      "bytes": 6627768
+    },
+    "linux-arm64": {
+      "sha256": "14398df8340d441679a2c3bef54ffd2e91cc80e4627ddf6680d3b4e003c05566",
+      "bytes": 6627824
+    },
+    "windows-x86_64": {
+      "sha256": "c72065bd1b4cb0e002aa4df3514f1ba513cba144fbb886d1c9eb5a9dddd08169",
+      "bytes": 7418880
+    }
+  },
+  "sources_sha256": {
+    "zig/pkg/antfly-grep/src/artifact_cache.zig": "da64c5219e31acf0c2e75a9b5612915f2d1d831e98db44cef5c9e3aab504c022",
+    "zig/pkg/antfly-grep/src/budget.zig": "18c74ee9b3c918b7ea1a75b9355ab006c217a097a2d7b744aac6aa9b9573a0c0",
+    "zig/pkg/antfly-grep/src/cache_codec.zig": "7c7b9214a631b7f38e7f5cddbdf5cb55b3b3b887868e7d2e017155547fdcaeb9",
+    "zig/pkg/antfly-grep/src/codec_stream.zig": "fb9183b943e0d10866c72c5905e9fd4ebc441977f0b61be62fd39f8968d2cf20",
+    "zig/pkg/antfly-grep/src/compression.zig": "3f09460e617e977e9449a67589e0fc2221d5b3067bc436f2627239d2deeb5422",
+    "zig/pkg/antfly-grep/src/concurrency.zig": "b85274a948d733dbea6d457010eac81ed708ce59dc0fda7b383660da5e3a640a",
+    "zig/pkg/antfly-grep/src/decision.zig": "bd4aef5c347c6169af20ff02c160e441bd9ea1d597dda2459c8a3ccb7ef18db2",
+    "zig/pkg/antfly-grep/src/discovery.zig": "e8bba805cb5b45d5a2888630f6b93b2be9c441c22464b2099222da50faaa5caf",
+    "zig/pkg/antfly-grep/src/document.zig": "d0acbda961bdbe4b55c1511486c75665939f39ffe5fea2f69b6e8db01a70a7d6",
+    "zig/pkg/antfly-grep/src/evidence.zig": "092a79ea0290902d73a8c0fe3bbd6af9ec244ba36d515f7535ffd1e82c2bfda5",
+    "zig/pkg/antfly-grep/src/external_dictionary.zig": "8bfba886a4bbbcc4dba4ee143adde99358f8692844a8f806c80522882e4f0047",
+    "zig/pkg/antfly-grep/src/filesystem.zig": "3ef2da9133a4cceae55287c5ca53681595352a5613f232ded8793e73e326343a",
+    "zig/pkg/antfly-grep/src/filetypes.zig": "20b562e88bf967518f97a20d7bdb27ccf24f7f8c4707481f16a09ebfeb0c8c88",
+    "zig/pkg/antfly-grep/src/http_date.zig": "8389e3fb2aedc54cb7a8f235e29d28cefd3d3a86137e67748f9555ce0bbf57ea",
+    "zig/pkg/antfly-grep/src/indexed.zig": "7ce76a691954ff841c716f1c02edfde4c8c76ee32d0afa0346bb4f985250872d",
+    "zig/pkg/antfly-grep/src/interrupt.zig": "2b9352c36fc129315588ef7d3310d6e4138753997b2802c4146991fb422d3743",
+    "zig/pkg/antfly-grep/src/local_decider.zig": "826e76d53b3ced41fafa959f2f521dcf4700dcba9364cd882d055c781ce8448f",
+    "zig/pkg/antfly-grep/src/main.zig": "d9739891ca60c29e728cc3a532d720e1876c0321714dfce9f36c76556bdfe75b",
+    "zig/pkg/antfly-grep/src/matcher.zig": "cd3860e2afc91be2d81233ea20cf8f515580af198d323061f709363e7260d20a",
+    "zig/pkg/antfly-grep/src/native_library.zig": "2d7f89fbca9980b75c5944dd85ca0c722a72e4ca1bde1c8b33bbbeab97a72d2d",
+    "zig/pkg/antfly-grep/src/options.zig": "7dc26644228c548a23ad1a9d3155e4dd6c70b8b0a4e6c8e0a149aa94be3aeb45",
+    "zig/pkg/antfly-grep/src/pcre2.zig": "4b69b3cdcc237b4618ce9c728fbd6cc6da2b0cd5c2992631ceeecf354ff11368",
+    "zig/pkg/antfly-grep/src/providers.zig": "0d3ea9bda270af65131c19da11d7d8b5a923ba89105d3b9a797c61087ae74992",
+    "zig/pkg/antfly-grep/src/regions.zig": "da17958e3bc12ff521dc27e160ea034e7b8a88921a4dd942232a7e20937ba007",
+    "zig/pkg/antfly-grep/src/root.zig": "a25b998794399f2b1948837184e13600b892c328410efa7303f10b24fef3212e",
+    "zig/pkg/antfly-grep/src/score_store.zig": "5956340004ace90c0c26f91f6c46422ca2dad40e2fd9492a2f15f997d9c518a5",
+    "zig/pkg/antfly-grep/src/setup.zig": "7033192fb3dd5b8485e37746ac9be4a9652fc143679301530b60b5895521611a",
+    "zig/pkg/antfly-grep/src/snapshot.zig": "5f852f987f59fcf51fa80a59fb32c409a06619db35c92b12e2ff682179686a40",
+    "zig/pkg/antfly-grep/src/source.zig": "97f3b0ce15aa226710981c5a01454d1ee961d76d79aaa41a960dc1732c26213f",
+    "zig/pkg/antfly-grep/src/source_cache.zig": "1f24ec9905bf3e4338c25ce5aae0a0195ff07902ac20b8fa14579d32e1552833",
+    "zig/pkg/antfly-grep/src/stream_encoding.zig": "ecfb327c4624fab32e229f47fbe6dd141a544489d353a278bb684a5ea20bc645",
+    "zig/pkg/antfly-grep/src/style.zig": "5c432d957810ea1c8157b9562e18a5757b078e36ee041c8244248b6ec5c5cfb1",
+    "zig/pkg/antfly-grep/src/terminal.zig": "9e67e71a46c405ec8b220131592c561da1ed5de5036a6de2868d006a5d7778e3",
+    "zig/pkg/antfly-grep/src/tooling.zig": "f96904ed73f94b843a635168ff6a1f454e1c310b49f00e53fa2ca68721cf050d",
+    "zig/pkg/antfly-grep/build.zig": "23691dec01ea95721e4248ee87712172392bc030f887cc00fca7b0726dd59936",
+    "zig/pkg/antfly-grep/tests/test_cli.py": "9bf99305bb782dea7beb0c6d1c5d22fe9afc6e8a96f8adb2f3f0f40e8c226eb8",
+    "zig/pkg/antfly-grep/bench/cache_scale.py": "60806b1604b462c41a6c895bcccb098a7344bc9e7ac939a7954db75bfd4a9197",
+    "zig/pkg/antfly-grep/bench/output_pipeline.py": "7de7711d61a1ba7ad1abe297c69051321c11f3e9349c25a9d9a8e898ed101f13"
+  },
+  "validation": {
+    "macos_cli": {
+      "tests": 165,
+      "skipped": 2,
+      "passed": true
+    },
+    "linux_cli": {
+      "tests": 165,
+      "skipped": 1,
+      "passed": true,
+      "cpus": 2,
+      "network": "none",
+      "image": "antfly-grep-bench-arm64:review-1164",
+      "oracle": "ripgrep 15.2.0 / PCRE2 10.45"
+    },
+    "native_unit": true,
+    "native_hardening": true,
+    "generated_tooling": true,
+    "artifact_safety": {
+      "standalone_debug_tests": 4,
+      "checks": [
+        "torn key/header/body",
+        "concurrent small buckets",
+        "large bucket compact size bound",
+        "complete identity and checksum"
+      ]
+    },
+    "windows_cross_compile": true,
+    "generated_differential": {
+      "cases": 1000,
+      "failures": 0,
+      "timeouts": 0
+    },
+    "split_failure_baseline": {
+      "old_bug_reproduced": true,
+      "symptom": "Successful left half was cached for entire input; rerun made zero requests and reported complete with no matches"
+    },
+    "regressions": [
+      "incomplete single-input subdivision is not cached",
+      "previously absent scalar table becomes visible",
+      "scalar-only waves promote batches",
+      "unaffected batches retain headers",
+      "V8 decision and V2 source artifacts migrate without inference or TTL refresh",
+      "compact local and indexed JSON reconstructs equivalent results",
+      "repeated local paths get distinct observation IDs",
+      "version 2 binary data, budgets, file overviews, revisions and flag precedence",
+      "pre-fix subdivision scores rejected through legacy cache keys",
+      "sequential scalar hits repair partially populated batches"
+    ],
+    "apache_boundary": {
+      "sources": 2077,
+      "passed": true
+    },
+    "boundary_checker_tests": {
+      "tests": 35,
+      "passed": true
+    },
+    "ruff": true,
+    "zig_format": true,
+    "license_headers": true
+  },
+  "cache_contract": {
+    "batch_format": 9,
+    "source_format": 3,
+    "header_bytes": 80,
+    "read_path": "one contiguous bucket-header read plus one bounded payload read; one open/close, no stat",
+    "batch_write": "bounded fixed offsets, identity/length/time/body checksum; concurrent or torn writes miss",
+    "source_write": "bounded packed bodies with atomic bucket rename; no sparse large-slot allocation",
+    "batch_max_logical_bytes": 50331648,
+    "source_max_logical_bytes": 1073741824,
+    "score_table_bytes": 4194304,
+    "legacy": "V5/V6/V7/V8 decisions, score-table V1 and V2 source artifacts remain readable; lazy presence inventory; old files retained until explicit clear",
+    "expiry": "Original per-score creation times retained through repair, compaction and migration",
+    "evidence_identity": "complete-subdivision-v1 appended for shapes eligible for single-input subdivision; other legacy identities preserved"
+  },
+  "limitations": [
+    "Warm filesystem on a shared macOS host; independent native Linux hardware and cold caches not qualified",
+    "Linux ARM64 runtime runs in a two-CPU VM on the same host",
+    "Windows cross-compilation only; runtime filesystem and terminal behavior not qualified",
+    "Fixture-only inference; no real-provider quality or billing claims",
+    "Memory roughly unchanged; small output and single-file cases can regress",
+    "Logical cache bounds exclude filesystem allocation overhead, transient atomic rewrite files and retained legacy files",
+    "Full upstream regex/JIT/CLI parity remains unproven"
+  ]
+}

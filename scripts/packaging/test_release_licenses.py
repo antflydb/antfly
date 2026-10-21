@@ -68,6 +68,7 @@ class ReleaseLicenseTests(unittest.TestCase):
                 "scripts/packaging/fixture_process.py",
                 "scripts/packaging/create_reproducible_tar.py",
                 "scripts/packaging/render_libantfly_pkgconfig.py",
+                "scripts/packaging/package_grep_release.py",
                 "zig/pkg/antfly-embedded/libantfly.pc.in",
                 "scripts/packaging/lite-release-README.md",
                 "scripts/packaging/embedded-release-README.md",
@@ -85,6 +86,7 @@ class ReleaseLicenseTests(unittest.TestCase):
                 destination = root / name
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(ROOT / name, destination)
+            shutil.copytree(ROOT / "zig/pkg/antfly-grep", root / "zig/pkg/antfly-grep")
             shutil.copytree(
                 ROOT / "LICENSES/third-party", root / "LICENSES/third-party"
             )
@@ -108,6 +110,7 @@ class ReleaseLicenseTests(unittest.TestCase):
                 "inference = Path.cwd().name == 'inference'\n"
                 "library = 'lib/libantfly.dylib' if any(arg.startswith('-Dtarget=aarch64-macos') for arg in args) else 'lib/libantfly.so'\n"
                 "names = ('bin/antfly-inference',) if inference else (('bin/antfly-lite',) if 'lite' in args else ('bin/antfly',)) + (library, 'include/antfly.h')\n"
+                "if 'grep' in args: names += ('bin/antfly-grep',)\n"
                 "for name in names:\n"
                 "    path = prefix / name\n"
                 "    path.parent.mkdir(parents=True, exist_ok=True)\n"
@@ -136,7 +139,7 @@ pub fn build(b: *std.Build) void {
                 )
             completions = root / "scripts/completions.sh"
             completions.write_text(
-                '#!/bin/sh\nmkdir -p "$1"\n'
+                '#!/bin/sh\nrm -rf "$1"\nmkdir -p "$1"\n'
                 'for shell in bash zsh fish; do echo fixture > "$1/antfly.$shell"; done\n'
             )
             completions.chmod(0o755)
@@ -169,9 +172,9 @@ pub fn build(b: *std.Build) void {
                 ("embedded", darwin_target, ["lite"], "LICENSES/Apache-2.0.txt"),
                 ("lite", darwin_target, ["lite"], "LICENSES/Apache-2.0.txt"),
                 ("inference", darwin_target, [], "LICENSES/Apache-2.0.txt"),
-                ("server", darwin_target, ["antfly", "capi"], "LICENSE"),
-                ("server", darwin_target, ["antfly", "capi"], "LICENSE"),
-                ("server", "aarch64-linux-musl", ["antfly", "capi"], "LICENSE"),
+                ("server", darwin_target, ["antfly", "capi", "grep"], "LICENSE"),
+                ("server", darwin_target, ["antfly", "capi", "grep"], "LICENSE"),
+                ("server", "aarch64-linux-musl", ["antfly", "capi", "grep"], "LICENSE"),
             ):
                 if compile_failed:
                     break  # Later cases require this first provider/cache to exist.
@@ -212,7 +215,11 @@ pub fn build(b: *std.Build) void {
                     args = json.loads((build_dir / "build-args.json").read_text())
                     self.assertEqual(
                         steps,
-                        [arg for arg in args if arg in ("lite", "antfly", "capi")],
+                        [
+                            arg
+                            for arg in args
+                            if arg in ("lite", "antfly", "capi", "grep")
+                        ],
                     )
                     self.assertEqual(
                         product == "server", "-Dapple-providers=false" in args

@@ -317,7 +317,7 @@ pub fn appendRelationItem(
     });
 }
 
-fn renderGraphArtifactTemplateAlloc(
+pub fn renderGraphArtifactTemplateAlloc(
     alloc: Allocator,
     template_source: []const u8,
     doc_key: []const u8,

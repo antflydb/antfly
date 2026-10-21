@@ -25,6 +25,7 @@ test {
     _ = @import("antfly_local_sources").storage_db_primary_effect;
     _ = @import("storage/db_split_vopr.zig");
     _ = @import("antfly_local_sources").storage_db_promotion_runtime;
+    _ = @import("antfly_local_sources").storage_db_entity_alias_curation;
     _ = @import("antfly_local_sources").storage_db_resolution_runtime;
     _ = @import("antfly_local_sources").storage_db_relational_index_catalog;
     _ = @import("antfly_local_sources").storage_db_relational_index_gc;

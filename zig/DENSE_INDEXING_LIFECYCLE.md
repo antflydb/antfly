@@ -494,6 +494,19 @@ fenced activation boundaries:
 
 ### Durable repair intent
 
+Generation paths are relative to the index namespace, which can differ from
+its primary container path. External roots configure `generation_storage` for
+shadow directories, readiness manifests, active-root pointers, replay sidecars,
+and retired index deletion. Lite keeps that publication state in the same
+`.aflite` file as its index data; publication must not create host-side shadow
+directories. Orphan discovery, canonical-root pruning, and candidate byte
+accounting use the same backend. Empty algebraic generation directories retain
+a durable marker until paged primary-key cleanup finishes, including across
+restart. Capacity reservations subtract materialized candidate bytes so they
+cover only remaining growth and cleanup headroom.
+External dense readiness requires complete artifact publication, independently
+of whether every document supplies a vector.
+
 Before starting reconstruction, persist an index repair intent in the DB's
 replica-local repair checkpoint. It shares the local durability boundary needed
 by replay pins, but it is not user data and is not emitted by logical table

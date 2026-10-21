@@ -47,6 +47,7 @@ def contents(zig):
         ROOT / "pkg/inference/src",
         ROOT / "lib",
         ROOT / "pkg/antfly-embedded/src",
+        ROOT / "pkg/antfly-embedded/resolver/src",
         std,
     ]
     names = set()

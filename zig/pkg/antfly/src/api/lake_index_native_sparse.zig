@@ -25,9 +25,9 @@ const rebuild = @import("../serverless/build/lake_rebuild.zig");
 const A = std.mem.Allocator;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const Declared = local.serverless_segment_sidecar_manifest.DeclaredArtifact;
-pub const metadata_version: u16 = 3;
+pub const metadata_version: u16 = 4;
 pub fn supportsMetadata(version: u16) bool {
-    return version == 2 or version == metadata_version;
+    return version == 2 or version == 3 or version == metadata_version;
 }
 pub const Root = struct {
     version: u16 = metadata_version,
@@ -96,11 +96,19 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             if (!std.mem.eql(u8, &root.recipe, &recipe) or !std.mem.eql(u8, &root.generation.domain, &store.upload_scope.?.domain)) continue;
             break root;
         } else null;
-        const previous_states = if (seed) |root| if (root.file_directory != null and !state.canUseDelta(provider, root.binding.snapshot_id)) try state.directoryFiles(ca, store.*, root.file_directory.?, root.generation.domain, cancellation) else root.file_states else &.{};
+        if (provider.resume_work) |work| if (work.file != null and seed != null) {
+            const accepted = for (candidates) |declaration| {
+                if (work.trusts(store.*, declaration.artifact) and std.mem.eql(u8, declaration.name, wanted.name)) break true;
+            } else false;
+            if (!accepted) return error.InvalidNativeLakeFileState;
+        };
+        const appending = if (provider.resume_work) |work| work.file != null else false;
+        const previous_states = if (appending) &.{} else if (seed) |root| if (root.file_directory != null and !state.canUseDelta(provider, root.binding.snapshot_id)) try state.directoryFiles(ca, store.*, root.file_directory.?, root.generation.domain, cancellation) else root.file_states else &.{};
         var plan = try state.Plan.initPaged(a, ca, provider, previous_states, if (seed) |root| root.file_directory else null, seed != null, if (seed) |root| state.canUseDelta(provider, root.binding.snapshot_id) else false);
         defer plan.deinit();
         var tracker = try state.Tracker.init(a, ca, &plan, store, cancellation);
         defer tracker.deinit();
+        tracker.cumulative_bytes = if (provider.resume_work) |work| &work.native_keys_left else null;
         const io = provider.context.io orelse return error.UnsupportedSqlExecution;
         var random: [16]u8 = undefined;
         try io.randomSecure(&random);
@@ -114,11 +122,13 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var budget: local.sql_memory_budget = .{ .backing = a, .limit = 256 * 1024 * 1024 };
         var index = try local.sparse_sparse.SparseIndex.open(budget.allocator(), path, .{ .lsm_storage = candidate_storage, .lsm_options = .{ .flush_threshold = 8 * 1024 * 1024 } });
         defer index.close();
+        var baseline = if (seed != null) try index.pinNativeCheckpoint() else null;
+        defer if (baseline) |*cut| cut.deinit();
         if (seed == null) try index.beginBulkIngestSession();
         var finished = false;
         defer if (!finished and seed == null) index.abortBulkIngestSession();
         if (seed) |root| {
-            var deletes: state.Deletes = .{ .files = if (root.file_directory != null and provider.native_delta != null and state.canUseDelta(provider, root.binding.snapshot_id)) provider.native_delta.?.prior_changed else previous_states, .directory = root.file_directory, .domain = root.generation.domain, .current = &plan };
+            var deletes: state.Deletes = .{ .files = if (appending) &.{} else if (root.file_directory != null and provider.native_delta != null and state.canUseDelta(provider, root.binding.snapshot_id)) provider.native_delta.?.prior_changed else previous_states, .directory = root.file_directory, .domain = root.generation.domain, .current = &plan };
             defer deletes.deinit();
             while (try deletes.next(a, store.*, cancellation)) |keys| {
                 defer a.free(keys);
@@ -160,7 +170,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         input_provider.enrichment_columns = @import("lake_enrichment_units.zig").configured(producer.config, "template") != null;
         const rows = try input_provider.provider().open_with_cancellation_fn.?(input_provider.provider().ptr, a, binding, cancellation);
         defer rows.deinit(a);
-        var input: u64 = 512 * 1024 * 1024;
+        var input_remaining: u64 = 512 * 1024 * 1024;
+        const input = if (provider.resume_work) |work| &work.native_input_left else &input_remaining;
         while (try rows.next(a)) |batch| {
             var page_arena = std.heap.ArenaAllocator.init(a);
             defer page_arena.deinit();
@@ -176,7 +187,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 const parent_key = try plan.privateKey(pa, ref);
                 for (try producer.units(pa, row)) |unit| {
                     const vector = (try producer.sparseUnit(pa, unit)) orelse continue;
-                    try stores.chargeReadBudget(&input, @as(u64, @intCast(vector.indices.len)) * 8 + 128);
+                    try stores.chargeReadBudget(input, @as(u64, @intCast(vector.indices.len)) * 8 + 128);
                     const key = try @import("lake_enrichment_units.zig").identity(pa, parent_key, unit);
                     try tracker.append(ref, key);
                     if (unit.chunked) {
@@ -200,11 +211,19 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         finished = true;
         var checkpoint = try index.pinNativeCheckpoint();
         defer checkpoint.deinit();
-        var output_bytes: u64 = 1024 * 1024 * 1024;
-        const generation = try files.publishCheckpoint(a, ca, &checkpoint, store, cancellation, &output_bytes, if (seed) |root| .{ .root = root.generation } else null);
-        const root: Root = .{ .binding = binding, .config_json = try std.json.Stringify.valueAlloc(ca, configs.object.get(wanted.name) orelse return error.InvalidTableIndexMetadata, .{}), .generation = generation, .recipe = recipe, .file_states = if (plan.selection == null) plan.files else &.{}, .file_directory = if (plan.selection != null) try plan.publishDirectory(a, store, generation.domain, cancellation) else null };
+        var output_remaining: u64 = 1024 * 1024 * 1024;
+        const output_bytes: files.OutputBudget = .{ .generation = &output_remaining, .work = if (provider.resume_work) |work| &work.native_output_left else null };
+        var navigation: @import("lake_index_native_directory.zig").Navigation = .{ .allocator = a };
+        defer navigation.deinit();
+        const staging_generation = if (seed != null and seed.?.generation.version == 2) null else try files.publishCheckpoint(a, ca, &checkpoint, store, cancellation, output_bytes, if (seed) |root| .{ .root = root.generation, .navigation = &navigation } else null);
+        const generation = if (staging_generation == null)
+            try files.publishExtentDelta(a, ca, checkpoint.storage, try files.checkpointExtents(ca, &baseline.?, ""), try files.checkpointExtents(ca, &checkpoint, ""), seed.?.generation, store, cancellation, output_bytes)
+        else
+            try @import("lake_index_native_directory.zig").persist(a, ca, store, staging_generation.?, if (seed) |root| root.generation else null, cancellation, if (provider.resume_work) |work| &work.native_output_left else null);
+        const root: Root = .{ .binding = binding, .config_json = try std.json.Stringify.valueAlloc(ca, configs.object.get(wanted.name) orelse return error.InvalidTableIndexMetadata, .{}), .generation = generation, .recipe = recipe, .file_states = if (!plan.isPaged()) plan.files else &.{}, .file_directory = if (plan.isPaged()) try plan.publishDirectory(a, store, generation.domain, cancellation) else null };
         const bytes = try std.json.Stringify.valueAlloc(ca, root, .{});
         if (bytes.len > files.max_root_bytes) return error.NativeLakeFilesTooLarge;
+        if (provider.resume_work) |work| try stores.chargeReadBudget(&work.native_output_left, bytes.len);
         var uploaded = try store.putWithCancellation(bytes, cancellation);
         defer uploaded.deinit(store.allocator);
         const declaration: Declared = .{ .name = wanted.name, .binding = binding, .artifact = .{ .kind = .sparse_segment, .name = wanted.name, .metadata_version = metadata_version, .artifact_id = uploaded.artifact_id, .byte_len = uploaded.byte_len, .checksum = uploaded.checksum } };

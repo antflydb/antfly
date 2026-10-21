@@ -114,7 +114,7 @@ pub const ValueScanner = struct {
                     depth += 1;
                 },
                 .string, .number, .true, .false, .null => {
-                    try scanner.skipValue();
+                    if (try scanner.peekNextTokenType() != .string or !try @import("string_scan.zig").skip(scanner)) try scanner.skipValue();
                     if (depth == 1 and member_name != null) {
                         try observer.?.member_fn(observer.?.ctx, member_name.?, scanner.input[member_start..scanner.cursor]);
                         member_name = null;
@@ -363,7 +363,10 @@ test "value scanner retains wide sibling tables within the shared budget" {
     try input.writer.writeByte('}');
     const Fixture = struct {
         fn run(backing: std.mem.Allocator, json: []const u8) !void {
-            var counted: std.testing.FailingAllocator = .init(backing, .{});
+            // Failure enumeration must not depend on whether a particular
+            // Linux allocator layout can resize/remap a decoded-key arena.
+            // Refuse resizes so every growth uses the counted alloc/copy path.
+            var counted: std.testing.FailingAllocator = .init(backing, .{ .resize_fail_index = 0 });
             var workspace: ValueScanner = .init(counted.allocator());
             defer workspace.deinit();
             for (0..4) |iteration| {

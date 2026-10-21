@@ -15501,6 +15501,24 @@ test "lite indexed namespace directory allocation failures release keys exactly 
     try std.testing.expect((try file.check()).valid);
 }
 
+// Build an old linked value explicitly: the current document writer emits
+// extent trees for large values. These codec/read-ahead fixtures must retain
+// coverage of existing linked files independently of current writer policy.
+fn linkedValueForTest(file: *NativeFile, value: []const u8) !NativeFile.IndexValue {
+    std.debug.assert(builtin.is_test);
+    var checkpoint = file.activeCheckpoint();
+    var pages = try file.pageAllocatorFromFreeMap(checkpoint);
+    defer pages.deinit();
+    const root = try file.writeValuePagesAllocated(&pages, value);
+    checkpoint.free_map_root_page = try pages.allocate();
+    checkpoint.page_count = pages.next_page_id;
+    checkpoint.commit_sequence += 1;
+    try pages.flush();
+    try file.writeFreeMapPage(checkpoint.free_map_root_page, checkpoint.page_count, pages.remainingFreePages());
+    try file.publishCheckpoint(checkpoint);
+    return .{ .root = root, .length = value.len };
+}
+
 test "lite value windows cache requested pages and retain warm extent metadata" {
     const a = std.testing.allocator;
     for ([_]bool{ false, true }) |metadata_only| {
@@ -15516,12 +15534,9 @@ test "lite value windows cache requested pages and retain warm extent metadata" 
         defer a.free(value);
         @memset(value, 'v');
         try file.putIndexCatalogRecord("wal", value);
-        try file.putDocument("chain", value);
+        const chain = try linkedValueForTest(&file, value);
         const checkpoint = file.activeCheckpoint();
-        const record = (try file.lookupDocumentIndexPage(checkpoint, "chain")).?;
-        const raw = try file.readPagePayloadByKindAlloc(a, record, .document);
-        defer a.free(raw);
-        const root = (try decodeDocumentEntry(raw)).external_value_root_page;
+        const root = chain.root;
         file.page_cache_enabled.store(true, .monotonic);
         var reader = NativeFile.ValuePageReader{};
         defer reader.deinit(&file);
@@ -17274,12 +17289,8 @@ test "lite immutable checksums traverse linked values once and seek extent range
     const bytes = try a.alloc(u8, 2 * 1024 * 1024);
     defer a.free(bytes);
     for (bytes, 0..) |*byte, i| byte.* = @truncate(i *% 17);
-    try file.putDocument("chain", bytes);
+    const chain = try linkedValueForTest(&file, bytes);
     const checkpoint = file.activeCheckpoint();
-    const reference = (try file.lookupDocumentIndexPage(checkpoint, "chain")).?;
-    var page: [65536]u8 = undefined;
-    const entry = try decodeDocumentEntry(try decodePagePayload(try file.readPageInto(reference, checkpoint, &page), .document));
-    const chain = NativeFile.IndexValue{ .root = entry.external_value_root_page, .length = entry.external_value_len };
     const start = bytes.len - 128 * 1024;
     file.test_page_reads.store(0, .monotonic);
     var crc = Crc32.init();

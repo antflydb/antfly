@@ -48,6 +48,37 @@ are shared; IDs and order are preserved. Limits: 128 inputs, 64 questions,
 2–64 choices or levels, 1 MiB per input and 16 MiB per request. Model and
 executor limits can be smaller.
 
+## Shared context batches
+
+Supporting Antfly servers accept the explicit `context_version: 1` transport
+extension. Send immutable context strings once and reference their zero-based
+indices from individual inputs:
+
+```json
+{
+  "model": "decision-model",
+  "context_version": 1,
+  "contexts": ["File: retry.py\nCONTEXT: def retry(): ..."],
+  "inputs": [
+    {"id": "line-1", "input": "TARGET: retry_count += 1", "context_index": 0},
+    {"id": "line-2", "input": "TARGET: return response", "context_index": 0}
+  ],
+  "questions": [{"name": "relevant", "type": "predicate", "instructions": "Does TARGET implement retry enforcement? Use CONTEXT only to interpret TARGET."}]
+}
+```
+
+Each referenced item is evaluated with exactly `context + "\n" + input`.
+Unreferenced items keep their original input. Answer IDs, indices, and question
+semantics are unchanged. Unknown versions, missing context arrays, invalid
+indices, and references without a version fail validation. Context arrays contain
+at most 128 nonempty UTF-8 strings; effective inputs remain limited to 1 MiB each
+and their combined expanded size is limited to 16 MiB before model admission.
+Model limits may reject smaller requests. Shared transport reduces request bytes;
+it does not imply shared model computation or lower billed token usage.
+
+`antfly-grep --decision-context shared-v1` opts into this format. Its default
+`legacy` transport remains compatible with existing endpoints.
+
 ## Embedding similarity and multi-choice
 
 [EmbeddingGemma 2](embeddinggemma2.md) advertises `embedding_similarity` and

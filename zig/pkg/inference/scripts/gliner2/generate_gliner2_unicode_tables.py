@@ -36,7 +36,7 @@ from generated_source_licenses import unicode_source_header
 
 PYTHON = (3, 12)
 UNICODE = "15.0.0"
-OUTPUT = Path(__file__).resolve().parents[2] / "src/finetune/gliner2_unicode_tables.zig"
+OUTPUT = Path(__file__).resolve().parents[4] / "lib/extracting/src/unicode_tables.zig"
 PINNED_NORMALIZER_CHARMAP_SHA256 = bytes.fromhex(
     "ce10d747170c5e102c99b841d1cdea976d54405ebc44791f9c3636741a894d8f"
 )

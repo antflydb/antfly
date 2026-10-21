@@ -15586,6 +15586,7 @@ func TestReconcileStandaloneStatefulSetSuspendPolicyPreservesExistingStorageTopo
 			}}}},
 		},
 	}
+	g.Expect(controllerutil.SetControllerReference(cluster, existing, s)).To(Succeed())
 	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, existing).Build()
 	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
 

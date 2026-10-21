@@ -125,7 +125,43 @@ fn encodedParameterKeyIsSensitive(encoded: []const u8) bool {
         index += 1;
     }
     const key = std.mem.trim(u8, decoded_buffer[0..decoded_len], &std.ascii.whitespace);
+    // Escaped separators remain part of one literal name, not another
+    // credential parameter (for example note%26token=example).
+    if (std.mem.indexOfAny(u8, key, "&;=") != null) return false;
     return fieldNameIsSensitive(key);
+}
+
+/// Scrub a request-owned provider configuration before public inspection.
+/// Generated deciders wrap providers under generator; fallback configurations
+/// can add further arrays/objects. Traverse all of them without recursion.
+/// Callers clone first so durable execution credentials remain untouched.
+pub fn redactPublicProviderConfig(a: std.mem.Allocator, root: *std.json.Value) !void {
+    var pending: std.ArrayList(*std.json.Value) = .empty;
+    defer pending.deinit(a);
+    try pending.append(a, root);
+    while (pending.pop()) |value| switch (value.*) {
+        .object => |*object| {
+            var index: usize = 0;
+            while (index < object.count()) {
+                const field = object.keys()[index];
+                const entry = object.values()[index];
+                const endpoint = std.ascii.eqlIgnoreCase(field, "url") or
+                    std.ascii.eqlIgnoreCase(field, "api_url") or
+                    std.ascii.eqlIgnoreCase(field, "base_url") or
+                    std.ascii.eqlIgnoreCase(field, "endpoint") or
+                    std.ascii.eqlIgnoreCase(field, "endpoint_url");
+                if (fieldNameIsSensitive(field) or (entry == .string and
+                    (containsSecretReference(entry.string) or (endpoint and urlContainsCredentials(entry.string)))))
+                {
+                    _ = object.swapRemove(field);
+                } else index += 1;
+            }
+            // Queue children only after removals: map compaction moves values.
+            for (object.values()) |*child| try pending.append(a, child);
+        },
+        .array => |*array| for (array.items) |*child| try pending.append(a, child),
+        else => {},
+    };
 }
 
 test "credential URL detection covers authority query fragment and secret references" {
@@ -135,4 +171,20 @@ test "credential URL detection covers authority query fragment and secret refere
     try std.testing.expect(urlContainsCredentials("https://example.com/v1#access_token=secret"));
     try std.testing.expect(!urlContainsCredentials("https://example.com/v1?timeout=10#section"));
     try std.testing.expect(containsSecretReference("${secret:inference_url}"));
+}
+
+test "URL credential aliases preserve encoded parameter boundaries" {
+    for ([_][]const u8{
+        "https://example.com?api_key=secret",
+        "https://example.com?%61pi_key=secret",
+        "https://example.com?bearer_token=secret",
+        "https://example.com?api-token=secret",
+        "https://example.com#capability_token=secret",
+        "https://example.com?note=example;api_key=secret",
+    }) |url| try std.testing.expect(urlContainsCredentials(url));
+    for ([_][]const u8{
+        "https://example.com?note=literal%26token%3Dexample",
+        "https://example.com?note%26token=literal",
+        "https://example.com?note%3Dtoken=literal",
+    }) |url| try std.testing.expect(!urlContainsCredentials(url));
 }

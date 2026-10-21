@@ -104,6 +104,7 @@ test {
     _ = gliner_boundary_long_relations;
     _ = extraction_regex;
     _ = @import("gliner_boundary_unicode.zig");
+    _ = @import("token_logprobs.zig");
     _ = @import("embedding.zig");
     _ = @import("sparse_embedding.zig");
     _ = @import("chunking.zig");

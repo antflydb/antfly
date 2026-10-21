@@ -1,0 +1,38 @@
+{
+  "measurement": "Isolate native v2/v3 encoding with a buffered raw-byte consumer.\n\nValidate complete decoded results before timing. Timed requests drain every\nframe and validate summaries/termination, but decode only control records.\nProducer CPU includes workers; raw-drain elapsed is not editor/client latency.\nUse enough requests to amortize 10 ms process CPU counter quantization.\n",
+  "host": "macOS-27.0.1-arm64-arm-64bit",
+  "driver_sha256": "b363b0fea98e6eed34b6824c47a12784e7336655ccacd2ba8563a7c5c7162503",
+  "binaries": {
+    "baseline": "57c92be2c6df4b95255b0614c7934a6fe466275e9a49b272a310f5f43ca781f4",
+    "candidate": "6a09a4c44056ecf6507332d05da889de7451d2c574a7814a8fa717e02704fbdc"
+  },
+  "requests_per_control": 128,
+  "lines": 20000,
+  "trials": [
+    {"baseline_v2":{"seconds_per_request":0.0117949791640625,"producer_cpu_per_request":0.008671875,"wire_bytes_per_request":6084765.953125},"candidate_v2":{"seconds_per_request":0.01179698275,"producer_cpu_per_request":0.00890625,"wire_bytes_per_request":6084765.984375},"baseline_v3":{"seconds_per_request":0.009147315101562501,"producer_cpu_per_request":0.0084375,"wire_bytes_per_request":4065870.125},"candidate_v3":{"seconds_per_request":0.007853579749999999,"producer_cpu_per_request":0.00734375,"wire_bytes_per_request":4065870.0}},
+    {"candidate_v2":{"seconds_per_request":0.010968074875000004,"producer_cpu_per_request":0.00828125,"wire_bytes_per_request":6084765.8359375},"baseline_v3":{"seconds_per_request":0.00864720800781249,"producer_cpu_per_request":0.008203125,"wire_bytes_per_request":4065870.03125},"candidate_v3":{"seconds_per_request":0.008254721031249995,"producer_cpu_per_request":0.007421875,"wire_bytes_per_request":4065870.109375},"baseline_v2":{"seconds_per_request":0.010531455078125002,"producer_cpu_per_request":0.008046875,"wire_bytes_per_request":6084765.46875}},
+    {"baseline_v3":{"seconds_per_request":0.008505870773437493,"producer_cpu_per_request":0.008046875,"wire_bytes_per_request":4065870.03125},"candidate_v3":{"seconds_per_request":0.007736638343750005,"producer_cpu_per_request":0.0072656249999999995,"wire_bytes_per_request":4065870.0},"baseline_v2":{"seconds_per_request":0.010961628585937508,"producer_cpu_per_request":0.00828125,"wire_bytes_per_request":6084765.7265625},"candidate_v2":{"seconds_per_request":0.010957975585937502,"producer_cpu_per_request":0.0084375,"wire_bytes_per_request":6084765.7578125}}
+  ],
+  "median": {
+    "baseline_v2": {
+      "seconds_per_request": 0.010961628585937508,
+      "producer_cpu_per_request": 0.00828125,
+      "wire_bytes_per_request": 6084765.7265625
+    },
+    "candidate_v2": {
+      "seconds_per_request": 0.010968074875000004,
+      "producer_cpu_per_request": 0.0084375,
+      "wire_bytes_per_request": 6084765.8359375
+    },
+    "baseline_v3": {
+      "seconds_per_request": 0.00864720800781249,
+      "producer_cpu_per_request": 0.008203125,
+      "wire_bytes_per_request": 4065870.03125
+    },
+    "candidate_v3": {
+      "seconds_per_request": 0.007853579749999999,
+      "producer_cpu_per_request": 0.00734375,
+      "wire_bytes_per_request": 4065870.0
+    }
+  }
+}

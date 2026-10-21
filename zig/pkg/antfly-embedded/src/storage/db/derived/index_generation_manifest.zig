@@ -23,6 +23,7 @@ const Crc32 = @import("antfly_hash").Crc32;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 
 const Allocator = std.mem.Allocator;
+const Storage = @import("../../lsm_backend.zig").Storage;
 const file_name = ".antfly-index-generation";
 const magic = "AFIDXGN1";
 const legacy_version: u32 = 1;
@@ -91,6 +92,19 @@ pub fn writeReadyForPhysicalFormat(
     ready_applied_sequence: u64,
     physical_format: PhysicalFormat,
 ) !void {
+    return writeReadyForPhysicalFormatWithStorage(null, alloc, index_path, generation_id, index_name, config_hash, ready_applied_sequence, physical_format);
+}
+
+pub fn writeReadyForPhysicalFormatWithStorage(
+    storage: ?Storage,
+    alloc: Allocator,
+    index_path: []const u8,
+    generation_id: u128,
+    index_name: []const u8,
+    config_hash: u64,
+    ready_applied_sequence: u64,
+    physical_format: PhysicalFormat,
+) !void {
     if (generation_id == 0 or index_name.len == 0 or index_name.len > max_index_name_bytes) {
         return error.InvalidIndexGenerationManifest;
     }
@@ -98,6 +112,17 @@ pub fn writeReadyForPhysicalFormat(
     defer alloc.free(path);
     const raw = try encode(alloc, generation_id, index_name, config_hash, ready_applied_sequence, physical_format);
     defer alloc.free(raw);
+    if (storage) |files| {
+        try files.createDirPath(index_path);
+        const staging = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
+        defer alloc.free(staging);
+        try files.writeFileAbsolute(staging, raw);
+        errdefer files.deleteFileAbsolute(staging) catch {};
+        try files.syncFileContentsAbsolute(staging);
+        try files.renameAbsolute(staging, path);
+        try files.syncParentAbsolute(path);
+        return;
+    }
     const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
     defer alloc.free(tmp_path);
 
@@ -121,11 +146,18 @@ pub fn writeReadyForPhysicalFormat(
 }
 
 pub fn load(alloc: Allocator, index_path: []const u8) !Manifest {
+    return loadWithStorage(null, alloc, index_path);
+}
+
+pub fn loadWithStorage(storage: ?Storage, alloc: Allocator, index_path: []const u8) !Manifest {
     const path = try manifestPathAlloc(alloc, index_path);
     defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-    const raw = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_manifest_bytes));
+    const raw = if (storage) |files|
+        try files.readFileAlloc(alloc, path, max_manifest_bytes)
+    else
+        try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_manifest_bytes));
     defer alloc.free(raw);
     return try decode(alloc, raw);
 }
@@ -137,7 +169,19 @@ pub fn validateReady(
     expected_index_name: []const u8,
     expected_config_hash: u64,
 ) !u64 {
-    return switch (try certifyReady(
+    return validateReadyWithStorage(null, alloc, index_path, expected_generation_id, expected_index_name, expected_config_hash);
+}
+
+pub fn validateReadyWithStorage(
+    storage: ?Storage,
+    alloc: Allocator,
+    index_path: []const u8,
+    expected_generation_id: ?u128,
+    expected_index_name: []const u8,
+    expected_config_hash: u64,
+) !u64 {
+    return switch (try certifyReadyWithStorage(
+        storage,
         alloc,
         index_path,
         expected_generation_id,
@@ -158,7 +202,18 @@ pub fn certifyReady(
     expected_index_name: []const u8,
     expected_config_hash: u64,
 ) !ReadyCertification {
-    var manifest = load(alloc, index_path) catch |err| switch (err) {
+    return certifyReadyWithStorage(null, alloc, index_path, expected_generation_id, expected_index_name, expected_config_hash);
+}
+
+pub fn certifyReadyWithStorage(
+    storage: ?Storage,
+    alloc: Allocator,
+    index_path: []const u8,
+    expected_generation_id: ?u128,
+    expected_index_name: []const u8,
+    expected_config_hash: u64,
+) !ReadyCertification {
+    var manifest = loadWithStorage(storage, alloc, index_path) catch |err| switch (err) {
         error.FileNotFound => return .missing,
         error.InvalidIndexGenerationManifest,
         error.FileTooBig,
@@ -324,4 +379,21 @@ test "index generation manifest decodes legacy v1 as LSM physical format" {
     defer manifest.deinit(alloc);
     try std.testing.expectEqual(PhysicalFormat.legacy_lsm, manifest.physical_format);
     try std.testing.expectEqual(@as(u64, 125), manifest.ready_applied_sequence);
+}
+
+test "index generation manifest external storage preserves certification (#1210)" {
+    const alloc = std.testing.allocator;
+    var files = @import("../../lsm_backend/mod.zig").MemoryStorage.init(alloc);
+    defer files.deinit();
+    const path = "/virtual/shadow/indexes/img";
+    try writeReadyForPhysicalFormatWithStorage(files.storage(), alloc, path, 91, "img", 44, 123, .dense_native_v2);
+    try std.testing.expectEqual(@as(u64, 123), try validateReadyWithStorage(files.storage(), alloc, path, 91, "img", 44));
+    try std.testing.expectError(error.IndexGenerationManifestMismatch, validateReadyWithStorage(files.storage(), alloc, path, 92, "img", 44));
+    const manifest_path = try manifestPathAlloc(alloc, path);
+    defer alloc.free(manifest_path);
+    const raw = try files.storage().readFileAlloc(alloc, manifest_path, max_manifest_bytes);
+    defer alloc.free(raw);
+    raw[0] ^= 1;
+    try files.storage().writeFileAbsolute(manifest_path, raw);
+    try std.testing.expectError(error.InvalidIndexGenerationManifest, validateReadyWithStorage(files.storage(), alloc, path, 91, "img", 44));
 }

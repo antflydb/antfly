@@ -272,6 +272,7 @@ pub const Handle = struct {
                 opts.index_backends.text_lsm_storage = storage;
                 opts.index_backends.dense_lsm_storage = storage;
                 opts.index_backends.vector_block_storage = storage;
+                opts.index_backends.generation_storage = storage;
                 opts.index_backends.sparse_lsm_storage = storage;
                 opts.index_backends.graph_lsm_storage = storage;
                 opts.index_repair_checkpoint_storage = storage;
@@ -294,6 +295,7 @@ pub const Handle = struct {
                 opts.index_backends.text_lsm_storage = storage;
                 opts.index_backends.dense_lsm_storage = storage;
                 opts.index_backends.vector_block_storage = storage;
+                opts.index_backends.generation_storage = storage;
                 opts.index_backends.sparse_lsm_storage = storage;
                 opts.index_backends.graph_lsm_storage = storage;
                 opts.index_backends.text_main_lsm_options.storage = storage;
@@ -367,6 +369,7 @@ pub const Handle = struct {
         opts.index_backends.text_lsm_storage = storage;
         opts.index_backends.dense_lsm_storage = storage;
         opts.index_backends.vector_block_storage = storage;
+        opts.index_backends.generation_storage = storage;
         opts.index_backends.sparse_lsm_storage = storage;
         opts.index_backends.graph_lsm_storage = storage;
         opts.index_backends.text_main_lsm_options.storage = storage;
@@ -457,6 +460,14 @@ pub const Handle = struct {
         if (self.engine != .native_single_file) return error.InvalidArgument;
         if (try self.isStandaloneArtifact()) return;
         try self.native_docstore.?.putCatalogRecord(artifact_profile_catalog_key, standalone_artifact_profile);
+    }
+
+    /// Adoption transfers catalog authority to standalone metadata. Physical
+    /// snapshots preserve this marker, so an offline client cannot create a
+    /// second schema/index authority that the server would later overwrite.
+    pub fn requireEmbeddedCatalogOwnership(self: *const Handle) !void {
+        if (self.hasStandaloneRootAdoption() or try self.isStandaloneArtifact())
+            return error.StandaloneLiteCatalogRequiresApi;
     }
 
     pub fn isStandaloneArtifact(self: *const Handle) !bool {

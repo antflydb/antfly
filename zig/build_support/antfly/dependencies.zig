@@ -605,6 +605,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .optimize = optimize,
     });
     regex_mod.addImport("antfly_fst", fst_mod);
+    regex_mod.addImport("antfly_grapheme", b.createModule(.{ .root_source_file = b.path("lib/tokenizer/src/grapheme.zig"), .target = target, .optimize = optimize }));
     regex_mod.addImport("antfly_platform", platform_mod);
     const sql_regex_mod = @import("../../lib/sql_regex/build.zig").createModule(b, target, optimize, b.path("lib/sql_regex"));
     regex_mod.addImport("antfly_capture_regex", sql_regex_mod.import_table.get("antfly_capture_regex").?);
@@ -645,6 +646,9 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     httpx_mod.addImport("antfly-json", json_mod);
     jsonschema_mod.addImport("antfly_regex", regex_mod);
     jsonschema_mod.addImport("antfly-json", json_mod);
+    jsonschema_mod.addImport("antfly_platform", platform_mod);
+    const structured_mod = b.addModule("antfly_structured", .{ .root_source_file = b.path("lib/structured/root.zig") });
+    structured_mod.addImport("antfly_jsonschema", jsonschema_mod);
     const generating_mod = b.createModule(.{
         .root_source_file = b.path("lib/generating/src/mod.zig"),
         .target = target,
@@ -690,6 +694,9 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     extracting_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
 
     // --- Inference backend detection (must precede module creation) ---
+    structured_mod.addImport("antfly_generating", generating_mod);
+    structured_mod.addImport("antfly_extracting", extracting_mod);
+
     const image_mod = image_build.createModule(b, b.path("lib/image"), target, optimize, hash_mod);
     const pdf_standard_fonts_mod = @import("fonts.zig").create(b, target, optimize);
     const font_mod = b.createModule(.{
@@ -744,6 +751,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     const tokenizer = @import("../../lib/tokenizer/build_support.zig").create(b, .{
         .platform = platform_mod,
         .root = b.path("lib/tokenizer"),
+        .grapheme = regex_mod.import_table.get("antfly_grapheme").?,
         .target = target,
         .optimize = optimize,
         .protobuf = protobuf_mod,
@@ -812,6 +820,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
             .audio_openapi = audio_openapi_mod,
             .s3_openapi = s3_openapi_mod,
             .generating_openapi = generating_openapi_mod,
+            .generating = generating_mod,
             .extraction_openapi = extraction_openapi_mod,
             .extracting = extracting_mod,
         },
@@ -1021,6 +1030,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .optimize = optimize,
     });
     inference_openai_mod.addImport("httpx", httpx_mod);
+    inference_openai_mod.addImport("antfly-json", json_mod);
     inference_openai_mod.addImport("openai_api", openai_api_mod);
     inference_openai_mod.addImport("antfly_inference_types", inference_types_mod);
     const inference_provider_defaults_mod = b.createModule(.{
@@ -1058,6 +1068,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     inference_vertex_mod.addImport("antfly_scraping", scraping_mod);
     inference_vertex_mod.addImport("httpx", httpx_mod);
+    inference_vertex_mod.addImport("antfly-json", json_mod);
     inference_vertex_mod.addImport("antfly_google", google_mod);
     inference_vertex_mod.addImport("antfly_inference_types", inference_types_mod);
     inference_vertex_mod.addImport("antfly_inference_provider_defaults", inference_provider_defaults_mod);
@@ -1287,6 +1298,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .regex = regex_mod,
         .sql_regex = sql_regex_mod,
         .json = json_mod,
+        .structured = structured_mod,
         .jsonschema = jsonschema_mod,
         .mcp = mcp_mod,
         .toon = toon_mod,

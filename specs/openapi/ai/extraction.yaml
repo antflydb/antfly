@@ -38,6 +38,33 @@ components:
           $ref: '#/components/schemas/ExtractionSchema'
         options:
           $ref: '#/components/schemas/ExtractionOptions'
+    GeneratedExtractorConfig:
+      type: object
+      additionalProperties: false
+      required: [method, generator, schema]
+      properties:
+        method:
+          type: string
+          enum: [generated]
+        generator:
+          $ref: '../shared/generating.yaml#/components/schemas/GeneratorConfig'
+        schema:
+          $ref: '#/components/schemas/ExtractionSchema'
+        entity_definitions:
+          type: object
+          additionalProperties:
+            type: string
+        instructions:
+          type: string
+          maxLength: 65536
+        output:
+          $ref: '../shared/generating.yaml#/components/schemas/ConstrainedOutput'
+        probabilities:
+          $ref: '../shared/generating.yaml#/components/schemas/ConstrainedProbabilities'
+        batch:
+          $ref: '../shared/generating.yaml#/components/schemas/ConstrainedGenerationBatch'
+        options:
+          $ref: '#/components/schemas/ExtractionOptions'
     ExtractionInput:
       type: object
       required:
@@ -436,6 +463,50 @@ components:
         resolver:
           $ref: '#/components/schemas/ExtractionResolverOptions'
       additionalProperties: true
+    GeneratedExtractionInput:
+      type: object
+      additionalProperties: false
+      required: [content]
+      properties:
+        id: { type: string, minLength: 1, maxLength: 1024 }
+        content: { type: string, maxLength: 1048576 }
+    ExtractionInputRequest:
+      description: A trained extractor request or a constrained generator request.
+      oneOf:
+        - $ref: '#/components/schemas/ExtractionRequest'
+        - $ref: '#/components/schemas/GeneratedExtractionRequest'
+    GeneratedExtractionRequest:
+      type: object
+      additionalProperties: false
+      required: [method, generator, schema, inputs]
+      properties:
+        inputs:
+          type: array
+          minItems: 1
+          maxItems: 128
+          items: { $ref: '#/components/schemas/GeneratedExtractionInput' }
+        method:
+          type: string
+          enum: [generated]
+        generator:
+          $ref: '../shared/generating.yaml#/components/schemas/GeneratorConfig'
+        schema:
+          $ref: '#/components/schemas/ExtractionSchema'
+        entity_definitions:
+          type: object
+          additionalProperties:
+            type: string
+        instructions:
+          type: string
+          maxLength: 65536
+        output:
+          $ref: '../shared/generating.yaml#/components/schemas/ConstrainedOutput'
+        probabilities:
+          $ref: '../shared/generating.yaml#/components/schemas/ConstrainedProbabilities'
+        batch:
+          $ref: '../shared/generating.yaml#/components/schemas/ConstrainedGenerationBatch'
+        options:
+          $ref: '#/components/schemas/ExtractionOptions'
     ExtractionRequest:
       type: object
       description: Atomic extraction request. Every input is validated before inference; failures return no partial
@@ -548,6 +619,15 @@ components:
     ExtractionObject:
       type: object
       properties:
+        model: { type: string }
+        probability_source:
+          type: string
+          enum: [token_logprobs, verdict]
+          description: Generated extraction confidence comes from measured decoder evidence or explicit verdict-only assertions.
+        unaligned_mentions:
+          type: integer
+          minimum: 0
+          description: Generated mention proposals dropped because they could not be aligned to the source.
         id:
           type: string
         offset_unit:

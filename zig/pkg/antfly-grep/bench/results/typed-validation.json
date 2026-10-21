@@ -1,0 +1,299 @@
+{
+  "schema_version": 1,
+  "qualification_base": "b261a10f84c42279cf3baa0ebbfb93c3d1f0de6f",
+  "merged_main": "dfc6007c5d772f199ccfe8a32a126ba1cecfac3e",
+  "compiler": "0.17.0",
+  "compiler_sha256": "1c5f706db0ed6d55451940f31dc05a6177d05696bc1fa5d853696d04c718b523",
+  "build_flags": [
+    "--build-file zig/build.zig",
+    "-Dgrep-only=true",
+    "-Doptimize=ReleaseFast",
+    "-Dstrip=true",
+    "-j2"
+  ],
+  "source_sha256": {
+    "zig/pkg/antfly-grep/src/root.zig": "a0d3063b6ea66d35a261b6436c8d48427537d6f39f1e5cb82e47212c9a90e127",
+    "zig/pkg/antfly-grep/src/workspace.zig": "b57f2536c70649325fe5563d86ee3cab478ebd9b7843354ede48717c3fb2ce91",
+    "zig/pkg/antfly-grep/src/workspace_store.zig": "37a25301a023b6c5bd1a18fdabb3591d7100c03f4aef57db6772bf50294147d5",
+    "zig/pkg/antfly-grep/src/lexical_index.zig": "866291a1699ae5a46d9a73a89eefabee813604de53dc89675c7b0ce2dff6a2ed",
+    "zig/pkg/antfly-grep/src/prepared_query.zig": "f020eb23bccb80886bd5b2a013b8a610851fe437f8a323f6a0190c344f6aa78e",
+    "zig/pkg/antfly-grep/README.md": "b8b39acd91e011c3b94b47e1ea61d61ff9b5d07ab5c68a725c57f9c34f585413",
+    "zig/pkg/antfly-grep/COMPATIBILITY.md": "192e928eb2e85b9c6b80633f331ec0e45d6fb5aeceee00adf6ffe9388c194058",
+    "zig/pkg/antfly-grep/compatibility.json": "5220514f986a1699e0cc9910fa57e7dbe3538569d35bd84d4d8bdcc81690c6dd",
+    "zig/pkg/antfly-grep/bench/lexical_reuse.py": "92d1c90c5c32115dd4e2ab45750b2bce6ec035f25c975a3884d092ca03a25003",
+    "zig/pkg/antfly-grep/bench/lexical_delta.py": "45fc119355e83994dfe1263670942fd22b1d13c568f38198f90b0c358ca4ce9b",
+    "zig/pkg/antfly-grep/bench/registered.py": "0767d1381b9ac4fb347ca4b8ff0eceaac19b3a32252ba15df50a6e14cdeb2b45",
+    "zig/pkg/antfly-grep/tests/test_cli.py": "e197e72a68f4d072f8ce3d7a4b1384cf6a826968a132fc39c7f610d9b00d779b",
+    "zig/pkg/antfly-grep/build.zig": "b699e66fbd204d68139916b372fde093020f2550630435f6ba639b89b1891f8b",
+    "zig/build.zig": "528d4c8954870304f14ad203b5b0bce00580e391ec135f83ef629072ad79ec27"
+  },
+  "report_sha256": {
+    "typed-capture-linux.json": "1f5e5bf260590a526a7b87ed45c5678fc97abd40ac8ca401864b9069de4e07d6",
+    "typed-capture-macos.json": "463d0b832bd015d88ad3a1423085d918e47c1430f158d7c4c5eb14257719e6e8",
+    "typed-delta-linux.json": "bc9e909a648c06b053f4c5923985ed8829101aeefe9ced1acd88801247b722fd",
+    "typed-delta-macos.json": "6ec9a2a6ccffa6cd5d7a96f975705c0a90617e23aea048851935ef7915077a77",
+    "typed-differential.json": "72a5b0306b55e70cdc3d341708e409c9187f89d4d805fda6ca6c38b0ceb1602d",
+    "typed-lexical-linux.json": "193063143dab8d59c0498afb430bf40e8b38fe84bc0145f42359aa982de42bd2",
+    "typed-lexical-macos.json": "219f70490f25329eff10d40e002601f7fb5bfcf6b8bfc6b8c78da63f056ac47f",
+    "typed-preparation-linux.json": "48981259a4413eece49a53ac9eb9187dff363476644a67c90769cccd29b3dcbe",
+    "typed-refresh-linux.json": "5b64e115d0b0896354d899a79cc253cf38ad8fc51e6db5a8f32a545590854fc7",
+    "typed-tiny-linux.json": "25d26e3286cfdb8c42572ab0db476670796235155159d4a8dd4430c8288dd52f",
+    "typed-tiny-macos.json": "01f04bafffcc2c5ba121fe7ef8efe474a43c950685bbd8ad96f82f0f64ef5668"
+  },
+  "archives": {
+    "macos": {
+      "binary_sha256": "19000033d633a4d2c95241abac3a27643a92a28e246deea395ee068f8038c400",
+      "archive_sha256": "de2d05d70894af0c1db5e83c69633bb640abf79ce1118164fc55ab3c6adba522",
+      "binary_bytes": 7596680,
+      "runtime_verified": true,
+      "verified_members": {
+        "README.md": "b8b39acd91e011c3b94b47e1ea61d61ff9b5d07ab5c68a725c57f9c34f585413",
+        "share/antfly-grep/README.md": "b8b39acd91e011c3b94b47e1ea61d61ff9b5d07ab5c68a725c57f9c34f585413",
+        "share/antfly-grep/COMPATIBILITY.md": "192e928eb2e85b9c6b80633f331ec0e45d6fb5aeceee00adf6ffe9388c194058",
+        "THIRD_PARTY_NOTICES.md": "d6542ec2592291421a32175d65e2a85a0d05399e250143bfccd2166e921fbcf0",
+        "LICENSE": "e56aea6e2b9b30b1008326f604dee4afa8c88f44a6dea7e3719592ed987b80c4",
+        "share/antfly-grep/schema/document-v1.json": "2c6e245dffefe476c140affcaee976c5cc047eeacb75fc31965557697bb91147",
+        "share/antfly-grep/schema/tables.example.json": "d1159896495f4becde17cf514de22f4205363fe5da0139a39ca2252c7096b165",
+        "share/antfly-grep/schema/tables-v1.json": "4f8eeb8176e4887ec2e90b28694a6378ceac37710985774c625a5002c2c207c6",
+        "share/antfly-grep/schema/workspace-request-v1.json": "586a8512ad2cc9c7f4ccdd16788aeab852d47beff340dd1eea548f4c70aa5e71",
+        "completions/antfly-grep.ps1": "2a36533d499ac1ee4e35aa10392a551065087539d7d8539f672151f9fd2477db",
+        "completions/antfly-grep.zsh": "ada73b78850e6df3569366e2d0ca8c15a881db87fe1d56826073136f4d82db99",
+        "completions/antfly-grep.bash": "54cc6aa01f4fbfb71eadc9cdc9a3309eea7a9d48e3ac314e0a420b6d71babf63",
+        "share/man/man1/antfly-grep.1": "51bb42b4d07b724f389af370e469549419b6d748eae72cb189cc485165fe9d4e",
+        "completions/antfly-grep.fish": "2c86fb8be81121d9a569501737b1f9c6dd1ce909c75aa4bf8c25703dba0b4c2d",
+        "LICENSES/Apache-2.0.txt": "e56aea6e2b9b30b1008326f604dee4afa8c88f44a6dea7e3719592ed987b80c4",
+        "LICENSES/third-party/WHATWG-Encoding-BSD-3-Clause.txt": "594771abd645734c5728e993f4629f79f883c7147220b76d6e18558b930c81d2",
+        "LICENSES/third-party/libvpx-BSD-3-Clause.txt": "aa56ba9024f01edde9bfa5f5364644e6dd305874c3da8b73b92eb8af05539861",
+        "LICENSES/third-party/NV-Codec-CUDA-MIT.txt": "23f177eee4c2a4ee4477b7cd52b54072446272ee0b1124faa8bae01ed2858a2b",
+        "LICENSES/third-party/Roboto-COPYRIGHT.txt": "2b6aa252cfb3d712072c7131fc87c60168b12f39f317e5d90385170e32a3eca5",
+        "LICENSES/third-party/LMDB-midl-h-notice.txt": "c4fd66cd70ccfb2ce9ab0e689b619d7925658c018a06a7aefd37526953c6a6e6",
+        "LICENSES/third-party/HTTPX-MIT.txt": "c58fe77764f844597d39afe811a91196459975b0963a34e1070d426443b448b3",
+        "LICENSES/third-party/Tree-Sitter-Python-MIT.txt": "d724405ce238a22c0d35769c5a36b386ad5958192efe8bbb304fb2896254575f",
+        "LICENSES/third-party/Zig-SHA256-MIT.txt": "eaba5e4ee34a0cb7404e7dac1fffaf4dac621c60d9643859cca320b38c9c1abd",
+        "LICENSES/third-party/Yuku-MIT.txt": "8ac8d8d1663cc193ccb3fde7494ccb8e41d63de07047c20c6778c24ca09bc37f",
+        "LICENSES/third-party/Unicode-V3.txt": "e7a93b009565cfce55919a381437ac4db883e9da2126fa28b91d12732bc53d96",
+        "LICENSES/third-party/PyTorch-BSD-3-Clause.txt": "a8a2c6b67cf8a597ffaa5c82380a6bd1b82629c0417e00673d8013d662eb500a",
+        "LICENSES/third-party/LMDB-midl-c-notice.txt": "c4fd66cd70ccfb2ce9ab0e689b619d7925658c018a06a7aefd37526953c6a6e6",
+        "LICENSES/third-party/NV-Codec-NVIDIA-MIT.txt": "ee73e7577cfac7f231fb8a35b2404af227d2ed3d038711931ac373bc63a6c956",
+        "LICENSES/third-party/PacketVideo-AAC-notice.txt": "f58233d85a0148c4602f8fa812de00483e9d6b2301298070942ec321dc3d28e6",
+        "LICENSES/third-party/Tree-Sitter-Rust-MIT.txt": "31d5b6f4243d5c7c6e1c4ebbbb9f6407bd1457a08bcc4f706521710341acba36",
+        "LICENSES/third-party/OpenLDAP-2.8.txt": "310fe25c858a9515fc8c8d7d1f24a67c9496f84a91e0a0e41ea9975b1371e569",
+        "LICENSES/third-party/dav1d-BSD-2-Clause.txt": "b327887de263238deaa80c34cdd2ff3e0ba1d35db585ce14a37ce3e74ee389e9",
+        "LICENSES/third-party/LMDB-mdb-c-notice.txt": "d6db046a3c751ce762b210cae486eb69fb604721111c90c18bd3f90d820f823f",
+        "LICENSES/third-party/Zig-Stdlib-MIT.txt": "5c537d6853e005298a285d508cff9ac7192cea23576c840d485b2b586a7ff177",
+        "LICENSES/third-party/Roboto-Apache-2.0.txt": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+        "LICENSES/third-party/XZ-Embedded-0BSD.txt": "d9ff4f089509582e7b197e86f3d2d66948b89169f27c1f2349eb0d1ed4459309",
+        "LICENSES/third-party/LMDB-lmdb-h-notice.txt": "de1c09aa9ee499d3693f3c4f4af501b16e6b5259d0f52c3f8daf602568f7695a",
+        "LICENSES/third-party/SciPy-rectangular-lsap-BSD-3-Clause.txt": "6d55c62aeff822641f8202c08e438a4b839f3348683f7ac4941e79ca73d067c2",
+        "LICENSES/third-party/Bzip2-1.0.6.txt": "67fc67381a47fe66f07b5f6705472d26314e6bcdf949f92c2cdde64521bbfdce",
+        "LICENSES/third-party/Tree-Sitter-Go-MIT.txt": "2e0110e07abef7c2548b26ec9d6969775617ca539a0dc8dbeeb14d6452c711d1",
+        "LICENSES/third-party/Brotli-Zig-MIT.txt": "124399bdca50319a2c3443e8a448d9d1dcaa2016aad81ff4a995ca5537d2f297",
+        "LICENSES/third-party/Zig-TLS-MIT.txt": "07fb0b8cf1f8fc9bf8aa1f918f81b053c0aea255706d3777cb1908f0200cf39c"
+      }
+    },
+    "linux": {
+      "binary_sha256": "389c59476fbe2fab6f80678ae5c684b4f52505ca78d84fd1386aa873209cd68c",
+      "archive_sha256": "59a109a59b2b545ea2232eccb3701e1860d46a777242600350e5d0deb5a54a53",
+      "binary_bytes": 7609368,
+      "runtime_verified": true,
+      "verified_members": {
+        "README.md": "b8b39acd91e011c3b94b47e1ea61d61ff9b5d07ab5c68a725c57f9c34f585413",
+        "share/antfly-grep/README.md": "b8b39acd91e011c3b94b47e1ea61d61ff9b5d07ab5c68a725c57f9c34f585413",
+        "share/antfly-grep/COMPATIBILITY.md": "192e928eb2e85b9c6b80633f331ec0e45d6fb5aeceee00adf6ffe9388c194058",
+        "THIRD_PARTY_NOTICES.md": "d6542ec2592291421a32175d65e2a85a0d05399e250143bfccd2166e921fbcf0",
+        "LICENSE": "e56aea6e2b9b30b1008326f604dee4afa8c88f44a6dea7e3719592ed987b80c4",
+        "share/antfly-grep/schema/document-v1.json": "2c6e245dffefe476c140affcaee976c5cc047eeacb75fc31965557697bb91147",
+        "share/antfly-grep/schema/tables.example.json": "d1159896495f4becde17cf514de22f4205363fe5da0139a39ca2252c7096b165",
+        "share/antfly-grep/schema/tables-v1.json": "4f8eeb8176e4887ec2e90b28694a6378ceac37710985774c625a5002c2c207c6",
+        "share/antfly-grep/schema/workspace-request-v1.json": "586a8512ad2cc9c7f4ccdd16788aeab852d47beff340dd1eea548f4c70aa5e71",
+        "completions/antfly-grep.ps1": "2a36533d499ac1ee4e35aa10392a551065087539d7d8539f672151f9fd2477db",
+        "completions/antfly-grep.zsh": "ada73b78850e6df3569366e2d0ca8c15a881db87fe1d56826073136f4d82db99",
+        "completions/antfly-grep.bash": "54cc6aa01f4fbfb71eadc9cdc9a3309eea7a9d48e3ac314e0a420b6d71babf63",
+        "share/man/man1/antfly-grep.1": "51bb42b4d07b724f389af370e469549419b6d748eae72cb189cc485165fe9d4e",
+        "completions/antfly-grep.fish": "2c86fb8be81121d9a569501737b1f9c6dd1ce909c75aa4bf8c25703dba0b4c2d",
+        "LICENSES/Apache-2.0.txt": "e56aea6e2b9b30b1008326f604dee4afa8c88f44a6dea7e3719592ed987b80c4",
+        "LICENSES/third-party/WHATWG-Encoding-BSD-3-Clause.txt": "594771abd645734c5728e993f4629f79f883c7147220b76d6e18558b930c81d2",
+        "LICENSES/third-party/libvpx-BSD-3-Clause.txt": "aa56ba9024f01edde9bfa5f5364644e6dd305874c3da8b73b92eb8af05539861",
+        "LICENSES/third-party/NV-Codec-CUDA-MIT.txt": "23f177eee4c2a4ee4477b7cd52b54072446272ee0b1124faa8bae01ed2858a2b",
+        "LICENSES/third-party/Roboto-COPYRIGHT.txt": "2b6aa252cfb3d712072c7131fc87c60168b12f39f317e5d90385170e32a3eca5",
+        "LICENSES/third-party/LMDB-midl-h-notice.txt": "c4fd66cd70ccfb2ce9ab0e689b619d7925658c018a06a7aefd37526953c6a6e6",
+        "LICENSES/third-party/HTTPX-MIT.txt": "c58fe77764f844597d39afe811a91196459975b0963a34e1070d426443b448b3",
+        "LICENSES/third-party/Tree-Sitter-Python-MIT.txt": "d724405ce238a22c0d35769c5a36b386ad5958192efe8bbb304fb2896254575f",
+        "LICENSES/third-party/Zig-SHA256-MIT.txt": "eaba5e4ee34a0cb7404e7dac1fffaf4dac621c60d9643859cca320b38c9c1abd",
+        "LICENSES/third-party/Yuku-MIT.txt": "8ac8d8d1663cc193ccb3fde7494ccb8e41d63de07047c20c6778c24ca09bc37f",
+        "LICENSES/third-party/Unicode-V3.txt": "e7a93b009565cfce55919a381437ac4db883e9da2126fa28b91d12732bc53d96",
+        "LICENSES/third-party/PyTorch-BSD-3-Clause.txt": "a8a2c6b67cf8a597ffaa5c82380a6bd1b82629c0417e00673d8013d662eb500a",
+        "LICENSES/third-party/LMDB-midl-c-notice.txt": "c4fd66cd70ccfb2ce9ab0e689b619d7925658c018a06a7aefd37526953c6a6e6",
+        "LICENSES/third-party/NV-Codec-NVIDIA-MIT.txt": "ee73e7577cfac7f231fb8a35b2404af227d2ed3d038711931ac373bc63a6c956",
+        "LICENSES/third-party/PacketVideo-AAC-notice.txt": "f58233d85a0148c4602f8fa812de00483e9d6b2301298070942ec321dc3d28e6",
+        "LICENSES/third-party/Tree-Sitter-Rust-MIT.txt": "31d5b6f4243d5c7c6e1c4ebbbb9f6407bd1457a08bcc4f706521710341acba36",
+        "LICENSES/third-party/OpenLDAP-2.8.txt": "310fe25c858a9515fc8c8d7d1f24a67c9496f84a91e0a0e41ea9975b1371e569",
+        "LICENSES/third-party/dav1d-BSD-2-Clause.txt": "b327887de263238deaa80c34cdd2ff3e0ba1d35db585ce14a37ce3e74ee389e9",
+        "LICENSES/third-party/LMDB-mdb-c-notice.txt": "d6db046a3c751ce762b210cae486eb69fb604721111c90c18bd3f90d820f823f",
+        "LICENSES/third-party/Zig-Stdlib-MIT.txt": "5c537d6853e005298a285d508cff9ac7192cea23576c840d485b2b586a7ff177",
+        "LICENSES/third-party/Roboto-Apache-2.0.txt": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+        "LICENSES/third-party/XZ-Embedded-0BSD.txt": "d9ff4f089509582e7b197e86f3d2d66948b89169f27c1f2349eb0d1ed4459309",
+        "LICENSES/third-party/LMDB-lmdb-h-notice.txt": "de1c09aa9ee499d3693f3c4f4af501b16e6b5259d0f52c3f8daf602568f7695a",
+        "LICENSES/third-party/SciPy-rectangular-lsap-BSD-3-Clause.txt": "6d55c62aeff822641f8202c08e438a4b839f3348683f7ac4941e79ca73d067c2",
+        "LICENSES/third-party/Bzip2-1.0.6.txt": "67fc67381a47fe66f07b5f6705472d26314e6bcdf949f92c2cdde64521bbfdce",
+        "LICENSES/third-party/Tree-Sitter-Go-MIT.txt": "2e0110e07abef7c2548b26ec9d6969775617ca539a0dc8dbeeb14d6452c711d1",
+        "LICENSES/third-party/Brotli-Zig-MIT.txt": "124399bdca50319a2c3443e8a448d9d1dcaa2016aad81ff4a995ca5537d2f297",
+        "LICENSES/third-party/Zig-TLS-MIT.txt": "07fb0b8cf1f8fc9bf8aa1f918f81b053c0aea255706d3777cb1908f0200cf39c"
+      }
+    },
+    "windows": {
+      "binary_sha256": "675182827c279318a286ec8a5bf02fb9c80f051cf38051a99bf9445e5b5fa4bc",
+      "archive_sha256": "938acf2e914198e0fac14a43aebdb8e8c2dc34776261445851ae5913df88ae06",
+      "binary_bytes": 8514048,
+      "runtime_verified": false,
+      "verified_members": {
+        "README.md": "b8b39acd91e011c3b94b47e1ea61d61ff9b5d07ab5c68a725c57f9c34f585413",
+        "share/antfly-grep/README.md": "b8b39acd91e011c3b94b47e1ea61d61ff9b5d07ab5c68a725c57f9c34f585413",
+        "share/antfly-grep/COMPATIBILITY.md": "192e928eb2e85b9c6b80633f331ec0e45d6fb5aeceee00adf6ffe9388c194058",
+        "THIRD_PARTY_NOTICES.md": "d6542ec2592291421a32175d65e2a85a0d05399e250143bfccd2166e921fbcf0",
+        "LICENSE": "e56aea6e2b9b30b1008326f604dee4afa8c88f44a6dea7e3719592ed987b80c4",
+        "share/antfly-grep/schema/document-v1.json": "2c6e245dffefe476c140affcaee976c5cc047eeacb75fc31965557697bb91147",
+        "share/antfly-grep/schema/tables.example.json": "d1159896495f4becde17cf514de22f4205363fe5da0139a39ca2252c7096b165",
+        "share/antfly-grep/schema/tables-v1.json": "4f8eeb8176e4887ec2e90b28694a6378ceac37710985774c625a5002c2c207c6",
+        "share/antfly-grep/schema/workspace-request-v1.json": "586a8512ad2cc9c7f4ccdd16788aeab852d47beff340dd1eea548f4c70aa5e71",
+        "completions/antfly-grep.ps1": "2a36533d499ac1ee4e35aa10392a551065087539d7d8539f672151f9fd2477db",
+        "completions/antfly-grep.zsh": "ada73b78850e6df3569366e2d0ca8c15a881db87fe1d56826073136f4d82db99",
+        "completions/antfly-grep.bash": "54cc6aa01f4fbfb71eadc9cdc9a3309eea7a9d48e3ac314e0a420b6d71babf63",
+        "share/man/man1/antfly-grep.1": "51bb42b4d07b724f389af370e469549419b6d748eae72cb189cc485165fe9d4e",
+        "completions/antfly-grep.fish": "2c86fb8be81121d9a569501737b1f9c6dd1ce909c75aa4bf8c25703dba0b4c2d",
+        "LICENSES/Apache-2.0.txt": "e56aea6e2b9b30b1008326f604dee4afa8c88f44a6dea7e3719592ed987b80c4",
+        "LICENSES/third-party/WHATWG-Encoding-BSD-3-Clause.txt": "594771abd645734c5728e993f4629f79f883c7147220b76d6e18558b930c81d2",
+        "LICENSES/third-party/libvpx-BSD-3-Clause.txt": "aa56ba9024f01edde9bfa5f5364644e6dd305874c3da8b73b92eb8af05539861",
+        "LICENSES/third-party/NV-Codec-CUDA-MIT.txt": "23f177eee4c2a4ee4477b7cd52b54072446272ee0b1124faa8bae01ed2858a2b",
+        "LICENSES/third-party/Roboto-COPYRIGHT.txt": "2b6aa252cfb3d712072c7131fc87c60168b12f39f317e5d90385170e32a3eca5",
+        "LICENSES/third-party/LMDB-midl-h-notice.txt": "c4fd66cd70ccfb2ce9ab0e689b619d7925658c018a06a7aefd37526953c6a6e6",
+        "LICENSES/third-party/HTTPX-MIT.txt": "c58fe77764f844597d39afe811a91196459975b0963a34e1070d426443b448b3",
+        "LICENSES/third-party/Tree-Sitter-Python-MIT.txt": "d724405ce238a22c0d35769c5a36b386ad5958192efe8bbb304fb2896254575f",
+        "LICENSES/third-party/Zig-SHA256-MIT.txt": "eaba5e4ee34a0cb7404e7dac1fffaf4dac621c60d9643859cca320b38c9c1abd",
+        "LICENSES/third-party/Yuku-MIT.txt": "8ac8d8d1663cc193ccb3fde7494ccb8e41d63de07047c20c6778c24ca09bc37f",
+        "LICENSES/third-party/Unicode-V3.txt": "e7a93b009565cfce55919a381437ac4db883e9da2126fa28b91d12732bc53d96",
+        "LICENSES/third-party/PyTorch-BSD-3-Clause.txt": "a8a2c6b67cf8a597ffaa5c82380a6bd1b82629c0417e00673d8013d662eb500a",
+        "LICENSES/third-party/LMDB-midl-c-notice.txt": "c4fd66cd70ccfb2ce9ab0e689b619d7925658c018a06a7aefd37526953c6a6e6",
+        "LICENSES/third-party/NV-Codec-NVIDIA-MIT.txt": "ee73e7577cfac7f231fb8a35b2404af227d2ed3d038711931ac373bc63a6c956",
+        "LICENSES/third-party/PacketVideo-AAC-notice.txt": "f58233d85a0148c4602f8fa812de00483e9d6b2301298070942ec321dc3d28e6",
+        "LICENSES/third-party/Tree-Sitter-Rust-MIT.txt": "31d5b6f4243d5c7c6e1c4ebbbb9f6407bd1457a08bcc4f706521710341acba36",
+        "LICENSES/third-party/OpenLDAP-2.8.txt": "310fe25c858a9515fc8c8d7d1f24a67c9496f84a91e0a0e41ea9975b1371e569",
+        "LICENSES/third-party/dav1d-BSD-2-Clause.txt": "b327887de263238deaa80c34cdd2ff3e0ba1d35db585ce14a37ce3e74ee389e9",
+        "LICENSES/third-party/LMDB-mdb-c-notice.txt": "d6db046a3c751ce762b210cae486eb69fb604721111c90c18bd3f90d820f823f",
+        "LICENSES/third-party/Zig-Stdlib-MIT.txt": "5c537d6853e005298a285d508cff9ac7192cea23576c840d485b2b586a7ff177",
+        "LICENSES/third-party/Roboto-Apache-2.0.txt": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+        "LICENSES/third-party/XZ-Embedded-0BSD.txt": "d9ff4f089509582e7b197e86f3d2d66948b89169f27c1f2349eb0d1ed4459309",
+        "LICENSES/third-party/LMDB-lmdb-h-notice.txt": "de1c09aa9ee499d3693f3c4f4af501b16e6b5259d0f52c3f8daf602568f7695a",
+        "LICENSES/third-party/SciPy-rectangular-lsap-BSD-3-Clause.txt": "6d55c62aeff822641f8202c08e438a4b839f3348683f7ac4941e79ca73d067c2",
+        "LICENSES/third-party/Bzip2-1.0.6.txt": "67fc67381a47fe66f07b5f6705472d26314e6bcdf949f92c2cdde64521bbfdce",
+        "LICENSES/third-party/Tree-Sitter-Go-MIT.txt": "2e0110e07abef7c2548b26ec9d6969775617ca539a0dc8dbeeb14d6452c711d1",
+        "LICENSES/third-party/Brotli-Zig-MIT.txt": "124399bdca50319a2c3443e8a448d9d1dcaa2016aad81ff4a995ca5537d2f297",
+        "LICENSES/third-party/Zig-TLS-MIT.txt": "07fb0b8cf1f8fc9bf8aa1f918f81b053c0aea255706d3777cb1908f0200cf39c"
+      }
+    }
+  },
+  "checks": {
+    "budget_regressions": {
+      "log_sha256": "8b6c3b6e6373d85268bd1a6f769d5b18ac676e8077c76320a6468b59127bb5de",
+      "assertions": [
+        "Ran 4 tests",
+        "OK"
+      ]
+    },
+    "linux_byte_paths": {
+      "log_sha256": "88ac0dac5cf1478c7969ca47b90a89d371bec2bcd79bd60e47b0a4205bc6196e",
+      "assertions": [
+        "non-UTF8 removal identity verified"
+      ]
+    },
+    "macos_cli": {
+      "log_sha256": "66b4063e0e7d379b5f94a8c56efaffadc4f7feaae9c0ccaabc7513fd90e75d6f",
+      "assertions": [
+        "Ran 239 tests",
+        "OK (skipped=2)"
+      ]
+    },
+    "linux_cli": {
+      "log_sha256": "f90ff666a94199555f57087aeb020c22880cae46d41b2c7306d3a23721840efd",
+      "assertions": [
+        "Ran 239 tests",
+        "OK (skipped=2)"
+      ]
+    },
+    "macos_unit": {
+      "log_sha256": "66872841220eecb511455636fc00b7cf69d4b666dd12709980d081d4254e06b0",
+      "assertions": [
+        "92 passed; 1 skipped; 0 failed."
+      ]
+    },
+    "linux_unit": {
+      "log_sha256": "1044c4c3ff413fa630db363f1d619a68683ac67cae5bb3f36aa2aee79fee7d76",
+      "assertions": [
+        "92 passed; 1 skipped; 0 failed."
+      ]
+    },
+    "macos_safe": {
+      "log_sha256": "66872841220eecb511455636fc00b7cf69d4b666dd12709980d081d4254e06b0",
+      "assertions": [
+        "92 passed; 1 skipped; 0 failed."
+      ]
+    },
+    "conformance": {
+      "log_sha256": "1af1675d5eaadafd293513a51187db6ef7c00bbba5f93ef00c86c282f647f036",
+      "assertions": [
+        "steps succeeded"
+      ]
+    },
+    "boundary": {
+      "log_sha256": "4fbf01612a88e643f87a36ffa02f438dcb4301e1664fa3468c46d0eae1911666",
+      "assertions": [
+        "Apache product boundary verified"
+      ]
+    },
+    "release_licenses": {
+      "log_sha256": "a30a67b71fa80c9aeb478057b7b698e7d085ff4749cd310f29376643bd2e2053",
+      "assertions": [
+        "Ran 3 tests",
+        "OK"
+      ]
+    },
+    "toolchain": {
+      "log_sha256": "9c62d84185f3765881bb58ef7c07bcaa7889b2bc77e5219868645cd14aefba70",
+      "assertions": [
+        "Repository toolchain policy is consistent"
+      ]
+    }
+  },
+  "build_logs": {
+    "build-final-macos.log": "6fd4ba7c48b8fa550287f53d428a3567b38b741646a5d6340206d08a04c921f1",
+    "build-linux.log": "d9c13dc64c7d1d4d84edd22cd86c0b8f5d4493b42a1d46d310094a118bdf0ca3",
+    "build-windows.log": "6f9b3a22fda99be6a1ff6b650437c935f87a2496d3d655858e90d6a66f635f09",
+    "build-safe.log": "5cd5593032745c1cc35c456e229a660fbd3fd0d1b75147703dc880f203b45bf1",
+    "native-conformance-final.log": "1af1675d5eaadafd293513a51187db6ef7c00bbba5f93ef00c86c282f647f036"
+  },
+  "post_qualification_merge": {
+    "qualified_commit": "18ec53341f17e63e115bc148db34e18224859f3d",
+    "merged_main": "dfc6007c5d",
+    "scope": "Workflow action updates and unrelated guide; three rebuilt product binaries are byte-identical to qualified artifacts. Native unit/hardening targets pass.",
+    "logs": {
+      "merge-linux.log": "3d9a345b2216cbb725b40ed74a3c58d7547d00a81338b16b0c7d814d3ceebd0e",
+      "merge-windows.log": "28b2022fcd22106bde132f9582f793cf3f105e1c7cbc178818efeea62d68a62f",
+      "merge-native.log": "33dd348f9bc503db65e8ece9fbbf0a286dc4f0131bb2723aeb0903d0b1454e72"
+    }
+  },
+  "exploratory_profile": {
+    "binary_sha256": "1003a780c38012e546a35f0011462975336bb8c4f55ad207cbe0940f399275e8",
+    "sample_sha256": "c1c700b043f19e9bae4b3e38f43d5bef31c62d4219cf939aad0c376d6c9eacce",
+    "scope": "Symbolized intermediate build before typed-span collector/output batching. Repeated tiny-file JSON showed writev/locking and JSON escaping, guiding batching rather than speculative JIT expansion."
+  },
+  "limitations": [
+    "Warm synthetic data and shared host; no cold-storage qualification or independent native Linux hardware.",
+    "Linux is an ARM64 Docker VM capped at two CPUs; Windows is cross-compilation only.",
+    "Refresh is excluded from query timings; full results compare source/path identity and spans, and deltas compare materialized views including current snapshot provenance.",
+    "Opt-in lexical metadata adds bounded RAM per registration; no durable source mirror or lexical disk index is introduced.",
+    "Source/output changes still require work; no universal speed or zero-resource-cost claim.",
+    "Local provider fixtures only; no live relevance or billing qualification.",
+    "Full upstream ripgrep/PCRE2/JIT parity remains unproven.",
+    "Full PR CI remains subject to repository admission."
+  ]
+}

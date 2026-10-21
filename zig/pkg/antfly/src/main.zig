@@ -266,7 +266,7 @@ fn printUsage(argv0: []const u8) void {
         \\  insert         Insert a single document
         \\  delete         Delete a single document
         \\  agents         Run AI agents (retrieval, query-builder)
-        \\  backup         Backup tables
+        \\  backup         Back up tables; inspect local backup files
         \\  restore        Restore tables from backup, including Lite *.aflite input
         \\  storage        Manage table storage (migrate)
         \\  connections    Manage provider connections (login, list, models, logout)

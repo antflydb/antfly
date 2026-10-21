@@ -19,6 +19,8 @@ const fst = @import("antfly_fst");
 
 const Allocator = std.mem.Allocator;
 
+pub const search = @import("search.zig");
+pub const Budget = @import("bounded.zig").Budget;
 pub const RegexAutomaton = automaton.RegexAutomaton;
 /// Capture-capable Unicode execution, independent of byte/FST automata.
 pub const captures = @import("antfly_capture_regex");
@@ -75,6 +77,40 @@ pub const PreparedPattern = struct {
     anchored_start: bool,
     states: []const State,
     start: u32,
+    consumes_slash: bool,
+    fast: Anchored = .{},
+
+    const Anchored = struct {
+        prefix: []const u8 = "",
+        suffix: []const u8 = "",
+        exact: bool = false,
+        separator_only: bool = false,
+        middle: ?*const Node = null,
+        fn init(a: Allocator, root: *const Node) Error!Anchored {
+            if (root.tag != .seq or root.children.len < 2 or root.children[0].tag != .anchor_start or root.children[root.children.len - 1].tag != .anchor_end) return .{};
+            const nodes = root.children[1 .. root.children.len - 1];
+            var left: usize = 0;
+            while (left < nodes.len and nodes[left].tag == .literal) : (left += 1) {}
+            var right = nodes.len;
+            while (right > left and nodes[right - 1].tag == .literal) : (right -= 1) {}
+            const prefix = try a.alloc(u8, left);
+            for (prefix, nodes[0..left]) |*byte, node| byte.* = node.literal;
+            const suffix = try a.alloc(u8, nodes.len - right);
+            for (suffix, nodes[right..]) |*byte, node| byte.* = node.literal;
+            const middle = if (right == left + 1 and nodes[left].tag == .repeat and nodes[left].min == 0 and nodes[left].max == null) nodes[left].child else null;
+            var separator_only = false;
+            if (middle) |node| if (node.tag == .char_class) {
+                const class = node.char_class.?;
+                var count: usize = 0;
+                for (class.bytes) |present| count += @intFromBool(present);
+                separator_only = class.negated and class.bytes['/'] and count == 1;
+            };
+            return .{ .prefix = prefix, .suffix = suffix, .exact = left == nodes.len, .separator_only = separator_only, .middle = if (middle) |node| switch (node.tag) {
+                .any, .char_class => node,
+                else => null,
+            } else null };
+        }
+    };
 
     pub fn init(alloc: Allocator, pattern: []const u8) Error!PreparedPattern {
         var arena = std.heap.ArenaAllocator.init(alloc);
@@ -84,7 +120,18 @@ pub const PreparedPattern = struct {
         var compiler = Compiler{ .alloc = arena.allocator() };
         const accept = try compiler.emit(.{ .tag = .accept });
         const start = try compiler.lower(root, accept);
-        return .{ .root = root, .arena = arena, .anchored_start = requiresStart(root), .states = compiler.states.items, .start = start };
+        var consumes_slash = false;
+        for (compiler.states.items) |state| if (state.tag == .consume) {
+            const node = state.node.?;
+            consumes_slash = consumes_slash or switch (node.tag) {
+                .literal => node.literal == '/',
+                .any => true,
+                .char_class => node.char_class.?.matches('/'),
+                else => unreachable,
+            };
+        };
+        const fast = try Anchored.init(arena.allocator(), root);
+        return .{ .root = root, .arena = arena, .anchored_start = requiresStart(root), .states = compiler.states.items, .start = start, .consumes_slash = consumes_slash, .fast = fast };
     }
 
     pub fn deinit(self: *PreparedPattern) void {
@@ -93,10 +140,29 @@ pub const PreparedPattern = struct {
     }
 
     pub fn matches(self: *const PreparedPattern, alloc: Allocator, text: []const u8) Error!bool {
-        const buffers = try alloc.alloc(u32, self.states.len * 3);
-        defer alloc.free(buffers);
-        const seen = try alloc.alloc(bool, self.states.len);
-        defer alloc.free(seen);
+        const fast = self.fast;
+        if (text.len < fast.prefix.len + fast.suffix.len or !std.mem.startsWith(u8, text, fast.prefix) or !std.mem.endsWith(u8, text, fast.suffix)) return false;
+        if (fast.exact) return text.len == fast.prefix.len;
+        if (fast.middle) |node| {
+            if (node.tag == .any) return true;
+            const bytes = text[fast.prefix.len .. text.len - fast.suffix.len];
+            const class = node.char_class.?;
+            // The common wildcard excludes only '/'. Verify that predicate
+            // before using a vectorized separator search.
+            if (fast.separator_only) return std.mem.indexOfScalar(u8, bytes, '/') == null;
+            for (bytes) |byte| if (!class.matches(byte)) return false;
+            return true;
+        }
+        // Discovery checks short compiled globs for every directory entry. Keep
+        // their bounded VM workspaces on the stack instead of allocating twice
+        // per rule/path. Large patterns retain the same bounded heap fallback.
+        var stack_buffers: [256 * 3]u32 = undefined;
+        var stack_seen: [256]bool = undefined;
+        const use_stack = self.states.len <= stack_seen.len;
+        const buffers = if (use_stack) stack_buffers[0 .. self.states.len * 3] else try alloc.alloc(u32, self.states.len * 3);
+        defer if (!use_stack) alloc.free(buffers);
+        const seen = if (use_stack) stack_seen[0..self.states.len] else try alloc.alloc(bool, self.states.len);
+        defer if (!use_stack) alloc.free(seen);
         @memset(seen, false);
         var current = buffers[0..self.states.len];
         var next = buffers[self.states.len .. self.states.len * 2];

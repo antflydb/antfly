@@ -127,7 +127,7 @@ pub const BaselinePage = struct {
         var previous = self.expected_cursor;
         var remaining: usize = 2 * 1024 * 1024;
         for (self.row_keys) |key| {
-            if (!keys.isStoredDocumentRowKey(key) or std.mem.order(u8, key, previous) != .gt or
+            if (!keys.isStoredSourceRowKey(key) or std.mem.order(u8, key, previous) != .gt or
                 std.mem.order(u8, key, self.next_cursor) == .gt) return error.InvalidBatchRequest;
             remaining = std.math.sub(usize, remaining, key.len) catch return error.InvalidBatchRequest;
             previous = key;
@@ -167,12 +167,14 @@ pub const CensusPage = struct {
 /// Claims exclude receiver-local root and obligation counters; they never
 /// substitute for that receiver's own durable evidence.
 pub const CompletionPage = struct {
+    group_producers: bool = false,
     document_key: []const u8,
     visits: u32,
     bytes: u32,
     before: Digest,
     after: Digest,
     pub fn validate(self: CompletionPage) !void {
+        if (self.group_producers and !@import("group_source_identity.zig").isAnchor(self.document_key)) return error.InvalidBatchRequest;
         if (self.document_key.len == 0 or self.document_key.len > 1024 * 1024 or
             self.visits == 0 or self.visits > 128 or self.bytes == 0 or self.bytes > 64 * 1024 or
             std.mem.eql(u8, &self.before, &self.after)) return error.InvalidBatchRequest;
@@ -300,6 +302,7 @@ pub const Command = struct {
         }
         hash.update(&.{@intFromBool(self.completion != null)});
         if (self.completion) |page| {
+            if (page.group_producers) hash.update("antfly:group-producer-completion:v1:");
             bytes(&hash, page.document_key);
             number(&hash, page.visits);
             number(&hash, page.bytes);
@@ -579,6 +582,7 @@ pub fn stageArtifactTombstoneRevision(txn: anytype, namespace: Namespace, artifa
 }
 
 pub fn guardedArtifactKey(key_bytes: []const u8) bool {
+    if (@import("group_source_identity.zig").isUnitContextEpochKey(key_bytes)) return true;
     // Head bytes are valid read-set witnesses, not generic artifact mutations.
     // Only the staged-output publication path may change generation visibility.
     if (@import("artifact_generation_scope.zig").isHead(key_bytes)) return true;

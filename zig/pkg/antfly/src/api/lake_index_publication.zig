@@ -89,6 +89,8 @@ pub const Lease = struct {
 };
 const BuildProgress = struct {
     a: A,
+    io: ?std.Io = null,
+    mutex: std.Io.Mutex = .init,
     store: *stores.ArtifactStore,
     cancellation: Cancellation,
     clock: Clock,
@@ -120,6 +122,8 @@ const BuildProgress = struct {
     fn saveBatch(raw: *anyopaque, completed: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact) !void {
         if (completed.len == 0) return;
         const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.io) |io| try self.mutex.lock(io);
+        defer if (self.io) |io| self.mutex.unlock(io);
         for (completed) |declaration| {
             try self.cancellation.check();
             try self.remember(declaration);
@@ -128,6 +132,8 @@ const BuildProgress = struct {
     }
     fn saveNavigation(raw: *anyopaque, ref: local.serverless_manifest_artifact_ref.ArtifactRef) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.io) |io| try self.mutex.lock(io);
+        defer if (self.io) |io| self.mutex.unlock(io);
         self.saved.source_navigation = ref;
         try self.persist();
     }
@@ -198,7 +204,9 @@ fn priorInventory(a: A, store: stores.ArtifactStore, ref: local.serverless_manif
     };
     return inventory;
 }
-fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.TableRecord, source: *serving.ServingSource, store_identity: catalog.Digest, context: Context, cancellation: Cancellation, clock: Clock, lease: ?Lease, embedding_options: ?local.inference_managed_embedder.InitOptions, memo: ?@import("lake_vector_enrichment.zig").Memo, reuse: bool) ![]u8 {
+fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: records.TableRecord, source: *serving.ServingSource, store_identity: catalog.Digest, context: Context, cancellation: Cancellation, clock: Clock, lease: ?Lease, embedding_options: ?local.inference_managed_embedder.InitOptions, memo: ?@import("lake_vector_enrichment.zig").Memo, reuse: bool) ![]u8 {
+    var allocations: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = backing };
+    const a = allocations.allocator();
     try context.ensureActive();
     try cancellation.check();
     var current = try catalog.parse(a, table.lake_index_catalog_json);
@@ -321,7 +329,7 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
     const inventory: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .external_base_source, .metadata_version = navigation_api.inventoryVersion(inventory_bytes), .artifact_id = inventory_artifact.artifact_id, .checksum = inventory_artifact.checksum, .byte_len = inventory_artifact.byte_len };
     const base_source = try binding.binding.toManifestBaseSource(source.inventory.snapshot_id, inventory.artifact_id);
 
-    var progress: BuildProgress = .{ .a = a, .store = &scoped, .cancellation = cancellation, .clock = clock, .lease = lease orelse .{ .ptr = undefined, .snapshot = undefined }, .saved = .{ .reader_protocol = attempt.reader_protocol, .reuse_published = reuse_published, .store_locator = attempt.store_locator, .namespace = current.value.namespace, .generation = attempt.generation, .token = attempt.token, .signature = signature, .published_at_ms = started, .base_source = base_source, .inventory = inventory, .source_navigation = navigation.ref } };
+    var progress: BuildProgress = .{ .a = a, .io = context.io, .store = &scoped, .cancellation = cancellation, .clock = clock, .lease = lease orelse .{ .ptr = undefined, .snapshot = undefined }, .saved = .{ .reader_protocol = attempt.reader_protocol, .reuse_published = reuse_published, .store_locator = attempt.store_locator, .namespace = current.value.namespace, .generation = attempt.generation, .token = attempt.token, .signature = signature, .published_at_ms = started, .base_source = base_source, .inventory = inventory, .source_navigation = navigation.ref } };
     defer progress.deinit();
     if (lease) |owner| if (owner.save_checkpoint != null) {
         if (current.value.checkpoint) |saved| for (saved.declarations) |declaration| try progress.remember(declaration);
@@ -337,6 +345,9 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
     contribution_index.migrating = previous_root != null and previous_ownership == 0;
     contribution_index.prior_roots = if (previous_root != null and previous_ownership == 1) current.value.published.?.contribution_roots else &.{};
     defer contribution_index.deinit();
+    if (prior_navigation) |prior| {
+        if (previous_root != null and previous_ownership == 1) contribution_index.predecessor = .{ .source = prior.source, .schema = prior.schema, .snapshot = prior.snapshot, .count = prior.count };
+    }
     // The authenticated inventory supplies the file delta once per refresh.
     // Counted ownership proves all prior files belong to the unchanged recipes;
     // replay need not point-probe every file/recipe in the contribution tree.
@@ -348,12 +359,14 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
             source.inventory.deleted_row_groups.len == 0 and
             (if (source.scanner.iceberg_delete_plan) |plan| plan.files.len == 0 else true))
         {
-            if (try priorInventory(na, scoped, previous.inventory, cancellation)) |old_inventory| {
-                if (old_inventory.deleted_row_groups.len == 0) {
-                    provider.previous_inventory = old_inventory;
-                    if (previous_root != null and previous_ownership == 1 and std.mem.eql(u8, &previous.signature.desired, &signature.desired)) {
-                        for (old_inventory.files) |file| try contribution_index.covered_files.put(a, @import("lake_index_native_aggregates.zig").inventoryFileIdentity(old_inventory, file), {});
-                        contribution_index.has_file_coverage = true;
+            if (!contribution_index.acceptsDelta(navigation.delta)) {
+                if (try priorInventory(na, scoped, previous.inventory, cancellation)) |old_inventory| {
+                    if (old_inventory.deleted_row_groups.len == 0) {
+                        provider.previous_inventory = old_inventory;
+                        if (previous_root != null and previous_ownership == 1 and std.mem.eql(u8, &previous.signature.desired, &signature.desired)) {
+                            for (old_inventory.files) |file| try contribution_index.covered_files.put(a, @import("lake_index_native_aggregates.zig").inventoryFileIdentity(old_inventory, file), {});
+                            contribution_index.has_file_coverage = true;
+                        }
                     }
                 }
             }
@@ -363,7 +376,7 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
     const replay_columns = try replay_api.columnsForBuild(a, na, table, &provider, base_source);
     var replay = replay_api.Replay.init(a, &provider, replay_columns);
     defer replay.deinit();
-    if (current.value.published) |previous| if (candidates.len != 0 and std.mem.eql(u8, &previous.signature.desired, &signature.desired)) {
+    if (replay_columns.len != 0 and provider.replay_recommended) if (current.value.published) |previous| if (candidates.len != 0 and std.mem.eql(u8, &previous.signature.desired, &signature.desired)) {
         replay.only_files = try replay_api.changedFilesIndexed(a, na, &provider, scoped, candidates, previous_contributions, cancellation, &contribution_index);
     };
     if (replay_columns.len != 0 and provider.replay_recommended) provider.replay = &replay;
@@ -394,18 +407,33 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
     const legacy_json = try std.json.Stringify.valueAlloc(na, legacy_indexes, .{});
     var manifest = try rebuild.reconcileResolvedExternalSourceSidecarsWithRuntimeAlloc(a, &scoped, provider.provider(), base_source, source.inventory, .{ .table_name = table.name, .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = legacy_json }, reusable, cancellation, .{ .published_generation = attempt.generation, .edge_generation = attempt.generation, .computed_at_ms = started }, .{}, scope);
     defer manifest.deinit(a);
-    const native = @import("lake_index_native_aggregates.zig").buildIndexed(a, na, table, source, &scoped, &provider, cancellation, reusable, previous_contributions, &contribution_index) catch |err| return constructionFailure(err, "aggregate_build", attempt.generation);
+    const builders = @import("lake_index_publication_builders.zig");
+    const built = (try builders.build(.{ .a = a, .out = na, .table = table, .store = &scoped, .provider = &provider, .base = base_source, .reusable = reusable, .candidates = candidates, .contributions = previous_contributions, .index = &contribution_index, .token = cancellation })) orelse serial: {
+        const native = @import("lake_index_native_aggregates.zig").buildIndexed(a, na, table, source, &scoped, &provider, cancellation, reusable, previous_contributions, &contribution_index) catch |err| return constructionFailure(err, "aggregate_build", attempt.generation);
+        // Aggregate construction already completes the entire set before this
+        // boundary. Publishing every growing prefix writes quadratic directory
+        // bytes and metadata commits without saving any earlier build work.
+        provider.checkpointBatch(native.declarations) catch |err| return constructionFailure(err, "aggregate_checkpoint", attempt.generation);
+        const ordered = @import("lake_index_native_rows.zig").buildIncremental(a, na, table, source, &scoped, &provider, cancellation, reusable, candidates) catch |err| return constructionFailure(err, "ordered_build", attempt.generation);
+        for (ordered) |declaration| provider.checkpoint(declaration) catch |err| return constructionFailure(err, "ordered_checkpoint", attempt.generation);
+        const text = @import("lake_index_native_text.zig").buildIncremental(a, na, table, source, base_source, &scoped, &provider, cancellation, reusable, candidates) catch |err| return constructionFailure(err, "text_build", attempt.generation);
+        for (text) |declaration| provider.checkpoint(declaration) catch |err| return constructionFailure(err, "text_checkpoint", attempt.generation);
+        const sparse = @import("lake_index_native_sparse.zig").buildIncremental(a, na, table, source, base_source, &scoped, &provider, cancellation, reusable, candidates) catch |err| return constructionFailure(err, "sparse_build", attempt.generation);
+        const dense = @import("lake_index_native_dense.zig").buildIncremental(a, na, table, source, base_source, &scoped, &provider, cancellation, reusable, candidates) catch |err| return constructionFailure(err, "dense_build", attempt.generation);
+        break :serial builders.Result{ .native = native, .ordered = ordered, .text = text, .sparse = sparse, .dense = dense };
+    };
+    if (built.contribution_root) |root| {
+        contribution_index.root = root;
+        contribution_index.counted = true;
+        contribution_index.prior_roots = built.contribution_roots;
+        for (built.contribution_roots) |key| try contribution_index.includeRoot(key);
+    }
+    const native = built.native;
     const native_declarations = native.declarations;
-    // Aggregate construction already completes the entire set before this
-    // boundary. Publishing every growing prefix writes quadratic directory
-    // bytes and metadata commits without saving any earlier build work.
-    provider.checkpointBatch(native_declarations) catch |err| return constructionFailure(err, "aggregate_checkpoint", attempt.generation);
-    const ordered = @import("lake_index_native_rows.zig").buildIncremental(a, na, table, source, &scoped, &provider, cancellation, reusable, candidates) catch |err| return constructionFailure(err, "ordered_build", attempt.generation);
-    for (ordered) |declaration| provider.checkpoint(declaration) catch |err| return constructionFailure(err, "ordered_checkpoint", attempt.generation);
-    const text = @import("lake_index_native_text.zig").buildIncremental(a, na, table, source, base_source, &scoped, &provider, cancellation, reusable, candidates) catch |err| return constructionFailure(err, "text_build", attempt.generation);
-    for (text) |declaration| provider.checkpoint(declaration) catch |err| return constructionFailure(err, "text_checkpoint", attempt.generation);
-    const sparse = @import("lake_index_native_sparse.zig").buildIncremental(a, na, table, source, base_source, &scoped, &provider, cancellation, reusable, candidates) catch |err| return constructionFailure(err, "sparse_build", attempt.generation);
-    const dense = @import("lake_index_native_dense.zig").buildIncremental(a, na, table, source, base_source, &scoped, &provider, cancellation, reusable, candidates) catch |err| return constructionFailure(err, "dense_build", attempt.generation);
+    const ordered = built.ordered;
+    const text = built.text;
+    const sparse = built.sparse;
+    const dense = built.dense;
     const declarations = try na.alloc(local.serverless_segment_sidecar_manifest.DeclaredArtifact, manifest.artifacts.len + native_declarations.len + ordered.len + text.len + sparse.len + dense.len);
     @memcpy(declarations[0..manifest.artifacts.len], manifest.artifacts);
     @memcpy(declarations[manifest.artifacts.len .. manifest.artifacts.len + native_declarations.len], native_declarations);
@@ -538,6 +566,20 @@ test "external lake native publication builds scoped text artifacts and fences e
         try std.testing.expectEqual(@as(usize, 1001), checkpoints.count);
         try std.testing.expectEqual(@as(usize, 17), checkpoints.last_declarations);
         try std.testing.expectEqual(@as(usize, 17), progress.declarations.items.len);
+        progress.io = std.testing.io;
+        const Save = struct {
+            fn run(owner: *BuildProgress, completed: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact) anyerror!void {
+                try BuildProgress.saveBatch(owner, completed);
+            }
+        };
+        var first = try std.testing.io.concurrent(Save.run, .{ &progress, batch[0..8] });
+        defer first.cancel(std.testing.io) catch {};
+        var second = try std.testing.io.concurrent(Save.run, .{ &progress, batch[8..] });
+        defer second.cancel(std.testing.io) catch {};
+        try first.await(std.testing.io);
+        try second.await(std.testing.io);
+        try std.testing.expectEqual(@as(usize, 1003), checkpoints.count);
+        try std.testing.expectEqual(@as(usize, 17), checkpoints.last_declarations);
     }
     try std.testing.expectEqual(@as(usize, 0), checkpoint_budget.live);
 
@@ -679,7 +721,7 @@ test "external lake native publication builds scoped text artifacts and fences e
         const reader = try aggregate.Reader.open(a, artifact_store, declaration.artifact, recipe, .none);
         defer reader.cursor().close(reader);
         const values = (try reader.cursor().next(reader, next.arena.allocator(), 8)).?;
-        var count = try local.sql_aggregate_partial.decode(a, values[0].aggregates[0], .{ .kind = .count });
+        var count = try local.sql_aggregate_partial.read(a, values[0], 0, .{ .kind = .count });
         defer count.deinit();
         try std.testing.expectEqual(@as(u64, 4), count.count);
     };

@@ -36,12 +36,17 @@ pub fn artifactKeyAllowed(source: Source, key_bytes: []const u8) bool {
     const binding = source.artifact_catalog orelse return false;
     if (!binding.valid()) return false;
     return @import("online_vector_artifacts.zig").isKey(key_bytes) or
-        (binding.effect_protocol == 15 and @import("online_graph_artifacts.zig").isKey(key_bytes));
+        (binding.effect_protocol >= 15 and @import("online_graph_artifacts.zig").isKey(key_bytes)) or
+        (binding.effect_protocol == 16 and @import("group_source_transfer.zig").isKey(key_bytes));
 }
 
 pub fn validateArtifactEffect(source: Source, key_bytes: []const u8, value: ?[]const u8) !void {
     if (!artifactKeyAllowed(source, key_bytes)) return error.InvalidMergePage;
-    if (@import("online_graph_artifacts.zig").isKey(key_bytes)) {
+    if (@import("group_source_transfer.zig").isKey(key_bytes)) {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        try @import("group_source_transfer.zig").validate(arena.allocator(), key_bytes, value);
+    } else if (@import("online_graph_artifacts.zig").isKey(key_bytes)) {
         try @import("online_graph_artifacts.zig").validate(key_bytes, value);
     } else try @import("online_vector_artifacts.zig").validate(key_bytes, value);
 }

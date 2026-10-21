@@ -94,9 +94,7 @@ fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_s
             break :loaded root_pin.?.value.*;
         } else try navigation.load(root_arena.allocator(), artifacts, ref, normalized, null);
         const expected_domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(table.id, store.identity, published.namespace);
-        if (root.public_identity_version != source.inventory.row_identity_version or !std.mem.eql(u8, &root.domain, &expected_domain) or root.count != source.fileCount() or
-            !std.mem.eql(u8, root.source, source.inventory.source_id) or !std.mem.eql(u8, root.schema, source.inventory.schema_fingerprint) or
-            !std.mem.eql(u8, root.snapshot, source.inventory.snapshot_id)) return error.InvalidExternalLakeIndexCoverage;
+        try validateNavigationIdentity(root, expected_domain, source.inventory, source.fileCount());
         try local.serverless_query_lake_scan_plan.validateBindingInventoryIdentity(binding, source.inventory);
         const immutable_proof = source.immutable_objects and source.plan_identity != null and root.coverage != null and
             root.coverage.?.plan != null and std.mem.eql(u8, &source.plan_identity.?, &root.coverage.?.plan.?) and
@@ -195,6 +193,40 @@ const InventoryMetadata = struct {
         return result;
     }
 };
+
+// A valid publication may describe an older source cut while a replacement
+// builds. Keep that ordinary freshness failure distinct from corrupt/cross-store
+// coverage so required reads use the existing retryable catalog-change path.
+fn validateNavigationIdentity(root: @import("lake_source_navigation.zig").Root, domain: catalog.Digest, inventory: local.serverless_external_source_types.Inventory, count: usize) !void {
+    if (!std.mem.eql(u8, &root.domain, &domain)) return error.InvalidExternalLakeIndexCoverage;
+    if (root.public_identity_version != inventory.row_identity_version) return error.ExternalLakeSnapshotMismatch;
+    if (root.count != count or !std.mem.eql(u8, root.source, inventory.source_id) or
+        !std.mem.eql(u8, root.schema, inventory.schema_fingerprint) or
+        !std.mem.eql(u8, root.snapshot, inventory.snapshot_id)) return error.ExternalLakeIndexSourceChanged;
+}
+
+test "external lake navigation distinguishes stale source cuts from invalid publication domains" {
+    const root: @import("lake_source_navigation.zig").Root = .{ .domain = @splat(3), .source = "source", .schema = "schema", .snapshot = "snapshot", .count = 2 };
+    const inventory: local.serverless_external_source_types.Inventory = .{
+        .format = .parquet,
+        .source_id = @constCast("source"),
+        .source_uri = @constCast("file:///source"),
+        .snapshot_id = @constCast("snapshot"),
+        .schema_fingerprint = @constCast("schema"),
+        .files = &.{},
+    };
+    try validateNavigationIdentity(root, root.domain, inventory, 2);
+    try std.testing.expectError(error.InvalidExternalLakeIndexCoverage, validateNavigationIdentity(root, @splat(4), inventory, 2));
+    try std.testing.expectError(error.ExternalLakeIndexSourceChanged, validateNavigationIdentity(root, root.domain, inventory, 3));
+    inline for (.{ "source_id", "snapshot_id", "schema_fingerprint" }) |field| {
+        var changed = inventory;
+        @field(changed, field) = @constCast("changed");
+        try std.testing.expectError(error.ExternalLakeIndexSourceChanged, validateNavigationIdentity(root, root.domain, changed, 2));
+    }
+    var changed = inventory;
+    changed.row_identity_version = 2;
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, validateNavigationIdentity(root, root.domain, changed, 2));
+}
 
 test "external lake legacy coverage proofs bind immutable plans publications and fresh request authority" {
     const a = std.testing.allocator;

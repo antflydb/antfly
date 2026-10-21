@@ -65,6 +65,7 @@ pub fn recordSortRejectionDiagnosticForTesting(field: []const u8, reason: []cons
 
 pub fn textQueryIsScoreBearing(query: types.TextQuery) bool {
     return switch (query) {
+        .value, .autocomplete => true,
         .phrase,
         .multi_phrase,
         .term,

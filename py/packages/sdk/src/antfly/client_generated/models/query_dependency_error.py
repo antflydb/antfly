@@ -12,7 +12,7 @@ T = TypeVar("T", bound="QueryDependencyError")
 
 @_attrs_define
 class QueryDependencyError:
-    """A stable failure envelope for query embedding, reranking, and decision dependencies.
+    """A stable failure envelope for query execution policy and embedding, reranking, and decision dependencies.
 
     Attributes:
         code (QueryDependencyErrorCode):

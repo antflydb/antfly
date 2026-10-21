@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "final_main_merge": "f1b52cadc9ba2349d0928dfa78d89e99e2253396",
+  "merged_main": "78cabfba0d3d9714164bfea4481b86e9fbee4c90",
+  "qualified_artifact_commit": "fb87644b59f54cd0cd429dab52f08846608cc582",
+  "unchanged_source_and_dependency_paths": [
+    "zig/pkg/antfly-grep",
+    "zig/lib/regex",
+    "zig/lib/compress",
+    "zig/lib/syntax",
+    "zig/lib/httpx",
+    "zig/lib/json",
+    "zig/lib/encoding",
+    "zig/lib/hash",
+    "zig/lib/tokenizer"
+  ],
+  "all_prior_validation_source_hashes_still_match": true,
+  "postmerge_native_binary_sha256": "5b54c96b2c05398a96d1c3c835775776babad6fdf9684ac7e0ef0416ef272780",
+  "tests": {
+    "native_cli": {
+      "total": 215,
+      "skipped": 2
+    },
+    "native_build": {
+      "steps_passed": 27,
+      "tests_passed": 116,
+      "platform_skipped": 1
+    },
+    "release_licenses": {
+      "passed": 3
+    },
+    "ci_controller": {
+      "passed": 208
+    },
+    "toolchain_policy": "passed"
+  },
+  "log_sha256": {
+    "handles-postmerge-native-owned.log": "6087bfce829922b0b0330177c618d4c73dd0001b3e5edbdbc1819e35835ba83e",
+    "handles-postmerge-release-licenses.log": "6e379f4b46f2f8a80a0ef1b7e803dc16bee149cb9ffd558bb634f0229a8f3742",
+    "handles-postmerge-ci.log": "b3e8f3d6cf130e48bebf145c08692ace31dc8f8a28c7efb70916ede8ad944fb4"
+  },
+  "discarded_attempt": {
+    "environment": "Inherited /tmp Zig caches; repeated with explicit worktree-owned local/global caches",
+    "result": "One one-second cache-TTL warm-hit timing assertion expired under concurrent load; complete owned-cache rerun passed all 215 CLI cases",
+    "log_sha256": "304dad0988646da2146c12f51c7c160b982ec9851fcad48a5b0c16bd59c684d8"
+  },
+  "artifact_scope": "Benchmark and three-target archive reports remain tied to their original frozen hashes; no post-merge Linux/Windows rebuild or rebenchmark is claimed."
+}

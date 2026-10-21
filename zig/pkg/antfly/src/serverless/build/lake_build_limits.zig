@@ -64,6 +64,19 @@ pub const WorkingSetAllocator = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
+    pub fn headroom(a: std.mem.Allocator) ?usize {
+        if (a.vtable == &vtable) {
+            const self: *WorkingSetAllocator = @ptrCast(@alignCast(a.ptr));
+            self.lock();
+            const available = self.max_live_bytes -| self.live_bytes;
+            const backing = self.backing;
+            self.mutex.unlock();
+            return @min(available, headroom(backing) orelse return null);
+        }
+        if (@import("antfly_local_sources").sql_parallel_scheduler.LockedAllocator.parentAllocator(a)) |parent| return headroom(parent);
+        if (comptime @import("builtin").is_test) if (a.vtable == std.testing.allocator.vtable) return std.math.maxInt(usize);
+        return @import("antfly_local_sources").sql_memory_budget.optionalHeadroom(a);
+    }
     fn permitsGrowth(self: *WorkingSetAllocator, additional_bytes: usize) bool {
         if (additional_bytes <= self.max_live_bytes -| self.live_bytes) return true;
         self.limit_exceeded = true;

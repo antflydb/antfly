@@ -62,6 +62,10 @@ const makeRootBuildOptions = antfly_storage_build.makeRootBuildOptions;
 const selectTestFilters = antfly_tests_build.selectTestFilters;
 
 pub fn build(b: *std.Build) void {
+    if (b.option(bool, "grep-only", "Compose only the standalone native grep CLI") orelse false) {
+        @import("pkg/antfly-grep/build.zig").add(b, b.standardTargetOptions(.{}), b.standardOptimizeOption(.{}));
+        return;
+    }
     if (b.option(bool, "embedded-only", "Compose only the Apache embedded products") orelse false) {
         return @import("embedded.build.zig").buildDependency(b, @This());
     }
@@ -127,6 +131,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const usermgr_mod = shared.usermgr_mod;
     const fst_mod = shared.fst_mod;
     const regex_mod = shared.regex_mod;
+    @import("pkg/antfly-grep/build.zig").addConfigured(b, target, optimize, shared.antfly_version, strip);
     const jsonschema_mod = shared.jsonschema_mod;
     const toon_mod = shared.toon_mod;
     const mcp_mod = shared.mcp_mod;
@@ -462,6 +467,22 @@ pub fn create(b: *std.Build) ?Artifacts {
         },
     });
     const run_httpx_transport_regression_tests = b.addRunArtifact(httpx_transport_regression_tests);
+
+    const group_source_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/db/group_sources.zig"), .target = target, .optimize = optimize }) });
+    group_source_tests.root_module.addImport("antfly-json", json_mod);
+    const run_group_source_tests = b.addRunArtifact(group_source_tests);
+    b.step("group-sources-test", "Run durable grouped-source membership and fencing tests").dependOn(&run_group_source_tests.step);
+    const structured_test_module = b.createModule(.{ .root_source_file = b.path("lib/structured/root.zig"), .target = target, .optimize = optimize });
+    var structured_imports = b.modules.get("antfly_structured").?.import_table.iterator();
+    while (structured_imports.next()) |entry| structured_test_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    const structured_tests = b.addTest(.{ .root_module = structured_test_module });
+    const run_structured_tests = b.addRunArtifact(structured_tests);
+    b.step("lib-structured-test", "Run constrained output, evidence and generated extraction tests").dependOn(&run_structured_tests.step);
+    const decisions_test_module = b.createModule(.{ .root_source_file = b.path("lib/decisions/root.zig"), .target = target, .optimize = optimize });
+    decisions_test_module.addImport("antfly_structured", b.modules.get("antfly_structured").?);
+    const decisions_tests = b.addTest(.{ .root_module = decisions_test_module });
+    const run_decisions_tests = b.addRunArtifact(decisions_tests);
+    b.step("lib-decisions-test", "Run shared decision wire and generated contract tests").dependOn(&run_decisions_tests.step);
 
     const lib_generating_tests = b.addTest(.{
         .root_module = generating_mod,
@@ -803,6 +824,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const conformance_test_step = b.step("conformance-test", "Fetch and run conformance suites");
     const soak_test_step = b.step("soak-test", "Run long-running soak test aggregates");
     const lib_test_step = b.step("lib-test", "Run default standalone library tests");
+    lib_test_step.dependOn(&b.top_level_steps.get("grep-test").?.step);
     dependOnAll(conformance_test_step, &.{ lib_toon_conformance_step, lib_image_conformance_run_step });
     lib_test_step.dependOn(&b.top_level_steps.get("lib-cypher-test").?.step);
     lib_test_step.dependOn(&b.top_level_steps.get("cypher-grammar-generated-check").?.step);
@@ -812,6 +834,9 @@ pub fn create(b: *std.Build) ?Artifacts {
     lib_test_step.dependOn(&run_raft_library_tests.step);
     lib_test_step.dependOn(&run_lib_jsonschema_tests.step);
     lib_test_step.dependOn(&run_lib_generating_tests.step);
+    lib_test_step.dependOn(&run_structured_tests.step);
+    lib_test_step.dependOn(&run_group_source_tests.step);
+    lib_test_step.dependOn(&run_decisions_tests.step);
     lib_test_step.dependOn(&run_lib_embeddings_tests.step);
     lib_test_step.dependOn(&run_lib_vectorindex_tests.step);
     lib_test_step.dependOn(&run_lib_hash_tests.step);

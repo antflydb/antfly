@@ -102,7 +102,10 @@ test "embeddinggemma2 SIMD FFT512 matches scalar DFT across frame tails and sile
 }
 
 test "embeddinggemma2 FFT512 completed CPU benchmark" {
-    if (comptime @import("builtin").os.tag != .macos or !@import("builtin").link_libc) return error.SkipZigTest;
+    // Runtime opt-in cannot remove the external reference from an unlinked
+    // test binary. Match the configured link capability at compile time.
+    if (comptime @import("builtin").os.tag != .macos or !@import("builtin").link_libc or
+        !@import("build_options").enable_system_blas) return error.SkipZigTest;
     const Blas = struct {
         extern fn cblas_sgemm(order: c_int, trans_a: c_int, trans_b: c_int, m: c_int, n: c_int, k: c_int, alpha: f32, a: [*]const f32, lda: c_int, b: [*]const f32, ldb: c_int, beta: f32, c: [*]f32, ldc: c_int) void;
     };

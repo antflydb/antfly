@@ -410,6 +410,7 @@ pub fn validateSplitAwareOwnership(byte_range: ByteRange, split_state: ?SplitSta
 }
 
 pub fn validatePrepareSplit(byte_range: ByteRange, split_state: ?SplitState, split_key: []const u8) KeyOwnershipError!void {
+    if (@import("db/group_source_identity.zig").splitBoundary(split_key).len != split_key.len) return error.KeyOutOfRange;
     if (split_state) |state| {
         if (state.phase != .none) return error.SplitInProgress;
     }

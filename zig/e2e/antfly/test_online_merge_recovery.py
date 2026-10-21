@@ -36,6 +36,117 @@ from helpers import PhaseTimings, wait_until
 three_by_three_backup_cluster = backups.three_by_three_backup_cluster
 
 
+def wait_for_constraint_activation(cluster, session, table, *, timeout_s=90):
+    """Observe activation within one budget; never replay a catalog mutation."""
+    deadline = time.monotonic() + timeout_s
+    last = None
+    while True:
+        cluster.assert_processes_alive()
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, (
+            f"constraint activation deadline exceeded for {table}: {last}",
+            cluster.debug_logs(),
+        )
+        try:
+            response = session.get(
+                f"{cluster.data_api_urls[0]}/tables/{table}/constraints/status",
+                timeout=min(5, remaining),
+            )
+        except (requests.Timeout, requests.ConnectionError) as error:
+            last = str(error)
+        else:
+            last = (response.status_code, response.text)
+            if response.status_code == 200:
+                state = response.json()["state"]
+                if state == "enforced":
+                    return
+                assert state == "validating", (table, last)
+            else:
+                assert response.status_code in (404, 409, 503, 504), (table, last)
+        time.sleep(min(0.5, max(0, deadline - time.monotonic())))
+
+
+@pytest.mark.parametrize("ready", [False, True])
+def test_constraint_activation_wait_bounds_transport_retries(monkeypatch, ready):
+    class Clock:
+        now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    clock = Clock()
+    monkeypatch.setattr(f"{__name__}.time", clock)
+
+    class Cluster:
+        data_api_urls = ["http://owner"]
+
+        def assert_processes_alive(self):
+            pass
+
+        def debug_logs(self):
+            return "owner logs"
+
+    class Session:
+        calls = 0
+
+        def get(self, url, *, timeout):
+            assert url == "http://owner/tables/parent/constraints/status"
+            assert 0 < timeout <= min(5, 6 - clock.now)
+            self.calls += 1
+            if not ready or self.calls == 1:
+                clock.now += timeout
+                raise requests.ReadTimeout("slow durability")
+            response = requests.Response()
+            response.status_code = 200
+            response._content = b'{"state":"enforced"}'
+            return response
+
+    session = Session()
+    if ready:
+        wait_for_constraint_activation(Cluster(), session, "parent", timeout_s=6)
+        assert clock.now == 5.5
+    else:
+        with pytest.raises(
+            AssertionError, match="constraint activation deadline exceeded"
+        ):
+            wait_for_constraint_activation(Cluster(), session, "parent", timeout_s=6)
+        assert clock.now == 6
+    assert session.calls == 2
+
+
+@pytest.mark.parametrize(
+    "status,state", [(200, "invalid"), (401, "validating"), (500, "validating")]
+)
+def test_constraint_activation_wait_preserves_terminal_failure(status, state):
+    class Cluster:
+        data_api_urls = ["http://owner"]
+
+        def assert_processes_alive(self):
+            pass
+
+    class Session:
+        def get(self, url, *, timeout):
+            response = requests.Response()
+            response.status_code = status
+            response._content = json.dumps({"state": state}).encode()
+            return response
+
+    with pytest.raises(AssertionError):
+        wait_for_constraint_activation(Cluster(), Session(), "parent")
+
+
+def test_constraint_activation_wait_preserves_process_failure():
+    class Cluster:
+        def assert_processes_alive(self):
+            raise AssertionError("owner exited")
+
+    with pytest.raises(AssertionError, match="owner exited"):
+        wait_for_constraint_activation(Cluster(), None, "parent")
+
+
 class OwnerLinkFault:
     def __init__(self, window):
         self.window = window
@@ -60,6 +171,7 @@ class OwnerLinkFault:
         self.owner_progress = deque(maxlen=32)
         self.merge_progress = deque(maxlen=32)
         self.owner_timings = {}
+        self.status_delay_s = 0.0
 
     @staticmethod
     def transaction_identity(body):
@@ -151,7 +263,12 @@ class OwnerLinkFault:
                 except ValueError:
                     pass
             if response.status_code >= 400 and path.endswith(
-                ("/restore-owner", "/txn-prepare", "/batch-routed-v1")
+                (
+                    "/restore-owner",
+                    "/txn-prepare",
+                    "/batch-routed-v1",
+                    "/online-merge-io",
+                )
             ):
                 self.failed_owner_responses.append(
                     (index, path, response.status_code, response.text[:256])
@@ -387,6 +504,20 @@ def test_owner_link_timings_are_bounded_and_group_requests_by_operation():
     assert len(fault.owner_timings) <= 33
     assert "other" in fault.owner_timings
 
+    for owner in range(140):
+        fault.observe_response(
+            owner,
+            {"_fault_path": "/internal/v1/groups/7/tables/rows/online-merge-io"},
+            response,
+        )
+    assert len(fault.failed_owner_responses) == 128
+    assert fault.failed_owner_responses[-1] == (
+        139,
+        "/internal/v1/groups/7/tables/rows/online-merge-io",
+        503,
+        "unavailable",
+    )
+
 
 @pytest.mark.parametrize("ready", [False, True])
 def test_group_leader_wait_follows_reports_with_one_deadline(monkeypatch, ready):
@@ -522,6 +653,10 @@ def owner_link_fault(request, monkeypatch):
                     self.send_header("Connection", "close")
                     self.end_headers()
                     return
+                if index < 3 and "status" in control.get("operation", {}):
+                    # Explicit slow-owner case only: each probe fits the
+                    # production turn budget, but two serial probes do not.
+                    time.sleep(fault.status_delay_s)
                 try:
                     with self.upstream_session.request(
                         self.command,
@@ -635,6 +770,7 @@ def faulted_merge_cluster(owner_link_fault, three_by_three_backup_cluster):
         ("finalize", "owner"),
         ("release", "coordinator"),
         ("snapshot", "raft_quorum"),
+        ("snapshot", "status_latency"),
         ("release", "reply_loss"),
         ("accept", "accept_reply_restart"),
     ],
@@ -786,6 +922,10 @@ def test_online_merge_recovers_after_owner_link_outage_and_crash(
                     cluster, session, table_name, tail
                 )
             documents.update(tail)
+        if crash == "status_latency":
+            fault.status_delay_s = 1.1
+            fault.heal()
+            return online
         if crash == "reply_loss":
             fault.heal_with_lost_reply()
             assert fault.reply_dropped.wait(30), (
@@ -966,16 +1106,7 @@ def test_online_fk_merge_preserves_shadow_claims_and_retained_references(
         assert wait_until(lambda: owner.fully_replicated_topology(child), timeout_s=90)
         timings.mark("child.replicated_topology")
 
-        def ready():
-            response = session.get(
-                f"{owner.data_api_urls[0]}/tables/{child}/constraints/status", timeout=5
-            )
-            return (
-                response.status_code == 200
-                and response.json().get("state") == "enforced"
-            )
-
-        assert wait_until(ready, timeout_s=90), owner.debug_logs()
+        wait_for_constraint_activation(owner, session, child)
         timings.mark("child.constraints_enforced")
         children.update(
             {f"z:child:{row['id']}": {"id": row["id"]} for row in rows.values()}
@@ -1064,17 +1195,7 @@ def test_online_fk_merge_preserves_shadow_claims_and_retained_references(
                 lambda: cluster.fully_replicated_topology(parent), timeout_s=90
             )
 
-            def ready_parent():
-                response = session.get(
-                    f"{cluster.data_api_urls[0]}/tables/{parent}/constraints/status",
-                    timeout=5,
-                )
-                return (
-                    response.status_code == 200
-                    and response.json().get("state") == "enforced"
-                )
-
-            assert wait_until(ready_parent, timeout_s=90), cluster.debug_logs()
+            wait_for_constraint_activation(cluster, session, parent)
             backups._seed_online_merge_setup_docs(cluster, session, parent, documents)
         children.update(documents)
     backups._exercise_online_document_merge(

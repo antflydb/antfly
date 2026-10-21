@@ -2225,6 +2225,8 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.ArtifactDependencyFailed,
         error.InvalidEmbeddingResponse,
         error.InvalidEmbeddingDimensions,
+        error.InvalidEmbeddingIdentity,
+        error.EmbeddingIdentityMismatch,
         error.EmbedRequestFailed,
         error.ReadRequestFailed,
         error.ExtractionInvalidRequest,
@@ -2762,6 +2764,8 @@ test "enrichment retries unknown errors and isolates known permanent errors" {
     }
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.UnsupportedEmbeddingProvider));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.InvalidEmbeddingDimensions));
+    try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.InvalidEmbeddingIdentity));
+    try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.EmbeddingIdentityMismatch));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.ReadRequestFailed));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.EmbedRequestFailed));
     inline for (.{ error.ExtractionInvalidRequest, error.ExtractionUnauthorized, error.ExtractionForbidden, error.ExtractionNotFound, error.ExtractionRequestTooLarge, error.ExtractionRequestRejected }) |err| {
@@ -12772,6 +12776,8 @@ fn processAsset(
     defer if (context_owned) if (context) |*value| value.deinit();
     var raw_owned = true;
     defer if (raw_owned) if (observed) |value| runtime.alloc.free(value);
+    var prior_input: ?@import("group_prior_input.zig").Input = null;
+    defer if (prior_input) |*value| value.deinit();
     const accepted = if (context) |*value| accepted: {
         var read = try runtime.store.beginProbe();
         defer read.abort();
@@ -12784,8 +12790,23 @@ fn processAsset(
         try finishAcceptedAssetGraph(runtime, request);
         return;
     }
+    // Accepted provenance already validates the saved causal guards. In
+    // particular, an unchanged segment outside a correction's finite horizon
+    // must not wait for earlier pending work just to reuse its current output.
+    if (request.prior_context_json.len > 0 and observed != null) {
+        const Render = struct {
+            fn render(ptr: *anyopaque, a: Allocator, prior_template: []const u8, item: std.json.Value) ![]const u8 {
+                const owner: *EnrichmentRuntime = @ptrCast(@alignCast(ptr));
+                const json = try @import("antfly-json").stringifyValueAlloc(a, item);
+                defer a.free(json);
+                return renderSourceTemplateText(a, owner.config, json, prior_template);
+            }
+        };
+        prior_input = try @import("group_prior_input.zig").capture(runtime.alloc, runtime.artifact_store orelse return error.ArtifactCatalogDrift, request, observed.?, if (context) |*value| value else null, .{ .ptr = runtime, .render = Render.render });
+    }
     const raw = observed orelse {
         if (context) |*value| {
+            std.log.debug("producer retirement replay artifact={s}", .{requestArtifactName(request)});
             const artifact = requestArtifactName(request);
             const output_key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "asset", artifact);
             defer runtime.alloc.free(output_key);
@@ -12847,6 +12868,16 @@ fn processAsset(
     };
     var source_text_owned = true;
     defer if (source_text_owned) runtime.alloc.free(@constCast(source_text));
+    if (consumes_upstream and request.group_artifact_name.len > 0 and std.mem.eql(u8, request.upstream_artifact_name, request.group_artifact_name)) {
+        const wrapper = try std.json.parseFromSlice(std.json.Value, runtime.alloc, source_text, .{});
+        defer wrapper.deinit();
+        if (wrapper.value != .object) return error.GroupedSourceCorrupt;
+        const text = wrapper.value.object.get("text") orelse return error.GroupedSourceCorrupt;
+        if (text != .string) return error.GroupedSourceCorrupt;
+        const selected = try runtime.alloc.dupe(u8, text.string);
+        runtime.alloc.free(@constCast(source_text));
+        source_text = selected;
+    }
     if (source_text.len == 0) {
         if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, null);
         const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
@@ -12877,7 +12908,7 @@ fn processAsset(
         return;
     }
 
-    var source_parts_json = if (producer_cfg.type != .copy and request.source_template.len > 0)
+    var source_parts_json = if (producer_cfg.type.usesTemplateParts(request.source_template))
         try renderSourcePartsJson(runtime.alloc, runtime.config, raw, request)
     else
         null;
@@ -12927,6 +12958,20 @@ fn processAsset(
                     runtime.alloc.free(parts);
                     source_parts_json = amended;
                 }
+            }
+        }
+    }
+
+    if (prior_input) |value| {
+        const marker = try std.fmt.allocPrint(runtime.alloc, "[prior_context {x}]\n{s}", .{ &value.fingerprint, value.text });
+        defer runtime.alloc.free(marker);
+        const combined = try std.mem.join(runtime.alloc, "\n", &.{ source_text, marker });
+        runtime.alloc.free(@constCast(source_text));
+        source_text = combined;
+        if (source_parts_json) |parts| {
+            if (try appendNeighborContextTextPartAlloc(runtime.alloc, parts, marker)) |amended| {
+                runtime.alloc.free(parts);
+                source_parts_json = amended;
             }
         }
     }
@@ -25278,7 +25323,13 @@ fn getOrCreatePlannedRequests(
 
     const doc_store_key = try documentSourceStoreKeyAlloc(runtime, doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = (try storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key)) orelse {
+    const observed = try storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key);
+    defer if (observed) |value| runtime.alloc.free(value);
+    // Private group units own an ordinary producer DAG even after their source
+    // row is deleted. Plan its applicable templates so every descendant can
+    // publish accepted absence and retract its graph contributions. The empty
+    // planning object is never producer input: processAsset re-observes absence.
+    const raw = observed orelse if (@import("../group_source_identity.zig").isAnchor(doc_key)) "{}" else {
         const empty = try runtime.alloc.alloc(enrichment_types.GeneratedEnrichmentRequest, 0);
         try request_plan_cache.append(runtime.alloc, .{
             .doc_key = owned_doc_key,
@@ -25286,7 +25337,6 @@ fn getOrCreatePlannedRequests(
         });
         return request_plan_cache.items[request_plan_cache.items.len - 1].requests;
     };
-    defer runtime.alloc.free(raw);
 
     const explicit_dense: []const mapper.DenseEmbeddingWrite = &.{};
     const explicit_sparse: []const mapper.SparseEmbeddingWrite = &.{};
@@ -25302,6 +25352,54 @@ fn getOrCreatePlannedRequests(
         .requests = planned,
     });
     return request_plan_cache.items[request_plan_cache.items.len - 1].requests;
+}
+
+test "grouped sources production plans deleted unit descendants without source bytes" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "retired-units" });
+    defer store.deinit();
+    var erased = try backend_erased.storeFrom(alloc, store);
+    defer erased.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/indexes", .{tmp.sub_path});
+    var manager = try index_manager_mod.IndexManager.init(alloc, path);
+    defer manager.deinit();
+    const groups = @import("../group_sources.zig");
+    const config = groups.Config{ .group_by = "thread", .order_by = "ordinal", .segment_by = "turn", .field = "text" };
+    try manager.addEnrichment(&store, .{ .name = "turns", .kind = .group, .source = config });
+    try manager.addEnrichment(&store, .{ .name = "claims", .kind = .asset, .source_artifact_name = "turns", .producer_json = "{\"type\":\"copy\"}" });
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .ownership = undefined,
+        .config = .{},
+    };
+    const anchor = try @import("../group_source_identity.zig").anchor(alloc, 1, groups.definitionDigest("turns", config), @splat(2));
+    defer alloc.free(anchor);
+    const unit = try std.fmt.allocPrint(alloc, "{s}/p/segment/0/u/unit", .{anchor});
+    defer alloc.free(unit);
+    var cache = std.ArrayListUnmanaged(RequestPlanCacheEntry).empty;
+    defer freeRequestPlanCache(alloc, &cache);
+    const planned = try getOrCreatePlannedRequests(&runtime, unit, &cache);
+    try std.testing.expectEqual(@as(usize, 2), planned.len);
+    try std.testing.expectEqualStrings("turns", planned[0].artifact_name);
+    try std.testing.expectEqualStrings("claims", planned[1].artifact_name);
+    try std.testing.expectEqualStrings("turns", planned[1].upstream_artifact_name);
+    const ordinary = try getOrCreatePlannedRequests(&runtime, "deleted-primary", &cache);
+    try std.testing.expectEqual(@as(usize, 0), ordinary.len);
 }
 
 fn flushGeneratedReplayWindowIfNeeded(
@@ -31835,7 +31933,7 @@ fn documentSourceStoreKeyAlloc(runtime: *EnrichmentRuntime, doc_key: []const u8)
 }
 
 fn documentSourceStoreKeyWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocator, doc_key: []const u8) ![]u8 {
-    return if (runtimeUsesRelationalBaseRows(runtime))
+    return if (runtimeUsesRelationalBaseRows(runtime) and !@import("../group_source_identity.zig").isAnchor(doc_key))
         try relational_store.keyAlloc(alloc, doc_key)
     else
         try internal_keys.documentKeyAlloc(alloc, doc_key);
@@ -32052,50 +32150,39 @@ fn extractModelChunkSource(a: Allocator, config: Config, raw: []const u8, reques
     var parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return .{};
-    const field = parsed.value.object.get(request.source_field) orelse return .{};
-    if (field == .null) return .{};
-    if (field == .string) {
-        const text = try a.dupe(u8, field.string);
-        return .{ .input = .{ .text = text }, .bytes = text };
+    const field = enrichment_types.sourceFieldValue(parsed.value, request.source_field, request.group_artifact_name.len > 0);
+    const source = try @import("../../../chunking/chunk.zig").modelSourceFromValue(field);
+    switch (source) {
+        .none => return .{},
+        .text => |value| {
+            const text = try a.dupe(u8, value);
+            return .{ .input = .{ .text = text }, .bytes = text };
+        },
+        .source => |borrowed| {
+            var reference = borrowed;
+            var result = ModelChunkSource{};
+            errdefer result.deinit(a);
+            result.uri = try a.dupe(u8, reference.uri);
+            result.mime_type = try a.dupe(u8, reference.mime_type);
+            result.version = try a.dupe(u8, reference.version);
+            reference.uri = result.uri.?;
+            reference.mime_type = result.mime_type.?;
+            reference.version = result.version.?;
+            result.input = .{ .source = reference };
+            return result;
+        },
+        .media => |media| {
+            // Decode binary media only on the execution path. Offline source
+            // inspection uses the same borrowed descriptor without this work.
+            const size = std.base64.standard.Decoder.calcSizeForSlice(media.data) catch return error.InvalidChunkSource;
+            if (size > try document_extraction_mod.effectiveRemoteContentMaxDownloadSize(config.remote_content)) return error.SourceTooLarge;
+            const bytes = try a.alloc(u8, size);
+            errdefer a.free(bytes);
+            std.base64.standard.Decoder.decode(bytes, media.data) catch return error.InvalidChunkSource;
+            const owned_mime = try a.dupe(u8, media.mime_type);
+            return .{ .input = .{ .binary = .{ .mime_type = owned_mime, .data = bytes } }, .bytes = bytes, .mime_type = owned_mime };
+        },
     }
-    if (field != .object) return error.InvalidChunkSource;
-    const kind = field.object.get("type") orelse return error.InvalidChunkSource;
-    if (kind == .string and std.mem.eql(u8, kind.string, "source")) {
-        const C = @import("inference_chunker");
-        const uri = field.object.get("uri") orelse return error.InvalidChunkSource;
-        const mime = field.object.get("mime_type") orelse return error.InvalidChunkSource;
-        const version = field.object.get("version") orelse return error.InvalidChunkSource;
-        const length = field.object.get("length") orelse return error.InvalidChunkSource;
-        if (uri != .string or mime != .string or version != .string or length != .integer or length.integer <= 0 or mime.string.len == 0) return error.InvalidChunkSource;
-        var reference = C.SourceReference{ .uri = uri.string, .mime_type = mime.string, .version = version.string, .length = @intCast(length.integer) };
-        if (field.object.get("version_kind")) |value| {
-            if (value != .string) return error.InvalidChunkSource;
-            reference.version_kind = std.meta.stringToEnum(@TypeOf(reference.version_kind), value.string) orelse return error.InvalidChunkSource;
-        }
-        var result = ModelChunkSource{};
-        errdefer result.deinit(a);
-        result.uri = try a.dupe(u8, uri.string);
-        result.mime_type = try a.dupe(u8, mime.string);
-        result.version = try a.dupe(u8, version.string);
-        reference.uri = result.uri.?;
-        reference.mime_type = result.mime_type.?;
-        reference.version = result.version.?;
-        result.input = .{ .source = reference };
-        return result;
-    }
-    if (kind != .string or !std.mem.eql(u8, kind.string, "media")) return error.InvalidChunkSource;
-    const mime = field.object.get("mime_type") orelse return error.InvalidChunkSource;
-    const data = field.object.get("data") orelse return error.InvalidChunkSource;
-    if (mime != .string or data != .string or mime.string.len == 0) return error.InvalidChunkSource;
-    // Inline media is versioned with the document. Remote assets first pass
-    // through the existing authorized asset materialization/retention path.
-    const size = std.base64.standard.Decoder.calcSizeForSlice(data.string) catch return error.InvalidChunkSource;
-    if (size > document_extraction_mod.effectiveRemoteContentMaxDownloadSize(config.remote_content)) return error.SourceTooLarge;
-    const bytes = try a.alloc(u8, size);
-    errdefer a.free(bytes);
-    std.base64.standard.Decoder.decode(bytes, data.string) catch return error.InvalidChunkSource;
-    const owned_mime = try a.dupe(u8, mime.string);
-    return .{ .input = .{ .binary = .{ .mime_type = owned_mime, .data = bytes } }, .bytes = bytes, .mime_type = owned_mime };
 }
 
 fn extractSourceText(
@@ -32107,7 +32194,7 @@ fn extractSourceText(
     if (request.source_template.len > 0) {
         // Render via Handlebars template
         const rendered = renderSourceTemplateText(alloc, config, raw_doc, request.source_template) catch |err| switch (err) {
-            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => return null,
         };
         if (rendered.len == 0) {
@@ -32121,7 +32208,7 @@ fn extractSourceText(
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw_doc, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return null;
-    const source = parsed.value.object.get(request.source_field) orelse return null;
+    const source = enrichment_types.sourceFieldValue(parsed.value, request.source_field, request.group_artifact_name.len > 0);
     if (source != .string) return null;
     return try alloc.dupe(u8, source.string);
 }
@@ -32156,13 +32243,14 @@ fn extractAssetSourceValue(
 ) !?[]const u8 {
     if (request.source_template.len > 0) {
         const rendered = renderSourceTemplateText(alloc, config, raw_doc, request.source_template) catch |err| switch (err) {
-            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => return null,
         };
         if (rendered.len == 0) {
             alloc.free(rendered);
             return null;
         }
+        errdefer alloc.free(rendered);
         try document_extraction_mod.validateInlineSourceSize(config.remote_content, rendered);
         return rendered;
     }
@@ -32170,7 +32258,7 @@ fn extractAssetSourceValue(
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw_doc, .{ .parse_numbers = false });
     defer parsed.deinit();
     if (parsed.value != .object) return null;
-    const source = parsed.value.object.get(request.source_field) orelse return null;
+    const source = enrichment_types.sourceFieldValue(parsed.value, request.source_field, request.group_artifact_name.len > 0);
     return switch (source) {
         .null => null,
         .string => |value| blk: {
@@ -32196,12 +32284,12 @@ fn renderSourceParts(
     if (request.source_template.len == 0) return null;
     const parts = if (comptime @hasDecl(template_remote, "renderJsonToPartsWithConfig"))
         template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, max_media_parts)) catch |err| switch (err) {
-            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => return null,
         }
     else
         template_remote.renderJsonToParts(alloc, request.source_template, raw_doc) catch |err| switch (err) {
-            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => return null,
         };
     if (parts.len == 0) {
@@ -34190,7 +34278,7 @@ fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !v
     });
     defer db.close();
     try db.setSchemaJson(alloc, "{}");
-    try db.addEnrichment(.{ .name = "copy", .kind = .asset, .field = "body", .content_type = if (graph) "application/json" else "text/plain", .producer_json = if (generated) "{\"type\":\"generator\",\"config\":{}}" else "" });
+    try db.addEnrichment(.{ .name = "copy", .kind = .asset, .field = "body", .content_type = if (graph) "application/json" else "text/plain", .producer_json = if (generated) "{\"type\":\"generator\",\"config\":{\"provider\":\"ollama\",\"model\":\"fixture\"}}" else "" });
     try db.addEnrichment(.{ .name = "downstream", .kind = .asset, .source_artifact_name = "copy", .content_type = "text/plain" });
     if (graph) try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"sources\":[{\"artifact\":\"copy\"}]}" });
     const asset_body = if (graph) "{\"type\":\"mentions\",\"target\":\"other\"}" else "hello";
@@ -34436,7 +34524,7 @@ test "asset preparation is lazy and byte bounded across retryable provider batch
         .artifact_name = "generated",
         .doc_key = "blocked",
         .source_field = "body",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
         .execution_json = "{\"batch_items\":8,\"batch_bytes\":1}",
         .sequence = 7,
     };
@@ -34607,7 +34695,7 @@ test "asset producer neighbor context samples local graph adjacency into the inp
         .artifact_name = "conceptualize_v1",
         .doc_key = doc_key,
         .source_field = "name",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
         .neighbor_context_json = "{\"graph_index\":\"taxonomy\",\"direction\":\"out\",\"limit\":8}",
         .sequence = 3,
     };
@@ -34690,7 +34778,7 @@ test "asset producer neighbor context samples local graph adjacency into the inp
         .name = "conceptualize_v1",
         .kind = .asset,
         .field = "name",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
         .neighbor_context = .{ .graph_index = "taxonomy" },
     });
     try db.batch(.{ .graph_writes = &.{
@@ -35549,6 +35637,36 @@ test "extractSourceText with template and invalid JSON returns null" {
     try std.testing.expect(result == null);
 }
 
+test "enrichment preserves snapshot failures instead of skipping source content" {
+    const Probe = struct {
+        fn text(raw: ?*anyopaque, _: Allocator, _: []const u8, _: []const u8, _: template_remote.RenderConfig) anyerror![]const u8 {
+            const failure: *anyerror = @ptrCast(@alignCast(raw.?));
+            return failure.*;
+        }
+        fn parts(raw: ?*anyopaque, _: Allocator, _: []const u8, _: []const u8, _: template_remote.RenderConfig) anyerror![]template.ContentPart {
+            const failure: *anyerror = @ptrCast(@alignCast(raw.?));
+            return failure.*;
+        }
+    };
+    var failure: anyerror = error.ResourceTemporarilyUnavailable;
+    template_remote.setHostRenderer(.{ .ctx = &failure, .render_json_to_text = Probe.text, .render_json_to_parts = Probe.parts });
+    defer template_remote.setHostRenderer(null);
+    const request = enrichment_types.GeneratedEnrichmentRequest{
+        .kind = .dense_embedding,
+        .index_name = "idx",
+        .doc_key = "doc:1",
+        .source_field = "url",
+        .source_template = "{{remoteMedia url=url}}",
+    };
+    const doc = "{\"url\":\"file:///media.png\"}";
+    for ([_]anyerror{ error.OutOfMemory, error.ResourceTemporarilyUnavailable, error.Timeout, error.Canceled }) |err| {
+        failure = err;
+        try std.testing.expectError(err, extractSourceText(std.testing.allocator, .{}, doc, request));
+        try std.testing.expectError(err, extractAssetSourceValue(std.testing.allocator, .{}, doc, request));
+        try std.testing.expectError(err, renderSourceParts(std.testing.allocator, .{}, doc, request, null));
+    }
+}
+
 test "enrichment extractSourceText with template error directive fails instead of returning text" {
     const alloc = std.testing.allocator;
     const doc = "{\"body\":\"large image description\"}";
@@ -35717,6 +35835,29 @@ test "model aware media forced requests cannot reuse an earlier worker vector co
     try std.testing.expect(!std.mem.eql(u8, ordinary, forced));
 }
 
+test "backup preflight literal fields match enrichment execution" {
+    const a = std.testing.allocator;
+    const raw = "{\"media.uri\":\"file:///private/active.pdf\"}";
+    const producer = "{\"type\":\"reader\",\"config\":{}}";
+    try @import("config_validation.zig").validatePublicConfig(a, .{ .name = "reader", .kind = .asset, .field = "media.uri", .producer_json = producer });
+    const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .asset, .index_name = "reader", .artifact_name = "reader", .doc_key = "doc", .source_field = "media.uri", .producer_json = producer };
+    const actual = (try extractAssetSourceValue(a, .{}, raw, request)).?;
+    defer a.free(actual);
+    try std.testing.expectEqualStrings("file:///private/active.pdf", actual);
+    const preflight = @import("../../lite/backup_preflight.zig");
+    var report: preflight.Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+    defer report.deinit();
+    var inspector: preflight.Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    const catalog = try @import("../catalog/enrichment_catalog.zig").serializeCatalog(a, &.{.{ .name = "reader", .kind = .asset, .source_field = "media.uri", .producer_json = producer }});
+    defer a.free(catalog);
+    try inspector.metadataJson(catalog);
+    try inspector.document("doc", raw, "");
+    const json = try report.jsonAlloc("{\"version\":1,\"configuration_id\":\"empty-destination\"}");
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "source_local") != null);
+}
+
 test "model aware media retained source recipes own their immutable object reference" {
     const Fixture = struct {
         fn qualify(a: Allocator) !void {
@@ -35767,4 +35908,101 @@ test "model aware media fused reuse rejects a changed provider generation with t
     try std.testing.expect((try compatibleModelChunkVector(std.testing.allocator, provider, request, &metadata)) == null);
     metadata.dimensions = 3;
     try std.testing.expect((try compatibleModelChunkVector(std.testing.allocator, provider, request, &metadata)) == null);
+}
+
+fn testPreflightLiteralModelInput(asset: bool) !void {
+    const a = std.testing.allocator;
+    const text = "Example: <<<dotprompt:media:url file:///private/example.pdf>>>";
+    const raw = try std.json.Stringify.valueAlloc(a, .{ .body = text }, .{});
+    defer a.free(raw);
+    const producer = if (asset) "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"mock\"}}" else "{\"version\":2,\"provider\":\"antfly\",\"model\":\"mock\",\"endpoint\":\"antfly:embedded\",\"sparse\":false}";
+    try @import("config_validation.zig").validatePublicConfig(a, .{ .name = "model", .kind = if (asset) .asset else .embedding, .field = "body", .expected_dims = if (asset) 0 else 3, .producer_json = producer });
+    const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = if (asset) .asset else .dense_embedding, .index_name = "model", .artifact_name = "model", .doc_key = "doc", .source_field = "body", .producer_json = producer, .expected_dims = if (asset) 0 else 3 };
+    const actual = if (asset) (try extractAssetSourceValue(a, .{}, raw, request)).? else (try extractSourceText(a, .{}, raw, request)).?;
+    defer a.free(actual);
+    try std.testing.expectEqualStrings(text, actual);
+    try std.testing.expect((try renderSourceParts(a, .{}, raw, request, null)) == null);
+    const preflight = @import("../../lite/backup_preflight.zig");
+    var report: preflight.Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+    defer report.deinit();
+    var inspector: preflight.Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    const catalog = try @import("../catalog/enrichment_catalog.zig").serializeCatalog(a, &.{.{ .name = "model", .kind = if (asset) .asset else .embedding, .source_field = "body", .expected_dims = if (asset) 0 else 3, .producer_json = producer }});
+    defer a.free(catalog);
+    try inspector.metadataJson(catalog);
+    try inspector.document("doc", raw, "");
+    const caps = try a.alloc(preflight.Capability, report.requirements.items.len);
+    defer a.free(caps);
+    for (report.requirements.items, caps) |*r, *cap| cap.* = .{ .requirement_sha256 = &r.sha256, .supported = true, .query_embedding = true, .future_ingestion = true, .model_revision_verified = true, .preprocessing_verified = true, .vector_space_verified = true, .dimensions = r.dimensions };
+    const evidence = try std.json.Stringify.valueAlloc(a, preflight.Destination{ .version = 1, .configuration_id = "all-model-capabilities", .requirements = caps }, .{});
+    defer a.free(evidence);
+    const json = try report.jsonAlloc(evidence);
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"compatibility\":{\"verdict\":\"compatible\"") != null);
+}
+
+test "backup preflight template free generator input" {
+    try testPreflightLiteralModelInput(true);
+}
+test "backup preflight template free embedding input" {
+    try testPreflightLiteralModelInput(false);
+}
+
+test "backup preflight prior context output remains an appended text part" {
+    const a = std.testing.allocator;
+    const producer = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"mock\"}}";
+    const prior: @import("../group_sources.zig").PriorContext = .{ .artifact = "claims", .render = "{{media url=source}}" };
+    try @import("config_validation.zig").validatePublicConfig(a, .{ .name = "model", .kind = .asset, .source_artifact_name = "turns", .producer_json = producer, .prior_context = prior });
+    const raw = "{\"source\":\"file:///private/example.pdf\"}";
+    const text = try template.renderDocument(a, prior.render, raw);
+    defer a.free(text);
+    const parts = (try appendNeighborContextTextPartAlloc(a, "[{\"type\":\"text\",\"text\":\"prompt\"}]", text)).?;
+    defer a.free(parts);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, parts, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("text", parsed.value.array.items[1].object.get("type").?.string);
+    try std.testing.expectEqualStrings(text, parsed.value.array.items[1].object.get("text").?.string);
+    const prior_json = try std.json.Stringify.valueAlloc(a, prior, .{});
+    defer a.free(prior_json);
+    const metadata = try @import("../catalog/enrichment_catalog.zig").serializeCatalog(a, &.{.{ .name = "model", .kind = .asset, .source_field = "", .source_artifact_name = "turns", .producer_json = producer, .prior_context_json = prior_json }});
+    defer a.free(metadata);
+    const preflight = @import("../../lite/backup_preflight.zig");
+    var report: preflight.Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+    defer report.deinit();
+    var inspector: preflight.Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    try inspector.metadataJson(metadata);
+    try inspector.document("prior", raw, "claims");
+    for (report.requirements.items) |requirement| try std.testing.expect(requirement.kind != .source_local);
+    try std.testing.expect(report.analysis_complete);
+}
+
+test "backup preflight reader media parts match execution" {
+    const a = std.testing.allocator;
+    const producer = "{\"type\":\"reader\",\"config\":{\"provider\":\"antfly\",\"model\":\"mock\"}}";
+    const source_template = "https://example.org/notes <<<dotprompt:media:url file:///private/page.png>>>";
+    try @import("config_validation.zig").validatePublicConfig(a, .{ .name = "reader", .kind = .asset, .template = source_template, .producer_json = producer });
+    const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .asset, .index_name = "reader", .artifact_name = "reader", .doc_key = "doc", .source_field = "", .source_template = source_template, .producer_json = producer };
+    const parts = (try renderSourceParts(a, .{}, "{}", request, null)).?;
+    defer template.freeContentParts(a, parts);
+    try std.testing.expectEqual(@as(usize, 2), parts.len);
+    try std.testing.expectEqualStrings("file:///private/page.png", parts[1].media_url);
+    const preflight = @import("../../lite/backup_preflight.zig");
+    var report: preflight.Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+    defer report.deinit();
+    var inspector: preflight.Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    const catalog = try @import("../catalog/enrichment_catalog.zig").serializeCatalog(a, &.{.{ .name = "reader", .kind = .asset, .source_field = "", .source_template = source_template, .producer_json = producer }});
+    defer a.free(catalog);
+    try inspector.metadataJson(catalog);
+    try inspector.document("doc", "{}", "");
+    const caps = try a.alloc(preflight.Capability, report.requirements.items.len);
+    defer a.free(caps);
+    for (report.requirements.items, caps) |*r, *cap| cap.* = .{ .requirement_sha256 = &r.sha256, .supported = true, .query_embedding = true, .future_ingestion = true, .model_revision_verified = true, .preprocessing_verified = true, .vector_space_verified = true, .dimensions = r.dimensions };
+    const evidence = try std.json.Stringify.valueAlloc(a, preflight.Destination{ .version = 1, .configuration_id = "all-evidence", .requirements = caps }, .{});
+    defer a.free(evidence);
+    const json = try report.jsonAlloc(evidence);
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"source_local\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"compatibility\":{\"verdict\":\"blocked\"") != null);
 }

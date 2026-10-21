@@ -861,6 +861,9 @@ Attempted change: "%s"`,
 
 	oldStorageEngine := effectiveStorageEngine(old.Spec.Storage)
 	newStorageEngine := effectiveStorageEngine(r.Spec.Storage)
+	if old.Spec.Storage.EffectiveStandaloneAccessMode() != r.Spec.Storage.EffectiveStandaloneAccessMode() {
+		errors = append(errors, "field 'spec.storage.standaloneAccessMode' is immutable after deployment; create a new volume and restore a backup")
+	}
 	if newStorageEngine != oldStorageEngine {
 		errors = append(errors, fmt.Sprintf(
 			`field 'spec.storage.engine' is immutable after deployment
@@ -2451,6 +2454,9 @@ func (r *AntflyCluster) validateStandaloneConfig() error {
 // It is shared by admission and reconciliation so a webhook outage cannot make
 // the controller silently reinterpret an unsupported engine as local storage.
 func ValidateOperatorManagedStorageSpec(mode ClusterMode, storage StorageSpec) error {
+	if storage.StandaloneAccessMode != "" && storage.StandaloneAccessMode != corev1.ReadWriteOnce && storage.StandaloneAccessMode != corev1.ReadWriteOncePod {
+		return fmt.Errorf("spec.storage.standaloneAccessMode must be ReadWriteOnce or ReadWriteOncePod")
+	}
 	engine := storage.Engine
 	if engine == "" {
 		engine = "local"
@@ -2465,6 +2471,9 @@ func ValidateOperatorManagedStorageSpec(mode ClusterMode, storage StorageSpec) e
 	}
 	switch effectiveMode {
 	case ClusterModeDistributed:
+		if storage.StandaloneAccessMode != "" {
+			return fmt.Errorf("spec.storage.standaloneAccessMode requires spec.mode=Standalone")
+		}
 		if engine != "local" {
 			return fmt.Errorf("spec.storage.engine=%q is not supported when spec.mode=Distributed", engine)
 		}

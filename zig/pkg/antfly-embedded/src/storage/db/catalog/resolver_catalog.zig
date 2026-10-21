@@ -33,6 +33,9 @@ const matcher = @import("antfly_matcher");
 /// Durable resolver-backfill cursors. They live with the resolver catalog
 /// metadata so catalog mutations can mark backfill dirty in the same store
 /// transaction that publishes the catalog change.
+// Durable key spelling belongs to the catalog contract, not the physical DB.
+pub const drop_marker_prefix = "\x00\x00__metadata__:resolver_curation_drop:";
+
 pub const reresolve_resume_key = "\x00\x00__metadata__:resolution_reresolve_resume";
 pub const reresolve_repair_resume_key = "\x00\x00__metadata__:resolution_reresolve_repair_resume";
 
@@ -65,7 +68,14 @@ fn cloneLabels(alloc: Allocator, labels: []const []const u8) ![]const []const u8
 pub const minimum_reader_key = "\x00\x00__metadata__:minimum_reader_version";
 pub const replacement_reader_base_key = "\x00\x00__metadata__:replacement_reader_base_v1";
 pub const graph_expiration_namespace_reader_version: u32 = 4;
-pub const supported_reader_version: u32 = graph_expiration_namespace_reader_version;
+pub const adjudication_reader_version: u32 = 5;
+pub const curation_reader_version: u32 = 6;
+pub const generated_producers_reader_version: u32 = 7;
+pub const grouped_sources_reader_version: u32 = 8;
+pub const namespace_curation_reader_version: u32 = 9;
+pub const curation_provenance_reader_version: u32 = 10;
+pub const scoped_curation_reader_version: u32 = 11;
+pub const supported_reader_version: u32 = scoped_curation_reader_version;
 
 pub fn readerVersionBytes(version: u32) ![]const u8 {
     return switch (version) {
@@ -73,6 +83,13 @@ pub fn readerVersionBytes(version: u32) ![]const u8 {
         2 => "2",
         3 => "3",
         4 => "4",
+        5 => "5",
+        6 => "6",
+        7 => "7",
+        8 => "8",
+        9 => "9",
+        10 => "10",
+        11 => "11",
         else => error.UnsupportedDatabaseReaderVersion,
     };
 }
@@ -95,6 +112,26 @@ pub fn catalogReaderVersion(a: Allocator, data: []const u8) !u32 {
     var required: u32 = if (parsed.value == .object) @intCast(parsed.value.object.get("version").?.integer) else 1;
     for (rows.array.items) |entry| {
         if (entry != .object) return error.InvalidResolverConfig;
+        if (entry.object.get("adjudicate_json")) |adjudicate| {
+            required = @max(required, adjudication_reader_version);
+            if (adjudicate == .string and adjudicate.string.len > 0) {
+                const config = try std.json.parseFromSlice(std.json.Value, a, adjudicate.string, .{});
+                defer config.deinit();
+                if (config.value == .object) if (config.value.object.get("decider")) |decider| if (decider == .object) if (decider.object.get("decision_method")) |method| {
+                    if (method == .string and std.mem.eql(u8, method.string, "generated")) required = @max(required, generated_producers_reader_version);
+                };
+            }
+        }
+        if (entry.object.get("curation_json")) |curation| {
+            if (curation == .string and curation.string.len > 0) {
+                const state = try std.json.parseFromSlice(std.json.Value, a, curation.string, .{});
+                defer state.deinit();
+                if (state.value == .object and (state.value.object.contains("redirect_origins") or state.value.object.contains("proposals"))) required = @max(required, curation_provenance_reader_version);
+                if (state.value == .object and state.value.object.contains("receipt_scope")) required = @max(required, scoped_curation_reader_version);
+            }
+        }
+        if (entry.object.contains("namespace_curation_generation")) required = @max(required, namespace_curation_reader_version);
+        if (entry.object.contains("suppress_json") or entry.object.contains("curation_json") or entry.object.contains("curation_revision")) required = @max(required, curation_reader_version);
         if (entry.object.contains("replacement_index") or entry.object.contains("replacement_resolver")) required = @max(required, 3);
         for ([_][]const u8{ "inline_managed", "retired", "aliases", "promote", "merge_generation", "merge_state_version", "resolution_generation", "namespace_generation", "retain_work", "max_work_bytes" }) |field| {
             if (entry.object.contains(field)) required = @max(required, 2);
@@ -201,6 +238,13 @@ pub const ResolverConfig = struct {
     type_must_match: bool = true,
     /// Optional matcher scorer config; empty means deterministic minting only.
     scorer_json: []const u8 = "",
+    /// Frozen, validated REVIEW adjudication policy; public spelling is adjudicate.
+    adjudicate_json: []const u8 = "",
+    suppress_json: []const u8 = "",
+    /// Runtime identity state, preserved across graph replacement/retirement.
+    curation_json: []const u8 = "",
+    curation_revision: u64 = 0,
+    namespace_curation_generation: u64 = 0,
     /// Candidate blocking strategy: "" (none, deterministic mint) or
     /// "exact_key" (look up the rendered canonical key as a candidate so the
     /// scorer can link to an existing entity). ANN/prefix blocking over the
@@ -239,9 +283,53 @@ pub const ResolverConfig = struct {
     /// and are dropped by the canonical-only rule). The cheap
     /// post-extraction junk filter for score-carrying extractors (GLiNER);
     /// 0 admits everything.
-    min_confidence: f64 = 0.0,
+    min_confidence: ?f64 = null,
     /// Bumped to force a versioned re-resolution pass.
     config_generation: u64 = 0,
+
+    pub fn parseValue(a: Allocator, value: std.json.Value) !std.json.Parsed(ResolverConfig) {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var normalized = try std.json.parseFromSliceLeaky(std.json.Value, scratch, try std.json.Stringify.valueAlloc(scratch, value, .{}), .{});
+        if (normalized != .object) return error.InvalidResolverConfig;
+        if (normalized.object.fetchSwapRemove("suppress")) |entry| if (entry.value != .null) {
+            if (normalized.object.contains("suppress_json")) return error.InvalidResolverConfig;
+            try normalized.object.put(scratch, "suppress_json", .{ .string = try std.json.Stringify.valueAlloc(scratch, entry.value, .{}) });
+        };
+        if (normalized.object.fetchSwapRemove("adjudicate")) |entry| {
+            if (entry.value != .null) {
+                if (normalized.object.contains("adjudicate_json")) return error.InvalidResolverConfig;
+                const raw = try std.json.Stringify.valueAlloc(scratch, entry.value, .{});
+                try @import("../../../functions/resolver_adjudication.zig").validate(scratch, raw);
+                try normalized.object.put(scratch, "adjudicate_json", .{ .string = raw });
+            }
+        }
+        // Embedded callers may use the same typed scorer spelling as HTTP.
+        if (normalized.object.fetchSwapRemove("scorer")) |entry| {
+            if (entry.value != .null) {
+                if (normalized.object.contains("scorer_json")) return error.InvalidResolverConfig;
+                try normalized.object.put(scratch, "scorer_json", .{ .string = try std.json.Stringify.valueAlloc(scratch, entry.value, .{}) });
+            }
+        }
+        return std.json.parseFromValue(ResolverConfig, a, normalized, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    }
+
+    /// Public identity inspection never exposes a frozen provider credential.
+    pub fn publicValue(self: ResolverConfig, a: Allocator) !std.json.Value {
+        var value = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, self, .{}), .{});
+        _ = value.object.swapRemove("curation_json");
+        if (value.object.fetchSwapRemove("suppress_json")) |entry|
+            try value.object.put(a, "suppress", try std.json.parseFromSliceLeaky(std.json.Value, a, entry.value.string, .{}));
+        if (value.object.fetchSwapRemove("adjudicate_json")) |entry| {
+            var policy = try std.json.parseFromSliceLeaky(std.json.Value, a, entry.value.string, .{});
+            if (policy.object.getPtr("decider")) |decider| {
+                try @import("../../../common/credential_safety.zig").redactPublicProviderConfig(a, decider);
+            }
+            try value.object.put(a, "adjudicate", policy);
+        }
+        return value;
+    }
 
     pub fn eql(self: ResolverConfig, other: ResolverConfig) bool {
         inline for (@typeInfo(ResolverConfig).@"struct".field_names, @typeInfo(ResolverConfig).@"struct".field_types) |reflected_name, field_type| {
@@ -265,15 +353,16 @@ pub const ResolverConfig = struct {
 
     /// Borrowed strings, owned array. Durable curation wins over inline aliases.
     pub fn effectiveAliasesAlloc(self: ResolverConfig, alloc: Allocator) ![]const resolver_lib.KeyAlias {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const curation = try resolver_lib.curation.Index.init(arena.allocator(), self.suppress_json, self.curation_json);
+        var curated: std.StringHashMapUnmanaged(void) = .empty;
+        for (self.merges) |alias| try curated.put(arena.allocator(), alias.key, {});
         var result: std.ArrayList(resolver_lib.KeyAlias) = .empty;
         errdefer result.deinit(alloc);
         for (self.aliases) |alias| {
-            var redirected = false;
-            for (self.merges) |merge| if (std.mem.eql(u8, alias.key, merge.key)) {
-                redirected = true;
-                break;
-            };
-            if (!redirected) try result.append(alloc, alias);
+            if (curation.removed_aliases.contains(alias.key)) continue;
+            if (!curated.contains(alias.key)) try result.append(alloc, alias);
         }
         try result.appendSlice(alloc, self.merges);
         return try result.toOwnedSlice(alloc);
@@ -286,7 +375,7 @@ pub const ResolverConfig = struct {
         try writer.beginObject();
         inline for (@typeInfo(ResolverConfig).@"struct".field_names) |field| {
             if (comptime !std.mem.eql(u8, field, "merges")) {
-                const omit = if (comptime std.mem.eql(u8, field, "aliases")) self.aliases.len == 0 else if (comptime std.mem.eql(u8, field, "promote")) self.promote else if (comptime std.mem.eql(u8, field, "merge_generation")) self.merge_generation == 0 else if (comptime std.mem.eql(u8, field, "merge_state_version")) self.merge_state_version == 0 else if (comptime std.mem.eql(u8, field, "resolution_generation")) self.resolution_generation == 0 else if (comptime std.mem.eql(u8, field, "namespace_generation")) self.namespace_generation == 0 else if (comptime std.mem.eql(u8, field, "inline_managed")) self.inline_managed == null else if (comptime std.mem.eql(u8, field, "replacement_index")) self.replacement_index.len == 0 else if (comptime std.mem.eql(u8, field, "replacement_resolver")) self.replacement_resolver.len == 0 else if (comptime std.mem.eql(u8, field, "retired")) !self.retired else if (comptime std.mem.eql(u8, field, "retain_work")) self.retain_work == .full else if (comptime std.mem.eql(u8, field, "max_work_bytes")) self.max_work_bytes == 1024 * 1024 else false;
+                const omit = if (comptime (std.mem.eql(u8, field, "adjudicate_json") or std.mem.eql(u8, field, "suppress_json") or std.mem.eql(u8, field, "curation_json"))) @field(self, field).len == 0 else if (comptime std.mem.eql(u8, field, "namespace_curation_generation")) self.namespace_curation_generation == 0 else if (comptime std.mem.eql(u8, field, "curation_revision")) self.curation_revision == 0 else if (comptime std.mem.eql(u8, field, "aliases")) self.aliases.len == 0 else if (comptime std.mem.eql(u8, field, "promote")) self.promote else if (comptime std.mem.eql(u8, field, "merge_generation")) self.merge_generation == 0 else if (comptime std.mem.eql(u8, field, "merge_state_version")) self.merge_state_version == 0 else if (comptime std.mem.eql(u8, field, "resolution_generation")) self.resolution_generation == 0 else if (comptime std.mem.eql(u8, field, "namespace_generation")) self.namespace_generation == 0 else if (comptime std.mem.eql(u8, field, "inline_managed")) self.inline_managed == null else if (comptime std.mem.eql(u8, field, "replacement_index")) self.replacement_index.len == 0 else if (comptime std.mem.eql(u8, field, "replacement_resolver")) self.replacement_resolver.len == 0 else if (comptime std.mem.eql(u8, field, "retired")) !self.retired else if (comptime std.mem.eql(u8, field, "retain_work")) self.retain_work == .full else if (comptime std.mem.eql(u8, field, "max_work_bytes")) self.max_work_bytes == 1024 * 1024 else false;
                 if (!omit) {
                     try writer.objectField(field);
                     try writer.write(@field(self, field));
@@ -382,6 +471,9 @@ pub const ResolverConfig = struct {
         for (self.labels) |l| alloc.free(@constCast(l));
         if (self.labels.len > 0) alloc.free(self.labels);
         if (self.scorer_json.len > 0) alloc.free(@constCast(self.scorer_json));
+        if (self.adjudicate_json.len > 0) alloc.free(self.adjudicate_json);
+        if (self.suppress_json.len > 0) alloc.free(self.suppress_json);
+        if (self.curation_json.len > 0) alloc.free(self.curation_json);
         if (self.candidate_search.len > 0) alloc.free(@constCast(self.candidate_search));
         if (self.candidate_ann_index.len > 0) alloc.free(@constCast(self.candidate_ann_index));
         if (self.name_embedding.len > 0) alloc.free(@constCast(self.name_embedding));
@@ -397,6 +489,34 @@ pub const ResolverConfig = struct {
     /// prior outside [0, 1]) collapses every edge weight toward 0, which a
     /// weighted traversal with a positive `min_weight` would silently drop.
     pub fn validate(self: ResolverConfig) !void {
+        if (self.suppress_json.len > 0 or self.curation_json.len > 0) {
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const policy = try resolver_lib.curation.Index.init(a, self.suppress_json, self.curation_json);
+            const aliases = try self.effectiveAliasesAlloc(a);
+            const state = try resolver_lib.curation.parseState(a, self.curation_json);
+            const redirects = try resolver_lib.curation.RedirectIndex.init(a, aliases);
+            for (state.distinct) |pair| {
+                const from = redirects.canonical(pair.from);
+                const to = redirects.canonical(pair.to);
+                if (std.mem.eql(u8, from, to)) return error.ResolverDistinctPair;
+            }
+            for (aliases) |alias| {
+                const target = redirects.canonical(alias.target);
+                if (policy.keySuppressed(target)) return error.SuppressedResolverRedirectTarget;
+                if (try policy.pinnedDistinct(a, alias.key, target)) return error.ResolverDistinctPair;
+            }
+        }
+        if (self.adjudicate_json.len > 0) {
+            if (self.scorer_json.len == 0) return error.InvalidResolverConfig;
+            try @import("../../../functions/resolver_adjudication.zig").validate(std.heap.page_allocator, self.adjudicate_json);
+            const policy = try resolver_lib.adjudication.Config.parse(std.heap.page_allocator, self.adjudicate_json);
+            defer policy.deinit();
+            if (policy.value.description_inputs.mention_artifact) |artifact| {
+                if (self.source_artifact_kind != .asset or std.mem.eql(u8, artifact, self.source_artifact) or std.mem.eql(u8, artifact, self.resolution_artifact)) return error.InvalidResolverConfig;
+            }
+        }
         try resolver_lib.validateAliases(self.aliases);
         try resolver_lib.validateAliases(self.merges);
         if (self.max_work_bytes > 16 * 1024 * 1024) return error.InvalidResolverConfig;
@@ -429,7 +549,7 @@ pub const ResolverConfig = struct {
         if (std.mem.eql(u8, self.candidate_search, "ann")) {
             if (self.candidate_ann_index.len == 0 and self.name_embedding.len == 0) return error.InvalidResolverConfig;
         }
-        if (!(self.min_confidence >= 0.0 and self.min_confidence <= 1.0)) return error.InvalidResolverConfig;
+        if (self.min_confidence) |floor| if (!(floor >= 0.0 and floor <= 1.0)) return error.InvalidResolverConfig;
         if (self.fusion_combine.len == 0) return;
         if (fusionStrategy(self.fusion_combine) == null) return error.InvalidResolverConfig;
         if (!(self.fusion_trust > 0.0 and self.fusion_trust <= 1.0)) return error.InvalidResolverConfig;
@@ -917,12 +1037,40 @@ test "graph ttl migration catalog epoch remains authoritative with replacement f
     defer a.free(fenced);
     try std.testing.expectEqual(@as(u32, 4), try catalogReaderVersion(a, fenced));
     try std.testing.expectEqualStrings("4", try readerVersionBytes(4));
-    try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, readerVersionBytes(5));
+    try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, readerVersionBytes(supported_reader_version + 1));
+}
+
+test "resolver adjudication catalogs fence old readers and redact public credentials" {
+    const a = std.testing.allocator;
+    const raw =
+        \\{"name":"concepts","table":"entities","source_artifact":"kg","resolution_artifact":"resolved","key_template":"{{_entity.text}}","scorer":{"comparisons":[]},"adjudicate":{"decider":{"provider":"antfly","model":"fixture","api_key":"private-key"},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Are these the same entity?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9}}}
+    ;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), raw, .{});
+    const parsed = try ResolverConfig.parseValue(a, value);
+    defer parsed.deinit();
+    try parsed.value.validate();
+    const catalog = try serializeCatalog(a, &.{parsed.value});
+    defer a.free(catalog);
+    try std.testing.expectEqual(adjudication_reader_version, try catalogReaderVersion(a, catalog));
+    const reopened = try deserializeCatalog(a, catalog);
+    defer {
+        for (reopened) |*cfg| cfg.deinit(a);
+        a.free(reopened);
+    }
+    try std.testing.expectEqualStrings(parsed.value.adjudicate_json, reopened[0].adjudicate_json);
+    const public = try parsed.value.publicValue(arena.allocator());
+    const public_json = try std.json.Stringify.valueAlloc(a, public, .{});
+    defer a.free(public_json);
+    try std.testing.expect(std.mem.indexOf(u8, public_json, "private-key") == null);
+    try std.testing.expect(public.object.contains("adjudicate"));
 }
 
 test "ordered artifact inventory resolver catalog serialization preserves explicit envelope" {
     const a = std.testing.allocator;
-    for ([_]u32{ 1, 2, 3, 4 }) |version| {
+    for (1..supported_reader_version + 1) |reader_version| {
+        const version: u32 = @intCast(reader_version);
         const encoded = try serializeCatalogWithMinimumVersion(a, &.{}, version);
         defer a.free(encoded);
         try std.testing.expectEqual(version, try catalogReaderVersion(a, encoded));
@@ -934,5 +1082,35 @@ test "ordered artifact inventory resolver catalog serialization preserves explic
         try std.testing.expectEqualStrings(encoded, roundtrip);
     }
     try std.testing.expectError(error.UnsupportedResolverCatalogVersion, serializeCatalogWithMinimumVersion(a, &.{}, 0));
-    try std.testing.expectError(error.UnsupportedResolverCatalogVersion, serializeCatalogWithMinimumVersion(a, &.{}, 5));
+    try std.testing.expectError(error.UnsupportedResolverCatalogVersion, serializeCatalogWithMinimumVersion(a, &.{}, supported_reader_version + 1));
+}
+
+test "resolver public inspection redacts nested generated provider credentials without mutating execution" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const policy =
+        \\{"decider":{"decision_method":"generated","generator":{"provider":"openai","model":"gpt-4.1","api_key":"nested-private-key","credentials_path":"private-credentials-path","capability_token":"private-capability","url":"https://user:password@provider.example/v1","fallbacks":[{"api_key":"fallback-private-key","endpoint":"https://provider.example/v1?access%5Ftoken=private-query"},{"url":"https://safe.example/v1","connection_id":"hosted"}]},"instructions":"Compare these concepts"}}
+    ;
+    const cfg = ResolverConfig{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{_entity.text}}", .adjudicate_json = policy };
+    const public = try cfg.publicValue(a);
+    const encoded = try std.json.Stringify.valueAlloc(a, public, .{});
+    for ([_][]const u8{ "nested-private-key", "private-credentials-path", "private-capability", "password", "fallback-private-key", "private-query", "api_key", "credentials_path", "capability_token" }) |secret| {
+        try std.testing.expect(std.mem.indexOf(u8, encoded, secret) == null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "https://safe.example/v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "gpt-4.1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cfg.adjudicate_json, "nested-private-key") != null);
+}
+
+test "resolver curation state requires the current receipt decoder" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const curation = @import("antfly_resolver").curation;
+    const empty = try std.json.Stringify.valueAlloc(a, .{.{ .curation_json = try std.json.Stringify.valueAlloc(a, curation.State{}, .{}) }}, .{});
+    try std.testing.expectEqual(scoped_curation_reader_version, try catalogReaderVersion(a, empty));
+    const scoped = try std.json.Stringify.valueAlloc(a, .{.{ .curation_json = try std.json.Stringify.valueAlloc(a, curation.State{ .receipt_scope = @splat('a') }, .{}) }}, .{});
+    try std.testing.expectEqual(scoped_curation_reader_version, try catalogReaderVersion(a, scoped));
+    try std.testing.expectEqualStrings("11", try readerVersionBytes(scoped_curation_reader_version));
 }

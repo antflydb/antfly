@@ -552,7 +552,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (graph.isKey(effect.key)) break true;
             } else false;
             if (!has_graph) return unchanged;
-            if (page.source.artifact_catalog == null or page.source.artifact_catalog.?.effect_protocol != 15) return error.InvalidMergePage;
+            if (page.source.artifact_catalog == null or page.source.artifact_catalog.?.effect_protocol < 15) return error.InvalidMergePage;
             var txn = try S.ownerField(self, "core").*.store.beginReadTxnWithBlockCacheAdmission(.transient);
             defer txn.abort();
             const raw_state = txn.get(merge_state_mod.key) catch |err| switch (err) {
@@ -1540,7 +1540,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const cleaned = (if (request.source_template.len > 0) try extracted[row_index].logicalJson() else try extracted[row_index].logicalJsonForField(request.source_field)) orelse continue;
                     const source_text = if (request.source_template.len > 0)
                         renderSourceTemplateText(memo.alloc, self, request.source_template, cleaned) catch |err| switch (err) {
-                            error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                            error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                             else => null,
                         }
                     else
@@ -1673,7 +1673,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const cleaned = (if (request.source_template.len > 0) try extracted[row_index].logicalJson() else try extracted[row_index].logicalJsonForField(request.source_field)) orelse continue;
                     const source_text = if (request.source_template.len > 0)
                         renderSourceTemplateText(memo.alloc, self, request.source_template, cleaned) catch |err| switch (err) {
-                            error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                            error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                             else => null,
                         }
                     else
@@ -1747,6 +1747,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             if (schema.ttl_duration_ns != 0) try prepared.requireLogicalField(schema.ttl_field);
             if (plan) |snapshot| {
+                if (snapshot.group_sources) |group_plan| for (group_plan.entries) |entry| {
+                    if (entry.source.filter != .null) {
+                        try prepared.requireLogicalRoot();
+                    } else {
+                        for ([_][]const u8{ entry.source.group_by, entry.source.order_by, entry.source.field }) |field| {
+                            try prepared.requireLogicalField(field);
+                            if (std.mem.indexOfScalar(u8, field, '.')) |dot| try prepared.requireLogicalField(field[0..dot]);
+                        }
+                        if (entry.source.segment_by) |field| {
+                            try prepared.requireLogicalField(field);
+                            if (std.mem.indexOfScalar(u8, field, '.')) |dot| try prepared.requireLogicalField(field[0..dot]);
+                        }
+                    }
+                };
                 for (snapshot.graph_fields) |graph_field| for (graph_field.edges) |edge| try prepared.requireLogicalField(edge.field_name);
                 for (snapshot.sparse_fields) |field| try prepared.requireLogicalField(field.field_name);
                 for (snapshot.dense_fields) |field| {
@@ -2092,6 +2106,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         // belong to the row region (whose free operation is a no-op),
                         // so prepared_text_root remains valid until that region is
                         // released; otherwise the worker scratch arena is reset here.
+                        if (ctx.write_plan) |pinned_write_plan| if (pinned_write_plan.group_sources) |group_plan| {
+                            prepared.group_changes = group_plan.prepareRow(row_alloc, ctx.writes[index].key, prepared.parsedValue()) catch |err| {
+                                prepared.deinit(owner_alloc);
+                                ctx.fail(err);
+                                return;
+                            };
+                        };
                         prepared.releaseParsed();
                         ctx.rows[index] = prepared;
                         _ = scratch_arena.reset(.retain_capacity);

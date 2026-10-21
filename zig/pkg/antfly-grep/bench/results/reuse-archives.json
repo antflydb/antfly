@@ -1,0 +1,62 @@
+{
+  "macos": {
+    "binary_sha256": "077d18d4790d22d661714a5911b00c3fa1d29a3da2c27a22b056b699b63d00c7",
+    "archive_sha256": "fe5869755cbbcf328348afdad3dd48c8f0a24f5a4408f86c51e57116e529661d",
+    "verified_members": [
+      "antfly-grep",
+      "README.md",
+      "LICENSE",
+      "THIRD_PARTY_NOTICES.md",
+      "LICENSES/Apache-2.0.txt",
+      "completions/antfly-grep.bash",
+      "completions/antfly-grep.fish",
+      "completions/antfly-grep.zsh",
+      "share/man/man1/antfly-grep.1",
+      "share/antfly-grep/README.md",
+      "share/antfly-grep/COMPATIBILITY.md",
+      "share/antfly-grep/schema/workspace-request-v1.json",
+      "share/antfly-grep/build.json"
+    ],
+    "files": 48
+  },
+  "linux": {
+    "binary_sha256": "b5ae2a39308e84c8ffd749186eca4fdc611944a4a993cb56836df43e81b2d936",
+    "archive_sha256": "7abec25dbb0a0d08e0118c6c4b708c9cb586f2db89ae82670a8eafd559ea3542",
+    "verified_members": [
+      "antfly-grep",
+      "README.md",
+      "LICENSE",
+      "THIRD_PARTY_NOTICES.md",
+      "LICENSES/Apache-2.0.txt",
+      "completions/antfly-grep.bash",
+      "completions/antfly-grep.fish",
+      "completions/antfly-grep.zsh",
+      "share/man/man1/antfly-grep.1",
+      "share/antfly-grep/README.md",
+      "share/antfly-grep/COMPATIBILITY.md",
+      "share/antfly-grep/schema/workspace-request-v1.json",
+      "share/antfly-grep/build.json"
+    ],
+    "files": 48
+  },
+  "windows": {
+    "binary_sha256": "e8dfb9e3f6fbb87e4bbb266c72b94227b09d056364fe4c361fdabdcde911290c",
+    "archive_sha256": "8096222ddc3429465d46766f6ea93b2b004761f0494a4a780758e2aca31212d6",
+    "verified_members": [
+      "antfly-grep.exe",
+      "README.md",
+      "LICENSE",
+      "THIRD_PARTY_NOTICES.md",
+      "LICENSES/Apache-2.0.txt",
+      "completions/antfly-grep.bash",
+      "completions/antfly-grep.fish",
+      "completions/antfly-grep.zsh",
+      "share/man/man1/antfly-grep.1",
+      "share/antfly-grep/README.md",
+      "share/antfly-grep/COMPATIBILITY.md",
+      "share/antfly-grep/schema/workspace-request-v1.json",
+      "share/antfly-grep/build.json"
+    ],
+    "files": 48
+  }
+}

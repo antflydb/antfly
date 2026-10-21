@@ -147,6 +147,9 @@ pub fn submit(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, m
     var raster_mode: ?bool = null;
     var largest_input: usize = 0;
     var largest_scratch: usize = 0;
+    var largest_patches: usize = 0;
+    var largest_sequence: usize = 0;
+    var largest_decoded: usize = 0;
     for (groups, 0..) |group, index| {
         grouped.validateGroup(group, options) catch return null;
         shapes[index] = if (general) (groupShape(group) catch return null) else (shape(group) catch return null) orelse return null;
@@ -159,7 +162,12 @@ pub fn submit(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, m
         largest_input = @max(largest_input, shapes[index].bytes);
         if (!general and !audio_mode) {
             const info = if (raw) @import("image.zig").EncodedImageInfo{ .width = part.raster.width, .height = part.raster.height } else try @import("image.zig").inspectEncodedForInference(part.image, null);
-            largest_scratch = @max(largest_scratch, try projector.embeddingGemma2ImageScratch(info.width, info.height, 2 * 1024 * 1024 * 1024));
+            if (grouped.boundedVision(session.backend())) {
+                const geometry = try projector.embeddingGemma2ImageGeometry(info.width, info.height);
+                largest_patches = @max(largest_patches, geometry.grid_x * geometry.grid_y);
+                largest_sequence = @max(largest_sequence, geometry.tokenCount() + 4);
+                if (!raw) largest_decoded = @max(largest_decoded, try std.math.mul(usize, try std.math.mul(usize, info.width, info.height), 3));
+            } else largest_scratch = @max(largest_scratch, try projector.embeddingGemma2ImageScratch(info.width, info.height, 2 * 1024 * 1024 * 1024));
         }
         payloads[index] = .{ .session = session, .tokenizer = tokenizer, .gate = gate, .options = options, .part = part, .group = if (general) group else null, .control = control, .input_tokens = shapes[index].tokens };
         identities[index] = if (raw) .{ .item_id = part.raster.item_id, .source_fingerprint = part.raster.source_fingerprint, .page_number = part.raster.page_number } else .{};
@@ -167,7 +175,7 @@ pub fn submit(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, m
     // Plan against immutable policy limits without reserving GPU scratch.
     // A tighter policy decreases occupancy; an ineligible singleton retains
     // the original executor instead of making a previously valid call fail.
-    capacity = if (general) capacity else if (audio_mode) try fittingAudioCapacity(session, capacity, largest_input) else try fittingCapacity(session, capacity, largest_input, largest_scratch);
+    capacity = if (general) capacity else if (audio_mode) try fittingAudioCapacity(session, capacity, largest_input) else try fittingCapacity(session, capacity, largest_input, largest_scratch, largest_patches, largest_sequence, largest_decoded);
     if (capacity == 0) return null;
     const Probe = struct {
         fn canceled(ptr: *const anyopaque) bool {
@@ -203,12 +211,13 @@ pub fn submit(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, m
     return .{ .allocator = allocator, .items = owned };
 }
 
-fn fittingCapacity(session: Session, ceiling: usize, largest_input: usize, largest_scratch: usize) !usize {
+fn fittingCapacity(session: Session, ceiling: usize, largest_input: usize, largest_scratch: usize, patches: usize, sequence: usize, decoded: usize) !usize {
     var capacity = ceiling;
     while (capacity != 0) : (capacity -= 1) {
         const input_bytes = std.math.mul(usize, largest_input, capacity) catch return 0;
         const vision_bytes = @min(std.math.mul(usize, largest_scratch, capacity) catch return 0, 2 * 1024 * 1024 * 1024);
-        if (try session.fitsRun(grouped.imageRunRequest(session.backend(), input_bytes, 0, capacity, vision_bytes))) break;
+        const request = if (patches != 0 and grouped.boundedVision(session.backend())) try grouped.imageHeaderRunRequest(session.backend(), input_bytes, try std.math.mul(usize, decoded, capacity), capacity, sequence, patches) else grouped.imageRunRequest(session.backend(), input_bytes, 0, capacity, vision_bytes);
+        if (try session.fitsRun(request)) break;
     }
     return capacity;
 }
@@ -283,10 +292,31 @@ fn executeChecked(items: []const micro.ExecuteItem) !void {
             }
             break :blk .{ .vectors = vectors, .execution = .fallback };
         };
-        if (@import("antfly_platform").env.getenvBool("ANTFLY_GEMMA4_GROUP_BROKER_TRACE")) std.debug.print("gemma4-group-cohort items={d} execution={s}\n", .{ items.len, @tagName(result.execution) });
         defer shared.free(result.input_tokens);
+        var execution = result.execution;
+        // The scheduler preserves finished peers and shrinks prepared encoder
+        // cohorts before returning pressure errors. Once its prepared owners
+        // drain, retry only the failed items; completed towers never replay.
+        for (items, groups[0..items.len], 0..) |item, group, index| {
+            const failure = errors[index] orelse continue;
+            if (failure != error.MemoryBudgetExceeded and failure != error.ResourceLimitExceeded and failure != error.ResourceTemporarilyUnavailable) continue;
+            item.control.check() catch |err| {
+                errors[index] = err;
+                continue;
+            };
+            const singleton = grouped.embed(shared, first.session, first.tokenizer, group, first.options, first.gate, control) catch |err| {
+                errors[index] = err;
+                continue;
+            };
+            shared.free(result.vectors[index]);
+            result.vectors[index] = singleton.vector;
+            result.input_tokens[index] = singleton.input_tokens;
+            errors[index] = null;
+            execution = .fallback;
+        }
+        if (@import("antfly_platform").env.getenvBool("ANTFLY_GEMMA4_GROUP_BROKER_TRACE")) std.debug.print("gemma4-group-cohort items={d} execution={s}\n", .{ items.len, @tagName(execution) });
         @memcpy(counts[0..items.len], result.input_tokens);
-        break :blk .{ .vectors = result.vectors, .execution = result.execution };
+        break :blk .{ .vectors = result.vectors, .execution = execution };
     } else if (first.part == .audio) blk: {
         var clips: [4]@import("audio_preparation.zig").Clip = undefined;
         for (items, 0..) |item, index| clips[index] = .{ .bytes = item.payloadAs(Ticket).part.audio };
@@ -336,7 +366,7 @@ test "gemma4 image broker rejects mixed prompts and distinguishes rotated grids"
     try std.testing.expect(projector.embeddingGemma2GeometryKey(wide) != projector.embeddingGemma2GeometryKey(tall));
 }
 
-test "gemma4 image broker reduces occupancy under serving scratch policy" {
+test "embeddinggemma2 image broker shares bounded plan without source staging inflation" {
     const tensor = @import("../backends/tensor.zig");
     const memory = @import("../runtime/tier/memory.zig");
     const Mock = struct {
@@ -355,11 +385,15 @@ test "gemma4 image broker reduces occupancy under serving scratch policy" {
     var controller = memory.AdmissionController{};
     var session = Session{ .ptr = &dummy, .vtable = &.{ .run = Mock.run, .inputInfo = Mock.info, .outputInfo = Mock.info, .backend = Mock.backend, .close = Mock.close }, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .static_workspace_bytes = 0, .limits = .{ .scratch_limit_bytes = 1536 * 1024 * 1024 }, .check_live_memory = false } };
     const scratch = try projector.embeddingGemma2ImageScratch(512, 512, 2 * 1024 * 1024 * 1024);
-    try std.testing.expectEqual(@as(usize, 2), try fittingCapacity(session, 4, 1024, scratch));
+    try std.testing.expectEqual(@as(usize, 2), try fittingCapacity(session, 4, 1024, scratch, 0, 0, 0));
+    const geometry = try projector.embeddingGemma2ImageGeometry(512, 512);
+    try std.testing.expectEqual(@as(usize, 4), try fittingCapacity(session, 4, 1024, scratch, geometry.grid_x * geometry.grid_y, geometry.tokenCount() + 4, 0));
+    try std.testing.expectEqual(@as(usize, 4), try fittingCapacity(session, 4, 128 * 1024 * 1024, scratch, geometry.grid_x * geometry.grid_y, geometry.tokenCount() + 4, 0));
+
     session.run_admission.?.limits.scratch_limit_bytes = 4 * 1024 * 1024 * 1024;
-    try std.testing.expectEqual(@as(usize, 4), try fittingCapacity(session, 4, 1024, scratch));
+    try std.testing.expectEqual(@as(usize, 4), try fittingCapacity(session, 4, 1024, scratch, 0, 0, 0));
     session.run_admission.?.limits.scratch_limit_bytes = 256 * 1024 * 1024;
-    try std.testing.expectEqual(@as(usize, 0), try fittingCapacity(session, 4, 1024, scratch));
+    try std.testing.expectEqual(@as(usize, 0), try fittingCapacity(session, 4, 1024, scratch, 0, 0, 0));
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().scratchTotalBytes());
 }
 

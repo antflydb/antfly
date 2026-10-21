@@ -768,7 +768,7 @@ pub const Capture = struct {
             }
         }
         const vector = @import("db/online_vector_artifacts.zig").isKey(key);
-        const graph = @import("db/online_graph_artifacts.zig").isKey(key);
+        const graph = @import("db/online_graph_artifacts.zig").isKey(key) or @import("db/group_source_transfer.zig").isKey(key);
         if (!primary and !internal_keys.isTtlKey(key) and !integrity.isKey(key) and !vector and !graph) return;
         if (graph) {
             // Preserve the old zero-retention graph path. Merely recognizing a
@@ -827,7 +827,7 @@ pub const Capture = struct {
         defer alloc.free(touched);
         var touched_iter = self.keys.keyIterator();
         for (touched) |*key| key.* = touched_iter.next().?.*;
-        for (touched) |key| if (internal_keys.isTtlKey(key)) {
+        for (touched) |key| if (internal_keys.isTtlKey(key) and !@import("db/group_source_transfer.zig").isKey(key)) {
             const candidate = try alloc.dupe(u8, key);
             errdefer alloc.free(candidate);
             candidate[candidate.len - 1] = internal_keys.primary_kind;
@@ -887,6 +887,11 @@ pub const Capture = struct {
                 // Invalid caller-authored vectors reject the mutation rather
                 // than wedging its Raft entry as durable-log corruption.
                 @import("db/online_vector_artifacts.zig").validate(key, value.*) catch return error.InvalidBatchRequest;
+            } else if (@import("db/group_source_transfer.zig").isKey(key)) {
+                if (!state.graph_artifacts) return error.RetainedEffectsFenceMismatch;
+                var group_arena = std.heap.ArenaAllocator.init(alloc);
+                defer group_arena.deinit();
+                try @import("db/group_source_transfer.zig").validate(group_arena.allocator(), key, value.*);
             } else if (@import("db/online_graph_artifacts.zig").isKey(key)) {
                 if (!state.graph_artifacts) return error.RetainedEffectsFenceMismatch;
                 @import("db/online_graph_artifacts.zig").validate(key, value.*) catch return error.InvalidBatchRequest;

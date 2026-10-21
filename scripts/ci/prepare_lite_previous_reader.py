@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -25,6 +26,28 @@ import sys
 
 # Last main before resolver execution ownership / retired identities in #1114.
 REVISION = "e8666a5b758e1e588a6b2b74b260212e984b40a9"
+BUILD_SHA256 = "7c607d6bd765beda4d4b33a1ce41e4b0d5ec6fe6f9c531cdefb4081ecb15c26a"
+FIXED_BUILD_SHA256 = "8113db112725765e1991bb7ca842a8427f6d3f76d2b7a4651487ef7993036103"
+
+
+def prepare_previous_reader_build(previous: Path) -> None:
+    # Backport only the redundant metadata-link removal from #1173:
+    # https://github.com/antflydb/antfly/commit/d4d3a4a6ea22149aebe99bbdc68b4519426994dc
+    # addEmbedded already links this object. Keep the historical reader and
+    # resolver sources at REVISION; do not move the compatibility baseline.
+    build = previous / "zig/embedded.build.zig"
+    original = build.read_bytes()
+    digest = hashlib.sha256(original).hexdigest()
+    if digest == FIXED_BUILD_SHA256:
+        return
+    if digest != BUILD_SHA256:
+        raise RuntimeError("unexpected pinned previous-reader embedded build contents")
+    fixed = original.replace(
+        b"    shared.build_info.link(embedded.libantfly_link_mod);\n", b"", 1
+    )
+    if hashlib.sha256(fixed).hexdigest() != FIXED_BUILD_SHA256:
+        raise RuntimeError("unexpected previous-reader build repair result")
+    build.write_bytes(fixed)
 
 
 def main() -> None:
@@ -49,6 +72,7 @@ def main() -> None:
             cwd=root,
             check=True,
         )
+    prepare_previous_reader_build(previous)
     env = dict(
         os.environ,
         TZ="UTC0",

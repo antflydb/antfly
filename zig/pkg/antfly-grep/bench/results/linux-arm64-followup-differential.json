@@ -1,0 +1,13 @@
+{
+  "platform": "linux-aarch64",
+  "complete": true,
+  "seed": 1151,
+  "oracle": "ripgrep 15.2.0 (rev e89fff89ac)\n\nfeatures:+pcre2\nsimd(compile):+NEON\nsimd(runtime):+NEON\n\nPCRE2 10.45 is available (JIT is available)\n",
+  "pcre2_runtime": "PCRE2 10.45 is available (JIT is available)\n",
+  "binary_sha256": "44e9e5d81bb8d64def8e3add06294f5bfdf14aabb53ded63bb54fa234b9af021",
+  "oracle_sha256": "e36d0eb52e70696bdf1781392722e05a21bb91d3b7b762ef5ec20e5df2ec687b",
+  "cases": 5000,
+  "failures": [],
+  "timeouts": [],
+  "oracle_mode": "live-pinned-oracle"
+}

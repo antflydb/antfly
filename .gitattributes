@@ -17,3 +17,11 @@ zig/pkg/inference/testdata/gliner25/family/evidence/** linguist-generated=true
 zig/pkg/inference/testdata/gliner25/family/*/oracle_fp32.jsonl linguist-generated=true
 zig/pkg/inference/testdata/gliner25/family/*/capacity_oracle_fp32.jsonl linguist-generated=true
 zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels.ptx linguist-generated=true
+
+# Pinned compression dictionaries and packed grammar tables are binary assets.
+zig/lib/compress/src/brotli/brotli_dictionary.bin binary
+zig/lib/syntax/src/grammars/*.bin binary
+
+# CLI tooling and benchmark evidence are generated artifacts; keep source diffs readable.
+zig/pkg/antfly-grep/generated/** linguist-generated=true
+zig/pkg/antfly-grep/bench/results/** linguist-generated=true

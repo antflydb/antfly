@@ -169,6 +169,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-storage-repair-activation-test", "Run bounded index activation, coverage, and candidate-resume regressions")
         .dependOn(&addFilteredTestRunArtifact(b, repair_activation_tests).step);
     const db_enrichment_filters: []const []const u8 = &.{
+        "#1210",
         "db public artifact reprocess accepts durable work despite unrelated provider retries",
         "db public extraction budget rejection publishes a failure manifest",
         "db document extraction manifest inspection and reprocess API",
@@ -700,6 +701,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-storage-db-parent-match-all-test", "Run parent match_all chunk population regressions")
         .dependOn(&addCuratedTestRunArtifact(b, parent_match_all_tests, &parent_match_all_filters).step);
+    const logical_db_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "logical query primary", "logical query sort" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("logical-field-db-test", "Run logical-field native primary and indexed query contracts")
+        .dependOn(&addFilteredTestRunArtifact(b, logical_db_tests).step);
+
     const lib_db_query_step = b.step("antfly-storage-db-query-test", "Run root-module DB query/indexing tests");
     lib_db_query_step.dependOn(&run_lib_db_query_tests.step);
 

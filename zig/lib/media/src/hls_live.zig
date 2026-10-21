@@ -234,6 +234,13 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
             self.allocator.free(self.url);
             self.* = undefined;
         }
+        /// A request-scoped cancellation checkpoint; retained segment controls
+        /// continue to borrow transport.control, never this transient callback.
+        pub fn swapReadControl(self: *Self, control: ?@import("source.zig").Control) ?@import("source.zig").Control {
+            const previous = self.transport.request_control;
+            self.transport.request_control = control;
+            return previous;
+        }
         pub fn mediaUrl(self: *const Self) []const u8 {
             return self.media_url orelse self.url;
         }

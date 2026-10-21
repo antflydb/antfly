@@ -294,7 +294,9 @@ pub fn decodeRgba(alloc: Allocator, png_bytes: []const u8) !DecodedImage {
         (@as(usize, height) * (stride + 1))
     else
         try adam7ExpectedRawLen(width, height, channels, bit_depth);
-    const raw = try alloc.alloc(u8, expected_raw_len);
+    // One sentinel byte lets inflate consume zero-output terminal blocks after
+    // the scanlines fill the buffer. Any actual surplus output is rejected.
+    const raw = try alloc.alloc(u8, try std.math.add(usize, expected_raw_len, 1));
     defer alloc.free(raw);
 
     var in: std.Io.Reader = .fixed(idat.items);
@@ -311,13 +313,14 @@ pub fn decodeRgba(alloc: Allocator, png_bytes: []const u8) !DecodedImage {
         };
     }
     if (decompressed_len != expected_raw_len) return error.PngDecodeFailed;
+    if (decompress.container_metadata.zlib.adler != Adler32.hash(raw[0..expected_raw_len])) return error.PngDecodeFailed;
 
     const rgba = try alloc.alloc(u8, @as(usize, width) * @as(usize, height) * 4);
     errdefer alloc.free(rgba);
     if (interlace_method == 0) {
-        try decodeNonInterlacedRgba(alloc, rgba, raw, width, height, color_type, bit_depth, channels, stride, filter_bpp, palette[0..palette_entries], transparent_gray, transparent_rgb);
+        try decodeNonInterlacedRgba(alloc, rgba, raw[0..expected_raw_len], width, height, color_type, bit_depth, channels, stride, filter_bpp, palette[0..palette_entries], transparent_gray, transparent_rgb);
     } else {
-        try decodeAdam7Rgba(alloc, rgba, raw, width, height, color_type, bit_depth, channels, filter_bpp, palette[0..palette_entries], transparent_gray, transparent_rgb);
+        try decodeAdam7Rgba(alloc, rgba, raw[0..expected_raw_len], width, height, color_type, bit_depth, channels, filter_bpp, palette[0..palette_entries], transparent_gray, transparent_rgb);
     }
 
     return .{
@@ -1274,5 +1277,42 @@ test "decode rgba rejects manifest-backed bad trns png fixtures" {
         defer alloc.free(fixture_bytes);
 
         try std.testing.expectError(error.PngDecodeFailed, decodeRgba(alloc, fixture_bytes));
+    }
+}
+
+test "PNG inflate consumes trailing empty blocks and rejects surplus or truncated output" {
+    const alloc = std.testing.allocator;
+    // Python zlib: compress(scanlines), Z_SYNC_FLUSH, Z_FINISH, for an 8x8 red RGB image.
+    const compressed = [_]u8{ 0x78, 0x9c, 0x62, 0xf8, 0xcf, 0xc0, 0x80, 0x15, 0x61, 0x17, 0x1d, 0xb4, 0x12, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x03, 0x00, 0x28, 0xff, 0x3f, 0xc1 };
+    // Changing IHDR height exercises both insufficient and surplus scanlines.
+    for ([_]u32{ 8, 7, 9 }) |height| {
+        var ihdr: [13]u8 = .{ 0, 0, 0, 8, 0, 0, 0, 8, 8, 2, 0, 0, 0 };
+        std.mem.writeInt(u32, ihdr[4..8], height, .big);
+        var png: [8 + 25 + 12 + compressed.len + 12]u8 = undefined;
+        @memcpy(png[0..8], &[_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' });
+        var cursor: usize = 8;
+        appendChunkToBuffer(&png, &cursor, "IHDR", &ihdr);
+        appendChunkToBuffer(&png, &cursor, "IDAT", &compressed);
+        appendChunkToBuffer(&png, &cursor, "IEND", "");
+        if (height != 8) {
+            try std.testing.expectError(error.PngDecodeFailed, decodeRgba(alloc, &png));
+            continue;
+        }
+        const decoded = try decodeRgba(alloc, &png);
+        defer alloc.free(decoded.rgba);
+        try std.testing.expectEqual(@as(u32, 8), decoded.width);
+        try std.testing.expectEqual(height, decoded.height);
+        for (0..64) |i| try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, decoded.rgba[i * 4 ..][0..4]);
+        // Recompute the PNG chunk CRC so these failures specifically exercise
+        // the zlib trailer, rather than the surrounding PNG container.
+        var corrupt = compressed;
+        corrupt[corrupt.len - 1] ^= 1;
+        for ([_][]const u8{ &corrupt, compressed[0 .. compressed.len - 1] }) |invalid| {
+            cursor = 8;
+            appendChunkToBuffer(&png, &cursor, "IHDR", &ihdr);
+            appendChunkToBuffer(&png, &cursor, "IDAT", invalid);
+            appendChunkToBuffer(&png, &cursor, "IEND", "");
+            try std.testing.expectError(error.PngDecodeFailed, decodeRgba(alloc, png[0..cursor]));
+        }
     }
 }

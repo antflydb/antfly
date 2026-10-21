@@ -340,6 +340,10 @@ func inferOperationFromMethod(method string) OperationKind {
 func inferOperationFromBackendPath(method, path string) OperationKind {
 	path = canonicalPublicBackendPath(path)
 	switch {
+	case strings.HasPrefix(path, "/resolvers/") && (strings.HasSuffix(path, ":render") || strings.HasSuffix(path, ":resolve")):
+		return OperationRead
+	case strings.HasPrefix(path, "/resolvers/") && strings.HasSuffix(path, ":namespace"):
+		return OperationAdmin
 	case path == "/" && (method == http.MethodPost || method == http.MethodPut || method == http.MethodPatch || method == http.MethodDelete):
 		return OperationAdmin
 	case strings.HasPrefix(path, "/query"), strings.HasPrefix(path, "/graph"), strings.HasPrefix(path, "/versions/"):

@@ -17,6 +17,7 @@ const std = @import("std");
 const httpx = @import("httpx");
 
 const Allocator = std.mem.Allocator;
+pub const text_processing = @import("text.zig");
 
 pub const Provider = enum {
     antfly,
@@ -1276,4 +1277,9 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test {
+    _ = text_processing.windows;
+    _ = text_processing.alignment;
 }

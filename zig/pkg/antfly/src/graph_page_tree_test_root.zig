@@ -13,6 +13,8 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+pub const antfly_sources = @import("source_owner_physical.zig");
+
 test {
     _ = @import("serverless/graph_segment/page_tree.zig");
     _ = @import("serverless/build/lake_build_limits.zig");

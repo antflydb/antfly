@@ -177,7 +177,7 @@ pub fn commandUsage(command: []const u8) ?[]const u8 {
     \\                       [--execute] [--streaming|--no-streaming] (delegate to the retrieval workflow)
     \\
     ;
-    if (std.mem.eql(u8, command, "backup")) return "usage: antfly backup --table <table> --location <uri> [options]\n";
+    if (std.mem.eql(u8, command, "backup")) return "usage: antfly backup --table <table> --location <uri> [options]\n       antfly backup inspect --input FILE [--destination-capabilities FILE] [--max-input-bytes N] [--max-expanded-bytes N]\n";
     if (std.mem.eql(u8, command, "restore")) return "usage: antfly restore --location <uri> [options]\n";
     if (std.mem.eql(u8, command, "auth")) return "usage: antfly auth <me|users|permissions|roles|row-filters|subjects|api-keys> [options]\n";
     if (std.mem.eql(u8, command, "internal")) return

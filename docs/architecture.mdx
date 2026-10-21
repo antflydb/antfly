@@ -69,6 +69,8 @@ The per-request `sync_level` picks how far a write gets before the response retu
 
 ## Indexes
 
+Logical query operations resolve source fields to compatible index representations; original-value predicates verify candidates before pagination. See [Logical Field Queries](https://github.com/antflydb/antfly/blob/main/docs/design/logical-field-queries.md).
+
 Index types form a closed set, and one table can carry any combination of them:
 
 - **`full_text`**: BM25 over Lucene-style segments with FST term dictionaries and roaring-bitmap postings. Analyzers include Snowball stemmers. Queries cover phrase, fuzzy, wildcard, regex, numeric, and geo, plus highlighting and faceting through `aggregations` (terms, range, histogram, date_histogram, geo). Search visibility waits for the segment write, not compaction; merges run in the background. Design: [FULL_TEXT.md](https://github.com/antflydb/antfly/blob/main/zig/FULL_TEXT.md).

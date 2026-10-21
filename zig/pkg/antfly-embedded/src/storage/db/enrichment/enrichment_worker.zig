@@ -78,3 +78,26 @@ test "enrichment worker collects changed documents from thin change journal" {
     try std.testing.expectEqual(@as(u64, 2), groups[1].sequence);
     try std.testing.expectEqualStrings("doc:a", groups[1].doc_key);
 }
+
+test "grouped sources production retirement reaches the ordinary enrichment scanner" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &buffer);
+    const path = try alloc.dupeSentinel(u8, buffer[0..path_len], 0);
+    defer alloc.free(path);
+    var journal = try change_journal_mod.Journal.open(path.ptr, .{});
+    defer journal.close();
+    const staged = @import("../group_source_snapshot.zig").Staged{ .changed = &.{"unit:live"}, .deleted = &.{"unit:retired"}, .sequence = 1 };
+    const replayed = try staged.replayDocuments(alloc);
+    defer alloc.free(replayed);
+    const payload = try change_journal_mod.encodeRecord(alloc, .{ .sequence = 1, .changed_doc_keys = replayed, .deleted_doc_keys = staged.deleted, .target_hints = &.{ .enrichment, .graph } });
+    defer alloc.free(payload);
+    _ = try journal.appendOpaque(payload);
+    const groups = try collectPendingDocumentGroups(alloc, replay_source_mod.Source.fromJournal(&journal), 0);
+    defer freePendingDocumentGroups(alloc, groups);
+    try std.testing.expectEqual(@as(usize, 2), groups.len);
+    try std.testing.expectEqualStrings("unit:live", groups[0].doc_key);
+    try std.testing.expectEqualStrings("unit:retired", groups[1].doc_key);
+}

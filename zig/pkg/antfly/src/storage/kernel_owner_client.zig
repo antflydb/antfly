@@ -84,6 +84,31 @@ pub const Context = struct {
         try statusToError(abi.antfly_storage_context_configure_native_queries(self.handle, .fromSlice(setup)));
     }
 
+    /// Keep the remote-content publisher live across the compiled owner boundary.
+    pub fn configureRemoteContent(self: *Context, config: ?*const @import("antfly_scraping").RemoteContentConfig) !void {
+        const remote = config orelse return self.configureRemoteContentSecurity("");
+        const Adapter = struct {
+            fn acquire(raw: *anyopaque, out: *abi.OwnedBytes) callconv(.c) abi.Status {
+                const facade: *const @import("antfly_scraping").RemoteContentConfig = @ptrCast(@alignCast(raw));
+                const bytes = @import("antfly_local_sources").common_config.remoteContentSecurityJsonAlloc(std.heap.smp_allocator, facade) catch |err| return switch (err) {
+                    error.OutOfMemory => .out_of_memory,
+                    error.Timeout => .timeout,
+                    error.Canceled => .cancelled,
+                    else => .resource_temporarily_unavailable,
+                };
+                out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+                return .ok;
+            }
+            fn release(_: *anyopaque, bytes: abi.OwnedBytes) callconv(.c) void {
+                std.heap.smp_allocator.free(bytes.slice());
+            }
+        };
+        const services = @import("kernel_runtime_services.zig");
+        const source = services.RemoteContentSource{ .context = @ptrCast(@constCast(remote)), .acquire = Adapter.acquire, .release = Adapter.release };
+        try self.ensure();
+        try statusToError(services.antfly_storage_context_configure_remote_content_source(self.handle, &source));
+    }
+
     pub fn configureRemoteContentSecurity(self: *Context, security_json: []const u8) !void {
         try self.ensure();
         try statusToError(abi.antfly_storage_context_configure_remote_content_security(
@@ -376,9 +401,16 @@ pub const Owner = struct {
     }
 
     pub fn preflightWriteAdmission(self: *Owner, table_name: []const u8) !void {
+        _ = try self.preflightWriteAdmissionJson(table_name, "");
+    }
+
+    pub fn preflightWriteAdmissionJson(self: *Owner, table_name: []const u8, request_json: []const u8) !bool {
+        var has_groups: u8 = 0;
         try statusToError(abi.antfly_storage_owner_preflight_write_admission(self.handle, &.{
             .table_name = .fromSlice(table_name),
-        }));
+            .request_json = .fromSlice(request_json),
+        }, &has_groups));
+        return has_groups != 0;
     }
 
     /// Reconstruction uses a shared generation lease. Configuration is a
@@ -567,6 +599,10 @@ pub const Owner = struct {
     }
 
     pub fn waitForSyncWithCancellation(self: *Owner, table_name: []const u8, sync_level: abi.SyncLevel, cancellation: @import("antfly_cancellation").CancellationToken) !void {
+        return self.waitForSyncTargetWithCancellation(table_name, sync_level, null, cancellation);
+    }
+
+    pub fn waitForSyncTargetWithCancellation(self: *Owner, table_name: []const u8, sync_level: abi.SyncLevel, target: ?*abi.SyncTarget, cancellation: @import("antfly_cancellation").CancellationToken) !void {
         const Callback = struct {
             fn cancelled(ptr: ?*anyopaque) callconv(.c) u8 {
                 const token: *const @import("antfly_cancellation").CancellationToken = @ptrCast(@alignCast(ptr.?));
@@ -576,6 +612,7 @@ pub const Owner = struct {
         try statusToError(abi.antfly_storage_owner_wait_for_sync(
             self.handle,
             &.{
+                .target = target,
                 .sync_level = @backingInt(sync_level),
                 .table_name = .fromSlice(table_name),
                 .cancellation_ctx = @ptrCast(@constCast(&cancellation)),
@@ -782,6 +819,22 @@ pub const Owner = struct {
             &failure,
         );
         try acceptStorageOwnerFailure(status, failure, "storage-owner graph metric maintenance");
+        return response;
+    }
+
+    pub fn resolverOperationJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
+        var response: Response = .{};
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_resolver_operation_json(
+            self.handle,
+            &.{
+                .table_name = .fromSlice(table_name),
+                .request_json = .fromSlice(request_json),
+            },
+            &response.buffer,
+            &failure,
+        );
+        try acceptStorageOwnerFailure(status, failure, "storage-owner resolver operation");
         return response;
     }
 

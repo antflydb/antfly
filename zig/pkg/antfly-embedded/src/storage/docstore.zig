@@ -963,7 +963,7 @@ pub const DocStore = struct {
                 try self.artifact_footprint.touch(key, value);
                 try self.range_mutation.touch(self, key);
                 try self.artifact_inputs.touch(self.alloc, self, key, value);
-                try self.retained.touch(self.alloc, self, key, internal_keys.isStoredDocumentRowKey(key), self.retained_cache);
+                try self.retained.touch(self.alloc, self, key, internal_keys.isStoredSourceRowKey(key), self.retained_cache);
                 try self.markColumnarDirty(key, value);
                 try self.invalidateColumns(key);
 
@@ -1003,7 +1003,7 @@ pub const DocStore = struct {
                 // defer activation until their unordered import is complete.
                 try self.range_mutation.touch(self, key);
                 try self.artifact_inputs.touch(self.alloc, self, key, value);
-                try self.retained.touch(self.alloc, self, key, internal_keys.isStoredDocumentRowKey(key), self.retained_cache);
+                try self.retained.touch(self.alloc, self, key, internal_keys.isStoredSourceRowKey(key), self.retained_cache);
                 if (self.unordered_bulk_append_puts and internal_keys.isRelationalRowKey(key)) {
                     // Keep auxiliary records in the bulk arena too. A regular
                     // put drains that arena into a sorted mutable map, causing
@@ -1036,7 +1036,7 @@ pub const DocStore = struct {
                 try self.artifact_footprint.touch(key, null);
                 try self.range_mutation.touch(self, key);
                 try self.artifact_inputs.touch(self.alloc, self, key, null);
-                try self.retained.touch(self.alloc, self, key, internal_keys.isStoredDocumentRowKey(key), self.retained_cache);
+                try self.retained.touch(self.alloc, self, key, internal_keys.isStoredSourceRowKey(key), self.retained_cache);
                 try self.markColumnarDirty(key, null);
                 try self.invalidateColumns(key);
 
@@ -5966,7 +5966,7 @@ test "graph endpoint cleanup byte admission releases partial page allocations" {
             try std.testing.expectEqual(@as(usize, 2), page.deletes.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{&store});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{&store});
 }
 
 test "graph relationship bulk ingestion preserves direct append and retirement during migration" {
@@ -6216,7 +6216,7 @@ test "graph owner revival planning releases every partial allocation" {
             defer page.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Case.plan, .{&store});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Case.plan, .{&store});
 }
 
 test "graph qualified directory upgrade removes stale foreign membership and preserves revived artifacts" {

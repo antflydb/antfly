@@ -1,0 +1,354 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Private stdio service: versioned requests, one active immutable generation,
+//! bounded frames, explicit invalidation and transactional refresh. No listener
+//! or implicit freshness claim. EOF tears down all retained source memory.
+const std = @import("std");
+const A = std.mem.Allocator;
+const Phases = @import("workspace_profile.zig").Phases;
+const Options = @import("options.zig").Options;
+const Generation = @import("workspace_store.zig").Generation;
+fn emit(a: A, io: std.Io, value: anytype) !void {
+    // Small control frames need no heap allocation and only one write. Large
+    // error/control frames retain the allocating fallback.
+    var buffer: [2048]u8 = undefined;
+    var writer = std.Io.Writer.fixed(buffer[0 .. buffer.len - 1]);
+    std.json.Stringify.value(value, .{}, &writer) catch {
+        const bytes = try std.json.Stringify.valueAlloc(a, value, .{});
+        defer a.free(bytes);
+        try std.Io.File.stdout().writeStreamingAll(io, bytes);
+        try std.Io.File.stdout().writeStreamingAll(io, "\n");
+        return;
+    };
+    buffer[writer.end] = '\n';
+    try std.Io.File.stdout().writeStreamingAll(io, buffer[0 .. writer.end + 1]);
+}
+pub fn serve(comptime Search: type, a: A, io: std.Io, base: *const Options) !u8 {
+    if (base.pre != null or base.search_zip or base.table_config != null or base.pattern_files.items.len != 0 or base.inventory or base.follow) return error.UnsupportedWorkspaceCaptureOptions;
+    const Watch = @import("source_watch.zig").Watch;
+    const watch: ?*Watch = if (base.workspace_watch) blk: {
+        const watcher = try a.create(Watch);
+        watcher.* = Watch.initSources();
+        watcher.limit = @min(watcher.limit, base.workspace_watch_limit);
+        break :blk watcher;
+    } else null;
+    defer if (watch) |watcher| {
+        watcher.deinit();
+        a.destroy(watcher);
+    };
+    const Journal = @import("discovery_journal.zig").Journal;
+    const journal: ?*Journal = if (watch != null) blk: {
+        const value = try a.create(Journal);
+        value.* = Journal.initLimited(a, io, base.workspace_watch_memory_limit, base.workspace_watch_limit);
+        break :blk value;
+    } else null;
+    defer if (journal) |value| {
+        value.deinit();
+        a.destroy(value);
+    };
+    var generation = try Generation.captureJournal(a, io, base, null, watch, journal);
+    defer generation.deinit();
+    var session = @import("session.zig").Session.init(a, io);
+    defer session.deinit();
+    var reuse = Search.Reuse.init(a, io);
+    defer reuse.deinit();
+    var registrations: @import("prepared_query.zig").Registry(Search) = .{ .a = a, .io = io };
+    defer registrations.deinit();
+    var valid = true;
+    try ready(a, io, generation, null);
+    // A frame cannot grow with repository size. Source bytes are captured by
+    // refresh, not carried in requests. Oversized framing terminates the stream
+    // so an unread suffix can never become a new request.
+    const buffer = try a.alloc(u8, 65536);
+    defer a.free(buffer);
+    var reader = std.Io.File.stdin().readerStreaming(io, buffer);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    while (try reader.interface.takeDelimiter('\n')) |line| {
+        var phases = Phases.init(io, "request");
+        defer phases.finish();
+        // One serial request arena, with bounded reuse across small frames.
+        // Registrations and generations copy every value they retain.
+        defer _ = arena.reset(.{ .retain_with_limit = 16 * 1024 });
+        const scratch = arena.allocator();
+        const Request = struct { version: u32, id: u64, op: []const u8, revision: ?[]const u8 = null, args: []const []const u8 = &.{}, if_result_token: ?[]const u8 = null, force_rescan: bool = false, query_handle: ?[]const u8 = null, compact: bool = true, batches: bool = false, row_format: enum { objects, tuples } = .objects, delta: bool = false, acknowledgement: enum { full, minimal } = .full };
+        const request = std.json.parseFromSliceLeaky(Request, scratch, line, .{}) catch {
+            try emit(a, io, .{ .type = "workspace_error", .id = @as(?u64, null), .message = "InvalidWorkspaceRequest" });
+            continue;
+        };
+        phases.mark("parse");
+        if (request.version != 1) {
+            try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "UnsupportedWorkspaceVersion" });
+            continue;
+        }
+        if (request.if_result_token) |token| {
+            const valid_token = token.len == 64 and for (token) |ch| {
+                if (!std.ascii.isHex(ch) or std.ascii.isUpper(ch)) break false;
+            } else true;
+            if (!valid_token or !std.mem.eql(u8, request.op, "search")) {
+                try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "InvalidResultToken" });
+                continue;
+            }
+        }
+        if ((request.batches or request.row_format == .tuples) and !std.mem.eql(u8, request.op, "register")) {
+            try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "InvalidBatchRegistration" });
+            continue;
+        }
+        if (request.force_rescan and !std.mem.eql(u8, request.op, "refresh")) {
+            try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "InvalidForceRescanOperation" });
+            continue;
+        }
+        if (request.acknowledgement == .minimal and (!std.mem.eql(u8, request.op, "search") or request.query_handle == null or request.if_result_token == null)) {
+            try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "InvalidAcknowledgementOperation" });
+            continue;
+        }
+        if (request.delta and (!std.mem.eql(u8, request.op, "search") or request.query_handle == null or request.if_result_token == null)) {
+            try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "InvalidDeltaOperation" });
+            continue;
+        }
+        if (request.query_handle != null and (!std.mem.eql(u8, request.op, "search") and !std.mem.eql(u8, request.op, "forget") or request.args.len != 0)) {
+            try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "InvalidQueryHandleOperation" });
+            continue;
+        }
+        if (std.mem.eql(u8, request.op, "register")) {
+            const plan = registrations.register(base, request.args, request.compact, request.batches, request.row_format == .tuples) catch |err| {
+                try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = @errorName(err) });
+                continue;
+            };
+            try emit(a, io, .{ .type = "query_registered", .id = request.id, .query_handle = plan.handle, .result_schema_version = if (plan.options.json_tuples) @as(u32, 4) else if (plan.options.json_batches) @as(u32, 3) else if (plan.options.json_compact) @as(u32, 2) else 1, .supports_lexical_delta = Search.lexicalDeltaEligible(&plan.options) });
+        } else if (std.mem.eql(u8, request.op, "forget")) {
+            if (request.query_handle == null or !registrations.forget(request.query_handle.?)) {
+                try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "UnknownQueryHandle" });
+                continue;
+            }
+            try emit(a, io, .{ .type = "query_forgotten", .id = request.id });
+        } else if (std.mem.eql(u8, request.op, "invalidate")) {
+            valid = false;
+            // External invalidation may describe a kernel-invisible write or
+            // lost notification. The next refresh must recertify by reading.
+            if (watch) |watcher| watcher.reset();
+            if (journal) |value| value.reset();
+            try emit(a, io, .{ .type = "workspace_invalidated", .id = request.id, .revision = generation.revision });
+        } else if (std.mem.eql(u8, request.op, "trim")) {
+            // Protocol requests are serial and every search joins its workers.
+            // Drop optional state without changing the published source lease.
+            const released = registrations.retainedBytes() + session.plans.physical.load(.monotonic) + reuse.lexical.physical.load(.monotonic) + reuse.files.physical.load(.monotonic) + reuse.queries.physical.load(.monotonic) + (if (session.memo) |memo| memo.bytes else @as(usize, 0));
+            if (watch) |watcher| watcher.reset();
+            if (journal) |value| value.reset();
+            session.deinit();
+            session = @import("session.zig").Session.init(a, io);
+            reuse.deinit();
+            reuse = Search.Reuse.init(a, io);
+            registrations.deinit();
+            @import("memory_pressure.zig").trim();
+            try emit(a, io, .{ .type = "workspace_trimmed", .id = request.id, .revision = generation.revision, .retained_source_bytes = generation.retainedBytes(), .retained_cache_bytes = @as(usize, 0), .released_cache_bytes = released });
+        } else if (std.mem.eql(u8, request.op, "refresh")) {
+            valid = false;
+            if (request.force_rescan) {
+                if (watch) |watcher| watcher.reset();
+                if (journal) |value| value.reset();
+            }
+            const next = Generation.captureJournal(a, io, base, generation, watch, journal) catch |err| {
+                try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = @errorName(err) });
+                continue;
+            };
+            generation.deinit();
+            generation = next;
+            valid = true;
+            try ready(a, io, generation, request.id);
+        } else if (std.mem.eql(u8, request.op, "search")) {
+            if (!valid or request.revision == null or !std.mem.eql(u8, request.revision.?, &generation.revision)) {
+                try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = if (!valid) "WorkspaceInvalidated" else "WorkspaceRevisionMismatch" });
+                continue;
+            }
+            const plan = if (request.query_handle) |handle| registrations.get(handle) orelse {
+                try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "UnknownQueryHandle" });
+                continue;
+            } else null;
+            if (request.acknowledgement == .minimal) if (plan) |prepared| {
+                if (Search.lexicalCertificateEligible(&prepared.options)) if (prepared.completion) |certificate| {
+                    if (std.mem.eql(u8, request.if_result_token.?, &certificate.token) and std.mem.eql(u8, &generation.revision, &certificate.revision)) {
+                        if (try Search.completedMinimal(io, &prepared.options, generation, certificate.summary, certificate.token, request.id)) continue;
+                    }
+                };
+            };
+            phases.mark("validate");
+            try emit(a, io, .{ .type = "workspace_begin", .id = request.id, .revision = generation.revision });
+            phases.mark("begin");
+            const code = (if (plan) |prepared| registered(Search, a, io, generation, &session, &reuse, prepared, request.if_result_token, request.delta) else search(Search, a, io, base, generation, &session, &reuse, request.args, request.if_result_token)) catch |err| blk: {
+                try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = @errorName(err) });
+                break :blk @as(u8, 2);
+            };
+            phases.mark("search");
+            try emit(a, io, .{ .type = "workspace_end", .id = request.id, .revision = generation.revision, .exit_code = code });
+        } else if (std.mem.eql(u8, request.op, "close")) {
+            try emit(a, io, .{ .type = "workspace_closed", .id = request.id });
+            return 0;
+        } else try emit(a, io, .{ .type = "workspace_error", .id = request.id, .message = "UnknownWorkspaceOperation" });
+    }
+    return 0;
+}
+fn ready(a: A, io: std.Io, generation: *const Generation, id: ?u64) !void {
+    try emit(a, io, .{ .type = "workspace_ready", .version = 1, .id = id, .revision = generation.revision, .observed_at = generation.captured_at, .files = generation.entries.items.len, .entry_bytes = @sizeOf(@import("workspace_store.zig").Entry), .bytes = generation.source_bytes, .retained_bytes = generation.retainedBytes(), .preparations_built = generation.preparations_built, .preparations_reused = generation.preparations_reused, .watch_fallback = generation.watch_fallback, .source_bytes_read = generation.source_bytes_read, .capture_workers = generation.capture_workers, .parallel_sources_read = generation.parallel_sources_read, .parallel_sources_opened = generation.parallel_sources_opened, .sources_opened = generation.sources_opened, .refresh_entries_visited = generation.refresh_entries_visited, .namespace_paths_checked = generation.namespace_paths_checked, .namespace_directories_scanned = generation.namespace_directories_scanned, .discovery_reused = generation.discovery_reused, .source_bytes_reused = generation.source_bytes_reused });
+}
+fn search(comptime Search: type, a: A, io: std.Io, base: *const Options, generation: *const Generation, session: *@import("session.zig").Session, reuse: *Search.Reuse, args: []const []const u8, if_result_token: ?[]const u8) !u8 {
+    var option_arena = std.heap.ArenaAllocator.init(a);
+    defer option_arena.deinit();
+    var o = try @import("workspace_options.zig").prepare(option_arena.allocator(), base, args, null);
+    var searcher = try Search.init(a, io, &o);
+    defer searcher.deinit();
+    if (o.ask != null) try session.configure(&o);
+    searcher.workspace_generation = generation;
+    searcher.reuse = reuse;
+    searcher.if_result_token = if_result_token;
+    if (o.ask != null and !o.no_cache and o.cache_dir != null and o.cache_ttl_seconds != 0) {
+        const identity = try Search.Reuse.identities(a, &o);
+        searcher.reuse_identity = identity.full;
+        searcher.evaluation_identity = identity.evaluation;
+    }
+    searcher.executor = &session.files;
+    searcher.region_plans = &session.plans;
+    searcher.decider.executor = &session.providers;
+    if (session.http) |*http| searcher.decider.shared_http = http;
+    searcher.decider.shared_local = session.local;
+    if (!o.no_cache and o.cache_dir != null) searcher.decider.batch_store = &session.batches;
+    const interrupt = @import("interrupt.zig").Guard.init(&searcher.limits.cancel);
+    defer interrupt.deinit();
+    return searcher.run();
+}
+
+fn registered(comptime Search: type, a: A, io: std.Io, generation: *const Generation, session: *@import("session.zig").Session, reuse: *Search.Reuse, plan: *@import("prepared_query.zig").Registry(Search).Plan, token: ?[]const u8, delta: bool) !u8 {
+    var phases = Phases.init(io, "registered");
+    defer phases.finish();
+    // Any staging/allocation/output failure invalidates partly updated metadata.
+    // The client applies patches only after a complete successful transaction.
+    errdefer plan.lexical.clear();
+    if (Search.lexicalCertificateEligible(&plan.options)) if (plan.completion) |certificate| {
+        if (token != null and std.mem.eql(u8, token.?, &certificate.token) and std.mem.eql(u8, &generation.revision, &certificate.revision))
+            if (try Search.completedConditional(a, io, &plan.options, generation, certificate.summary, certificate.token)) |code| return code;
+    };
+    if (token) |value| if (try Search.conditional(a, io, &plan.options, generation, reuse, plan.identity, value)) |code| return code;
+    phases.mark("conditional");
+    var searcher = try Search.initCompiled(a, io, &plan.options, &plan.matcher, plan.cwd);
+    defer {
+        searcher.deinit();
+        phases.mark("teardown");
+    }
+    phases.mark("init");
+    if (plan.options.ask != null) try session.configure(&plan.options);
+    searcher.workspace_generation = generation;
+    searcher.reuse = reuse;
+    searcher.reuse_identity = plan.identity;
+    searcher.evaluation_identity = plan.evaluation;
+    searcher.if_result_token = token;
+    searcher.executor = &session.files;
+    searcher.region_plans = &session.plans;
+    searcher.decider.executor = &session.providers;
+    searcher.decider.shared_local = session.local;
+    if (session.http) |*http| searcher.decider.shared_http = http;
+    if (!plan.options.no_cache and plan.options.cache_dir != null) searcher.decider.batch_store = &session.batches;
+    if (Search.incrementalEligible(&plan.options) and (plan.incremental_disabled_revision == null or !std.mem.eql(u8, &plan.incremental_disabled_revision.?, &generation.revision))) {
+        const same = plan.index.revision != null and std.mem.eql(u8, &plan.index.revision.?, &generation.revision);
+        const parent = plan.index.revision != null and generation.parent_revision != null and std.mem.eql(u8, &plan.index.revision.?, &generation.parent_revision.?);
+        const valid = if (same) plan.index.valid(plan.options.cache_ttl_seconds) else if (parent) plan.index.validAfter(generation.changes.items, plan.options.cache_ttl_seconds) else false;
+        if (!valid) plan.index.clear();
+        searcher.incremental = &plan.index;
+        if (plan.delivery != null) searcher.prior_delivery = &plan.delivery.?;
+        if (delta and token != null and plan.delivery != null and std.mem.eql(u8, token.?, &plan.delivery.?.token)) searcher.delta_base = &plan.delivery.?;
+    }
+    // Delta indexing is opt-in. A bootstrap delta with an unknown valid token
+    // delivers a complete result and builds bounded metadata for future edits.
+    var delta_arena = std.heap.ArenaAllocator.init(a);
+    defer delta_arena.deinit();
+    const lo = &plan.options;
+    const lexical_eligible = Search.lexicalDeltaEligible(lo);
+    const admission_allowed = plan.lexical_admission.permit(generation.entries.items.len, generation.path_bytes, plan.lexical.budget.limit);
+    if (lexical_eligible and delta and !admission_allowed) searcher.summary.lexical_index_admission_skips = 1;
+    if (lexical_eligible and admission_allowed and (delta or plan.lexical.revision != null)) {
+        const same = plan.lexical.healthy and plan.lexical.revision != null and std.mem.eql(u8, &plan.lexical.revision.?, &generation.revision);
+        if (!same) {
+            const parent = plan.lexical.healthy and plan.lexical.revision != null and generation.parent_revision != null and std.mem.eql(u8, &plan.lexical.revision.?, &generation.parent_revision.?);
+            var patch = parent and delta and token != null and plan.completion != null and std.mem.eql(u8, token.?, &plan.completion.?.token) and std.mem.eql(u8, &plan.completion.?.revision, &plan.lexical.revision.?);
+            var removed: std.ArrayList(Search.JsonText) = .empty;
+            if (parent) {
+                for (generation.changes.items) |path| {
+                    if (patch and plan.lexical.visible(path)) try removed.append(delta_arena.allocator(), try Search.jsonText(delta_arena.allocator(), path));
+                    plan.lexical.remove(path);
+                }
+            } else {
+                plan.lexical.clear();
+                searcher.summary.lexical_index_admissions = 1;
+            }
+            // Reserve before scanning or publishing a patch. Incremental map
+            // growth can exceed the quota only because old/new tables overlap;
+            // retry once from empty before remembering a persistent rejection.
+            var reserved = plan.lexical.reserve(generation.entries.items.len, generation.path_bytes);
+            if (!reserved and parent and plan.lexical.budget.denied) {
+                plan.lexical.clear();
+                patch = false;
+                searcher.summary.lexical_index_admissions = 1;
+                reserved = plan.lexical.reserve(generation.entries.items.len, generation.path_bytes);
+            }
+            if (!reserved) {
+                patch = false;
+                if (plan.lexical.budget.denied) plan.lexical_admission.reject(generation.entries.items.len, generation.path_bytes, plan.lexical.budget.limit) else plan.lexical_admission.deferRetry();
+                plan.lexical.clear();
+                searcher.summary.lexical_index_admission_failures = 1;
+            }
+            if (searcher.summary.lexical_index_admission_failures == 0) searcher.lexical_index = &plan.lexical;
+            if (patch) {
+                searcher.lexical_paths = generation.changes.items;
+                searcher.summary = plan.lexical.aggregate;
+                searcher.lexical_patch = .{ .base_token = plan.completion.?.token, .base_revision = plan.completion.?.revision, .removed = removed.items };
+            }
+        }
+    }
+    phases.mark("admission");
+    const guard = @import("interrupt.zig").Guard.init(&searcher.limits.cancel);
+    defer guard.deinit();
+    phases.mark("guard");
+    const code = try searcher.run();
+    phases.mark("run");
+    if (searcher.lexical_index != null) {
+        if (code <= 1 and searcher.summary.complete and plan.lexical.healthy and plan.lexical.files.count() == generation.entries.items.len and !searcher.limits.cancel.load(.acquire)) {
+            plan.lexical.revision = generation.revision;
+            plan.lexical_admission = .{};
+        } else {
+            if (!plan.lexical.healthy) {
+                if (plan.lexical.budget.denied) plan.lexical_admission.reject(generation.entries.items.len, generation.path_bytes, plan.lexical.budget.limit) else plan.lexical_admission.deferRetry();
+            }
+            plan.lexical.clear();
+        }
+    }
+    if (Search.lexicalCertificateEligible(&plan.options) and code <= 1 and searcher.summary.complete and !searcher.limits.cancel.load(.acquire)) {
+        const previous = if (plan.completion) |c| (if (std.mem.eql(u8, &c.revision, &generation.revision)) c.token else null) else null;
+        const completed_token = try searcher.publishCompletion(previous);
+        plan.completion = .{ .token = completed_token, .revision = generation.revision, .summary = searcher.summary };
+    }
+    if (plan.options.trace) std.debug.print("antfly-grep: registered index attached={} healthy={} files={d}/{d} bytes={d} revision_present={} query_hit={d} incremental_hit={d}\n", .{ searcher.incremental != null, plan.index.healthy, plan.index.files.count(), generation.entries.items.len, plan.index.budget.live, plan.index.revision != null, searcher.summary.query_cache_hits, searcher.summary.incremental_cache_hits });
+    if (searcher.incremental != null and code <= 1 and searcher.summary.complete and plan.index.healthy and plan.index.files.count() == generation.entries.items.len) {
+        // Only a cold population or an incremental run may publish a revision.
+        // Complete-query replay does not update file outcomes.
+        if (searcher.summary.query_cache_hits == 0) plan.index.revision = generation.revision;
+        plan.incremental_disabled_revision = null;
+        if (searcher.last_result_token) |value| plan.remember(value);
+    } else if (searcher.incremental != null) {
+        plan.incremental_disabled_revision = generation.revision;
+        plan.index.clear();
+    }
+    phases.mark("commit");
+    return code;
+}

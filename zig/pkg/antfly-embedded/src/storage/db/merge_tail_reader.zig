@@ -272,9 +272,9 @@ pub const Session = struct {
             if (previous.len != 0 and std.mem.order(u8, previous, key) != .lt) return error.RetainedEffectsCorrupt;
             const is_integrity = @import("relational_integrity_contract.zig").isKey(key);
             const is_vector = @import("online_vector_artifacts.zig").isKey(key);
-            const is_graph = @import("online_graph_artifacts.zig").isKey(key);
+            const is_graph = @import("online_graph_artifacts.zig").isKey(key) or @import("group_source_transfer.zig").isKey(key);
             const is_artifact = is_vector or is_graph;
-            if (!is_integrity and !is_artifact and !internal.isStoredDocumentRowKey(key)) return error.RetainedEffectsCorrupt;
+            if (!is_integrity and !is_artifact and !internal.isStoredSourceRowKey(key)) return error.RetainedEffectsCorrupt;
             if (is_integrity or is_artifact) {
                 if (effect.timestamp != 0 or (is_artifact and !view.direct_vectors) or (is_graph and !view.graph_artifacts)) return error.RetainedEffectsCorrupt;
             }

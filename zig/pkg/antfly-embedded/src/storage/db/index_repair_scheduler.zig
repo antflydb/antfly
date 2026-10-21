@@ -57,6 +57,7 @@ const IndexRepairScheduleRecord = struct {
     root_generation: u64,
     class: IndexRepairScheduleClass,
     phase_terminal: bool,
+    source_recovery: bool,
     /// Durable retry deadline from the checkpoint. Progress waits are a
     /// process-local acceleration layer and may temporarily replace the
     /// effective deadline without changing durable repair authority.
@@ -96,6 +97,7 @@ pub const Directory = struct {
     paused: usize = 0,
     terminal: usize = 0,
     progress_waiters: usize = 0,
+    source_recovery_runnable: usize = 0,
 
     pub fn classifyControlMutation(
         self: *const @This(),
@@ -317,6 +319,18 @@ pub const Directory = struct {
         return self.by_name.contains(name);
     }
 
+    pub fn sourceRecoveryCountForIndex(self: *const @This(), name: ?[]const u8) usize {
+        const selected = name orelse return self.source_recovery_runnable;
+        const record = self.lookupByName(selected) orelse return 0;
+        return @intFromBool(record.class == .runnable and record.source_recovery);
+    }
+
+    pub fn sourceRecoveryIntent(intent: index_repair_state.IndexRepairIntent) bool {
+        return intent.work_class == .initial_build and intent.phase == .detected and
+            intent.candidate_relative_path == null and intent.source_replay_state != .not_required and
+            (intent.trigger == .replay_artifact_unavailable or intent.trigger == .catalog_admission);
+    }
+
     pub fn upsert(
         self: *@This(),
         alloc: Allocator,
@@ -324,6 +338,7 @@ pub const Directory = struct {
         persisted_revision: u64,
     ) !void {
         const class = classForIntent(intent);
+        const source_recovery = sourceRecoveryIntent(intent);
         if (self.by_id.get(intent.repair_id)) |record_index| {
             const record = &self.records.items[record_index];
             if (!std.mem.eql(u8, record.index_name, intent.index_name)) return error.InvalidIndexRepairState;
@@ -334,6 +349,7 @@ pub const Directory = struct {
                     record.config_hash != intent.config_hash or
                     record.root_generation != intent.root_generation or
                     record.phase_terminal != (intent.phase == .terminal) or
+                    record.source_recovery != source_recovery or
                     record.durable_next_retry_at_ms != intent.next_retry_at_ms)
                 {
                     return error.InvalidIndexRepairState;
@@ -347,6 +363,9 @@ pub const Directory = struct {
                 try self.runnable_heap.ensureUnusedCapacity(alloc, 1);
             if (schedule_changed and record.class == .runnable and class != .runnable)
                 self.removeRunnable(intent.repair_id);
+            self.source_recovery_runnable -= @intFromBool(record.class == .runnable and record.source_recovery);
+            self.source_recovery_runnable += @intFromBool(class == .runnable and source_recovery);
+            record.source_recovery = source_recovery;
             if (record.class != class) {
                 self.decrementClass(record.class);
                 self.incrementClass(class);
@@ -387,18 +406,21 @@ pub const Directory = struct {
             .root_generation = intent.root_generation,
             .class = class,
             .phase_terminal = intent.phase == .terminal,
+            .source_recovery = source_recovery,
             .durable_next_retry_at_ms = intent.next_retry_at_ms,
             .next_retry_at_ms = intent.next_retry_at_ms,
         });
         self.by_id.putAssumeCapacity(intent.repair_id, record_index);
         self.by_name.putAssumeCapacity(owned_name, record_index);
         self.incrementClass(class);
+        self.source_recovery_runnable += @intFromBool(class == .runnable and source_recovery);
         if (class == .runnable) self.addRunnableAssumeCapacity(intent.repair_id);
     }
 
     pub fn remove(self: *@This(), alloc: Allocator, repair_id: u128) void {
         const record_index = self.by_id.get(repair_id) orelse return;
         const removed = self.records.items[record_index];
+        self.source_recovery_runnable -= @intFromBool(removed.class == .runnable and removed.source_recovery);
         if (removed.progress_wait_until_sequence != null) self.progress_waiters -= 1;
         if (removed.class == .runnable) self.removeRunnable(removed.repair_id);
         self.decrementClass(removed.class);
@@ -622,4 +644,56 @@ test "resident index repair progress waits are revision scoped and event driven"
     try std.testing.expectEqual(@as(u64, 800), directory.wake().at_realtime_ms);
     try std.testing.expect(directory.wakeForIndexProgress("semantic_idx", std.math.maxInt(u64)) == null);
     try std.testing.expectEqual(@as(u64, 800), directory.wake().at_realtime_ms);
+}
+
+test "source recovery directory tracks only executable initial producer work" {
+    const a = std.testing.allocator;
+    var directory = Directory{ .initialized = true };
+    defer directory.deinit(a);
+    var intent = index_repair_state.IndexRepairIntent{
+        .repair_id = 1,
+        .db_identity = 1,
+        .group_id = 1,
+        .replica_id = 1,
+        .root_generation = 1,
+        .index_name = try a.dupe(u8, "graph"),
+        .kind = .graph,
+        .config_hash = 1,
+        .trigger = .replay_artifact_unavailable,
+        .work_class = .initial_build,
+        .source_replay_state = .pending,
+        .detected_sequence = 1,
+        .target_sequence = 1,
+        .started_at_ms = 1,
+        .updated_at_ms = 1,
+        .owner_epoch = 0,
+    };
+    defer intent.deinit(a);
+    var revision: u64 = 1;
+    try directory.upsert(a, intent, revision);
+    try std.testing.expectEqual(@as(usize, 1), directory.source_recovery_runnable);
+    intent.automation = .paused;
+    revision += 1;
+    try directory.upsert(a, intent, revision);
+    try std.testing.expectEqual(@as(usize, 0), directory.source_recovery_runnable);
+    intent.automation = .enabled;
+    intent.source_replay_state = .complete;
+    revision += 1;
+    try directory.upsert(a, intent, revision);
+    try std.testing.expectEqual(@as(usize, 1), directory.source_recovery_runnable);
+    intent.phase = .preflight;
+    revision += 1;
+    try directory.upsert(a, intent, revision);
+    try std.testing.expectEqual(@as(usize, 0), directory.source_recovery_runnable);
+    intent.phase = .detected;
+    intent.source_replay_state = .not_required;
+    revision += 1;
+    try directory.upsert(a, intent, revision);
+    try std.testing.expectEqual(@as(usize, 0), directory.source_recovery_runnable);
+    intent.source_replay_state = .pending;
+    revision += 1;
+    try directory.upsert(a, intent, revision);
+    try std.testing.expectEqual(@as(usize, 1), directory.source_recovery_runnable);
+    directory.remove(a, intent.repair_id);
+    try std.testing.expectEqual(@as(usize, 0), directory.source_recovery_runnable);
 }

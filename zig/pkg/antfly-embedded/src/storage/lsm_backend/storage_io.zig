@@ -623,6 +623,9 @@ pub const Storage = struct {
         delete_file_absolute: *const fn (*anyopaque, []const u8) anyerror!void,
         delete_tree: *const fn (*anyopaque, []const u8) anyerror!void,
         list_file_names_alloc: ?*const fn (*anyopaque, Allocator, []const u8) anyerror![][]u8 = null,
+        /// Immediate child directories, including virtual directories inferred
+        /// from descendant files. Missing directories return an empty list.
+        list_directory_names_alloc: ?*const fn (*anyopaque, Allocator, []const u8) anyerror![][]u8 = null,
         now_ns: *const fn (*anyopaque) u64,
         root_identity_alloc: ?*const fn (*anyopaque, Allocator, []const u8) anyerror![]u8 = null,
         /// Writes require a caller-owned publication lease, including staging
@@ -880,6 +883,41 @@ pub const Storage = struct {
         return try BoundaryAbi.call("list_file_names_alloc", self.boundary_dispatch, list, .{ self.ptr, allocator, path });
     }
 
+    pub fn listDirectoryNamesAlloc(self: Storage, allocator: Allocator, path: []const u8) ![][]u8 {
+        const list = self.vtable.list_directory_names_alloc orelse return error.DirectoryListingUnsupported;
+        return BoundaryAbi.call("list_directory_names_alloc", self.boundary_dispatch, list, .{ self.ptr, allocator, path }) catch |err| switch (err) {
+            error.FileNotFound => allocator.alloc([]u8, 0),
+            else => return err,
+        };
+    }
+
+    /// Logical file bytes in a generation. Released descriptors/snapshots from
+    /// each listing keep recursive traversal from retaining backend resources.
+    pub fn treeBytes(self: Storage, allocator: Allocator, path: []const u8) anyerror!u64 {
+        const files = self.listFileNamesAlloc(allocator, path) catch |err| switch (err) {
+            error.FileNotFound => return 0,
+            else => return err,
+        };
+        defer freeFileNames(allocator, files);
+        var total: u64 = 0;
+        for (files) |name| {
+            const child = try std.fs.path.join(allocator, &.{ path, name });
+            defer allocator.free(child);
+            total +|= self.fileSize(child) catch |err| switch (err) {
+                error.FileNotFound => 0, // Concurrent reclamation.
+                else => return err,
+            };
+        }
+        const directories = try self.listDirectoryNamesAlloc(allocator, path);
+        defer freeFileNames(allocator, directories);
+        for (directories) |name| {
+            const child = try std.fs.path.join(allocator, &.{ path, name });
+            defer allocator.free(child);
+            total +|= try self.treeBytes(allocator, child);
+        }
+        return total;
+    }
+
     pub fn freeFileNames(allocator: Allocator, names: [][]u8) void {
         for (names) |name| allocator.free(name);
         allocator.free(names);
@@ -1024,6 +1062,8 @@ pub const IoStorage = struct {
         .rename_absolute = renameAbsolute,
         .delete_file_absolute = deleteFileAbsolute,
         .delete_tree = deleteTree,
+        .list_file_names_alloc = listFileNamesAlloc,
+        .list_directory_names_alloc = listDirectoryNamesAlloc,
         .now_ns = nowNs,
         .root_identity_alloc = rootIdentityAlloc,
         .rename_is_atomic = true,
@@ -1093,6 +1133,14 @@ pub const IoStorage = struct {
 
     fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
         try std.Io.Dir.cwd().deleteTree(context(ptr).receiver.io(), path);
+    }
+
+    fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) ![][]u8 {
+        return listFileNamesWithIo(allocator, context(ptr).receiver.io(), path);
+    }
+
+    fn listDirectoryNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) ![][]u8 {
+        return listNamesWithIo(allocator, context(ptr).receiver.io(), path, .directory);
     }
 
     fn nowNs(ptr: *anyopaque) u64 {
@@ -2304,6 +2352,7 @@ const EventedNativeStorage = struct {
         .delete_file_absolute = deleteFileAbsolute,
         .delete_tree = deleteTree,
         .list_file_names_alloc = listFileNamesAlloc,
+        .list_directory_names_alloc = listDirectoryNamesAlloc,
         .now_ns = nowNs,
         .root_identity_alloc = nativeRootIdentityAlloc,
         .rename_is_atomic = true,
@@ -2542,6 +2591,14 @@ const EventedNativeStorage = struct {
         };
     }
 
+    fn listDirectoryNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) ![][]u8 {
+        const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+        return switch (self.runtime) {
+            .threaded => |*threaded| try listNamesWithIo(allocator, threaded.io(), path, .directory),
+            .evented => |*evented| try listNamesWithIo(allocator, evented.io(), path, .directory),
+        };
+    }
+
     fn nowNs(ptr: *anyopaque) u64 {
         const self: *NativeStorage = @ptrCast(@alignCast(ptr));
         return switch (self.runtime) {
@@ -2603,6 +2660,7 @@ const ThreadedNativeStorage = struct {
         .delete_file_absolute = deleteFileAbsolute,
         .delete_tree = deleteTree,
         .list_file_names_alloc = listFileNamesAlloc,
+        .list_directory_names_alloc = listDirectoryNamesAlloc,
         .now_ns = nowNs,
         .root_identity_alloc = rootIdentityAlloc,
         .rename_is_atomic = true,
@@ -2850,6 +2908,13 @@ const ThreadedNativeStorage = struct {
         return try listFileNamesWithIo(allocator, permit.io, path);
     }
 
+    fn listDirectoryNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) ![][]u8 {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        var permit = try state.acquireFdPermit();
+        defer permit.release();
+        return try listNamesWithIo(allocator, permit.io, path, .directory);
+    }
+
     fn rootIdentityAlloc(ptr: *anyopaque, allocator: Allocator, root_dir: []const u8) ![]u8 {
         const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
         var permit = try state.acquireFdPermit();
@@ -2888,6 +2953,10 @@ fn writeFileAbsoluteWithIo(io: anytype, path: []const u8, contents: []const u8) 
 }
 
 fn listFileNamesWithIo(allocator: Allocator, io: anytype, path: []const u8) ![][]u8 {
+    return listNamesWithIo(allocator, io, path, .file);
+}
+
+fn listNamesWithIo(allocator: Allocator, io: anytype, path: []const u8, kind: std.Io.File.Kind) ![][]u8 {
     var dir = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true })
     else
@@ -2900,7 +2969,7 @@ fn listFileNamesWithIo(allocator: Allocator, io: anytype, path: []const u8) ![][
     }
     var iterator = dir.iterate();
     while (try iterator.next(io)) |entry| {
-        if (entry.kind != .file) continue;
+        if (entry.kind != kind) continue;
         const name = try allocator.dupe(u8, entry.name);
         errdefer allocator.free(name);
         try names.append(allocator, name);
@@ -4026,6 +4095,7 @@ const memory_vtable: Storage.VTable = .{
     .delete_file_absolute = memoryDeleteFileAbsolute,
     .delete_tree = memoryDeleteTree,
     .list_file_names_alloc = memoryListFileNamesAlloc,
+    .list_directory_names_alloc = memoryListDirectoryNamesAlloc,
     .now_ns = memoryNowNs,
     .rename_is_atomic = true,
 };
@@ -4043,24 +4113,47 @@ test "native path locking does not imply host generation publication" {
 
 fn memoryCreateDirPath(_: *anyopaque, _: []const u8) !void {}
 
-fn memoryListFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) ![][]u8 {
+fn memoryListDirectoryNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) ![][]u8 {
     const self: *MemoryStorage = @ptrCast(@alignCast(ptr));
     const locked = lockAtomic(&self.mutex);
     defer if (locked) self.mutex.unlock();
+    return listMapNamesAlloc(allocator, path, &self.files, true);
+}
+
+/// Shared directory inference for map-backed file services. This only matches
+/// descendants below a separator boundary, never neighboring prefix names.
+pub fn listMapNamesAlloc(allocator: Allocator, path: []const u8, files: anytype, directories: bool) ![][]u8 {
+    const directory = std.mem.trimEnd(u8, path, "/");
+    const prefix = try std.fmt.allocPrint(allocator, "{s}/", .{directory});
+    defer allocator.free(prefix);
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(allocator);
     var names = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
         for (names.items) |name| allocator.free(name);
         names.deinit(allocator);
     }
-    var iterator = self.files.keyIterator();
+    var iterator = files.keyIterator();
     while (iterator.next()) |stored_path| {
-        const parent = std.fs.path.dirname(stored_path.*) orelse continue;
-        if (!std.mem.eql(u8, parent, path)) continue;
-        const name = try allocator.dupe(u8, std.fs.path.basename(stored_path.*));
-        errdefer allocator.free(name);
-        try names.append(allocator, name);
+        if (!std.mem.startsWith(u8, stored_path.*, prefix)) continue;
+        const relative = stored_path.*[prefix.len..];
+        const separator = std.mem.indexOfScalar(u8, relative, '/');
+        if (directories != (separator != null)) continue;
+        const name = relative[0..(separator orelse relative.len)];
+        if (name.len == 0 or seen.contains(name)) continue;
+        const owned = try allocator.dupe(u8, name);
+        errdefer allocator.free(owned);
+        try seen.put(allocator, owned, {});
+        try names.append(allocator, owned);
     }
     return try names.toOwnedSlice(allocator);
+}
+
+fn memoryListFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) ![][]u8 {
+    const self: *MemoryStorage = @ptrCast(@alignCast(ptr));
+    const locked = lockAtomic(&self.mutex);
+    defer if (locked) self.mutex.unlock();
+    return listMapNamesAlloc(allocator, path, &self.files, false);
 }
 
 fn memoryReadFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
@@ -5660,4 +5753,37 @@ test "storage file errors and returned writers use their owning dispatcher" {
     try std.testing.expectEqualStrings("hello", &bytes);
     try std.testing.expectError(error.EndOfStream, reader.readRangeInto(5, &bytes));
     try std.testing.expectEqual(@as(usize, 2), ReaderForeign.calls);
+}
+
+test "generation tree accounting respects directory boundaries (#1210)" {
+    const a = std.testing.allocator;
+    var memory = MemoryStorage.init(a);
+    defer memory.deinit();
+    const storage = memory.storage();
+    try storage.writeFileAbsolute("/generation/index/a", "123");
+    try storage.writeFileAbsolute("/generation/index/nested/b", "4567");
+    try storage.writeFileAbsolute("/generation/index/nested/c", "89");
+    try storage.writeFileAbsolute("/generation-other/keep", "unrelated");
+    try std.testing.expectEqual(@as(u64, 9), try storage.treeBytes(a, "/generation"));
+    try std.testing.expectEqual(@as(u64, 0), try storage.treeBytes(a, "/missing"));
+    const dirs = try storage.listDirectoryNamesAlloc(a, "/generation/");
+    defer Storage.freeFileNames(a, dirs);
+    try std.testing.expectEqual(@as(usize, 1), dirs.len);
+    try std.testing.expectEqualStrings("index", dirs[0]);
+
+    if (!supports_native_storage) return;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/generation", .{tmp.sub_path});
+    defer a.free(path);
+    var native = try NativeStorage.init(a, .threaded);
+    defer native.deinit();
+    const native_storage = native.storage();
+    const nested = try std.fs.path.join(a, &.{ path, "index/nested" });
+    defer a.free(nested);
+    try native_storage.createDirPath(nested);
+    const file = try std.fs.path.join(a, &.{ nested, "payload" });
+    defer a.free(file);
+    try native_storage.writeFileAbsolute(file, "123456789");
+    try std.testing.expectEqual(@as(u64, 9), try native_storage.treeBytes(a, path));
 }

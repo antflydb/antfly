@@ -87,7 +87,7 @@ pub fn descriptor(alloc: std.mem.Allocator, reader: anytype, object_size: u64, p
     const key = try alloc.alloc(u8, key_len);
     errdefer alloc.free(key);
     try exact(reader, position.object, key_offset, key);
-    if (!graph.isKey(key)) return error.SourceSnapshotCorrupt;
+    if (!graph.isKey(key) and !@import("group_source_transfer.zig").isKey(key)) return error.SourceSnapshotCorrupt;
     next_position.offset = end;
     return .{ .key = key, .object = position.object, .value_offset = value_offset, .value_len = value_len, .next_position = next_position };
 }
@@ -105,7 +105,11 @@ pub const Reader = struct {
         var previous: []const u8 = "";
         while (try validation.next()) |entry| {
             if (std.mem.order(u8, previous, entry.key) != .lt) return error.InvalidGraphTransfer;
-            try graph.validate(entry.key, entry.value);
+            if (@import("group_source_transfer.zig").isKey(entry.key)) {
+                var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer arena.deinit();
+                try @import("group_source_transfer.zig").validate(arena.allocator(), entry.key, entry.value);
+            } else try graph.validate(entry.key, entry.value);
             previous = entry.key;
         }
         return result;

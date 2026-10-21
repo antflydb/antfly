@@ -117,7 +117,7 @@ def test_composite_model_eviction_churn_stays_healthy(api):
         assert len(embedded["data"]) == 2
         assert all(len(item["embedding"]) == 512 for item in embedded["data"])
 
-        read = api.read([image], model=reader)
+        read = api.read([image], model=reader, max_tokens=8)
         assert len(read["data"]) == 1
         assert isinstance(read["data"][0].get("text"), str)
 

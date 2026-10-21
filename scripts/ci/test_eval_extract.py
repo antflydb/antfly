@@ -25,6 +25,28 @@ spec.loader.exec_module(eval_extract)
 
 
 class EvalExtractTests(unittest.TestCase):
+    def test_generation_accounting_reports_alignment_and_explicit_cost(self):
+        output = {
+            "data": [{"entities": [{}, {}, {}], "unaligned_mentions": 1}],
+            "usage": {"input_tokens": 100, "output_tokens": 20},
+        }
+        report = eval_extract.generation_accounting(
+            [output], {"input_usd_per_million": 2, "output_usd_per_million": 10}
+        )
+        self.assertEqual(report["alignment_rate"], 0.75)
+        self.assertAlmostEqual(report["cost_usd"], 0.0004)
+        unknown = eval_extract.generation_accounting([{"data": [{"entities": []}]}])
+        self.assertIsNone(unknown["alignment_rate"])
+        self.assertIsNone(unknown["input_tokens"])
+        self.assertIsNone(unknown["cost_usd"])
+        with self.assertRaises(ValueError):
+            eval_extract.generation_accounting([{"data": [{"unaligned_mentions": -1}]}])
+        with self.assertRaises(ValueError):
+            eval_extract.generation_accounting(
+                [output],
+                {"input_usd_per_million": float("nan"), "output_usd_per_million": 1},
+            )
+
     def test_exact_metrics_include_negatives_and_duplicate_deduplication(self):
         report = eval_extract.metrics(
             [{("p", 0, 3)}, set()], [{("p", 0, 3), ("p", 4, 7)}, {("p", 0, 3)}]

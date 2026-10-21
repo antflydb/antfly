@@ -7,6 +7,7 @@ from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.extraction_request import ExtractionRequest
 from ...models.extraction_response import ExtractionResponse
+from ...models.generated_extraction_request import GeneratedExtractionRequest
 from ...models.inference_error import InferenceError
 from ...models.inference_transient_capacity_error import InferenceTransientCapacityError
 from ...types import Response
@@ -14,7 +15,7 @@ from ...types import Response
 
 def _get_kwargs(
     *,
-    body: ExtractionRequest,
+    body: ExtractionRequest | GeneratedExtractionRequest,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
@@ -23,7 +24,10 @@ def _get_kwargs(
         "url": "/ai/v1/extract",
     }
 
-    _kwargs["json"] = body.to_dict()
+    if isinstance(body, ExtractionRequest):
+        _kwargs["json"] = body.to_dict()
+    else:
+        _kwargs["json"] = body.to_dict()
 
     headers["Content-Type"] = "application/json"
 
@@ -104,7 +108,7 @@ def _build_response(
 def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
-    body: ExtractionRequest,
+    body: ExtractionRequest | GeneratedExtractionRequest,
 ) -> Response[ExtractionResponse | InferenceError | InferenceTransientCapacityError]:
     """Extract entities, relations, classifications, and structures
 
@@ -125,8 +129,8 @@ def sync_detailed(
     extraction consumes one admission unit.
 
     Args:
-        body (ExtractionRequest): Atomic extraction request. Every input is validated before
-            inference; failures return no partial data.
+        body (ExtractionRequest | GeneratedExtractionRequest): A trained extractor request or a
+            constrained generator request.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -150,7 +154,7 @@ def sync_detailed(
 def sync(
     *,
     client: AuthenticatedClient | Client,
-    body: ExtractionRequest,
+    body: ExtractionRequest | GeneratedExtractionRequest,
 ) -> ExtractionResponse | InferenceError | InferenceTransientCapacityError | None:
     """Extract entities, relations, classifications, and structures
 
@@ -171,8 +175,8 @@ def sync(
     extraction consumes one admission unit.
 
     Args:
-        body (ExtractionRequest): Atomic extraction request. Every input is validated before
-            inference; failures return no partial data.
+        body (ExtractionRequest | GeneratedExtractionRequest): A trained extractor request or a
+            constrained generator request.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -191,7 +195,7 @@ def sync(
 async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
-    body: ExtractionRequest,
+    body: ExtractionRequest | GeneratedExtractionRequest,
 ) -> Response[ExtractionResponse | InferenceError | InferenceTransientCapacityError]:
     """Extract entities, relations, classifications, and structures
 
@@ -212,8 +216,8 @@ async def asyncio_detailed(
     extraction consumes one admission unit.
 
     Args:
-        body (ExtractionRequest): Atomic extraction request. Every input is validated before
-            inference; failures return no partial data.
+        body (ExtractionRequest | GeneratedExtractionRequest): A trained extractor request or a
+            constrained generator request.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -235,7 +239,7 @@ async def asyncio_detailed(
 async def asyncio(
     *,
     client: AuthenticatedClient | Client,
-    body: ExtractionRequest,
+    body: ExtractionRequest | GeneratedExtractionRequest,
 ) -> ExtractionResponse | InferenceError | InferenceTransientCapacityError | None:
     """Extract entities, relations, classifications, and structures
 
@@ -256,8 +260,8 @@ async def asyncio(
     extraction consumes one admission unit.
 
     Args:
-        body (ExtractionRequest): Atomic extraction request. Every input is validated before
-            inference; failures return no partial data.
+        body (ExtractionRequest | GeneratedExtractionRequest): A trained extractor request or a
+            constrained generator request.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

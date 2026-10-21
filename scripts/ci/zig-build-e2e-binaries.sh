@@ -87,7 +87,7 @@ if command -v lscpu >/dev/null 2>&1; then
 fi
 zig version
 
-build_steps=(antfly)
+build_steps=(antfly grep)
 if [[ "$build_capi" == "true" ]]; then
   build_steps+=(capi capi-smoke)
 fi

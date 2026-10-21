@@ -1,0 +1,3608 @@
+{
+  "measurement": "Alternating lexical full delivery, conditional acknowledgement and single edits.\n\nWarm process/filesystem data; capture/refresh is outside search timing. Baselines\nwithout lexical tokens deliver ordinary results for an unknown valid token.\nEvery full/edit delivery is compared by exact match/context data, outside timing.",
+  "host": "Linux-7.0.14-linuxkit-aarch64-with-glibc2.41",
+  "cpu_count": 14,
+  "cgroup_cpu_max": "200000 100000",
+  "files": 64,
+  "bytes_per_file": 1048576,
+  "binaries": {
+    "current": {
+      "sha256": "389c59476fbe2fab6f80678ae5c684b4f52505ca78d84fd1386aa873209cd68c"
+    },
+    "baseline": {
+      "sha256": "75126e1d8d3c81d25ba5cf05b6dfb6520d9b55452e4031f1d9322d8562f4c62a"
+    }
+  },
+  "trials": [
+    {
+      "load_average": [
+        0.05029296875,
+        0.1396484375,
+        0.09375
+      ],
+      "full": {
+        "baseline": {
+          "seconds": 0.0009055410046130419,
+          "response_bytes": 78053,
+          "first_event_seconds": 0.00013041601050645113,
+          "producer_seconds": 0.0007625,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 762500,
+                "human": "0.000763s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108936,
+                "bytes_printed": 76785,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_cache_hits": 64,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108936,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        },
+        "current": {
+          "seconds": 0.0007713749073445797,
+          "response_bytes": 78078,
+          "first_event_seconds": 0.0001229170011356473,
+          "producer_seconds": 0.000506083,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 506083,
+                "human": "0.000506s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108936,
+                "bytes_printed": 76781,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_entries_visited": 64,
+              "lexical_cache_hits": 64,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108936,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        }
+      },
+      "conditional": {
+        "baseline": {
+          "seconds": 0.00025500007905066013,
+          "response_bytes": 1373,
+          "first_event_seconds": 0.00018775009084492922,
+          "producer_seconds": 6.583e-06,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 6583,
+                "human": "0.000007s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108936,
+                "bytes_printed": 216,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_cache_hits": 0,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 1,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108936,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": true
+        },
+        "current": {
+          "seconds": 8.91250092536211e-05,
+          "response_bytes": 1401,
+          "first_event_seconds": 7.85409938544035e-05,
+          "producer_seconds": 2.459e-06,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 2459,
+                "human": "0.000002s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108936,
+                "bytes_printed": 216,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_entries_visited": 0,
+              "lexical_cache_hits": 0,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 1,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108936,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": true
+        }
+      },
+      "edit": {
+        "baseline": {
+          "seconds": 0.0007990000303834677,
+          "response_bytes": 78051,
+          "first_event_seconds": 0.0001503330422565341,
+          "producer_seconds": 0.000692084,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 692084,
+                "human": "0.000692s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76783,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_cache_hits": 63,
+              "lexical_files_evaluated": 1,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        },
+        "current": {
+          "seconds": 0.0007114580366760492,
+          "response_bytes": 78077,
+          "first_event_seconds": 0.0001379579771310091,
+          "producer_seconds": 0.0004105,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 410500,
+                "human": "0.000411s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76780,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_entries_visited": 64,
+              "lexical_cache_hits": 63,
+              "lexical_files_evaluated": 1,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        }
+      }
+    },
+    {
+      "load_average": [
+        0.05029296875,
+        0.1396484375,
+        0.09375
+      ],
+      "full": {
+        "current": {
+          "seconds": 0.000664666062220931,
+          "response_bytes": 78074,
+          "first_event_seconds": 8.875003550201654e-05,
+          "producer_seconds": 0.000372792,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 372792,
+                "human": "0.000373s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76777,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_entries_visited": 64,
+              "lexical_cache_hits": 64,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        },
+        "baseline": {
+          "seconds": 0.0007096249610185623,
+          "response_bytes": 78051,
+          "first_event_seconds": 8.358294144272804e-05,
+          "producer_seconds": 0.000609416,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 609416,
+                "human": "0.000609s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76783,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_cache_hits": 64,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        }
+      },
+      "conditional": {
+        "current": {
+          "seconds": 7.254199590533972e-05,
+          "response_bytes": 1401,
+          "first_event_seconds": 5.9875077567994595e-05,
+          "producer_seconds": 1.5e-06,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 1500,
+                "human": "0.000002s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 216,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_entries_visited": 0,
+              "lexical_cache_hits": 0,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 1,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": true
+        },
+        "baseline": {
+          "seconds": 4.204094875603914e-05,
+          "response_bytes": 1373,
+          "first_event_seconds": 3.2624928280711174e-05,
+          "producer_seconds": 1.75e-06,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 1750,
+                "human": "0.000002s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 216,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_cache_hits": 0,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 1,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": true
+        }
+      },
+      "edit": {
+        "current": {
+          "seconds": 0.0009189589181914926,
+          "response_bytes": 78079,
+          "first_event_seconds": 0.00024162500631064177,
+          "producer_seconds": 0.000521542,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 521542,
+                "human": "0.000522s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76782,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_entries_visited": 64,
+              "lexical_cache_hits": 63,
+              "lexical_files_evaluated": 1,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        },
+        "baseline": {
+          "seconds": 0.0010764579055830836,
+          "response_bytes": 78064,
+          "first_event_seconds": 0.0002669579116627574,
+          "producer_seconds": 0.000973459,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 973459,
+                "human": "0.000973s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76796,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_cache_hits": 63,
+              "lexical_files_evaluated": 1,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        }
+      }
+    },
+    {
+      "load_average": [
+        0.05029296875,
+        0.1396484375,
+        0.09375
+      ],
+      "full": {
+        "baseline": {
+          "seconds": 0.0008112500654533505,
+          "response_bytes": 78049,
+          "first_event_seconds": 0.00016883411444723606,
+          "producer_seconds": 0.0005975,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 597500,
+                "human": "0.000598s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76781,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_cache_hits": 64,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        },
+        "current": {
+          "seconds": 0.0006787499878555536,
+          "response_bytes": 78074,
+          "first_event_seconds": 0.0001485419925302267,
+          "producer_seconds": 0.00046425,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 464250,
+                "human": "0.000464s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76777,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_entries_visited": 64,
+              "lexical_cache_hits": 64,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        }
+      },
+      "conditional": {
+        "baseline": {
+          "seconds": 7.837498560547829e-05,
+          "response_bytes": 1373,
+          "first_event_seconds": 6.787502206861973e-05,
+          "producer_seconds": 2.042e-06,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 2042,
+                "human": "0.000002s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 216,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_cache_hits": 0,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 1,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": true
+        },
+        "current": {
+          "seconds": 6.479199510067701e-05,
+          "response_bytes": 1401,
+          "first_event_seconds": 5.512498319149017e-05,
+          "producer_seconds": 1.625e-06,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 1625,
+                "human": "0.000002s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 216,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_entries_visited": 0,
+              "lexical_cache_hits": 0,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 1,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": true
+        }
+      },
+      "edit": {
+        "baseline": {
+          "seconds": 0.0010389999952167273,
+          "response_bytes": 78055,
+          "first_event_seconds": 0.00020929193124175072,
+          "producer_seconds": 0.000886333,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 886333,
+                "human": "0.000886s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76787,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_cache_hits": 63,
+              "lexical_files_evaluated": 1,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        },
+        "current": {
+          "seconds": 0.0008579170098528266,
+          "response_bytes": 78079,
+          "first_event_seconds": 0.000298708095215261,
+          "producer_seconds": 0.000478375,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 478375,
+                "human": "0.000478s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76782,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_entries_visited": 64,
+              "lexical_cache_hits": 63,
+              "lexical_files_evaluated": 1,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        }
+      }
+    },
+    {
+      "load_average": [
+        0.05029296875,
+        0.1396484375,
+        0.09375
+      ],
+      "full": {
+        "current": {
+          "seconds": 0.0008367090485990047,
+          "response_bytes": 78077,
+          "first_event_seconds": 0.00012341700494289398,
+          "producer_seconds": 0.000604625,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 604625,
+                "human": "0.000605s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76780,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_entries_visited": 64,
+              "lexical_cache_hits": 64,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        },
+        "baseline": {
+          "seconds": 0.0009857920231297612,
+          "response_bytes": 78062,
+          "first_event_seconds": 0.00015049998182803392,
+          "producer_seconds": 0.000764458,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 764458,
+                "human": "0.000764s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76794,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_cache_hits": 64,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        }
+      },
+      "conditional": {
+        "current": {
+          "seconds": 0.0001056670444086194,
+          "response_bytes": 1401,
+          "first_event_seconds": 9.04579646885395e-05,
+          "producer_seconds": 2.709e-06,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 2709,
+                "human": "0.000003s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 216,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_entries_visited": 0,
+              "lexical_cache_hits": 0,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 1,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": true
+        },
+        "baseline": {
+          "seconds": 8.883303962647915e-05,
+          "response_bytes": 1373,
+          "first_event_seconds": 7.858301978558302e-05,
+          "producer_seconds": 1.625e-06,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 1625,
+                "human": "0.000002s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 216,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_cache_hits": 0,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 1,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": true
+        }
+      },
+      "edit": {
+        "current": {
+          "seconds": 0.001231667003594339,
+          "response_bytes": 78077,
+          "first_event_seconds": 0.0002834579208865762,
+          "producer_seconds": 0.00083375,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 833750,
+                "human": "0.000834s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76780,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_entries_visited": 64,
+              "lexical_cache_hits": 63,
+              "lexical_files_evaluated": 1,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        },
+        "baseline": {
+          "seconds": 0.0013767079217359424,
+          "response_bytes": 78068,
+          "first_event_seconds": 0.00020408292766660452,
+          "producer_seconds": 0.000980041,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 980041,
+                "human": "0.000980s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76800,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_cache_hits": 63,
+              "lexical_files_evaluated": 1,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        }
+      }
+    },
+    {
+      "load_average": [
+        0.05029296875,
+        0.1396484375,
+        0.09375
+      ],
+      "full": {
+        "baseline": {
+          "seconds": 0.000780333997681737,
+          "response_bytes": 78052,
+          "first_event_seconds": 0.00016999989748001099,
+          "producer_seconds": 0.000625834,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 625834,
+                "human": "0.000626s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76784,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_cache_hits": 64,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        },
+        "current": {
+          "seconds": 0.0007457910105586052,
+          "response_bytes": 78074,
+          "first_event_seconds": 0.00013875006698071957,
+          "producer_seconds": 0.000438958,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 438958,
+                "human": "0.000439s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76777,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_entries_visited": 64,
+              "lexical_cache_hits": 64,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        }
+      },
+      "conditional": {
+        "baseline": {
+          "seconds": 7.458298932760954e-05,
+          "response_bytes": 1373,
+          "first_event_seconds": 6.11250288784504e-05,
+          "producer_seconds": 2.25e-06,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 2250,
+                "human": "0.000002s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 216,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_cache_hits": 0,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 1,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": true
+        },
+        "current": {
+          "seconds": 6.133306305855513e-05,
+          "response_bytes": 1401,
+          "first_event_seconds": 5.1791081205010414e-05,
+          "producer_seconds": 1.916e-06,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 1916,
+                "human": "0.000002s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 216,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_entries_visited": 0,
+              "lexical_cache_hits": 0,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 1,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": true
+        }
+      },
+      "edit": {
+        "baseline": {
+          "seconds": 0.0009830830385908484,
+          "response_bytes": 78054,
+          "first_event_seconds": 0.00016779208090156317,
+          "producer_seconds": 0.000677417,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 677417,
+                "human": "0.000677s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76786,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_cache_hits": 63,
+              "lexical_files_evaluated": 1,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        },
+        "current": {
+          "seconds": 0.000764541095122695,
+          "response_bytes": 78077,
+          "first_event_seconds": 0.00020350003615021706,
+          "producer_seconds": 0.000487083,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 487083,
+                "human": "0.000487s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76780,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_entries_visited": 64,
+              "lexical_cache_hits": 63,
+              "lexical_files_evaluated": 1,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        }
+      }
+    },
+    {
+      "load_average": [
+        0.05029296875,
+        0.1396484375,
+        0.09375
+      ],
+      "full": {
+        "current": {
+          "seconds": 0.0006953750271350145,
+          "response_bytes": 78075,
+          "first_event_seconds": 0.00011737504974007607,
+          "producer_seconds": 0.000395917,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 395917,
+                "human": "0.000396s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76778,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_entries_visited": 64,
+              "lexical_cache_hits": 64,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        },
+        "baseline": {
+          "seconds": 0.000778250047005713,
+          "response_bytes": 78049,
+          "first_event_seconds": 9.883404709398746e-05,
+          "producer_seconds": 0.000579084,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 579084,
+                "human": "0.000579s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76781,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_cache_hits": 64,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        }
+      },
+      "conditional": {
+        "current": {
+          "seconds": 7.220893166959286e-05,
+          "response_bytes": 1401,
+          "first_event_seconds": 6.195891182869673e-05,
+          "producer_seconds": 2.791e-06,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 2791,
+                "human": "0.000003s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 216,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_entries_visited": 0,
+              "lexical_cache_hits": 0,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 1,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": true
+        },
+        "baseline": {
+          "seconds": 5.370797589421272e-05,
+          "response_bytes": 1373,
+          "first_event_seconds": 4.516600165516138e-05,
+          "producer_seconds": 1.667e-06,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 1667,
+                "human": "0.000002s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 216,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_cache_hits": 0,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 1,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": true
+        }
+      },
+      "edit": {
+        "current": {
+          "seconds": 0.0007963749812915921,
+          "response_bytes": 78077,
+          "first_event_seconds": 0.00015058298595249653,
+          "producer_seconds": 0.000519875,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 519875,
+                "human": "0.000520s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76780,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_entries_visited": 64,
+              "lexical_cache_hits": 63,
+              "lexical_files_evaluated": 1,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        },
+        "baseline": {
+          "seconds": 0.0008196251001209021,
+          "response_bytes": 78057,
+          "first_event_seconds": 0.00013749999925494194,
+          "producer_seconds": 0.000714583,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 714583,
+                "human": "0.000715s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76789,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_cache_hits": 63,
+              "lexical_files_evaluated": 1,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        }
+      }
+    },
+    {
+      "load_average": [
+        0.12646484375,
+        0.154296875,
+        0.0986328125
+      ],
+      "full": {
+        "baseline": {
+          "seconds": 0.0007465420057997108,
+          "response_bytes": 78053,
+          "first_event_seconds": 9.945803321897984e-05,
+          "producer_seconds": 0.0006455,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 645500,
+                "human": "0.000646s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76785,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_cache_hits": 64,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        },
+        "current": {
+          "seconds": 0.0007685830350965261,
+          "response_bytes": 78075,
+          "first_event_seconds": 0.00013004103675484657,
+          "producer_seconds": 0.000450917,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 450917,
+                "human": "0.000451s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76778,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_entries_visited": 64,
+              "lexical_cache_hits": 64,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        }
+      },
+      "conditional": {
+        "baseline": {
+          "seconds": 7.845798972994089e-05,
+          "response_bytes": 1373,
+          "first_event_seconds": 6.566697265952826e-05,
+          "producer_seconds": 2.042e-06,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 2042,
+                "human": "0.000002s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 216,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_cache_hits": 0,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 1,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": true
+        },
+        "current": {
+          "seconds": 5.7875062339007854e-05,
+          "response_bytes": 1401,
+          "first_event_seconds": 4.716706462204456e-05,
+          "producer_seconds": 1.833e-06,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 1833,
+                "human": "0.000002s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 216,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_entries_visited": 0,
+              "lexical_cache_hits": 0,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 1,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": true
+        }
+      },
+      "edit": {
+        "baseline": {
+          "seconds": 0.0010399590246379375,
+          "response_bytes": 78057,
+          "first_event_seconds": 0.0003172919386997819,
+          "producer_seconds": 0.000855875,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 855875,
+                "human": "0.000856s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76789,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_cache_hits": 63,
+              "lexical_files_evaluated": 1,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        },
+        "current": {
+          "seconds": 0.0007312910165637732,
+          "response_bytes": 78078,
+          "first_event_seconds": 0.0001820409670472145,
+          "producer_seconds": 0.000421,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 421000,
+                "human": "0.000421s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76781,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_entries_visited": 64,
+              "lexical_cache_hits": 63,
+              "lexical_files_evaluated": 1,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        }
+      }
+    },
+    {
+      "load_average": [
+        0.12646484375,
+        0.154296875,
+        0.0986328125
+      ],
+      "full": {
+        "current": {
+          "seconds": 0.0006527920486405492,
+          "response_bytes": 78074,
+          "first_event_seconds": 9.891705121845007e-05,
+          "producer_seconds": 0.000353166,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 353166,
+                "human": "0.000353s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76777,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_entries_visited": 64,
+              "lexical_cache_hits": 64,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        },
+        "baseline": {
+          "seconds": 0.0008428749861195683,
+          "response_bytes": 78049,
+          "first_event_seconds": 0.00012304203119128942,
+          "producer_seconds": 0.000676833,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 676833,
+                "human": "0.000677s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76781,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_cache_hits": 64,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        }
+      },
+      "conditional": {
+        "current": {
+          "seconds": 0.00010950001887977123,
+          "response_bytes": 1401,
+          "first_event_seconds": 8.733395952731371e-05,
+          "producer_seconds": 2.334e-06,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 2334,
+                "human": "0.000002s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 216,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_entries_visited": 0,
+              "lexical_cache_hits": 0,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 1,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": true
+        },
+        "baseline": {
+          "seconds": 5.633395630866289e-05,
+          "response_bytes": 1373,
+          "first_event_seconds": 4.466692917048931e-05,
+          "producer_seconds": 2e-06,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 2000,
+                "human": "0.000002s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 216,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_cache_hits": 0,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 1,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": true
+        }
+      },
+      "edit": {
+        "current": {
+          "seconds": 0.0008221670286729932,
+          "response_bytes": 78077,
+          "first_event_seconds": 0.0002552920486778021,
+          "producer_seconds": 0.000609708,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 609708,
+                "human": "0.000610s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76780,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_entries_visited": 64,
+              "lexical_cache_hits": 63,
+              "lexical_files_evaluated": 1,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        },
+        "baseline": {
+          "seconds": 0.0008380830986425281,
+          "response_bytes": 78055,
+          "first_event_seconds": 0.00016120809596031904,
+          "producer_seconds": 0.000710917,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 710917,
+                "human": "0.000711s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76787,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_cache_hits": 63,
+              "lexical_files_evaluated": 1,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        }
+      }
+    },
+    {
+      "load_average": [
+        0.12646484375,
+        0.154296875,
+        0.0986328125
+      ],
+      "full": {
+        "baseline": {
+          "seconds": 0.0007522499654442072,
+          "response_bytes": 78051,
+          "first_event_seconds": 0.00010466598905622959,
+          "producer_seconds": 0.000633625,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 633625,
+                "human": "0.000634s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76783,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_cache_hits": 64,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        },
+        "current": {
+          "seconds": 0.0007430830737575889,
+          "response_bytes": 78075,
+          "first_event_seconds": 0.00017083308193832636,
+          "producer_seconds": 0.000460917,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 460917,
+                "human": "0.000461s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76778,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_entries_visited": 64,
+              "lexical_cache_hits": 64,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        }
+      },
+      "conditional": {
+        "baseline": {
+          "seconds": 8.449994493275881e-05,
+          "response_bytes": 1373,
+          "first_event_seconds": 6.754102651029825e-05,
+          "producer_seconds": 2.291e-06,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 2291,
+                "human": "0.000002s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 216,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_cache_hits": 0,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 1,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": true
+        },
+        "current": {
+          "seconds": 8.1834034062922e-05,
+          "response_bytes": 1401,
+          "first_event_seconds": 6.895908154547215e-05,
+          "producer_seconds": 1.916e-06,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 1916,
+                "human": "0.000002s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 216,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_entries_visited": 0,
+              "lexical_cache_hits": 0,
+              "lexical_files_evaluated": 0,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 1,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": true
+        }
+      },
+      "edit": {
+        "baseline": {
+          "seconds": 0.0011589580681174994,
+          "response_bytes": 78068,
+          "first_event_seconds": 0.00039416702929884195,
+          "producer_seconds": 0.0010005,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 1000500,
+                "human": "0.001001s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76799,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_cache_hits": 63,
+              "lexical_files_evaluated": 1,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        },
+        "current": {
+          "seconds": 0.0008057079976424575,
+          "response_bytes": 78082,
+          "first_event_seconds": 0.0002490829210728407,
+          "producer_seconds": 0.000523083,
+          "summary": {
+            "type": "summary",
+            "data": {
+              "elapsed_total": {
+                "secs": 0,
+                "nanos": 523083,
+                "human": "0.000523s"
+              },
+              "stats": {
+                "elapsed": {
+                  "secs": 0,
+                  "nanos": 0,
+                  "human": "0.000000s"
+                },
+                "searches": 64,
+                "searches_with_match": 64,
+                "bytes_searched": 67108935,
+                "bytes_printed": 76785,
+                "matched_lines": 65,
+                "matches": 65
+              }
+            },
+            "stats": {
+              "lexical_entries_visited": 64,
+              "lexical_cache_hits": 63,
+              "lexical_files_evaluated": 1,
+              "index_requests": 0,
+              "incremental_cache_hits": 0,
+              "incremental_files_evaluated": 0,
+              "incremental_results_materialized": 0,
+              "query_cache_hits": 0,
+              "file_evaluation_cache_hits": 0,
+              "source_cache_hits": 0,
+              "source_parses": 0,
+              "files": 64,
+              "bytes": 67108935,
+              "matches": 65,
+              "reading_leads": 0,
+              "occurrences": 65,
+              "occurrences_exact": true,
+              "files_with_matches": 64,
+              "regions_considered": 0,
+              "regions_evaluated": 0,
+              "errors": 0,
+              "skipped_paths": 0,
+              "invalid_utf8_files": 0,
+              "complete": true
+            },
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_bytes": 0,
+            "request_inputs": 0,
+            "peak_request_bytes": 0,
+            "cache_hits": 0,
+            "result_schema_version": 2
+          },
+          "unchanged": false
+        }
+      }
+    }
+  ],
+  "median": {
+    "full": {
+      "current": {
+        "seconds": 0.0007430830737575889,
+        "producer_seconds": 0.000450917,
+        "first_event_seconds": 0.00012341700494289398,
+        "response_bytes": 78075
+      },
+      "baseline": {
+        "seconds": 0.000780333997681737,
+        "producer_seconds": 0.000633625,
+        "first_event_seconds": 0.00012304203119128942,
+        "response_bytes": 78051
+      }
+    },
+    "conditional": {
+      "current": {
+        "seconds": 7.254199590533972e-05,
+        "producer_seconds": 1.916e-06,
+        "first_event_seconds": 6.195891182869673e-05,
+        "response_bytes": 1401
+      },
+      "baseline": {
+        "seconds": 7.837498560547829e-05,
+        "producer_seconds": 2.042e-06,
+        "first_event_seconds": 6.566697265952826e-05,
+        "response_bytes": 1373
+      }
+    },
+    "edit": {
+      "current": {
+        "seconds": 0.0008057079976424575,
+        "producer_seconds": 0.000519875,
+        "first_event_seconds": 0.00024162500631064177,
+        "response_bytes": 78077
+      },
+      "baseline": {
+        "seconds": 0.0010389999952167273,
+        "producer_seconds": 0.000855875,
+        "first_event_seconds": 0.00020408292766660452,
+        "response_bytes": 78057
+      }
+    }
+  }
+}

@@ -1,0 +1,124 @@
+{
+  "implementation_commit": "c9c79a3dbf25466c1184566231fa47998505a566",
+  "base_commit": "02c9684b9620c353ab2be82be7ad89afe0a4536c",
+  "sources_sha256": {
+    "zig/build_support/antfly/dependencies.zig": "f43bb05cd1867eabd59cc8da12542e628596c0d07f5d80b9f10cfd1f55500f52",
+    "zig/build_support/embedded/wasm.zig": "8ee5c7159ddb0ef7fa030e99efd614f6851c5afd5b1360af16f5c18ed58c1b93",
+    "zig/lib/compress/src/bzip2.zig": "eeffcf5443bfb3a4b931c817d87b60d525867b0cf194e94dea41a424908b4b73",
+    "zig/lib/tokenizer/build_support.zig": "6e2fb8eac4152e758992b0851721fbc8ac539e7b8a6b2288d540e25dddd346e3",
+    "zig/lib/tokenizer/src/unicode_normalizer.zig": "2b69d27278502efbc2984f81e93ccebbabdea322de1aea9d72cc0815a64505de",
+    "zig/pkg/antfly-grep/bench/compare.py": "0d33d229e36d8534bc4e3c6ba87e4d83104363c846c0149c6a682359bc95a7e7",
+    "zig/pkg/antfly-grep/src/decision.zig": "a0ec450a4385c496ae5e55b2ee71cd2a0f6de38a08fa09daf90c853fabedeeb4",
+    "zig/pkg/antfly-grep/src/discovery.zig": "6eda6c492a837b61bc09ad17f25cacab9982adfe82c8b9eb58d4e0950784940b",
+    "zig/pkg/antfly-grep/src/indexed.zig": "51745add43f0911275e08f01a231a0e555ba8166d99b0747977b05da7c1ea8a2",
+    "zig/pkg/antfly-grep/src/options.zig": "d9cb4c2d6dc8a67330eff5bf3b3e9735ce210c38d65795f5443cc4de3d6aafdc",
+    "zig/pkg/antfly-grep/src/root.zig": "d5492b994e547ab397cbe253a3f88e341b7244e4f71518209a5a0558d52101f0",
+    "zig/pkg/antfly-grep/tests/test_benchmark_tools.py": "3e93bcbd0326de2914500e0e742b2d5948b07b8068f89fb1bec19471c47fb818",
+    "zig/pkg/antfly-grep/tests/test_cli.py": "e787c96371ea84e0c02f3e3ae8ca60b957f508445bfc48ba97f1fe5545d4958a",
+    "zig/pkg/inference/build/runtime.zig": "50fae3e99e5465c359f13bcfb0b2afdf7338ded17e3b38306ab702a5f9978459",
+    "zig/pkg/inference/build/wasm.zig": "5152b7c95f4b400ff77bd35c3436fdc108ca6762b2f0537922f9e739e06d887b",
+    "zig/pkg/inference/src/pipelines/gliner.zig": "be32d7ebdbed04cabe217a7be8ed64b7bd5d8ac096c37c7752a12a02cf757175"
+  },
+  "binaries": {
+    "macos-arm64": {
+      "sha256": "abaca853e733c85c56286043ff302fb1558e89b246c31e29b6d8dae07456ca85",
+      "bytes": 6545688
+    },
+    "linux-arm64": {
+      "sha256": "ad6c579a8bf8dd09368af89fc55c0da8945eae26f36526f2b61c616adff5833d",
+      "bytes": 6538592
+    }
+  },
+  "validation": {
+    "macos_cli": {
+      "tests": 137,
+      "skipped": 2,
+      "passed": true
+    },
+    "linux_cli": {
+      "tests": 137,
+      "skipped": 1,
+      "passed": true,
+      "cpus": 2,
+      "image": "antfly-grep-bench-arm64:review-1164",
+      "network": "none",
+      "execution_environment": "Native ARM64 instructions in Linux VM/container on ARM64 macOS host; not independent Linux hardware"
+    },
+    "native_server_indexed": {
+      "tests": 5,
+      "passed": true,
+      "server_binary_sha256": "d816bebc093b3c881163a0fcf0af1d9c5396215e93fe0bde39b30cf6710a36e0",
+      "scope": "Existing native server validates client indexed pagination, updates, expiry, authorization and large-document scenarios; GLiNER changes verified separately by native fixtures"
+    },
+    "decision_contract": {
+      "tests": 15,
+      "passed": true
+    },
+    "native_gliner_preparation": {
+      "selected": 36,
+      "passed": 36,
+      "import_smoke_tests": 34,
+      "preparation_regressions": 2,
+      "scope": "Exact monorepo inference module graph, ReleaseSafe, compile-time filter, all selected tests executed directly. Token/marker equivalence, exact-hit reuse, changed question, bounded-retention fallback, complete batched/singleton row equality, task splitting, masks, ranges and token accounting. No model assets or live provider."
+    },
+    "bzip2_canonical_lookup": {
+      "tests": 1,
+      "passed": true
+    },
+    "generated_differential": {
+      "cases": 1000,
+      "mismatches": 0,
+      "timeouts": 0,
+      "seed": 1151
+    },
+    "codec_coverage_fuzz": {
+      "runs": 10138,
+      "unique_runs": 60,
+      "passed": true,
+      "scope": "Bzip2 malformed-input and codec validation; coverage is reported, not exhaustive conformance"
+    },
+    "boundary_checker_tests": {
+      "tests": 35,
+      "passed": true
+    },
+    "apache_product_boundary": {
+      "source_files": 2077,
+      "passed": true
+    },
+    "license_headers": {
+      "passed": true
+    },
+    "benchmark_normalization": {
+      "tests": 2,
+      "skipped": 1,
+      "passed": true,
+      "scope": "Cross-stream statistics/output comparison; Linux RSS supervisor regression previously qualified separately"
+    },
+    "labeled_repository_fixture": {
+      "questions": 5,
+      "precision": 1.0,
+      "recall": 1.0,
+      "scope": "Ground-truth loopback fixture; not live model relevance"
+    },
+    "compatibility_document_consistency": {
+      "passed": true
+    }
+  },
+  "profile": {
+    "tool": "macOS sample, five seconds at one millisecond intervals, symbolized ReleaseFast build",
+    "binary_sha256": "fa4341c9aad51eb04ca7e60850281c7c34849272e300dde4a9e3d9fadfdbc1fa",
+    "compressed_input_sha256": "a058f31f79c793fef461c892959427bc5fef33b6e6900e8bee4f79eb0a7e7414",
+    "generator": "row b\"2026-10-15 info worker processed request id=123456 status=success\\n\" repeated floor(128 MiB / row length), Python bz2.compress defaults",
+    "flags": "-j1 --search-zip -F unfindable-literal <same compressed file repeated 16 times>",
+    "decoder_source_sha256_at_sampling": "b84857a495b3a48b275609ce95d8979c4d834902275a25e6156f939fa2a74def",
+    "scope": "Pre-histogram-fusion decoder, uncommitted CLI fixes; sample is diagnostic attribution, not a throughput measurement",
+    "interpretation": "Inverse-BWT dependent link traversal and block construction dominate decoder work; fuse histogram accumulation into MTF/RLE symbols to remove one serial content pass, retaining the four-byte links and bounded buffers",
+    "evidence": "bounded-review-repetitive.sample.txt"
+  },
+  "limitations": [
+    "Shared host with unrelated workspace builds; reports retain paired trials and load, and are not portable guarantees.",
+    "Linux runs use a VM/container on this ARM64 macOS host. Independent Linux hardware and Windows runtime conformance were not available.",
+    "No live provider or encoder latency benchmark: task/text tokenization reuse is fixture-validated and does not reuse bidirectional activations.",
+    "Main PR CI remains subject to commit-specific human approval."
+  ]
+}

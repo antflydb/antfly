@@ -128,7 +128,7 @@ pub fn prepareRaft(alloc: std.mem.Allocator, store: anytype) !?Prepared {
         if (visited != 0 and (visited >= 128 or bytes >= 64 * 1024 or item.key.len > 64 * 1024 - bytes or @import("antfly_platform").time.monotonicNs() >= deadline)) break;
         if (item.key.len > obligations.max_cursor_bytes) return error.TransactionTooLarge;
         next = try owned.dupe(u8, item.key);
-        if (keys.isStoredDocumentRowKey(item.key)) try rows.append(owned, next);
+        if (keys.isStoredSourceRowKey(item.key)) try rows.append(owned, next);
         visited += 1;
         bytes += item.key.len;
         entry = try cursor.next();
@@ -165,9 +165,14 @@ pub fn stageRaft(alloc: std.mem.Allocator, txn: anytype, command: publication.Co
         try stageBound(alloc, txn, authority, page_control.upper_bound);
     }
     for (page_control.row_keys) |row| {
-        const document = (try keys.decodeStoredDocumentRowKeyAlloc(alloc, row)) orelse return error.InvalidBatchRequest;
+        const document = (try keys.decodeStoredSourceRowKeyAlloc(alloc, row)) orelse return error.InvalidBatchRequest;
         defer alloc.free(document);
-        _ = try obligations.mark(alloc, txn, authority, document, try publication.inputRevision(txn, authority.namespace, document));
+        var revision = try publication.inputRevision(txn, authority.namespace, document);
+        if (revision == null) {
+            revision = .{ .raft = .{ .term = page_control.observed_term, .index = page_control.observed_index } };
+            try txn.put(&publication.inputRevisionKey(authority.namespace, document), &try revision.?.encode());
+        }
+        _ = try obligations.mark(alloc, txn, authority, document, revision);
     }
     try obligations.advanceBaseline(alloc, txn, authority, page_control.expected_cursor, page_control.next_cursor, page_control.at_end);
     if (page_control.at_end) try txn.delete(bound_key);
@@ -204,8 +209,8 @@ pub fn page(alloc: std.mem.Allocator, store: anytype) !bool {
     while (entry) |item| {
         if (count != 0 and (count >= 128 or bytes >= 64 * 1024 or item.key.len > 64 * 1024 - bytes or @import("antfly_platform").time.monotonicNs() >= deadline)) break;
         if (item.key.len > obligations.max_cursor_bytes) return error.TransactionTooLarge;
-        if (keys.isStoredDocumentRowKey(item.key)) {
-            const document = (try keys.decodeStoredDocumentRowKeyAlloc(alloc, item.key)) orelse return error.ArtifactCatalogCorrupt;
+        if (keys.isStoredSourceRowKey(item.key)) {
+            const document = (try keys.decodeStoredSourceRowKeyAlloc(alloc, item.key)) orelse return error.ArtifactCatalogCorrupt;
             errdefer alloc.free(document);
             try documents.append(alloc, document);
         }

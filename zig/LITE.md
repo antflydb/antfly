@@ -340,8 +340,20 @@ document-identity namespace of that future `default` table from creation, so
 adoption is O(1) rather than rewriting every live document; an identity mismatch
 fails closed. Subsequent standalone tables use isolated
 namespaces in the same artifact. This allows a file populated by `lite batch` to be served by standalone.
+Direct adoption currently accepts one embedded root table with full-text indexes
+and supported enrichments. Native dense, sparse, graph and algebraic indexes,
+resolver catalogs, and additional embedded tables fail before the alias is
+published; adoption does not silently remove or reinterpret their definitions.
+The shared catalog translator preserves full-text incarnations and enrichment
+configuration alongside stored artifacts.
+
 After that adoption, embedded data commands continue to address the `default`
-table through the persisted alias. A file created directly by standalone has
+table through the persisted alias. Catalog authority belongs to standalone:
+embedded schema, index, enrichment, resolver, range and table-definition changes
+are rejected, including SQL DDL. Use the standalone API for those changes.
+Document reads, writes and search remain available offline. Physical snapshots
+preserve the ownership marker, so returning a file to an embedded client and
+serving it again cannot introduce a second catalog authority. A file created directly by standalone has
 no unambiguous root table, so root-oriented `lite batch`, query, schema, index,
 enrichment, import, promote, and compact operations fail closed and direct the
 user to `standalone --storage-engine lite --storage-path` plus `/db/v1`. Artifact `status` and the physical `check`,

@@ -24,6 +24,19 @@ pub fn runFromIterator(
     command: []const u8,
     args: *std.process.Args.Iterator,
 ) !void {
+    // Dispatch offline inspection before global configuration, credentials,
+    // HTTP setup, or catalog-scope argument processing.
+    if (std.mem.eql(u8, command, "backup")) {
+        var probe = args.*;
+        if (probe.next()) |subcommand| {
+            if (std.mem.eql(u8, subcommand, "inspect")) {
+                _ = args.next();
+                var inspection_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+                defer inspection_io.deinit();
+                return cli.backup.runInspect(init.gpa, inspection_io.io(), args);
+            }
+        }
+    }
     if (helpRequested(args)) {
         var probe = args.*;
         while (probe.next()) |arg| {

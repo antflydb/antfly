@@ -244,6 +244,7 @@ pub fn writeBlockPartsTo(writer: *std.Io.Writer, block_type: BlockType, parts: [
 pub const SliceReader = struct {
     data: []const u8,
     pos: usize,
+    max_block_bytes: usize = max_block_payload_bytes,
 
     pub fn init(data: []const u8) SliceReader {
         return .{ .data = data, .pos = 0 };
@@ -289,11 +290,19 @@ pub const SliceReader = struct {
     }
 
     pub fn readBlock(self: *SliceReader, alloc: Allocator) !Block {
+        return self.readBlockLimited(alloc, self.max_block_bytes);
+    }
+
+    /// Bound logical output before allocating it; stored bytes retain the
+    /// format's independent framing limit.
+    pub fn readBlockLimited(self: *SliceReader, alloc: Allocator, max_bytes: usize) !Block {
+        const limit = @min(max_bytes, self.max_block_bytes);
         const env = try self.readExact(6);
         const block_type: BlockType = @fromBackingInt(@intCast(env[0]));
         const flags = env[1];
         const payload_len = std.mem.readInt(u32, env[2..6], .little);
         if (payload_len > max_block_payload_bytes) return error.BackupBlockTooLarge;
+        if (flags & block_flag_compressed == 0 and payload_len > limit) return error.BackupExpansionLimitExceeded;
 
         const payload = try self.readExact(payload_len);
         const crc_bytes = try self.readExact(4);
@@ -309,7 +318,10 @@ pub const SliceReader = struct {
 
         // Decompress if needed
         if (flags & block_flag_compressed != 0) {
-            const decompressed = try decompressZstd(alloc, payload);
+            const decompressed = decompressZstdLimited(alloc, payload, limit) catch |err| switch (err) {
+                error.StreamTooLong => if (limit < max_block_payload_bytes) return error.BackupExpansionLimitExceeded else return err,
+                else => return err,
+            };
             return .{ .block_type = block_type, .payload = decompressed };
         }
 
@@ -336,6 +348,7 @@ pub const FileReader = struct {
     hasher: Blake3 = Blake3.init(.{}),
     completed_pass_fingerprint: ?Fingerprint = null,
     generation_changed: bool = false,
+    max_block_bytes: usize = max_block_payload_bytes,
 
     pub fn init(io: std.Io, file: std.Io.File, size: u64) FileReader {
         return .{ .io = io, .file = file, .size = size };
@@ -410,12 +423,20 @@ pub const FileReader = struct {
     }
 
     pub fn readBlock(self: *FileReader, alloc: Allocator) !Block {
+        return self.readBlockLimited(alloc, self.max_block_bytes);
+    }
+
+    /// Bound logical output before allocating it; stored bytes retain the
+    /// format's independent framing limit.
+    pub fn readBlockLimited(self: *FileReader, alloc: Allocator, max_bytes: usize) !Block {
+        const limit = @min(max_bytes, self.max_block_bytes);
         var env: [6]u8 = undefined;
         try self.readExact(&env);
         const block_type: BlockType = @fromBackingInt(@intCast(env[0]));
         const flags = env[1];
         const payload_len = std.mem.readInt(u32, env[2..6], .little);
         if (payload_len > max_block_payload_bytes) return error.BackupBlockTooLarge;
+        if (flags & block_flag_compressed == 0 and payload_len > limit) return error.BackupExpansionLimitExceeded;
 
         const payload = try alloc.alloc(u8, payload_len);
         errdefer alloc.free(payload);
@@ -428,7 +449,10 @@ pub const FileReader = struct {
         if (crc.final() != std.mem.readInt(u32, &crc_bytes, .little)) return error.BlockCrcMismatch;
 
         if (flags & block_flag_compressed != 0) {
-            const decompressed = try decompressZstd(alloc, payload);
+            const decompressed = decompressZstdLimited(alloc, payload, limit) catch |err| switch (err) {
+                error.StreamTooLong => if (limit < max_block_payload_bytes) return error.BackupExpansionLimitExceeded else return err,
+                else => return err,
+            };
             alloc.free(payload);
             return .{ .block_type = block_type, .payload = decompressed };
         }
@@ -441,6 +465,10 @@ pub const FileReader = struct {
 };
 
 pub fn decompressZstd(alloc: Allocator, compressed: []const u8) ![]u8 {
+    return decompressZstdLimited(alloc, compressed, max_block_payload_bytes);
+}
+
+pub fn decompressZstdLimited(alloc: Allocator, compressed: []const u8, max_bytes: usize) ![]u8 {
     const Reader = std.Io.Reader;
     var input = Reader.fixed(compressed);
     // The window is about 8 MiB, so keep it off the stack: embedded callers
@@ -448,7 +476,24 @@ pub fn decompressZstd(alloc: Allocator, compressed: []const u8) ![]u8 {
     const window_buf = try alloc.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max);
     defer alloc.free(window_buf);
     var decomp = std.compress.zstd.Decompress.init(&input, window_buf, .{});
-    return decomp.reader.allocRemaining(alloc, .limited(max_block_payload_bytes));
+    return decomp.reader.allocRemaining(alloc, .limited(@min(max_bytes, max_block_payload_bytes)));
+}
+
+/// Count nested document expansion without retaining decoded output. Enforce the
+/// caller's remaining budget even for frames without a declared content size.
+pub fn zstdExpandedSizeLimited(alloc: Allocator, compressed: []const u8, max_bytes: usize) !usize {
+    var input = std.Io.Reader.fixed(compressed);
+    const window_buf = try alloc.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max);
+    defer alloc.free(window_buf);
+    var decomp = std.compress.zstd.Decompress.init(&input, window_buf, .{});
+    const limit = @min(max_bytes, max_block_payload_bytes);
+    const size = try decomp.reader.discardShort(limit);
+    if (size < limit) return size;
+    _ = decomp.reader.peekByte() catch |err| switch (err) {
+        error.EndOfStream => return size,
+        else => return err,
+    };
+    return error.StreamTooLong;
 }
 
 test "file reader detects same-size archive replacement between passes" {
@@ -529,49 +574,72 @@ pub fn encodeKeyValueBatch(alloc: Allocator, entries: []const KeyValueEntry) ![]
     return buf.toOwnedSlice(alloc);
 }
 
+/// Validated, allocation-free traversal of a key/value block. Entries borrow
+/// immutable payload bytes; consumers must copy only values they retain.
+pub const KeyValueBatchReader = struct {
+    data: []const u8,
+    offset: usize = 4,
+    remaining: u32,
+
+    pub fn init(data: []const u8) !@This() {
+        if (data.len < 4) return error.BatchTooShort;
+        const count = std.mem.readInt(u32, data[0..4], .little);
+        if (count > (data.len - 4) / 8) return error.Truncated;
+        const reader: @This() = .{ .data = data, .remaining = count };
+        var validation = reader;
+        while (try validation.next()) |_| {}
+        return reader;
+    }
+
+    fn take(self: *@This(), len: usize) ![]const u8 {
+        if (len > self.data.len - self.offset) return error.Truncated;
+        const bytes = self.data[self.offset..][0..len];
+        self.offset += len;
+        return bytes;
+    }
+
+    fn length(self: *@This()) !u32 {
+        return std.mem.readInt(u32, (try self.take(4))[0..4], .little);
+    }
+
+    pub fn next(self: *@This()) !?KeyValueEntry {
+        if (self.remaining == 0) {
+            if (self.offset != self.data.len) return error.TrailingBytes;
+            return null;
+        }
+        const key = try self.take(try self.length());
+        const value = try self.take(try self.length());
+        self.remaining -= 1;
+        return .{ .key = key, .value = value };
+    }
+
+    /// Validate every record before any schema/catalog allocation. Checking
+    /// both names and values also bounds metadata-key parsing and retention.
+    pub fn checkEntryLimit(self: @This(), max_bytes: usize) !void {
+        var reader = self;
+        while (try reader.next()) |entry| {
+            if (entry.key.len > max_bytes or entry.value.len > max_bytes) return error.StreamTooLong;
+        }
+    }
+};
+
 pub fn decodeKeyValueBatch(alloc: Allocator, data: []const u8) ![]KeyValueEntry {
-    if (data.len < 4) return error.BatchTooShort;
-
-    const count = std.mem.readInt(u32, data[0..4], .little);
-    if (count > (data.len - 4) / 8) return error.Truncated;
-    var off: usize = 4;
-
-    var entries = try ArrayList(KeyValueEntry).initCapacity(alloc, count);
+    var reader = try KeyValueBatchReader.init(data);
+    var entries = try ArrayList(KeyValueEntry).initCapacity(alloc, reader.remaining);
     errdefer {
-        for (entries.items) |e| {
-            alloc.free(e.key);
-            alloc.free(e.value);
+        for (entries.items) |entry| {
+            alloc.free(entry.key);
+            alloc.free(entry.value);
         }
         entries.deinit(alloc);
     }
-
-    var i: u32 = 0;
-    while (i < count) : (i += 1) {
-        if (off + 4 > data.len) return error.Truncated;
-        const key_len = std.mem.readInt(u32, data[off..][0..4], .little);
-        off += 4;
-
-        if (off + key_len > data.len) return error.Truncated;
-        const key = try alloc.dupe(u8, data[off..][0..key_len]);
+    while (try reader.next()) |entry| {
+        const key = try alloc.dupe(u8, entry.key);
         errdefer alloc.free(key);
-        off += key_len;
-
-        if (off + 4 > data.len) return error.Truncated;
-        const value_len = std.mem.readInt(u32, data[off..][0..4], .little);
-        off += 4;
-
-        if (off + value_len > data.len) return error.Truncated;
-        const value = try alloc.dupe(u8, data[off..][0..value_len]);
+        const value = try alloc.dupe(u8, entry.value);
         errdefer alloc.free(value);
-        off += value_len;
-
-        try entries.append(alloc, .{
-            .key = key,
-            .value = value,
-        });
+        try entries.append(alloc, .{ .key = key, .value = value });
     }
-
-    if (off != data.len) return error.TrailingBytes;
     return entries.toOwnedSlice(alloc);
 }
 
@@ -1569,4 +1637,58 @@ test "relationship key value decoding releases truncated and failed allocations"
         }
     };
     try std.testing.checkAllAllocationFailures(alloc, Case.decode, .{payload});
+}
+
+test "bounded block readers reject stored payload before allocation and accept exact limits" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var data: ArrayList(u8) = .empty;
+    defer data.deinit(a);
+    try writeBlock(&data, a, .document_batch, "payload");
+    var empty: [0]u8 = .{};
+    var bounded = std.heap.FixedBufferAllocator.init(&empty);
+    var slice = SliceReader.init(data.items);
+    try std.testing.expectError(error.BackupExpansionLimitExceeded, slice.readBlockLimited(bounded.allocator(), 6));
+    slice.reset();
+    const exact = try slice.readBlockLimited(a, 7);
+    defer a.free(exact.payload);
+    try std.testing.expectEqualStrings("payload", exact.payload);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(io, "block", .{ .read = true });
+    defer file.close(io);
+    try file.writePositionalAll(io, data.items, 0);
+    var reader = FileReader.init(io, file, data.items.len);
+    reader.max_block_bytes = 6;
+    try std.testing.expectError(error.BackupExpansionLimitExceeded, reader.readBlock(bounded.allocator()));
+    reader = FileReader.init(io, file, data.items.len);
+    reader.max_block_bytes = 7;
+    const from_file = try reader.readBlock(a);
+    defer a.free(from_file.payload);
+    try std.testing.expectEqualStrings("payload", from_file.payload);
+}
+
+test "backup preflight borrowed key value reader validates complete batches without allocation" {
+    const a = std.testing.allocator;
+    const payload = try encodeKeyValueBatch(a, &.{ .{ .key = "catalog", .value = "value" }, .{ .key = "schema", .value = "row" } });
+    defer a.free(payload);
+    for (0..payload.len) |end| {
+        if (KeyValueBatchReader.init(payload[0..end])) |_| return error.TestUnexpectedResult else |_| {}
+    }
+    var reader = try KeyValueBatchReader.init(payload);
+    try reader.checkEntryLimit(7);
+    try std.testing.expectError(error.StreamTooLong, reader.checkEntryLimit(6));
+    const first = (try reader.next()).?;
+    try std.testing.expectEqualStrings("catalog", first.key);
+    try std.testing.expectEqualStrings("value", first.value);
+    try std.testing.expectEqual(@intFromPtr(payload.ptr) + 8, @intFromPtr(first.key.ptr));
+    try std.testing.expectEqualStrings("schema", (try reader.next()).?.key);
+    try std.testing.expect((try reader.next()) == null);
+    const trailing = try a.alloc(u8, payload.len + 1);
+    defer a.free(trailing);
+    @memcpy(trailing[0..payload.len], payload);
+    trailing[payload.len] = 0;
+    try std.testing.expectError(error.TrailingBytes, KeyValueBatchReader.init(trailing));
+    var empty = try KeyValueBatchReader.init(&.{ 0, 0, 0, 0 });
+    try std.testing.expect((try empty.next()) == null);
 }

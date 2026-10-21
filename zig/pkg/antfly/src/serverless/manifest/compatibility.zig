@@ -79,7 +79,7 @@ fn validateArtifacts(artifacts: []const artifact_ref.ArtifactRef) !void {
         if (artifact.checksum.len == 0) return error.IncompatibleLakeManifest;
         for (artifacts[0..idx]) |previous| {
             if (std.mem.eql(u8, previous.artifact_id, artifact.artifact_id) and
-                !artifact_ref.areGraphArtifactAliases(previous, artifact))
+                !artifact_ref.areArtifactAliases(previous, artifact))
             {
                 return error.DuplicateLakeManifestArtifact;
             }

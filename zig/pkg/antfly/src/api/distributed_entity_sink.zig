@@ -114,6 +114,8 @@ fn mergePromotionDocument(a: std.mem.Allocator, destination: *std.json.Value, so
     }
 }
 
+const alias_curation = @import("antfly_local_sources").storage_db_entity_alias_curation;
+
 const PromotionMove = struct {
     physical: []const u8,
     key: []const u8,
@@ -127,6 +129,7 @@ const PromotionMove = struct {
 pub const DistributedEntitySink = struct {
     writes: table_writes.TableWriteSource,
     reads: ?table_reads.TableReadSource = null,
+    io: ?std.Io = null,
     catalog_binding: ?@import("antfly_local_sources").system_catalog_domain.BindingSource = null,
     /// Sync level for entity upserts. `write` (durable, not full-index) keeps
     /// promotion latency low; the entity shard indexes asynchronously.
@@ -141,7 +144,12 @@ pub const DistributedEntitySink = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable = EntitySink.VTable{ .upsert = upsertFn, .upsert_batch = upsertBatchFn };
+    const vtable = EntitySink.VTable{ .upsert = upsertFn, .upsert_batch = upsertBatchFn, .supports_curation = supportsCuration };
+
+    fn supportsCuration(ptr: *anyopaque) anyerror!bool {
+        const self: *DistributedEntitySink = @ptrCast(@alignCast(ptr));
+        return self.atomic_batch_required and self.reads != null;
+    }
 
     /// Promote all of a document's entities atomically. With
     /// `atomic_batch_required`
@@ -157,6 +165,11 @@ pub const DistributedEntitySink = struct {
         if (entries.len == 0) return;
         if (!self.atomic_batch_required) {
             for (entries) |e| {
+                if (!e.delete) {
+                    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, e.doc_json, .{});
+                    defer parsed.deinit();
+                    if (parsed.value == .object and parsed.value.object.contains(alias_curation.control_field)) return error.EntityCurationUnavailable;
+                }
                 if (e.storage_table != null) return error.EntityPromotionAtomicCommitUnavailable;
             }
             for (entries) |e| {
@@ -236,13 +249,65 @@ pub const DistributedEntitySink = struct {
                 .expected_content_digest = if (old) |row| row.expected_content_digest else null,
             });
         }
+        // Read each controlled destination once, with bounded parallelism.
+        // Slots own their allocations so asynchronous tasks never share the
+        // operation arena; all predicates still commit in one atomic batch.
+        const Read = struct {
+            id: []const u8,
+            physical: []const u8,
+            key: []const u8,
+            row: ?table_reads.LookupResponse = null,
+            failure: ?anyerror = null,
+            fn run(slot: *@This(), reads: table_reads.TableReadSource) void {
+                slot.row = reads.lookup(std.heap.smp_allocator, slot.physical, slot.key, .{ .include_primary_digest = true }, .read_index) catch |err| {
+                    slot.failure = err;
+                    return;
+                };
+            }
+        };
+        var jobs: std.ArrayListUnmanaged(Read) = .empty;
+        var pending_reads: std.StringHashMapUnmanaged(void) = .empty;
+        for (entries) |e| {
+            if (e.delete) continue;
+            const document = try parsePromotionDocument(a, e.doc_json);
+            if (try alias_curation.control(a, document) == null) continue;
+            if (self.reads == null) return error.EntityCurationUnavailable;
+            const physical = e.storage_table orelse unpinned.get(e.table).?;
+            const id = try promotionDocumentIdentityAlloc(a, physical, e.key);
+            if (moves.contains(id)) continue;
+            const unique = try pending_reads.getOrPut(a, id);
+            if (unique.found_existing) continue;
+            try jobs.append(a, .{ .id = id, .physical = physical, .key = e.key });
+        }
+        defer for (jobs.items) |*job| if (job.row) |*row| row.deinit(std.heap.smp_allocator);
+        var start: usize = 0;
+        while (start < jobs.items.len) {
+            const batch = jobs.items[start..@min(jobs.items.len, start + 16)];
+            if (self.io) |io| {
+                var tasks: std.Io.Group = .init;
+                for (batch) |*job| tasks.async(io, Read.run, .{ job, self.reads.? });
+                tasks.await(io) catch return error.Canceled;
+            } else for (batch) |*job| Read.run(job, self.reads.?);
+            for (batch) |job| if (job.failure) |err| return err;
+            start += batch.len;
+        }
+        for (jobs.items) |job| try moves.put(a, job.id, .{
+            .physical = job.physical,
+            .key = job.key,
+            .document = if (job.row) |row| try parsePromotionDocument(a, row.json) else .{ .object = .empty },
+            .version = if (job.row) |row| row.version else 0,
+            .digest = if (job.row) |row| row.expected_content_digest else null,
+        });
+
         for (entries) |e| {
             if (e.delete) continue;
             const physical = e.storage_table orelse unpinned.get(e.table).?;
             if (moves.count() != 0) {
                 const id = try promotionDocumentIdentityAlloc(a, physical, e.key);
                 if (moves.getPtr(id)) |move| {
-                    try mergePromotionDocument(a, &move.document, try parsePromotionDocument(a, e.doc_json));
+                    if (e.skip_if_missing and move.version == 0 and move.document.object.count() == 0) continue;
+                    const current = if (move.version == 0 and move.document.object.count() == 0) null else try std.json.Stringify.valueAlloc(a, move.document, .{});
+                    move.document = try parsePromotionDocument(a, try alias_curation.merge(a, current, e.doc_json, e.key));
                     continue;
                 }
             }
@@ -253,6 +318,7 @@ pub const DistributedEntitySink = struct {
             }
         }
         for (moves.values()) |*move| {
+            if (move.version == 0 and move.document.object.count() == 0) continue;
             const batch = try promotionTableBatch(a, &tables, move.physical);
             try batch.writes.append(a, .{ .key = move.key, .value = try std.json.Stringify.valueAlloc(a, move.document, .{}) });
             try batch.predicates.append(a, .{ .key = move.key, .expected_version = move.version, .expected_content_digest = move.digest });

@@ -1,0 +1,796 @@
+{
+  "host": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "cpu_count": 14,
+  "cgroup_cpu_max": null,
+  "measurement": "Alternating fresh-process workspace captures on warm filesystem data.\n\nNo cache eviction is attempted. Timings include process spawn through readiness;\nRSS is sampled after readiness, and revision equality is checked outside timing.",
+  "binaries": {
+    "current": {
+      "sha256": "6b20c100f7655d01fcb569d536b571c8eaf48dc12a2397a79604507cab409252",
+      "version": "antfly-grep 0.1.0-dev\nZig 0.17.0 fast\nnative regex, PCRE-style VM/JIT, streaming compression, encoding\ntarget aarch64-macos-none dynamic"
+    },
+    "baseline": {
+      "sha256": "481ca6d1e20640d37334ecd9c0c935578eb8231e08aebd846f6ca09d86a905b0",
+      "version": "antfly-grep 0.1.0-dev\nZig 0.17.0 fast\nnative regex, PCRE-style VM/JIT, streaming compression, encoding\ntarget aarch64-macos-none dynamic"
+    }
+  },
+  "cases": [
+    {
+      "files": 1000,
+      "directories": 64,
+      "trials": [
+        {
+          "load_average": [
+            9.09130859375,
+            12.67822265625,
+            13.44140625
+          ],
+          "baseline": {
+            "seconds": 0.05711979209445417,
+            "rss_kib": 6512,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "23fa904dc11fecffa8bd48c6f614e79b23a44274d7982564806064684ea22535",
+              "files": 1000,
+              "bytes": 14000,
+              "retained_bytes": 1098008,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": false,
+              "source_bytes_read": 14000,
+              "sources_opened": 1000,
+              "refresh_entries_visited": 1000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          },
+          "current": {
+            "seconds": 0.05726154102012515,
+            "rss_kib": 6464,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "23fa904dc11fecffa8bd48c6f614e79b23a44274d7982564806064684ea22535",
+              "files": 1000,
+              "bytes": 14000,
+              "retained_bytes": 1098008,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": false,
+              "source_bytes_read": 14000,
+              "sources_opened": 1000,
+              "refresh_entries_visited": 1000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          }
+        },
+        {
+          "load_average": [
+            9.09130859375,
+            12.67822265625,
+            13.44140625
+          ],
+          "current": {
+            "seconds": 0.056973665952682495,
+            "rss_kib": 6432,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "23fa904dc11fecffa8bd48c6f614e79b23a44274d7982564806064684ea22535",
+              "files": 1000,
+              "bytes": 14000,
+              "retained_bytes": 1098008,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": false,
+              "source_bytes_read": 14000,
+              "sources_opened": 1000,
+              "refresh_entries_visited": 1000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          },
+          "baseline": {
+            "seconds": 0.05611174996010959,
+            "rss_kib": 6464,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "23fa904dc11fecffa8bd48c6f614e79b23a44274d7982564806064684ea22535",
+              "files": 1000,
+              "bytes": 14000,
+              "retained_bytes": 1098008,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": false,
+              "source_bytes_read": 14000,
+              "sources_opened": 1000,
+              "refresh_entries_visited": 1000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          }
+        },
+        {
+          "load_average": [
+            9.09130859375,
+            12.67822265625,
+            13.44140625
+          ],
+          "baseline": {
+            "seconds": 0.05837720900308341,
+            "rss_kib": 6512,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "23fa904dc11fecffa8bd48c6f614e79b23a44274d7982564806064684ea22535",
+              "files": 1000,
+              "bytes": 14000,
+              "retained_bytes": 1098008,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": false,
+              "source_bytes_read": 14000,
+              "sources_opened": 1000,
+              "refresh_entries_visited": 1000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          },
+          "current": {
+            "seconds": 0.05879158398602158,
+            "rss_kib": 6448,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "23fa904dc11fecffa8bd48c6f614e79b23a44274d7982564806064684ea22535",
+              "files": 1000,
+              "bytes": 14000,
+              "retained_bytes": 1098008,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": false,
+              "source_bytes_read": 14000,
+              "sources_opened": 1000,
+              "refresh_entries_visited": 1000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          }
+        },
+        {
+          "load_average": [
+            9.09130859375,
+            12.67822265625,
+            13.44140625
+          ],
+          "current": {
+            "seconds": 0.060719958040863276,
+            "rss_kib": 6480,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "23fa904dc11fecffa8bd48c6f614e79b23a44274d7982564806064684ea22535",
+              "files": 1000,
+              "bytes": 14000,
+              "retained_bytes": 1098008,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": false,
+              "source_bytes_read": 14000,
+              "sources_opened": 1000,
+              "refresh_entries_visited": 1000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          },
+          "baseline": {
+            "seconds": 0.06104649999178946,
+            "rss_kib": 6512,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "23fa904dc11fecffa8bd48c6f614e79b23a44274d7982564806064684ea22535",
+              "files": 1000,
+              "bytes": 14000,
+              "retained_bytes": 1098008,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": false,
+              "source_bytes_read": 14000,
+              "sources_opened": 1000,
+              "refresh_entries_visited": 1000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          }
+        },
+        {
+          "load_average": [
+            9.09130859375,
+            12.67822265625,
+            13.44140625
+          ],
+          "baseline": {
+            "seconds": 0.06038899999111891,
+            "rss_kib": 6512,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "23fa904dc11fecffa8bd48c6f614e79b23a44274d7982564806064684ea22535",
+              "files": 1000,
+              "bytes": 14000,
+              "retained_bytes": 1098008,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": false,
+              "source_bytes_read": 14000,
+              "sources_opened": 1000,
+              "refresh_entries_visited": 1000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          },
+          "current": {
+            "seconds": 0.05786037491634488,
+            "rss_kib": 6480,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "23fa904dc11fecffa8bd48c6f614e79b23a44274d7982564806064684ea22535",
+              "files": 1000,
+              "bytes": 14000,
+              "retained_bytes": 1098008,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": false,
+              "source_bytes_read": 14000,
+              "sources_opened": 1000,
+              "refresh_entries_visited": 1000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          }
+        },
+        {
+          "load_average": [
+            9.09130859375,
+            12.67822265625,
+            13.44140625
+          ],
+          "current": {
+            "seconds": 0.056676457985304296,
+            "rss_kib": 6464,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "23fa904dc11fecffa8bd48c6f614e79b23a44274d7982564806064684ea22535",
+              "files": 1000,
+              "bytes": 14000,
+              "retained_bytes": 1098008,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": true,
+              "source_bytes_read": 14000,
+              "sources_opened": 1000,
+              "refresh_entries_visited": 1000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          },
+          "baseline": {
+            "seconds": 0.05697866599075496,
+            "rss_kib": 6512,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "23fa904dc11fecffa8bd48c6f614e79b23a44274d7982564806064684ea22535",
+              "files": 1000,
+              "bytes": 14000,
+              "retained_bytes": 1098008,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": false,
+              "source_bytes_read": 14000,
+              "sources_opened": 1000,
+              "refresh_entries_visited": 1000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          }
+        },
+        {
+          "load_average": [
+            9.09130859375,
+            12.67822265625,
+            13.44140625
+          ],
+          "baseline": {
+            "seconds": 0.05773100000806153,
+            "rss_kib": 6528,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "23fa904dc11fecffa8bd48c6f614e79b23a44274d7982564806064684ea22535",
+              "files": 1000,
+              "bytes": 14000,
+              "retained_bytes": 1098008,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": false,
+              "source_bytes_read": 14000,
+              "sources_opened": 1000,
+              "refresh_entries_visited": 1000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          },
+          "current": {
+            "seconds": 0.05575562501326203,
+            "rss_kib": 6464,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "23fa904dc11fecffa8bd48c6f614e79b23a44274d7982564806064684ea22535",
+              "files": 1000,
+              "bytes": 14000,
+              "retained_bytes": 1098008,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": false,
+              "source_bytes_read": 14000,
+              "sources_opened": 1000,
+              "refresh_entries_visited": 1000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          }
+        }
+      ],
+      "median": {
+        "current": {
+          "seconds": 0.05726154102012515,
+          "rss_kib": 6464,
+          "retained_bytes": 1098008
+        },
+        "baseline": {
+          "seconds": 0.05773100000806153,
+          "rss_kib": 6512,
+          "retained_bytes": 1098008
+        }
+      }
+    },
+    {
+      "files": 10000,
+      "directories": 64,
+      "trials": [
+        {
+          "load_average": [
+            8.923828125,
+            12.58349609375,
+            13.4033203125
+          ],
+          "baseline": {
+            "seconds": 0.4487504999851808,
+            "rss_kib": 17856,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "bb289e6ff7d7f181b7356749d07552cc0c8ec56123ac33d115a5a9a87f44c01c",
+              "files": 10000,
+              "bytes": 140000,
+              "retained_bytes": 10912016,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": true,
+              "source_bytes_read": 140000,
+              "sources_opened": 10000,
+              "refresh_entries_visited": 10000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          },
+          "current": {
+            "seconds": 0.4405612499685958,
+            "rss_kib": 17760,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "bb289e6ff7d7f181b7356749d07552cc0c8ec56123ac33d115a5a9a87f44c01c",
+              "files": 10000,
+              "bytes": 140000,
+              "retained_bytes": 10912016,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": true,
+              "source_bytes_read": 140000,
+              "sources_opened": 10000,
+              "refresh_entries_visited": 10000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          }
+        },
+        {
+          "load_average": [
+            8.923828125,
+            12.58349609375,
+            13.4033203125
+          ],
+          "current": {
+            "seconds": 0.48474829201586545,
+            "rss_kib": 17776,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "bb289e6ff7d7f181b7356749d07552cc0c8ec56123ac33d115a5a9a87f44c01c",
+              "files": 10000,
+              "bytes": 140000,
+              "retained_bytes": 10912016,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": true,
+              "source_bytes_read": 140000,
+              "sources_opened": 10000,
+              "refresh_entries_visited": 10000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          },
+          "baseline": {
+            "seconds": 0.4861026250291616,
+            "rss_kib": 17760,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "bb289e6ff7d7f181b7356749d07552cc0c8ec56123ac33d115a5a9a87f44c01c",
+              "files": 10000,
+              "bytes": 140000,
+              "retained_bytes": 10912016,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": true,
+              "source_bytes_read": 140000,
+              "sources_opened": 10000,
+              "refresh_entries_visited": 10000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          }
+        },
+        {
+          "load_average": [
+            8.923828125,
+            12.58349609375,
+            13.4033203125
+          ],
+          "baseline": {
+            "seconds": 0.45948204200249165,
+            "rss_kib": 17808,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "bb289e6ff7d7f181b7356749d07552cc0c8ec56123ac33d115a5a9a87f44c01c",
+              "files": 10000,
+              "bytes": 140000,
+              "retained_bytes": 10912016,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": true,
+              "source_bytes_read": 140000,
+              "sources_opened": 10000,
+              "refresh_entries_visited": 10000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          },
+          "current": {
+            "seconds": 0.43075637507718056,
+            "rss_kib": 17776,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "bb289e6ff7d7f181b7356749d07552cc0c8ec56123ac33d115a5a9a87f44c01c",
+              "files": 10000,
+              "bytes": 140000,
+              "retained_bytes": 10912016,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": true,
+              "source_bytes_read": 140000,
+              "sources_opened": 10000,
+              "refresh_entries_visited": 10000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          }
+        },
+        {
+          "load_average": [
+            8.923828125,
+            12.58349609375,
+            13.4033203125
+          ],
+          "current": {
+            "seconds": 0.42006012494675815,
+            "rss_kib": 17792,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "bb289e6ff7d7f181b7356749d07552cc0c8ec56123ac33d115a5a9a87f44c01c",
+              "files": 10000,
+              "bytes": 140000,
+              "retained_bytes": 10912016,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": true,
+              "source_bytes_read": 140000,
+              "sources_opened": 10000,
+              "refresh_entries_visited": 10000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          },
+          "baseline": {
+            "seconds": 0.4785669590346515,
+            "rss_kib": 17808,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "bb289e6ff7d7f181b7356749d07552cc0c8ec56123ac33d115a5a9a87f44c01c",
+              "files": 10000,
+              "bytes": 140000,
+              "retained_bytes": 10912016,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": true,
+              "source_bytes_read": 140000,
+              "sources_opened": 10000,
+              "refresh_entries_visited": 10000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          }
+        },
+        {
+          "load_average": [
+            8.923828125,
+            12.58349609375,
+            13.4033203125
+          ],
+          "baseline": {
+            "seconds": 0.498332874965854,
+            "rss_kib": 17808,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "bb289e6ff7d7f181b7356749d07552cc0c8ec56123ac33d115a5a9a87f44c01c",
+              "files": 10000,
+              "bytes": 140000,
+              "retained_bytes": 10912016,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": true,
+              "source_bytes_read": 140000,
+              "sources_opened": 10000,
+              "refresh_entries_visited": 10000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          },
+          "current": {
+            "seconds": 0.4582524159923196,
+            "rss_kib": 17808,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "bb289e6ff7d7f181b7356749d07552cc0c8ec56123ac33d115a5a9a87f44c01c",
+              "files": 10000,
+              "bytes": 140000,
+              "retained_bytes": 10912016,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": true,
+              "source_bytes_read": 140000,
+              "sources_opened": 10000,
+              "refresh_entries_visited": 10000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          }
+        },
+        {
+          "load_average": [
+            8.9296875,
+            12.52392578125,
+            13.37744140625
+          ],
+          "current": {
+            "seconds": 0.44250283297151327,
+            "rss_kib": 17776,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "bb289e6ff7d7f181b7356749d07552cc0c8ec56123ac33d115a5a9a87f44c01c",
+              "files": 10000,
+              "bytes": 140000,
+              "retained_bytes": 10912016,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": true,
+              "source_bytes_read": 140000,
+              "sources_opened": 10000,
+              "refresh_entries_visited": 10000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          },
+          "baseline": {
+            "seconds": 0.49017266696318984,
+            "rss_kib": 17792,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "bb289e6ff7d7f181b7356749d07552cc0c8ec56123ac33d115a5a9a87f44c01c",
+              "files": 10000,
+              "bytes": 140000,
+              "retained_bytes": 10912016,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": true,
+              "source_bytes_read": 140000,
+              "sources_opened": 10000,
+              "refresh_entries_visited": 10000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          }
+        },
+        {
+          "load_average": [
+            8.9296875,
+            12.52392578125,
+            13.37744140625
+          ],
+          "baseline": {
+            "seconds": 0.43315195792820305,
+            "rss_kib": 17776,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "bb289e6ff7d7f181b7356749d07552cc0c8ec56123ac33d115a5a9a87f44c01c",
+              "files": 10000,
+              "bytes": 140000,
+              "retained_bytes": 10912016,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": true,
+              "source_bytes_read": 140000,
+              "sources_opened": 10000,
+              "refresh_entries_visited": 10000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          },
+          "current": {
+            "seconds": 0.4399239170597866,
+            "rss_kib": 17744,
+            "ready": {
+              "type": "workspace_ready",
+              "version": 1,
+              "id": null,
+              "revision": "bb289e6ff7d7f181b7356749d07552cc0c8ec56123ac33d115a5a9a87f44c01c",
+              "files": 10000,
+              "bytes": 140000,
+              "retained_bytes": 10912016,
+              "preparations_built": 0,
+              "preparations_reused": 0,
+              "watch_fallback": true,
+              "source_bytes_read": 140000,
+              "sources_opened": 10000,
+              "refresh_entries_visited": 10000,
+              "namespace_paths_checked": 0,
+              "namespace_directories_scanned": 0,
+              "discovery_reused": false,
+              "source_bytes_reused": 0
+            }
+          }
+        }
+      ],
+      "median": {
+        "current": {
+          "seconds": 0.4405612499685958,
+          "rss_kib": 17776,
+          "retained_bytes": 10912016
+        },
+        "baseline": {
+          "seconds": 0.4785669590346515,
+          "rss_kib": 17808,
+          "retained_bytes": 10912016
+        }
+      }
+    }
+  ]
+}

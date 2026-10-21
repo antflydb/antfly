@@ -33,6 +33,7 @@ remove this compatibility copy when upgrading to a release with a working backen
 pkg/
   antfly/            AntflyDB server, API, metadata, storage, search, raft
   antfly-client/     Zig client package
+  antfly-grep/       Native local regex and decision-based source search CLI
   antfly-embedded/   Embedded Antfly package and WASM smoke surface
   inference/         Inference runtime, OpenAPI server, tools, web UI
   inference-client/  Zig inference client package

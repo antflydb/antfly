@@ -47,6 +47,49 @@ components:
         temperature: 0.7
         max_tokens: 2048
 
+    ConstrainedOutput:
+      type: string
+      enum: [auto, tool_call, json_schema, grammar]
+      default: auto
+      description: Provider and model admission selects a supported constrained mechanism. Auto prefers forced tools, then provider JSON schema, then native grammar. Free-text parsing is not a mode.
+    ConstrainedProbabilities:
+      type: string
+      enum: [token_logprobs, verdict_only]
+      default: token_logprobs
+      description: Token probabilities require complete decoder evidence for the allowed values. Verdict-only is explicit opt-in; model-reported confidence is never used.
+    ConstrainedGenerationBatch:
+      type: object
+      additionalProperties: false
+      properties:
+        max_items_per_call:
+          type: integer
+          minimum: 1
+          maximum: 256
+          default: 8
+        max_input_bytes:
+          type: integer
+          minimum: 1
+          maximum: 4194304
+          default: 65536
+    ConstrainedGeneratorProducerConfig:
+      type: object
+      additionalProperties: false
+      required: [generator, output_schema]
+      properties:
+        generator:
+          $ref: '#/components/schemas/GeneratorConfig'
+        instructions:
+          type: string
+          maxLength: 65536
+        output_schema:
+          type: object
+          additionalProperties: true
+          description: JSON schema enforced before artifact publication. Unsupported schema vocabulary fails admission. Invalid or missing batch items receive one validation retry; successful siblings are retained.
+        output:
+          $ref: '#/components/schemas/ConstrainedOutput'
+        batch:
+          $ref: '#/components/schemas/ConstrainedGenerationBatch'
+
     AppleGeneratorConfig:
       type: object
       description: "On-device Apple Foundation Models generation. Requires a macOS Apple provider build, Apple Intelligence enabled, and its system model ready. Supports text conversations; tool calling and media attachments are not supported."

@@ -222,26 +222,34 @@ pub fn Adapter(comptime http: type) type {
         root_url: []const u8,
         limits: Limits = .{},
         control: source.Control = .{},
+        /// Borrowed only by an active HTTP request. Never copied into snapshots.
+        request_control: ?source.Control = null,
         pool: ?*admission.Pool = null,
         requests: usize = 0,
         charged_bytes: u64 = 0,
         transferred_bytes: u64 = 0,
         const Cancel = struct {
             control: source.Control,
+            request_control: ?source.Control,
             fn check(raw: *const anyopaque) bool {
                 const self: *const @This() = @ptrCast(@alignCast(raw));
                 self.control.check() catch return true;
+                if (self.request_control) |control| control.check() catch return true;
                 return false;
             }
         };
-        pub fn resourceBinding(self: *Self, base: []const u8, reference: []const u8, range: ?hls.Range, epoch: usize, context: [32]u8, encryption: ?Encryption) ![32]u8 {
+        fn check(self: *const Self) !void {
             try self.control.check();
+            if (self.request_control) |control| try control.check();
+        }
+        pub fn resourceBinding(self: *Self, base: []const u8, reference: []const u8, range: ?hls.Range, epoch: usize, context: [32]u8, encryption: ?Encryption) ![32]u8 {
+            try self.check();
             const url = try resolve(self.allocator, self.root_url, base, reference, self.limits.max_uri_bytes);
             defer self.allocator.free(url);
             return resumeBinding(url, range, "", epoch, context, encryption, null, self.control);
         }
         pub fn fetch(self: *Self, base: []const u8, reference: []const u8, range: ?hls.Range, resource_limit: usize) !Body {
-            try self.control.check();
+            try self.check();
             if (self.requests >= self.limits.max_requests) return error.ResourceLimitExceeded;
             const url = try resolve(self.allocator, self.root_url, base, reference, self.limits.max_uri_bytes);
             defer self.allocator.free(url);
@@ -258,7 +266,7 @@ pub fn Adapter(comptime http: type) type {
             headers[0] = .{ "Accept-Encoding", "identity" };
             var range_buffer: [96]u8 = undefined;
             if (range) |requested| headers[1] = .{ "Range", try std.fmt.bufPrint(&range_buffer, "bytes={d}-{d}", .{ requested.offset, requested.offset + requested.length - 1 }) };
-            const cancel = Cancel{ .control = self.control };
+            const cancel = Cancel{ .control = self.control, .request_control = self.request_control };
             self.requests += 1;
             self.charged_bytes += cap; // Failed transports cannot reset retry work.
             var response = self.client.get(url, .{
@@ -270,14 +278,14 @@ pub fn Adapter(comptime http: type) type {
                 .timeout_ms = self.limits.timeout_ms,
                 .cancellation = .{ .ptr = &cancel, .is_cancelled_fn = Cancel.check },
             }) catch |err| {
-                try self.control.check();
+                try self.check();
                 return err;
             };
             var response_live = true;
             defer if (response_live) response.deinit();
             const body = response.body orelse return error.EmptyMediaResource;
             self.transferred_bytes += @min(cap, body.len);
-            try self.control.check();
+            try self.check();
             if (body.len == 0 or body.len > cap) return error.ResourceLimitExceeded;
             if (range) |requested| {
                 if (response.status.code != 206 or body.len != requested.length) return error.InvalidRemoteRange;
@@ -304,7 +312,7 @@ pub fn Adapter(comptime http: type) type {
         /// independently padded object. Final padding validates before body EOF
         /// completion; earlier acknowledged fragments retain replay progress.
         pub fn streamFmp4WithEncryption(self: *Self, base: []const u8, reference: []const u8, range: ?hls.Range, resource_limit: usize, ingest: *live.Ingest, encryption: ?Encryption, context: *anyopaque, accept: *const fn (*anyopaque, *FragmentDelivery) anyerror!void) !StreamStats {
-            try self.control.check();
+            try self.check();
             if (ingest.ended or ingest.pending.items.len != 0) return error.InvalidMediaStreamState;
             const Frames = struct {
                 adapter: *Self,
@@ -346,7 +354,7 @@ pub fn Adapter(comptime http: type) type {
         /// one whole-object AES-128 CBC resource. No retry or buffering policy is
         /// hidden in the consumer; it owns its parsing/finalization state.
         pub fn streamBody(self: *Self, base: []const u8, reference: []const u8, range: ?hls.Range, resource_limit: usize, encryption: ?Encryption, consumer: BodyConsumer) !StreamStats {
-            try self.control.check();
+            try self.check();
             if (self.requests >= self.limits.max_requests) return error.ResourceLimitExceeded;
             const url = try resolve(self.allocator, self.root_url, base, reference, self.limits.max_uri_bytes);
             defer self.allocator.free(url);
@@ -377,7 +385,7 @@ pub fn Adapter(comptime http: type) type {
                 decryptor: ?hls.crypto.Stream = null,
                 stats: StreamStats = .{},
                 pub fn startResponse(sink: *@This(), response: anytype) !void {
-                    try sink.adapter.control.check();
+                    try sink.adapter.check();
                     if (sink.started) return error.InvalidMediaStreamState;
                     if (sink.range) |requested| {
                         if (response.status.code != 206) return error.InvalidRemoteRange;
@@ -388,7 +396,7 @@ pub fn Adapter(comptime http: type) type {
                 }
                 pub fn writeAll(sink: *@This(), bytes: []const u8) !void {
                     if (!sink.started) return error.InvalidMediaStreamState;
-                    try sink.adapter.control.check();
+                    try sink.adapter.check();
                     if (bytes.len > sink.cap -| sink.stats.bytes) return error.ResourceLimitExceeded;
                     sink.stats.bytes += bytes.len;
                     sink.adapter.transferred_bytes += bytes.len;
@@ -396,7 +404,7 @@ pub fn Adapter(comptime http: type) type {
                     // boundary; draining does not retain the complete HTTP body.
                     var offset: usize = 0;
                     while (offset < bytes.len) {
-                        try sink.adapter.control.check();
+                        try sink.adapter.check();
                         const end = @min(bytes.len, offset + 8192);
                         if (sink.decryptor) |*decryptor| {
                             try decryptor.push(bytes[offset..end], sink, @This().writePlain);
@@ -405,7 +413,7 @@ pub fn Adapter(comptime http: type) type {
                     }
                 }
                 fn writePlain(sink: *@This(), bytes: []const u8) !void {
-                    try sink.adapter.control.check();
+                    try sink.adapter.check();
                     sink.stats.plaintext_bytes += bytes.len;
                     try sink.consumer.write(sink.consumer.context, bytes);
                 }
@@ -413,7 +421,7 @@ pub fn Adapter(comptime http: type) type {
             var sink = Sink{ .adapter = self, .consumer = consumer, .range = range, .cap = cap };
             if (encryption) |cipher| sink.decryptor = hls.crypto.Stream.init(cipher.key, cipher.iv, self.control);
             defer if (sink.decryptor) |*decryptor| decryptor.deinit();
-            const cancel = Cancel{ .control = self.control };
+            const cancel = Cancel{ .control = self.control, .request_control = self.request_control };
             self.requests += 1;
             self.charged_bytes += cap;
             if (consumer.entered) |entered| try entered(consumer.context);
@@ -426,11 +434,11 @@ pub fn Adapter(comptime http: type) type {
                 .timeout_ms = self.limits.timeout_ms,
                 .cancellation = .{ .ptr = &cancel, .is_cancelled_fn = Cancel.check },
             }, &sink, null, null) catch |err| {
-                try self.control.check();
+                try self.check();
                 return err;
             };
             defer response.deinit();
-            try self.control.check();
+            try self.check();
             if (!sink.started) return error.UnexpectedHttpStatus;
             if (sink.stats.bytes == 0) return error.EmptyMediaResource;
             if (range) |requested| if (sink.stats.bytes != requested.length) return error.InvalidRemoteRange;
@@ -447,7 +455,7 @@ pub fn Adapter(comptime http: type) type {
         /// ledger; transport/cancellation/admission failures remain retryable.
         /// Caller must reconcile taken-but-unacknowledged snapshots on failure.
         pub fn streamFmp4Resuming(self: *Self, base: []const u8, reference: []const u8, range: ?hls.Range, resource_limit: usize, initialization: []const u8, ledger: *FragmentLedger, options: ResumeOptions, context: *anyopaque, accept: *const fn (*anyopaque, *FragmentDelivery) anyerror!void) !ResumeStats {
-            try self.control.check();
+            try self.check();
             if (ledger.active) return error.InvalidMediaStreamState;
             if (ledger.invalid) return error.SourceVersionChanged;
             try options.ingest.stream.control.check();

@@ -1,0 +1,120 @@
+{
+  "evaluation": "fixture_pipeline",
+  "manifest_sha256": "94d73408510b8242280016a805f029cd5fa096224f2fba365feb35a77b1dc274",
+  "binary_sha256": "5df65d30086651df079cf9a8366f05f165151951e16fc46a800095cb1075029a",
+  "model": "fixture",
+  "ranking": "CLI file order, then source-line order",
+  "token_accounting": "Provider-reported CLI counters; zero may mean omitted usage. Fixture replies omit token usage.",
+  "questions": [
+    {
+      "id": "retry-bound",
+      "precision": 1.0,
+      "recall": 1.0,
+      "ndcg": 1.0,
+      "true_positive": 2,
+      "returned": 2,
+      "expected": 2,
+      "complete": true,
+      "elapsed_seconds": 0.27590025,
+      "files": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "ndcg": 1.0,
+        "true_positive": 1,
+        "returned": 1,
+        "expected": 1
+      },
+      "requests": 15,
+      "input_tokens": 0,
+      "output_tokens": 0
+    },
+    {
+      "id": "invalid-input",
+      "precision": 1.0,
+      "recall": 1.0,
+      "ndcg": 1.0,
+      "true_positive": 2,
+      "returned": 2,
+      "expected": 2,
+      "complete": true,
+      "elapsed_seconds": 0.20563104100000001,
+      "files": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "ndcg": 1.0,
+        "true_positive": 1,
+        "returned": 1,
+        "expected": 1
+      },
+      "requests": 15,
+      "input_tokens": 0,
+      "output_tokens": 0
+    },
+    {
+      "id": "atomic-cache",
+      "precision": 1.0,
+      "recall": 1.0,
+      "ndcg": 1.0,
+      "true_positive": 3,
+      "returned": 3,
+      "expected": 3,
+      "complete": true,
+      "elapsed_seconds": 0.16706745899999997,
+      "files": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "ndcg": 1.0,
+        "true_positive": 1,
+        "returned": 1,
+        "expected": 1
+      },
+      "requests": 15,
+      "input_tokens": 0,
+      "output_tokens": 0
+    },
+    {
+      "id": "permission-gate",
+      "precision": 1.0,
+      "recall": 1.0,
+      "ndcg": 1.0,
+      "true_positive": 2,
+      "returned": 2,
+      "expected": 2,
+      "complete": true,
+      "elapsed_seconds": 0.16694733400000006,
+      "files": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "ndcg": 1.0,
+        "true_positive": 1,
+        "returned": 1,
+        "expected": 1
+      },
+      "requests": 15,
+      "input_tokens": 0,
+      "output_tokens": 0
+    },
+    {
+      "id": "no-relevant-source",
+      "precision": 1,
+      "recall": 1,
+      "ndcg": 1,
+      "true_positive": 0,
+      "returned": 0,
+      "expected": 0,
+      "complete": true,
+      "elapsed_seconds": 0.15092958300000003,
+      "files": {
+        "precision": 1,
+        "recall": 1,
+        "ndcg": 1,
+        "true_positive": 0,
+        "returned": 0,
+        "expected": 0
+      },
+      "requests": 15,
+      "input_tokens": 0,
+      "output_tokens": 0
+    }
+  ]
+}

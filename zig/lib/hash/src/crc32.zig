@@ -176,3 +176,62 @@ fn check(comptime Impl: type, comptime Oracle: type, data: []const u8) !void {
     try std.testing.expectEqual(oracle.final(), fast.final());
     try std.testing.expectEqual(oracle.final(), slow.final());
 }
+
+/// Bzip2's non-reflected IEEE CRC (CRC-32/BZIP2), distinct from gzip's
+/// reflected wire checksum. Native slicing-by-eight needs no byte reflection
+/// buffers or target-specific instruction assumptions.
+pub const Crc32Bzip2 = struct {
+    crc: u32 = 0xffffffff,
+    const tables: [8][256]u32 = block: {
+        @setEvalBranchQuota(30000);
+        var result: [8][256]u32 = undefined;
+        for (0..256) |i| {
+            var value = @as(u32, @intCast(i)) << 24;
+            for (0..8) |_| value = (value << 1) ^ (if (value & 0x80000000 != 0) @as(u32, 0x04c11db7) else 0);
+            result[0][i] = value;
+        }
+        for (1..8) |row| for (0..256) |i| {
+            const previous = result[row - 1][i];
+            result[row][i] = (previous << 8) ^ result[0][previous >> 24];
+        };
+        break :block result;
+    };
+    pub fn init() Crc32Bzip2 {
+        return .{};
+    }
+    pub fn update(self: *Crc32Bzip2, bytes: []const u8) void {
+        var at: usize = 0;
+        var value = self.crc;
+        while (bytes.len - at >= 8) : (at += 8) {
+            value ^= std.mem.readInt(u32, bytes[at..][0..4], .big);
+            value = tables[7][value >> 24] ^ tables[6][(value >> 16) & 255] ^ tables[5][(value >> 8) & 255] ^ tables[4][value & 255] ^
+                tables[3][bytes[at + 4]] ^ tables[2][bytes[at + 5]] ^ tables[1][bytes[at + 6]] ^ tables[0][bytes[at + 7]];
+        }
+        for (bytes[at..]) |byte| value = (value << 8) ^ tables[0][(value >> 24) ^ byte];
+        self.crc = value;
+    }
+    pub fn final(self: Crc32Bzip2) u32 {
+        return ~self.crc;
+    }
+    pub fn hash(bytes: []const u8) u32 {
+        var crc = init();
+        crc.update(bytes);
+        return crc.final();
+    }
+};
+test "Bzip2 CRC slicing preserves non-reflected incremental wire semantics" {
+    try std.testing.expectEqual(@as(u32, 0xfc891918), Crc32Bzip2.hash("123456789"));
+    var bytes: [1031]u8 = undefined;
+    for (&bytes, 0..) |*byte, i| byte.* = @truncate(i * 193);
+    var expected: u32 = 0xffffffff;
+    for (bytes) |byte| {
+        expected ^= @as(u32, byte) << 24;
+        for (0..8) |_| expected = (expected << 1) ^ (if (expected & 0x80000000 != 0) @as(u32, 0x04c11db7) else 0);
+    }
+    for (0..33) |split| {
+        var crc = Crc32Bzip2.init();
+        crc.update(bytes[0..split]);
+        crc.update(bytes[split..]);
+        try std.testing.expectEqual(~expected, crc.final());
+    }
+}

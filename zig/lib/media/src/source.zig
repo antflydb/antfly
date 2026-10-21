@@ -32,6 +32,13 @@ pub const Limits = struct {
     max_reads: usize = 100_000,
 };
 pub const Range = struct {
+    /// Content digest or immutable object/version binding. Providers supplying
+    /// this must validate that every returned range belongs to that snapshot.
+    /// A display URL or unverified ETag is insufficient.
+    immutable_binding: ?[32]u8 = null,
+    /// Immutable local extents may lend a contiguous read without allocating.
+    /// Null requests the ordinary read_at path (for example across extents).
+    borrow_at: ?*const fn (*anyopaque, u64, usize, Control) anyerror!?[]const u8 = null,
     context: *anyopaque,
     /// May return a short read. Returning zero before the declared end is EOF.
     read_at: *const fn (*anyopaque, u64, []u8, Control) anyerror!usize,
@@ -76,6 +83,15 @@ pub const Source = struct {
                 return .{ .bytes = bytes[@intCast(offset)..][0..size], .source = self, .reservation = reservation };
             },
             .range => |range| {
+                if (range.borrow_at) |borrow| {
+                    if (try borrow(range.context, offset, size, self.control)) |bytes| {
+                        if (bytes.len != size) return error.InvalidSourceRead;
+                        try self.control.check();
+                        self.reads += 1;
+                        self.total_bytes += size;
+                        return .{ .bytes = bytes, .source = self, .reservation = reservation };
+                    }
+                }
                 const owned = try self.allocator.alloc(u8, size);
                 errdefer self.allocator.free(owned);
                 var done: usize = 0;
@@ -227,4 +243,41 @@ test "source shared lease admission is retained and denied without provider read
     var retry = try src.read(4, 4);
     retry.deinit();
     try std.testing.expectEqual(admission.Resources{}, pool.snapshot());
+}
+
+test "source immutable range borrows enforce limits and fall back across extents" {
+    const Provider = struct {
+        borrows: usize = 0,
+        copies: usize = 0,
+        fn borrow(raw: *anyopaque, offset: u64, size: usize, _: Control) !?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.borrows += 1;
+            if (offset < 4 and size > 4 - offset) return null;
+            return "abcdefgh"[@intCast(offset)..][0..size];
+        }
+        fn copy(raw: *anyopaque, offset: u64, target: []u8, _: Control) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.copies += 1;
+            @memcpy(target, "abcdefgh"[@intCast(offset)..][0..target.len]);
+            return target.len;
+        }
+    };
+    var provider = Provider{};
+    var src = Source{ .allocator = std.testing.failing_allocator, .identity = "immutable-extents", .storage = .{ .range = .{ .context = &provider, .read_at = Provider.copy, .borrow_at = Provider.borrow, .length = 8 } }, .limits = .{ .max_read_bytes = 4, .max_retained_bytes = 7, .max_total_bytes = 7, .max_reads = 2 } };
+    var first = try src.read(0, 3);
+    defer first.deinit();
+    try std.testing.expect(first.owned == null);
+    try std.testing.expectEqualStrings("abc", first.bytes);
+    try std.testing.expectError(error.ResourceLimitExceeded, src.read(0, 5));
+    try std.testing.expectEqual(@as(usize, 1), provider.borrows);
+    // The crossing read needs an owned lease; use a reclaiming allocator.
+    src.allocator = std.testing.allocator;
+    var crossing = try src.read(2, 4);
+    defer crossing.deinit();
+    try std.testing.expect(crossing.owned != null);
+    try std.testing.expectEqualStrings("cdef", crossing.bytes);
+    try std.testing.expectEqual(@as(usize, 1), provider.copies);
+    try std.testing.expectError(error.ResourceLimitExceeded, src.read(7, 1));
+    try std.testing.expectEqual(@as(usize, 2), provider.borrows);
+    try std.testing.expectEqual(@as(u64, 7), src.total_bytes);
 }

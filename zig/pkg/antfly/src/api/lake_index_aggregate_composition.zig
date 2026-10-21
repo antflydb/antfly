@@ -50,6 +50,12 @@ pub const Composition = struct {
     pub fn cursor(self: *Composition) Cursor {
         return .{ .ptr = self, .next = next, .close = close };
     }
+    /// Preflight the first complete cohort without consuming any partials.
+    pub fn prime(self: *Composition) !Cursor {
+        if (self.slot != 0) return error.InvalidSqlBackendResponse;
+        if (self.child == null) self.child = try self.factory.open(self.factory.ptr, 0);
+        return self.child.?;
+    }
     fn next(raw: *anyopaque, a: A, maximum: u32) !?[]const GroupResult {
         const self: *Composition = @ptrCast(@alignCast(raw));
         if (maximum == 0) return error.InvalidSqlLimit;
@@ -73,7 +79,7 @@ pub const Composition = struct {
             const slots = try a.dupe(u16, &.{@intCast(self.slot)});
             for (rows, page) |*row, input| {
                 const mapping = input.aggregate_slots orelse slots;
-                if (input.aggregates.len != mapping.len or mapping.len == 0) return error.InvalidSqlBackendResponse;
+                if (try local.sql_aggregate_partial.partialCount(input) != mapping.len or mapping.len == 0) return error.InvalidSqlBackendResponse;
                 var has_current = false;
                 for (mapping, 0..) |slot, i| {
                     if (slot >= self.width) return error.InvalidSqlBackendResponse;
@@ -82,7 +88,8 @@ pub const Composition = struct {
                     self.consumed[slot] = true;
                 }
                 if (!has_current) return error.InvalidSqlBackendResponse;
-                row.* = .{ .keys = input.keys, .aggregates = input.aggregates, .ordinal = input.ordinal, .aggregate_slots = mapping };
+                row.* = input;
+                row.aggregate_slots = mapping;
             }
             return rows;
         }
@@ -116,7 +123,7 @@ test "external lake aggregate composition preserves exact slots across different
         }
         fn pull(raw: *anyopaque, alloc: A, _: u32) !?[]const GroupResult {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            const row = (try self.groups[self.position].nextPartialResult(alloc)) orelse return null;
+            const row = (if (self.position == 0) try self.groups[self.position].nextTypedPartialResult(alloc) else try self.groups[self.position].nextPartialResult(alloc)) orelse return null;
             return try alloc.dupe(GroupResult, &.{row});
         }
         fn closeChild(raw: *anyopaque) void {
@@ -137,7 +144,7 @@ test "external lake aggregate composition preserves exact slots across different
         var page = std.heap.ArenaAllocator.init(a);
         defer page.deinit();
         const rows = (try cursor.next(cursor.ptr, page.allocator(), 1)) orelse break;
-        for (rows) |row| try result.importPartialMapped(row.keys, row.aggregates, row.aggregate_slots, row.ordinal);
+        try result.importPartialBatch(rows);
     }
     try std.testing.expectEqual(@as(usize, 2), source.opened);
     try std.testing.expectEqual(@as(usize, 2), source.closed);

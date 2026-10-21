@@ -801,6 +801,7 @@ pub const HfTokenizer = struct {
         .encodeForModelUnpadded = @ptrCast(&encodeForModelUnpadded),
         .encodeGeneration = @ptrCast(&encodeGeneration),
         .decode = @ptrCast(&decode),
+        .tokenPiece = @ptrCast(&tokenPieceForVTable),
         .specialTokens = @ptrCast(&getSpecialTokens),
         .allSpecialTokenIds = @ptrCast(&getAllSpecialTokenIds),
         .vocabSize = @ptrCast(&getVocabSize),
@@ -7639,6 +7640,49 @@ pub const HfTokenizer = struct {
     // Decoding
     // =====================================================================
 
+    fn byteFallbackValue(self: *const HfTokenizer, token: []const u8) ?u8 {
+        if (!self.byte_fallback or token.len != 6 or !std.mem.startsWith(u8, token, "<0x") or token[5] != '>') return null;
+        return std.fmt.parseInt(u8, token[3..5], 16) catch null;
+    }
+    fn tokenPieceForVTable(self: *HfTokenizer, allocator: std.mem.Allocator, id: i32) ?Tokenizer.TokenPiece {
+        const bytes = self.tokenBytes(allocator, id) catch return null;
+        const fallback = if (self.id_to_token.get(id)) |token| self.byteFallbackValue(token) != null else false;
+        return .{ .bytes = bytes, .is_byte_fallback = fallback };
+    }
+
+    fn tokenBytes(self: *HfTokenizer, allocator: std.mem.Allocator, id: i32) ![]u8 {
+        const token = self.id_to_token.get(id) orelse return allocator.dupe(u8, "");
+        if (self.added_tokens.contains(token)) return allocator.dupe(u8, "");
+        if (self.byteFallbackValue(token)) |byte| return allocator.dupe(u8, &.{byte});
+        var result = std.ArrayListUnmanaged(u8).empty;
+        errdefer result.deinit(allocator);
+        switch (self.model_type) {
+            .word_piece => {
+                if (std.mem.startsWith(u8, token, self.continuing_prefix)) {
+                    try result.appendSlice(allocator, token[self.continuing_prefix.len..]);
+                } else {
+                    try result.append(allocator, ' ');
+                    try result.appendSlice(allocator, token);
+                }
+            },
+            .bpe => {
+                if (self.pre_tokenizer_type == .byte_level or self.pre_tokenizer_type == .byte_level_split) {
+                    try appendByteDecoded(&result, allocator, token);
+                } else try result.appendSlice(allocator, token);
+            },
+            .unigram => try result.appendSlice(allocator, token),
+        }
+        if (self.model_type == .unigram or
+            (self.model_type == .bpe and self.pre_tokenizer_type == .metaspace) or
+            (self.model_type == .bpe and self.replace_space_with != null))
+        {
+            const bytes = try replaceMetaspaceWithPrefix(allocator, result.items, self.metaspace_replacement, false);
+            result.deinit(allocator);
+            return bytes;
+        }
+        return result.toOwnedSlice(allocator);
+    }
+
     fn decode(self: *HfTokenizer, allocator: std.mem.Allocator, token_ids: []const i32) ![]u8 {
         var result = std.ArrayListUnmanaged(u8).empty;
 
@@ -9092,9 +9136,12 @@ fn appendByteDecoded(result: *std.ArrayListUnmanaged(u8), allocator: std.mem.All
 }
 
 fn replaceMetaspace(allocator: std.mem.Allocator, text: []const u8, replacement: []const u8) ![]u8 {
+    return replaceMetaspaceWithPrefix(allocator, text, replacement, true);
+}
+fn replaceMetaspaceWithPrefix(allocator: std.mem.Allocator, text: []const u8, replacement: []const u8, strip_leading: bool) ![]u8 {
     var result = std.ArrayListUnmanaged(u8).empty;
     var i: usize = 0;
-    var at_start = true;
+    var at_start = strip_leading;
     while (i < text.len) {
         if (i + replacement.len <= text.len and std.mem.eql(u8, text[i .. i + replacement.len], replacement)) {
             if (!at_start) {
@@ -12389,4 +12436,25 @@ fn z17RepeatString(comptime bytes: []const u8, comptime count: usize) *const [by
         break :blk repeated;
     };
     return &result;
+}
+
+test "raw token bytes retain metaspace and split byte fallback without sequence cleanup" {
+    const a = std.testing.allocator;
+    const tok = try HfTokenizer.loadFromBytes(a,
+        \\{"model":{"type":"Unigram","unk_id":0,"byte_fallback":true,"vocab":[["<unk>",0],["x",-1],["▁1",-1],["1",-1],["▁",-1],["<0xC3>",-1],["<0xA9>",-1]]},"pre_tokenizer":{"type":"Metaspace","replacement":"▁","prepend_scheme":"always","split":true}}
+    );
+    defer tok.deinitSelf();
+    const tokenizer = tok.tokenizer();
+    const standalone = try tokenizer.decode(a, &.{2});
+    defer a.free(standalone);
+    try std.testing.expectEqualStrings("1", standalone);
+    const continuation = try tokenizer.tokenBytes(a, 2);
+    defer a.free(continuation);
+    try std.testing.expectEqualStrings(" 1", continuation);
+    const space = try tokenizer.tokenBytes(a, 4);
+    defer a.free(space);
+    try std.testing.expectEqualStrings(" ", space);
+    const byte = try tokenizer.tokenBytes(a, 5);
+    defer a.free(byte);
+    try std.testing.expectEqualSlices(u8, &.{0xc3}, byte);
 }

@@ -12,6 +12,8 @@ if TYPE_CHECKING:
     from ..models.chunker_config import ChunkerConfig
     from ..models.enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
     from ..models.execution_policy import ExecutionPolicy
+    from ..models.grouped_artifact_source import GroupedArtifactSource
+    from ..models.prior_artifact_context import PriorArtifactContext
 
 
 T = TypeVar("T", bound="CreatedEnrichmentConfig")
@@ -24,6 +26,8 @@ class CreatedEnrichmentConfig:
     Attributes:
         name (str):
         kind (EnrichmentKind): Managed generated artifact kind.
+        source (GroupedArtifactSource | Unset):
+        prior_context (PriorArtifactContext | Unset):
         field (str | Unset):
         template (str | Unset):
         source_artifact_name (str | Unset):
@@ -48,6 +52,8 @@ class CreatedEnrichmentConfig:
 
     name: str
     kind: EnrichmentKind
+    source: GroupedArtifactSource | Unset = UNSET
+    prior_context: PriorArtifactContext | Unset = UNSET
     field: str | Unset = UNSET
     template: str | Unset = UNSET
     source_artifact_name: str | Unset = UNSET
@@ -66,6 +72,14 @@ class CreatedEnrichmentConfig:
         name = self.name
 
         kind = self.kind.value
+
+        source: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.source, Unset):
+            source = self.source.to_dict()
+
+        prior_context: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.prior_context, Unset):
+            prior_context = self.prior_context.to_dict()
 
         field = self.field
 
@@ -107,6 +121,10 @@ class CreatedEnrichmentConfig:
                 "kind": kind,
             }
         )
+        if source is not UNSET:
+            field_dict["source"] = source
+        if prior_context is not UNSET:
+            field_dict["prior_context"] = prior_context
         if field is not UNSET:
             field_dict["field"] = field
         if template is not UNSET:
@@ -141,11 +159,27 @@ class CreatedEnrichmentConfig:
         from ..models.chunker_config import ChunkerConfig
         from ..models.enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
         from ..models.execution_policy import ExecutionPolicy
+        from ..models.grouped_artifact_source import GroupedArtifactSource
+        from ..models.prior_artifact_context import PriorArtifactContext
 
         d = dict(src_dict)
         name = d.pop("name")
 
         kind = EnrichmentKind(d.pop("kind"))
+
+        _source = d.pop("source", UNSET)
+        source: GroupedArtifactSource | Unset
+        if isinstance(_source, Unset):
+            source = UNSET
+        else:
+            source = GroupedArtifactSource.from_dict(_source)
+
+        _prior_context = d.pop("prior_context", UNSET)
+        prior_context: PriorArtifactContext | Unset
+        if isinstance(_prior_context, Unset):
+            prior_context = UNSET
+        else:
+            prior_context = PriorArtifactContext.from_dict(_prior_context)
 
         field = d.pop("field", UNSET)
 
@@ -191,6 +225,8 @@ class CreatedEnrichmentConfig:
         created_enrichment_config = cls(
             name=name,
             kind=kind,
+            source=source,
+            prior_context=prior_context,
             field=field,
             template=template,
             source_artifact_name=source_artifact_name,

@@ -306,5 +306,5 @@ test "external lake Parquet schema footer prefetch overlaps bounded reads and pr
     try std.testing.expect(fixture.peak.load(.acquire) >= 2 and fixture.peak.load(.acquire) <= 3);
     try std.testing.expectEqual(@as(usize, 0), fixture.active.load(.acquire));
     fixture.gated = false;
-    try std.testing.checkAllAllocationFailures(a, Fixture.run, .{ reader, inventory });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.run, .{ reader, inventory });
 }

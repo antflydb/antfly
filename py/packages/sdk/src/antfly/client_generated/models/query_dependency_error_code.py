@@ -15,6 +15,8 @@ class QueryDependencyErrorCode(StrEnum):
     QUERY_TIMEOUT = "query_timeout"
     RERANKER_RATE_LIMITED = "reranker_rate_limited"
     RERANKER_UPSTREAM_FAILURE = "reranker_upstream_failure"
+    VALUE_SEARCH_LIMIT_EXCEEDED = "value_search_limit_exceeded"
+    VALUE_SEARCH_REQUIRES_SCAN = "value_search_requires_scan"
 
     def __str__(self) -> str:
         return str(self.value)

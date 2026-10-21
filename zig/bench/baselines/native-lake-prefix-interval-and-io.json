@@ -1,0 +1,57 @@
+{
+  "base_commit": "63555af28b3e176df60c6d6c5da1374c2fc5f623",
+  "merged_main": "beb332c973eaf78876f9ef798d3d959fe41f307d",
+  "zig_version": "0.17.0",
+  "build": "Debug",
+  "scope": "Deterministic reconstruction/write amplification; no archive-scale latency or provider throughput claim.",
+  "prefix_navigation": {
+    "rows": 65536,
+    "predicate_passes_per_256_row_batch": 2,
+    "before_steps": 8617727,
+    "after_steps": 163967,
+    "reverse_steps": 6450942,
+    "navigation_bytes": 8192,
+    "rejected_rows_materialized": 0
+  },
+  "overlapping_tree_merge": {
+    "output_groups": 24000,
+    "shared_groups": 1,
+    "value_bytes": 128,
+    "written_bytes": 69098,
+    "page_reads": 4,
+    "original_attempts_retained": true
+  },
+  "publication_io": {
+    "retained_buffers_keep_memory_admission": true,
+    "batch_reserves_full_io_fanout": true,
+    "failed_operations_release_io_slots": true,
+    "disabled_io_preserves_required_inline_path": true,
+    "capability_retained_by_pointer": true,
+    "existing_reader_retention_budget_bytes": 16384
+  },
+  "archive_comparison": {
+    "status": "not_run",
+    "reason": "The 142577-row HN fixture is not available locally; real-provider qualification remains deferred."
+  },
+  "validation": {
+    "codec_passed": 9,
+    "scheduler_passed": 10,
+    "graph_page_and_upload_passed": 74,
+    "real_parquet_iceberg_e2e_passed": 23,
+    "e2e_seconds": 216.54,
+    "failed": 0,
+    "leaked": 0,
+    "server_build": "Debug, stripped; Zig 0.17.0",
+    "checks": [
+      "Zig formatting",
+      "license headers",
+      "Apache boundary",
+      "source catalogue",
+      "inference error catalogue",
+      "git diff --check"
+    ],
+    "compact_capability_focused_passed": 4,
+    "lake_shared_passed": 231,
+    "lake_native_passed": 381
+  }
+}

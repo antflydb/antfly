@@ -95,6 +95,68 @@ fn validateDecisionTask(task: DecisionTask) !void {
     }
 }
 
+const EncodedDecisionTask = struct { ids: []const i32, markers: []const usize };
+
+/// Request-local reuse of tokenization, never encoder activations. Bidirectional
+/// attention still receives each original complete row. Caps bound map overhead
+/// on requests containing many unique tasks or texts; uncached inputs keep the
+/// same encoding path and validation.
+const DecisionPreparationCache = struct {
+    tasks: std.AutoHashMapUnmanaged([32]u8, EncodedDecisionTask) = .empty,
+    texts: std.StringHashMapUnmanaged([]const i32) = .empty,
+    retained_bytes: usize = 0,
+    const max_entries = 128;
+    const max_bytes = 4 * 1024 * 1024;
+
+    fn hashPart(hash: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
+        var len: [8]u8 = undefined;
+        std.mem.writeInt(u64, &len, bytes.len, .little);
+        hash.update(&len);
+        hash.update(bytes);
+    }
+    fn taskKey(value: DecisionTask) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hashPart(&hash, value.name);
+        hashPart(&hash, value.prompt);
+        hashPart(&hash, @tagName(value.example_mode));
+        var count: [8]u8 = undefined;
+        std.mem.writeInt(u64, &count, value.labels.len, .little);
+        hash.update(&count);
+        for (value.labels) |label| {
+            hashPart(&hash, label.name);
+            hashPart(&hash, label.description);
+        }
+        for (value.examples) |example| {
+            hashPart(&hash, example.input);
+            hashPart(&hash, example.output);
+        }
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        return digest;
+    }
+    fn task(self: *DecisionPreparationCache, a: std.mem.Allocator, tok: Tokenizer, value: DecisionTask, special: [5]i64) !EncodedDecisionTask {
+        const key = taskKey(value);
+        if (self.tasks.get(key)) |encoded| return encoded;
+        const encoded = try encodeDecisionTask(a, tok, value, special[0], special[1], special[2], special[3], special[4]);
+        const size = encoded.ids.len * @sizeOf(i32) + encoded.markers.len * @sizeOf(usize);
+        if (self.tasks.count() < max_entries and size <= max_bytes - self.retained_bytes) {
+            try self.tasks.put(a, key, encoded);
+            self.retained_bytes += size;
+        }
+        return encoded;
+    }
+    fn text(self: *DecisionPreparationCache, a: std.mem.Allocator, tok: Tokenizer, value: []const u8) ![]const i32 {
+        if (self.texts.get(value)) |ids| return ids;
+        const ids = try decisionTextIds(a, tok, value);
+        const size = ids.len * @sizeOf(i32);
+        if (self.texts.count() < max_entries and size <= max_bytes - self.retained_bytes) {
+            try self.texts.put(a, value, ids);
+            self.retained_bytes += size;
+        }
+        return ids;
+    }
+};
+
 fn encodeDecisionTask(
     a: std.mem.Allocator,
     tok: Tokenizer,
@@ -104,7 +166,7 @@ fn encodeDecisionTask(
     desc_id: i64,
     example_id: i64,
     output_id: i64,
-) !struct { ids: []const i32, markers: []const usize } {
+) !EncodedDecisionTask {
     _ = desc_id;
     _ = example_id;
     _ = output_id;
@@ -786,21 +848,21 @@ pub const GlinerPipeline = struct {
         const prompt_tokens = try a.alloc(usize, requests.len);
         errdefer a.free(prompt_tokens);
 
+        var preparation_cache = DecisionPreparationCache{};
         for (requests, 0..) |request, request_index| {
             if (request.tasks.len == 0) return error.InvalidDecisionRequest;
-            const text_ids = try decisionTextIds(scratch, self.tok, request.text);
+            const text_ids = try preparation_cache.text(scratch, self.tok, request.text);
             const fixed = try std.math.add(usize, 1, text_ids.len); // [SEP_TEXT] + full text
             if (fixed >= max_length) return error.DecisionInputTooLong;
 
-            const EncodedTask = struct { ids: []const i32, markers: []const usize };
-            const encoded = try scratch.alloc(EncodedTask, request.tasks.len);
+            const encoded = try scratch.alloc(EncodedDecisionTask, request.tasks.len);
             const ranges = try a.alloc(DecisionTaskRange, request.tasks.len);
             all_ranges[request_index] = ranges;
             range_requests += 1;
             var flat: usize = 0;
             for (request.tasks, encoded, ranges, 0..) |task, *out, *range, task_index| {
                 try validateDecisionTask(task);
-                const prepared_task = try encodeDecisionTask(scratch, self.tok, task, p_id, l_id, desc_id, example_id, output_id);
+                const prepared_task = try preparation_cache.task(scratch, self.tok, task, .{ p_id, l_id, desc_id, example_id, output_id });
                 out.* = .{ .ids = prepared_task.ids, .markers = prepared_task.markers };
                 if (try std.math.add(usize, fixed, out.ids.len) > max_length) return error.DecisionInputTooLong;
                 const end = try std.math.add(usize, flat, task.labels.len);
@@ -3139,4 +3201,90 @@ test "decision text normalization matches Fastino punctuation and Unicode lowerc
     try std.testing.expectEqual(@as(usize, 2), punctuated.len);
     try std.testing.expectEqualStrings("hi", probe.seen.items[4]);
     try std.testing.expectEqualStrings("!", probe.seen.items[5]);
+}
+
+test "decision preparation reuses exact tasks and texts with unchanged tokens" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Probe = struct {
+        calls: usize = 0,
+        fn append(ptr: *anyopaque, alloc: std.mem.Allocator, bytes: []const u8, out: *std.ArrayListUnmanaged(i32)) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            for (bytes) |byte| try out.append(alloc, byte);
+        }
+    };
+    var probe = Probe{};
+    const tok = Tokenizer{ .ptr = &probe, .vtable = &.{ .encode = undefined, .encodeInto = Probe.append, .encodeForModel = undefined, .encodeGeneration = undefined, .decode = undefined, .specialTokens = undefined, .vocabSize = undefined, .deinit = undefined } };
+    var cache = DecisionPreparationCache{};
+    const labels = [_]DecisionLabel{ .{ .name = "no", .description = "reject" }, .{ .name = "yes", .description = "accept" } };
+    const special = [5]i64{ 1000, 1001, 1002, 1003, 1004 };
+    for ([_]DecisionExampleMode{ .descriptions, .few_shot, .both }) |mode| {
+        var task = DecisionTask{ .name = "relevance", .prompt = "find retry", .labels = &labels, .examples = &.{.{ .input = "retry once", .output = "yes" }}, .example_mode = mode };
+        const reference = try encodeDecisionTask(a, tok, task, special[0], special[1], special[2], special[3], special[4]);
+        const encoded = try cache.task(a, tok, task, special);
+        try std.testing.expectEqualSlices(i32, reference.ids, encoded.ids);
+        try std.testing.expectEqualSlices(usize, reference.markers, encoded.markers);
+        const before = probe.calls;
+        const repeated = try cache.task(a, tok, task, special);
+        try std.testing.expectEqual(before, probe.calls);
+        try std.testing.expectEqual(encoded.ids.ptr, repeated.ids.ptr);
+        task.prompt = "different question";
+        _ = try cache.task(a, tok, task, special);
+        try std.testing.expect(probe.calls > before);
+    }
+    const text = "İSTANBUL retry!";
+    const reference = try decisionTextIds(a, tok, text);
+    const encoded = try cache.text(a, tok, text);
+    try std.testing.expectEqualSlices(i32, reference, encoded);
+    const before = probe.calls;
+    _ = try cache.text(a, tok, text);
+    try std.testing.expectEqual(before, probe.calls);
+    // Capped retention falls back to the identical uncached encoder.
+    cache.retained_bytes = DecisionPreparationCache.max_bytes;
+    const other = try cache.text(a, tok, "other");
+    try std.testing.expectEqualSlices(i32, try decisionTextIds(a, tok, "other"), other);
+    try std.testing.expectEqual(@as(u32, 1), cache.texts.count());
+}
+
+test "decision preparation batching preserves complete singleton encoder rows" {
+    const a = std.testing.allocator;
+    const tokenizer = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a,
+        \\{"added_tokens":[{"id":1,"content":"[P]","special":true},{"id":2,"content":"[L]","special":true},{"id":3,"content":"[SEP_STRUCT]","special":true},{"id":4,"content":"[SEP_TEXT]","special":true},{"id":5,"content":"[DESCRIPTION]","special":true},{"id":6,"content":"[EXAMPLE]","special":true},{"id":7,"content":"[OUTPUT]","special":true}],"model":{"type":"WordPiece","unk_token":"[UNK]","vocab":{"[UNK]":0,"[P]":1,"[L]":2,"[SEP_STRUCT]":3,"[SEP_TEXT]":4,"[DESCRIPTION]":5,"[EXAMPLE]":6,"[OUTPUT]":7}}}
+    );
+    const tok = tokenizer.tokenizer();
+    defer tok.deinitTokenizer();
+    var pipeline = GlinerPipeline{ .allocator = a, .session = undefined, .tok = tok, .config = .{ .max_length = 32 } };
+    const labels = [_]DecisionLabel{ .{ .name = "no" }, .{ .name = "yes" } };
+    const tasks = [_]DecisionTask{
+        .{ .name = "first", .prompt = "retry", .labels = &labels },
+        .{ .name = "second", .prompt = "cancel", .labels = &labels },
+        .{ .name = "third", .prompt = "budget", .labels = &labels },
+    };
+    const requests = [_]DecisionRequest{
+        .{ .text = "same retry source", .tasks = &tasks },
+        .{ .text = "same retry source", .tasks = &tasks },
+        .{ .text = "different source!", .tasks = tasks[1..] },
+    };
+    var batched = try pipeline.prepareDecisionBatch(&requests);
+    defer batched.deinit();
+    try std.testing.expect(batched.rows.len > requests.len); // Exercise task splitting.
+    for (requests, 0..) |request, request_index| {
+        var singleton = try pipeline.prepareDecisionBatch(&.{request});
+        defer singleton.deinit();
+        var row_index: usize = 0;
+        for (batched.rows) |row| {
+            if (row.request_index != request_index) continue;
+            const reference = singleton.rows[row_index];
+            inline for (.{ "input_ids", "attention_mask", "marker_positions", "marker_mask" }) |field|
+                try std.testing.expectEqualSlices(i64, @field(reference, field), @field(row, field));
+            try std.testing.expectEqualSlices(usize, reference.task_indexes, row.task_indexes);
+            row_index += 1;
+        }
+        try std.testing.expectEqual(singleton.rows.len, row_index);
+        try std.testing.expectEqual(singleton.prompt_tokens[0], batched.prompt_tokens[request_index]);
+        try std.testing.expectEqual(singleton.logits_len[0], batched.logits_len[request_index]);
+        try std.testing.expectEqualSlices(DecisionTaskRange, singleton.task_ranges[0], batched.task_ranges[request_index]);
+    }
 }

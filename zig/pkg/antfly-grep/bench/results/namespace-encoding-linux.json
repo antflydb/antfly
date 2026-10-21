@@ -1,0 +1,105 @@
+{
+  "measurement": "Isolate native v2/v3 encoding with a buffered raw-byte consumer.\n\nValidate complete decoded results before timing. Timed requests drain every\nframe and validate summaries/termination, but decode only control records.\nProducer CPU includes workers; raw-drain elapsed is not editor/client latency.\nUse enough requests to amortize 10 ms process CPU counter quantization.\n",
+  "host": "Linux-7.0.14-linuxkit-aarch64-with-glibc2.41",
+  "driver_sha256": "b363b0fea98e6eed34b6824c47a12784e7336655ccacd2ba8563a7c5c7162503",
+  "binaries": {
+    "baseline": "3c4c2d24786060822b31d7b961c04840fc603417c57b000e85aa595105130d3a",
+    "candidate": "2eaa1308e9025f5c6f82063ef5387c4c008040ce5cfd536db3b0629683a36aba"
+  },
+  "requests_per_control": 64,
+  "lines": 20000,
+  "trials": [
+    {
+      "baseline_v2": {
+        "seconds_per_request": 0.018835768874851055,
+        "producer_cpu_per_request": 0.015,
+        "wire_bytes_per_request": 6084686.0
+      },
+      "candidate_v2": {
+        "seconds_per_request": 0.0255642480624374,
+        "producer_cpu_per_request": 0.0221875,
+        "wire_bytes_per_request": 6084686.0
+      },
+      "baseline_v3": {
+        "seconds_per_request": 0.010068375657283468,
+        "producer_cpu_per_request": 0.008125,
+        "wire_bytes_per_request": 4065790.4375
+      },
+      "candidate_v3": {
+        "seconds_per_request": 0.009854909500063513,
+        "producer_cpu_per_request": 0.0078125,
+        "wire_bytes_per_request": 4065790.53125
+      }
+    },
+    {
+      "candidate_v2": {
+        "seconds_per_request": 0.02071638803136011,
+        "producer_cpu_per_request": 0.016875,
+        "wire_bytes_per_request": 6084686.0
+      },
+      "baseline_v3": {
+        "seconds_per_request": 0.010474727219843771,
+        "producer_cpu_per_request": 0.00890625,
+        "wire_bytes_per_request": 4065790.6875
+      },
+      "candidate_v3": {
+        "seconds_per_request": 0.009824750015468453,
+        "producer_cpu_per_request": 0.0084375,
+        "wire_bytes_per_request": 4065790.5
+      },
+      "baseline_v2": {
+        "seconds_per_request": 0.012061100265782443,
+        "producer_cpu_per_request": 0.00859375,
+        "wire_bytes_per_request": 6084686.0
+      }
+    },
+    {
+      "baseline_v3": {
+        "seconds_per_request": 0.008850011079630349,
+        "producer_cpu_per_request": 0.0075,
+        "wire_bytes_per_request": 4065790.125
+      },
+      "candidate_v3": {
+        "seconds_per_request": 0.009516811860521557,
+        "producer_cpu_per_request": 0.0078125,
+        "wire_bytes_per_request": 4065790.328125
+      },
+      "baseline_v2": {
+        "seconds_per_request": 0.012746525389957242,
+        "producer_cpu_per_request": 0.00921875,
+        "wire_bytes_per_request": 6084686.0
+      },
+      "candidate_v2": {
+        "seconds_per_request": 0.013193828781368211,
+        "producer_cpu_per_request": 0.00921875,
+        "wire_bytes_per_request": 6084686.0
+      }
+    }
+  ],
+  "median": {
+    "baseline_v2": {
+      "seconds_per_request": 0.012746525389957242,
+      "producer_cpu_per_request": 0.00921875,
+      "wire_bytes_per_request": 6084686.0
+    },
+    "candidate_v2": {
+      "seconds_per_request": 0.02071638803136011,
+      "producer_cpu_per_request": 0.016875,
+      "wire_bytes_per_request": 6084686.0
+    },
+    "baseline_v3": {
+      "seconds_per_request": 0.010068375657283468,
+      "producer_cpu_per_request": 0.008125,
+      "wire_bytes_per_request": 4065790.4375
+    },
+    "candidate_v3": {
+      "seconds_per_request": 0.009824750015468453,
+      "producer_cpu_per_request": 0.0078125,
+      "wire_bytes_per_request": 4065790.5
+    }
+  },
+  "qualified_program_commit": "8f1a78f67926f2858be56ceb070c2f7ddcffc0ad",
+  "qualified_consumer_commit": "95126ee24aabc6d1c0d11a84c2a12c5eac8afa95",
+  "baseline_program_commit": "687cf045a27bc07087988cb95f2ed9db0466263f",
+  "qualification_limits": "Shared warm macOS host. Linux is a two-CPU ARM64 Docker VM, with namespace fixtures on tmpfs; not independent native Linux hardware or cold storage. Windows is cross-compiled only. Default v2 has no general performance-win claim."
+}

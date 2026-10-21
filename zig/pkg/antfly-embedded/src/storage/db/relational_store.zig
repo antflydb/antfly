@@ -69,6 +69,19 @@ pub fn decodeValueForSchemaAndLayoutAlloc(
     return try row_codec.reconstructOrdinalValueWithLayoutAlloc(alloc, packed_row, table_schema, layout);
 }
 
+/// Decode without allocating a logical JSON document larger than max_bytes.
+pub fn decodeValueForSchemaAndLayoutLimitedAlloc(
+    alloc: Allocator,
+    packed_row: []const u8,
+    table_schema: schema.TableSchema,
+    layout: *const row_codec.PhysicalLayout,
+    max_bytes: usize,
+) ![]u8 {
+    if (!document_mapper.isRelationalRowValue(packed_row)) return error.InvalidFormat;
+    _ = try row_codec.rowSchemaVersion(packed_row);
+    return row_codec.reconstructOrdinalValueWithLayoutLimitedAlloc(alloc, packed_row, table_schema, layout, max_bytes);
+}
+
 pub fn materializeDocumentForSchemaAndLayoutAlloc(
     alloc: Allocator,
     packed_row: []const u8,

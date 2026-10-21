@@ -42,6 +42,100 @@ test "metadata ordered artifact inventory admission requires matching catalogs o
     try std.testing.expect(artifactCatalogsCompatible(binding, .{ .epoch = 2, .digest = @splat(2), .semantic_digest = binding.semantic_digest }));
 }
 
+const StatusResponses = struct {
+    donor: api.QueryResponse,
+    receiver: api.QueryResponse,
+    fn deinit(self: *StatusResponses, alloc: Allocator) void {
+        self.donor.deinit(alloc);
+        self.receiver.deinit(alloc);
+    }
+};
+
+/// Both independent read-index probes share one turn budget. Serial probes
+/// can starve the copy forever when each fits the budget but their sum does
+/// not. Responses own separate buffers; parsing into the turn arena remains
+/// single-threaded. Every error joins the read before releasing its inputs.
+fn concurrentStatuses(io: std.Io, alloc: Allocator, worker: anytype) !StatusResponses {
+    const Worker = switch (@typeInfo(@TypeOf(worker))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(worker),
+    };
+    var donor = io.concurrent(Worker.run, .{ worker, io_contract.Side.donor }) catch {
+        // Inline runtimes and a saturated general lane retain the previous
+        // bounded serial path; lack of a spare task is not new merge debt.
+        var source_response = try worker.run(.donor);
+        errdefer source_response.deinit(alloc);
+        return .{ .donor = source_response, .receiver = try worker.run(.receiver) };
+    };
+    var receiver = worker.run(.receiver) catch |err| {
+        if (donor.cancel(io)) |response| {
+            var discarded = response;
+            discarded.deinit(alloc);
+        } else |_| {}
+        return err;
+    };
+    errdefer receiver.deinit(alloc);
+    return .{ .donor = try donor.await(io), .receiver = receiver };
+}
+
+test "online merge status probes overlap and join both error paths" {
+    const Worker = struct {
+        io: std.Io,
+        entered: std.atomic.Value(u32) = .init(0),
+        both_entered: std.Io.Event = .unset,
+        fail: ?io_contract.Side,
+        fn run(self: *@This(), side: io_contract.Side) !api.QueryResponse {
+            if (self.entered.fetchAdd(1, .acq_rel) == 1) self.both_entered.set(self.io);
+            // This rendezvous fails if either status is awaited before the
+            // other starts; it does not rely on an elapsed-time assertion.
+            try self.both_entered.waitTimeout(self.io, .{
+                .duration = .{ .raw = .fromSeconds(2), .clock = .awake },
+            });
+            if (self.fail == side) return error.Timeout;
+            return .{ .body = try std.testing.allocator.dupe(u8, @tagName(side)) };
+        }
+    };
+    for ([_]?io_contract.Side{ null, .donor, .receiver }) |fail| {
+        var worker: Worker = .{ .io = std.testing.io, .fail = fail };
+        if (fail != null) {
+            try std.testing.expectError(error.Timeout, concurrentStatuses(std.testing.io, std.testing.allocator, &worker));
+        } else {
+            var responses = try concurrentStatuses(std.testing.io, std.testing.allocator, &worker);
+            defer responses.deinit(std.testing.allocator);
+            try std.testing.expectEqualStrings("donor", responses.donor.body);
+            try std.testing.expectEqualStrings("receiver", responses.receiver.body);
+        }
+        try std.testing.expectEqual(@as(u32, 2), worker.entered.load(.acquire));
+    }
+}
+
+test "online merge status probes preserve inline progress when concurrency is unavailable" {
+    var unavailable = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .nothing });
+    defer unavailable.deinit();
+    const Worker = struct {
+        calls: u32 = 0,
+        fail: ?io_contract.Side,
+        fn run(self: *@This(), side: io_contract.Side) !api.QueryResponse {
+            try std.testing.expectEqual(if (self.calls == 0) io_contract.Side.donor else .receiver, side);
+            self.calls += 1;
+            if (self.fail == side) return error.Timeout;
+            return .{ .body = try std.testing.allocator.dupe(u8, @tagName(side)) };
+        }
+    };
+    for ([_]?io_contract.Side{ null, .donor, .receiver }) |fail| {
+        var worker: Worker = .{ .fail = fail };
+        if (fail != null) {
+            try std.testing.expectError(error.Timeout, concurrentStatuses(unavailable.io(), std.testing.allocator, &worker));
+        } else {
+            var responses = try concurrentStatuses(unavailable.io(), std.testing.allocator, &worker);
+            defer responses.deinit(std.testing.allocator);
+            try std.testing.expectEqualStrings("donor", responses.donor.body);
+            try std.testing.expectEqualStrings("receiver", responses.receiver.body);
+        }
+        try std.testing.expectEqual(@as(u32, if (fail == .donor) 1 else 2), worker.calls);
+    }
+}
+
 pub const Context = struct {
     record: state_mod.MergeTransitionRecord,
     donor: ?table.RangeRecord,
@@ -329,7 +423,7 @@ fn Adapter(comptime Service: type) type {
             const alloc = owned.arena.allocator();
             var proposed = batch;
             if (proposed.merge_checkpoint) |*checkpoint_value| if (checkpoint_value.page_source) |source_identity| if (source_identity.artifact_catalog) |binding| {
-                if (binding.effect_protocol == 15 and checkpoint_value.page_source_catalogs == null) {
+                if (binding.effect_protocol >= 15 and checkpoint_value.page_source_catalogs == null) {
                     const catalogs = try self.fetch(@import("antfly_local_sources").storage_db_artifact_inventory.Catalogs, owned, state, .source_catalog);
                     if (!std.mem.eql(u8, &catalogs.digest(), &binding.digest)) return error.OnlineMergeArtifactCatalogChanged;
                     checkpoint_value.page_source_catalogs = catalogs;
@@ -362,17 +456,34 @@ fn Adapter(comptime Service: type) type {
                 owned.arena.deinit();
                 self.alloc.destroy(owned.arena);
             }
-            const donor = try self.fetch(io_contract.SourceStatus, owned, state, .{ .status = .donor });
+            const alloc = owned.arena.allocator();
+            const donor = if (state.needsReceiver()) blk: {
+                const StatusWorker = struct {
+                    adapter: *Self,
+                    owned: Owned,
+                    state: online.State,
+                    fn run(worker: @This(), side: io_contract.Side) !api.QueryResponse {
+                        // The shared turn arena is not thread-safe. Each
+                        // transport uses the service's concurrent allocator.
+                        var transport = worker.adapter.client(worker.adapter.alloc);
+                        var cancellation: http.RequestCancellation = .{ .borrowed_context = worker.owned.request.cancellation.ptr, .borrowed_is_cancelled = worker.owned.request.cancellation.is_cancelled_fn };
+                        const request: io_contract.Request = .{ .scope = worker.state.scope, .operation = .{ .status = side } };
+                        return transport.fetchGroupOnlineMergeIo(try worker.owned.uri(request.ownerGroup()), request.ownerGroup(), worker.owned.context.record.table_contract.table_name, request, try timeout(worker.owned.request), &cancellation);
+                    }
+                };
+                const io = (try self.service.ensureBackendRuntime()).io() orelse return error.BackendIoUnavailable;
+                var responses = try concurrentStatuses(io, self.alloc, StatusWorker{ .adapter = self, .owned = owned, .state = state });
+                defer responses.deinit(self.alloc);
+                const receiver = try std.json.parseFromSliceLeaky(io_contract.ReceiverStatus, alloc, responses.receiver.body, .{ .allocate = .alloc_always });
+                if (!std.meta.eql(receiver.scope, state.scope)) return error.OnlineMergeReceiptMismatch;
+                owned.receiver_status = receiver;
+                break :blk try std.json.parseFromSliceLeaky(io_contract.SourceStatus, alloc, responses.donor.body, .{ .allocate = .alloc_always });
+            } else try self.fetch(io_contract.SourceStatus, owned, state, .{ .status = .donor });
             if (state.phase == .admit and donor.ordinary_conflict) {
                 if (!std.meta.eql(donor.scope, state.scope)) return error.OnlineMergeReceiptMismatch;
                 return .{ .owned_arena = owned.arena, .scope = state.scope, .source_progress = donor.progress, .ordinary_conflict = true };
             }
             if (!std.meta.eql(donor.scope, state.scope)) return error.OnlineMergeReceiptMismatch;
-            if (state.needsReceiver()) {
-                const receiver = try self.fetch(io_contract.ReceiverStatus, owned, state, .{ .status = .receiver });
-                if (!std.meta.eql(receiver.scope, state.scope)) return error.OnlineMergeReceiptMismatch;
-                owned.receiver_status = receiver;
-            }
             if (!donor.row_derived_indexes and owned.context.record.rollback_reason == null and
                 state.phase != .cancel_receiver and state.phase != .cancel_release and state.phase != .release and !state.terminal())
                 return error.OnlineMergeArtifactTailsUnsupported;
@@ -414,7 +525,7 @@ fn Adapter(comptime Service: type) type {
         fn prepared(self: *Self, owned: Owned, state: online.State, operation_kind: @FieldType(io_contract.Request, "operation")) !void {
             var prepared_operation = operation_kind;
             if (prepared_operation == .checkpoint) if (prepared_operation.checkpoint.page_source) |source_identity| if (source_identity.artifact_catalog) |binding| {
-                if (binding.effect_protocol == 15) {
+                if (binding.effect_protocol >= 15) {
                     const catalogs = try self.fetch(@import("antfly_local_sources").storage_db_artifact_inventory.Catalogs, owned, state, .source_catalog);
                     if (!std.mem.eql(u8, &catalogs.digest(), &binding.digest)) return error.OnlineMergeArtifactCatalogChanged;
                     prepared_operation.checkpoint.page_source_catalogs = catalogs;

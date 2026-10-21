@@ -417,7 +417,7 @@ func (r *AntflyClusterReconciler) reconcileHAStartupTargetPVC(ctx context.Contex
 	}
 	key := types.NamespacedName{Name: name, Namespace: cluster.Namespace}
 	existing := &corev1.PersistentVolumeClaim{}
-	if err := r.Get(ctx, key, existing); err != nil {
+	if err := r.haBoundaryReader().Get(ctx, key, existing); err != nil {
 		if !errors.IsNotFound(err) {
 			return nil, err
 		}
@@ -428,7 +428,7 @@ func (r *AntflyClusterReconciler) reconcileHAStartupTargetPVC(ctx context.Contex
 		created := &corev1.PersistentVolumeClaim{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cluster.Namespace, Labels: persistentVolumeClaimLabels(cluster, standaloneComponent(cluster))},
 			Spec: corev1.PersistentVolumeClaimSpec{
-				AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				AccessModes:      []corev1.PersistentVolumeAccessMode{cluster.Spec.Storage.EffectiveStandaloneAccessMode()},
 				StorageClassName: storageClassName,
 				Resources: corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{
 					corev1.ResourceStorage: resource.MustParse(storageSize),
@@ -442,6 +442,9 @@ func (r *AntflyClusterReconciler) reconcileHAStartupTargetPVC(ctx context.Contex
 	}
 	if existing.DeletionTimestamp != nil {
 		return nil, fmt.Errorf("HA startup target PVC %s is terminating", name)
+	}
+	if err := validateExplicitStandalonePVCAccessMode(existing, cluster); err != nil {
+		return nil, err
 	}
 	if owner := metav1.GetControllerOf(existing); owner != nil {
 		return nil, fmt.Errorf("HA startup target PVC %s must be independently retained, but is controlled by %s %s", name, owner.Kind, owner.Name)
@@ -504,13 +507,22 @@ func (r *AntflyClusterReconciler) reconcileLegacyStandaloneStatefulSetStartupGat
 func (r *AntflyClusterReconciler) reconcileSuspendedStandaloneStatefulSet(ctx context.Context, cluster *antflyv1.AntflyCluster) (bool, error) {
 	existing := &appsv1.StatefulSet{}
 	key := types.NamespacedName{Name: standaloneStatefulSetName(cluster), Namespace: cluster.Namespace}
-	if err := r.Get(ctx, key, existing); err != nil {
+	if err := r.haBoundaryReader().Get(ctx, key, existing); err != nil {
 		if errors.IsNotFound(err) {
 			return false, nil
 		}
 		return false, err
 	}
-	if existing.Spec.Replicas == nil || *existing.Spec.Replicas != 0 {
+	// This fast path bypasses CreateOrUpdate and must establish ownership
+	// itself before changing availability or claim retention. Use the live
+	// object's resource version so an ownership race conflicts on Update.
+	if !metav1.IsControlledBy(existing, cluster) {
+		return false, fmt.Errorf("cannot suspend StatefulSet %s: it is not controlled by AntflyCluster UID %s", existing.Name, cluster.UID)
+	}
+	retention := existing.Spec.PersistentVolumeClaimRetentionPolicy
+	retain := retention != nil && retention.WhenScaled == appsv1.RetainPersistentVolumeClaimRetentionPolicyType && retention.WhenDeleted == appsv1.RetainPersistentVolumeClaimRetentionPolicyType
+	if existing.Spec.Replicas == nil || *existing.Spec.Replicas != 0 || !retain {
+		existing.Spec.PersistentVolumeClaimRetentionPolicy = &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{WhenDeleted: appsv1.RetainPersistentVolumeClaimRetentionPolicyType, WhenScaled: appsv1.RetainPersistentVolumeClaimRetentionPolicyType}
 		zero := int32(0)
 		existing.Spec.Replicas = &zero
 		return true, r.Update(ctx, existing)
@@ -1766,9 +1778,49 @@ func standaloneStorageIdentity(cluster *antflyv1.AntflyCluster) (engine, liteFil
 	return engine, liteFileName
 }
 
+func validateExplicitStandalonePVCAccessMode(pvc *corev1.PersistentVolumeClaim, cluster *antflyv1.AntflyCluster) error {
+	// Existing HA deployments predate this optional contract. Once requested,
+	// an explicit seed claim must provide the same fence as a claim template.
+	if cluster.Spec.Storage.StandaloneAccessMode != "" && (len(pvc.Spec.AccessModes) != 1 || pvc.Spec.AccessModes[0] != cluster.Spec.Storage.EffectiveStandaloneAccessMode()) {
+		return fmt.Errorf("standalone PVC %s access mode migration requires a new volume: existing %v, requested %s", pvc.Name, pvc.Spec.AccessModes, cluster.Spec.Storage.EffectiveStandaloneAccessMode())
+	}
+	return nil
+}
+
+// A retained claim can outlive its StatefulSet and be reused by name. Its
+// access mode, rather than a newly created claim template, is the actual fence.
+func (r *AntflyClusterReconciler) validateRetainedStandalonePVCAccessMode(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	name := fmt.Sprintf("%s-%s-0", standaloneStorageVolumeName(cluster), standaloneStatefulSetName(cluster))
+	claim := &corev1.PersistentVolumeClaim{}
+	if err := r.haBoundaryReader().Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, claim); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if claim.DeletionTimestamp != nil {
+		return fmt.Errorf("standalone PVC %s is terminating", name)
+	}
+	if len(claim.Spec.AccessModes) != 1 || claim.Spec.AccessModes[0] != cluster.Spec.Storage.EffectiveStandaloneAccessMode() {
+		return fmt.Errorf("standalone PVC %s access mode migration requires a new volume: existing %v, requested %s", name, claim.Spec.AccessModes, cluster.Spec.Storage.EffectiveStandaloneAccessMode())
+	}
+	return nil
+}
+
 func validateAndSetStandaloneStorageIdentity(statefulSet *appsv1.StatefulSet, cluster *antflyv1.AntflyCluster) error {
 	engine, liteFileName := standaloneStorageIdentity(cluster)
 	if statefulSet.ResourceVersion != "" {
+		// Claim templates are immutable. A webhook outage must not turn an
+		// existing RWO volume into an apparently pod-exclusive deployment.
+		for _, claim := range statefulSet.Spec.VolumeClaimTemplates {
+			if claim.Name != standaloneStorageVolumeName(cluster) {
+				continue
+			}
+			modes := claim.Spec.AccessModes
+			if len(modes) == 0 { // Legacy objects omitted the RWO default.
+				modes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
+			}
+			if len(modes) != 1 || modes[0] != cluster.Spec.Storage.EffectiveStandaloneAccessMode() {
+				return fmt.Errorf("standalone PVC access mode migration requires a new volume: existing StatefulSet %s uses %v, requested %s", statefulSet.Name, modes, cluster.Spec.Storage.EffectiveStandaloneAccessMode())
+			}
+		}
 		persistedEngine, ok := statefulSet.Annotations[annotationStorageEngine]
 		if !ok {
 			if standaloneUsesLegacySwarmIdentity(cluster) && engine == "local" && statefulSet.Name == cluster.Name+"-swarm" && metav1.IsControlledBy(statefulSet, cluster) {
@@ -4775,6 +4827,15 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 	if replicas == 0 {
 		replicas = 1
 	}
+	if standalone.Suspend {
+		replicas = 0
+		if held, err := r.reconcileSuspendedStandaloneStatefulSet(ctx, cluster); err != nil {
+			return err
+		} else if held {
+			return nil
+		}
+	}
+
 	storageSize := chooseStandaloneStorageSize(cluster)
 	startupGate := haRuntimeStartupGate(cluster)
 	activatedSeedGate := startupGate != nil && startupGate.Policy == antflyv1.HAStartupGatePolicyRequireActivatedSeed && startupGate.RequiredReceipt != nil
@@ -4847,7 +4908,7 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 			},
 			Spec: corev1.PersistentVolumeClaimSpec{
 				AccessModes: []corev1.PersistentVolumeAccessMode{
-					corev1.ReadWriteOnce,
+					cluster.Spec.Storage.EffectiveStandaloneAccessMode(),
 				},
 				StorageClassName: storageClassName,
 				Resources: corev1.VolumeResourceRequirements{
@@ -4889,9 +4950,23 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 			if preservedSeedStorage == nil && hasExplicitStandaloneStoragePVC(statefulSet, storageVolumeName) {
 				return fmt.Errorf("existing StatefulSet %s has an explicit standalone storage PVC without a complete activated-seed binding; refusing to reinterpret its on-disk layout", statefulSet.Name)
 			}
+			if preservedSeedStorage != nil && cluster.Spec.Storage.StandaloneAccessMode != "" {
+				claim := &corev1.PersistentVolumeClaim{}
+				if err := r.haBoundaryReader().Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: preservedSeedStorage.claimName}, claim); err != nil {
+					return err
+				}
+				if err := validateExplicitStandalonePVCAccessMode(claim, cluster); err != nil {
+					return err
+				}
+			}
 		}
 		if err := validateAndSetStandaloneStorageIdentity(statefulSet, cluster); err != nil {
 			return err
+		}
+		if len(statefulSet.Spec.VolumeClaimTemplates) != 0 {
+			if err := r.validateRetainedStandalonePVCAccessMode(ctx, cluster); err != nil {
+				return err
+			}
 		}
 		if err := controllerutil.SetControllerReference(cluster, statefulSet, r.Scheme); err != nil {
 			return err
@@ -4899,6 +4974,10 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 
 		statefulSet.Spec.Replicas = &replicas
 		statefulSet.Spec.PersistentVolumeClaimRetentionPolicy = buildPVCRetentionPolicy(cluster.Spec.Storage.PVCRetentionPolicy)
+		if standalone.Suspend {
+			statefulSet.Spec.PersistentVolumeClaimRetentionPolicy = &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{WhenDeleted: appsv1.RetainPersistentVolumeClaimRetentionPolicyType, WhenScaled: appsv1.RetainPersistentVolumeClaimRetentionPolicyType}
+		}
+
 		deferPromotionRollout, err := r.shouldDeferPromotedStandaloneRollout(ctx, cluster, statefulSet)
 		if err != nil {
 			return err
@@ -6072,6 +6151,32 @@ func (r *AntflyClusterReconciler) reconcileServiceMeshStatus(ctx context.Context
 	return nil
 }
 
+// A zero desired count is a request, not evidence that the writer stopped.
+// Only current, controller-owned workload status and an empty live Pod list
+// establish suspension. Pending and terminating Pods must also be absent.
+func standaloneSuspensionObserved(cluster *antflyv1.AntflyCluster, sts *appsv1.StatefulSet, pods *corev1.PodList) bool {
+	return sts.UID != "" && sts.Generation > 0 && sts.DeletionTimestamp == nil && metav1.IsControlledBy(sts, cluster) &&
+		sts.Spec.Replicas != nil && *sts.Spec.Replicas == 0 && sts.Status.ObservedGeneration >= sts.Generation &&
+		sts.Status.Replicas == 0 && sts.Status.ReadyReplicas == 0 && sts.Status.CurrentReplicas == 0 && sts.Status.UpdatedReplicas == 0 && sts.Status.AvailableReplicas == 0 &&
+		len(pods.Items) == 0
+}
+
+func listStandalonePodsForSuspension(ctx context.Context, reader client.Reader, cluster *antflyv1.AntflyCluster, sts *appsv1.StatefulSet) (*corev1.PodList, error) {
+	var namespacePods corev1.PodList
+	if err := reader.List(ctx, &namespacePods, client.InNamespace(cluster.Namespace)); err != nil {
+		return nil, err
+	}
+	pods := &corev1.PodList{ListMeta: namespacePods.ListMeta}
+	for i := range namespacePods.Items {
+		pod := &namespacePods.Items[i]
+		owner := metav1.GetControllerOf(pod)
+		if (sts.UID != "" && owner != nil && owner.UID == sts.UID) || statefulSetOrdinalPodName(standaloneStatefulSetName(cluster), pod.Name) {
+			pods.Items = append(pods.Items, *pod.DeepCopy())
+		}
+	}
+	return pods, nil
+}
+
 func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
 	return r.updateStatusFrom(ctx, cluster, nil)
 }
@@ -6106,8 +6211,14 @@ func (r *AntflyClusterReconciler) updateStatusFrom(
 			return fmt.Errorf("spec.standalone is required when spec.mode=Standalone")
 		}
 
+		// Suspension is a quiescence observation, so it cannot rely on the
+		// controller cache for either the workload or its remaining Pods.
+		var reader client.Reader = r.Client
+		if standalone.Suspend {
+			reader = r.haBoundaryReader()
+		}
 		standaloneSts := &appsv1.StatefulSet{}
-		if err := r.Get(ctx, types.NamespacedName{Name: standaloneStatefulSetName(cluster), Namespace: cluster.Namespace}, standaloneSts); err != nil && !errors.IsNotFound(err) {
+		if err := reader.Get(ctx, types.NamespacedName{Name: standaloneStatefulSetName(cluster), Namespace: cluster.Namespace}, standaloneSts); err != nil && !errors.IsNotFound(err) {
 			return err
 		}
 
@@ -6117,7 +6228,7 @@ func (r *AntflyClusterReconciler) updateStatusFrom(
 		cluster.Status.StandaloneNodesReady = readyReplicas
 		cluster.Status.MetadataNodesReady = 0
 		cluster.Status.DataNodesReady = 0
-		if readyReplicas >= standalone.Replicas && standalone.Replicas > 0 {
+		if readyReplicas >= standalone.Replicas && standalone.Replicas > 0 && !standalone.Suspend {
 			cluster.Status.Phase = "Running"
 		} else {
 			cluster.Status.Phase = "Pending"
@@ -6128,7 +6239,7 @@ func (r *AntflyClusterReconciler) updateStatusFrom(
 		}
 		oldStatus := *cluster.Status.StandaloneStatus
 		inferenceEnabled := standalone.Inference == nil || standalone.Inference.Enabled
-		cluster.Status.StandaloneStatus.Ready = readyReplicas >= standalone.Replicas && standalone.Replicas > 0
+		cluster.Status.StandaloneStatus.Ready = readyReplicas >= standalone.Replicas && standalone.Replicas > 0 && !standalone.Suspend
 		cluster.Status.StandaloneStatus.MetadataReady = cluster.Status.StandaloneStatus.Ready
 		cluster.Status.StandaloneStatus.StoreReady = cluster.Status.StandaloneStatus.Ready
 		cluster.Status.StandaloneStatus.InferenceReady = !inferenceEnabled || cluster.Status.StandaloneStatus.Ready
@@ -6140,9 +6251,22 @@ func (r *AntflyClusterReconciler) updateStatusFrom(
 		}
 
 		var podList corev1.PodList
-		if err := r.List(ctx, &podList, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, standaloneComponent(cluster)))); err != nil {
+		if standalone.Suspend {
+			// Names and controller ownership survive selector-label changes.
+			// Keep terminating and terminal Pods until Kubernetes removes them.
+			pods, err := listStandalonePodsForSuspension(ctx, reader, cluster, standaloneSts)
+			if err != nil {
+				return err
+			}
+			podList = *pods
+			if standaloneSuspensionObserved(cluster, standaloneSts, &podList) {
+				cluster.Status.Phase = "Suspended"
+			}
+		} else if err := reader.List(ctx, &podList, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, standaloneComponent(cluster)))); err != nil {
 			return err
 		}
+		cluster.Status.StandaloneStatus.PodName = ""
+		cluster.Status.StandaloneStatus.PodIP = ""
 		for _, pod := range podList.Items {
 			if pod.Status.Phase == corev1.PodRunning || pod.Status.Phase == corev1.PodPending {
 				cluster.Status.StandaloneStatus.PodName = pod.Name
@@ -6173,11 +6297,15 @@ func (r *AntflyClusterReconciler) updateStatusFrom(
 		}
 
 		r.updateRolloutCondition(cluster, standaloneSts)
-		r.setComponentCondition(cluster, antflyv1.TypeStandaloneReady, readyReplicas, standalone.Replicas, standaloneFindings, "standalone")
-		r.setComponentCondition(cluster, antflyv1.TypeMetadataReady, readyReplicas, standalone.Replicas, standaloneFindings, "standalone metadata")
-		r.setComponentCondition(cluster, antflyv1.TypeDataReady, readyReplicas, standalone.Replicas, standaloneFindings, "standalone store")
+		componentReadyReplicas := readyReplicas
+		if standalone.Suspend {
+			componentReadyReplicas = 0
+		}
+		r.setComponentCondition(cluster, antflyv1.TypeStandaloneReady, componentReadyReplicas, standalone.Replicas, standaloneFindings, "standalone")
+		r.setComponentCondition(cluster, antflyv1.TypeMetadataReady, componentReadyReplicas, standalone.Replicas, standaloneFindings, "standalone metadata")
+		r.setComponentCondition(cluster, antflyv1.TypeDataReady, componentReadyReplicas, standalone.Replicas, standaloneFindings, "standalone store")
 		if inferenceEnabled {
-			r.setComponentCondition(cluster, antflyv1.TypeInferenceReady, readyReplicas, standalone.Replicas, standaloneFindings, "standalone inference")
+			r.setComponentCondition(cluster, antflyv1.TypeInferenceReady, componentReadyReplicas, standalone.Replicas, standaloneFindings, "standalone inference")
 		} else {
 			meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
 				Type:               antflyv1.TypeInferenceReady,
@@ -6187,7 +6315,7 @@ func (r *AntflyClusterReconciler) updateStatusFrom(
 				Message:            "Inference is disabled",
 			})
 		}
-		r.setAvailableCondition(cluster, standaloneFindings, readyReplicas >= standalone.Replicas && standalone.Replicas > 0)
+		r.setAvailableCondition(cluster, standaloneFindings, readyReplicas >= standalone.Replicas && standalone.Replicas > 0 && !standalone.Suspend)
 		r.recordClusterRuntimeFailureEvents(cluster, originalConditions)
 		r.updateProductTierStatus(cluster)
 		if err := r.observeHAPrimaryRouteStatus(ctx, cluster); err != nil {

@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://antfly.io/schemas/grep-document-v1.json",
+  "title": "Antfly grep source document v1",
+  "type": "object",
+  "required": [
+    "grep"
+  ],
+  "properties": {
+    "grep": {
+      "type": "object",
+      "required": [
+        "version",
+        "uri",
+        "path",
+        "content",
+        "revision",
+        "indexed_at",
+        "permissions"
+      ],
+      "properties": {
+        "version": {
+          "const": 1
+        },
+        "uri": {
+          "type": "string",
+          "format": "uri",
+          "maxLength": 16384
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384
+        },
+        "content": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "indexed_at": {
+          "type": "integer",
+          "description": "UTC Unix seconds at which this exact revision was indexed."
+        },
+        "modified_at": {
+          "type": "integer"
+        },
+        "permissions": {
+          "type": "object",
+          "required": [
+            "public",
+            "readers"
+          ],
+          "properties": {
+            "public": {
+              "type": "boolean"
+            },
+            "readers": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "metadata": {
+          "type": "object"
+        },
+        "regions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "start_line",
+              "end_line"
+            ],
+            "properties": {
+              "start_line": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "end_line": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "label": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "created_at": {
+          "type": "integer"
+        },
+        "accessed_at": {
+          "type": "integer"
+        }
+      }
+    }
+  }
+}

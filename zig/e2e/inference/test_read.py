@@ -227,7 +227,9 @@ def _read_or_skip_backend_unavailable(
 @pytest.mark.multimodal
 def test_read_image(api):
     """Reading an image should return some text output."""
-    resp = api.read(images=[TINY_PNG_URI])
+    # This checks response shape, not long-form OCR. Keep native decode work
+    # bounded independently of the server's production output ceiling.
+    resp = api.read(images=[TINY_PNG_URI], max_tokens=8)
     assert_openai_list_response(resp, expected_len=1)
     results = resp["data"]
     assert len(results) == 1
@@ -237,7 +239,7 @@ def test_read_image(api):
 @pytest.mark.multimodal
 def test_read_with_prompt(api):
     """Reading with a prompt should return text."""
-    resp = api.read(images=[TINY_PNG_URI], prompt="Describe this image")
+    resp = api.read(images=[TINY_PNG_URI], prompt="Describe this image", max_tokens=32)
     results = resp["data"]
     assert len(results) == 1
     _assert_read_result_shape(results[0])

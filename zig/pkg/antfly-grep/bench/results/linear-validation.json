@@ -1,0 +1,149 @@
+{
+  "schema_version": 1,
+  "program_source_commit": "687cf045a27bc07087988cb95f2ed9db0466263f",
+  "measurement_driver_commit": "e2fcb5032144705d12394cbeaee2195b938ee9f5",
+  "baseline_commit": "168a2b04e1bcd549d247275cc656df71283a6c5e",
+  "merged_main": "f173b597eef090ef8b858fcb92264ceb41af71ab",
+  "compiler": "0.17.0",
+  "compiler_sha256": "1c5f706db0ed6d55451940f31dc05a6177d05696bc1fa5d853696d04c718b523",
+  "product_flags": [
+    "-Dgrep-only=true",
+    "-Doptimize=ReleaseFast",
+    "-Dstrip=true",
+    "-j2"
+  ],
+  "targets": {
+    "macos": "aarch64-macos-none native",
+    "linux": "aarch64-linux-gnu / shared-host two-CPU ARM64 Docker VM",
+    "windows": "x86_64-windows-gnu cross compilation only"
+  },
+  "source_sha256": {
+    "zig/pkg/antfly-grep/bench/encoding.py": "b363b0fea98e6eed34b6824c47a12784e7336655ccacd2ba8563a7c5c7162503",
+    "zig/pkg/antfly-grep/bench/framing.py": "bcdb8274d5b8b19236dbe701e3e3175827737e67afdd633c47aea12a9fddacb8",
+    "zig/pkg/antfly-grep/bench/session_compare.py": "8b066a9e80a25ddab707749cb0a500a36535ac11254516a490ba2b41c25a8da0",
+    "zig/pkg/antfly-grep/bench/transport_compare.py": "0da6a0e8a2eeac65891b794d1f4190812d3916fd81365ee891196aab3148e96d",
+    "zig/pkg/antfly-grep/src/artifact_cache.zig": "741a0431432dbf2039432d94bac184e15516439e4dd3353fb056387f7d243c6f",
+    "zig/pkg/antfly-grep/src/batch_store.zig": "dfc9000d7a2cb172537648934c4e85832691502b6c9f73bff0557d3fcc04e641",
+    "zig/pkg/antfly-grep/src/budget.zig": "a6eaba3744ddc79766d424986ab48f50a11980932d20d1bd0a0be9bb609d8fce",
+    "zig/pkg/antfly-grep/src/cache_codec.zig": "7c7b9214a631b7f38e7f5cddbdf5cb55b3b3b887868e7d2e017155547fdcaeb9",
+    "zig/pkg/antfly-grep/src/codec_stream.zig": "fb9183b943e0d10866c72c5905e9fd4ebc441977f0b61be62fd39f8968d2cf20",
+    "zig/pkg/antfly-grep/src/compression.zig": "3f09460e617e977e9449a67589e0fc2221d5b3067bc436f2627239d2deeb5422",
+    "zig/pkg/antfly-grep/src/concurrency.zig": "b85274a948d733dbea6d457010eac81ed708ce59dc0fda7b383660da5e3a640a",
+    "zig/pkg/antfly-grep/src/decision.zig": "21d1c3fcf14e3036d36f35f4cc1bd3776470622526d7da5402a339143a5cb4ce",
+    "zig/pkg/antfly-grep/src/directory_stamp.zig": "c6911d955f21c3e33940dd59f7138ccde4683ceba5302f476214c3e118ec6310",
+    "zig/pkg/antfly-grep/src/discovery.zig": "4da236828313cc3adca084810ba120e31e9b03620a3edef7e458cde3beb6d12d",
+    "zig/pkg/antfly-grep/src/discovery_journal.zig": "87b6dc9f27ff7553c458db4ea67ec861b99bd4daae105f8968a8b8e44fe605e8",
+    "zig/pkg/antfly-grep/src/document.zig": "97cc26609ff6a72ce576a914c0d3adc5b309fcd3572015604b09f4d368709a62",
+    "zig/pkg/antfly-grep/src/evidence.zig": "c78be52539f83924cc9a945746811101fef69df6c25ee005923df01603c91da5",
+    "zig/pkg/antfly-grep/src/external_dictionary.zig": "8bfba886a4bbbcc4dba4ee143adde99358f8692844a8f806c80522882e4f0047",
+    "zig/pkg/antfly-grep/src/filesystem.zig": "3ef2da9133a4cceae55287c5ca53681595352a5613f232ded8793e73e326343a",
+    "zig/pkg/antfly-grep/src/filetypes.zig": "20b562e88bf967518f97a20d7bdb27ccf24f7f8c4707481f16a09ebfeb0c8c88",
+    "zig/pkg/antfly-grep/src/http_date.zig": "8389e3fb2aedc54cb7a8f235e29d28cefd3d3a86137e67748f9555ce0bbf57ea",
+    "zig/pkg/antfly-grep/src/incremental.zig": "d0d407a48ca3a61a4e46625554c822865c8abe3ae6cc18848f50a8d25ae49c20",
+    "zig/pkg/antfly-grep/src/indexed.zig": "353fa3572553ba016c4e5b96fb579e481ecb81ec56ba5df369dafbda251e4ae9",
+    "zig/pkg/antfly-grep/src/interrupt.zig": "2b9352c36fc129315588ef7d3310d6e4138753997b2802c4146991fb422d3743",
+    "zig/pkg/antfly-grep/src/inventory.zig": "348abb48648f138046912e191eee607925b037d23217d516860f667e251047f7",
+    "zig/pkg/antfly-grep/src/json_fields.zig": "c521345aa2b2fc65289f528a9e35774ecfe2fceb9324a1f5ba06264b652c11dd",
+    "zig/pkg/antfly-grep/src/lexical_index.zig": "6e4fd881c3396eb54a3071789a7145ceef40efa5da4e26acea117fbcee69fa56",
+    "zig/pkg/antfly-grep/src/local_decider.zig": "826e76d53b3ced41fafa959f2f521dcf4700dcba9364cd882d055c781ce8448f",
+    "zig/pkg/antfly-grep/src/main.zig": "b3d6e682de4ab87108885e3a0bc134e0c68b3b90c62eaea011b0ed518d5d3db7",
+    "zig/pkg/antfly-grep/src/matcher.zig": "cd3860e2afc91be2d81233ea20cf8f515580af198d323061f709363e7260d20a",
+    "zig/pkg/antfly-grep/src/memory_pressure.zig": "48f627a5bd2af4dcdb2554480f1d45bfd74542f8d2eafa0c5172b83f87238680",
+    "zig/pkg/antfly-grep/src/native_library.zig": "2d7f89fbca9980b75c5944dd85ca0c722a72e4ca1bde1c8b33bbbeab97a72d2d",
+    "zig/pkg/antfly-grep/src/options.zig": "1dc44ec877679f1008d4b85c22ccda9e65a70ebeb7bf91bc97d48c0389513350",
+    "zig/pkg/antfly-grep/src/path_watch.zig": "14a05e925253080fce01cdc8e37e46c96d0384dadb219d29000ca803b7d73d9b",
+    "zig/pkg/antfly-grep/src/pcre2.zig": "4b69b3cdcc237b4618ce9c728fbd6cc6da2b0cd5c2992631ceeecf354ff11368",
+    "zig/pkg/antfly-grep/src/physical_allocator.zig": "b75c79c042bcaf095404292483c7d38a28ab9abdd430ce30d92ccdd92b8f03a5",
+    "zig/pkg/antfly-grep/src/preparation_store.zig": "7e8bb12e1e6907c96859509fed657830230721472a50400aa3feef1e37883932",
+    "zig/pkg/antfly-grep/src/prepared_query.zig": "c119c9fc36559c4611a9e515e9108eeff68123469a9b1fdfd48c6db43f0c1172",
+    "zig/pkg/antfly-grep/src/providers.zig": "0d3ea9bda270af65131c19da11d7d8b5a923ba89105d3b9a797c61087ae74992",
+    "zig/pkg/antfly-grep/src/ranked.zig": "61ff8b9c21a01ee2d1a700cd90bbbe3032a9ada1924b43119020646b0ba36d36",
+    "zig/pkg/antfly-grep/src/region_plan.zig": "ca7a0340dd423cc73cb2efa11917c4d84c4602ad8671406089f9c8b17b0f49e2",
+    "zig/pkg/antfly-grep/src/regions.zig": "386bd5f38042ad5374b3c27cbda2244ed28e7d3430233541852a0dba9cbeea6d",
+    "zig/pkg/antfly-grep/src/reuse_cache.zig": "553950a50e25ca4124e3d389393a113ba64fcbf615e85c301fe7733d0cb3be97",
+    "zig/pkg/antfly-grep/src/root.zig": "df442740b415575e542920c127dbf7a65b3a07ecf730535dc02ce1626df65b8c",
+    "zig/pkg/antfly-grep/src/score_store.zig": "5956340004ace90c0c26f91f6c46422ca2dad40e2fd9492a2f15f997d9c518a5",
+    "zig/pkg/antfly-grep/src/session.zig": "e5a69bf90e56357aa41502d8ad9f4f60b37da4675aa051a378ba0b358fd4bf69",
+    "zig/pkg/antfly-grep/src/setup.zig": "e3cde8066054dc564c6021c6232ce3057614bd13d1d75cbd2146038504f42aeb",
+    "zig/pkg/antfly-grep/src/snapshot.zig": "5f852f987f59fcf51fa80a59fb32c409a06619db35c92b12e2ff682179686a40",
+    "zig/pkg/antfly-grep/src/source.zig": "97f3b0ce15aa226710981c5a01454d1ee961d76d79aaa41a960dc1732c26213f",
+    "zig/pkg/antfly-grep/src/source_cache.zig": "752a6505ece853659c62fd42ef08c384ba0ab6b3f4a0b9287ebb06d689d9bcb8",
+    "zig/pkg/antfly-grep/src/source_views.zig": "6a1ee2dc8c2f1f57ef8cac9dcb366f2650cb72326989a224d7e47d8100e518b4",
+    "zig/pkg/antfly-grep/src/source_watch.zig": "905d3d9c69c3aae6525739b02a353dea973d809a4f41ec91741fd442ec52c4a3",
+    "zig/pkg/antfly-grep/src/spill.zig": "57833b2200e003be41bc8c31a8c2f05c647a208a60be25d5c0214679c6af1c5c",
+    "zig/pkg/antfly-grep/src/stream_encoding.zig": "ecfb327c4624fab32e229f47fbe6dd141a544489d353a278bb684a5ea20bc645",
+    "zig/pkg/antfly-grep/src/style.zig": "5c432d957810ea1c8157b9562e18a5757b078e36ee041c8244248b6ec5c5cfb1",
+    "zig/pkg/antfly-grep/src/temporary.zig": "c735fdf5d64e26c53bef0afb08d85f1ed4830770a92248fa4570e4db5a21fcb1",
+    "zig/pkg/antfly-grep/src/terminal.zig": "9e67e71a46c405ec8b220131592c561da1ed5de5036a6de2868d006a5d7778e3",
+    "zig/pkg/antfly-grep/src/tooling.zig": "b826ae7694ee6568689590ae5cd0f44308dbb558ab54f632d66bb8683598d65f",
+    "zig/pkg/antfly-grep/src/worker_pool.zig": "bb7ef5159fdc5b92f4930fb17774e2e5016c5b4c6e49f3c533736968b76f6667",
+    "zig/pkg/antfly-grep/src/workspace.zig": "a1f382ab0adbfe2010ecbe9578e846585645d55ec4f45ccf28c1ac4024c9ba6b",
+    "zig/pkg/antfly-grep/src/workspace_options.zig": "bc75945e6371091ec00b4b95d632f7f15a980a19500bd531848f7ffe26ef51da",
+    "zig/pkg/antfly-grep/src/workspace_profile.zig": "1ac469d4f3d575e950ed56538f29ad1e3af94fa394ec0d4492bf98a3ee37cd75",
+    "zig/pkg/antfly-grep/src/workspace_store.zig": "5b78f5fea398708f0b5e91ecf3f55fdcf511f726b39ed352be1c127c56684f1d",
+    "zig/pkg/antfly-grep/tests/test_cli.py": "3b25ee9fc3dec857158832c27ae60526b227e5f9a7864ef67c8fd3ceddc1fb14",
+    "zig/pkg/antfly-grep/tests/test_retained_tools.py": "9c86c6631b69c223486bf12dfd71a46d44bf48d0f9c5521a5fa80c406446273e"
+  },
+  "documentation_sha256": {
+    "README.md": "7cc5151cd70770f42be15e8e0b0d71a1bd8f9422784d4e0c4b82b27be9a5d063",
+    "COMPATIBILITY.md": "273ac727b9943eb1ef39f122ea2ae2b010f92a1e8d9fe0bfc7986d412a6714b5"
+  },
+  "binary_sha256": {
+    "macos": "6a09a4c44056ecf6507332d05da889de7451d2c574a7814a8fa717e02704fbdc",
+    "linux": "3c4c2d24786060822b31d7b961c04840fc603417c57b000e85aa595105130d3a",
+    "windows.exe": "798ffa7763e07270cea0f5b664987cd18b51cad594cf29252e17aa947aaf3a39"
+  },
+  "fixture_sha256": {
+    "macos": "5b98315bde639330e2e0a0fc94bb3a416ef6e9da04ae2abcdaafa7383018ab1e",
+    "linux": "4cab613b8956005528c765ee7656e122e471935e46373db6d0eae7f6bdf99f40"
+  },
+  "checks": {
+    "cli-macos.log": "4799b1de11f65fde51dd0e6b0f3c3dfe269e3325f3bb088a32bc201ef21affb3",
+    "cli-linux.log": "b7c1e1596107a98778736c75f3cd065fa9f9730cf8be8309c68e8fdd545de0bd",
+    "unit-macos.log": "895162f2298c4cab35c93c072d8b2bf1f2a92bb6fb8939b42c1581927cddc0de",
+    "unit-linux.log": "3d5d26a3beefcf0807c92d7dcd8fe591e598903d828bb25ee829401109b7b2ab",
+    "safe-macos.log": "29a16be3d2db6f1adfcc7db8c080c7eec9ff2b5e7c9140eebb7a647d90262575",
+    "tools.log": "f033993b7c6253d520391a568400eb028b9b860163145f76f9c15be334c80a4a",
+    "boundary.log": "4fbf01612a88e643f87a36ffa02f438dcb4301e1664fa3468c46d0eae1911666",
+    "toolchain.log": "9c62d84185f3765881bb58ef7c07bcaa7889b2bc77e5219868645cd14aefba70",
+    "ruff.log": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18",
+    "build-macos-final.log": "111103000d4309a7ff9dfc1acef39427ad6c62c45c6565916ab873588e12da7a",
+    "build-linux.log": "f7ed15438daa70a694dd0a25939dc8c26d3bca4705676627ce397672bf3a0923",
+    "build-windows.log": "563d56b471826cf5f647b6cc50e25e222d62363c0b542c9ff49899a73aa3ff6c",
+    "packaging.log": "546ca073854466c6b4dbd1e1dd6167c63773af28c5c19f5ec38ba37eea8d0664",
+    "license.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "compatibility.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "archives": {
+    "macos": {
+      "sha256": "fa7dd7b9e6976898796946f25f1c51fa47fcf531d09a82d0906046e603accc8c",
+      "binary_sha256": "6a09a4c44056ecf6507332d05da889de7451d2c574a7814a8fa717e02704fbdc",
+      "exact_assets": true
+    },
+    "linux": {
+      "sha256": "d173688d153032c42a9a774eac2387803cdd255501a8ae25acb80a679b500656",
+      "binary_sha256": "3c4c2d24786060822b31d7b961c04840fc603417c57b000e85aa595105130d3a",
+      "exact_assets": true
+    },
+    "windows": {
+      "sha256": "6e971412caac1571825e4f418f3edb110d2c45b5296be664bf5cdd0f6dffd497",
+      "binary_sha256": "798ffa7763e07270cea0f5b664987cd18b51cad594cf29252e17aa947aaf3a39",
+      "exact_assets": true
+    }
+  },
+  "reports": {
+    "linear-linux.json": "58ecfdafdc2f9563942d33576cd81944cd4ccc64e3393595b50a06908ea7eef0",
+    "linear-encoding-linux.json": "d3854a0bb35a90b401b889b6e47d324b99d98d8316c33b07dba355aed82f448e",
+    "linear-macos.json": "a6d389d3d7cf5a685283854a49f3c0d6a56b0f13a5536f74741f9258004a2b42",
+    "linear-framing.json": "08a6b3c161dac78e07f974dc89e7485bc5e723aa4c3c947ec8f0be3830c8441d",
+    "linear-encoding-macos.json": "dff88669ad07a36b1e4b80032e6d78cb878dd247966effeb0bba6dd91bc921e7"
+  },
+  "limits": [
+    "Shared host, warm filesystem caches; no independent Linux hardware or Windows runtime qualification.",
+    "V3 native CPU improves in these controls; decoded delivery remains consumer-bound and default-v2 results are mixed.",
+    "No peak-memory or cold-storage guarantee.",
+    "No indexed server change: exact JSON candidate pruning still requires a server-owned snapshot/validation/accounting contract.",
+    "No live providers or new real-server indexed scenarios run in this pass.",
+    "Full upstream PCRE2 dialect/JIT/CLI parity remains unproven."
+  ]
+}

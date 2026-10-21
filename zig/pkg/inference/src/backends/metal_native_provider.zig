@@ -91,6 +91,7 @@ comptime {
 }
 
 pub const MetalNativeProvider = if (build_options.enable_metal) struct {
+    pub const image_coefficient_budget: usize = 16 * 1024 * 1024;
     raw_provider: ?*RawMetalProvider,
     raw_decode_runtime: ?*RawMetalDecodeRuntime,
     embedding_workspace_leases: [64]?memory.AdmissionLease = @splat(null),
@@ -105,6 +106,19 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     embeddinggemma2_linear_cache_bytes: usize = 0,
     embeddinggemma2_vision_linear_cache_bytes: usize = 0,
     embeddinggemma2_audio_linear_cache_bytes: usize = 0,
+    embedding_vision_coefficients: ?*@import("../ops/metal_embedding_bindings.zig").VisionCoefficients = null,
+    embedding_vision_workspace_builds: u64 = 0,
+    embedding_vision_coefficient_builds: u64 = 0,
+    embedding_vision_workspaces: [2]?*@import("../ops/metal_embedding_bindings.zig").VisionWorkspace = @splat(null),
+    /// One model-owned RGB preparer; coefficients replace by geometry and are
+    /// admitted independently of request workspace. The provider lease serializes it.
+    embedding_image_preparer: ?@import("antfly_video").preparation.Metal = null,
+    embedding_rotary: [4]?*@import("../ops/metal_embedding_bindings.zig").Rotary = @splat(null),
+    embedding_rotary_clock: u64 = 0,
+    embedding_rotary_builds: u64 = 0,
+    embedding_rotary_hits: u64 = 0,
+    embedding_vision_clock: u64 = 0,
+    embedding_vision_retry: u64 = 0,
     embedding_bindings: ?*@import("../ops/metal_embedding_bindings.zig").State = null,
     embedding_binding_retry: u64 = 0,
     embedding_binding_clock: u64 = 0,
@@ -203,6 +217,55 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         self.releaseEmbeddingWorkspaceLeases();
     }
 
+    fn clearRotary(self: *MetalNativeProvider, vision: ?bool) usize {
+        var bytes: usize = 0;
+        for (&self.embedding_rotary) |*slot| if (slot.*) |entry| {
+            if (vision) |kind| if (entry.spec.vision != kind) continue;
+            bytes += entry.owner.host_bytes + entry.owner.backend_bytes;
+            entry.owner.deinit();
+            if (self.embeddinggemma2_cache_admission) |cache| {
+                cache.noteRelease(.host, entry.owner.host_bytes);
+                cache.noteRelease(.backend, entry.owner.backend_bytes);
+            }
+            std.heap.c_allocator.destroy(entry);
+            slot.* = null;
+        };
+        return bytes;
+    }
+    fn clearVisionWorkspaces(self: *MetalNativeProvider) usize {
+        var bytes: usize = 0;
+        for (&self.embedding_vision_workspaces) |*entry| if (entry.*) |workspace| {
+            bytes += workspace.owner.host_bytes + workspace.owner.backend_bytes;
+            workspace.owner.deinit();
+            if (self.embeddinggemma2_cache_admission) |cache| {
+                cache.noteRelease(.host, workspace.owner.host_bytes);
+                cache.noteRelease(.backend, workspace.owner.backend_bytes);
+            }
+            std.heap.c_allocator.destroy(workspace);
+            entry.* = null;
+        };
+        if (self.embedding_vision_coefficients) |coefficients| {
+            bytes += coefficients.owner.host_bytes + coefficients.owner.backend_bytes;
+            coefficients.owner.deinit();
+            if (self.embeddinggemma2_cache_admission) |cache| {
+                cache.noteRelease(.host, coefficients.owner.host_bytes);
+                cache.noteRelease(.backend, coefficients.owner.backend_bytes);
+            }
+            std.heap.c_allocator.destroy(coefficients);
+            self.embedding_vision_coefficients = null;
+        }
+        if (self.embedding_image_preparer) |*preparer| {
+            preparer.deinit(); // Fence before releasing persistent admission.
+            self.embedding_image_preparer = null;
+            if (self.embeddinggemma2_cache_admission) |cache| {
+                cache.noteRelease(.host, @sizeOf(@import("antfly_video").preparation.Metal));
+                cache.noteRelease(.backend, image_coefficient_budget);
+            }
+            bytes += image_coefficient_budget + @sizeOf(@import("antfly_video").preparation.Metal);
+        }
+        self.embedding_vision_retry = 0;
+        return bytes;
+    }
     fn clearEmbeddingBindings(self: *MetalNativeProvider) usize {
         const state = self.embedding_bindings orelse return 0;
         const bytes = state.owner.host_bytes + state.owner.backend_bytes;
@@ -239,7 +302,9 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         const cache = self.embeddinggemma2_cache_admission orelse return 0;
         const policy = @import("../models/embedding_gemma2_weight_cache.zig");
         var reclaimed: usize = 0;
+        if (cache_class != .audio) reclaimed += self.clearRotary(cache_class == .vision);
         if (cache_class == .language) reclaimed += self.clearEmbeddingBindings();
+        if (cache_class == .vision) reclaimed += self.clearVisionWorkspaces();
         if (cache_class == .audio) {
             if (metal_runtime.antfly_metal_audio_storage_clear(self.raw_decode_runtime) != 0) return error.MetalWorkspaceBusy;
             reclaimed += self.clearAudioSchedules();
@@ -368,7 +433,9 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
             metal_runtime.waitFrame(self.raw_decode_runtime) catch {};
         }
         metal_runtime.resetGatheredSpans(self);
+        _ = self.clearRotary(null);
         _ = self.clearEmbeddingBindings();
+        _ = self.clearVisionWorkspaces();
         _ = self.clearAudioSchedules();
         if (self.embeddinggemma2_audio_storage_bytes != 0) {
             _ = metal_runtime.antfly_metal_audio_storage_clear(self.raw_decode_runtime);

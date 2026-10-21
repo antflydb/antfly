@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
+from ..models.inference_decide_request_context_version import InferenceDecideRequestContextVersion
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -30,6 +31,10 @@ class InferenceDecideRequest:
             model (str):
             questions (list[ChoiceDecisionQuestion | MultiChoiceDecisionQuestion | PredicateDecisionQuestion |
                 ScoreDecisionQuestion]):
+            context_version (InferenceDecideRequestContextVersion | Unset): Explicit shared-context transport version.
+                Requires batched inputs and contexts; unknown versions are rejected.
+            contexts (list[str] | Unset): Shared immutable context strings referenced by context_index. Requires
+                context_version 1. Total expanded input bytes are limited to 16 MiB.
             model_identity (str | Unset): Pin the exact EmbeddingGemma 2 assets and embedding recipe.
             input_ (str | Unset):
             inputs (list[DecisionInput] | Unset):
@@ -43,6 +48,8 @@ class InferenceDecideRequest:
     questions: list[
         ChoiceDecisionQuestion | MultiChoiceDecisionQuestion | PredicateDecisionQuestion | ScoreDecisionQuestion
     ]
+    context_version: InferenceDecideRequestContextVersion | Unset = UNSET
+    contexts: list[str] | Unset = UNSET
     model_identity: str | Unset = UNSET
     input_: str | Unset = UNSET
     inputs: list[DecisionInput] | Unset = UNSET
@@ -69,6 +76,14 @@ class InferenceDecideRequest:
                 questions_item = questions_item_data.to_dict()
 
             questions.append(questions_item)
+
+        context_version: int | Unset = UNSET
+        if not isinstance(self.context_version, Unset):
+            context_version = self.context_version.value
+
+        contexts: list[str] | Unset = UNSET
+        if not isinstance(self.contexts, Unset):
+            contexts = self.contexts
 
         model_identity = self.model_identity
 
@@ -97,6 +112,10 @@ class InferenceDecideRequest:
                 "questions": questions,
             }
         )
+        if context_version is not UNSET:
+            field_dict["context_version"] = context_version
+        if contexts is not UNSET:
+            field_dict["contexts"] = contexts
         if model_identity is not UNSET:
             field_dict["model_identity"] = model_identity
         if input_ is not UNSET:
@@ -166,6 +185,15 @@ class InferenceDecideRequest:
 
             questions.append(questions_item)
 
+        _context_version = d.pop("context_version", UNSET)
+        context_version: InferenceDecideRequestContextVersion | Unset
+        if isinstance(_context_version, Unset):
+            context_version = UNSET
+        else:
+            context_version = InferenceDecideRequestContextVersion(_context_version)
+
+        contexts = cast(list[str], d.pop("contexts", UNSET))
+
         model_identity = d.pop("model_identity", UNSET)
 
         input_ = d.pop("input", UNSET)
@@ -196,6 +224,8 @@ class InferenceDecideRequest:
         inference_decide_request = cls(
             model=model,
             questions=questions,
+            context_version=context_version,
+            contexts=contexts,
             model_identity=model_identity,
             input_=input_,
             inputs=inputs,

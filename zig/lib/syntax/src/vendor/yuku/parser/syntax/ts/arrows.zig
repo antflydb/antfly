@@ -1,0 +1,173 @@
+// Vendored Yuku 0.20.1; upstream revision e68066ff291d2fe43c727054f03636f4a633596b.
+// SPDX-License-Identifier: MIT
+//
+// MIT License
+//
+// Copyright (c) 2026 Yuku
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+const std = @import("std");
+const ast = @import("../../ast.zig");
+const Parser = @import("../../parser.zig").Parser;
+const Error = @import("../../parser.zig").Error;
+
+const functions = @import("../functions.zig");
+const parenthesized = @import("../parenthesized.zig");
+const ParseExpressionOptions = @import("../expressions.zig").ParseExpressionOptions;
+
+const generics = @import("types/generics.zig");
+const predicate = @import("types/predicate.zig");
+
+pub const ArrowHead = enum { no, yes, maybe };
+
+pub fn classifyArrowHead(parser: *Parser) ArrowHead {
+    if (parser.current_token.tag != .left_paren) return .no;
+
+    var peek = parser.beginPeek();
+    defer peek.end();
+
+    const second = peek.next();
+
+    switch (second.tag) {
+        .spread => return .yes,
+        .left_bracket, .left_brace => return .maybe,
+        .right_paren => {
+            const third = peek.next();
+            return switch (third.tag) {
+                .arrow, .colon => .yes,
+                else => .no,
+            };
+        },
+        .this => {
+            const third = peek.next();
+            return if (third.tag == .colon) .yes else .no;
+        },
+        else => {
+            if (!second.tag.isIdentifierLike()) return .no;
+            const third = peek.next();
+            return switch (third.tag) {
+                .colon => .yes,
+                .question => blk: {
+                    const fourth = peek.next();
+                    break :blk switch (fourth.tag) {
+                        .colon, .comma, .assign, .right_paren => .yes,
+                        else => .no,
+                    };
+                },
+                .comma, .assign, .right_paren => .maybe,
+                else => .no,
+            };
+        },
+    }
+}
+
+pub fn parseArrow(
+    parser: *Parser,
+    is_async: bool,
+    arrow_start: u32,
+    options: ParseExpressionOptions,
+) Error!?ast.NodeIndex {
+    const saved_await = parser.context.await;
+    if (is_async) parser.context.await = true;
+    defer parser.context.await = saved_await;
+
+    const has_angle = generics.isAngleOpen(parser.current_token.tag);
+    const type_parameters = try generics.parseTypeParameters(parser);
+    if (has_angle and type_parameters == .null) return null;
+
+    if (parser.current_token.tag != .left_paren) return null;
+
+    const params = try functions.parseFormalParameters(
+        parser,
+        .arrow_formal_parameters,
+        false,
+    ) orelse return null;
+
+    const has_return_type = parser.tree.isTs() and parser.current_token.tag == .colon;
+    const return_type: ast.NodeIndex = if (has_return_type)
+        try predicate.parseReturnTypeAnnotation(parser) orelse return null
+    else
+        .null;
+
+    if (parser.current_token.tag != .arrow or parser.current_token.hasLineTerminatorBefore()) {
+        try parser.reportExpected(
+            parser.current_token.span,
+            "Expected '=>' on the same line after the arrow function parameters",
+            .{},
+        );
+        return null;
+    }
+
+    return parenthesized.buildArrowFunction(
+        parser,
+        params,
+        is_async,
+        arrow_start,
+        type_parameters,
+        return_type,
+        options,
+    );
+}
+
+// rewind on failure so a parenthesized expression, call, jsx, or `<T>` assertion can win
+pub fn tryParseArrow(
+    parser: *Parser,
+    is_async: bool,
+    arrow_start: u32,
+    options: ParseExpressionOptions,
+) Error!?ast.NodeIndex {
+    const head = parser.current_token.span.start;
+    if (parser.ts_rejected_speculations.contains(head)) return null;
+
+    const cp = parser.checkpoint();
+
+    const arrow = (try parseArrow(parser, is_async, arrow_start, options)) orelse {
+        parser.rewind(cp);
+        try parser.ts_rejected_speculations.putNoClobber(parser.allocator(), head, {});
+        return null;
+    };
+
+    // the `:` after an annotated arrow may belong to an enclosing conditional
+    const return_type = parser.tree.data(arrow).arrow_function_expression.return_type;
+    if (!parser.ts_context.allow_arrow_return_type and
+        return_type != .null and
+        parser.current_token.tag != .colon)
+    {
+        parser.rewind(cp);
+        return null;
+    }
+
+    return arrow;
+}
+
+// skip the checkpoint when jsx or a type assertion is likelier
+pub fn tryParseGenericArrow(
+    parser: *Parser,
+    is_async: bool,
+    arrow_start: u32,
+    options: ParseExpressionOptions,
+) Error!?ast.NodeIndex {
+    std.debug.assert(parser.current_token.tag == .less_than);
+
+    const next = parser.peekAhead();
+    if (!next.tag.isIdentifierLike() and next.tag != .@"const") return null;
+
+    return tryParseArrow(parser, is_async, arrow_start, options);
+}

@@ -410,7 +410,8 @@ test('every expensive worker is gated, pins its checkout, and disables automatic
     }
     const checkouts=text.match(/uses: actions\/checkout@[^\n]+\n[\s\S]*?(?=\n      -|$)/g)||[];
     for (const checkout of checkouts) {
-      if (suite.id === 'policy' && /path: trusted-ci\n/.test(checkout)) {
+      if ((suite.id === 'policy' && /path: trusted-ci\n/.test(checkout)) ||
+          (suite.workflow === 'zig-tests.yml' && /path: \.ci-dependency-policy\n/.test(checkout))) {
         assert.match(checkout,/ref: \$\{\{ github.workflow_sha \}\}/);
       } else {
         assert.match(checkout,/ref: \$\{\{ inputs.head_sha \|\| github.sha \}\}/);
@@ -714,5 +715,18 @@ test('PR result maps expanded suites to their single execution job', () => {
     for (const result of ['failure', 'skipped', 'cancelled']) {
       assert.throws(() => check({env: {RESULTS: JSON.stringify({...results, [job]: {result}})}}), /did not pass/);
     }
+  }
+});
+
+
+test('dependency bootstrap tooling comes from the executing workflow for old PR checkouts', () => {
+  const text=fs.readFileSync(path.resolve(__dirname,'../workflows/zig-tests.yml'),'utf8');
+  const blocks=text.split(/^  [\w-]+:\n/m).filter(s=>/name: Prepare verified Zig source dependencies/.test(s));
+  assert.ok(blocks.length > 0);
+  for (const block of blocks) {
+    assert.match(block,/name: Check out executing dependency policy[\s\S]*?ref: \$\{\{ github.workflow_sha \}\}\n\s+path: \.ci-dependency-policy\n\s+persist-credentials: false/);
+    assert.match(block,/sparse-checkout: \|\n\s+\.github\/actions\/prepare-zig-dependencies\n\s+scripts\/ci\/prepare_zig_dependencies.py\n\s+scripts\/ci\/zig-dependencies.json/);
+    assert.match(block,/name: Prepare verified Zig source dependencies\n\s+uses: \.\/\.ci-dependency-policy\/\.github\/actions\/prepare-zig-dependencies/);
+    assert.doesNotMatch(block,/uses: \.\/\.github\/actions\/prepare-zig-dependencies/);
   }
 });

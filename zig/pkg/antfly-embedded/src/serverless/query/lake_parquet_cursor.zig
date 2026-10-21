@@ -57,7 +57,8 @@ pub const Cursor = struct {
         pruned: bool = false,
         chunk: external.ColumnChunk,
         offset: u64,
-        decoded: ?parquet.OwnedColumns = null,
+        decoded: ?*SharedColumns = null,
+        dictionary_owner: ?*SharedDictionary = null,
         cached: ?@import("lake_decoded_cache.zig").Lease = null,
         dictionary: ?page.Dictionary = null,
         dictionary_lease: ?@import("lake_decoded_cache.zig").Lease = null,
@@ -65,6 +66,44 @@ pub const Cursor = struct {
         count: usize = 0,
         consumed: usize = 0,
     };
+    fn Shared(comptime T: type) type {
+        return struct {
+            a: A,
+            budget: @import("../../sql/memory_budget.zig"),
+            refs: std.atomic.Value(usize) = .init(1),
+            value: T = undefined,
+            dictionary: ?*SharedDictionary = null,
+            fn create(a: A) !*@This() {
+                const owner = try a.create(@This());
+                owner.* = .{ .a = a, .budget = .{ .backing = a, .limit = std.math.maxInt(usize) } };
+                return owner;
+            }
+            fn retain(self: *@This()) *@This() {
+                _ = self.refs.fetchAdd(1, .monotonic);
+                return self;
+            }
+            fn release(self: *@This()) void {
+                if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+                self.discard(true);
+            }
+            fn discard(self: *@This(), initialized: bool) void {
+                const a = self.a;
+                if (initialized) self.value.deinit(self.budget.allocator());
+                std.debug.assert(self.budget.live == 0);
+                if (self.dictionary) |dictionary| dictionary.release();
+                a.destroy(self);
+            }
+            fn bytes(self: *const @This()) usize {
+                return @sizeOf(@This()) +| self.budget.live +| if (self.dictionary) |dictionary| @sizeOf(SharedDictionary) +| dictionary.budget.live else 0;
+            }
+            fn stabilize(self: *@This(), a: A) void {
+                self.a = a;
+                self.budget.backing = a;
+            }
+        };
+    }
+    const SharedDictionary = Shared(page.Dictionary);
+    const SharedColumns = Shared(parquet.OwnedColumns);
     pub fn init(a: A, reader: parquet.ObjectRangeReader, inventory: external.Inventory, file_id: []const u8, ordinal: u32, names: []const []const u8, limits: parquet.MaterializationLimits) !Cursor {
         const file = inventory.fileById(file_id) orelse return error.ExternalSourceFileNotFound;
         if (ordinal >= file.row_groups.len) return error.ExternalSourceRowOutOfBounds;
@@ -82,34 +121,50 @@ pub const Cursor = struct {
     pub fn deinit(self: *Cursor) void {
         for (self.columns) |*column| {
             if (column.projection) |projection| projection.destroyWithAllocator(self.a);
-            if (column.decoded) |*decoded| decoded.deinit(self.a);
+            if (column.decoded) |decoded| decoded.release();
             if (column.cached) |lease| lease.release();
             if (column.directory_lease) |lease| lease.release() else if (column.directory) |*directory| directory.deinit();
-            if (column.dictionary_lease) |lease| lease.release() else if (column.dictionary) |*dictionary| dictionary.deinit(self.a);
+            if (column.dictionary_lease) |lease| lease.release() else if (column.dictionary_owner) |owner| owner.release();
         }
         self.a.free(self.columns);
         self.output.deinit();
     }
     pub fn retainColumns(self: *Cursor, a: A) !?types.ColumnOwner {
-        for (self.columns) |column| if (column.cached == null) return null;
+        for (self.columns) |column| if (column.projection != null or (column.cached == null and column.decoded == null)) return null;
+        const Held = union(enum) {
+            cached: @import("lake_decoded_cache.zig").Lease,
+            local: *SharedColumns,
+            fn release(held: @This()) void {
+                switch (held) {
+                    .cached => |lease| lease.release(),
+                    .local => |owner| owner.release(),
+                }
+            }
+        };
         const Owner = struct {
             a: A,
-            leases: []@import("lake_decoded_cache.zig").Lease,
+            held: []Held,
             fn release(raw: *anyopaque) void {
                 const self_: *@This() = @ptrCast(@alignCast(raw));
-                for (self_.leases) |lease| lease.release();
-                self_.a.free(self_.leases);
+                for (self_.held) |held| held.release();
+                self_.a.free(self_.held);
                 self_.a.destroy(self_);
             }
         };
         const owner = try a.create(Owner);
         errdefer a.destroy(owner);
-        owner.* = .{ .a = a, .leases = try a.alloc(@import("lake_decoded_cache.zig").Lease, self.columns.len) };
+        owner.* = .{ .a = a, .held = try a.alloc(Held, self.columns.len) };
         var bytes: usize = 0;
-        for (self.columns, owner.leases) |column, *lease| {
-            lease.* = column.cached.?.retain();
-            bytes +|= lease.item.budget.live;
-            if (lease.item.dependency) |dependency| bytes +|= dependency.budget.live;
+        for (self.columns, owner.held) |column, *held| {
+            if (column.cached) |cached| {
+                held.* = .{ .cached = cached.retain() };
+                bytes +|= cached.item.budget.live;
+                if (cached.item.dependency) |dependency| bytes +|= dependency.budget.live;
+            } else {
+                const local = column.decoded.?;
+                held.* = .{ .local = local.retain() };
+                bytes +|= local.bytes();
+            }
         }
         return .{ .ptr = owner, .release_fn = Owner.release, .retained_bytes = bytes };
     }
@@ -168,7 +223,7 @@ pub const Cursor = struct {
     fn advance(self: *Cursor, column: *Column) !void {
         if (column.projection) |projection| projection.destroyWithAllocator(self.a);
         column.projection = null;
-        if (column.decoded) |*decoded| decoded.deinit(self.a);
+        if (column.decoded) |decoded| decoded.release();
         column.decoded = null;
         if (column.cached) |lease| lease.release();
         column.cached = null;
@@ -297,10 +352,14 @@ pub const Cursor = struct {
                         column.dictionary_lease = lease;
                         column.dictionary = lease.item.payload.dictionary;
                     } else {
-                        var dictionary = try decodeDictionaryAlloc(self.a, column.chunk, parsed.header, encoded[parsed.header_len..]);
-                        errdefer dictionary.deinit(self.a);
-                        if (dictionary.retainedBytes() > self.limits.max_decoded_bytes / share) return error.ParquetPageTooLarge;
-                        column.dictionary = dictionary;
+                        const owner = try SharedDictionary.create(self.a);
+                        var initialized = false;
+                        errdefer owner.discard(initialized);
+                        owner.value = try decodeDictionaryAlloc(owner.budget.allocator(), column.chunk, parsed.header, encoded[parsed.header_len..]);
+                        initialized = true;
+                        if (owner.value.retainedBytes() > self.limits.max_decoded_bytes / share) return error.ParquetPageTooLarge;
+                        column.dictionary_owner = owner;
+                        column.dictionary = owner.value;
                     }
                     self.dictionary_decodes += 1;
                     continue;
@@ -359,10 +418,16 @@ pub const Cursor = struct {
                 const lease = try cache.acquire(key, @min(cache.max_loading_bytes, self.limits.max_decoded_bytes / share *| 4 +| self.limits.max_struct_allocation_bytes), self.shared_reader.?.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
                 column.cached = lease;
             } else {
-                // Cursor-owned dictionaries outlive every uncached page. Only
-                // cache publication needs an independently retained dependency.
+                // Uncached page leases retain their dictionary owner across
+                // cursor advancement and closure without copying dictionary values.
                 limits.borrow_dictionary = true;
-                column.decoded = try parquet.buildSupportedColumnsAllocWithLimits(self.a, self.inventory, self.file.file_id, self.group.ordinal, &input, limits);
+                const owner = try SharedColumns.create(self.a);
+                var initialized = false;
+                errdefer owner.discard(initialized);
+                owner.value = try parquet.buildSupportedColumnsAllocWithLimits(owner.budget.allocator(), self.inventory, self.file.file_id, self.group.ordinal, &input, limits);
+                initialized = true;
+                if (column.dictionary_owner) |dictionary| owner.dictionary = dictionary.retain();
+                column.decoded = owner;
             }
             column.count = count;
             column.consumed = @intCast(self.position - column.first);
@@ -544,7 +609,11 @@ pub const Cursor = struct {
     }
     fn advanceColumns(self: *Cursor, required_only: bool) !void {
         // Scoped decode locks never escape into retained page allocators.
-        defer for (self.columns) |column| if (column.projection) |projection| projection.stabilize(self.a);
+        defer for (self.columns) |column| {
+            if (column.projection) |projection| projection.stabilize(self.a);
+            if (column.decoded) |owner| owner.stabilize(self.a);
+            if (column.dictionary_owner) |owner| owner.stabilize(self.a);
+        };
         // Index arenas outlive this call. Their backing allocator must be the
         // cursor allocator, never the temporary worker locking adapter.
         for (self.columns) |*column| {
@@ -626,7 +695,7 @@ pub const Cursor = struct {
                 self.selected_values_decoded += projection.converted - previous;
                 continue;
             }
-            const decoded = if (column.cached) |lease| lease.item.payload.columns[0] else column.decoded.?.columns[0];
+            const decoded = if (column.cached) |lease| lease.item.payload.columns[0] else column.decoded.?.value.columns[0];
             const begin: usize = @intCast(self.position - column.first);
             var vector = decoded;
             vector.values = switch (decoded.values) {

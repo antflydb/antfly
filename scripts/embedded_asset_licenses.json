@@ -32,5 +32,60 @@
     "license": "Apache-2.0",
     "sha256": "5386fc9ad3e2798a4eb9ae97352514ffd1875170d9aaf775451c75154f2b15e9",
     "size_bytes": 541
+  },
+  "zig/lib/compress/src/brotli/brotli_dictionary.bin": {
+    "license": "MIT",
+    "license_text": "LICENSES/third-party/Brotli-Zig-MIT.txt",
+    "sha256": "20e42eb1b511c21806d4d227d07e5dd06877d8ce7b3a817f378f313653f35c70",
+    "size_bytes": 122784,
+    "source": "https://raw.githubusercontent.com/akeating/zig-parquet/38dec45c665037f2092db1464676afb8406a90d4/zig-parquet/src/core/compress/brotli_dictionary.bin"
+  },
+  "zig/lib/syntax/src/grammars/go.bin": {
+    "license": "MIT",
+    "license_text": "LICENSES/third-party/Tree-Sitter-Go-MIT.txt",
+    "sha256": "c78ee12d997debdff4b7897d4cafce9a2642c71f8d30efb553495c2d88425b00",
+    "size_bytes": 204502,
+    "source": "https://github.com/tree-sitter/tree-sitter-go/tree/1547678a9da59885853f5f5cc8a99cc203fa2e2c",
+    "kind": "Generated LR tables"
+  },
+  "zig/lib/syntax/src/grammars/go_corpus.bin": {
+    "license": "MIT",
+    "license_text": "LICENSES/third-party/Tree-Sitter-Go-MIT.txt",
+    "sha256": "0ecb582e40c6b11a25e5b2fa9d79d0f7e55f292f345617d8ccc0556acf198777",
+    "size_bytes": 45995,
+    "source": "https://github.com/tree-sitter/tree-sitter-go/tree/1547678a9da59885853f5f5cc8a99cc203fa2e2c",
+    "kind": "Upstream grammar conformance fixtures; normalized named syntax trees with compiler-backed ambiguity choices"
+  },
+  "zig/lib/syntax/src/grammars/python.bin": {
+    "license": "MIT",
+    "license_text": "LICENSES/third-party/Tree-Sitter-Python-MIT.txt",
+    "sha256": "e2d7e16c98c5a436ac6030112196771c12b6f23ebf337221652d6b96ee461140",
+    "size_bytes": 455984,
+    "source": "https://github.com/tree-sitter/tree-sitter-python/tree/293fdc02038ee2bf0e2e206711b69c90ac0d413f",
+    "kind": "Generated LR tables"
+  },
+  "zig/lib/syntax/src/grammars/python_corpus.bin": {
+    "license": "MIT",
+    "license_text": "LICENSES/third-party/Tree-Sitter-Python-MIT.txt",
+    "sha256": "23b0676dfc350c73b07c88259a88b8b5b42348052494ac1029ed23ab54cc239e",
+    "size_bytes": 69592,
+    "source": "https://github.com/tree-sitter/tree-sitter-python/tree/293fdc02038ee2bf0e2e206711b69c90ac0d413f",
+    "kind": "Upstream grammar conformance fixtures; normalized named syntax trees with compiler-backed ambiguity choices"
+  },
+  "zig/lib/syntax/src/grammars/rust.bin": {
+    "license": "MIT",
+    "license_text": "LICENSES/third-party/Tree-Sitter-Rust-MIT.txt",
+    "sha256": "9c45ae355f405b11752d5d757650c25202b4b5caa453a854101fb13edd037e2d",
+    "size_bytes": 790020,
+    "source": "https://github.com/tree-sitter/tree-sitter-rust/tree/77a3747266f4d621d0757825e6b11edcbf991ca5",
+    "kind": "Generated LR tables"
+  },
+  "zig/lib/syntax/src/grammars/rust_corpus.bin": {
+    "license": "MIT",
+    "license_text": "LICENSES/third-party/Tree-Sitter-Rust-MIT.txt",
+    "sha256": "3511fb6ee392dce720ceb24d582382d0db1304dfda8e937963d63a01b8296451",
+    "size_bytes": 81447,
+    "source": "https://github.com/tree-sitter/tree-sitter-rust/tree/77a3747266f4d621d0757825e6b11edcbf991ca5",
+    "kind": "Upstream grammar conformance fixtures; normalized named syntax trees with compiler-backed ambiguity choices"
   }
 }

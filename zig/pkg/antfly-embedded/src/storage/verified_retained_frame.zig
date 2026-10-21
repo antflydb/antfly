@@ -124,7 +124,7 @@ pub const Frame = struct {
                 if (effect.timestamp != 0) return error.RetainedEffectsCorrupt;
             } else if (@import("db/online_vector_artifacts.zig").isKey(key)) {
                 if (!view.direct_vectors or effect.timestamp != 0) return error.RetainedEffectsCorrupt;
-            } else if (@import("db/online_graph_artifacts.zig").isKey(key)) {
+            } else if (@import("db/online_graph_artifacts.zig").isKey(key) or @import("db/group_source_transfer.zig").isKey(key)) {
                 if (!view.graph_artifacts or effect.timestamp != 0) return error.RetainedEffectsCorrupt;
             } else if (!@import("internal_keys.zig").isStoredDocumentRowKey(key)) return error.RetainedEffectsCorrupt;
             // A resumed page checks its immediate predecessor directly, not

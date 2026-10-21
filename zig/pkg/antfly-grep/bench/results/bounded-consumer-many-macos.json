@@ -1,0 +1,59 @@
+{
+  "measurement": "Paired full-view consumption: decoded trees, raw-frame lists, and buffered original frames.\n\nOne exact binary, warm pinned generation. Includes request, response decoding and\ntransaction publication; refresh excluded. Python CPU measures the consumer.\nTraced peak is a separate untimed allocation probe, not process RSS.",
+  "host": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "python": {
+    "implementation": "CPython",
+    "version": "3.14.7"
+  },
+  "cpu_count": 14,
+  "cgroup_cpu_max": null,
+  "binary_sha256": "0baa2d640e1691a83d074d0441feb0ff3b5cc7b96fc43b819f324b56b500bb83",
+  "files": 1000,
+  "matches_per_file": 1,
+  "rounds": 16,
+  "trials": [
+    {"load_average":[12.943359375,11.69580078125,13.48779296875],"order":["decoded","listed","streaming"],"decoded":{"seconds_per_request":0.01716149481217144,"client_cpu_seconds_per_request":0.017086249999999997,"bytes_per_request":1245332.9375,"retained_payload_bytes":1259902},"listed":{"seconds_per_request":0.00951840881316457,"client_cpu_seconds_per_request":0.0094478125,"bytes_per_request":1245286.6875,"retained_payload_bytes":1259925},"streaming":{"seconds_per_request":0.009747515628987458,"client_cpu_seconds_per_request":0.009671562500000001,"bytes_per_request":1245222.1875,"retained_payload_bytes":1259868}},
+    {"load_average":[12.943359375,11.69580078125,13.48779296875],"order":["listed","streaming","decoded"],"listed":{"seconds_per_request":0.009564122432493605,"client_cpu_seconds_per_request":0.009466749999999996,"bytes_per_request":1245229.875,"retained_payload_bytes":1259779},"streaming":{"seconds_per_request":0.00990251299663214,"client_cpu_seconds_per_request":0.009794749999999998,"bytes_per_request":1245216.0,"retained_payload_bytes":1259791},"decoded":{"seconds_per_request":0.01823420575237833,"client_cpu_seconds_per_request":0.0177885,"bytes_per_request":1245247.5625,"retained_payload_bytes":1259789}},
+    {"load_average":[12.943359375,11.69580078125,13.48779296875],"order":["streaming","decoded","listed"],"streaming":{"seconds_per_request":0.01007103124720743,"client_cpu_seconds_per_request":0.009934000000000012,"bytes_per_request":1245242.5,"retained_payload_bytes":1259848},"decoded":{"seconds_per_request":0.03912951819074806,"client_cpu_seconds_per_request":0.02384056250000001,"bytes_per_request":1245222.1875,"retained_payload_bytes":1259778},"listed":{"seconds_per_request":0.010864864627365023,"client_cpu_seconds_per_request":0.010222687499999994,"bytes_per_request":1245265.1875,"retained_payload_bytes":1259840}},
+    {"load_average":[12.943359375,11.69580078125,13.48779296875],"order":["decoded","listed","streaming"],"decoded":{"seconds_per_request":0.01901418493798701,"client_cpu_seconds_per_request":0.018417062499999998,"bytes_per_request":1245321.75,"retained_payload_bytes":1259829},"listed":{"seconds_per_request":0.009588515626091976,"client_cpu_seconds_per_request":0.009504249999999992,"bytes_per_request":1245240.4375,"retained_payload_bytes":1259814},"streaming":{"seconds_per_request":0.010158388002309948,"client_cpu_seconds_per_request":0.009972937500000001,"bytes_per_request":1245266.75,"retained_payload_bytes":1259905}},
+    {"load_average":[12.70751953125,11.66748046875,13.46728515625],"order":["listed","streaming","decoded"],"listed":{"seconds_per_request":0.009807757814996876,"client_cpu_seconds_per_request":0.009674437499999994,"bytes_per_request":1245241.625,"retained_payload_bytes":1259862},"streaming":{"seconds_per_request":0.009945080753823277,"client_cpu_seconds_per_request":0.009834750000000003,"bytes_per_request":1245242.375,"retained_payload_bytes":1259756},"decoded":{"seconds_per_request":0.019232343744079117,"client_cpu_seconds_per_request":0.017784874999999978,"bytes_per_request":1245244.4375,"retained_payload_bytes":1259737}},
+    {"load_average":[12.70751953125,11.66748046875,13.46728515625],"order":["streaming","decoded","listed"],"streaming":{"seconds_per_request":0.009925583311996888,"client_cpu_seconds_per_request":0.009804124999999997,"bytes_per_request":1245222.0,"retained_payload_bytes":1259833},"decoded":{"seconds_per_request":0.018637971377756912,"client_cpu_seconds_per_request":0.018189499999999997,"bytes_per_request":1245275.0,"retained_payload_bytes":1259872},"listed":{"seconds_per_request":0.009931609376508277,"client_cpu_seconds_per_request":0.009695437499999987,"bytes_per_request":1245253.25,"retained_payload_bytes":1259897}},
+    {"load_average":[12.70751953125,11.66748046875,13.46728515625],"order":["decoded","listed","streaming"],"decoded":{"seconds_per_request":0.01821253124944633,"client_cpu_seconds_per_request":0.017809874999999975,"bytes_per_request":1245250.0,"retained_payload_bytes":1259857},"listed":{"seconds_per_request":0.010482330682862084,"client_cpu_seconds_per_request":0.010046374999999996,"bytes_per_request":1245250.8125,"retained_payload_bytes":1259875},"streaming":{"seconds_per_request":0.011217020808544476,"client_cpu_seconds_per_request":0.010593624999999995,"bytes_per_request":1245275.875,"retained_payload_bytes":1259835}},
+    {"load_average":[12.70751953125,11.66748046875,13.46728515625],"order":["listed","streaming","decoded"],"listed":{"seconds_per_request":0.02318216662388295,"client_cpu_seconds_per_request":0.011307562500000035,"bytes_per_request":1245306.75,"retained_payload_bytes":1259945},"streaming":{"seconds_per_request":0.011951734370086342,"client_cpu_seconds_per_request":0.011005312499999975,"bytes_per_request":1245308.75,"retained_payload_bytes":1259879},"decoded":{"seconds_per_request":0.020046367186296266,"client_cpu_seconds_per_request":0.019094062499999953,"bytes_per_request":1245272.1875,"retained_payload_bytes":1259870}},
+    {"load_average":[12.70751953125,11.66748046875,13.46728515625],"order":["streaming","decoded","listed"],"streaming":{"seconds_per_request":0.011733442690456286,"client_cpu_seconds_per_request":0.010702375000000042,"bytes_per_request":1245277.1875,"retained_payload_bytes":1259816},"decoded":{"seconds_per_request":0.023938390622788575,"client_cpu_seconds_per_request":0.02026125000000001,"bytes_per_request":1245235.25,"retained_payload_bytes":1259883},"listed":{"seconds_per_request":0.011085755184467416,"client_cpu_seconds_per_request":0.009918749999999976,"bytes_per_request":1245185.0,"retained_payload_bytes":1259787}}
+  ],
+  "allocation_probe": {
+    "decoded": {
+      "live_bytes": 1431244,
+      "peak_bytes": 8353700
+    },
+    "listed": {
+      "live_bytes": 1422428,
+      "peak_bytes": 1562770
+    },
+    "streaming": {
+      "live_bytes": 1422360,
+      "peak_bytes": 1562702
+    }
+  },
+  "median": {
+    "decoded": {
+      "seconds_per_request": 0.01901418493798701,
+      "client_cpu_seconds_per_request": 0.018189499999999997,
+      "bytes_per_request": 1245250.0,
+      "retained_payload_bytes": 1259857
+    },
+    "listed": {
+      "seconds_per_request": 0.009931609376508277,
+      "client_cpu_seconds_per_request": 0.009695437499999987,
+      "bytes_per_request": 1245250.8125,
+      "retained_payload_bytes": 1259862
+    },
+    "streaming": {
+      "seconds_per_request": 0.01007103124720743,
+      "client_cpu_seconds_per_request": 0.009934000000000012,
+      "bytes_per_request": 1245242.5,
+      "retained_payload_bytes": 1259835
+    }
+  }
+}

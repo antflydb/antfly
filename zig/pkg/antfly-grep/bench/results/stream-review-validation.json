@@ -1,0 +1,132 @@
+{
+  "implementation_commit": "21fef37a27c0c44fb8433cd9cbe76a0241e9ae86",
+  "base_commit": "f36d2c4b475c7e0c710408d214f139d8f2ee1b3b",
+  "sources_sha256": {
+    "zig/lib/httpx/src/client/client.zig": "ef77702fdfc185d3f5ebc74589f272ca991678e42aed8c8d80a5f2db03cd3e67",
+    "zig/lib/httpx/src/client/pool.zig": "5361d3456a2e6bf5199692f2d46cb6332e0d247c47d6e48c2d14c82258d53d4c",
+    "zig/pkg/antfly-grep/bench/decision_transport.py": "c3cd0c61500735413d88bf29e2a7bd788927115553395c67cd794a15559fae8e",
+    "zig/pkg/antfly-grep/bench/indexed_overlap.py": "609e6386553ca9d0d2f18f6cc4c663f045a7f149c0a0155e68fc9aebb38b77fb",
+    "zig/pkg/antfly-grep/bench/output_pipeline.py": "139b1d0fd16351228365b5defb9fb3c4301adcbdd486ca945b6d5fd6fc03a1ff",
+    "zig/pkg/antfly-grep/generated/antfly-grep.1": "5efb636df8ba114bf39bbb691bfa4e8699e8bd973af0d3e02886fe75664d1e1d",
+    "zig/pkg/antfly-grep/generated/antfly-grep.bash": "4063b6bacf094eccb83f28525349cbc235d8f59a8a5951f05cdb1372c0261ed5",
+    "zig/pkg/antfly-grep/generated/antfly-grep.fish": "ea9b03d07d69c2185c1eb5866533dccc215fd3de3f2c2b8cb5c3b093c419dd3f",
+    "zig/pkg/antfly-grep/generated/antfly-grep.ps1": "5665fb73105e710d69244b2de04ac2b8f97988d0d4fd5c2d3b5803147186cb4d",
+    "zig/pkg/antfly-grep/generated/antfly-grep.zsh": "c5af512b3fdfd88533e106eb5daf0fb29a4568a308de23b7f1dd3989b4d74a5e",
+    "zig/pkg/antfly-grep/src/decision.zig": "124076e6969d6aa5a5a23474381202d32234b74040902e2bfc0532a08ea46d86",
+    "zig/pkg/antfly-grep/src/discovery.zig": "e47a625fa1ee3598a981f141f46bcd56690b8ffb714b7c563279f6d4623fbc52",
+    "zig/pkg/antfly-grep/src/indexed.zig": "9b9688d83cfbc2fabf8ef3034328ae6eac210f2474061c1f4a285499165d5bfc",
+    "zig/pkg/antfly-grep/src/main.zig": "d42e78e4fe87f39da0ad3f66ffc1adf42620b227da5a14cdf29404fb3e4024f6",
+    "zig/pkg/antfly-grep/src/options.zig": "c99bf6e906ec73e10a0f6da615015c0a5c42d5f09af3ca5fee302ed93b3a8625",
+    "zig/pkg/antfly-grep/src/root.zig": "4624f2926ebd7052ae2acd2ce27175c16f9f736e30468dc851eb2d24320565ed",
+    "zig/pkg/antfly-grep/src/style.zig": "5c432d957810ea1c8157b9562e18a5757b078e36ee041c8244248b6ec5c5cfb1",
+    "zig/pkg/antfly-grep/src/tooling.zig": "f96904ed73f94b843a635168ff6a1f454e1c310b49f00e53fa2ca68721cf050d",
+    "zig/pkg/antfly-grep/tests/test_cli.py": "d83704e5e0afacda71c6e65a9c2b61a5fd02cc56e6185f9c76dddeba2c89c00e"
+  },
+  "binaries": {
+    "macos-arm64": {
+      "sha256": "a0c151c3fcfa004971b9bdea3b0468b3303a8db97062ef2a429b96e6d8266b08",
+      "bytes": 6562104
+    },
+    "linux-arm64": {
+      "sha256": "37f86fce6d40f5f429bea12e8f64a3b8f0fb613d16e3bb6fc61e4f0161c8696b",
+      "bytes": 6559680
+    }
+  },
+  "validation": {
+    "macos_cli": {
+      "tests": 142,
+      "skipped": 2,
+      "passed": true
+    },
+    "linux_cli": {
+      "tests": 142,
+      "skipped": 1,
+      "passed": true,
+      "cpus": 2,
+      "network": "none",
+      "image": "antfly-grep-bench-arm64:review-1164",
+      "execution_environment": "Native ARM64 instructions in Linux VM on ARM64 macOS host; not independent Linux hardware"
+    },
+    "native_grep_targets": {
+      "unit": true,
+      "hardening": true,
+      "generated_tooling": true
+    },
+    "http1_socket_regressions": {
+      "passed": true,
+      "regressions": 2,
+      "import_smoke_tests": 1,
+      "command": "zig test -OReleaseSafe --dep antfly-json -Mroot=zig/lib/httpx/src/client_test_root.zig -Mantfly-json=zig/lib/json/src/mod.zig -lc --test-filter disable Nagle",
+      "scope": "Direct and pooled reused H1 sockets assert TCP_NODELAY; named import root filtering is not counted"
+    },
+    "prepared_type_equivalence": {
+      "passed": true,
+      "scope": "Exact/suffix lookup against canonical globs, compound suffixes, hidden files, Unicode, case sensitivity and complex fallback"
+    },
+    "native_server_indexed": {
+      "tests": 5,
+      "passed": true,
+      "server_binary_sha256": "d816bebc093b3c881163a0fcf0af1d9c5396215e93fe0bde39b30cf6710a36e0"
+    },
+    "differential": {
+      "cases": 1000,
+      "failures": 0,
+      "timeouts": 0,
+      "oracle": "ripgrep 15.2.0 / PCRE2 10.45"
+    },
+    "labeled_relevance": {
+      "fixture_only": true,
+      "questions": 5,
+      "all_complete": true,
+      "precision": 1,
+      "recall": 1
+    },
+    "apache_boundary": {
+      "passed": true,
+      "source_files": 2077
+    },
+    "boundary_checker_tests": {
+      "tests": 35,
+      "passed": true
+    },
+    "compatibility_matrix": {
+      "passed": true
+    },
+    "zig_format": {
+      "passed": true
+    },
+    "git_diff_check": {
+      "passed": true
+    },
+    "license_headers": {
+      "passed": true
+    },
+    "python_ruff": {
+      "check": true,
+      "format": true,
+      "files": 4
+    }
+  },
+  "correctness": {
+    "finite_default_request_budget": {
+      "requests": 1000,
+      "retrievals": 500,
+      "decisions": 500,
+      "selected_lines": 50000,
+      "same_with_prefetch_enabled_or_disabled": true,
+      "previous_speculative_path": {
+        "retrievals": 501,
+        "decisions": 499,
+        "selected_lines": 49900
+      }
+    },
+    "hidden_type_includes": "Matching hidden filenames included; hidden parent directories and ignore exclusions remain pruned. Local j1/j4 and indexed fixtures."
+  },
+  "limits": [
+    "Shared host and warm-cache timing; unrelated builds active",
+    "Dense regex replay trades 5-17% elapsed regression versus previous head for roughly 90% lower memory on measured cases",
+    "Finite request budgets disable indexed decision prefetch; explicit unlimited allows overlap",
+    "Loopback fixtures do not establish provider/model quality, billed token savings, or live resilience",
+    "Full upstream ripgrep/PCRE2/JIT and Windows runtime parity not established"
+  ]
+}

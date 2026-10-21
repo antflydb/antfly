@@ -165,6 +165,22 @@ pub const PageStore = struct {
         if (bytes > self.remaining_write_bytes.*) return error.GraphPageWriteBudgetExceeded;
         self.remaining_write_bytes.* -= bytes;
         try self.cancellation.check();
+        const width = if (self.artifacts.io_phase) |phase| phase.max_parallel else tree.max_write_batch;
+        var begin: usize = 0;
+        while (begin < writes.len) {
+            const end = @min(writes.len, begin + width);
+            var phase = try self.artifacts.beginIo(end - begin);
+            defer phase.abort();
+            var backend = self.artifacts.*;
+            backend.io_phase = null;
+            var worker = self.*;
+            worker.artifacts = &backend;
+            worker.uploadBatch(writes[begin..end]) catch |err| return phase.failed(err);
+            try phase.finish();
+            begin = end;
+        }
+    }
+    fn uploadBatch(self: *PageStore, writes: []const tree.Write) !void {
         var failures: [tree.max_write_batch]?anyerror = @splat(null);
         var group: std.Io.Group = .init;
         const io = self.io.?;
@@ -665,4 +681,60 @@ test "serverless graph page store bounded uploads drain failures and respect adm
     try std.testing.expectEqual(before_stream + 16, fixture.completed_uploads.load(.acquire));
     try std.testing.expectEqual(@as(u64, tree.max_page_bytes) * tree.max_write_batch - 512, write_bytes);
     try std.testing.expectEqual(@as(usize, 0), fixture.active_uploads.load(.acquire));
+}
+
+test "serverless graph publication IO phases bound batch fanout and drain before resumption" {
+    const Phase = struct {
+        active: bool = false,
+        begins: usize = 0,
+        finishes: usize = 0,
+        aborted: usize = 0,
+        fn begin(raw: *anyopaque, slots: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(!self.active);
+            try std.testing.expect(slots > 0 and slots <= 2);
+            self.active = true;
+            self.begins += 1;
+        }
+        fn finish(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.active);
+            self.active = false;
+            self.finishes += 1;
+        }
+        fn abort(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.active);
+            self.active = false;
+            self.aborted += 1;
+        }
+    };
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    var fixture: TestArtifacts = .{ .memory = .{ .alloc = a }, .upload_io = io_impl.io() };
+    defer fixture.memory.deinit();
+    var phase: Phase = .{};
+    var backend = fixture.capability();
+    const io_capability: artifacts.IoPhase = .{ .ptr = &phase, .max_parallel = 2, .begin = Phase.begin, .finish = Phase.finish, .abort = Phase.abort };
+    backend.io_phase = &io_capability;
+    var read_bytes: u64 = 1024;
+    var write_bytes: u64 = 1024;
+    var pages: PageStore = .{ .domain = PageStore.namespaceDomain("io-phases"), .attempt = @splat(1), .artifacts = &backend, .remaining_read_bytes = &read_bytes, .remaining_write_bytes = &write_bytes, .io = io_impl.io(), .streaming = true };
+    const bytes: [64]u8 = @splat(3);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&bytes, &digest, .{});
+    const writes: [8]tree.Write = @splat(.{ .ref = .{ .digest = digest, .attempt = @splat(1), .bytes = bytes.len, .height = 0, .records = 1 }, .bytes = &bytes });
+    const store = pages.store();
+    try store.put_many.?(store.ptr, &writes);
+    try std.testing.expectEqual(@as(usize, 4), phase.begins);
+    try std.testing.expectEqual(phase.begins, phase.finishes);
+    try std.testing.expectEqual(@as(usize, 8), fixture.completed_uploads.load(.acquire));
+    try std.testing.expect(fixture.peak_uploads.load(.acquire) <= 2);
+    fixture.fail_upload = true;
+    try std.testing.expectError(error.InjectedUploadFailure, store.put_many.?(store.ptr, &writes));
+    try std.testing.expectEqual(@as(usize, 0), phase.aborted);
+    try std.testing.expectEqual(phase.begins, phase.finishes);
+    try std.testing.expectEqual(@as(usize, 0), fixture.active_uploads.load(.acquire));
+    try std.testing.expect(!phase.active);
 }
