@@ -603,17 +603,19 @@ pub const StorageOwnerRuntimeHooks = struct {
 
     fn candidateBeginBatch(ptr: *anyopaque, alloc: Allocator, tables: []const []const u8) anyerror!db_mod.CandidateSource.Batch {
         const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
-        const callback = self.config.resolution_candidates.begin_batch_fn orelse return .{ .source = self.candidateSource().? };
+        const callback = self.config.resolution_candidates.begin_batch_fn orelse return .{ .source = (try self.candidateSource()) orelse return error.MissingResolutionCandidateSource };
         const encoded = try alloc.alloc(kernel_owner_abi.BorrowedBytes, tables.len);
         defer alloc.free(encoded);
         for (tables, encoded) |table, *out| out.* = .fromSlice(table);
         var config: kernel_owner_abi.ResolutionCandidateConfig = .{};
         try kernel_error_identity.statusToError(callback(self.config.resolution_candidates.callback_ctx, if (encoded.len == 0) null else encoded.ptr, encoded.len, &config));
         errdefer if (config.release_fn) |release| release(config.callback_ctx);
-        if (config.callback_ctx == null or config.get_fn == null or config.release_fn == null) return error.InvalidArgument;
+        if (config.release_fn == null) return error.InvalidArgument;
         const batch = try alloc.create(CandidateBatch);
+        errdefer alloc.destroy(batch);
         batch.* = .{ .alloc = alloc, .hooks = .{ .config = .{ .resolution_candidates = config }, .group_id = self.group_id } };
-        return .{ .source = batch.hooks.candidateSource().?, .release = candidateReleaseBatch };
+        const source = (try batch.hooks.candidateSource()) orelse return error.MissingResolutionCandidateSource;
+        return .{ .source = source, .release = candidateReleaseBatch, .release_context = &batch.hooks };
     }
 
     fn candidateReleaseBatch(ptr: *anyopaque, _: Allocator) void {
@@ -6670,5 +6672,6 @@ pub fn releaseServerContext(context_ptr: *anyopaque) void {
 }
 
 pub const test_support = if (@import("builtin").is_test) struct {
+    pub const candidateSource = StorageOwnerRuntimeHooks.candidateSource;
     pub const transactionRecoveryConfig = StorageOwnerTransactionRecovery.serverConfig;
 } else struct {};

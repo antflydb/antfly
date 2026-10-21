@@ -102,8 +102,11 @@ pub const CandidateSource = struct {
     pub const Batch = struct {
         source: CandidateSource,
         release: ?*const fn (*anyopaque, std.mem.Allocator) void = null,
+        /// A borrowed native source may have a different context from the
+        /// adapter that owns its release callback.
+        release_context: ?*anyopaque = null,
         pub fn deinit(self: Batch, alloc: std.mem.Allocator) void {
-            if (self.release) |f| f(self.source.ptr, alloc);
+            if (self.release) |f| f(self.release_context orelse self.source.ptr, alloc);
         }
     };
     pub fn beginBatch(self: CandidateSource, alloc: std.mem.Allocator, tables: []const []const u8) !Batch {

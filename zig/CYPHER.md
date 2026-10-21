@@ -1993,7 +1993,13 @@ Binding-type snapshots are immutable across UNWIND shadowing and child exports;
 dummy NULL schema values never supply type evidence. Builtin signatures describe
 successful result domains. Arithmetic and argument-dependent builtins compose
 lazy primitive proofs, so derived keys can share domains without scanning
-unused parameter lists or skipping their original producer evaluations.
+unused parameter lists or skipping their original producer evaluations. CASE
+joins the successful result domains of its branches. List literals, indexing,
+HEAD/LAST, slicing and reversal transfer their element domains through forwarding
+aliases. Private collection summaries retain a separate logical input/window
+certificate, so lowering cannot mistake a summary header for a user element.
+Captured producer proofs use their original lexical frame and statement ownership;
+no certificate borrows a recyclable normalization arena.
 
 An independent pure zero-or-one-row CALL also preserves a compressed axis. Each
 child executes with one unit input, so filtering, DISTINCT, windows and global
@@ -2006,8 +2012,15 @@ and effects keep ordinary execution. Pure expanding children also preserve an
 unobserved axis for commutative COUNT/MIN/MAX consumers. Each complete child
 bag retains local filters, DISTINCT, ordering, windows and empty-input reducers;
 its emitted weights multiply the caller weight only after successful binding.
-Observed-axis uniqueness and integer-SUM proofs still require singleton children.
-Floating SUM/AVG and order-sensitive consumers retain sequential contributions.
+Observed range and immutable-list axes also compose with independent child bags.
+An invocation-scoped observation keeps bag copies separate from set support:
+COUNT multiplies the emitted child weights, while COUNT DISTINCT observes a
+complete unique range once per group and list domains merge their exact support.
+Integer SUM first combines the complete child's multiplicity for each group,
+then applies the axis's ordered prefix bounds with that multiplier. Replaying
+an entire mixed-sign axis per child could hide an intermediate overflow. Existing
+floating accumulators retain sequential list replay. Floating SUM/AVG and
+order-sensitive consumers otherwise retain sequential contributions.
 
 Bounded COUNT group windows accept pure expanding children using dynamic emitted
 weight certificates. Both materialized and streamed child boundaries check the
@@ -2129,8 +2142,11 @@ allocator-dependent metadata arena growth from retaining extra payload space.
 
 A scalar COUNT projection ordered directly by grouping keys can retain just
 SKIP + LIMIT groups while consuming the input. Its stable max heap owns each
-selected group's arena and recycles hash collision links on eviction. Rejected
-rows still evaluate COUNT arguments. Each charged contribution must certify a
+selected group's arena and recycles hash collision links on eviction. COUNT
+DISTINCT keeps membership only for selected groups and releases it on eviction.
+Rejected rows still evaluate arguments and validate their hash/depth domains.
+Recyclable membership values use emission-local metadata; immutable wide arguments
+reuse their owner's analysis. Each charged contribution must certify a
 logical count no greater than maxInt(i64) divided by the work budget, ruling out
 COUNT overflow even for discarded groups. Weighted producers and cached reducer
 packets carry exact bounds; an unproved weight retries general aggregation before

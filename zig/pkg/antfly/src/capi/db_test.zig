@@ -7251,3 +7251,57 @@ test "storage owner remote content source refreshes policy and retains in-flight
     defer alloc.free(recovered);
     try std.testing.expect(std.mem.indexOf(u8, recovered, "image/png") != null);
 }
+
+test "capi storage owner candidate batches release native views through their owning adapter" {
+    const Fixture = struct {
+        source: db_mod.CandidateSource = undefined,
+        invalid: bool = false,
+        released: usize = 0,
+        reads: usize = 0,
+        fn legacyGet(_: ?*anyopaque, _: kernel_owner_abi.BorrowedBytes, _: kernel_owner_abi.BorrowedBytes, _: ?*anyopaque, _: kernel_owner_abi.ResolutionCandidateConsumeFn) callconv(.c) kernel_owner_abi.Status {
+            return .ok;
+        }
+        fn nativeGet(ptr: *anyopaque, _: Allocator, _: []const u8, _: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reads += 1;
+            return null;
+        }
+        fn release(ptr: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.released += 1;
+        }
+        fn begin(ptr: ?*anyopaque, _: ?[*]const kernel_owner_abi.BorrowedBytes, _: u64, output: *kernel_owner_abi.ResolutionCandidateConfig) callconv(.c) kernel_owner_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            const bytes = std.mem.asBytes(&self.source);
+            output.* = .{
+                .callback_ctx = self,
+                .native_view = .fromSlice(if (self.invalid) bytes[0..1] else bytes),
+                .native_view_contract = .fromSlice(db_mod.CandidateSource.nativeContractBytes()),
+                .release_fn = release,
+            };
+            return .ok;
+        }
+    };
+    for ([_]bool{ false, true }) |invalid| {
+        var fixture: Fixture = .{ .invalid = invalid };
+        fixture.source = .{ .ptr = &fixture, .vtable = &.{ .get = Fixture.nativeGet } };
+        var hooks: StorageOwnerRuntimeHooks = .{ .config = .{ .resolution_candidates = .{ .callback_ctx = &fixture, .get_fn = Fixture.legacyGet, .begin_batch_fn = Fixture.begin } }, .group_id = 1 };
+        const source = (try server_api.test_support.candidateSource(&hooks)).?;
+        if (invalid) {
+            try std.testing.expectError(error.InvalidAbiVersion, source.beginBatch(std.testing.allocator, &.{"entities"}));
+        } else {
+            const batch = try source.beginBatch(std.testing.allocator, &.{"entities"});
+            defer batch.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(*anyopaque, @ptrCast(&fixture)), batch.source.ptr);
+            try std.testing.expect(batch.release_context.? != batch.source.ptr);
+            try std.testing.expectEqual(@as(?[]u8, null), try batch.source.get(std.testing.allocator, "entities", "key"));
+            try std.testing.expectEqual(@as(usize, 1), fixture.reads);
+        }
+        try std.testing.expectEqual(@as(usize, 1), fixture.released);
+    }
+    var fallback: StorageOwnerRuntimeHooks = .{ .config = .{ .resolution_candidates = .{ .get_fn = Fixture.legacyGet } }, .group_id = 1 };
+    const source = (try server_api.test_support.candidateSource(&fallback)).?;
+    const batch = try source.beginBatch(std.testing.allocator, &.{"entities"});
+    defer batch.deinit(std.testing.allocator);
+    try std.testing.expect(batch.release == null);
+}

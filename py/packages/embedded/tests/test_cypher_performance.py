@@ -6307,11 +6307,12 @@ def test_count_window_retry_keeps_exact_large_counts_and_publishes_stages_once(g
         "UNWIND [0,1] AS k RETURN DISTINCT CASE WHEN i=2 THEN true+1 ELSE k END AS y",
     ],
 )
-def test_call_count_window_keeps_middle_error_before_return_argument_error(graph_db, source, limit, body):
+@pytest.mark.parametrize("distinct", ["", "DISTINCT "])
+def test_call_count_window_keeps_middle_error_before_return_argument_error(graph_db, source, limit, body, distinct):
     with pytest.raises(af.AntflyError, match="CypherTypeMismatch"):
         graph_db.cypher_json(
             "g",
-            {"query": source + f" CALL {{{body}}} RETURN i,count(1/x) ORDER BY i LIMIT {limit}"},
+            {"query": source + f" CALL {{{body}}} RETURN i,count({distinct}1/x) ORDER BY i LIMIT {limit}"},
         )
 
 
@@ -6457,3 +6458,126 @@ def test_expanding_call_window_retains_overflow_from_rejected_groups(graph_db, m
                 "limits": {"intermediate_states": 2000},
             },
         )
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "CASE WHEN i>10 THEN i ELSE 0 END",
+        "head([i])",
+        "last(reverse([i]))",
+        "[i][0]",
+        "[[i]][0][0]",
+        "head(CASE WHEN i>10 THEN [i] ELSE [0] END)",
+    ],
+)
+def test_branch_and_element_keys_share_call_domains(graph_db, expression):
+    prefix = f"UNWIND $groups AS i WITH i,{expression} AS j UNWIND $xs AS x "
+    results = [
+        graph_db.cypher_json(
+            "g",
+            {
+                "query": prefix + f"CALL {{{body}}} RETURN i,avg(y) ORDER BY i",
+                "parameters": {"groups": list(range(1, 31)), "xs": list(range(1000))},
+                "limits": {"intermediate_states": 100000, "memory_bytes": 2 << 20},
+            },
+        )
+        for body in ("WITH j,avg(x) AS y RETURN y", "WITH avg(x) AS y RETURN y")
+    ]
+    assert results[0]["rows"] == results[1]["rows"]
+    assert len(results[0]["rows"]) == 30
+    assert results[0]["stats"]["intermediate_states"] < 50000
+
+
+@pytest.mark.parametrize(
+    "body,copies",
+    [
+        ("UNWIND [7,8] AS y RETURN y", 2),
+        ("UNWIND [7,7,8] AS y RETURN y", 3),
+        ("UNWIND [7,7,8] AS y RETURN DISTINCT y ORDER BY y LIMIT 1", 1),
+        ("UNWIND [7,8] AS z RETURN count(*) AS y", 1),
+        ("CALL {UNWIND [7,8] AS z RETURN z} RETURN z AS y", 2),
+        ("UNWIND range(1,1000) AS z RETURN 7 AS y", 1000),
+    ],
+)
+def test_observed_range_axes_compose_call_cardinality_and_set_support(graph_db, body, copies):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": f"UNWIND range(1,1000000) AS x CALL {{{body}}} "
+            "RETURN count(x),count(DISTINCT x),min(x),max(x),sum(x)",
+            "limits": {"intermediate_states": 2000, "memory_bytes": 1 << 20},
+        },
+    )
+    assert [[int(cell["value"]) for cell in row] for row in result["rows"]] == [
+        [copies * 1000000, 1000000, 1, 1000000, copies * 500000500000]
+    ]
+    assert result["stats"]["intermediate_states"] < 1000
+    assert result["plan"][1]["output_rows"] == copies * 1000000
+
+
+@pytest.mark.parametrize(
+    "prefix,argument",
+    [
+        ("UNWIND range(1,10000) AS i UNWIND [0,1,0] AS x", "x"),
+        ("UNWIND range(10000,1,-1) AS i UNWIND [0,1,0] AS x", "[x]"),
+        # Public requests clamp to the service's one-million-state ceiling.
+        # Leave room for CALL execution while retaining thousands of evictions;
+        # the native test also covers this CALL shape with 10,000 groups.
+        ("UNWIND range(9000,1,-1) AS i CALL {UNWIND [0,1,0] AS x RETURN x}", "{v:x}"),
+    ],
+)
+def test_distinct_group_windows_bound_membership_through_eviction(graph_db, prefix, argument):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": f"{prefix} RETURN i,count(DISTINCT {argument}) ORDER BY i LIMIT 5",
+            "limits": {"memory_bytes": 2 << 20, "intermediate_states": 1000000},
+        },
+    )
+    assert [[int(cell["value"]) for cell in row] for row in result["rows"]] == [[i, 2] for i in range(1, 6)]
+    assert result["stats"]["memory_bytes"] < 200000
+
+
+@pytest.mark.parametrize(
+    "source",
+    ["[9223372036854775807,-9223372036854775807]", "[-9223372036854775807,9223372036854775807]"],
+)
+def test_observed_call_sums_retain_repeated_element_prefix_overflow(graph_db, source):
+    with pytest.raises(af.AntflyError, match="CypherNumericOverflow"):
+        graph_db.cypher_json(
+            "g",
+            {
+                "query": f"UNWIND {source} AS x CALL {{UNWIND [7,8] AS y RETURN y}} RETURN sum(x)",
+                "limits": {"intermediate_states": 2000},
+            },
+        )
+
+
+def test_distinct_windows_reuse_wide_immutable_argument_analysis(graph_db):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND range(10000,1,-1) AS i UNWIND [0,1,0] AS x "
+            "RETURN i,count(DISTINCT $payload) ORDER BY i LIMIT 5",
+            "parameters": {"payload": list(range(1000))},
+            "limits": {"intermediate_states": 600000, "memory_bytes": 2 << 20},
+        },
+    )
+    assert [[int(cell["value"]) for cell in row] for row in result["rows"]] == [[i, 1] for i in range(1, 6)]
+
+
+def test_observed_parameter_lists_keep_bag_counts_and_shared_distinct_support(graph_db):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND $xs AS x CALL {UNWIND [7,7,8] AS y RETURN y} "
+            "RETURN y,count(x),count(DISTINCT x),sum(x),sum(DISTINCT x) ORDER BY y",
+            "parameters": {"xs": list(range(1001)) + [None]},
+            "limits": {"intermediate_states": 40000, "memory_bytes": 2 << 20},
+        },
+    )
+    assert [[int(cell["value"]) for cell in row] for row in result["rows"]] == [
+        [7, 2002, 1001, 1001000, 500500],
+        [8, 1001, 1001, 500500, 500500],
+    ]

@@ -15,7 +15,7 @@
 
 //! Shared scalar signatures for compile-time validation and execution.
 const std = @import("std");
-pub const Result = enum { unknown, primitive, primitive_items, arguments };
+pub const Result = enum { unknown, primitive, primitive_items, arguments, element, preserve };
 pub const Signature = struct { result: Result = .unknown, name: []const u8, minimum: usize = 1, maximum: usize = 1, repeatable: bool = false };
 pub const signatures = [_]Signature{
     .{ .repeatable = true, .result = .arguments, .name = "coalesce", .maximum = std.math.maxInt(usize) },
@@ -28,13 +28,13 @@ pub const signatures = [_]Signature{
     .{ .repeatable = true, .name = "relationships" },
     .{ .repeatable = true, .result = .primitive, .name = "length" },
     .{ .repeatable = true, .result = .primitive, .name = "size" },
-    .{ .repeatable = true, .name = "head" },
-    .{ .repeatable = true, .name = "last" },
+    .{ .repeatable = true, .result = .element, .name = "head" },
+    .{ .repeatable = true, .result = .element, .name = "last" },
     .{ .repeatable = true, .result = .primitive, .name = "toLower" },
     .{ .repeatable = true, .result = .primitive, .name = "toUpper" },
     .{ .repeatable = true, .result = .primitive, .name = "abs" },
     .{ .repeatable = true, .result = .primitive_items, .name = "keys" },
-    .{ .repeatable = true, .name = "reverse" },
+    .{ .repeatable = true, .result = .preserve, .name = "reverse" },
     .{ .repeatable = true, .result = .primitive, .name = "trim" },
     .{ .repeatable = true, .result = .primitive, .name = "ltrim" },
     .{ .repeatable = true, .result = .primitive, .name = "rtrim" },

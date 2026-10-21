@@ -2068,7 +2068,7 @@ const Engine = struct {
                         }
                     }
                 } else {
-                    const info = try engine.values.info(value);
+                    const info = if (engine.immutableOwner(value)) |owner| try owner.work.info(value) else try engine.values.info(value);
                     const hash = info.hash;
                     var candidate = self.distinct_index.head(hash);
                     while (candidate) |position| {
@@ -2384,7 +2384,7 @@ const Engine = struct {
             var keys: std.ArrayList(*const ast.Expr) = .empty;
             for (projection.items) |item| {
                 if (aggregates(item.expression)) {
-                    if (item.expression.value != .call or !std.ascii.eqlIgnoreCase(item.expression.value.call.name, "count") or item.expression.value.call.distinct) return null;
+                    if (item.expression.value != .call or !std.ascii.eqlIgnoreCase(item.expression.value.call.name, "count")) return null;
                 } else try keys.append(engine.a, item.expression);
             }
             if (keys.items.len == 0) return null;
@@ -2454,12 +2454,22 @@ const Engine = struct {
                 // These values would have been consumed even for discarded
                 // groups. Do not hide type/arithmetic/pattern errors in args.
                 if (fold.axis_packet == null) for (fold.calls) |expression| {
-                    if (!expression.value.call.star) _ = engine.eval(expression.value.call.args[0], row, null) catch |err| {
-                        // A later middle-stage failure precedes RETURN's
-                        // argument failures. Retry with deferred aggregates.
-                        if (fold.window_retry and StreamingAggregate.consumerFailure(err)) return error.CypherGroupWindowDeclined;
-                        return err;
-                    };
+                    if (!expression.value.call.star) {
+                        const value = engine.eval(expression.value.call.args[0], row, null) catch |err| {
+                            if (fold.window_retry and StreamingAggregate.consumerFailure(err)) return error.CypherGroupWindowDeclined;
+                            return err;
+                        };
+                        if (expression.value.call.distinct and value != .null) {
+                            var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+                            defer scratch.deinit();
+                            var work: value_work.Work = .{ .a = scratch.allocator(), .ptr = engine, .charge = chargeWork };
+                            const checked = if (engine.immutableOwner(value)) |owner| owner.work.info(value) else work.info(value);
+                            _ = checked catch |err| {
+                                if (fold.window_retry and StreamingAggregate.consumerFailure(err)) return error.CypherGroupWindowDeclined;
+                                return err;
+                            };
+                        }
+                    }
                 };
                 // An axis packet already certifies every pure argument in the
                 // complete captured domain, including losing group candidates.
@@ -2866,10 +2876,13 @@ const Engine = struct {
     const ScalarType = union(enum) {
         primitive,
         primitive_items,
+        sequence: *const ScalarType,
+        collection: *const CollectionType,
         items: *ListType,
         element: *ListType,
         derived: *PrimitiveType,
     };
+    const CollectionType = struct { input: ?ScalarType, filters: []const ?ScalarType };
     const PrimitiveType = struct { dependencies: []const ScalarType, plain: ?bool = null };
     const ListType = struct { items: []const v.Value, plain: ?bool = null };
     const ScalarTypes = std.StringHashMapUnmanaged(ScalarType);
@@ -2895,9 +2908,6 @@ const Engine = struct {
             .null, .boolean, .integer, .number, .string => true,
             else => false,
         };
-    }
-    fn knownPrimitive(known: ?ScalarType) bool {
-        return if (known) |kind| kind == .primitive else false;
     }
     fn plainBinding(self: *Engine, known: ?ScalarType) !bool {
         const kind = known orelse return false;
@@ -2942,6 +2952,7 @@ const Engine = struct {
         return certified;
     }
     fn scalarType(self: *Engine, expression: *const ast.Expr, types: ScalarTypes) anyerror!?ScalarType {
+        if (expression.execution_list_source) |id| return self.producerScalarType(id);
         return switch (expression.value) {
             .literal => .primitive,
             .variable => |name| types.get(name),
@@ -2954,24 +2965,112 @@ const Engine = struct {
                 // once per immutable parameter across all nested CALLs.
                 break :blk if (value == .list) try self.listType(value.list) else null;
             },
-            .unary => |u| try self.derivedPrimitive(&.{u.operand}, types),
-            .binary => |b| try self.derivedPrimitive(&.{ b.left, b.right }, types),
+            .unary, .comparison, .list_predicate, .exists => .primitive,
+            .binary => |b| if (b.op == .add) try self.derivedPrimitive(&.{ b.left, b.right }, types) else .primitive,
+            .index => |index| elementType(try self.scalarType(index.base, types)),
+            .slice => |slice| try self.scalarType(slice.base, types),
+            .case_when => |case| blk: {
+                var branches: std.ArrayList(ScalarType) = .empty;
+                for (case.branches) |branch| try branches.append(self.a, (try self.scalarType(branch.value, types)) orelse break :blk null);
+                try branches.append(self.a, if (case.otherwise) |otherwise| (try self.scalarType(otherwise, types)) orelse break :blk null else .primitive);
+                break :blk try self.joinScalarTypes(branches.items);
+            },
             .call => |call_value| blk: {
+                if (call_value.execution_list) {
+                    const input = try self.scalarType(call_value.args[0], types);
+                    const filters = try self.a.alloc(?ScalarType, call_value.collect_filters.len);
+                    for (call_value.collect_filters, filters) |filter, *result| {
+                        result.* = switch (filter.kind) {
+                            .count, .all, .any, .none, .single => .primitive,
+                            .fold => null,
+                            .window => window: {
+                                if (filter.projection == null) break :window input;
+                                var scope = try types.clone(self.a);
+                                if (elementType(input)) |element| try scope.put(self.a, filter.alias, element) else _ = scope.remove(filter.alias);
+                                break :window if (try self.scalarType(filter.projection.?, scope)) |element| try self.sequenceType(element) else null;
+                            },
+                        };
+                    }
+                    const summary = try self.a.create(CollectionType);
+                    summary.* = .{ .input = input, .filters = filters };
+                    break :blk .{ .collection = summary };
+                }
+                if (call_value.collection_extract) |extract| {
+                    if (extract == .cardinality) break :blk .primitive;
+                    const source = (try self.scalarType(call_value.args[0], types)) orelse break :blk null;
+                    if (source == .collection) break :blk switch (extract) {
+                        .window => source.collection.input,
+                        .filtered => |slot| source.collection.filters[slot],
+                        .cardinality => unreachable,
+                    };
+                    // Imported summaries have already executed their producer.
+                    // Preserve a lazy element certificate for their owned window.
+                    if (source == .items and extract == .window) {
+                        const packet = source.items.items;
+                        if (packet.len != 0 and packet[0] == .null) break :blk .primitive;
+                        const header = extract.window;
+                        if (header >= packet.len or packet[header] != .integer or packet[header].integer < 0) break :blk null;
+                        const length = std.math.cast(usize, packet[header].integer) orelse break :blk null;
+                        if (length > packet.len - header - 1) break :blk null;
+                        break :blk try self.listType(packet[header + 1 ..][0..length]);
+                    }
+                    break :blk null;
+                }
                 if (@import("functions.zig").lookup(call_value.name)) |signature| switch (signature.result) {
                     .primitive => break :blk .primitive,
                     .primitive_items => break :blk .primitive_items,
-                    .arguments => break :blk try self.derivedPrimitive(call_value.args, types),
+                    .arguments => break :blk try self.joinExpressionTypes(call_value.args, types),
+                    .element => break :blk elementType(try self.scalarType(call_value.args[0], types)),
+                    .preserve => break :blk try self.scalarType(call_value.args[0], types),
                     .unknown => {},
                 };
                 for ([_][]const u8{ "count", "sum", "avg" }) |name| if (std.ascii.eqlIgnoreCase(call_value.name, name)) break :blk .primitive;
                 break :blk null;
             },
-            .list => |items| blk: {
-                for (items) |item| if (!knownPrimitive(try self.scalarType(item, types))) break :blk null;
-                break :blk .primitive_items;
-            },
+            .list => |items| if (try self.joinExpressionTypes(items, types)) |element| try self.sequenceType(element) else null,
             else => null,
         };
+    }
+    fn elementType(known: ?ScalarType) ?ScalarType {
+        return switch (known orelse return null) {
+            .primitive, .primitive_items => .primitive,
+            .items => |certificate| .{ .element = certificate },
+            .sequence => |element| element.*,
+            else => null,
+        };
+    }
+    fn sequenceType(self: *Engine, element: ScalarType) !ScalarType {
+        if (element == .primitive) return .primitive_items;
+        const owned = try self.a.create(ScalarType);
+        owned.* = element;
+        return .{ .sequence = owned };
+    }
+    fn joinExpressionTypes(self: *Engine, expressions: []const *const ast.Expr, types: ScalarTypes) anyerror!?ScalarType {
+        const domains = try self.a.alloc(ScalarType, expressions.len);
+        for (expressions, domains) |expression, *domain| domain.* = (try self.scalarType(expression, types)) orelse return null;
+        return self.joinScalarTypes(domains);
+    }
+    fn joinScalarTypes(self: *Engine, domains: []const ScalarType) anyerror!?ScalarType {
+        var resolved = true;
+        var scalar = true;
+        var sequence = domains.len != 0;
+        for (domains) |domain| {
+            resolved = resolved and domain == .primitive;
+            scalar = scalar and (domain == .primitive or domain == .element or domain == .derived);
+            sequence = sequence and (domain == .primitive_items or domain == .items or domain == .sequence);
+        }
+        if (resolved) return .primitive;
+        if (scalar) {
+            const proof = try self.a.create(PrimitiveType);
+            proof.* = .{ .dependencies = try self.a.dupe(ScalarType, domains) };
+            return .{ .derived = proof };
+        }
+        if (sequence) {
+            const elements = try self.a.alloc(ScalarType, domains.len);
+            for (domains, elements) |domain, *element| element.* = elementType(domain).?;
+            return if (try self.joinScalarTypes(elements)) |element| try self.sequenceType(element) else null;
+        }
+        return null;
     }
     // Compose success-result proofs without inspecting parameter elements.
     // Resolve the dependencies only when eliminating an actual dead read.
@@ -2990,7 +3089,7 @@ const Engine = struct {
     }
     /// Expand bound wildcard columns without changing expression evaluation
     /// or CALL scope. A single scalar seed gives every stage one static schema.
-    fn normalizeScalarPipeline(self: *Engine, initial: Row, clauses: []const ast.Clause) anyerror![]const ast.Clause {
+    fn rowScalarTypes(self: *Engine, initial: Row) !ScalarTypes {
         var plain: ScalarTypes = .empty;
         for (initial) |entry| {
             if (primitive(entry.value)) {
@@ -2999,7 +3098,10 @@ const Engine = struct {
                 try plain.put(self.a, entry.name, try self.listType(entry.value.list));
             }
         }
-        return self.normalizeScalarPipelineTyped(initial, clauses, plain);
+        return plain;
+    }
+    fn normalizeScalarPipeline(self: *Engine, initial: Row, clauses: []const ast.Clause) anyerror![]const ast.Clause {
+        return self.normalizeScalarPipelineTyped(initial, clauses, try self.rowScalarTypes(initial));
     }
     fn normalizeScalarPipelineTyped(self: *Engine, initial: Row, clauses: []const ast.Clause, imported_plain: ScalarTypes) anyerror![]const ast.Clause {
         var plain = imported_plain;
@@ -3038,11 +3140,7 @@ const Engine = struct {
                 .unwind => |u| {
                     try varying.put(self.a, u.alias, {});
                     const source_type = try self.scalarType(u.expression, plain);
-                    const item_type: ?ScalarType = if (source_type) |kind| switch (kind) {
-                        .primitive_items => .primitive,
-                        .items => |certificate| .{ .element = certificate },
-                        else => null,
-                    } else null;
+                    const item_type = elementType(source_type);
                     // Snapshots are immutable, including when UNWIND shadows an
                     // alias. A later type cannot license an earlier dead read.
                     plain = try plain.clone(self.a);
@@ -3527,8 +3625,57 @@ const Engine = struct {
         return .{ .rows = rows.items, .weights = weights };
     }
 
+    const AxisObservation = struct {
+        slots: []const bool,
+        summary: ?IntegerListSum,
+        facts: ?*ListCountFacts,
+        weight: Count,
+        non_null: u64,
+        distinct_range: bool,
+        copies: std.AutoHashMapUnmanaged(usize, Count) = .empty,
+        fn init(fold: *StreamFold, slots: []const bool, summary: ?IntegerListSum, weight: Count, non_null: u64, range: bool, facts: ?*ListCountFacts) @This() {
+            var sum = false;
+            var range_distinct = false;
+            for (slots, fold.calls, 0..) |qualified, expression, index| if (qualified) {
+                if (fold.active_calls) |active| if (!active[index]) continue;
+                const call_value = expression.value.call;
+                sum = sum or (std.ascii.eqlIgnoreCase(call_value.name, "sum") and !call_value.distinct);
+                range_distinct = range_distinct or (range and std.ascii.eqlIgnoreCase(call_value.name, "count") and call_value.distinct);
+            };
+            return .{ .slots = slots, .summary = if (sum) summary.? else null, .facts = facts, .weight = weight, .non_null = non_null, .distinct_range = range_distinct };
+        }
+        fn record(self: *@This(), engine: *Engine, group: usize, copies: Count) !bool {
+            if (self.summary == null and !self.distinct_range) return true;
+            const entry = try self.copies.getOrPut(engine.scratch_allocator, group);
+            const first = !entry.found_existing;
+            if (first) entry.value_ptr.* = copies else if (self.summary != null) entry.value_ptr.* = try entry.value_ptr.add(engine.a, copies);
+            return first;
+        }
+        fn finish(self: *@This(), engine: *Engine, fold: *StreamFold) !void {
+            const summary = self.summary orelse return;
+            var groups = self.copies.iterator();
+            while (groups.next()) |entry| {
+                const weight = try self.weight.multiply(engine.a, entry.value_ptr.*);
+                for (self.slots, fold.groups.items[entry.key_ptr.*].states, 0..) |qualified, *state_value, index| {
+                    if (fold.active_calls) |active| if (!active[index]) continue;
+                    if (!qualified or state_value.failure != null or state_value.function.distinct or !std.ascii.eqlIgnoreCase(state_value.function.name, "sum")) continue;
+                    // Repeat each axis element by the complete child bag's
+                    // multiplicity. Replaying the whole axis per child instead
+                    // changes integer prefix overflow for mixed-sign domains.
+                    const result = if (self.facts) |facts| state_value.addIntegerListSum(engine, facts, weight) else state_value.addIntegerSummary(engine, summary, weight, self.non_null);
+                    result catch |err| {
+                        if (!fold.defer_aggregates or !StreamingAggregate.consumerFailure(err)) return err;
+                        state_value.failure = err;
+                    };
+                }
+            }
+        }
+    };
+
     const StreamFold = struct {
         axis_enabled: bool = true,
+        axis_observation: ?*AxisObservation = null,
+        axis_copies: Count = Count.one,
         partitioned_order: bool = false,
         ordered_index: ?usize = null,
         axis_plans: std.AutoHashMapUnmanaged(usize, ?*AxisPlan) = .empty,
@@ -3766,7 +3913,17 @@ const Engine = struct {
                                     fold.weight = try previous.multiply(engine.a, domain.length);
                                     try engine.state();
                                     if (fold.record_rows) fold.stage_counts[index + 1] +|= @intCast(fold.weight.cap(std.math.maxInt(usize)));
-                                    return fold.expand(engine, try engine.replace(row, unwind.alias, domain.ranges[0].at(0)), index + 1);
+                                    var observation = AxisObservation.init(fold, slots, domain.integer_sum, previous, domain.length.cap(std.math.maxInt(u64)), true, null);
+                                    defer observation.copies.deinit(engine.scratch_allocator);
+                                    const prior_observation = fold.axis_observation;
+                                    const prior_copies = fold.axis_copies;
+                                    fold.axis_observation = &observation;
+                                    fold.axis_copies = Count.one;
+                                    defer fold.axis_observation = prior_observation;
+                                    defer fold.axis_copies = prior_copies;
+                                    try fold.expand(engine, try engine.replace(row, unwind.alias, domain.ranges[0].at(0)), index + 1);
+                                    try observation.finish(engine, fold);
+                                    return;
                                 }
                             }
                         }
@@ -3802,7 +3959,7 @@ const Engine = struct {
                             defer fold.range_extrema = previous_extrema;
                             fold.range_extrema = if (source.values == .range) (ArithmeticDomain{ .ranges = &.{source.values.range} }).extrema() else null;
                             const previous_distinct = fold.range_distinct_count;
-                            fold.range_distinct_count = null;
+                            fold.range_distinct_count = if (counts != null) .{ .value = cardinality, .weight = previous } else null;
                             defer fold.range_distinct_count = previous_distinct;
                             const previous_lists = fold.list_counts;
                             fold.list_counts = if (list_counts) |proof| .{ .facts = proof.facts, .slots = proof.slots, .weight = previous } else null;
@@ -3813,6 +3970,22 @@ const Engine = struct {
                             defer fold.weight = previous;
                             try engine.state();
                             if (fold.record_rows) fold.stage_counts[index + 1] +|= @intCast(fold.weight.cap(std.math.maxInt(usize)));
+                            if (counts != null or list_counts != null) {
+                                const slots = if (counts) |qualified| qualified else list_counts.?.slots;
+                                const summary = if (fold.range_sum) |packet| packet.value else list_counts.?.facts.integer_sum;
+                                const non_null = if (fold.range_sum) |packet| packet.length else list_counts.?.facts.non_null;
+                                var observation = AxisObservation.init(fold, slots, summary, previous, non_null, counts != null, if (list_counts) |proof| proof.facts else null);
+                                defer observation.copies.deinit(engine.scratch_allocator);
+                                const prior_observation = fold.axis_observation;
+                                const prior_copies = fold.axis_copies;
+                                fold.axis_observation = &observation;
+                                fold.axis_copies = Count.one;
+                                defer fold.axis_observation = prior_observation;
+                                defer fold.axis_copies = prior_copies;
+                                try fold.expand(engine, try engine.replace(row, unwind.alias, source.at(0)), index + 1);
+                                try observation.finish(engine, fold);
+                                return;
+                            }
                             return fold.expand(engine, try engine.replace(row, unwind.alias, source.at(0)), index + 1);
                         }
                         if (try fold.memoAxis(engine, row, index)) return;
@@ -3900,11 +4073,14 @@ const Engine = struct {
                         };
                         if (cached == null) try apply.memo.put(engine, key, null, children);
                         const prior = fold.weight;
+                        const prior_copies = fold.axis_copies;
                         defer fold.weight = prior;
+                        defer fold.axis_copies = prior_copies;
                         for (children.rows, children.weights) |child, weight| {
                             var merged = row;
                             for (child) |entry| merged = (try engine.bind(merged, entry.name, entry.value)) orelse return error.CypherVariableConflict;
                             fold.weight = try prior.multiply(engine.a, weight);
+                            if (fold.axis_observation != null) fold.axis_copies = try prior_copies.multiply(engine.a, weight);
                             // A child bag may encode many logical rows in one
                             // emission. Certify it before consuming any suffix.
                             _ = try fold.permitsWindowProduct(engine, 1);
@@ -3975,6 +4151,11 @@ const Engine = struct {
             // carry these keys across UNWIND branches or nested scratch frames.
             var input_scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
             defer input_scratch.deinit();
+            const saved_values = engine.values;
+            if (fold.group_window != null) engine.values = .{ .a = input_scratch.allocator(), .ptr = engine, .charge = chargeWork, .parent = if (engine.scalarOwner()) |owner| &owner.work else null };
+            defer if (fold.group_window != null) {
+                engine.values = saved_values;
+            };
             var input_clones: v.CloneContext = .{ .a = engine.planning_allocator, .scratch = input_scratch.allocator(), .min_shared_string_bytes = 256, .max_shared_allocations = 16384 };
             const saved_input = engine.input_clones;
             const saved_capture = engine.capture_input_clones;
@@ -4043,6 +4224,7 @@ const Engine = struct {
                 engine.distinct_sequence += 1;
                 engine.distinct_input_token = engine.distinct_sequence;
             }
+            const first_domain = if (fold.axis_observation) |observation| try observation.record(engine, found.?, fold.axis_copies) else true;
             if (engine.statistic_packet) |arguments| {
                 for (arguments) |argument| {
                     if (argument.slot >= fold.calls.len) return error.CypherInvalidBackendPage;
@@ -4063,8 +4245,9 @@ const Engine = struct {
                     continue;
                 };
                 if (accumulator.failure != null) continue;
+                if (fold.axis_observation) |observation| if (observation.slots[i] and observation.summary != null and !accumulator.function.distinct and std.ascii.eqlIgnoreCase(accumulator.function.name, "sum")) continue;
                 if (fold.list_counts) |proof| if (proof.slots[i]) {
-                    accumulator.addListCount(engine, proof.facts, proof.weight) catch |err| {
+                    accumulator.addListCount(engine, proof.facts, try proof.weight.multiply(engine.a, fold.axis_copies)) catch |err| {
                         if (!fold.defer_aggregates or !StreamingAggregate.consumerFailure(err)) return err;
                         accumulator.failure = err;
                     };
@@ -4092,6 +4275,7 @@ const Engine = struct {
                     // The range packet proves non-NULL values, and DISTINCT
                     // additionally proves one disjoint axis in this group scope.
                     if (accumulator.function.distinct) if (fold.range_distinct_count) |packet| {
+                        if (!first_domain) continue;
                         multiplicity = try packet.weight.multiply(engine.a, packet.value);
                     };
                     accumulator.function.star = true;
@@ -4151,7 +4335,7 @@ const Engine = struct {
             // filter, rebinding or further axis needs its own domain proof.
             var observed_alias = alias;
             for (fold.middle[index..]) |clause| {
-                if (clause.operation == .subquery and try engine.independentUnitCall(clause.operation.subquery, observed_alias)) continue;
+                if (clause.operation == .subquery and try engine.independentCall(clause.operation.subquery, observed_alias)) continue;
                 if (clause.operation != .project) return null;
                 observed_alias = forwardedAxis(clause.operation.project.value, observed_alias) orelse return null;
             }
@@ -4185,7 +4369,7 @@ const Engine = struct {
             var observed_alias = alias;
             var mappings: std.ArrayList(struct { expression: *const ast.Expr, alias: []const u8 }) = .empty;
             for (fold.middle[index..]) |clause| {
-                if (clause.operation == .subquery and try engine.independentUnitCall(clause.operation.subquery, observed_alias)) continue;
+                if (clause.operation == .subquery and try engine.independentCall(clause.operation.subquery, observed_alias)) continue;
                 if (clause.operation != .project) return null;
                 const p = clause.operation.project.value;
                 if (forwardedAxis(p, observed_alias)) |forwarded| {
@@ -5891,7 +6075,22 @@ const Engine = struct {
         arithmetic: ?@import("range.zig").Range = null,
         arithmetic_shape: ?bool = null,
         arithmetic_domain: ?ArithmeticDomain = null,
+        scalar_type: ?ScalarType = null,
+        type_checked: bool = false,
     };
+    fn producerScalarType(self: *Engine, id: usize) anyerror!?ScalarType {
+        const source = &self.producer_sources.items[id];
+        if (source.type_checked) return source.scalar_type;
+        // A physical producer retains its original lexical frame. Infer from
+        // that frame, never its dummy carrier binding. Cache the DAG proof in
+        // statement ownership so no recyclable normalization arena escapes.
+        const saved = self.a;
+        self.a = self.planning_allocator;
+        defer self.a = saved;
+        source.scalar_type = try self.scalarType(source.expression, try self.rowScalarTypes(source.row));
+        source.type_checked = true;
+        return source.scalar_type;
+    }
     fn captureProducerSource(self: *Engine, expression: *const ast.Expr, row: Row, captured: *std.ArrayList(v.Entry), alias: []const u8) !*const ast.Expr {
         const arithmetic = if (isRange(expression)) try self.rangeInput(expression, row, null) else null;
         const summary = if (isRange(expression)) try self.sourceSummary(if (arithmetic) |sequence| .{ .values = .{ .range = sequence } } else null, .{ .name = "collect", .args = &.{}, .collect_limit = 0 }) else try self.listSummary(.{ .name = "collect", .args = &.{expression}, .collect_limit = 0, .collect_summary = true }, row, null);
