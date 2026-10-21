@@ -206,7 +206,7 @@ const Builder = struct {
                 return;
             }
             const ref = try @import("lake_index_seekable_text.zig").publishSource(a, out, self.store, staged.source(), self.token);
-            group = .{ .file = undefined, .sources = sources.items, .segments = try out.dupe(Chunk, &.{ref}), .admissions = try out.dupe(local.segment.SegmentReader.Admission, &.{admission}), .summaries = try out.dupe(?corpus.statistics.Ref, &.{try corpus.statistics.publishReaderWithIo(a, self.store, &reader, self.token, self.context.io)}) };
+            group = .{ .file = undefined, .sources = sources.items, .segments = try out.dupe(Chunk, &.{ref}), .admissions = try out.dupe(local.segment.SegmentReader.Admission, &.{admission}), .summaries = try out.dupe(?corpus.statistics.Ref, &.{if (staged.statistics) |captured| try captured.publish(self.store, self.token, self.context.io) else try corpus.statistics.publishReaderWithIo(a, self.store, &reader, self.token, self.context.io)}) };
         }
         if (level < 3 and group.sources.len >= std.math.pow(usize, 8, level + 1) and group.sources.len < corpus.source_spans.max_spans and group.admissions[0].bytes < 2 * 1024 * 1024) {
             // Only final packs own directory/ownership/statistics entries.
@@ -275,6 +275,7 @@ const Builder = struct {
         }
         const staged = try LocalSegment.empty(self.a, self.staging, self.store);
         errdefer staged.release();
+        try staged.captureStatistics();
         var sink = staged.sink();
         try local.segment.writeMergedSegmentToSink(a, &sink, merged[0..inputs.len]);
         try staged.seal();

@@ -3478,3 +3478,47 @@ identical, including patched tables and checksums. Cross-file tests continue to
 cover coordinates, ranking ties, restart, append/replacement/removal, exact root
 identity after cache OOM, and allocation-failure cleanup. These are deterministic
 work/memory contracts; full-archive and cloud-provider latency remain unmeasured.
+
+### Reclaimable runs, owned encoder output, and write-time summaries
+
+Private metadata forests now assign each newly built immutable tree a local run
+namespace. Forest publication commits its new roots before retiring consumed
+inputs and intermediate carries. The remaining runs share one anonymous SQL
+spill file through reusable 64 KiB extents, including quota accounting and
+cancellation-safe close. Each run has 256 disk hash buckets; at most 32 committed
+runs and 64 transient descriptors exist per forest. Closing a run releases its
+buffers and reuses its extents, trimming free tail extents when possible. This
+replaces cumulative merge-history retention without raising the disk quota or
+making checkpointed DF forests private. Local attempt tokens never escape:
+final metadata is rebuilt with the durable destination's attempt and domain.
+
+Text encoding now sends each bounded projection chunk to a synchronous consumer.
+The native producer transfers its encoded buffer directly into the compactor;
+it does not materialize an array of all chunk outputs or duplicate each payload
+on handoff. The compatibility collection API uses the same splitting policy.
+Ownership transfers on every result, including cancellation and failed flushes.
+
+Native initial writers and segment mergers emit term frequency and the same
+encoded scoring-bound metadata through a synchronous observer. Wrapping sinks
+forward the observer and bind the current field; the observer never changes
+segment bytes. Compact binary frames retain native term order within each field; only the small
+field directory is sorted into publication order. A 16 KiB append buffer and
+64 KiB replay buffer bound I/O transitions without per-term JSON or sorting.
+Compaction retains these private summaries with staged outputs across tier
+promotion, uploads summaries only for final packs, and releases summaries with
+their segment owner. An unchanged single-input section still uses compressed
+copying and observes its existing term navigation. Legacy segments can use the
+reader-based summary path. Final summary publication no longer traverses the
+newly written segment's dictionary or reads its scoring-bound pages again.
+
+Global DF accumulation no longer forces a remote delta after every small file.
+It keeps the existing record/disk pressure thresholds and flushes before saving
+a completed-file checkpoint or finishing the build. Checkpoint file inventory
+and durable DF roots still advance together; an interrupted unsaved batch is
+rebuilt from the preceding checkpoint. This reduces tiny immutable trees and
+binary merge traffic for archives of small files without weakening recovery.
+
+The regression contracts cover retained-run quota reuse, full record replay,
+allocation cleanup, encoded-segment ownership, and summary-root/segment-byte
+parity against the reader path for initial construction and deletion merges.
+Provider latency and archive throughput still require controlled measurement.

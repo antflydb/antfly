@@ -1443,35 +1443,43 @@ pub fn buildTextSegmentsFromProjectionBatch(
     text_analysis: introducer_mod.TextAnalysisConfig,
     options: BuildTextSegmentsOptions,
 ) ![][]u8 {
-    if (projection_batch.docs.len == 0) return try alloc.alloc([]u8, 0);
-
-    var segments = std.ArrayListUnmanaged([]u8).empty;
+    const Collector = struct {
+        alloc: Allocator,
+        analysis: introducer_mod.TextAnalysisConfig,
+        segments: std.ArrayListUnmanaged([]u8) = .empty,
+        pub fn consume(self: *@This(), chunk: TextProjectionBatch, build_options: introducer_mod.BuildTextOptions) !void {
+            const bytes = try introducer_mod.buildSegmentFromTextWithAnalysisOptions(self.alloc, chunk.docs, &analysis_mod.default_analyzer, self.analysis, build_options);
+            errdefer self.alloc.free(bytes);
+            if (bytes.len == 0) {
+                self.alloc.free(bytes);
+                return;
+            }
+            try self.segments.append(self.alloc, bytes);
+        }
+    };
+    var collector: Collector = .{ .alloc = alloc, .analysis = text_analysis };
     errdefer {
-        for (segments.items) |segment| alloc.free(segment);
-        segments.deinit(alloc);
+        for (collector.segments.items) |bytes| alloc.free(bytes);
+        collector.segments.deinit(alloc);
     }
+    try consumeTextProjectionChunks(projection_batch, options, &collector);
+    return collector.segments.toOwnedSlice(alloc);
+}
 
-    const target_bytes = @max(@as(usize, 1), options.target_segment_bytes);
+/// Consume each bounded input chunk synchronously. The consumer can choose a
+/// file or memory sink and take ownership immediately; no batch of encoded
+/// segments or duplicate handoff buffers is required.
+pub fn consumeTextProjectionChunks(batch_: TextProjectionBatch, options: BuildTextSegmentsOptions, consumer: anytype) !void {
     const build_options = buildTextOptionsFromSegmentOptions(options);
     var start: usize = 0;
-    while (start < projection_batch.docs.len) {
-        const split = introducer_mod.splitTextDocumentsForBuildBudget(projection_batch.docs, start, .{
+    while (start < batch_.docs.len) {
+        const split = introducer_mod.splitTextDocumentsForBuildBudget(batch_.docs, start, .{
             .target_build_memory_bytes = options.target_build_memory_bytes orelse build_options.build_memory_target_bytes,
-            .target_segment_bytes = target_bytes,
+            .target_segment_bytes = @max(@as(usize, 1), options.target_segment_bytes),
         });
-        const end = split.end;
-        const chunk: TextProjectionBatch = .{
-            .docs = projection_batch.docs[start..end],
-            .observed_field_analyzers = &.{},
-        };
-        const segment = try introducer_mod.buildSegmentFromTextWithAnalysisOptions(alloc, chunk.docs, &analysis_mod.default_analyzer, text_analysis, build_options);
-        if (segment.len > 0) {
-            try segments.append(alloc, segment);
-        }
-        start = end;
+        try consumer.consume(.{ .docs = batch_.docs[start..split.end] }, build_options);
+        start = split.end;
     }
-
-    return try segments.toOwnedSlice(alloc);
 }
 
 pub fn freeTextSegments(alloc: Allocator, segments: [][]u8) void {

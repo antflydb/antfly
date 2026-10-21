@@ -146,6 +146,202 @@ pub const Summary = struct {
     }
 };
 
+/// Native writers already emit terms in order within each field. Retain one
+/// compact field directory and append private binary frames, then replay fields
+/// in publication order. No per-term JSON, sort, or second dictionary pass.
+pub const Captured = struct {
+    const Field = struct { name: []u8, begin: u64, end: u64 };
+    const header_bytes = 6;
+    a: A,
+    manager: *local.sql_spill.Manager,
+    phase: ?*const stores.IoPhase = null,
+    file: ?local.sql_spill.File = null,
+    buffer: [16 * 1024]u8 = undefined,
+    used: usize = 0,
+    fields: std.ArrayList(Field) = .empty,
+    term: ?[]const u8 = null,
+    count: u64 = 0,
+    sealed: bool = false,
+    pub fn create(a: A, manager: *local.sql_spill.Manager) !*Captured {
+        const self = try a.create(Captured);
+        self.* = .{ .a = a, .manager = manager };
+        return self;
+    }
+    pub fn deinit(self: *Captured) void {
+        if (self.file) |*file| file.close();
+        for (self.fields.items) |field| self.a.free(field.name);
+        self.fields.deinit(self.a);
+        self.a.destroy(self);
+    }
+    fn io(self: *Captured) !stores.IoGuard {
+        if (self.phase) |phase| try phase.begin(phase.ptr, 1);
+        return .{ .phase = self.phase };
+    }
+    pub fn observer(self: *Captured) inverted.TermObserver {
+        return .{ .ptr = self, .begin = begin, .finish = finish };
+    }
+    fn begin(raw: *anyopaque, field: []const u8, term: []const u8) !void {
+        const self: *Captured = @ptrCast(@alignCast(raw));
+        if (self.sealed or self.term != null or field.len +| term.len > tree.max_key_bytes - 4) return error.InvalidNativeLakeTextStatistics;
+        const offset = self.length();
+        if (self.fields.items.len == 0 or !std.mem.eql(u8, self.fields.items[self.fields.items.len - 1].name, field)) {
+            const name = try self.a.dupe(u8, field);
+            errdefer self.a.free(name);
+            try self.fields.append(self.a, .{ .name = name, .begin = offset, .end = offset });
+        }
+        // The observer is synchronous: the writer retains this term until
+        // finish returns. Only the per-field directory needs owned names.
+        self.term = term;
+    }
+    fn finish(raw: *anyopaque, frequency: u32, bounds: ?inverted.BlockMaxInfo, norm: ?u32) !void {
+        const self: *Captured = @ptrCast(@alignCast(raw));
+        const term = self.term orelse return error.InvalidNativeLakeTextStatistics;
+        if (frequency == 0) {
+            self.term = null;
+            return;
+        }
+        var summary: Summary = .{ .frequency = frequency, .max_frequency = std.math.maxInt(u32), .min_norm = 0 };
+        if (norm) |value| {
+            summary.max_frequency = 0;
+            summary.min_norm = std.math.maxInt(u32);
+            summary.addPair(.{ .frequency = 1, .norm = value });
+        } else if (bounds) |blocks| {
+            if (blocks.frequencyNormAtOrdinal(0) != null) {
+                summary.max_frequency = 0;
+                summary.min_norm = std.math.maxInt(u32);
+                var i: usize = 0;
+                while (blocks.frequencyNormAtOrdinal(i)) |pair| : (i += 1) summary.addPair(.{ .frequency = pair.frequency, .norm = pair.norm });
+            }
+        }
+        var buffer: [Summary.max_bytes]u8 = undefined;
+        const encoded = summary.encode(&buffer);
+        var header: [header_bytes]u8 = undefined;
+        std.mem.writeInt(u32, header[0..4], @intCast(term.len), .little);
+        std.mem.writeInt(u16, header[4..6], @intCast(encoded.len), .little);
+        try self.appendPart(&header);
+        try self.appendPart(term);
+        try self.appendPart(encoded);
+        self.fields.items[self.fields.items.len - 1].end = self.length();
+        self.count += 1;
+        self.term = null;
+    }
+    fn length(self: *Captured) u64 {
+        return (if (self.file) |file| file.size else @as(u64, 0)) + self.used;
+    }
+    fn write(self: *Captured, bytes: []const u8) !void {
+        var guard = try self.io();
+        defer guard.abort();
+        self.writeRaw(bytes) catch |err| return guard.failed(err);
+        try guard.finish();
+    }
+    fn writeRaw(self: *Captured, bytes: []const u8) !void {
+        if (self.file == null) self.file = try self.manager.create();
+        const file = &self.file.?;
+        try file.writeRaw(file.size, bytes);
+    }
+    fn flush(self: *Captured) !void {
+        if (self.used == 0) return;
+        try self.write(self.buffer[0..self.used]);
+        self.used = 0;
+    }
+    fn appendPart(self: *Captured, bytes: []const u8) !void {
+        if (bytes.len > self.buffer.len - self.used) try self.flush();
+        if (bytes.len >= self.buffer.len) return self.write(bytes);
+        @memcpy(self.buffer[self.used..][0..bytes.len], bytes);
+        self.used += bytes.len;
+    }
+    pub fn seal(self: *Captured) !void {
+        if (self.sealed) return;
+        if (self.term != null) return error.InvalidNativeLakeTextStatistics;
+        try self.flush();
+        if (self.file) |*file| {
+            var guard = try self.io();
+            defer guard.abort();
+            file.seal() catch |err| return guard.failed(err);
+            try guard.finish();
+        }
+        std.mem.sort(Field, self.fields.items, {}, struct {
+            fn less(_: void, left: Field, right: Field) bool {
+                return left.name.len < right.name.len or (left.name.len == right.name.len and std.mem.order(u8, left.name, right.name) == .lt);
+            }
+        }.less);
+        self.sealed = true;
+    }
+    fn read(self: *Captured, offset: u64, bytes: []u8) !void {
+        var guard = try self.io();
+        defer guard.abort();
+        self.file.?.readRaw(offset, bytes) catch |err| return guard.failed(err);
+        try guard.finish();
+    }
+    pub fn publish(self: *Captured, store: *stores.ArtifactStore, cancellation: Cancellation, executor: ?std.Io) !?Ref {
+        try self.seal();
+        const Source = struct {
+            capture: *Captured,
+            field: usize = 0,
+            offset: ?u64 = null,
+            key: ?[]u8 = null,
+            value: [Summary.max_bytes]u8 = undefined,
+            buffer: [64 * 1024]u8 = undefined,
+            buffer_start: u64 = 0,
+            buffer_len: usize = 0,
+            fn read(self_: *@This(), offset: u64, bytes: []u8) !void {
+                var done: usize = 0;
+                while (done < bytes.len) {
+                    const position = offset + done;
+                    if (position < self_.buffer_start or position - self_.buffer_start >= self_.buffer_len) {
+                        self_.buffer_start = position;
+                        self_.buffer_len = @intCast(@min(self_.buffer.len, self_.capture.file.?.size - position));
+                        if (self_.buffer_len == 0) return error.InvalidNativeLakeTextStatistics;
+                        try self_.capture.read(position, self_.buffer[0..self_.buffer_len]);
+                    }
+                    const within: usize = @intCast(position - self_.buffer_start);
+                    const n = @min(bytes.len - done, self_.buffer_len - within);
+                    @memcpy(bytes[done..][0..n], self_.buffer[within..][0..n]);
+                    done += n;
+                }
+            }
+            pub fn next(self_: *@This()) !?tree.Cursor.Record {
+                const captured = self_.capture;
+                if (self_.key) |key| captured.a.free(key);
+                self_.key = null;
+                while (self_.field < captured.fields.items.len) {
+                    const field = captured.fields.items[self_.field];
+                    const offset = self_.offset orelse field.begin;
+                    if (offset == field.end) {
+                        self_.field += 1;
+                        self_.offset = null;
+                        continue;
+                    }
+                    if (offset > field.end or field.end - offset < header_bytes) return error.InvalidNativeLakeTextStatistics;
+                    var header: [header_bytes]u8 = undefined;
+                    try self_.read(offset, &header);
+                    const term_len = std.mem.readInt(u32, header[0..4], .little);
+                    const value_len = std.mem.readInt(u16, header[4..6], .little);
+                    if (value_len > self_.value.len or @as(u64, term_len) + value_len > field.end - offset - header_bytes or field.name.len +| term_len > tree.max_key_bytes - 4) return error.InvalidNativeLakeTextStatistics;
+                    const key = try captured.a.alloc(u8, 4 + field.name.len + term_len);
+                    self_.key = key;
+                    std.mem.writeInt(u32, key[0..4], @intCast(field.name.len), .big);
+                    @memcpy(key[4..][0..field.name.len], field.name);
+                    try self_.read(offset + header_bytes, key[4 + field.name.len ..]);
+                    try self_.read(offset + header_bytes + term_len, self_.value[0..value_len]);
+                    _ = try Summary.decode(self_.value[0..value_len]);
+                    self_.offset = offset + header_bytes + term_len + value_len;
+                    return .{ .key = key, .value = self_.value[0..value_len] };
+                }
+                return null;
+            }
+        };
+        var source: Source = .{ .capture = self };
+        defer if (source.key) |key| self.a.free(key);
+        const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
+        var reads: u64 = 0;
+        var writes: u64 = 128 * 1024 * 1024;
+        var pages: page_store.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .io = executor };
+        pages.admitPublication();
+        return tree.buildSortedWithOptions(self.a, pages.store(), &source, .{ .target_bytes = tree.bulk_target_page_bytes });
+    }
+};
+
 pub fn publishSegment(a: A, store: *stores.ArtifactStore, bytes: []const u8, cancellation: Cancellation) !?Ref {
     return publishSegmentWithIo(a, store, bytes, cancellation, null);
 }
@@ -1380,29 +1576,36 @@ test "external lake text statistics durable deltas coalesce files and resume sig
     const summary = (Summary{ .frequency = 3, .max_frequency = 3, .min_norm = 2 }).encode(&buffer);
     try base.addRecord(.{ .key = "common", .value = summary }, 1);
     const prior = try base.finish(memory.store(), null);
-    var deltas = Builder.init(a, &manager);
-    defer deltas.deinit();
-    deltas.enableDurable(memory.store());
-    // A deleted file and many replacements of common vocabulary accumulate in
-    // remote runs; the serving base is untouched until one final application.
-    try deltas.addRecord(.{ .key = "common", .value = summary }, -1);
-    try deltas.flush();
-    for (0..70) |_| {
-        try deltas.addRecord(.{ .key = "common", .value = summary }, 1);
+    var publication_writes: [2]usize = undefined;
+    for ([_]usize{ 1, 64 }, 0..) |width, mode| {
+        var deltas = Builder.init(a, &manager);
+        defer deltas.deinit();
+        deltas.enableDurable(memory.store());
+        // Compare per-file durability with completed-file checkpoint batches.
+        try deltas.addRecord(.{ .key = "common", .value = summary }, -1);
         try deltas.flush();
+        const writes_before = memory.writes;
+        for (0..70) |i| {
+            try deltas.addRecord(.{ .key = "common", .value = summary }, 1);
+            if ((i + 1) % width == 0) try deltas.flush();
+        }
+        try deltas.flush();
+        publication_writes[mode] = memory.writes - writes_before;
+        const checkpoint = try deltas.durable.?.snapshot(a);
+        defer a.free(checkpoint);
+        try std.testing.expect(checkpoint.len <= 7);
+        var resumed = Builder.init(a, &manager);
+        defer resumed.deinit();
+        resumed.enableDurable(memory.store());
+        try resumed.durable.?.restore(checkpoint);
+        const result = try resumed.finish(memory.store(), prior);
+        var cursor = try tree.Cursor.init(a, memory.store(), result, "", null);
+        defer cursor.deinit();
+        try std.testing.expectEqual(@as(u64, 210), try decodeFrequency((try cursor.next()).?.value));
+        try std.testing.expect((try cursor.next()) == null);
     }
-    const checkpoint = try deltas.durable.?.snapshot(a);
-    defer a.free(checkpoint);
-    try std.testing.expect(checkpoint.len <= 7);
-    var resumed = Builder.init(a, &manager);
-    defer resumed.deinit();
-    resumed.enableDurable(memory.store());
-    try resumed.durable.?.restore(checkpoint);
-    const result = try resumed.finish(memory.store(), prior);
-    var cursor = try tree.Cursor.init(a, memory.store(), result, "", null);
-    defer cursor.deinit();
-    try std.testing.expectEqual(@as(u64, 210), try decodeFrequency((try cursor.next()).?.value));
-    try std.testing.expect((try cursor.next()) == null);
+    // The same resumable signed state needs far fewer immutable page writes.
+    try std.testing.expect(publication_writes[1] * 8 < publication_writes[0]);
     var old = try tree.Cursor.init(a, memory.store(), prior, "", null);
     defer old.deinit();
     try std.testing.expectEqual(@as(u64, 3), try decodeFrequency((try old.next()).?.value));
@@ -1437,4 +1640,94 @@ test "external lake global frontier repeated frequency and phrase ceilings cover
     }
     const escaped: Summary = .{ .frequency = 100, .max_frequency = std.math.maxInt(u32), .min_norm = 3 };
     try std.testing.expect(escaped.exactScoreCeiling(100, .{}, 1, false) == null);
+}
+
+test "external lake captured writer summaries equal reader summaries for initial and deleted merges" {
+    const a = std.testing.allocator;
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    var context: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &context, .checkpoint = Check.call, .async_writes = false };
+    defer manager.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("captured-text-statistics");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(6), 1, std.testing.io);
+    const docs = try out.alloc(local.introducer.TextDocument, 4200);
+    for (docs, 0..) |*doc, i| {
+        const text = try std.fmt.allocPrint(out, "quasar common common unique{d} {s}", .{ i, if (i % 3 == 0) "more words many many many" else "short" });
+        doc.* = .{ .id = try std.fmt.allocPrint(out, "{d:0>8}", .{i}), .stored_data = "{}", .text_fields = try out.dupe(local.introducer.TextField, &.{ .{ .field_name = "body", .text = text }, .{ .field_name = "tag", .text = "same" } }) };
+    }
+    const captured = try Captured.create(a, &manager);
+    defer captured.deinit();
+    var memory = local.segment.MemorySegmentSink.init(a);
+    defer memory.deinit();
+    var sink = memory.sink();
+    sink.term_observer = captured.observer();
+    try local.storage_db_document_mapper.writeTextSegmentFromProjectionBatchToSink(a, .{ .docs = docs }, .{}, .{ .index_sort = &.{.{ .field = "_id", .desc = false }} }, &sink);
+    const bytes = try memory.finishOwned();
+    defer a.free(bytes);
+    var reader = try local.segment.SegmentReader.init(a, bytes);
+    defer reader.deinit();
+    const expected = (try publishReaderWithIo(a, &store, &reader, .none, std.testing.io)).?;
+    const actual = (try captured.publish(&store, .none, std.testing.io)).?;
+    try std.testing.expect(std.meta.eql(expected, actual));
+    try std.testing.expect(captured.count > 4200);
+    var deleted = local.encoding_roaring.RoaringBitmap.init(a);
+    defer deleted.deinit();
+    try deleted.addRange(128, 255);
+    // Include unchanged section copying, terms deleted entirely, large streamed
+    // merges and sorted document maps.
+    for (0..4) |case| {
+        const merged_capture = try Captured.create(a, &manager);
+        defer merged_capture.deinit();
+        var merged = local.segment.MemorySegmentSink.init(a);
+        defer merged.deinit();
+        var merged_sink = merged.sink();
+        merged_sink.term_observer = merged_capture.observer();
+        const inputs: [2]local.segment.MergeInput = .{ .{ .reader = &reader, .deleted = if (case == 0) null else deleted }, .{ .reader = &reader } };
+        const selected = inputs[0..if (case >= 2) @as(usize, 2) else 1];
+        const options: local.segment.MergeOptions = .{ .index_sort = if (case == 3) &.{.{ .field = "_id", .desc = false }} else &.{} };
+        try local.segment.writeMergedSegmentToSinkWithOptions(a, &merged_sink, selected, options);
+        const merged_bytes = try merged.finishOwned();
+        defer a.free(merged_bytes);
+        const reference_bytes = try local.segment.mergeSegmentInputsWithOptions(a, selected, options);
+        defer a.free(reference_bytes);
+        try std.testing.expectEqualSlices(u8, reference_bytes, merged_bytes);
+        var merged_reader = try local.segment.SegmentReader.init(a, merged_bytes);
+        defer merged_reader.deinit();
+        const expected_merged = (try publishReaderWithIo(a, &store, &merged_reader, .none, std.testing.io)).?;
+        const actual_merged = (try merged_capture.publish(&store, .none, std.testing.io)).?;
+        try std.testing.expect(std.meta.eql(expected_merged, actual_merged));
+    }
+}
+
+test "external lake captured summaries release private spills on every allocation failure" {
+    const Fixture = struct {
+        fn check(_: *anyopaque) !void {}
+        fn run(a: A) !void {
+            var context: u8 = 0;
+            var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &context, .checkpoint = check, .async_writes = false };
+            defer manager.deinit();
+            {
+                const captured = try Captured.create(a, &manager);
+                defer captured.deinit();
+                const observer = captured.observer();
+                for ([_][]const u8{ "alpha", "beta" }) |term| {
+                    try observer.begin(observer.ptr, "body", term);
+                    try observer.finish(observer.ptr, 1, null, 128);
+                }
+                try captured.seal();
+            }
+            try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
+            try std.testing.expectEqual(@as(usize, 0), manager.files);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

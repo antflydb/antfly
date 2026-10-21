@@ -198,22 +198,70 @@ pub const PageStore = struct {
     }
 };
 
-/// Operation-private immutable pages. A fixed hash directory points into one
-/// quota-accounted spill file; the index never grows with the number of pages.
-/// References must be consumed as records and rebuilt into a durable store.
+/// Operation-private immutable runs. Each run has a fixed, small hash directory;
+/// its attempt token identifies the owner without an archive-sized page map.
+/// Committed forests retain only reachable runs. All runs share reusable SQL
+/// spill extents and one physical descriptor; no private reference is durable.
 pub const PrivatePages = struct {
-    manager: *@import("antfly_local_sources").sql_spill.Manager,
+    const spill = @import("antfly_local_sources").sql_spill;
+    const Run = struct { file: spill.File, heads: [256]u64 = @splat(0), token: [16]u8 };
+    manager: *spill.Manager,
     domain: [32]u8,
     attempt: [16]u8,
     phase: ?*const artifacts.IoPhase = null,
-    file: ?@import("antfly_local_sources").sql_spill.File = null,
-    heads: [4096]u64 = @splat(0),
+    pool: ?spill.RunFiles = null,
+    runs: [64]?*Run = @splat(null),
+    generation: u64 = 0,
+    current: ?usize = null,
     pub fn deinit(self: *PrivatePages) void {
-        if (self.file) |*file| file.close();
-        self.file = null;
+        for (&self.runs) |*run| if (run.*) |value| {
+            value.file.close();
+            self.manager.allocator().destroy(value);
+            run.* = null;
+        };
+        if (self.pool) |*pool| pool.deinit();
+        self.pool = null;
+        self.current = null;
+    }
+    pub fn beginRun(raw: *anyopaque) !tree.Store {
+        const self = owner(raw);
+        var guard = try self.begin();
+        defer guard.abort();
+        const slot = for (self.runs, 0..) |run, i| {
+            if (run == null) break i;
+        } else return error.NativeLakeDeltaRunLimitExceeded;
+        if (self.pool == null) self.pool = .{ .manager = self.manager };
+        const run = try self.manager.allocator().create(Run);
+        errdefer self.manager.allocator().destroy(run);
+        self.generation = try std.math.add(u64, self.generation, 1);
+        var token = self.attempt;
+        std.mem.writeInt(u64, token[8..16], self.generation, .big);
+        run.* = .{ .file = self.pool.?.create() catch |err| return guard.failed(err), .token = token };
+        errdefer run.file.close();
+        try guard.finish();
+        self.runs[slot] = run;
+        self.current = slot;
+        return self.store();
+    }
+    pub fn retain(raw: *anyopaque, roots: []const ?tree.Ref) !void {
+        const self = owner(raw);
+        var guard = try self.begin();
+        defer guard.abort();
+        for (&self.runs, 0..) |*run, i| if (run.*) |value| {
+            const keep = for (roots) |root| {
+                if (root) |ref| if (std.mem.eql(u8, &ref.attempt, &value.token)) break true;
+            } else false;
+            if (!keep) {
+                value.file.close();
+                self.manager.allocator().destroy(value);
+                run.* = null;
+                if (self.current == i) self.current = null;
+            }
+        };
+        try guard.finish();
     }
     pub fn store(self: *PrivatePages) tree.Store {
-        return .{ .domain = self.domain, .attempt = self.attempt, .ptr = self, .get = get, .put = put, .check = check };
+        return .{ .domain = self.domain, .attempt = if (self.current) |i| self.runs[i].?.token else self.attempt, .ptr = self, .get = get, .put = put, .check = check };
     }
     fn owner(raw: *anyopaque) *PrivatePages {
         return @ptrCast(@alignCast(raw));
@@ -226,33 +274,37 @@ pub const PrivatePages = struct {
         return .{ .phase = self.phase };
     }
     fn bucket(ref: tree.Ref) usize {
-        return std.mem.readInt(u16, ref.digest[0..2], .little) % 4096;
+        return std.mem.readInt(u16, ref.digest[0..2], .little) % 256;
+    }
+    fn find(self: *PrivatePages, ref: tree.Ref) !*Run {
+        for (self.runs) |run| if (run) |value| {
+            if (std.mem.eql(u8, &ref.attempt, &value.token)) return value;
+        };
+        return error.InvalidGraphPage;
     }
     fn put(raw: *anyopaque, ref: tree.Ref, bytes: []const u8) !void {
         const self = owner(raw);
         try ref.validate();
-        if (bytes.len != ref.bytes or !std.mem.eql(u8, &ref.attempt, &self.attempt)) return error.InvalidGraphPage;
+        if (bytes.len != ref.bytes) return error.InvalidGraphPage;
         var guard = try self.begin();
         defer guard.abort();
         self.append(ref, bytes) catch |err| return guard.failed(err);
         try guard.finish();
     }
     fn append(self: *PrivatePages, ref: tree.Ref, bytes: []const u8) !void {
-        if (self.file == null) self.file = try self.manager.create();
-        const file = &self.file.?;
+        const run = try self.find(ref);
+        const file = &run.file;
         const offset = file.size;
         var header: [40]u8 = undefined;
         header[0..32].* = ref.digest;
-        std.mem.writeInt(u64, header[32..40], self.heads[bucket(ref)], .little);
+        std.mem.writeInt(u64, header[32..40], run.heads[bucket(ref)], .little);
         try file.writeRaw(offset, &header);
         try file.writeRaw(offset + header.len, bytes);
-        // Offset + 1 preserves a zero sentinel without reserving a file prefix.
-        self.heads[bucket(ref)] = offset + 1;
+        run.heads[bucket(ref)] = offset + 1;
     }
     fn get(raw: *anyopaque, a: std.mem.Allocator, ref: tree.Ref) ![]u8 {
         const self = owner(raw);
         try ref.validate();
-        if (!std.mem.eql(u8, &ref.attempt, &self.attempt)) return error.InvalidGraphPage;
         var guard = try self.begin();
         defer guard.abort();
         const bytes = self.lookup(a, ref) catch |err| return guard.failed(err);
@@ -261,8 +313,9 @@ pub const PrivatePages = struct {
         return bytes;
     }
     fn lookup(self: *PrivatePages, a: std.mem.Allocator, ref: tree.Ref) ![]u8 {
-        var next = self.heads[bucket(ref)];
-        const file = if (self.file) |*file| file else return error.FileNotFound;
+        const run = try self.find(ref);
+        var next = run.heads[bucket(ref)];
+        const file = &run.file;
         while (next != 0) {
             const offset = next - 1;
             var header: [40]u8 = undefined;
@@ -922,7 +975,7 @@ test "serverless private graph pages authenticate spill records and release quot
             {
                 var pages: PrivatePages = .{ .manager = &manager, .domain = @splat(7), .attempt = @splat(1) };
                 defer pages.deinit();
-                const storage = pages.store();
+                const storage = try PrivatePages.beginRun(&pages);
                 const root = (try tree.apply(a, storage, null, &.{.{ .key = "key", .value = "value" }})).?;
                 var page = try tree.readPage(a, storage, root);
                 defer page.deinit(a);
@@ -944,7 +997,7 @@ test "serverless private graph pages authenticate spill records and release quot
     {
         var pages: PrivatePages = .{ .manager = &manager, .domain = @splat(7), .attempt = @splat(1) };
         defer pages.deinit();
-        const storage = pages.store();
+        const storage = try PrivatePages.beginRun(&pages);
         const root = (try tree.apply(a, storage, null, &.{.{ .key = "key", .value = "value" }})).?;
         {
             var page = try tree.readPage(a, storage, root);
@@ -955,9 +1008,11 @@ test "serverless private graph pages authenticate spill records and release quot
         foreign.attempt = @splat(2);
         try std.testing.expectError(error.InvalidGraphPage, storage.get(storage.ptr, a, foreign));
         manager.max_bytes = manager.live_bytes;
-        try std.testing.expectError(error.SqlProgramLimitExceeded, tree.apply(a, storage, root, &.{.{ .key = "new", .value = "value" }}));
-        const offset = pages.heads[PrivatePages.bucket(root)] - 1;
-        try pages.file.?.writeRaw(offset + 40, "!");
+        var large: [128 * 1024]u8 = @splat(1);
+        try std.testing.expectError(error.SqlProgramLimitExceeded, tree.apply(a, storage, root, &.{.{ .key = "new", .value = &large }}));
+        const run = try pages.find(root);
+        const offset = run.heads[PrivatePages.bucket(root)] - 1;
+        try run.file.writeRaw(offset + 40, "!");
         try std.testing.expectError(error.ArtifactIntegrityMismatch, tree.readPage(a, storage, root));
     }
     try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);

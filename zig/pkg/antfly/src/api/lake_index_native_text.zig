@@ -1257,7 +1257,14 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             }
             var opening: @import("lake_index_text_opening_pack.zig").Collector = .{ .a = a, .out = fa, .store = store, .cancellation = cancellation };
             defer opening.deinit();
-            var compactor: Compactor = .{ .a = a, .out = fa, .store = store, .segments = &segments, .summaries = &summaries, .admissions = &admissions, .cancellation = cancellation, .file_ordinal = file_ordinal, .opening = &opening, .io = provider.context.io };
+            var capture_check = cancellation;
+            var capture_manager: local.sql_spill.Manager = .{ .alloc = a, .io = provider.context.io orelse return error.UnsupportedSqlExecution, .context = &capture_check, .checkpoint = struct {
+                fn check(raw: *anyopaque) !void {
+                    try @as(*Cancellation, @ptrCast(@alignCast(raw))).check();
+                }
+            }.check };
+            defer capture_manager.deinit();
+            var compactor: Compactor = .{ .capture_manager = &capture_manager, .a = a, .out = fa, .store = store, .segments = &segments, .summaries = &summaries, .admissions = &admissions, .cancellation = cancellation, .file_ordinal = file_ordinal, .opening = &opening, .io = provider.context.io };
             defer compactor.deinit();
             var ordinals = physical.Builder.init(a, fa, store, cancellation);
             defer ordinals.deinit();
@@ -1347,7 +1354,6 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 for (old.summaries) |summary| try df.add(df_pages.store(), summary, -1);
             } else if (previous_groups.get(file.id)) |old| for (old.summaries) |ref| try df.add(df_pages.store(), ref, -1);
             for (group.summaries) |ref| try df.add(df_pages.store(), ref, 1);
-            try df.flush();
             // Atomically checkpoint the completed file inventory and its DF
             // state. Save the first file, then at most 64 files or five seconds
             // of completed work; metadata traffic grows with the delta batch.
@@ -1355,6 +1361,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 try pending_files.append(a, .{ .file = .{ .id = file.id, .digest = file.digest, .key_width = file.key_width }, .manifest = file_manifests.get(file_ordinal).? });
                 const now = @import("antfly_platform").time.monotonicNs();
                 if (checkpoints_saved == 0 or pending_files.items.len >= 64 or now -| checkpoint_time >= 5 * std.time.ns_per_s) {
+                    try df.flush();
                     var checkpoint_arena = std.heap.ArenaAllocator.init(a);
                     defer checkpoint_arena.deinit();
                     checkpoint_files = try text_directory.publishFileRecords(a, store, pending_files.items, &.{}, checkpoint_files, cancellation, provider.context.io.?);
@@ -1880,6 +1887,14 @@ fn publishRoot(a: A, out: A, store: *stores.ArtifactStore, name: []const u8, roo
 const Compactor = struct {
     const fan_in = 8;
     const target_bytes = 16 * 1024 * 1024;
+    const Owned = struct {
+        bytes: []u8,
+        captured: ?*statistics.Captured = null,
+        fn deinit(self: Owned, a: A) void {
+            if (self.captured) |captured| captured.deinit();
+            a.free(self.bytes);
+        }
+    };
     a: A,
     out: A,
     store: *stores.ArtifactStore,
@@ -1891,21 +1906,25 @@ const Compactor = struct {
     opening: ?*@import("lake_index_text_opening_pack.zig").Collector = null,
     io: ?std.Io = null,
     workspace_bytes: usize = 64 * 1024 * 1024,
-    pending: [fan_in]?[]u8 = @splat(null),
+    capture_manager: ?*local.sql_spill.Manager = null,
+    pending: [fan_in]?Owned = @splat(null),
     count: usize = 0,
     bytes: usize = 0,
     fn deinit(self: *Compactor) void {
-        for (self.pending[0..self.count]) |value| self.a.free(value.?);
+        for (self.pending[0..self.count]) |value| value.?.deinit(self.a);
         self.count = 0;
         self.bytes = 0;
     }
-    fn add(self: *Compactor, bytes: []const u8) !void {
+    fn addOwned(self: *Compactor, owned: Owned) !void {
+        var adopted = false;
+        defer if (!adopted) owned.deinit(self.a);
         try self.cancellation.check();
-        if (self.count != 0 and bytes.len > target_bytes -| self.bytes) try self.finish();
-        if (bytes.len > target_bytes) return self.publish(bytes);
-        self.pending[self.count] = try self.a.dupe(u8, bytes);
+        if (self.count != 0 and owned.bytes.len > target_bytes -| self.bytes) try self.finish();
+        if (owned.bytes.len > target_bytes) return self.publishSource(.{ .contiguous = owned.bytes }, owned.captured);
+        self.pending[self.count] = owned;
+        adopted = true;
         self.count += 1;
-        self.bytes += bytes.len;
+        self.bytes += owned.bytes.len;
         if (self.count == fan_in) try self.finish();
     }
     fn finish(self: *Compactor) !void {
@@ -1921,7 +1940,7 @@ const Compactor = struct {
             var manager: local.sql_spill.Manager = .{ .alloc = self.a, .io = self.io.?, .context = self, .checkpoint = check, .max_bytes = 32 * 1024 * 1024, .async_writes = false };
             defer manager.deinit();
             const merged = self.merge(a, &manager) catch |err| switch (err) {
-                error.OutOfMemory, error.NativeLakeTextCorpusTooLarge => null,
+                error.OutOfMemory, error.NativeLakeTextCorpusTooLarge, error.SqlProgramLimitExceeded => null,
                 else => return err,
             };
             if (merged) |staged| {
@@ -1929,12 +1948,12 @@ const Compactor = struct {
                 // A merge must save an artifact and respect the serving cap.
                 if (staged.file.size <= self.bytes + 64 * 1024) {
                     try self.cancellation.check();
-                    try self.publishSource(staged.source());
+                    try self.publishSource(staged.source(), staged.statistics);
                     return;
                 }
             }
         }
-        for (self.pending[0..self.count]) |bytes| try self.publish(bytes.?);
+        for (self.pending[0..self.count]) |owned| try self.publishSource(.{ .contiguous = owned.?.bytes }, owned.?.captured);
     }
     fn check(raw: *anyopaque) !void {
         try @as(*Compactor, @ptrCast(@alignCast(raw))).cancellation.check();
@@ -1945,21 +1964,19 @@ const Compactor = struct {
         defer for (readers[0..opened]) |*reader| reader.deinit();
         var inputs: [fan_in]local.segment.MergeInput = undefined;
         for (self.pending[0..self.count], &readers, &inputs) |bytes, *reader, *input| {
-            reader.* = try local.segment.SegmentReader.init(a, bytes.?);
+            reader.* = try local.segment.SegmentReader.init(a, bytes.?.bytes);
             opened += 1;
             input.* = .{ .reader = reader };
         }
         const staged = try @import("lake_index_segment_spill.zig").LocalSegment.empty(self.a, manager, self.store);
         errdefer staged.release();
+        try staged.captureStatistics();
         var sink = staged.sink();
         try local.segment.writeMergedSegmentToSink(a, &sink, &inputs);
         try staged.seal();
         return staged;
     }
-    fn publish(self: *Compactor, bytes: []const u8) !void {
-        return self.publishSource(.{ .contiguous = bytes });
-    }
-    fn publishSource(self: *Compactor, source: local.index.SegmentSource) !void {
+    fn publishSource(self: *Compactor, source: local.index.SegmentSource, captured: ?*statistics.Captured) !void {
         const a = self.a;
         const out = self.out;
         const cancellation = self.cancellation;
@@ -1973,7 +1990,7 @@ const Compactor = struct {
         var reader = try local.segment.SegmentReader.initSource(a, source);
         defer reader.deinit();
         try self.admissions.append(out, try reader.admission(out));
-        const summary = statistics.publishReaderWithIo(a, store, &reader, cancellation, self.io) catch |err| return buildFailure(err, "segment_statistics", self.file_ordinal, segments.items.len);
+        const summary = (if (captured) |value| value.publish(store, cancellation, self.io) else statistics.publishReaderWithIo(a, store, &reader, cancellation, self.io)) catch |err| return buildFailure(err, "segment_statistics", self.file_ordinal, segments.items.len);
         try self.summaries.append(out, summary);
         try segments.append(out, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len });
     }
@@ -1983,9 +2000,30 @@ fn flush(compactor: *Compactor, batch: mapper.TextProjectionBatch, analysis: loc
     for (batch.docs, 0..) |doc, i| {
         if (i != 0 and std.mem.order(u8, batch.docs[i - 1].id, doc.id) != .lt) return error.InvalidNativeLakeTextCorpus;
     }
-    const encoded = mapper.buildTextSegmentsFromProjectionBatch(compactor.a, batch, analysis, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source }) catch |err| return buildFailure(err, "encode_segments", compactor.file_ordinal, compactor.segments.items.len);
-    defer mapper.freeTextSegments(compactor.a, encoded);
-    for (encoded) |bytes| try compactor.add(bytes);
+    const Consumer = struct {
+        compactor: *Compactor,
+        analysis: local.introducer.TextAnalysisConfig,
+        pub fn consume(self: *@This(), chunk: mapper.TextProjectionBatch, options: local.introducer.BuildTextOptions) !void {
+            const a = self.compactor.a;
+            const captured = if (self.compactor.capture_manager) |manager| try statistics.Captured.create(a, manager) else null;
+            if (captured) |value| value.phase = self.compactor.store.io_phase;
+            var owned = false;
+            defer if (!owned) {
+                if (captured) |value| value.deinit();
+            };
+            var memory_sink = local.segment.MemorySegmentSink.init(a);
+            defer memory_sink.deinit();
+            var sink = memory_sink.sink();
+            sink.term_observer = if (captured) |value| value.observer() else null;
+            try mapper.writeTextSegmentFromProjectionBatchToSink(a, chunk, self.analysis, options, &sink);
+            if (captured) |value| try value.seal();
+            const bytes = try memory_sink.finishOwned();
+            owned = true; // addOwned consumes both resources on every path.
+            try self.compactor.addOwned(.{ .bytes = bytes, .captured = captured });
+        }
+    };
+    var consumer: Consumer = .{ .compactor = compactor, .analysis = analysis };
+    mapper.consumeTextProjectionChunks(batch, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source }, &consumer) catch |err| return buildFailure(err, "encode_segments", compactor.file_ordinal, compactor.segments.items.len);
 }
 const ProjectionLeases = struct {
     const max_bytes = 8 * 1024 * 1024;
@@ -2087,8 +2125,7 @@ test "external lake text compaction preserves all physical keys in input order" 
         for (0..9) |i| {
             const key = try std.fmt.allocPrint(ca, "lake1:{s}:00000000:{x:0>16}", .{ file_id, i + 10 });
             const bytes = (try mapper.buildTextSegmentFromDocuments(a, &.{.{ .key = key, .value = "{\"body\":\"quasar\"}" }}, .{}, null)).?;
-            defer a.free(bytes);
-            try compactor.add(bytes);
+            try compactor.addOwned(.{ .bytes = bytes });
         }
         try compactor.finish();
         try std.testing.expectEqual(@as(usize, if (workspace == 1) 9 else 2), segments.items.len);

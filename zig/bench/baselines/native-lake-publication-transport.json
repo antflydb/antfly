@@ -33,8 +33,12 @@
     ],
     "private_metadata_intermediate_provider_writes": 0,
     "private_metadata_intermediate_provider_reads": 0,
-    "private_metadata_hash_buckets_per_forest": 4096,
-    "checkpointed_statistics_forests_remain_durable": true
+    "checkpointed_statistics_forests_remain_durable": true,
+    "private_metadata_hash_buckets_per_run": 256,
+    "private_metadata_committed_runs_per_forest": 32,
+    "private_metadata_transient_runs_per_forest": 64,
+    "private_metadata_extent_bytes": 65536,
+    "private_metadata_reclamation": "retire consumed runs after forest commit; recycle shared extents"
   },
   "text_publication": {
     "shared_manifest_consumers": [
@@ -106,7 +110,14 @@
     "canonical_replay_hash_buckets": 4096,
     "canonical_replay_consumers": "canonical metadata reduction and serving compaction, independent order",
     "fresh_manifest_provider_gets_during_file_first_parquet_build": 0,
-    "ordinary_fresh_manifest_serializations": 1
+    "ordinary_fresh_manifest_serializations": 1,
+    "canonical_encoder_handoff": "one encoded chunk transferred with ownership; no segment-array or payload copy",
+    "native_term_statistics": "bounded side channel during initial writing and merges; final output only",
+    "statistics_flush": "checkpoint boundary or pressure threshold; no forced per-file run",
+    "captured_statistics_append_buffer_bytes": 16384,
+    "captured_statistics_replay_buffer_bytes": 65536,
+    "captured_statistics_frame_header_bytes": 6,
+    "captured_statistics_ordering": "native per-field term order; sort compact field directory only"
   },
   "qualification_outstanding": [
     "Controlled identical-fixture base/head HN one-file and 1024-file latency and post-GC footprint",

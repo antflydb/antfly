@@ -238,7 +238,7 @@ pub const Mutations = struct {
         var source: Source = .{ .sort = &self.sort, .scratch = .init(self.a), .owned = .init(self.a), .addition_first = self.addition_first };
         defer source.scratch.deinit();
         defer source.owned.deinit();
-        self.forest.store = self.private_pages.store();
+        self.forest.runs = .{ .ptr = &self.private_pages, .begin = pages_mod.PrivatePages.beginRun, .retain = pages_mod.PrivatePages.retain };
         try self.forest.add(&source);
         const manager = self.sort.manager;
         self.sort.deinit();
@@ -1289,7 +1289,7 @@ test "external lake serving metadata additions override late deletions within an
     try publisher.files.flush();
     try std.testing.expectEqual(@as(u64, 0), publisher.writes);
     try std.testing.expectEqual(@as(u64, 0), publisher.reads);
-    try std.testing.expect(publisher.files.private_pages.file != null);
+    try std.testing.expect(publisher.files.private_pages.pool != null);
     try publisher.files.add(id, "newest", 6);
     try publisher.files.add(id, null, 6);
     const root = (try publisher.files.finish(null)).?;
@@ -1298,4 +1298,43 @@ test "external lake serving metadata additions override late deletions within an
     defer cursor.deinit();
     try std.testing.expectEqualStrings("newest", (try cursor.next()).?.value);
     try std.testing.expect(try cursor.next() == null);
+}
+
+test "external lake private metadata recycles consumed runs under a live spill quota" {
+    const a = std.testing.allocator;
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    var context: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &context, .checkpoint = Check.call, .max_bytes = 4 * 1024 * 1024, .async_writes = false };
+    defer manager.deinit();
+    var memory = tree.testing.MemoryStore{ .alloc = a };
+    defer memory.deinit();
+    {
+        var mutations = Mutations.init(a, &manager, memory.store());
+        defer mutations.deinit();
+        const value: [128]u8 = @splat(42);
+        for (0..4096) |i| {
+            var id: Id = @splat(0);
+            std.mem.writeInt(u64, id[24..32], i, .big);
+            try mutations.add(id, &value, 0);
+            if ((i + 1) % 16 == 0) try mutations.flush();
+        }
+        const root = (try mutations.finish(null)).?;
+        var cursor = try tree.Cursor.init(a, memory.store(), root, "", null);
+        defer cursor.deinit();
+        var count: usize = 0;
+        while (try cursor.next()) |record| : (count += 1) {
+            try std.testing.expectEqual(count, std.mem.readInt(u64, record.key[24..32], .big));
+            try std.testing.expectEqualSlices(u8, &value, record.value);
+        }
+        try std.testing.expectEqual(@as(usize, 4096), count);
+        // Logical history exceeds the quota. Only live
+        // inputs and uncommitted output survive, with one physical run file.
+        try std.testing.expect(manager.written_bytes > manager.max_bytes);
+        try std.testing.expect(manager.peak_bytes <= manager.max_bytes);
+        try std.testing.expect(manager.peak_files < 8);
+    }
+    try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
+    try std.testing.expectEqual(@as(usize, 0), manager.files);
 }

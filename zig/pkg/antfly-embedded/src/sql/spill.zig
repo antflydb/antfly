@@ -3462,6 +3462,27 @@ pub const Partitions = struct {
     }
 };
 
+/// Independent immutable runs share one physical file and recycle released
+/// extents. Every File must close before its pool; metadata and disk stay under
+/// the same statement allocator and spill quota as ordinary sorts.
+pub const RunFiles = struct {
+    manager: *Manager,
+    store: ?*RunStore = null,
+    pub fn create(self: *RunFiles) !File {
+        if (self.store == null) {
+            const store = try self.manager.allocator().create(RunStore);
+            errdefer self.manager.allocator().destroy(store);
+            store.* = .{ .file = try self.manager.create() };
+            self.store = store;
+        }
+        return self.store.?.fileRun();
+    }
+    pub fn deinit(self: *RunFiles) void {
+        if (self.store) |store| store.deinit();
+        self.store = null;
+    }
+};
+
 const RunStore = struct {
     const block_bytes: u64 = 64 * 1024;
     file: File,
@@ -3471,12 +3492,15 @@ const RunStore = struct {
     fn lock(self: *RunStore) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
-    fn run(self: *RunStore, block_size: usize) Sequential {
+    fn fileRun(self: *RunStore) File {
         self.lock();
         self.references += 1;
         self.mutex.unlock();
+        return .{ .manager = self.file.manager, .file = self.file.file, .id = self.file.id, .run_store = self };
+    }
+    fn run(self: *RunStore, block_size: usize) Sequential {
         const manager = self.file.manager;
-        return .{ .file = .{ .manager = manager, .file = self.file.file, .id = self.file.id, .run_store = self }, .block_bytes = block_size, .write_arena = .init(manager.allocator()), .read_arena = .init(manager.allocator()) };
+        return .{ .file = self.fileRun(), .block_bytes = block_size, .write_arena = .init(manager.allocator()), .read_arena = .init(manager.allocator()) };
     }
     fn allocate(self: *RunStore) !u64 {
         self.lock();

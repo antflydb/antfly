@@ -23,6 +23,7 @@ pub const LocalSegment = struct {
     a: A,
     file: local.sql_spill.File,
     refs: usize = 1,
+    statistics: ?*@import("lake_index_text_statistics.zig").Captured = null,
     store: *stores.ArtifactStore,
     mutex: std.atomic.Mutex = .unlocked,
     buffer: [16 * 1024]u8 = undefined,
@@ -53,6 +54,7 @@ pub const LocalSegment = struct {
     }
     pub fn seal(self: *LocalSegment) !void {
         try self.flush();
+        if (self.statistics) |captured| try captured.seal();
         var phase = try self.store.beginIo(1);
         defer phase.abort();
         self.file.seal() catch |err| return phase.failed(err);
@@ -107,8 +109,13 @@ pub const LocalSegment = struct {
         const self = owner(raw);
         return @sizeOf(LocalSegment) + self.file.write_buffer.len + self.file.read_buffer.len;
     }
+    pub fn captureStatistics(self: *LocalSegment) !void {
+        std.debug.assert(self.statistics == null);
+        self.statistics = try @import("lake_index_text_statistics.zig").Captured.create(self.a, self.file.manager);
+        self.statistics.?.phase = self.store.io_phase;
+    }
     pub fn sink(self: *LocalSegment) local.segment.SegmentSink {
-        return .{ .ptr = self, .vtable = &.{ .len = length, .append_slice = appendSlice, .append_byte = appendByte, .append_ntimes = appendNTimes, .write_at = writeAt, .crc32_prefix = crcPrefix, .crc32_range = crcRange, .resident_bytes = resident } };
+        return .{ .term_observer = if (self.statistics) |captured| captured.observer() else null, .ptr = self, .vtable = &.{ .len = length, .append_slice = appendSlice, .append_byte = appendByte, .append_ntimes = appendNTimes, .write_at = writeAt, .crc32_prefix = crcPrefix, .crc32_range = crcRange, .resident_bytes = resident } };
     }
     pub fn retain(self: *LocalSegment) void {
         self.refs += 1;
@@ -116,6 +123,7 @@ pub const LocalSegment = struct {
     pub fn release(self: *LocalSegment) void {
         self.refs -= 1;
         if (self.refs == 0) {
+            if (self.statistics) |captured| captured.deinit();
             self.file.close();
             self.a.destroy(self);
         }

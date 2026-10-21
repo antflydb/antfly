@@ -401,6 +401,7 @@ pub const SegmentWriter = struct {
         const stored_metadata_crc = try sink.crc32Range(@intCast(stored_offset), @intCast(stored_metadata_length));
 
         for (self.fields.items) |*field| {
+            sink.term_field = field.name;
             for (field.sections.items) |*section| {
                 section.offset = sink.len();
                 if (section.builder) |builder| {
@@ -2092,6 +2093,10 @@ pub const SegmentReader = struct {
 /// and bounded range checksums for immutable payloads. A file-backed sink can
 /// implement the same contract without materializing the final segment.
 pub const SegmentSink = struct {
+    /// Optional synchronous side channel; views expire before the writer
+    /// advances. Wrapping sinks forward it and identify the current field.
+    term_observer: ?inverted.TermObserver = null,
+    term_field: []const u8 = "",
     ptr: *anyopaque,
     vtable: *const VTable,
 
@@ -2184,7 +2189,7 @@ const PageChecksumSink = struct {
         self.section_dirty.deinit(self.alloc);
     }
     fn sink(self: *PageChecksumSink) SegmentSink {
-        return .{ .ptr = self, .vtable = &vtable };
+        return .{ .ptr = self, .vtable = &vtable, .term_observer = self.inner.term_observer, .term_field = self.inner.term_field };
     }
     fn owner(ptr: *anyopaque) *PageChecksumSink {
         return @ptrCast(@alignCast(ptr));
@@ -3547,6 +3552,7 @@ fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: 
     while (field_iter.next()) |field_name_ptr| {
         const field_name = field_name_ptr.*;
         var built_field = BuiltField{ .name = field_name };
+        sink.term_field = field_name;
         errdefer built_field.deinit(alloc);
 
         var has_inverted = false;
@@ -3570,6 +3576,19 @@ fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: 
         if (has_inverted) {
             if (present_count == 1 and first_present_index.? == 0 and !only_present_deleted) {
                 const view = inv_sections[0].?;
+                if (sink.term_observer) |observer| {
+                    var scoped = try inverted.ScopedInvertedIndexReader.initRanges(alloc, view, .{});
+                    defer scoped.deinit();
+                    var terms = try scoped.termIterator();
+                    defer terms.deinit();
+                    while (try terms.next()) |entry| {
+                        try observer.begin(observer.ptr, field_name, entry.term);
+                        switch (entry.result) {
+                            .one_hit => |hit| try observer.finish(observer.ptr, 1, null, hit.norm_bits),
+                            .postings => |postings| try observer.finish(observer.ptr, postings.doc_freq, postings.block_max, null),
+                        }
+                    }
+                }
                 const offset = sink.len();
                 sink.beginSection();
                 var scratch: [64 * 1024]u8 = undefined;
@@ -3670,6 +3689,7 @@ fn writeSortedMergedSegmentToSink(
     while (field_iter.next()) |field_name_ptr| {
         const field_name = field_name_ptr.*;
         var built_field = BuiltField{ .name = field_name };
+        sink.term_field = field_name;
         errdefer built_field.deinit(alloc);
 
         var has_inverted = false;
