@@ -647,3 +647,214 @@ test "prepared transaction effects borrowed readers unwind every allocation and 
         try std.testing.expectError(cause, Checks.run(a, &fixture.store, &checks));
     };
 }
+
+const CleanupCaptureTest = struct {
+    const keys = @import("../internal_keys.zig");
+    const contract = @import("../graph_cleanup_contract.zig");
+    fn seed(store: *DocStore, mode: usize) !void {
+        const a = std.testing.allocator;
+        if (mode == 0) return;
+        const edge = try keys.graphEdgeArtifactKeyAlloc(a, "doc", "g", "links", "target");
+        defer a.free(edge);
+        if (mode == 1) {
+            try store.put(keys.graph_incoming_ready_key, "1");
+            const incoming = (try keys.graphIncomingKeyAlloc(a, edge)).?;
+            defer a.free(incoming);
+            try store.put(incoming, edge);
+            const key = try keys.graphEndpointCleanupKeyAlloc(a, "target");
+            defer a.free(key);
+            const value = try contract.encodeAlloc(a, "target", 7);
+            defer a.free(value);
+            try store.put(key, value);
+        } else {
+            const key = try contract.ownerJobKeyAlloc(a, "doc");
+            defer a.free(key);
+            const value = try contract.encodeOwnerJobAlloc(a, .{ .owner = "doc", .generation = 9 });
+            defer a.free(value);
+            try store.put(key, value);
+            const retired = try keys.graphRetirementKeyAlloc(a, edge);
+            defer a.free(retired);
+            try store.put(retired, "1");
+            // Owner replay must work before unrelated directory migration completes.
+            try store.delete(keys.graph_incoming_ready_key);
+        }
+    }
+    fn freeKeys(a: A, items: [][]u8) void {
+        for (items) |key| a.free(key);
+        a.free(items);
+    }
+};
+
+test "prepared transaction effects cleanup planning is read only and retains job directory and owner proofs" {
+    const a = std.testing.allocator;
+    const keys = CleanupCaptureTest.keys;
+    const contract = CleanupCaptureTest.contract;
+    for (0..3) |mode| {
+        var fixture: ReadCaptureTest = .{};
+        try fixture.init();
+        defer fixture.deinit();
+        try CleanupCaptureTest.seed(&fixture.store, mode);
+        const before = fixture.store.query_generation_revision.load(.acquire);
+        var captured = read_set.Owned.init(a, null);
+        defer captured.deinit();
+        {
+            var reader = try read_set.observe(&fixture.store, &captured).beginReadTxn();
+            defer reader.abort();
+            var page = (try DocStore.planGraphEndpointCleanupPage(a, &reader)).?;
+            defer page.deinit();
+            if (mode == 0) {
+                try std.testing.expectEqual(@as(usize, 0), page.writes.len + page.deletes.len + page.replay_writes.len);
+            } else {
+                try std.testing.expectEqual(@as(usize, 1), page.guards.len);
+                try std.testing.expectEqual(@as(usize, 1), page.inspected);
+                try std.testing.expectEqual(@as(u64, if (mode == 1) 7 else 9), page.guards[0].generation);
+                try std.testing.expect(page.deletes.len != 0);
+                if (mode == 1) try std.testing.expectEqual(@as(usize, 1), page.writes.len) else try std.testing.expectEqual(@as(usize, 1), page.replay_writes.len);
+            }
+            try captured.finish();
+        }
+        try std.testing.expectEqual(before, fixture.store.query_generation_revision.load(.acquire));
+        try std.testing.expectEqual(mode == 1, try fixture.store.graphIncomingDirectoryReady());
+        var owned = try captured.take();
+        defer owned.deinit();
+        try owned.validate(&fixture.store, null);
+        if (mode == 0) {
+            try fixture.store.put(keys.graph_incoming_ready_key, "1");
+        } else if (mode == 1) {
+            const edge = try keys.graphEdgeArtifactKeyAlloc(a, "other", "g", "links", "target");
+            defer a.free(edge);
+            const incoming = (try keys.graphIncomingKeyAlloc(a, edge)).?;
+            defer a.free(incoming);
+            try fixture.store.put(incoming, edge);
+        } else {
+            const key = try contract.ownerJobKeyAlloc(a, "doc");
+            defer a.free(key);
+            const value = try contract.encodeOwnerJobAlloc(a, .{ .owner = "doc", .generation = 10 });
+            defer a.free(value);
+            try fixture.store.put(key, value);
+        }
+        try std.testing.expectError(error.PreparedReadSetChanged, owned.validate(&fixture.store, null));
+    }
+}
+
+test "prepared transaction effects retirement hints and bounded key pages retain their actual observations" {
+    const a = std.testing.allocator;
+    const keys = CleanupCaptureTest.keys;
+    var fixture: ReadCaptureTest = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    try CleanupCaptureTest.seed(&fixture.store, 2);
+    try fixture.store.put(keys.graph_incoming_ready_key, "1");
+    var hint = read_set.Owned.init(a, null);
+    defer hint.deinit();
+    try std.testing.expect(try read_set.observe(&fixture.store, &hint).mayHaveGraphRetirements());
+    try hint.finish();
+    try hint.validate(&fixture.store, null);
+    const previous = try fixture.store.get(a, keys.graph_retirement_count_key);
+    defer a.free(previous);
+    try fixture.store.put(keys.graph_retirement_count_key, &@as([8]u8, @splat(0)));
+    try std.testing.expectError(error.PreparedReadSetChanged, hint.validate(&fixture.store, null));
+    try fixture.store.put(keys.graph_retirement_count_key, previous);
+    try hint.validate(&fixture.store, null);
+    const prefix = try keys.graphRetirementPrefixAlloc(a, "doc");
+    defer a.free(prefix);
+    var captured = read_set.Owned.init(a, null);
+    defer captured.deinit();
+    for ([_]usize{ 0, 1, 2 }) |limit| for ([_]?[]const u8{ null, "outside" }) |after| {
+        const expected = try fixture.store.scanPrefixKeysPage(a, prefix, after, limit);
+        defer CleanupCaptureTest.freeKeys(a, expected);
+        const actual = try read_set.observe(&fixture.store, &captured).scanPrefixKeysPage(a, prefix, after, limit);
+        defer CleanupCaptureTest.freeKeys(a, actual);
+        try std.testing.expectEqual(expected.len, actual.len);
+        for (expected, actual) |left, right| try std.testing.expectEqualStrings(left, right);
+    };
+    try captured.finish();
+    try captured.validate(&fixture.store, null);
+    const edge = try keys.graphEdgeArtifactKeyAlloc(a, "doc", "g", "links", "second");
+    defer a.free(edge);
+    const retired = try keys.graphRetirementKeyAlloc(a, edge);
+    defer a.free(retired);
+    try fixture.store.put(retired, "1");
+    try std.testing.expectError(error.PreparedReadSetChanged, captured.validate(&fixture.store, null));
+}
+
+test "prepared transaction effects cleanup and key page allocations and original controls unwind" {
+    const a = std.testing.allocator;
+    const admission = @import("../../common/read_admission.zig");
+    const Checks = struct {
+        calls: usize = 0,
+        stop: usize = std.math.maxInt(usize),
+        cause: anyerror = error.NotFound,
+        fn check(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == self.stop) return self.cause;
+        }
+        fn run(allocator: A, store: *DocStore, checks: ?*@This(), observed: bool) !void {
+            var payload: admission.Payload = .{ .ptr = checks orelse undefined, .vtable = &.{ .checkpoint = check } };
+            var captured = read_set.Owned.init(allocator, if (checks != null) admission.Port.init(&payload) else null);
+            defer captured.deinit();
+            const source = read_set.observe(store, if (observed) &captured else null);
+            {
+                var reader = source.beginReadTxn() catch |err| return captured.failure orelse err;
+                defer reader.abort();
+                var page = (DocStore.planGraphEndpointCleanupPage(allocator, &reader) catch |err| return captured.failure orelse err).?;
+                defer page.deinit();
+            }
+            const prefix = try CleanupCaptureTest.keys.graphRetirementPrefixAlloc(allocator, "doc");
+            defer allocator.free(prefix);
+            const rows = source.scanPrefixKeysPage(allocator, prefix, null, 2) catch |err| return captured.failure orelse err;
+            defer CleanupCaptureTest.freeKeys(allocator, rows);
+            captured.finish() catch |err| return captured.failure orelse err;
+            var owned = try captured.take();
+            defer owned.deinit();
+        }
+    };
+    for (0..3) |mode| {
+        var fixture: ReadCaptureTest = .{};
+        try fixture.init();
+        defer fixture.deinit();
+        try CleanupCaptureTest.seed(&fixture.store, mode);
+        for ([_]bool{ false, true }) |observed| try std.testing.checkAllAllocationFailures(a, Checks.run, .{ &fixture.store, @as(?*Checks, null), observed });
+        var baseline: Checks = .{};
+        try Checks.run(a, &fixture.store, &baseline, true);
+        for ([_]anyerror{ error.NotFound, error.OutOfMemory, error.DeadlineExceeded }) |cause| for (1..baseline.calls + 1) |stop| {
+            var checks: Checks = .{ .stop = stop, .cause = cause };
+            try std.testing.expectError(cause, Checks.run(a, &fixture.store, &checks, true));
+        };
+    }
+}
+
+test "prepared transaction effects child manifests retain presence absence and decoded routing snapshots" {
+    const a = std.testing.allocator;
+    const effects = @import("document_child_range_effects.zig");
+    const keys = CleanupCaptureTest.keys;
+    var fixture: ReadCaptureTest = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const key = try keys.artifactNamedPrefixAlloc(a, "doc", "asset", "units");
+    defer a.free(key);
+    const raw = "{\"child_ranges\":[{\"range_id\":\"r\",\"range_kind\":\"unit\",\"artifact_name\":\"units\",\"split_boundary\":\"unit\",\"placement\":\"remote\",\"start_key\":\"a\",\"end_key_exclusive\":\"z\",\"last_key\":\"y\",\"child_count\":1}]}";
+    for ([_]bool{ false, true }) |present| {
+        if (present) try fixture.store.put(key, raw);
+        var captured = read_set.Owned.init(a, null);
+        defer captured.deinit();
+        {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            var source = read_set.observe(&fixture.store, &captured);
+            var snapshots: std.ArrayListUnmanaged(effects.DocumentChildRangeRoutingSnapshot) = .empty;
+            try effects.collectDocumentChildRangeRoutingSnapshots(effects.Reader.fromStore(&source), arena.allocator(), .{ .artifact_writes = @as([]const @import("types.zig").BatchWrite, &.{}), .artifact_delete_keys = @as([]const []const u8, &.{key}) }, &snapshots);
+            try std.testing.expectEqual(@as(usize, @intFromBool(present)), snapshots.items.len);
+            if (present) try std.testing.expectEqualStrings("r", snapshots.items[0].child_ranges[0].range_id);
+            try captured.finish();
+        }
+        var owned = try captured.take();
+        defer owned.deinit();
+        try std.testing.expectEqual(@as(usize, 1), owned.points.items.len);
+        try owned.validate(&fixture.store, null);
+        if (present) try fixture.store.delete(key) else try fixture.store.put(key, raw);
+        try std.testing.expectError(error.PreparedReadSetChanged, owned.validate(&fixture.store, null));
+        if (!present) try fixture.store.delete(key);
+    }
+}

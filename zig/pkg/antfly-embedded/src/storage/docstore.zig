@@ -2041,7 +2041,7 @@ pub const DocStore = struct {
         return true;
     }
 
-    fn hasPrefixTxn(txn: *Txn, prefix: []const u8) !bool {
+    fn hasPrefixTxn(txn: anytype, prefix: []const u8) !bool {
         var cursor = try txn.openPhysicalCursorAdapter();
         defer cursor.close();
         const row = (try cursor.seekAtOrAfter(prefix)) orelse return false;
@@ -2175,15 +2175,36 @@ pub const DocStore = struct {
     /// retirements remove their own directory inputs atomically, so restarting
     /// at the prefix is both a durable cursor and an idempotent retry.
     pub fn prepareGraphEndpointCleanupPage(self: *DocStore, alloc: Allocator) !?GraphEndpointCleanupPage {
-        const owner_only = blk: {
+        if (!try self.maintainGraphCleanupDirectory()) return try emptyGraphCleanupPage(alloc);
+        var read = try self.beginReadTxn();
+        defer read.abort();
+        return planGraphEndpointCleanupPage(alloc, &read);
+    }
+
+    /// Migration is an execution phase: it can write durable directory state.
+    /// Keep it outside the read-only planner, including for replicated replay.
+    pub fn maintainGraphCleanupDirectory(self: *DocStore) !bool {
+        {
             var read = try self.beginReadTxn();
             defer read.abort();
-            break :blk !try hasPrefixTxn(&read, internal_keys.graph_endpoint_cleanup_prefix) and try hasPrefixTxn(&read, internal_keys.graph_owner_replay_prefix);
+            if (!try hasPrefixTxn(&read, internal_keys.graph_endpoint_cleanup_prefix) and try hasPrefixTxn(&read, internal_keys.graph_owner_replay_prefix)) return true;
+        }
+        return self.backfillGraphIncomingDirectoryPage();
+    }
+
+    pub fn emptyGraphCleanupPage(alloc: Allocator) !GraphEndpointCleanupPage {
+        return .{ .alloc = alloc, .writes = try alloc.alloc(KVPair, 0), .deletes = try alloc.alloc([]const u8, 0), .inspected = 0, .bytes = 0 };
+    }
+
+    /// Pure planning from one caller-owned snapshot. An incomplete incoming
+    /// directory yields an empty page; owner replay needs no directory upgrade.
+    /// The read interface supplies no mutation or maintenance capability.
+    pub fn planGraphEndpointCleanupPage(alloc: Allocator, read: anytype) !?GraphEndpointCleanupPage {
+        if (!try hasPrefixTxn(read, internal_keys.graph_endpoint_cleanup_prefix) and try hasPrefixTxn(read, internal_keys.graph_owner_replay_prefix)) return planGraphOwnerReplayPage(alloc, read);
+        _ = read.get(internal_keys.graph_incoming_ready_key) catch |err| switch (err) {
+            error.NotFound => return try emptyGraphCleanupPage(alloc),
+            else => return err,
         };
-        // Owner revival needs only its own primary prefixes. An unrelated
-        // incoming-directory upgrade must not delay its bounded input replay.
-        if (owner_only) return self.prepareGraphOwnerReplayPage(alloc);
-        if (!try self.backfillGraphIncomingDirectoryPage()) return .{ .alloc = alloc, .writes = try alloc.alloc(KVPair, 0), .deletes = try alloc.alloc([]const u8, 0), .inspected = 0, .bytes = 0 };
         var guards = std.ArrayListUnmanaged(@import("graph_cleanup_contract.zig").Guard).empty;
         errdefer {
             for (guards.items) |guard| alloc.free(guard.endpoint);
@@ -2203,14 +2224,12 @@ pub const DocStore = struct {
         var inspected: usize = 0;
         var bytes: usize = 0;
         {
-            var read = try self.beginReadTxn();
-            defer read.abort();
             var jobs = try read.openPhysicalCursorAdapter();
             defer jobs.close();
             var incoming = try read.openPhysicalCursorAdapter();
             defer incoming.close();
             var job_row = try jobs.seekAtOrAfter(internal_keys.graph_endpoint_cleanup_prefix);
-            if (job_row == null or !std.mem.startsWith(u8, job_row.?.key, internal_keys.graph_endpoint_cleanup_prefix)) return self.prepareGraphOwnerReplayPage(alloc);
+            if (job_row == null or !std.mem.startsWith(u8, job_row.?.key, internal_keys.graph_endpoint_cleanup_prefix)) return planGraphOwnerReplayPage(alloc, read);
             while (job_row) |job| {
                 if (!std.mem.startsWith(u8, job.key, internal_keys.graph_endpoint_cleanup_prefix)) break;
                 if (inspected + deletes.items.len >= 256) break;
@@ -2284,10 +2303,8 @@ pub const DocStore = struct {
     /// Owner revival uses the same replicated maintenance lane as endpoint
     /// cleanup. Each page owns at most 255 records plus its checkpoint and
     /// releases its source snapshot before publication.
-    fn prepareGraphOwnerReplayPage(self: *DocStore, alloc: Allocator) !?GraphEndpointCleanupPage {
+    fn planGraphOwnerReplayPage(alloc: Allocator, read: anytype) !?GraphEndpointCleanupPage {
         const contract = @import("graph_cleanup_contract.zig");
-        var read = try self.beginReadTxn();
-        defer read.abort();
         var jobs = try read.openPhysicalCursorAdapter();
         defer jobs.close();
         const row = (try jobs.seekAtOrAfter(internal_keys.graph_owner_replay_prefix)) orelse return null;
@@ -2390,8 +2407,12 @@ pub const DocStore = struct {
     pub fn mayHaveGraphRetirements(self: *DocStore) !bool {
         var txn = try self.beginReadTxn();
         defer txn.abort();
+        return mayHaveGraphRetirementsFromTxn(&txn);
+    }
+
+    pub fn mayHaveGraphRetirementsFromTxn(txn: anytype) !bool {
         var maybe: ?bool = null;
-        return graphRetirementsPresentCached(&txn, &maybe);
+        return graphRetirementsPresentCached(txn, &maybe);
     }
 
     pub fn graphRelationshipRetired(self: *DocStore, key: []const u8) !bool {
@@ -3601,7 +3622,9 @@ pub const DocStore = struct {
         while (true) {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
             if (bounded_after_key == null or std.mem.order(u8, entry.key, bounded_after_key.?) == .gt) {
-                try results.append(alloc, try alloc.dupe(u8, entry.key));
+                const owned_key = try alloc.dupe(u8, entry.key);
+                errdefer alloc.free(owned_key);
+                try results.append(alloc, owned_key);
                 if (results.items.len >= limit) break;
             }
             entry = (try cur.next()) orelse break;

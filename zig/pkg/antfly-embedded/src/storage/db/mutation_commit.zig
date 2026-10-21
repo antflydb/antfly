@@ -1521,7 +1521,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // the scheduler or foreground drain probed it.
                 if (try self.maintenanceRequiresOrderedApply()) return error.InvalidBatchRequest;
                 effective_req.graph_endpoint_cleanup_planned = true;
-                graph_cleanup_page = try S.ownerField(self, "core").*.store.prepareGraphEndpointCleanupPage(S.ownerField(self, "alloc").*);
+                if (try S.ownerField(self, "core").*.store.maintainGraphCleanupDirectory()) {
+                    var cleanup_read = try observed_store.beginReadTxn();
+                    defer cleanup_read.abort();
+                    graph_cleanup_page = try docstore_mod.DocStore.planGraphEndpointCleanupPage(S.ownerField(self, "alloc").*, &cleanup_read);
+                } else graph_cleanup_page = try docstore_mod.DocStore.emptyGraphCleanupPage(S.ownerField(self, "alloc").*);
                 if (graph_cleanup_page) |page| {
                     const graph_deletes = try graphEndpointCleanupDeletesAlloc(preparation_alloc, page);
                     cleanup_graph_deletes = graph_deletes;
@@ -2223,12 +2227,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 };
                 defer if (pending) |value| S.ownerField(self, "alloc").*.free(value);
                 var needs_revival = pending != null;
-                if (!needs_revival and try S.ownerField(self, "core").*.store.mayHaveGraphRetirements()) {
+                if (!needs_revival and try observed_store.mayHaveGraphRetirements()) {
                     const prefix = try internal_keys.graphRetirementPrefixAlloc(S.ownerField(self, "alloc").*, write.key);
                     defer S.ownerField(self, "alloc").*.free(prefix);
                     // One prefix seek proves presence; never enumerate owner history
                     // or retained artifact inputs in the foreground mutation.
-                    const markers = try S.ownerField(self, "core").*.store.scanPrefixKeysPage(S.ownerField(self, "alloc").*, prefix, null, 1);
+                    const markers = try observed_store.scanPrefixKeysPage(S.ownerField(self, "alloc").*, prefix, null, 1);
                     defer freeOwnedKeySlice(S.ownerField(self, "alloc").*, markers);
                     needs_revival = markers.len != 0;
                 }
@@ -2333,7 +2337,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
 
                 if (opts.document_child_range_dispatcher) |dispatcher| {
-                    try document_child_range_effects.partitionRemoteDocumentChildRangeGeneratedBatch(childRangeManifestReader(self), preparation_alloc, &precomputed_generated, &remote_child_range_dispatches, .{ .ptr = dispatcher.ptr, .select = dispatcher.select_destination });
+                    var manifest_reader = observed_store;
+                    try document_child_range_effects.partitionRemoteDocumentChildRangeGeneratedBatch(document_child_range_effects.Reader.fromStore(&manifest_reader), preparation_alloc, &precomputed_generated, &remote_child_range_dispatches, .{ .ptr = dispatcher.ptr, .select = dispatcher.select_destination });
                 }
 
                 for (precomputed_generated.artifact_writes) |write| {

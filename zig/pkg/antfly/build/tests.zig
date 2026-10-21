@@ -6062,6 +6062,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("docstore-prepared-transaction-effects-test", "Verify bounded durable prepared effect encoding and original controls")
         .dependOn(&addCuratedTestRunArtifact(b, prepared_effects_tests, &.{"prepared transaction effects"}).step);
+    const cleanup_planning_filters = [_][]const u8{ "graph endpoint cleanup", "graph owner revival", "graph incoming directory", "child range manifest releases", "child range planning uses caller" };
+    const cleanup_planning_tests = b.addTest(.{
+        .root_module = prepared_effects_mod,
+        .filters = &cleanup_planning_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("docstore-observed-cleanup-test", "Run bounded graph cleanup, migration, revival and child manifest regressions")
+        .dependOn(&addCuratedTestRunArtifact(b, cleanup_planning_tests, &cleanup_planning_filters).step);
     const identity_ownership_tests = b.addTest(.{
         .root_module = prepared_effects_mod,
         .filters = &.{"storage.db.doc_identity."},

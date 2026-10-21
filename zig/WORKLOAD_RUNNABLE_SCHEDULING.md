@@ -6331,3 +6331,44 @@ vote, DB/execution lifetimes, executable recovery resources/derived-log quota,
 migration/peer eligibility, normal required PREPARE drivers and broader
 scheduler/default/session scope remain incomplete. Strong defaults remain off.
 No ABI/wire/reader/durable-format change; full qualification remains waived.
+
+
+### Observed cleanup planning, retirement probes and child manifests (2026-10-20)
+
+Graph cleanup now separates durable incoming-directory maintenance from pure
+page planning. The planner accepts one caller-owned read snapshot; endpoint
+jobs, incoming edges, readiness and owner-replay inputs use that snapshot and
+can feed the preparation read set. Owner replay still proceeds without an
+unrelated directory migration. The existing public helper performs maintenance
+before opening the planning snapshot; mutation assembly explicitly preserves
+that execution order under apply. This does not move durable migration into a
+predecision dry run or finish the full preparation/execution split.
+
+Retirement summary checks and bounded retirement-key pages now retain their
+actual point and physical-cursor observations. Null-observation paths delegate
+to the existing helpers. Child-range manifest reads use an observed, synchronously
+borrowed adapter while preserving caller-owned decoded routing snapshots. An
+opaque destination selector remains live policy, not a retained routing lease.
+The allocation sweep also fixed a preexisting raw key-page leak when copying a
+key succeeded but appending it failed.
+
+Final receipt `observed-cleanup-planning-v3`: actual native exit zero, unchanged
+source inputs, 106/106 build steps and 162 test executions (prepared66, DB38,
+grouped7, graph4, identity33, existing cleanup/manifest14), with no skips,
+failures or leaks. Four new cases cover read-only endpoint and owner planning,
+empty proofs and incoming phantoms, retirement summaries and bounded pages,
+manifest presence/absence across scratch retirement, exhaustive allocations and
+original NotFound/OOM/deadline rejections. Explicit test-root imports ensure the
+cleanup regression target discovers its existing cases. The earlier failed run
+exposed missing test discovery and a fixture whose retirement insertion also
+initialized readiness; the corrected fixture explicitly removes readiness.
+
+Fetched origin/main remains `dd49f55102f81a430491a36a9932f46e697ef15a`, already
+merged in this branch. No ABI/wire/reader/durable-format change. Full Linux
+qualification remains waived; no public-consumer or full-archive requalification
+is claimed. Earlier pre-apply graph reads and live core-cache/policy inputs still
+need coverage. Durable writer-enforced metadata exclusion across the decision,
+full assembly before vote, DB/execution lifetimes, executable recovery resources
+and derived-log quota, migration/peer eligibility, normal required PREPARE
+orchestration and the broader scheduler/default/session scope remain incomplete.
+Strong defaults remain off; the full objective remains active.

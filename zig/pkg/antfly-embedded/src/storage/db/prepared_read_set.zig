@@ -215,6 +215,41 @@ pub fn ObservedReader(comptime Store: type) type {
             if (self.observations == null) return self.store.scanReadTxnWithContext(&txn.txn, lower, upper, options, ctx, callback);
             return txn.scan(lower, upper, options, ctx, callback);
         }
+        pub fn mayHaveGraphRetirements(self: @This()) !bool {
+            if (self.observations == null) return self.store.mayHaveGraphRetirements();
+            var read = try self.beginReadTxn();
+            defer read.abort();
+            return DocStore.mayHaveGraphRetirementsFromTxn(&read);
+        }
+        pub fn scanPrefixKeysPage(self: @This(), a: A, prefix: []const u8, after_key: ?[]const u8, limit: usize) ![][]u8 {
+            if (self.observations == null) return self.store.scanPrefixKeysPage(a, prefix, after_key, limit);
+            return self.scanPrefixKeysInner(a, prefix, after_key, limit) catch |err| {
+                if (self.observations.?.failure == null) self.observations.?.failure = err;
+                return err;
+            };
+        }
+        fn scanPrefixKeysInner(self: @This(), a: A, prefix: []const u8, after_key: ?[]const u8, limit: usize) ![][]u8 {
+            if (limit == 0) return a.alloc([]u8, 0);
+            var cursor = try self.openCursor(a, true);
+            defer cursor.close();
+            var keys: std.ArrayListUnmanaged([]u8) = .empty;
+            errdefer {
+                for (keys.items) |key| a.free(key);
+                keys.deinit(a);
+            }
+            const after = if (after_key) |key| if (std.mem.startsWith(u8, key, prefix)) key else null else null;
+            var next = try cursor.seekAtOrAfter(after orelse prefix);
+            while (next) |row| : (next = try cursor.next()) {
+                if (!std.mem.startsWith(u8, row.key, prefix)) break;
+                if (after) |key| if (std.mem.order(u8, row.key, key) != .gt) continue;
+                const captured = self.observations.?;
+                const key = try copy(a, row.key, captured.control, &captured.failure);
+                errdefer a.free(key);
+                try keys.append(a, @constCast(key));
+                if (keys.items.len >= limit) break;
+            }
+            return keys.toOwnedSlice(a);
+        }
         pub fn getOptional(self: @This(), a: A, key: []const u8) !?[]u8 {
             const raw = self.get(a, key) catch |err| return if (err == error.NotFound) null else err;
             return @constCast(raw);
