@@ -2475,10 +2475,14 @@ test "memory source watch pages remain immediately due until the bounded round c
     const first = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
     try std.testing.expect(first.resource_cursor != null);
     try std.testing.expectEqual(@as(i64, 40000), first.next_resource_check_at.?);
-    try discard(&store, .advance, "", "{}", "page-two", 40000);
+    try discard(&store, .observe, "", "{\"evidence\":[{\"id\":\"new-source\",\"resource_selector\":{\"table\":\"business\",\"id\":\"new\"}}]}", "concurrent-observe", 40001);
+    const admitted = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    try std.testing.expectEqualStrings(first.resource_cursor.?, admitted.resource_cursor.?);
+    try std.testing.expectEqual(first.next_resource_check_at, admitted.next_resource_check_at);
+    try discard(&store, .advance, "", "{}", "page-two", 40001);
     const second = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
     try std.testing.expect(second.resource_cursor == null);
-    try std.testing.expectEqual(@as(i64, 70000), second.next_resource_check_at.?);
+    try std.testing.expectEqual(@as(i64, 70001), second.next_resource_check_at.?);
 }
 
 test "memory explanation reports invalid source metadata and authorizes cross-database edges independently" {
@@ -3542,4 +3546,68 @@ test "memory explanation truncation allocates linearly within a fixed memory cei
     try std.testing.expect(graph.nodes.len > 1);
     try std.testing.expect(full.len > bounded.len);
     try std.testing.expect(bounded_counter.peak <= full_counter.peak + 1024 * 1024);
+}
+
+test "memory source polling retires and invalidates sources during continuous ingestion" {
+    const scheduler = @import("scheduling.zig");
+    const Worker = struct {
+        store: *Store,
+        now: i64,
+        calls: usize = 0,
+        fn resource(ptr: *anyopaque, a: A, ref: m.types.provenance.Resource) !m.types.provenance.Snapshot {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            if (std.mem.eql(u8, ref.id, "old")) {
+                if (store.failures == 1) return .{ .state = .missing };
+                return m.types.provenance.snapshot(a, ref, 7, 8, store.resource_json, store.resource_digest);
+            }
+            return Store.resource(ptr, a, ref);
+        }
+        fn execute(ptr: *anyopaque, pending: ?m.types.Operation) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(pending == null);
+            self.calls += 1;
+            var svc = self.store.service("alice", true, self.now);
+            svc.backend.resource = resource;
+            const a = self.store.arena.allocator();
+            _ = try svc.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "worker-{d}", .{self.calls}));
+        }
+    };
+    for ([_]bool{ false, true }) |missing| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        try discard(&store, .create, "", "{}", "create", 1);
+        try discard(&store, .observe, "", "{\"evidence\":[{\"id\":\"old\",\"resource_selector\":{\"table\":\"business\",\"id\":\"old\"}}]}", "old", 2);
+        const claim: m.types.Assertion = .{ .id = "summary", .subject = "deployment", .predicate = "guidance", .value = "Helm", .statement = "Deploy with Helm", .kind = .summary, .evidence = &.{.{ .id = "old" }} };
+        _ = try store.service("alice", true, 3).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{claim} }, .{}), "summary");
+        store.failures = if (missing) 1 else 2;
+        var cursor: scheduler.Cursor = .{};
+        var worker: Worker = .{ .store = &store, .now = 0 };
+        // New resource-backed evidence arrives faster than the 30-second poll
+        // interval. Scheduling must still process the original lost source.
+        for (0..8) |i| {
+            const now: i64 = @intCast((i + 1) * 10000);
+            var svc = store.service("alice", true, now);
+            svc.backend.resource = Worker.resource;
+            const id = try std.fmt.allocPrint(a, "new-{d}", .{i});
+            const evidence: m.types.Evidence = .{ .id = id, .resource_selector = .{ .table = "business", .id = id } };
+            _ = try svc.execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{evidence} }, .{}), id);
+            const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+            if (i < 4) try std.testing.expectEqual(@as(i64, 30002), state.next_resource_check_at.?);
+            worker.now = now + 1;
+            try scheduler.advance(svc.backend, a, worker.now, state, &cursor, .{ .ptr = &worker, .execute = Worker.execute });
+        }
+        try std.testing.expect(worker.calls > 0);
+        const evidence_key = try fixtureKey(a, "evidence", "old");
+        const assertion_key = try fixtureKey(a, "assertion", "summary");
+        if (missing) {
+            try std.testing.expect(!store.values.contains(evidence_key));
+            try std.testing.expect(!store.values.contains(assertion_key));
+            try std.testing.expect(store.values.contains(try fixtureKey(a, "forgotten-evidence", "old")));
+        } else {
+            try std.testing.expect(store.values.contains(evidence_key));
+            const summary = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, store.values.get(assertion_key).?, .{});
+            try std.testing.expect(summary.stale);
+        }
+    }
 }

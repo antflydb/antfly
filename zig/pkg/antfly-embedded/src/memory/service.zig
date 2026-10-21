@@ -855,7 +855,7 @@ const Run = struct {
                 if (source.source_version.len == 0) source.source_version = try std.fmt.allocPrint(self.a, "{d}", .{reference.revision});
                 try self.put(try std.fmt.allocPrint(self.a, "resource-evidence/{s}/{s}", .{ try hash(self.a, reference.identity()), try hash(self.a, source.id) }), .{ .evidence_id = source.id });
                 try self.put(try key(self.a, "resource-watch", source.id), .{ .evidence_id = source.id, .last_state = snapshot.state });
-                self.state.next_resource_check_at = self.service.context.now_ms +| resource_check_interval_ms;
+                self.scheduleResourceCheck();
             }
             try t.validateId(source.id);
             try t.validateId(source.source_id);
@@ -1926,6 +1926,12 @@ const Run = struct {
         try self.remove(try self.generationKey("assertion", id));
         try self.remove(try key(self.a, "assertion", id));
         try self.invalidate("assertion", id);
+    }
+    // Admission arms an idle poller or brings a pending deadline forward. It
+    // never postpones existing work, including an unfinished bounded round.
+    fn scheduleResourceCheck(self: *Run) void {
+        const due = if (self.state.resource_cursor != null) self.service.context.now_ms else self.service.context.now_ms +| resource_check_interval_ms;
+        if (self.state.next_resource_check_at == null or due < self.state.next_resource_check_at.?) self.state.next_resource_check_at = due;
     }
     fn pollResources(self: *Run) !void {
         const due = self.state.next_resource_check_at orelse return;

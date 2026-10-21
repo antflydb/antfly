@@ -404,6 +404,11 @@ Actual processing and artifact publication retain their source authorization gat
 request cancellation and deadlines remain authoritative and cannot be renewed by
 this worker-only path. A crash or unavailable storage can still require replay;
 inference calls are not exactly once.
+Resource-watch admission arms polling when idle and otherwise preserves the
+earliest durable deadline. An unfinished bounded round remains immediately due,
+with its persisted cursor intact; new observations cannot debounce that round or
+postpone already scheduled source-change invalidation and deleted-source cleanup.
+Only completing a polling round schedules the next periodic interval.
 Cleanup uses the space's own saved binding, independently of every operation's
 binding. A revoked cleanup identity does not block valid operations, and a busy
 operation queue does not starve authorized cleanup. Each authorized quantum still
