@@ -106,6 +106,32 @@ type BoolFieldQuery struct {
 	Field string `json:"field,omitempty,omitzero"`
 }
 
+// BoolQuery Canonical Boolean wrapper. Must clauses score; filter clauses constrain without scoring.
+type BoolQuery struct {
+	Bool BoolQueryBody `json:"bool"`
+}
+
+// BoolQueryBody defines model for BoolQueryBody.
+type BoolQueryBody struct {
+	// Boost A floating-point number used to decrease or increase the relevance scores of a query.
+	Boost  Boost           `json:"boost,omitempty,omitzero"`
+	Filter BoolQueryClause `json:"filter,omitempty,omitzero"`
+
+	// MinimumShouldMatch Minimum optional clauses required; omission follows the runtime's required-clause defaults.
+	MinimumShouldMatch uint32          `json:"minimum_should_match,omitempty,omitzero"`
+	Must               BoolQueryClause `json:"must,omitempty,omitzero"`
+	MustNot            BoolQueryClause `json:"must_not,omitempty,omitzero"`
+	Should             BoolQueryClause `json:"should,omitempty,omitzero"`
+}
+
+// BoolQueryClause defines model for BoolQueryClause.
+type BoolQueryClause struct {
+	union json.RawMessage
+}
+
+// BoolQueryClause1 defines model for BoolQueryClause.1.
+type BoolQueryClause1 = []Query
+
 // BooleanQuery defines model for BooleanQuery.
 type BooleanQuery struct {
 	// Boost A floating-point number used to decrease or increase the relevance scores of a query.
@@ -458,6 +484,68 @@ type WildcardQuery struct {
 	Boost    Boost  `json:"boost,omitempty,omitzero"`
 	Field    string `json:"field,omitempty,omitzero"`
 	Wildcard string `json:"wildcard"`
+}
+
+// AsQuery returns the union data inside the BoolQueryClause as a Query
+func (t BoolQueryClause) AsQuery() (Query, error) {
+	var body Query
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromQuery overwrites any union data inside the BoolQueryClause as the provided Query
+func (t *BoolQueryClause) FromQuery(v Query) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeQuery performs a merge with any union data inside the BoolQueryClause, using the provided Query
+func (t *BoolQueryClause) MergeQuery(v Query) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsBoolQueryClause1 returns the union data inside the BoolQueryClause as a BoolQueryClause1
+func (t BoolQueryClause) AsBoolQueryClause1() (BoolQueryClause1, error) {
+	var body BoolQueryClause1
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromBoolQueryClause1 overwrites any union data inside the BoolQueryClause as the provided BoolQueryClause1
+func (t *BoolQueryClause) FromBoolQueryClause1(v BoolQueryClause1) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeBoolQueryClause1 performs a merge with any union data inside the BoolQueryClause, using the provided BoolQueryClause1
+func (t *BoolQueryClause) MergeBoolQueryClause1(v BoolQueryClause1) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+func (t BoolQueryClause) MarshalJSON() ([]byte, error) {
+	b, err := t.union.MarshalJSON()
+	return b, err
+}
+
+func (t *BoolQueryClause) UnmarshalJSON(b []byte) error {
+	err := t.union.UnmarshalJSON(b)
+	return err
 }
 
 // AsFuzziness0 returns the union data inside the Fuzziness as a Fuzziness0
@@ -990,6 +1078,32 @@ func (t *Query) MergeDateRangeStringQuery(v DateRangeStringQuery) error {
 	return err
 }
 
+// AsBoolQuery returns the union data inside the Query as a BoolQuery
+func (t Query) AsBoolQuery() (BoolQuery, error) {
+	var body BoolQuery
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromBoolQuery overwrites any union data inside the Query as the provided BoolQuery
+func (t *Query) FromBoolQuery(v BoolQuery) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeBoolQuery performs a merge with any union data inside the Query, using the provided BoolQuery
+func (t *Query) MergeBoolQuery(v BoolQuery) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsBooleanQuery returns the union data inside the Query as a BooleanQuery
 func (t Query) AsBooleanQuery() (BooleanQuery, error) {
 	var body BooleanQuery
@@ -1437,55 +1551,58 @@ type ClientWithResponsesInterface interface {
 // const string: with thousands of chunks the chained `+` fold is several
 // times slower for the Go compiler than parsing a slice literal.
 var swaggerSpec = []string{
-	"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",
+	"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",
 }
 
 // decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,

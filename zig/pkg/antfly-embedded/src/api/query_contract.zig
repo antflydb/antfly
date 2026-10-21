@@ -2337,18 +2337,11 @@ fn applyCommonSearchRequestOptions(
     }
 
     if (comptime @hasField(@TypeOf(request), "read_requirements")) if (request.read_requirements) |read| {
-        if (request.lake_read != null) return error.InvalidQueryRequest;
         const requirements = @import("../sql/read_requirements.zig").Requirements.fromWire(read) catch return error.InvalidQueryRequest;
         requirements.validate(.search) catch |err| return if (err == error.UnsupportedReadVisibility) error.UnsupportedQueryRequest else error.InvalidQueryRequest;
         req.lake_read = .{
             .visibility = if (requirements.visibility == .published) .published else .accepted,
             .through = if (requirements.after_write) |receipt| .{ .table_id = receipt.table_id, .object_generation = receipt.object_generation, .wal_lsn = receipt.wal_lsn } else null,
-        };
-    };
-    if (comptime @hasField(@TypeOf(request), "lake_read")) if (request.lake_read) |read| {
-        req.lake_read = .{
-            .visibility = if (read.visibility) |visibility| if (std.mem.eql(u8, visibility, "accepted")) .accepted else if (std.mem.eql(u8, visibility, "published")) .published else return error.InvalidQueryRequest else .accepted,
-            .through = if (read.through) |receipt| .{ .table_id = receipt.table_id, .object_generation = receipt.object_generation, .wal_lsn = receipt.wal_lsn } else null,
         };
     };
     if (request.offset) |offset| req.offset = @intCast(offset);
@@ -2728,6 +2721,9 @@ fn queryBodyContractFields(alloc: std.mem.Allocator, body: []const u8) !QueryBod
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
+    for ([_][]const u8{ "lake_read", "lake_visibility", "value_search_execution" }) |removed| {
+        if (parsed.value.object.contains(removed)) return error.InvalidQueryRequest;
+    }
     try validateRawGraphQueriesValueAlloc(alloc, parsed.value);
     return .{
         .has_internal_shard_fields = objectHasInternalShardField(parsed.value.object),
@@ -2899,7 +2895,7 @@ fn parseQueryRequestWithDeadlineCore(
     errdefer freeSearchRequest(alloc, &req);
 
     try applyCommonSearchRequestOptions(alloc, request, &req);
-    if (request.value_search_execution) |policy| {
+    if (request.execution) |execution| if (execution.value_verification) |policy| {
         req.value_search_execution = .{
             .allow_scan = policy.allow_scan orelse false,
             .max_documents = if (policy.max_documents) |n| std.math.cast(u64, n) orelse return error.InvalidQueryRequest else 100_000,
@@ -2907,7 +2903,7 @@ fn parseQueryRequestWithDeadlineCore(
             .max_regex_work = if (policy.max_regex_work) |n| std.math.cast(u64, n) orelse return error.InvalidQueryRequest else 100_000_000,
         };
         if (req.value_search_execution.max_documents == 0 or req.value_search_execution.max_bytes == 0 or req.value_search_execution.max_regex_work == 0) return error.InvalidQueryRequest;
-    }
+    };
     req.execution_deadline_ns = execution_deadline_ns;
     try applyPublicHierarchyControls(alloc, effective_body, &req);
     req.distributed_text_stats = try parseDistributedTextStatsAlloc(alloc, effective_body);
@@ -3652,6 +3648,10 @@ fn fastDensePublicQueryMayApply(body: []const u8) bool {
         "\"_index_name\"",
         "\"_primary_text_index_name\"",
         "\"_embedding_limits\"",
+        "\"execution\"",
+        "\"value_search_execution\"",
+        "\"lake_read\"",
+        "\"lake_visibility\"",
         db_mod.doc_filter_wire.field_name,
     };
     for (disallowed) |needle| {
@@ -6666,7 +6666,7 @@ fn buildProfileValue(
     }
     if (result.value_search_profile_json) |json| {
         const logical = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
-        try parsed.value.object.put(alloc, "value_search", logical.value);
+        try parsed.value.object.put(alloc, "value_verification", logical.value);
     }
     if (result.sort_profile) |sort_profile| {
         if (parsed.value != .object) return error.InvalidQueryRequest;
@@ -19693,7 +19693,7 @@ test "public graph metric borrowed wire vector document authority supports full 
 test "logical query operators and execution policy survive worker transport" {
     const a = std.testing.allocator;
     inline for (.{ "equals", "contains", "matches", "autocomplete" }) |operator| {
-        const body = "{\"query\":{\"" ++ operator ++ "\":\"Hello\",\"field\":\"content\"},\"value_search_execution\":{\"allow_scan\":true,\"max_documents\":51,\"max_bytes\":2048}}";
+        const body = "{\"query\":{\"" ++ operator ++ "\":\"Hello\",\"field\":\"content\"},\"execution\": {\"value_verification\": {\"allow_scan\":true,\"max_documents\":51,\"max_bytes\":2048}}}";
         var request = try parsePublicQueryRequest(a, null, "docs", body);
         defer request.deinit(a);
         try std.testing.expect(request.req.full_text != null);
@@ -19717,13 +19717,13 @@ test "logical query operators and execution policy survive worker transport" {
 
 test "logical query preserves value leaves in compound scoring and filter trees" {
     const a = std.testing.allocator;
-    const body = "{\"query\":{\"disjuncts\":[{\"contains\":\"needle\",\"field\":\"grep.content\",\"case_sensitive\":true}]},\"value_search_execution\":{\"allow_scan\":true,\"max_documents\":100000,\"max_bytes\":67108864,\"max_regex_work\":100000000},\"fields\":[\"grep.content\"],\"order_by\":[{\"field\":\"_id\",\"desc\":false}],\"limit\":1}";
+    const body = "{\"query\":{\"disjuncts\":[{\"contains\":\"needle\",\"field\":\"grep.content\",\"case_sensitive\":true}]},\"execution\": {\"value_verification\": {\"allow_scan\":true,\"max_documents\":100000,\"max_bytes\":67108864,\"max_regex_work\":100000000}},\"fields\":[\"grep.content\"],\"order_by\":[{\"field\":\"_id\",\"desc\":false}],\"limit\":1}";
     var request = try parsePublicQueryRequest(a, null, "docs", body);
     defer request.deinit(a);
     try std.testing.expect(request.req.full_text != null);
     try std.testing.expectEqual(@as(usize, 1), request.req.full_text.?.bool_query.should.len);
     try std.testing.expect(request.req.full_text.?.bool_query.should[0] == .value);
-    const filtered = "{\"query\":{\"match_all\":{}},\"filter_query\":{\"disjuncts\":[{\"contains\":\"needle\",\"field\":\"grep.content\"}]},\"value_search_execution\":{\"allow_scan\":true}}";
+    const filtered = "{\"query\":{\"match_all\":{}},\"filter_query\":{\"disjuncts\":[{\"contains\":\"needle\",\"field\":\"grep.content\"}]},\"execution\": {\"value_verification\": {\"allow_scan\":true}}}";
     var filter_request = try parsePublicQueryRequest(a, null, "docs", filtered);
     defer filter_request.deinit(a);
     try std.testing.expect(filter_request.req.filter_text != null);
@@ -19738,12 +19738,30 @@ test "logical query rejects ambiguous leaves unknown options and malformed value
         "{\"query\":{\"contains\":\"x\",\"field\":\"content\",\"match\":\"y\"}}",
         "{\"query\":{\"autocomplete\":\"x\",\"field\":\"content\",\"case_sensitive\":false}}",
         "{\"query\":{\"contains\":\"x\",\"field\":\"content\",\"normalizer\":\"custom\"}}",
-        "{\"query\":{\"contains\":\"x\",\"field\":\"content\"},\"value_search_execution\":{\"max_bytes\":0}}",
+        "{\"query\":{\"contains\":\"x\",\"field\":\"content\"},\"execution\": {\"value_verification\": {\"max_bytes\":0}}}",
     }) |body| {
         if (parsePublicQueryRequest(a, null, "docs", body)) |accepted| {
             var owned = accepted;
             owned.deinit(a);
             return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+}
+
+test "logical query canonical execution rejects removed public controls" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "{\"lake_read\":{}}",
+        "{\"lake_visibility\":\"accepted\"}",
+        "{\"value_search_execution\":{\"allow_scan\":true}}",
+        "{\"embeddings\":{\"dense\":[0.1]},\"\\u0076alue_search_execution\":{}}",
+        "{\"execution\":{\"allow_scan\":true}}",
+        "{\"execution\":{\"value_verification\":{\"max_documents\":0}}}",
+    }) |body| {
+        if (parsePublicQueryRequest(a, null, "docs", body)) |value| {
+            var accepted = value;
+            accepted.deinit(a);
+            return error.TestUnexpectedAcceptance;
         } else |_| {}
     }
 }

@@ -404,6 +404,7 @@ test "logical value source reuse proof requires a validated complete cut" {
     const io = std.testing.io;
     var directory = try @import("../../common/test_directory.zig").TestDirectory.init("value-source-proof");
     defer directory.cleanup();
+    try fs_paths.createDirPathPortable(io, directory.path());
     const source = try std.fmt.allocPrint(a, "{s}/source.data", .{directory.path()});
     defer a.free(source);
     _ = try backup.writeFileDurable(io, source, "original");

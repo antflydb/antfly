@@ -6,32 +6,36 @@ from typing import Any, TypeVar, cast
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..models.query_profile_value_search_plans_item_operation import QueryProfileValueSearchPlansItemOperation
-from ..models.query_profile_value_search_plans_item_verification import QueryProfileValueSearchPlansItemVerification
+from ..models.query_profile_value_verification_plans_item_operation import (
+    QueryProfileValueVerificationPlansItemOperation,
+)
+from ..models.query_profile_value_verification_plans_item_verification import (
+    QueryProfileValueVerificationPlansItemVerification,
+)
 from ..types import UNSET, Unset
 
-T = TypeVar("T", bound="QueryProfileValueSearchPlansItem")
+T = TypeVar("T", bound="QueryProfileValueVerificationPlansItem")
 
 
 @_attrs_define
-class QueryProfileValueSearchPlansItem:
+class QueryProfileValueVerificationPlansItem:
     """
     Attributes:
-        operation (QueryProfileValueSearchPlansItemOperation | Unset):
+        operation (QueryProfileValueVerificationPlansItemOperation | Unset):
         field (str | Unset):
         candidate_field (None | str | Unset):
         index (None | str | Unset):
-        verification (QueryProfileValueSearchPlansItemVerification | Unset): Membership proof; lossless_keyword uses
-            literal postings without source loading or synonym expansion. Retained immutable cuts may reuse previously
+        verification (QueryProfileValueVerificationPlansItemVerification | Unset): Membership proof; lossless_keyword
+            uses literal postings without source loading or synonym expansion. Retained immutable cuts may reuse previously
             verified original-value membership.
         fallback_reason (None | str | Unset):
     """
 
-    operation: QueryProfileValueSearchPlansItemOperation | Unset = UNSET
+    operation: QueryProfileValueVerificationPlansItemOperation | Unset = UNSET
     field: str | Unset = UNSET
     candidate_field: None | str | Unset = UNSET
     index: None | str | Unset = UNSET
-    verification: QueryProfileValueSearchPlansItemVerification | Unset = UNSET
+    verification: QueryProfileValueVerificationPlansItemVerification | Unset = UNSET
     fallback_reason: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -86,11 +90,11 @@ class QueryProfileValueSearchPlansItem:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
         _operation = d.pop("operation", UNSET)
-        operation: QueryProfileValueSearchPlansItemOperation | Unset
+        operation: QueryProfileValueVerificationPlansItemOperation | Unset
         if isinstance(_operation, Unset):
             operation = UNSET
         else:
-            operation = QueryProfileValueSearchPlansItemOperation(_operation)
+            operation = QueryProfileValueVerificationPlansItemOperation(_operation)
 
         field = d.pop("field", UNSET)
 
@@ -113,11 +117,11 @@ class QueryProfileValueSearchPlansItem:
         index = _parse_index(d.pop("index", UNSET))
 
         _verification = d.pop("verification", UNSET)
-        verification: QueryProfileValueSearchPlansItemVerification | Unset
+        verification: QueryProfileValueVerificationPlansItemVerification | Unset
         if isinstance(_verification, Unset):
             verification = UNSET
         else:
-            verification = QueryProfileValueSearchPlansItemVerification(_verification)
+            verification = QueryProfileValueVerificationPlansItemVerification(_verification)
 
         def _parse_fallback_reason(data: object) -> None | str | Unset:
             if data is None:
@@ -128,7 +132,7 @@ class QueryProfileValueSearchPlansItem:
 
         fallback_reason = _parse_fallback_reason(d.pop("fallback_reason", UNSET))
 
-        query_profile_value_search_plans_item = cls(
+        query_profile_value_verification_plans_item = cls(
             operation=operation,
             field=field,
             candidate_field=candidate_field,
@@ -137,8 +141,8 @@ class QueryProfileValueSearchPlansItem:
             fallback_reason=fallback_reason,
         )
 
-        query_profile_value_search_plans_item.additional_properties = d
-        return query_profile_value_search_plans_item
+        query_profile_value_verification_plans_item.additional_properties = d
+        return query_profile_value_verification_plans_item
 
     @property
     def additional_keys(self) -> list[str]:

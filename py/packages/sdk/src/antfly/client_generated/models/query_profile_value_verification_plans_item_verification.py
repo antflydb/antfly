@@ -1,7 +1,7 @@
 from enum import StrEnum
 
 
-class QueryProfileValueSearchPlansItemVerification(StrEnum):
+class QueryProfileValueVerificationPlansItemVerification(StrEnum):
     LOSSLESS_KEYWORD = "lossless_keyword"
     ORIGINAL_VALUE = "original_value"
 

@@ -1,7 +1,7 @@
 from enum import StrEnum
 
 
-class QueryProfileValueSearchPlansItemOperation(StrEnum):
+class QueryProfileValueVerificationPlansItemOperation(StrEnum):
     CONTAINS = "contains"
     EQUALS = "equals"
     MATCHES = "matches"

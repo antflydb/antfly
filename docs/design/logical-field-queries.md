@@ -47,7 +47,7 @@ For example, `distributed sy` can match both `Distributed Systems` and
 `distributed storage`; it is not an all-words constraint. Absence of a compatible mapping
 is an error, not an implicit raw prefix query.
 
-An independent `value_search_execution` request policy controls permission to
+An independent `execution.value_verification` request policy controls permission to
 scan and maximum documents/bytes verified. Defaults forbid unindexed fallback;
 limits are per shard request, count repeated source loads, and fail explicitly
 rather than returning successful partial results. Existing timeout and
@@ -241,7 +241,7 @@ For example, a logical text source with one sortable keyword view is exposed as:
 }
 ```
 
-MCP raw-query discovery exposes the same `value_search_execution` budgets and
+MCP raw-query discovery exposes the same `execution.value_verification` budgets and
 `remote_snapshot` cursor control as REST. Sequential `hierarchy.children`
 traversal accepts its retained snapshot token and rejects value-search policy,
 because that mode performs no relevance/filter verification phase.
@@ -535,3 +535,84 @@ verification changes from 9.15 to 8.27 ms and its largest observed window from
 The report retains those regressions, all raw trials, ingestion CPU and sampled
 process memory. Necessary postings, verification, and provider I/O remain real
 costs. The bounded design does not promise zero work or uniform throughput gains.
+
+### Canonical execution controls and read identity
+
+Logical intent stays in `query`: `equals`, `contains` and `matches` verify
+original values, while `autocomplete` performs analyzed bool-prefix matching.
+The execution envelope governs admitted work without changing those meanings:
+
+```json
+{
+  "query": {"contains": "needle", "field": "content"},
+  "execution": {
+    "value_verification": {
+      "allow_scan": true,
+      "max_documents": 100000,
+      "max_bytes": 67108864,
+      "max_regex_work": 100000000
+    }
+  },
+  "profile": true
+}
+```
+
+`profile.value_verification` describes measured work, selected representations,
+source reads/parsing and allocation admission. The typed OpenAPI profile includes
+these counters; aggregate window bytes are a maximum, not summed process memory.
+Limits remain per shard and exhaustion fails explicitly. Omitting the envelope
+retains conservative defaults; it never grants scan permission implicitly.
+The CLI's explicit scan policy and connection configuration use the same envelope.
+
+`read_requirements` governs minimum freshness, with `after_write` carrying a
+write receipt. `remote_snapshot` instead identifies the exact retained read for
+pagination. Both concepts remain distinct. Sequential `hierarchy.children`
+accepts a retained snapshot token alongside its revision-bound position cursor;
+it rejects value-verification execution controls because it has no matching phase.
+The removed public `lake_read`, SQL `lake_visibility` and
+`value_search_execution` options are rejected rather than silently ignored.
+Internal lake read capabilities and storage visibility types remain implementation
+contracts, not alternative public request spellings.
+
+Keep `autocomplete` as the public intent-level name: it selects documents, not
+suggested query strings. [MongoDB Search](https://www.mongodb.com/docs/search/query/operators-collectors/autocomplete/)
+uses the same intent name. Elasticsearch exposes
+[`match_bool_prefix`](https://www.elastic.co/docs/reference/query-languages/query-dsl/query-dsl-match-bool-prefix-query)
+and recommends querying root/shingle representations for
+[`search_as_you_type`](https://www.elastic.co/docs/reference/elasticsearch/mapping-reference/search-as-you-type).
+Antfly resolves those representations from the logical field; callers do not
+need to reproduce that physical query construction.
+
+### Bounded exploration and immutable membership views
+
+Source-reader calibration explores coarse windows before finer classes. Each
+batch class needs one required-read sample, while scalar reads use three;
+clipped and previously sampled classes are skipped. With stable row caps and completed reads, calibration finishes
+within ten provider calls, including the two-row bootstrap. Refused or truncated
+reads do not complete untested timing arms. The bootstrap seeds
+payload size but contributes no steady-state timing. Later bounded probes still
+adapt to changing costs, and allocation refusal continues to shrink admission.
+This avoids sixteen scalar calls per exploration class on every new execution.
+Fixed-window and scalar qualification controls remain independent.
+
+Borrowed substring terms are packed into document-owned key slabs. Hash-table
+entries retain stable slices, while dictionary/vector scratch remains reclaimable
+and quota-bound. Single-word sources skip the otherwise useless shingle pass.
+Postings digests and allocation-failure tests apply to the packed path as well.
+
+A complete predicate-cache entry can lend an immutable bitmap through an explicit
+reference-counted lease. Direct count-only producer filters consume cardinality directly and
+subtract current deletions through a compressed intersection count. They allocate
+no result bitmap, read no original source and release the pin even when the cache
+entry expires. Mutable and partial results keep the owned-bitmap path. Tests use
+an allocator that admits zero bytes, positive deletions and propagated errors.
+
+Cross-snapshot reuse requires a validated physical owner's source/publication
+proof, covering its lifetime nonce, primary revision, schema/index publication,
+replay progress and namespace. The cut manifest is validated before using that
+proof. Missing or legacy proofs and lazy remote readers retain snapshot-scoped
+keys. A segment ID alone is insufficient: unindexed source values can change
+without the term representation proving that change. Any source/publication
+change invalidates this whole-generation proof. Reusing unrelated segments across
+such a change requires separate, maintained per-segment source-binding
+certificates; this change does not infer those certificates from segment IDs.

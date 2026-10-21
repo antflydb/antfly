@@ -3590,7 +3590,7 @@ The CLI sends proven necessary literals as ordinary logical `contains` queries o
 `grep.content`. Antfly chooses compatible indexed representations and verifies
 original values before pagination. Mapping the content field with
 `"x-antfly-types": ["text", "substring"]` enables indexed candidate selection.
-The CLI explicitly permits scan fallback; optional `value_search_execution` in
+The CLI explicitly permits scan fallback; optional `execution.value_verification` in
 the table configuration controls `allow_scan`, `max_documents`, `max_bytes`, and
 `max_regex_work`. Server verification budgets apply and
 failures are reported. See the [shared logical-field query design](../../../docs/design/logical-field-queries.md).

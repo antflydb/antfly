@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
-from ..models.sql_request_lake_visibility import SQLRequestLakeVisibility
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -30,13 +29,7 @@ class SQLRequest:
             statement (str): A single SQL statement.
             read_requirements (ReadRequirements | Unset): Freshness requirements for writable Iceberg reads. Search supports
                 accepted and published (default accepted); SQL supports accepted and committed (default committed). Unsupported
-                visibility modes fail explicitly. Cannot be combined with legacy lake_read or lake_visibility. A pinned
-                transaction snapshot never advances to satisfy a newer receipt.
-            lake_visibility (SQLRequestLakeVisibility | Unset): Read visibility for writable Iceberg sources. Accepted pins
-                typed WAL changes over the committed snapshot; unavailable coverage fails closed. HTTP sessions and prepared
-                executions inside a transaction retain the first accepted read cut for each table, including across savepoint
-                rollback. Cuts expire after one hour. Serializable write transactions over external sources are not supported.
-                Prefer read_requirements.visibility; this field is a deprecated alias.
+                visibility modes fail explicitly. A pinned transaction snapshot never advances to satisfy a newer receipt.
             parameters (list[Any] | Unset): Positional JSON parameter values, including null.
             database (str | Unset): Database used to resolve unqualified catalog names.
             namespace (str | Unset): Namespace used to resolve unqualified table names.
@@ -49,7 +42,6 @@ class SQLRequest:
 
     statement: str
     read_requirements: ReadRequirements | Unset = UNSET
-    lake_visibility: SQLRequestLakeVisibility | Unset = UNSET
     parameters: list[Any] | Unset = UNSET
     database: str | Unset = UNSET
     namespace: str | Unset = UNSET
@@ -63,10 +55,6 @@ class SQLRequest:
         read_requirements: dict[str, Any] | Unset = UNSET
         if not isinstance(self.read_requirements, Unset):
             read_requirements = self.read_requirements.to_dict()
-
-        lake_visibility: str | Unset = UNSET
-        if not isinstance(self.lake_visibility, Unset):
-            lake_visibility = self.lake_visibility.value
 
         parameters: list[Any] | Unset = UNSET
         if not isinstance(self.parameters, Unset):
@@ -91,8 +79,6 @@ class SQLRequest:
         )
         if read_requirements is not UNSET:
             field_dict["read_requirements"] = read_requirements
-        if lake_visibility is not UNSET:
-            field_dict["lake_visibility"] = lake_visibility
         if parameters is not UNSET:
             field_dict["parameters"] = parameters
         if database is not UNSET:
@@ -122,13 +108,6 @@ class SQLRequest:
         else:
             read_requirements = ReadRequirements.from_dict(_read_requirements)
 
-        _lake_visibility = d.pop("lake_visibility", UNSET)
-        lake_visibility: SQLRequestLakeVisibility | Unset
-        if isinstance(_lake_visibility, Unset):
-            lake_visibility = UNSET
-        else:
-            lake_visibility = SQLRequestLakeVisibility(_lake_visibility)
-
         parameters = cast(list[Any], d.pop("parameters", UNSET))
 
         database = d.pop("database", UNSET)
@@ -144,7 +123,6 @@ class SQLRequest:
         sql_request = cls(
             statement=statement,
             read_requirements=read_requirements,
-            lake_visibility=lake_visibility,
             parameters=parameters,
             database=database,
             namespace=namespace,

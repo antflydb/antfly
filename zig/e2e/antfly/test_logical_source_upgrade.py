@@ -49,10 +49,12 @@ def test_logical_source_authority_upgrade_and_rollback(stateful_api):
         "limit": 0,
         "fields": [],
         "profile": True,
-        "value_search_execution": {
-            "allow_scan": True,
-            "max_documents": count,
-            "max_bytes": 16 * 1024 * 1024,
+        "execution": {
+            "value_verification": {
+                "allow_scan": True,
+                "max_documents": count,
+                "max_bytes": 16 * 1024 * 1024,
+            }
         },
     }
 
@@ -69,7 +71,7 @@ def test_logical_source_authority_upgrade_and_rollback(stateful_api):
         result = response.json()["responses"][0]
         assert not result.get("error"), result
         assert result["hits"]["total"]["value"] == expected, result
-        profile = result["profile"]["value_search"]
+        profile = result["profile"]["value_verification"]
         assert profile["documents"] == count, profile
         assert profile["bytes"] > count * 32 * 1024, profile
         return profile

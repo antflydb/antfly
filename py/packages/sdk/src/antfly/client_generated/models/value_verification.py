@@ -7,11 +7,11 @@ from attrs import define as _attrs_define
 
 from ..types import UNSET, Unset
 
-T = TypeVar("T", bound="ValueSearchExecution")
+T = TypeVar("T", bound="ValueVerification")
 
 
 @_attrs_define
-class ValueSearchExecution:
+class ValueVerification:
     """Execution policy for logical string-value operations. Limits apply to
     verification work per shard request, including repeated leaf evaluations.
     Exhaustion fails explicitly; it never returns a successful partial result.
@@ -64,11 +64,11 @@ class ValueSearchExecution:
 
         max_regex_work = d.pop("max_regex_work", UNSET)
 
-        value_search_execution = cls(
+        value_verification = cls(
             allow_scan=allow_scan,
             max_documents=max_documents,
             max_bytes=max_bytes,
             max_regex_work=max_regex_work,
         )
 
-        return value_search_execution
+        return value_verification
