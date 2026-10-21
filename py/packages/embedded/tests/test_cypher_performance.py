@@ -6308,3 +6308,55 @@ def test_call_count_window_keeps_middle_error_before_return_argument_error(graph
                 f"RETURN i,count(1/x) ORDER BY i LIMIT {limit}"
             },
         )
+
+
+@pytest.mark.parametrize("source", ["UNWIND $groups AS i", "WITH $groups AS gs UNWIND gs AS i"])
+def test_parameter_primitive_keys_share_call_domains(graph_db, source):
+    parameters = {"groups": list(range(1, 31)), "xs": list(range(1000))}
+    outputs = [
+        graph_db.cypher_json(
+            "g",
+            {
+                "query": f"{source} UNWIND $xs AS x CALL {{{body}}} RETURN i,avg(y) ORDER BY i",
+                "parameters": parameters,
+                "limits": {"memory_bytes": 4 << 20, "intermediate_states": 100000},
+            },
+        )
+        for body in ("WITH i,avg(x) AS y RETURN y", "WITH avg(x) AS y RETURN y")
+    ]
+    assert outputs[0]["rows"] == outputs[1]["rows"]
+    assert len(outputs[0]["rows"]) == 30
+    for result in outputs:
+        assert result["stats"]["intermediate_states"] < 50000
+        assert result["stats"]["memory_bytes"] < 2 << 20
+
+
+@pytest.mark.parametrize(
+    "body,projection,expected",
+    [
+        ("RETURN 7 AS y", "count(*),min(y),max(y)", [1000000, 7, 7]),
+        ("RETURN 7 AS y", "count(x),min(x),max(x),sum(x)", [1000000, 1, 1000000, 500000500000]),
+        ("CALL {RETURN DISTINCT 7 AS z LIMIT 1} RETURN z AS y", "count(*),min(y)", [1000000, 7]),
+        ("WITH 7 AS z WHERE false RETURN count(*) AS y", "count(*),min(y)", [1000000, 0]),
+        ("RETURN 7 AS y LIMIT 0", "count(*)", [0]),
+    ],
+)
+def test_independent_singleton_calls_preserve_symbolic_axis_domains(graph_db, body, projection, expected):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": f"UNWIND range(1,1000000) AS x CALL {{{body}}} RETURN {projection}",
+            "limits": {"intermediate_states": 2000, "memory_bytes": 1 << 20},
+        },
+    )
+    assert [[int(cell["value"]) for cell in row] for row in result["rows"]] == [expected]
+    assert result["stats"]["intermediate_states"] < 500
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["RETURN 7 AS x", "CALL {RETURN 7 AS x} RETURN 7 AS y"],
+)
+def test_independent_call_axis_compression_retains_output_binding_conflicts(graph_db, body):
+    with pytest.raises(af.AntflyError, match="CypherVariableConflict"):
+        graph_db.cypher_json("g", {"query": f"UNWIND [7,8] AS x CALL {{{body}}} RETURN count(*)"})

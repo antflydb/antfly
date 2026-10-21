@@ -1146,6 +1146,7 @@ const Engine = struct {
         owned_lists: std.AutoHashMapUnmanaged(Identity, @import("invariant_membership.zig").Membership) = .empty,
         list_counts: std.AutoHashMapUnmanaged(Identity, *ListCountFacts) = .empty,
         mapped_lists: std.AutoHashMapUnmanaged(MappingKey, ?v.Value) = .empty,
+        parameter_items: std.AutoHashMapUnmanaged(Identity, *ListType) = .empty,
         fn deinit(self: *@This()) void {
             if (self.bytes) |pool| pool.deinit();
             if (self.captured_lists) |*memo| memo.deinit();
@@ -2858,47 +2859,99 @@ const Engine = struct {
         while (keys.next()) |name| if (@import("expressions.zig").references(expression, name.*)) return true;
         return false;
     }
-    // Eliding a variable read requires a primitive result: entity reads may
-    // invoke authority projection, and container reads validate structural depth.
-    fn plainExpression(expression: *const ast.Expr, names: Names) bool {
-        return switch (expression.value) {
-            .literal => true,
-            .variable => |name| names.contains(name),
-            .unary => |u| plainExpression(u.operand, names),
-            .binary => |b| plainExpression(b.left, names) and plainExpression(b.right, names),
-            .call => |call_value| blk: {
-                for ([_][]const u8{ "count", "sum", "avg" }) |name| if (std.ascii.eqlIgnoreCase(call_value.name, name)) break :blk true;
-                break :blk false;
-            },
+    // Certificates describe successful results, not total evaluation. Original
+    // expressions still execute, including parameter, argument and depth errors.
+    // Only primitive variable reads may be elided: entity reads can project
+    // authority and containers must still validate structural depth.
+    const ScalarType = union(enum) {
+        primitive,
+        primitive_items,
+        items: *ListType,
+        element: *ListType,
+    };
+    const ListType = struct { items: []const v.Value, plain: ?bool = null };
+    const ScalarTypes = std.StringHashMapUnmanaged(ScalarType);
+    fn listType(self: *Engine, items: []const v.Value) !ScalarType {
+        // Only immutable parameters enter the statement cache. Other imported
+        // lists may belong to a recyclable row arena: their certificate lives
+        // solely through this normalization and is never keyed by that address.
+        for (self.parameters) |entry| if (entry.value == .list and entry.value.list.ptr == items.ptr and entry.value.list.len == items.len) {
+            const owner = try self.rootInvariantState();
+            const identity: Invariants.Identity = .{ .address = @intFromPtr(items.ptr), .length = items.len };
+            if (owner.parameter_items.get(identity)) |known| return .{ .items = known };
+            const known = try self.planning_allocator.create(ListType);
+            known.* = .{ .items = items };
+            try owner.parameter_items.put(self.planning_allocator, identity, known);
+            return .{ .items = known };
+        };
+        const known = try self.a.create(ListType);
+        known.* = .{ .items = items };
+        return .{ .items = known };
+    }
+    fn primitive(value: v.Value) bool {
+        return switch (value) {
+            .null, .boolean, .integer, .number, .string => true,
             else => false,
         };
     }
-    fn plainItems(expression: *const ast.Expr, names: Names) bool {
+    fn knownPrimitive(known: ?ScalarType) bool {
+        return if (known) |kind| kind == .primitive else false;
+    }
+    fn plainBinding(self: *Engine, known: ?ScalarType) !bool {
+        const kind = known orelse return false;
+        if (kind == .primitive) return true;
+        if (kind != .element) return false;
+        const certificate = kind.element;
+        if (certificate.plain) |certified| return certified;
+        const certified = for (certificate.items) |item| {
+            try self.state();
+            if (!primitive(item)) break false;
+        } else true;
+        certificate.plain = certified;
+        return certified;
+    }
+    fn scalarType(self: *Engine, expression: *const ast.Expr, types: ScalarTypes) anyerror!?ScalarType {
         return switch (expression.value) {
-            // Successful ranges always contain integers; argument evaluation
-            // remains in the original producer, including all of its errors.
-            .call => |call_value| std.ascii.eqlIgnoreCase(call_value.name, "range"),
-            .list => |items| blk: {
-                for (items) |item| if (!plainExpression(item, names)) break :blk false;
-                break :blk true;
+            .literal => .primitive,
+            .variable => |name| types.get(name),
+            .parameter => |name| blk: {
+                const value = lookup(self.parameters, name) orelse break :blk null;
+                if (primitive(value)) break :blk .primitive;
+                // Carry a lazy source certificate. Most UNWINDs never need to
+                // elide element reads: do not scan their lists just to plan a
+                // COUNT(*) or an unreachable child. Resolve only a dead read,
+                // once per immutable parameter across all nested CALLs.
+                break :blk if (value == .list) try self.listType(value.list) else null;
             },
-            else => false,
+            .unary => |u| if (knownPrimitive(try self.scalarType(u.operand, types))) .primitive else null,
+            .binary => |b| if (knownPrimitive(try self.scalarType(b.left, types)) and knownPrimitive(try self.scalarType(b.right, types))) .primitive else null,
+            .call => |call_value| blk: {
+                if (std.ascii.eqlIgnoreCase(call_value.name, "range")) break :blk .primitive_items;
+                for ([_][]const u8{ "count", "sum", "avg" }) |name| if (std.ascii.eqlIgnoreCase(call_value.name, name)) break :blk .primitive;
+                break :blk null;
+            },
+            .list => |items| blk: {
+                for (items) |item| if (!knownPrimitive(try self.scalarType(item, types))) break :blk null;
+                break :blk .primitive_items;
+            },
+            else => null,
         };
     }
     /// Expand bound wildcard columns without changing expression evaluation
     /// or CALL scope. A single scalar seed gives every stage one static schema.
     fn normalizeScalarPipeline(self: *Engine, initial: Row, clauses: []const ast.Clause) anyerror![]const ast.Clause {
-        var plain: Names = .empty;
-        for (initial) |entry| switch (entry.value) {
-            .null, .boolean, .integer, .number, .string => try plain.put(self.a, entry.name, {}),
-            else => {},
-        };
+        var plain: ScalarTypes = .empty;
+        for (initial) |entry| {
+            if (primitive(entry.value)) {
+                try plain.put(self.a, entry.name, .primitive);
+            } else if (entry.value == .list) {
+                try plain.put(self.a, entry.name, try self.listType(entry.value.list));
+            }
+        }
         return self.normalizeScalarPipelineTyped(initial, clauses, plain);
     }
-    fn normalizeScalarPipelineTyped(self: *Engine, initial: Row, clauses: []const ast.Clause, imported_plain: Names) anyerror![]const ast.Clause {
-        var plain: Names = .empty;
-        var imports = imported_plain.keyIterator();
-        while (imports.next()) |name| try plain.put(self.a, name.*, {});
+    fn normalizeScalarPipelineTyped(self: *Engine, initial: Row, clauses: []const ast.Clause, imported_plain: ScalarTypes) anyerror![]const ast.Clause {
+        var plain = imported_plain;
         var shape = initial;
         const output = try self.a.dupe(ast.Clause, clauses);
         const inputs = try self.a.alloc(Row, output.len);
@@ -2906,7 +2959,7 @@ const Engine = struct {
         // across child rows separately from captures varying between callers.
         var varying: Names = .empty;
         const variations = try self.a.alloc(Names, output.len);
-        const plain_inputs = try self.a.alloc(Names, output.len);
+        const plain_inputs = try self.a.alloc(ScalarTypes, output.len);
         for (output, inputs, variations, plain_inputs) |*clause, *input, *variation, *plain_input| {
             variation.* = varying;
             plain_input.* = plain;
@@ -2933,13 +2986,22 @@ const Engine = struct {
             switch (clause.operation) {
                 .unwind => |u| {
                     try varying.put(self.a, u.alias, {});
-                    if (plainItems(u.expression, plain)) try plain.put(self.a, u.alias, {}) else _ = plain.remove(u.alias);
+                    const source_type = try self.scalarType(u.expression, plain);
+                    const item_type: ?ScalarType = if (source_type) |kind| switch (kind) {
+                        .primitive_items => .primitive,
+                        .items => |certificate| .{ .element = certificate },
+                        else => null,
+                    } else null;
+                    // Snapshots are immutable, including when UNWIND shadows an
+                    // alias. A later type cannot license an earlier dead read.
+                    plain = try plain.clone(self.a);
+                    if (item_type) |known| try plain.put(self.a, u.alias, known) else _ = plain.remove(u.alias);
                 },
                 .project => |step| {
                     var next: Names = .empty;
-                    var next_plain: Names = .empty;
-                    for (step.value.items) |item| if (plainExpression(item.expression, plain)) {
-                        try next_plain.put(self.a, item.alias orelse try self.expressionName(item.expression), {});
+                    var next_plain: ScalarTypes = .empty;
+                    for (step.value.items) |item| if (try self.scalarType(item.expression, plain)) |known| {
+                        try next_plain.put(self.a, item.alias orelse try self.expressionName(item.expression), known);
                     };
                     plain = next_plain;
                     var varying_keys = false;
@@ -2957,6 +3019,7 @@ const Engine = struct {
                     // recursive normalization still handles its own constants.
                     var child = shape;
                     for (inner) |step| child = try self.streamShape(child, step);
+                    plain = try plain.clone(self.a);
                     for (child) |entry| {
                         try varying.put(self.a, entry.name, {});
                         _ = plain.remove(entry.name);
@@ -2995,14 +3058,14 @@ const Engine = struct {
                         // Keep an unobserved invocation-constant grouping slot:
                         // empty grouped inputs still return zero rows, without
                         // capturing the caller's otherwise unobserved value.
-                        if (!step.final and !required.contains(name) and (grouped or step.value.distinct) and item.expression.value == .variable and plain_inputs[cursor].contains(item.expression.value.variable) and !axisDepends(item.expression, variations[cursor])) {
+                        if (!step.final and !required.contains(name) and (grouped or step.value.distinct) and item.expression.value == .variable and (try self.plainBinding(plain_inputs[cursor].get(item.expression.value.variable))) and !axisDepends(item.expression, variations[cursor])) {
                             const constant_key = try self.a.create(ast.Expr);
                             constant_key.* = .{ .span = item.expression.span, .value = .{ .literal = .null } };
                             try kept.append(self.a, .{ .expression = constant_key, .alias = name });
                             continue;
                         }
                         // Varying keys still determine child multiplicity.
-                        if (step.final or step.value.distinct or grouped or item.expression.value != .variable or required.contains(name) or !plain_inputs[cursor].contains(item.expression.value.variable)) {
+                        if (step.final or step.value.distinct or grouped or item.expression.value != .variable or required.contains(name) or !(try self.plainBinding(plain_inputs[cursor].get(item.expression.value.variable)))) {
                             try kept.append(self.a, item);
                             try self.axisReferences(&before, item.expression);
                         }
@@ -3657,7 +3720,7 @@ const Engine = struct {
                             }
                         }
                         if (projectedSource(unwind.expression) and !arithmeticSource(unwind.expression)) {
-                            const independent = fold.independentTail(unwind.alias, index + 1);
+                            const independent = try fold.independentTail(engine, unwind.alias, index + 1);
                             if (!independent and try fold.memoAxis(engine, row, index)) return;
                             var consumer: UnwindReceiver = .{ .fold = fold, .row = row, .index = index, .owner = engine.local_invariants, .locals = engine.projection_locals, .weighted = independent };
                             var receiver: ListReceiver = .{ .ptr = &consumer, .emit = UnwindReceiver.add, .complete = UnwindReceiver.isComplete, .destination = fold.retained, .observer = .{ .name = "collect", .args = &.{}, .collect_limit = if (independent) 0 else null } };
@@ -3673,7 +3736,7 @@ const Engine = struct {
                         // its elements are unobserved. Arithmetic ranges also
                         // carry the non-NULL/uniqueness proof for COUNT(alias).
                         // Both proofs cover every remaining binding and consumer.
-                        if ((source.values == .range or source.values == .list) and (counts != null or list_counts != null or fold.independentTail(unwind.alias, index + 1)) and
+                        if ((source.values == .range or source.values == .list) and (counts != null or list_counts != null or try fold.independentTail(engine, unwind.alias, index + 1)) and
                             try fold.permitsWindowProduct(engine, source.length()))
                         {
                             const length = source.length();
@@ -3992,7 +4055,7 @@ const Engine = struct {
             if ((fold.top.* == null and fold.distinct_goal == null) or fold.projection.order.len != 0) return null;
             return engine.windowGoal(fold.projection);
         }
-        fn independentTail(fold: *@This(), alias: []const u8, index: usize) bool {
+        fn independentTail(fold: *@This(), engine: *Engine, alias: []const u8, index: usize) !bool {
             if (fold.consumer != null or fold.continuation != null) return false;
             // Even a homogeneous floating axis must retain sequential
             // rounding. Weighted multiplication is not repeated addition.
@@ -4007,6 +4070,7 @@ const Engine = struct {
                     if (!independentExpressions(u.expression, alias)) return false;
                     fanout = true;
                 },
+                .subquery => |inner| if (!try engine.independentUnitCall(inner, alias)) return false,
                 else => return false,
             };
             if (fanout) {
@@ -4028,6 +4092,7 @@ const Engine = struct {
             // filter, rebinding or further axis needs its own domain proof.
             var observed_alias = alias;
             for (fold.middle[index..]) |clause| {
+                if (clause.operation == .subquery and try engine.independentUnitCall(clause.operation.subquery, observed_alias)) continue;
                 if (clause.operation != .project) return null;
                 observed_alias = forwardedAxis(clause.operation.project.value, observed_alias) orelse return null;
             }
@@ -4061,6 +4126,7 @@ const Engine = struct {
             var observed_alias = alias;
             var mappings: std.ArrayList(struct { expression: *const ast.Expr, alias: []const u8 }) = .empty;
             for (fold.middle[index..]) |clause| {
+                if (clause.operation == .subquery and try engine.independentUnitCall(clause.operation.subquery, observed_alias)) continue;
                 if (clause.operation != .project) return null;
                 const p = clause.operation.project.value;
                 if (forwardedAxis(p, observed_alias)) |forwarded| {
@@ -4790,6 +4856,26 @@ const Engine = struct {
         for (inner) |clause| switch (clause.operation) {
             .project => {},
             .subquery => |child| if (!unitReturningCall(child)) return false,
+            else => return false,
+        };
+        return true;
+    }
+    /// A pure zero-or-one-row CALL independent of the axis has the same result
+    /// for each represented input. Evaluate it on a unit child and preserve the
+    /// caller's multiplicity; child DISTINCT, windows and global reducers stay
+    /// local to that unit input. A returned axis alias would join against the
+    /// actual input value even without reading it, so cannot use a representative.
+    fn independentUnitCall(self: *Engine, inner: []const ast.Clause, alias: []const u8) anyerror!bool {
+        if (!unitReturningCall(inner) or !independentExpressions(inner, alias)) return false;
+        for (inner) |clause| switch (clause.operation) {
+            .project => |step| {
+                if (step.value.wildcard) return false;
+                for (step.value.items) |item| {
+                    const name = item.alias orelse try self.expressionName(item.expression);
+                    if (std.mem.eql(u8, name, alias)) return false;
+                }
+            },
+            .subquery => |child| if (!try self.independentUnitCall(child, alias)) return false,
             else => return false,
         };
         return true;

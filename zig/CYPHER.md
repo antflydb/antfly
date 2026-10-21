@@ -1984,6 +1984,24 @@ visibility projection, and container reads enforce structural depth limits even
 when their values are dead. Varying keys, entity/container reads and potentially
 failing expressions keep their original evaluation.
 
+Primitive certificates follow parameter lists through forwarding projections and
+nested CALL imports. Element validation is lazy: only a proposed dead variable
+read requests a shallow primitive-element proof. Successful and failed proofs
+are charged and shared once per immutable parameter for that execution. Planning
+an ordinary COUNT(*) does not scan an otherwise unobserved parameter list.
+Binding-type snapshots are immutable across UNWIND shadowing and child exports;
+dummy NULL schema values never supply type evidence.
+
+An independent pure zero-or-one-row CALL also preserves a compressed axis. Each
+child executes with one unit input, so filtering, DISTINCT, windows and global
+empty-input reducers retain their invocation-local semantics before the caller's
+multiplicity is applied. This composes with exact range and immutable-list
+COUNT/MIN/MAX/integer-SUM certificates. The proof checks reads and output names,
+including implicit names and nested CALL joins: exporting the axis binding can
+conflict even when the child never reads it. Wildcards, correlated children,
+effects and expanding bodies keep ordinary execution. Floating SUM/AVG retain
+their sequential contribution order.
+
 An intermediate ORDER BY can share one sorted inner domain only after proving a
 unique outer source, unchanged partition lineage in every DISTINCT and grouping
 key, and identical captured inner inputs. Each nonempty partition contributes one
