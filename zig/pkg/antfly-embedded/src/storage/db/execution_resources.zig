@@ -966,7 +966,7 @@ pub const RelationalPriorMembership = struct {
         self.alloc.free(self.members);
     }
 
-    pub fn read(self: *@This(), db: anytype, txn: *docstore_mod.DocStore.Txn, plan: relational_index_plans.View, ready: []const bool, document: []const u8) ![]const bool {
+    pub fn read(self: *@This(), db: anytype, txn: anytype, plan: relational_index_plans.View, ready: []const bool, document: []const u8) ![]const bool {
         if (self.members.len == 0) return self.members;
         @memset(self.members, false);
         const needed = for (plan.boundIndexes(), ready) |index, is_ready| {

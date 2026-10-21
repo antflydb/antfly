@@ -27,6 +27,7 @@ pub const OwnedCursor = struct {
     read: *DocStore.Txn,
     cursor: DocStore.Txn.CursorAdapter,
     captured: ?*Cursor = null,
+    owns_read: bool = true,
     pub fn seekAtOrAfter(self: *@This(), selected: []const u8) !?@import("../backend_erased.zig").Entry {
         if (self.captured) |trace| try trace.check();
         const entry = try self.cursor.seekAtOrAfter(selected);
@@ -72,9 +73,60 @@ pub const OwnedCursor = struct {
     }
     pub fn close(self: *@This()) void {
         self.cursor.close();
-        self.read.abort();
-        self.allocator.destroy(self.read);
+        if (self.owns_read) {
+            self.read.abort();
+            self.allocator.destroy(self.read);
+        }
         if (self.captured) |trace| trace.close();
+    }
+};
+/// Borrows one existing transaction. Returned values remain transaction-owned;
+/// closing a traced cursor never aborts or destroys the caller's transaction.
+pub fn observeTxn(txn: *DocStore.Txn, observations: ?*Owned) TxnReader {
+    return .{ .txn = txn, .observations = observations };
+}
+pub const TxnReader = struct {
+    txn: *DocStore.Txn,
+    observations: ?*Owned,
+    pub fn get(self: TxnReader, key: []const u8) ![]const u8 {
+        if (self.observations) |captured| try captured.check();
+        const value = self.txn.get(key) catch |err| {
+            if (err == error.NotFound) if (self.observations) |captured| try captured.recordPoint(key, null);
+            return err;
+        };
+        if (self.observations) |captured| try captured.recordPoint(key, value);
+        return value;
+    }
+    pub fn getManySorted(self: TxnReader, keys: []const []const u8, values: []?[]const u8) !void {
+        self.getManySortedInner(keys, values) catch |err| {
+            if (self.observations) |captured| if (captured.failure == null) {
+                captured.failure = err;
+            };
+            return err;
+        };
+    }
+    fn getManySortedInner(self: TxnReader, keys: []const []const u8, values: []?[]const u8) !void {
+        if (self.observations) |captured| try captured.check();
+        try self.txn.getManySorted(keys, values);
+        if (self.observations) |captured| for (keys, values) |key, value| try captured.recordPoint(key, value);
+    }
+    pub fn openCursor(self: TxnReader) !OwnedCursor {
+        return self.open(false);
+    }
+    pub fn openPhysicalCursorAdapter(self: TxnReader) !OwnedCursor {
+        return self.open(true);
+    }
+    fn open(self: TxnReader, physical: bool) !OwnedCursor {
+        if (self.observations) |captured| try captured.check();
+        var cursor = if (physical) try self.txn.openPhysicalCursorAdapter() else try self.txn.openCursor();
+        errdefer cursor.close();
+        return .{ .allocator = self.txn.alloc, .read = self.txn, .cursor = cursor, .owns_read = false, .captured = if (self.observations) |captured| try captured.openCursorWithMode(physical) else null };
+    }
+    pub fn hasPrefix(self: TxnReader, prefix: []const u8) !bool {
+        var cursor = try self.openPhysicalCursorAdapter();
+        defer cursor.close();
+        const row = (try cursor.seekAtOrAfter(prefix)) orelse return false;
+        return std.mem.startsWith(u8, row.key, prefix);
     }
 };
 /// A read-only observed surface for preparation helpers. It returns caller-owned

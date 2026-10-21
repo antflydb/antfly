@@ -960,6 +960,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 for (items[0..initialized_cleanup_deletes]) |*item| item.deinit(preparation_alloc);
                 preparation_alloc.free(items);
             };
+            // Native authored effects are only known after extraction. Begin
+            // observing conservatively for vector-bearing primary writes so
+            // earlier checks cannot escape the eventual retained physical plan.
+            const capture_preparation_points = (if (opts.transaction_resolution) |resolution| resolution.accepted_effects != null else false) or
+                (S.ownerField(self, "root_incarnation").* != 0 and effective_req.writes.len != 0 and
+                    (S.ownerField(self, "core").*.index_manager.dense_indexes.items.len != 0 or S.ownerField(self, "core").*.index_manager.sparse_indexes.items.len != 0));
+            metadata_reads.control = publication_control;
+            const preparation_observations = if (capture_preparation_points) metadata_reads else null;
+            const observed_store = @import("prepared_read_set.zig").observe(S.ownerField(self, "core").*.store, preparation_observations);
             var apply_mutex_held = true;
             const apply_lock_acquired_ns = monotonicTimeNs();
             errdefer if (apply_mutex_held) unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
@@ -977,13 +986,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (req.schema_version != null) try self.validatePreparedSchemaViewLocked(request_schema_view);
             if (!S.ownerField(self, "core").*.relational_indexes.isCurrent(relational_index_snapshot)) return error.PreparedGenerationChanged;
             if (live_replication_apply) {
-                var integrity_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
-                defer integrity_read.abort();
+                var integrity_read_txn = try S.ownerField(self, "core").*.store.beginProbeTxn();
+                defer integrity_read_txn.abort();
+                var integrity_read = @import("prepared_read_set.zig").observeTxn(&integrity_read_txn, preparation_observations);
                 try self.validateLiveReplicationIntegrityEffects(preparation_alloc, &integrity_read, effective_req);
             }
             if (S.ownerField(self, "local_execution").*.restore_staging_required.load(.acquire) or opts.restore_staging != null or effective_req.restore_staging_scope != null) {
-                var restore_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
-                defer restore_read.abort();
+                var restore_read_txn = try S.ownerField(self, "core").*.store.beginProbeTxn();
+                defer restore_read_txn.abort();
+                var restore_read = @import("prepared_read_set.zig").observeTxn(&restore_read_txn, preparation_observations);
                 if (opts.restore_staging) |admission|
                     try @import("restore_staging.zig").validateImport(preparation_alloc, &restore_read, admission, effective_req.writes.len, effective_req.deletes.len)
                 else if (opts.transaction_resolution == null) {
@@ -996,7 +1007,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             if (opts.ordered_apply_receipt) |identity| {
                 switch (try orderedApplyDisposition(
-                    try readOrderedApplyReceipt(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store),
+                    try readOrderedApplyReceipt(S.ownerField(self, "alloc").*, observed_store),
                     identity,
                 )) {
                     .apply => {},
@@ -1098,8 +1109,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const transferred_artifacts = prepared_artifacts.effects;
             const artifact_source = if (req.merge_page) |page| @as(?@import("merge_page_contract.zig").Source, page.source) else if (req.merge_checkpoint) |checkpoint| checkpoint.page_source else null;
             if (artifact_source) |source| if (source.artifact_catalog) |binding| {
-                var read = try S.ownerField(self, "core").*.store.beginReadTxn();
-                defer read.abort();
+                var read_txn = try S.ownerField(self, "core").*.store.beginReadTxn();
+                defer read_txn.abort();
+                var read = @import("prepared_read_set.zig").observeTxn(&read_txn, preparation_observations);
                 var namespace: [24]u8 = undefined;
                 doc_identity.encodeNamespace(&namespace, S.ownerField(self, "core").*.identity_namespace);
                 if (req.artifact_catalog) |install| {
@@ -1215,14 +1227,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             var coordinated_handoff = false;
             if (req.split_replication != null or req.split_checkpoint != null) {
-                var topology_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
-                defer topology_read.abort();
+                var topology_read_txn = try S.ownerField(self, "core").*.store.beginProbeTxn();
+                defer topology_read_txn.abort();
+                var topology_read = @import("prepared_read_set.zig").observeTxn(&topology_read_txn, preparation_observations);
                 coordinated_handoff = try @import("relational_integrity_handoff.zig").admitSplitRequest(S.ownerField(self, "alloc").*, &topology_read, req);
                 if (hasCoordinatedConstraints(request_schema_view) and !coordinated_handoff) return error.CoordinatedConstraintTopologyUnsupported;
             }
             if (req.merge_replication != null or req.merge_checkpoint != null or req.merge_page != null) {
-                var topology_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
-                defer topology_read.abort();
+                var topology_read_txn = try S.ownerField(self, "core").*.store.beginProbeTxn();
+                defer topology_read_txn.abort();
+                var topology_read = @import("prepared_read_set.zig").observeTxn(&topology_read_txn, preparation_observations);
                 // Source retention remains authoritative after its brief pin
                 // fence is released. Receiving another merge would replace that
                 // source's range state while its immutable cut/tail are in use.
@@ -1240,8 +1254,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (!coordinated_handoff and opts.transaction_resolution == null and !live_replication_apply and !scoped_restore_replication_apply and (effective_req.writes.len != 0 or effective_req.deletes.len != 0 or
                 effective_req.graph_writes.len != 0 or effective_req.graph_deletes.len != 0))
             {
-                var topology_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
-                defer topology_read.abort();
+                var topology_read_txn = try S.ownerField(self, "core").*.store.beginProbeTxn();
+                defer topology_read_txn.abort();
+                var topology_read = @import("prepared_read_set.zig").observeTxn(&topology_read_txn, preparation_observations);
                 try @import("relational_integrity_topology.zig").requireUnfenced(&topology_read);
             }
 
@@ -1378,10 +1393,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var index_read: ?docstore_mod.DocStore.Txn = if (relational_index_snapshot != null) try S.ownerField(self, "core").*.store.beginReadTxn() else null;
             defer if (index_read) |*read| read.abort();
             if (relational_index_snapshot) |index_snapshot| for (index_snapshot.plan.boundIndexes(), index_ready) |index, *ready| {
-                ready.* = (try relational_index_jobs.status(&index_read.?, index)).state == .ready;
+                ready.* = (try relational_index_jobs.status(@import("prepared_read_set.zig").observeTxn(&index_read.?, preparation_observations), index)).state == .ready;
             };
             var index_stage: ?relational_index_records.Staged = if (index_read) |*read| relational_index_records.Staged.init(preparation_alloc, read) else null;
             defer if (index_stage) |*stage| stage.deinit();
+            if (index_stage) |*stage| stage.observations = preparation_observations;
             var prior_membership = try RelationalPriorMembership.init(preparation_alloc, if (relational_index_snapshot) |index_snapshot| index_snapshot.plan else null);
             defer prior_membership.deinit();
             // Consume the coalesced logical request, not raw input ordering. API
@@ -1390,7 +1406,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (index_stage) |*stage| for (effective_req.deletes) |key| {
                 if (isMetadataKey(key)) continue;
                 const plan = relational_index_snapshot.?.plan;
-                const members = try prior_membership.read(&.{ .core = S.ownerField(self, "core").* }, &index_read.?, plan, index_ready, key);
+                const members = try prior_membership.read(&.{ .core = S.ownerField(self, "core").* }, @import("prepared_read_set.zig").observeTxn(&index_read.?, preparation_observations), plan, index_ready, key);
                 if (members.len != 0) for (plan.boundIndexes(), members) |index, member| {
                     if (member) _ = try stage.deleteIndex(&index_writer, index.id(), key, .indexed);
                 };
@@ -1535,8 +1551,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     var iterator = live_jobs.keyIterator();
                     while (iterator.next()) |job| preparation_alloc.free(job.*);
                 }
-                var read = try S.ownerField(self, "core").*.store.beginReadTxn();
-                defer read.abort();
+                var read_txn = try S.ownerField(self, "core").*.store.beginReadTxn();
+                defer read_txn.abort();
+                var read = @import("prepared_read_set.zig").observeTxn(&read_txn, preparation_observations);
                 for (effective_req.graph_endpoint_cleanup_guards) |guard| {
                     const job = try contract.guardKeyAlloc(preparation_alloc, guard);
                     defer preparation_alloc.free(job);
@@ -1745,7 +1762,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     for (extracted[i].graph_writes) |graph_write| {
                         const generation = (S.ownerField(self, "core").*.index_manager.graphIndex(graph_write.index_name) orelse return error.IndexNotFound).config.coverage_generation;
                         const graph_entry = S.ownerField(self, "core").*.index_manager.graphIndex(graph_write.index_name) orelse return error.IndexNotFound;
-                        try appendGraphEdgeArtifactWrite(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, &explicit_graph_artifact_writes, graph_write, generation, graph_entry.ttl_duration_ns, batch_timestamp_ns);
+                        try appendGraphEdgeArtifactWrite(S.ownerField(self, "alloc").*, observed_store, &explicit_graph_artifact_writes, graph_write, generation, graph_entry.ttl_duration_ns, batch_timestamp_ns);
                     }
                     for (extracted[i].mentioned_graph_indexes) |index_name| {
                         const clear = try GraphArtifactClear.initAlloc(S.ownerField(self, "alloc").*, write.key, index_name);
@@ -1789,7 +1806,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         const plan = relational_index_snapshot.?.plan;
                         // Effective writes/deletes are coalesced before this loop,
                         // so the pinned base is the exact prior row for each key.
-                        const members = try prior_membership.read(&.{ .core = S.ownerField(self, "core").* }, &index_read.?, plan, index_ready, write.key);
+                        const members = try prior_membership.read(&.{ .core = S.ownerField(self, "core").* }, @import("prepared_read_set.zig").observeTxn(&index_read.?, preparation_observations), plan, index_ready, write.key);
                         try stage.upsertPreparedWithMembership(&index_writer, plan, keys, row, write.key, index_ready, members);
                     };
                     if (!use_preprepared_rows) {
@@ -1877,7 +1894,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const overwrite_probe_admission: backend_types.Namespace.BlockCacheAdmission = if (opts.store_batch_options.mode == .bulk_ingest or self.bulkSessionActive()) .transient else .retain;
                 var overwrite_probe_txn = try S.ownerField(self, "core").*.store.beginProbeTxnWithBlockCacheAdmission(overwrite_probe_admission);
                 defer overwrite_probe_txn.abort();
-                try overwrite_probe_txn.getManySorted(probe_keys, probe_values);
+                try @import("prepared_read_set.zig").observeTxn(&overwrite_probe_txn, preparation_observations).getManySorted(probe_keys, probe_values);
                 for (overwrite_probe_entries.items, 0..) |entry, i| {
                     const existing = probe_values[i] orelse continue;
                     overwritten_flags[entry.write_index] = true;
@@ -1927,13 +1944,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             for (effective_req.graph_writes) |graph_write| {
                 const generation = (S.ownerField(self, "core").*.index_manager.graphIndex(graph_write.index_name) orelse return error.IndexNotFound).config.coverage_generation;
                 const graph_entry = S.ownerField(self, "core").*.index_manager.graphIndex(graph_write.index_name) orelse return error.IndexNotFound;
-                try appendGraphEdgeArtifactWrite(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, &explicit_graph_artifact_writes, graph_write, generation, graph_entry.ttl_duration_ns, batch_timestamp_ns);
+                try appendGraphEdgeArtifactWrite(S.ownerField(self, "alloc").*, observed_store, &explicit_graph_artifact_writes, graph_write, generation, graph_entry.ttl_duration_ns, batch_timestamp_ns);
             }
 
-            const capture_preparation_points = (if (opts.transaction_resolution) |resolution| resolution.accepted_effects != null else false) or
-                (S.ownerField(self, "root_incarnation").* != 0 and explicit_embedding_artifact_writes.items.len != 0);
-            metadata_reads.control = publication_control;
-            const observed_store = @import("prepared_read_set.zig").observe(S.ownerField(self, "core").*.store, if (capture_preparation_points) metadata_reads else null);
             const cleanup_contract = @import("../graph_cleanup_contract.zig");
             var graph_lifecycle_generation: u64 = if (effective_req.graph_endpoint_cleanup or effective_req.graph_deletes.len != 0 or effective_req.deletes.len != 0 or
                 (std.mem.indexOfScalar(bool, derived_changed_flags, true) != null))
@@ -1969,7 +1982,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             );
             for (owned_delete_keys.items) |key| graph_delete_key_set.putAssumeCapacity(key, {});
             for (graph_artifact_clears.items) |clear| {
-                const existing = try collectGraphArtifactsForDocIndex(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, clear.doc_key, clear.index_name);
+                const existing = try collectGraphArtifactsForDocIndex(S.ownerField(self, "alloc").*, observed_store, clear.doc_key, clear.index_name);
                 defer docstore_mod.DocStore.freeResults(S.ownerField(self, "alloc").*, existing);
                 for (existing) |entry| {
                     // Field replacement owns the direct contributor only.
@@ -2844,8 +2857,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer if (ordered_artifact_value) |value| S.ownerField(self, "alloc").*.free(value);
             if (req.artifact_catalog) |command| {
                 const entry = opts.ordered_apply_receipt orelse return error.InvalidArtifactCatalogCommand;
-                var read = try S.ownerField(self, "core").*.store.beginReadTxn();
-                defer read.abort();
+                var read_txn = try S.ownerField(self, "core").*.store.beginReadTxn();
+                defer read_txn.abort();
+                var read = @import("prepared_read_set.zig").observeTxn(&read_txn, preparation_observations);
                 if (!std.mem.eql(u8, &command.namespace, &@import("online_source_contract.zig").namespaceBytes(S.ownerField(self, "core").*.identity_namespace))) return error.IdentityNamespaceMismatch;
                 if (!std.mem.eql(u8, &command.binding.digest, &(try @import("artifact_inventory.zig").local(&read)).digest)) return error.ArtifactCatalogDrift;
                 ordered_artifact_value = try @import("artifact_inventory.zig").prepareOrdered(S.ownerField(self, "alloc").*, &read, command, entry.index);
@@ -3145,8 +3159,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
             const authored_root = blk: {
                 if (S.ownerField(self, "root_incarnation").* == 0 or explicit_embedding_artifact_writes.items.len == 0) break :blk 0;
-                var probe = try S.ownerField(self, "core").*.store.beginProbeTxn();
-                defer probe.abort();
+                var probe_txn = try S.ownerField(self, "core").*.store.beginProbeTxn();
+                defer probe_txn.abort();
+                var probe = @import("prepared_read_set.zig").observeTxn(&probe_txn, preparation_observations);
                 if (try @import("artifact_publication.zig").authority(&probe) == null) break :blk 0;
                 break :blk S.ownerField(self, "root_incarnation").*;
             };
@@ -3173,10 +3188,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .generated_reads = generated_precompute_snapshot.entries,
                 .transform_reads = transform_snapshot.entries,
             }, publication_control);
-            if (prepared_physical) |*plan| {
-                try metadata_reads.finish();
-                plan.dependencies.?.metadata_reads = try metadata_reads.take();
-            }
+            // A candidate read set may exist even when extraction produced no
+            // retained physical plan. Never publish after a swallowed capture
+            // failure, and retire borrowed controls/cursors on either path.
+            try metadata_reads.finish();
+            if (prepared_physical) |*plan| plan.dependencies.?.metadata_reads = try metadata_reads.take();
             const commit_writes = if (prepared_physical) |plan| plan.bytes.writes else store_writes.items;
             const commit_deletes = if (prepared_physical) |plan| plan.bytes.deletes else delete_keys.items;
             const commit_replay: ?docstore_mod.DocStore.ReplayAppend = if (prepared_physical) |plan|

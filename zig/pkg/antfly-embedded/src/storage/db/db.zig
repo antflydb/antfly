@@ -145783,3 +145783,29 @@ test "db prepared transaction effects required contender scans retain membership
     try db.core.store.put(count_key, &changed_count);
     try std.testing.expectError(error.PreparedReadSetChanged, owned.validate(db.core.store, null));
 }
+
+test "db prepared transaction effects required graph TTL preparation propagates allocation failure instead of renewing lifetime" {
+    const a = std.testing.allocator;
+    const Check = struct {
+        fn run(allocator: Allocator, store: *docstore_mod.DocStore, key: []const u8) !void {
+            const encoded = try encodeGraphEdgeArtifactWithTtlAlloc(allocator, store, key, 1, 1000, 999, .{ .index_name = "g", .source = "source", .target = "target", .edge_type = "links", .metadata_json = "{}" });
+            defer allocator.free(encoded);
+            var edge = try enrichment_artifact_codec.decodeGraphEdgeAlloc(std.testing.allocator, encoded);
+            defer edge.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(u64, 123), edge.ttl_created_ns);
+        }
+    };
+    var directory = try TestDirectory.init("observed-graph-ttl-oom");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .start_independent_maintenance = false });
+    defer db.close();
+    const key = try internal_keys.graphEdgeArtifactKeyAlloc(a, "source", "g", "links", "target");
+    defer a.free(key);
+    const old = try enrichment_artifact_codec.encodeGraphEdgeWithTtlAlloc(a, null, 1, 1, 0, 0, 123, "{}");
+    defer a.free(old);
+    try db.core.store.put(key, old);
+    try std.testing.checkAllAllocationFailures(a, Check.run, .{ db.core.store, key });
+    const unchanged = try db.core.store.get(a, key);
+    defer a.free(unchanged);
+    try std.testing.expectEqualSlices(u8, old, unchanged);
+}

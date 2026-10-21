@@ -559,3 +559,91 @@ test "prepared transaction effects observed scan owners unwind allocation callba
     try std.testing.expectError(error.ReadAdmissionRejected, poisoned.finish());
     try std.testing.expectError(error.InvalidArgument, poisoned.take());
 }
+
+test "prepared transaction effects borrowed readers preserve snapshots and caller transaction lifetime" {
+    const a = std.testing.allocator;
+    var fixture: ReadCaptureTest = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    try fixture.store.put("r/a", "before");
+    var captured = read_set.Owned.init(a, null);
+    defer captured.deinit();
+    {
+        var txn = try fixture.store.beginReadTxn();
+        defer txn.abort();
+        const reader = read_set.observeTxn(&txn, &captured);
+        try std.testing.expectEqualStrings("before", try reader.get("r/a"));
+        try std.testing.expectError(error.NotFound, reader.get("missing"));
+        try std.testing.expect(try reader.hasPrefix("r/"));
+        {
+            var cursor = try reader.openCursor();
+            defer cursor.close();
+            try std.testing.expect(!cursor.owns_read);
+            try std.testing.expectEqualStrings("r/a", (try cursor.first()).?.key);
+            try std.testing.expectError(error.InvalidArgument, captured.finish());
+        }
+        // Closing either kind of borrowed cursor leaves the same snapshot live.
+        try std.testing.expectEqualStrings("before", try txn.get("r/a"));
+        try fixture.store.put("r/a", "after");
+        try std.testing.expectEqualStrings("before", try reader.get("r/a"));
+        {
+            var cursor = try reader.openPhysicalCursorAdapter();
+            defer cursor.close();
+            try std.testing.expectEqualStrings("before", (try cursor.last()).?.value);
+        }
+        try std.testing.expectEqualStrings("before", try txn.get("r/a"));
+        try captured.finish();
+    }
+    var owned = try captured.take();
+    defer owned.deinit();
+    try std.testing.expectError(error.PreparedReadSetChanged, owned.validate(&fixture.store, null));
+    try fixture.store.put("r/a", "before");
+    try owned.validate(&fixture.store, null);
+    try fixture.store.put("r/b", "phantom");
+    try std.testing.expectError(error.PreparedReadSetChanged, owned.validate(&fixture.store, null));
+}
+
+test "prepared transaction effects borrowed readers unwind every allocation and original rejection without owning source values" {
+    const a = std.testing.allocator;
+    const admission = @import("../../common/read_admission.zig");
+    const Checks = struct {
+        calls: usize = 0,
+        stop: usize = std.math.maxInt(usize),
+        cause: anyerror = error.NotFound,
+        fn check(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == self.stop) return self.cause;
+        }
+        fn run(allocator: A, store: *DocStore, checks: ?*@This()) !void {
+            var txn = try store.beginReadTxn();
+            defer txn.abort();
+            var payload: admission.Payload = .{ .ptr = checks orelse undefined, .vtable = &.{ .checkpoint = check } };
+            var captured = read_set.Owned.init(allocator, if (checks != null) admission.Port.init(&payload) else null);
+            defer captured.deinit();
+            const reader = read_set.observeTxn(&txn, &captured);
+            _ = reader.get("r/a") catch |err| return captured.failure orelse err;
+            var values: [2]?[]const u8 = undefined;
+            reader.getManySorted(&.{ "r/a", "r/missing" }, &values) catch |err| return captured.failure orelse err;
+            try std.testing.expect(values[0] != null and values[1] == null);
+            _ = reader.hasPrefix("r/") catch |err| return captured.failure orelse err;
+            captured.finish() catch |err| return captured.failure orelse err;
+            // Finish retires tracing controls, never the borrowed snapshot.
+            _ = try txn.get("r/a");
+            var owned = try captured.take();
+            defer owned.deinit();
+        }
+    };
+    var fixture: ReadCaptureTest = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const value: [17000]u8 = @splat('v');
+    try fixture.store.put("r/a", &value);
+    try std.testing.checkAllAllocationFailures(a, Checks.run, .{ &fixture.store, @as(?*Checks, null) });
+    var baseline: Checks = .{};
+    try Checks.run(a, &fixture.store, &baseline);
+    for ([_]anyerror{ error.NotFound, error.OutOfMemory, error.DeadlineExceeded }) |cause| for (1..baseline.calls + 1) |stop| {
+        var checks: Checks = .{ .stop = stop, .cause = cause };
+        try std.testing.expectError(cause, Checks.run(a, &fixture.store, &checks));
+    };
+}

@@ -6233,3 +6233,53 @@ writer-honored durable exclusion, executable recovery resources/derived-log
 quota, migration/peer eligibility, normal required PREPARE drivers and the
 broader scheduler/default/session scope remain incomplete. Strong defaults stay
 off; full qualification remains waived. The full objective remains active.
+
+
+### Borrowed preparation transactions and relational staging (2026-10-20)
+
+The retained read surface now borrows existing primary read/probe transactions
+through `observeTxn`. It records point values/absence, preserves sorted bulk
+reads as one backend call, and wraps logical/physical cursors without taking
+ownership of the transaction or its returned values. Closing a borrowed cursor
+retires only that cursor and trace. Existing snapshot and caller cleanup order
+are preserved.
+
+Capture now begins just after acquiring apply: accepted prepared effects or
+potential native vector-bearing primary writes are observed conservatively
+before final extraction eligibility is known. Wrapped reads include integrity/
+restore staging checks, artifact inventory compatibility/readiness/install,
+split/merge/topology admission, planned cleanup guards, index readiness and
+prior membership, and the sorted overwrite probe. Relational staging captures
+base gets, range activation and reverse-owner scans while honoring its own
+pending puts/deletes first. Earlier graph TTL/clear reads and ordered receipts
+use the observed store; native authored-authority lookup is also observed.
+Ordinary physical publication always finishes capture even when no physical
+plan is retained, preventing a failed candidate from publishing and retiring
+borrowed controls in both paths. Early committed marker/abort branches still
+execute real effects and must be separated explicitly during the future split.
+
+A related overload correctness fix propagates allocation failure while decoding
+an existing graph edge. It previously treated that failure as no decodable
+preimage and could renew the edge lifetime. The failure sweep verifies that
+preparation either preserves the existing timestamp123 or returns OOM, without
+changing stored bytes; it cannot substitute the new timestamp999.
+
+Final `observed-preparation-transactions-v4`: 88/88 steps and 106 tests
+(prepared58, requiredDB37, grouped7, existing graph4), no skips/failures/leaks.
+New tests prove borrowed cursor closure preserves the source transaction,
+immutable snapshots survive concurrent writes, source values are not freed by
+the observer, live traces cannot seal, retired observations detect phantoms,
+all capture allocations/original rejection checkpoints unwind (including bulk),
+and real relational forward/reverse staging preserves source proofs through
+stage/transaction retirement while excluding staged postimages. The graph TTL
+fault sweep passes. Native source/log hashes are recorded with the receipt;
+normal hooks and post-build cache cleanup are required for phase closure.
+
+No ABI/wire/reader/durable-format change. Full qualification remains waived.
+Pre-apply prepared graph reads, identity/route/cardinality/merge and other raw
+helpers/cleanup planner/manifest callbacks still need read coverage. Durable
+writer-honored metadata exclusion, full assembly before the global decision,
+DB/execution lifetime ownership, executable recovery resources/derived-log quota,
+migration/peer eligibility, normal required PREPARE drivers and the broader
+scheduler/default/session scope remain incomplete. Strong defaults remain off;
+the full objective remains active.

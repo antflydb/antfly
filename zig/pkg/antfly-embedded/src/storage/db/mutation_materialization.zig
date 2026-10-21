@@ -2136,7 +2136,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn appendGraphEdgeArtifactWrite(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
             write: types.GraphEdgeWrite,
             generation: u64,
@@ -2987,7 +2987,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn appendPreparedGraphEdgeArtifactWrite(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
             write: types.GraphEdgeWrite,
             generation: u64,
@@ -5191,7 +5191,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn collectGraphArtifactsForDocIndex(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             doc_key: []const u8,
             index_name: []const u8,
         ) ![]docstore_mod.OwnedKVPair {
@@ -8257,7 +8257,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn encodeGraphEdgeArtifactWithTtlAlloc(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             key: []const u8,
             generation: u64,
             ttl_duration_ns: u64,
@@ -8273,7 +8273,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 };
                 if (existing) |raw| {
                     defer alloc.free(raw);
-                    var previous = enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, raw) catch null;
+                    var previous = enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, raw) catch |err| if (err == error.OutOfMemory) return err else null;
                     if (previous) |*edge| {
                         defer edge.deinit(alloc);
                         if (edge.generation == generation and edge.ttl_created_ns != 0) ttl_created_ns = edge.ttl_created_ns;
