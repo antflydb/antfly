@@ -1072,7 +1072,11 @@ Begin with offline ablations and simple utility-aware reranking. Later investiga
 
 Defer parametric consolidation of tenant knowledge until external memory semantics are reliable and editability, attribution, privacy, and deletion tradeoffs are understood.
 
-## Implementation sequence
+## Original implementation and evaluation checklist
+
+This preserves the original rollout and qualification plan. The native contracts
+and Codex migration sections above describe the implemented service; consumer
+cutover and comparative model/product evaluations require separate qualification.
 
 ### Phase 1: First-party service contract, spaces, evidence, and identity
 
@@ -1227,7 +1231,9 @@ The proposed assertion model adds structured subject/predicate/value, explicit s
 
 ### Main integration and constrained-output follow-up (#1223)
 
-The native memory branch incorporates main through `dd49f55102`, including merged
+The native memory branch incorporates main through `1eb89d4e51`, including
+[#1246](https://github.com/antflydb/antfly/pull/1246) and the inference gateway.
+The original constrained-output integration came through `dd49f55102` and merged
 [#1223](https://github.com/antflydb/antfly/pull/1223). Memory continues to use shared
 constrained-producer schema admission, exact-number validation, bounded JSON
 ownership, and provider qualification; it does not maintain a second schema
