@@ -301,8 +301,14 @@ pub fn prepareResolution(alloc: std.mem.Allocator, command: publication.Command,
 pub fn stageHandoff(alloc: std.mem.Allocator, txn: anytype, command: publication.Command) !void {
     if (command.producer_kind != .resolver) return error.InvalidBatchRequest;
     const handoff = @import("resolution_handoff.zig");
+    const active = (try publication.authority(txn)) orelse return error.ArtifactCatalogDrift;
     for (command.mutations) |mutation| {
         if (mutation.family != .resolution) return error.InvalidBatchRequest;
+        // Resolution changes invalidate graph consumers even when the primary
+        // document is unchanged. Persist the producer revisit with the handoff;
+        // accepted asset/provider output is reused during that bounded retry.
+        const source = command.sources[mutation.source_index];
+        _ = try @import("artifact_producer_obligations.zig").mark(alloc, txn, active, source.document_key, source.input_position);
         const marker = try handoff.keyAlloc(alloc, mutation.key);
         defer alloc.free(marker);
         if (mutation.value) |raw| {

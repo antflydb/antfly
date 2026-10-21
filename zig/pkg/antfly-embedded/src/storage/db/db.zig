@@ -26470,6 +26470,7 @@ pub const DB = struct {
         // Index projection alone cannot advance resolver/promotion targets:
         // otherwise the last publication waits forever for another base write.
         notifyResolverReplayRuntimesForCatalog(batch_ctx.index_manager, batch_ctx.resolution_runtime, batch_ctx.promotion_runtime, sequence);
+        if (command.producer_kind == .resolver) if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
         if (self.executor.hasWorkers()) self.executor.forceSequence(sequence) else {
             prepared_value.batch.sequence = sequence;
             try self.lockApplyForPortableRuntime();

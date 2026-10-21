@@ -587,12 +587,18 @@ def test_runtime_entity_curation_preserves_future_promotion(
     assert mixed.json()["operation"] == "invalid", mixed.text
     assert mixed.json()["reason"] == "qualified_start_identity_required", mixed.text
 
-    reached = traversal(qualified)
-    assert reached.ok, reached.text
-    nodes = reached.json()["responses"][0]["graph_results"]["incoming"]["nodes"]
-    assert {node["key"] for node in nodes} == (
-        {"note-0", "note-1"} if action == "merge" else {"note-0"}
-    ), nodes
+    expected_nodes = {"note-0", "note-1"} if action == "merge" else {"note-0"}
+
+    def graph_published():
+        # Entity promotion and graph publication are independent consumers.
+        # A write-level acknowledgement plus promoted rows does not fence graph
+        # visibility, particularly with independently applied Raft publications.
+        reached = traversal(qualified)
+        assert reached.ok, reached.text
+        nodes = reached.json()["responses"][0]["graph_results"]["incoming"]["nodes"]
+        return nodes if {node["key"] for node in nodes} == expected_nodes else None
+
+    assert wait_until(graph_published, timeout_s=30), api.debug_logs()[-16000:]
     multiple_seeds = {"identities": list(qualified["identities"])}
     expected_paths = [(seed, "note-0")]
     if action == "merge":
@@ -615,3 +621,33 @@ def test_runtime_entity_curation_preserves_future_promotion(
         assert sorted(
             (node["path"][0]["key"], node["key"]) for node in nodes
         ) == sorted(expected_paths), nodes
+
+    # Re-resolution must refresh accepted graph projections without a new
+    # foreground write or another provider invocation.
+    edited = api.post(
+        f"/tables/{destination}/entities/{quote('concept/healthy_0', safe='')}:merge",
+        {"into": "concept/healthy_1", "wait": {"timeout_ms": 5000}},
+    )
+    assert edited["complete"], edited
+    assert wait_until(
+        lambda: api.get(f"/tables/{source}/resolvers/concepts")["progress"]["applied"],
+        timeout_s=60,
+    ), api.get(f"/tables/{source}/resolvers/concepts")
+
+    def refreshed():
+        response = traversal(
+            {"identities": [{"table": destination, "key": "concept/healthy_1"}]}
+        )
+        assert response.ok, response.text
+        nodes = response.json()["responses"][0]["graph_results"]["incoming"]["nodes"]
+        return {node["key"] for node in nodes} == {"note-0", "note-1"}
+
+    assert wait_until(refreshed, timeout_s=30), api.debug_logs()[-16000:]
+
+    def graph_complete():
+        status = api.get(f"/tables/{source}/indexes/knowledge")["status"]
+        return status["readiness"]["complete"]
+
+    assert wait_until(graph_complete, timeout_s=30), api.get(
+        f"/tables/{source}/indexes/knowledge"
+    )
