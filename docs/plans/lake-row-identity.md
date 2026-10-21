@@ -150,7 +150,8 @@ indexes in a mixed directory retain normal pruning and ordering fast paths.
 Compressed predicate blocks from a fresh metadata index are batch-translated
 before applying a retained text index’s ordinal kernels.
 Selective predicate pack proofs use shared encoded spill runs to avoid repeatedly
-merging an ever-growing prefix.
+merging an ever-growing prefix. Predicate block directories use shared multi-key
+runs too, preserving sibling file capacity without repeated prefix rewrites.
 
 A bounded optional construction pass joins verified IDs into compact forward and
 reverse trees keyed by 16-byte coordinates. Forward entries also store canonical
