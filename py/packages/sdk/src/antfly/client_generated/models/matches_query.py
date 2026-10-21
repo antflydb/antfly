@@ -63,6 +63,13 @@ class MatchesQuery:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        if set(src_dict) - {
+            "matches",
+            "field",
+            "case_sensitive",
+            "boost",
+        }:
+            raise ValueError("Unexpected properties for MatchesQuery")
         d = dict(src_dict)
         matches = d.pop("matches")
 

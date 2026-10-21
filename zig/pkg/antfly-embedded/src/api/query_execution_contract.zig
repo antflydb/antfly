@@ -3302,8 +3302,8 @@ pub fn encodeQueryRequestWithGraphWireMode(
         try appendQueryHierarchyField(alloc, &out, &first, req);
     }
     if (!std.meta.eql(req.value_search_execution, @import("../search/value_query.zig").Policy{})) {
-        try appendJsonFieldName(alloc, &out, &first, "value_search_execution");
-        const policy_json = try std.json.Stringify.valueAlloc(alloc, req.value_search_execution, .{});
+        try appendJsonFieldName(alloc, &out, &first, "execution");
+        const policy_json = try std.json.Stringify.valueAlloc(alloc, .{ .value_verification = req.value_search_execution }, .{});
         defer alloc.free(policy_json);
         try out.appendSlice(alloc, policy_json);
     }
@@ -5083,7 +5083,7 @@ fn finishRemoteSearchResult(alloc: std.mem.Allocator, response: metadata_openapi
             if (version != .integer or version.integer != 1) return error.InvalidRemoteResponse;
             result.document_authority_version = 1;
         }
-        if (profile.object.get("value_search")) |value| {
+        if (profile.object.get("value_verification")) |value| {
             result.value_search_profile_json = try std.json.Stringify.valueAlloc(alloc, value, .{});
         }
         if (profile.object.get("sort")) |value| {

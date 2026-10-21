@@ -5836,12 +5836,6 @@ export interface components {
          */
         SQLRequest: {
             read_requirements?: components["schemas"]["ReadRequirements"];
-            /**
-             * @deprecated
-             * @description Read visibility for writable Iceberg sources. Accepted pins typed WAL changes over the committed snapshot; unavailable coverage fails closed. HTTP sessions and prepared executions inside a transaction retain the first accepted read cut for each table, including across savepoint rollback. Cuts expire after one hour. Serializable write transactions over external sources are not supported. Prefer read_requirements.visibility; this field is a deprecated alias.
-             * @enum {string}
-             */
-            lake_visibility?: "committed" | "accepted";
             /** @description A single SQL statement. */
             statement: string;
             /** @description Positional JSON parameter values, including null. */
@@ -6250,7 +6244,7 @@ export interface components {
         /** @description A stable failure envelope for query execution policy and embedding, reranking, and decision dependencies. */
         QueryDependencyError: {
             /** @enum {string} */
-            code: "embedding_index_not_found" | "query_embedding_input_too_large" | "query_embedding_overloaded" | "query_embedding_rate_limited" | "query_embedding_upstream_failure" | "reranker_rate_limited" | "reranker_upstream_failure" | "decision_limit_exceeded" | "invalid_decision_evaluation" | "value_search_requires_scan" | "value_search_limit_exceeded" | "decision_provider_unavailable" | "decision_rate_limited" | "decision_upstream_failure" | "query_timeout";
+            code: "embedding_index_not_found" | "query_embedding_input_too_large" | "query_embedding_overloaded" | "query_embedding_rate_limited" | "query_embedding_upstream_failure" | "reranker_rate_limited" | "reranker_upstream_failure" | "decision_limit_exceeded" | "invalid_decision_evaluation" | "value_verification_requires_scan" | "value_verification_limit_exceeded" | "decision_provider_unavailable" | "decision_rate_limited" | "decision_upstream_failure" | "query_timeout";
             /** @description Legacy alias of code. Use code for programmatic handling. */
             error: string;
             message: string;
@@ -8106,7 +8100,8 @@ export interface components {
              */
             kind: "source" | "reserved" | "computed" | "template" | "unassociated";
             /**
-             * @description Supported original-value operations on field. Availability does not
+             * @description Supported logical query operations on field. Equals, contains and matches
+             *     verify original values; autocomplete performs analyzed bool-prefix matching. Availability does not
              *     attest index coverage or authorize scans. Case sensitivity, execution
              *     policy and work budgets apply. Reserved/computed/template/unassociated
              *     entries do not advertise original-document value operations.
@@ -11486,7 +11481,7 @@ export interface components {
             /** Format: uint64 */
             wal_lsn: number;
         };
-        /** @description Freshness requirements for writable Iceberg reads. Search supports accepted and published (default accepted); SQL supports accepted and committed (default committed). Unsupported visibility modes fail explicitly. Cannot be combined with legacy lake_read or lake_visibility. A pinned transaction snapshot never advances to satisfy a newer receipt. */
+        /** @description Freshness requirements for writable Iceberg reads. Search supports accepted and published (default accepted); SQL supports accepted and committed (default committed). Unsupported visibility modes fail explicitly. A pinned transaction snapshot never advances to satisfy a newer receipt. */
         ReadRequirements: {
             /**
              * @description Accepted includes durable WAL writes; committed reads an Iceberg commit; published reads the search index generation. These are distinct visibility stages.
@@ -11500,33 +11495,12 @@ export interface components {
              */
             wait_ms?: number;
         };
-        LakeReadReceipt: {
-            /** Format: uint64 */
-            table_id: number;
-            /** Format: uint64 */
-            object_generation: number;
-            /** Format: uint64 */
-            wal_lsn: number;
-        };
-        LakeReadRequirement: {
-            /**
-             * @description Accepted requires current WAL visibility; vector/hybrid reads wait for matching publication. Published explicitly permits the retained archive generation. Applies to native writable Iceberg reads.
-             * @enum {string}
-             */
-            visibility?: "accepted" | "published";
-            through?: components["schemas"]["LakeReadReceipt"];
-            /**
-             * Format: uint32
-             * @description Bounded readiness wait, default 5000 ms when lake_read is supplied; also bounded by query timeout and cancellation.
-             */
-            wait_ms?: number;
-        };
         /**
          * @description Execution policy for logical string-value operations. Limits apply to
          *     verification work per shard request, including repeated leaf evaluations.
          *     Exhaustion fails explicitly; it never returns a successful partial result.
          */
-        ValueSearchExecution: {
+        ValueVerification: {
             /**
              * @description Permit logical value verification without an indexed candidate constraint.
              * @default false
@@ -11549,12 +11523,14 @@ export interface components {
              */
             max_regex_work?: number;
         };
+        /** @description Execution controls; these affect admitted work, never predicate meaning or read freshness. */
+        QueryExecution: {
+            value_verification?: components["schemas"]["ValueVerification"];
+        };
         QueryRequest: {
-            value_search_execution?: components["schemas"]["ValueSearchExecution"];
+            execution?: components["schemas"]["QueryExecution"];
             read_requirements?: components["schemas"]["ReadRequirements"];
-            /** @deprecated */
-            lake_read?: components["schemas"]["LakeReadRequirement"];
-            /** @description Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409. */
+            /** @description Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409. Also supported when resuming hierarchy.children; its revision-bound ascending position cursor remains required. */
             remote_snapshot?: string;
             evaluate?: components["schemas"]["QueryEvaluation"];
             table_target?: components["schemas"]["CatalogTableTarget"];
@@ -12276,11 +12252,56 @@ export interface components {
          */
         QueryProfile: {
             /** @description Actual logical value verification work, summed across participating shards; plans describe selected physical fields and scan fallback reasons. Budgets remain per shard. */
-            value_search?: {
+            value_verification?: {
                 /** Format: int64 */
                 documents?: number;
                 /** Format: int64 */
                 bytes?: number;
+                /**
+                 * Format: int64
+                 * @description One when every participating shard supplied these verification counters; zero means aggregate coverage is incomplete.
+                 */
+                verification_metrics_version?: number;
+                /**
+                 * Format: int64
+                 * @description Sum of measured provider-read time in microseconds, including admitted source lookup work.
+                 */
+                source_read_us?: number;
+                /**
+                 * Format: int64
+                 * @description Sum of original-value parsing time in microseconds.
+                 */
+                source_parse_us?: number;
+                /**
+                 * Format: int64
+                 * @description Number of completed source read windows.
+                 */
+                source_batches?: number;
+                /**
+                 * Format: int64
+                 * @description Number of required individual source reads.
+                 */
+                source_scalar_reads?: number;
+                /**
+                 * Format: int64
+                 * @description Rows observed while considering projected reads, including rows that require a full-source fallback.
+                 */
+                projected_sources?: number;
+                /**
+                 * Format: int64
+                 * @description Rows actually verified from stored-field projections.
+                 */
+                stored_field_sources?: number;
+                /**
+                 * Format: int64
+                 * @description Source windows refused by allocation admission before bounded fallback.
+                 */
+                batch_refusals?: number;
+                /**
+                 * Format: int64
+                 * @description Largest admitted source-window allocation observed on any participating shard; not process RSS or a sum of concurrent allocations.
+                 */
+                batch_peak_bytes?: number;
                 plans?: {
                     /** @enum {string} */
                     operation?: "equals" | "contains" | "matches";
@@ -19277,6 +19298,23 @@ export interface components {
             boost?: components["schemas"]["Boost"];
             datetime_parser?: string;
         };
+        BoolQueryClause: components["schemas"]["Query"] | components["schemas"]["Query"][];
+        BoolQueryBody: {
+            must?: components["schemas"]["BoolQueryClause"];
+            should?: components["schemas"]["BoolQueryClause"];
+            must_not?: components["schemas"]["BoolQueryClause"];
+            filter?: components["schemas"]["BoolQueryClause"];
+            /**
+             * Format: uint32
+             * @description Minimum optional clauses required; omission follows the runtime's required-clause defaults.
+             */
+            minimum_should_match?: number;
+            boost?: components["schemas"]["Boost"];
+        };
+        /** @description Canonical Boolean wrapper. Must clauses score; filter clauses constrain without scoring. */
+        BoolQuery: {
+            bool: components["schemas"]["BoolQueryBody"];
+        };
         ConjunctionQuery: {
             conjuncts: components["schemas"]["Query"][];
             boost?: components["schemas"]["Boost"];
@@ -19379,7 +19417,7 @@ export interface components {
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
-        Query: components["schemas"]["EqualsQuery"] | components["schemas"]["ContainsQuery"] | components["schemas"]["MatchesQuery"] | components["schemas"]["AutocompleteQuery"] | components["schemas"]["TermQuery"] | components["schemas"]["MatchQuery"] | components["schemas"]["MultiMatchQuery"] | components["schemas"]["MatchPhraseQuery"] | components["schemas"]["PhraseQuery"] | components["schemas"]["MultiPhraseQuery"] | components["schemas"]["FuzzyQuery"] | components["schemas"]["PrefixQuery"] | components["schemas"]["RegexpQuery"] | components["schemas"]["WildcardQuery"] | components["schemas"]["QueryStringQuery"] | components["schemas"]["NumericRangeQuery"] | components["schemas"]["TermRangeQuery"] | components["schemas"]["DateRangeStringQuery"] | components["schemas"]["BooleanQuery"] | components["schemas"]["ConjunctionQuery"] | components["schemas"]["DisjunctionQuery"] | components["schemas"]["MatchAllQuery"] | components["schemas"]["MatchNoneQuery"] | components["schemas"]["DocIdQuery"] | components["schemas"]["BoolFieldQuery"] | components["schemas"]["IPRangeQuery"] | components["schemas"]["GeoBoundingBoxQuery"] | components["schemas"]["GeoDistanceQuery"] | components["schemas"]["GeoBoundingPolygonQuery"] | components["schemas"]["GeoShapeQuery"];
+        Query: components["schemas"]["EqualsQuery"] | components["schemas"]["ContainsQuery"] | components["schemas"]["MatchesQuery"] | components["schemas"]["AutocompleteQuery"] | components["schemas"]["TermQuery"] | components["schemas"]["MatchQuery"] | components["schemas"]["MultiMatchQuery"] | components["schemas"]["MatchPhraseQuery"] | components["schemas"]["PhraseQuery"] | components["schemas"]["MultiPhraseQuery"] | components["schemas"]["FuzzyQuery"] | components["schemas"]["PrefixQuery"] | components["schemas"]["RegexpQuery"] | components["schemas"]["WildcardQuery"] | components["schemas"]["QueryStringQuery"] | components["schemas"]["NumericRangeQuery"] | components["schemas"]["TermRangeQuery"] | components["schemas"]["DateRangeStringQuery"] | components["schemas"]["BoolQuery"] | components["schemas"]["BooleanQuery"] | components["schemas"]["ConjunctionQuery"] | components["schemas"]["DisjunctionQuery"] | components["schemas"]["MatchAllQuery"] | components["schemas"]["MatchNoneQuery"] | components["schemas"]["DocIdQuery"] | components["schemas"]["BoolFieldQuery"] | components["schemas"]["IPRangeQuery"] | components["schemas"]["GeoBoundingBoxQuery"] | components["schemas"]["GeoDistanceQuery"] | components["schemas"]["GeoBoundingPolygonQuery"] | components["schemas"]["GeoShapeQuery"];
         /**
          * @description Merge strategy for combining results from the semantic_search and full_text_search.
          *     rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula
