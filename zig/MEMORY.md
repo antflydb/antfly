@@ -120,7 +120,13 @@ become an untyped raw ID or be reused for a different entity after its payload i
 removed; typed identity dependencies remain fenced through cleanup and restart.
 
 Mutations require per-principal idempotency keys and fingerprint the action,
-resource ID and exact request body. A conflicting reuse fails. Durable managed
+resource ID and exact request body. A conflicting reuse fails. Authenticated,
+authorized receipt replay precedes the current space input budget. The global
+4-MiB request ceiling applies to every action; `max_input_bytes` additionally
+bounds new observations, assertions, corrections, outcomes, entity curation,
+staged vectors and recall input. Configuration, erasure, maintenance and
+structural reads use the global ceiling, preserving recovery even when a space
+has a one-byte ingestion budget. Durable managed
 operations expose evidence acceptance independently of assertion readiness,
 bounded attempts, errors, retry times and configuration generation. Publication
 uses the same revision predicate after inference; a stale result cannot commit.
@@ -128,7 +134,14 @@ Model calls use existing qualified Antfly producers and embedders, without
 persisting consumer session credentials. Each enabled role is qualified
 independently even when one model serves several roles.
 
-Source snapshots are scoped to a native execution. After generation, reconciliation,
+Source snapshots are scoped to a native execution. Multi-stage generation receives
+a service-owned inference boundary and completes it after **each** provider call,
+after restoring embedded storage access. Before forwarding source text or derived
+entities to the next stage, that boundary checks live authority, the original
+memory control revision, and the entire admitted generation input closure,
+including uncited context. Revocation, source drift or concurrent memory mutation
+stops the pipeline before a subsequent provider can receive stale input.
+After generation, reconciliation,
 or embedding releases its lease, the service revalidates the ordinary resources
 in that invocation’s input closure, including uncited generation context, shared
 parents and candidate explanation dependencies. Captures include cached source

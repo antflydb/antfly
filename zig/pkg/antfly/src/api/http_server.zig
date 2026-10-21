@@ -59427,7 +59427,7 @@ test "native memory background selection isolates revoked execution bindings and
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
         fn validate(_: *anyopaque, _: memory.memory.types.Config) !void {}
-        fn generate(_: *anyopaque, _: std.mem.Allocator, _: memory.memory.types.Config, _: []const memory.memory.types.StoredEvidence) !memory.memory.types.Generated {
+        fn generate(_: *anyopaque, _: std.mem.Allocator, _: memory.memory.types.Config, _: []const memory.memory.types.StoredEvidence, _: memory.memory.InferenceBoundary) !memory.memory.types.Generated {
             return error.TestUnexpectedResult;
         }
     };

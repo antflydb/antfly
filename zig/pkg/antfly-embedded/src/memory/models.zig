@@ -97,7 +97,7 @@ pub const Bridge = struct {
             .batch = .{ .max_items_per_call = @as(u32, 1), .max_input_bytes = config.max_input_bytes },
         }, .{});
     }
-    fn produce(self: *Bridge, a: A, config: t.Config, model: t.Model, comptime Output: type, instruction: []const u8, input: anytype) !Output {
+    fn produce(self: *Bridge, a: A, config: t.Config, model: t.Model, comptime Output: type, instruction: []const u8, input: anytype, boundary: ?service.InferenceBoundary) !Output {
         const producer = self.producer orelse return error.MemoryCapabilityUnavailable;
         const source = try std.json.Stringify.valueAlloc(a, input, .{});
         if (source.len > config.max_input_bytes) return error.MemoryInputTooLarge;
@@ -110,29 +110,32 @@ pub const Bridge = struct {
             break :blk producer.produce(a, request);
         } else |err| @as(anyerror![]u8, err);
         try self.after();
+        // The policy fence runs with storage access restored. It must precede
+        // parsing/forwarding this stage's output to any subsequent provider.
+        if (boundary) |fence| try fence.complete();
         const output = try produced;
         if (output.len > config.max_input_bytes) return error.MemoryInputTooLarge;
         return std.json.parseFromSliceLeaky(Output, a, output, .{ .ignore_unknown_fields = false });
     }
-    fn generate(ptr: *anyopaque, a: A, config: t.Config, inputs: []const t.StoredEvidence) !t.Generated {
+    fn generate(ptr: *anyopaque, a: A, config: t.Config, inputs: []const t.StoredEvidence, boundary: service.InferenceBoundary) !t.Generated {
         const self: *Bridge = @ptrCast(@alignCast(ptr));
         var claims: std.ArrayList(t.Assertion) = .empty;
         var entities: std.ArrayList(t.Entity) = .empty;
         const plan: service.generation_policy.Plan = .{ .config = config, .sources = inputs };
         const input = .{ .evidence = inputs, .ontology = config.predicates, .policy_version = config.policy_version, .ontology_version = config.ontology_version };
         if (config.features.entity_extraction) {
-            const output = try self.produce(a, config, config.models.extractor orelse config.models.generator.?, t.Generated, "Extract canonical entities and explicitly supported aliases only. Preserve distinct homonyms using source/scope qualified IDs. Leave assertions empty.", input);
+            const output = try self.produce(a, config, config.models.extractor orelse config.models.generator.?, t.Generated, "Extract canonical entities and explicitly supported aliases only. Preserve distinct homonyms using source/scope qualified IDs. Leave assertions empty.", input, boundary);
             try plan.validateOutput(.entities, output);
             try entities.appendSlice(a, output.entities);
         }
         if (plan.enabled(.distillation) and plan.hasCurrent(.distillation)) {
             const stage_inputs = try plan.inputs(a, .distillation);
-            const output = try self.produce(a, config, config.models.generator.?, t.Generated, "Extract atomic durable, source-grounded memory assertions. Leave entities empty; entity extraction is a separate stage. Use canonical IDs from supplied entities when present.", .{ .evidence = stage_inputs, .entities = entities.items, .ontology = config.predicates, .policy_version = config.policy_version });
+            const output = try self.produce(a, config, config.models.generator.?, t.Generated, "Extract atomic durable, source-grounded memory assertions. Leave entities empty; entity extraction is a separate stage. Use canonical IDs from supplied entities when present.", .{ .evidence = stage_inputs, .entities = entities.items, .ontology = config.predicates, .policy_version = config.policy_version }, boundary);
             try plan.validateOutput(.distillation, output);
             try claims.appendSlice(a, output.assertions);
         }
         if (config.features.summaries) {
-            const output = try self.produce(a, config, config.models.generator.?, t.Generated, "Synthesize source-grounded summary or procedural assertions only. Procedures require explicit preconditions, ordered steps and supporting outcomes. Leave entities empty.", input);
+            const output = try self.produce(a, config, config.models.generator.?, t.Generated, "Synthesize source-grounded summary or procedural assertions only. Procedures require explicit preconditions, ordered steps and supporting outcomes. Leave entities empty.", input, boundary);
             try plan.validateOutput(.summaries, output);
             try claims.appendSlice(a, output.assertions);
         }
@@ -143,7 +146,7 @@ pub const Bridge = struct {
     }
     fn decide(ptr: *anyopaque, a: A, config: t.Config, incoming: t.Assertion, candidates: []const t.StoredAssertion) !t.ReconciliationDecision {
         const self: *Bridge = @ptrCast(@alignCast(ptr));
-        return self.produce(a, config, config.models.decider orelse config.models.generator.?, t.ReconciliationDecision, "Decide whether incoming evidence explicitly replaces any listed assertion. Return only candidate IDs in supersedes, or an empty list when uncertain, simultaneously applicable, hypothetical, or unsupported. Ingestion order and similar wording are never replacement evidence. Explain the evidence-based decision in reason.", .{ .incoming = incoming, .candidates = candidates, .ontology = config.predicates, .policy_version = config.policy_version });
+        return self.produce(a, config, config.models.decider orelse config.models.generator.?, t.ReconciliationDecision, "Decide whether incoming evidence explicitly replaces any listed assertion. Return only candidate IDs in supersedes, or an empty list when uncertain, simultaneously applicable, hypothetical, or unsupported. Ingestion order and similar wording are never replacement evidence. Explain the evidence-based decision in reason.", .{ .incoming = incoming, .candidates = candidates, .ontology = config.predicates, .policy_version = config.policy_version }, null);
     }
     fn embedder(self: *Bridge, a: A, model: t.Model) !managed.ManagedEmbedder {
         const indexes = try std.json.Stringify.valueAlloc(a, .{ .memory = .{ .type = "embeddings", .field = "statement", .dimension = model.dimensions, .embedder = .{ .provider = model.provider, .model = model.model } } }, .{});
@@ -167,3 +170,58 @@ pub const Bridge = struct {
         return vector;
     }
 };
+
+test "native memory generation fences each provider after resuming its lease" {
+    const work = @import("antfly_inference_work");
+    const State = struct {
+        calls: usize = 0,
+        boundaries: usize = 0,
+        suspended: bool = false,
+        stop_after: usize,
+        failure: anyerror,
+        fn produce(ptr: *anyopaque, a: A, _: asset.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.suspended);
+            try std.testing.expectEqual(self.calls, self.boundaries);
+            self.calls += 1;
+            return a.dupe(u8, "{}");
+        }
+        fn capabilities(_: *anyopaque, _: A, _: []const asset.Request) !?work.InferenceCapabilities {
+            return .{ .model_revision = @splat(0), .task = .generate, .input_modalities = .{ .text = true }, .input_granularity = .item, .output = .generated_text };
+        }
+        fn memory(_: *anyopaque, _: A, _: []const asset.Request) !work.InvocationMemoryPlan {
+            return .{ .attachment_transport = .borrowed_binary, .fixed_bytes = 65536, .allocator_limit_bytes = 65536, .max_result_bytes_per_item = 4096, .max_result_bytes = 4096 };
+        }
+        fn before(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(!self.suspended);
+            self.suspended = true;
+        }
+        fn after(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.suspended);
+            self.suspended = false;
+        }
+        fn complete(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(!self.suspended);
+            self.boundaries += 1;
+            if (self.calls == self.stop_after) return self.failure;
+        }
+    };
+    for ([_]anyerror{ error.MemorySourceAccessDenied, error.MemoryResourceChanged }) |failure| for (0..4) |stop_after| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var state: State = .{ .stop_after = stop_after, .failure = failure };
+        var bridge: Bridge = .{ .base = undefined, .alloc = a, .producer = .{ .ptr = &state, .vtable = &.{ .produce = State.produce, .capabilities_for_requests = State.capabilities, .invocation_memory_for_requests = State.memory } }, .inference_ptr = &state, .before_inference = State.before, .after_inference = State.after };
+        const model: t.Model = .{ .provider = "test", .model = "qualified", .revision = "0000000000000000000000000000000000000000000000000000000000000000" };
+        const config: t.Config = .{ .processing = .managed, .features = .{ .entity_extraction = true, .assertion_distillation = true, .summaries = true }, .models = .{ .generator = model } };
+        const inputs = [_]t.StoredEvidence{.{ .evidence = .{ .id = "e1", .source_id = "note", .source_version = "1", .text = "Authorized source", .managed = true }, .owner = "alice", .recorded_at = 1, .revision = 1 }};
+        const result = Bridge.generate(&bridge, a, config, &inputs, .{ .ptr = &state, .complete_fn = State.complete });
+        if (stop_after > 0) try std.testing.expectError(failure, result) else _ = try result;
+        try std.testing.expectEqual(if (stop_after == 0) @as(usize, 3) else stop_after, state.calls);
+        try std.testing.expectEqual(state.calls, state.boundaries);
+        try std.testing.expect(!state.suspended);
+    };
+}

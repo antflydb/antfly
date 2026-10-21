@@ -252,7 +252,7 @@ fn fakeValidate(_: *anyopaque, _: m.types.Config) !void {}
 fn fakeEmbed(_: *anyopaque, a: A, _: m.types.Model, _: []const u8) ![]const f32 {
     return a.dupe(f32, &.{ 1, 0 });
 }
-fn fakeGenerate(ptr: *anyopaque, a: A, _: m.types.Config, _: []const m.types.StoredEvidence) !m.types.Generated {
+fn fakeGenerate(ptr: *anyopaque, a: A, _: m.types.Config, _: []const m.types.StoredEvidence, _: m.InferenceBoundary) !m.types.Generated {
     const store: *Store = @ptrCast(@alignCast(ptr));
     if (store.failures > 0) {
         store.failures -= 1;
@@ -901,7 +901,7 @@ test "memory ontology transition work limit leaves configuration and beliefs unt
     try std.testing.expect(info.state.pending_config == null);
 }
 
-fn contextDerivedOutput(_: *anyopaque, a: A, _: m.types.Config, _: []const m.types.StoredEvidence) !m.types.Generated {
+fn contextDerivedOutput(_: *anyopaque, a: A, _: m.types.Config, _: []const m.types.StoredEvidence, _: m.InferenceBoundary) !m.types.Generated {
     const claims = try a.alloc(m.types.Assertion, 1);
     claims[0] = .{ .id = "derived", .subject = "production", .predicate = "guidance", .value = "Secret", .statement = "Private context secret", .evidence = &.{.{ .id = "current" }}, .support_sets = &.{.{ .evidence = &.{.{ .id = "alternative" }} }} };
     const entities = try a.alloc(m.types.Entity, 1);
@@ -1736,7 +1736,7 @@ const ScheduledMemory = struct {
     now: i64 = 100,
     calls: usize = 0,
 
-    fn generate(_: *anyopaque, a: A, _: m.types.Config, inputs: []const m.types.StoredEvidence) !m.types.Generated {
+    fn generate(_: *anyopaque, a: A, _: m.types.Config, inputs: []const m.types.StoredEvidence, _: m.InferenceBoundary) !m.types.Generated {
         const claims = try a.alloc(m.types.Assertion, 1);
         claims[0] = .{ .id = try std.fmt.allocPrint(a, "claim-{s}", .{inputs[0].evidence.id}), .subject = "scheduled", .predicate = "fact", .value = inputs[0].evidence.id, .statement = inputs[0].evidence.text, .evidence = try a.dupe(m.types.EvidenceRef, &.{.{ .id = inputs[0].evidence.id }}) };
         return .{ .assertions = claims };
@@ -1797,7 +1797,7 @@ test "memory scheduling passes revoked and delayed queue pages while independent
             const queued = try std.json.parseFromSliceLeaky(struct { id: []const u8 }, a, row.json, .{});
             if (delayed) {
                 const Failing = struct {
-                    fn generate(_: *anyopaque, _: A, _: m.types.Config, _: []const m.types.StoredEvidence) !m.types.Generated {
+                    fn generate(_: *anyopaque, _: A, _: m.types.Config, _: []const m.types.StoredEvidence, _: m.InferenceBoundary) !m.types.Generated {
                         return error.TransientInferenceFailure;
                     }
                 };
@@ -1982,7 +1982,7 @@ test "memory external producer ownership covers every support branch and ingesti
     }
 }
 
-fn ownershipOutput(ptr: *anyopaque, a: A, _: m.types.Config, _: []const m.types.StoredEvidence) !m.types.Generated {
+fn ownershipOutput(ptr: *anyopaque, a: A, _: m.types.Config, _: []const m.types.StoredEvidence, _: m.InferenceBoundary) !m.types.Generated {
     const store: *Store = @ptrCast(@alignCast(ptr));
     if (store.failures == 7) {
         const entities = try a.alloc(m.types.Entity, 1);
@@ -2829,14 +2829,14 @@ test "memory cancellation consistently projects readiness and immutable decision
 
 test "memory publication rechecks uncited context and preserves denied work" {
     const Model = struct {
-        fn generate(ptr: *anyopaque, a: A, config: m.types.Config, sources: []const m.types.StoredEvidence) !m.types.Generated {
-            const output = try success(ptr, a, config, sources);
+        fn generate(ptr: *anyopaque, a: A, config: m.types.Config, sources: []const m.types.StoredEvidence, boundary: m.InferenceBoundary) !m.types.Generated {
+            const output = try success(ptr, a, config, sources, boundary);
             const store: *Store = @ptrCast(@alignCast(ptr));
             store.resource_state = .denied;
             return output;
         }
-        fn success(ptr: *anyopaque, a: A, config: m.types.Config, sources: []const m.types.StoredEvidence) !m.types.Generated {
-            const output = try fakeGenerate(ptr, a, config, sources);
+        fn success(ptr: *anyopaque, a: A, config: m.types.Config, sources: []const m.types.StoredEvidence, boundary: m.InferenceBoundary) !m.types.Generated {
+            const output = try fakeGenerate(ptr, a, config, sources, boundary);
             const claims = try a.dupe(m.types.Assertion, output.assertions);
             claims[0].evidence = &.{.{ .id = "e2" }};
             return .{ .assertions = claims };
@@ -2870,8 +2870,8 @@ test "memory publication rechecks uncited context and preserves denied work" {
 
 test "memory generation rejects changed source revisions without partial publication" {
     const Model = struct {
-        fn generate(ptr: *anyopaque, a: A, config: m.types.Config, sources: []const m.types.StoredEvidence) !m.types.Generated {
-            const output = try fakeGenerate(ptr, a, config, sources);
+        fn generate(ptr: *anyopaque, a: A, config: m.types.Config, sources: []const m.types.StoredEvidence, boundary: m.InferenceBoundary) !m.types.Generated {
+            const output = try fakeGenerate(ptr, a, config, sources, boundary);
             const store: *Store = @ptrCast(@alignCast(ptr));
             store.resource_revision += 1;
             return output;
@@ -3110,7 +3110,7 @@ test "memory timeout recovery persists bounded attempts and idempotent receipts"
             const store: *Store = @ptrCast(@alignCast(ptr));
             if (store.failures == 1) return error.DeadlineExceeded;
         }
-        fn generate(ptr: *anyopaque, _: A, _: m.types.Config, _: []const m.types.StoredEvidence) !m.types.Generated {
+        fn generate(ptr: *anyopaque, _: A, _: m.types.Config, _: []const m.types.StoredEvidence, _: m.InferenceBoundary) !m.types.Generated {
             const store: *Store = @ptrCast(@alignCast(ptr));
             store.failures = 1;
             return error.DeadlineExceeded;
@@ -3216,7 +3216,7 @@ test "memory reindex timeout recovery exhausts retries without publishing config
 
 test "memory provider timeout finalizes with backoff from completion time" {
     const Worker = struct {
-        fn generate(ptr: *anyopaque, _: A, _: m.types.Config, _: []const m.types.StoredEvidence) !m.types.Generated {
+        fn generate(ptr: *anyopaque, _: A, _: m.types.Config, _: []const m.types.StoredEvidence, _: m.InferenceBoundary) !m.types.Generated {
             const store: *Store = @ptrCast(@alignCast(ptr));
             return if (store.failures == 1) error.Timeout else error.DeadlineExceeded;
         }
@@ -3302,4 +3302,111 @@ test "memory failure finalization does not reacquire a timed out input plan" {
     // The next real processing attempt still checks source authorization and
     // cannot consume an additional model attempt while access is denied.
     try std.testing.expectError(error.MemorySourceAccessDenied, modelService(&store, 20000).advanceAtRevision(a, pending.id, "next", latest.revision));
+}
+
+test "memory input budgets preserve control recovery erasure and authorized replay" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const created = try store.run(.create, "", "{\"max_input_bytes\":1}", "create", 1);
+    defer std.testing.allocator.free(created);
+    try discard(&store, .inspect, "", "{}", "", 2);
+    try discard(&store, .advance, "", "{}", "maintain", 2);
+    try std.testing.expectError(error.Forbidden, store.service("bob", false, 3).execute(a, .configure, "", "{\"expected_revision\":3,\"config\":{}}", "restore"));
+    try discard(&store, .configure, "", "{\"expected_revision\":3,\"config\":{}}", "restore", 3);
+    try discard(&store, .observe, "", source, "source", 4);
+    const claim = try store.run(.assertions, "", helm, "claim", 5);
+    defer std.testing.allocator.free(claim);
+    try discard(&store, .configure, "", "{\"expected_revision\":6,\"config\":{\"max_input_bytes\":1}}", "shrink", 6);
+    const replay = try store.run(.assertions, "", helm, "claim", 7);
+    defer std.testing.allocator.free(replay);
+    try std.testing.expectEqualStrings(claim, replay);
+    const replay_create = try store.run(.create, "", "{\"max_input_bytes\":1}", "create", 7);
+    defer std.testing.allocator.free(replay_create);
+    try std.testing.expectEqualStrings(created, replay_create);
+    try std.testing.expectError(error.MemoryInputTooLarge, store.run(.assertions, "", terraform, "new", 7));
+    const Revoke = struct {
+        fn grant(_: *anyopaque, _: m.types.RequiredGrant) !void {
+            return error.Forbidden;
+        }
+    };
+    var revoked = store.service("alice", true, 7);
+    revoked.context.grant_ptr = &store;
+    revoked.context.require_grant_fn = Revoke.grant;
+    try std.testing.expectError(error.Forbidden, revoked.execute(a, .assertions, "", helm, "claim"));
+    try discard(&store, .forget, "", "{\"all\":true}", "erase", 8);
+    try discard(&store, .advance, "", "{}", "cleanup", 9);
+    try discard(&store, .inspect, "", "{}", "", 10);
+    try discard(&store, .configure, "", "{\"expected_revision\":9,\"config\":{}}", "recover", 11);
+    // Every action still has the absolute transport/service allocation bound.
+    const oversized = try a.alloc(u8, 4 * 1024 * 1024 + 1);
+    @memset(oversized, ' ');
+    try std.testing.expectError(error.MemoryInputTooLarge, store.run(.inspect, "", oversized, "", 12));
+}
+
+test "memory generation stage fences include uncited context without charging denied attempts" {
+    const Pipeline = struct {
+        fn generate(ptr: *anyopaque, a: A, config: m.types.Config, inputs: []const m.types.StoredEvidence, boundary: m.InferenceBoundary) !m.types.Generated {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            for (0..3) |_| {
+                store.decisions += 1;
+                if (store.decisions == store.failures) store.resource_state = if (store.public_output) .changed else .denied;
+                try boundary.complete();
+            }
+            return fakeGenerate(ptr, a, config, inputs, boundary);
+        }
+    };
+    for ([_]bool{ false, true }) |changed| for (1..3) |stage| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        _ = try managedSetup(&store);
+        // The model cites only e1, but a resource-backed context source is part
+        // of the admitted generation plan and must fence every provider stage.
+        _ = try modelService(&store, 3).execute(a, .observe, "", "{\"evidence\":[{\"id\":\"context\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}}]}", "context");
+        const accepted = try modelService(&store, 4).execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e1\",\"source_id\":\"note\",\"source_version\":\"1\",\"text\":\"Production uses Helm\",\"managed\":true}],\"context_evidence_ids\":[\"context\"]}", "with-context");
+        const pending = try std.json.parseFromSliceLeaky(m.types.Operation, a, accepted, .{});
+        var svc = modelService(&store, 5);
+        svc.backend.generate = Pipeline.generate;
+        store.failures = @intCast(stage);
+        store.public_output = changed;
+        const before = store.revision;
+        if (changed) {
+            _ = try svc.execute(a, .advance, pending.id, "{}", "advance");
+        } else {
+            try std.testing.expectError(error.MemorySourceAccessDenied, svc.execute(a, .advance, pending.id, "{}", "advance"));
+            try std.testing.expectEqual(before, store.revision);
+        }
+        try std.testing.expectEqual(stage, store.decisions);
+        store.resource_state = .current;
+        const status = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .operation, pending.id, "{}", ""), .{});
+        try std.testing.expectEqual(if (changed) m.types.Stage.cancelled else .pending, status.phase);
+        try std.testing.expectEqual(@as(u8, if (changed) 1 else 0), status.attempts);
+        try std.testing.expect(!status.assertions_ready);
+        try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "assertion/", null, 256)).rows.len);
+    };
+}
+
+test "memory generation stops between providers when evidence is concurrently forgotten" {
+    const Pipeline = struct {
+        fn generate(ptr: *anyopaque, _: A, _: m.types.Config, _: []const m.types.StoredEvidence, boundary: m.InferenceBoundary) !m.types.Generated {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.decisions += 1;
+            try discard(store, .forget, "", "{\"evidence_ids\":[\"e1\"]}", "concurrent-forget", 4);
+            try boundary.complete();
+            store.decisions += 1;
+            return .{};
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const id = try managedSetup(&store);
+    var svc = modelService(&store, 3);
+    svc.backend.generate = Pipeline.generate;
+    try std.testing.expectError(error.MemoryRevisionConflict, svc.execute(a, .advance, id, "{}", "attempt"));
+    try std.testing.expectEqual(@as(usize, 1), store.decisions);
+    const status = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .operation, id, "{}", ""), .{});
+    try std.testing.expectEqual(@as(u8, 0), status.attempts);
+    try std.testing.expectEqual(m.types.Stage.pending, status.phase);
 }

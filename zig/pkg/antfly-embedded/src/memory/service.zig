@@ -52,6 +52,16 @@ const EntityCurationProvenance = struct {
 pub const Row = struct { key: []const u8, json: []const u8, version: u64 = 0, digest: ?[32]u8 = null };
 pub const Change = struct { key: []const u8, json: ?[]const u8 };
 pub const Page = struct { rows: []const Row, next: ?[]const u8 = null };
+/// Service-owned causal input fence. Multi-call generation must complete this
+/// boundary after each provider call, after reacquiring any embedded lease and
+/// before exposing either the inputs or derived output to another provider.
+pub const InferenceBoundary = struct {
+    ptr: *anyopaque,
+    complete_fn: *const fn (*anyopaque) anyerror!void,
+    pub fn complete(self: InferenceBoundary) !void {
+        try self.complete_fn(self.ptr);
+    }
+};
 pub const Backend = struct {
     ptr: *anyopaque,
     get: *const fn (*anyopaque, A, []const u8) anyerror!?Row,
@@ -60,7 +70,7 @@ pub const Backend = struct {
     // Model integration must use Antfly's admitted provider/runtime. No model
     // client or credentials are owned by this policy module.
     resource: ?*const fn (*anyopaque, A, prov.Resource) anyerror!prov.Snapshot = null,
-    generate: ?*const fn (*anyopaque, A, t.Config, []const t.StoredEvidence) anyerror!t.Generated = null,
+    generate: ?*const fn (*anyopaque, A, t.Config, []const t.StoredEvidence, InferenceBoundary) anyerror!t.Generated = null,
     decide: ?*const fn (*anyopaque, A, t.Config, t.Assertion, []const t.StoredAssertion) anyerror!t.ReconciliationDecision = null,
     embed: ?*const fn (*anyopaque, A, t.Model, []const u8) anyerror![]const f32 = null,
     validate_models: ?*const fn (*anyopaque, t.Config) anyerror!void = null,
@@ -140,7 +150,6 @@ pub const Service = struct {
             run.state = try parse(t.State, a, row.json);
             if (run.state.table_id != 0 and self.context.table_id != 0 and run.state.table_id != self.context.table_id) return error.MemorySpaceBindingChanged;
             if (run.state.space.len > 0 and self.context.space.len > 0 and (!eql(u8, run.state.space, self.context.space) or !eql(u8, run.state.database, self.context.database) or !eql(u8, run.state.namespace, self.context.namespace))) return error.MemorySpaceBindingChanged;
-            if (body.len > run.state.config.max_input_bytes) return error.MemoryInputTooLarge;
         }
         const fingerprint = try hash(a, .{ .action = action, .id = id, .body = body, .principal = self.context.principal });
         const receipt_key = if (idempotency_key.len > 0) try key(a, "operation", try hash(a, .{ self.context.principal, idempotency_key })) else "";
@@ -163,6 +172,9 @@ pub const Service = struct {
             if (run.state.revision == std.math.maxInt(u64)) return error.MemoryCorruptState;
             run.state.revision += 1;
         }
+        // A current ingestion budget cannot invalidate a committed receipt or
+        // prevent the control operations needed to recover/configure a space.
+        if (operations.usesInputBudget(action) and body.len > run.state.config.max_input_bytes) return error.MemoryInputTooLarge;
         var op: t.Operation = .{
             .required_grant = required_grant,
             .execution_principal = self.context.execution_principal,
@@ -1744,7 +1756,23 @@ const Run = struct {
         pending.attempts += 1;
         const inputs = try self.captureResources(generationInputs, .{sources.items});
         const generate = self.service.backend.generate orelse return error.MemoryCapabilityUnavailable;
-        const generated = generate(self.service.backend.ptr, self.a, self.state.config, sources.items) catch |err| return self.processingFailure(path, &pending, err);
+        const Invocation = struct {
+            run: *Run,
+            resources: ResourceSet,
+            fn complete(ptr: *anyopaque) !void {
+                const invocation: *@This() = @ptrCast(@alignCast(ptr));
+                try invocation.run.service.context.finish();
+                // Forgetting, configuration and other memory mutations may
+                // commit while an embedded lease is released. Stop stale work
+                // before its next provider call, rather than waiting for CAS.
+                const expected = invocation.run.state_row orelse return error.MemorySpaceNotFound;
+                const latest = (try invocation.run.service.backend.get(invocation.run.service.backend.ptr, invocation.run.a, "control")) orelse return error.MemorySpaceNotFound;
+                if (latest.version != expected.version or !eql(u8, latest.json, expected.json)) return error.MemoryRevisionConflict;
+                try invocation.run.inferenceCompleted(invocation.resources);
+            }
+        };
+        var invocation: Invocation = .{ .run = self, .resources = inputs.resources };
+        const generated = generate(self.service.backend.ptr, self.a, self.state.config, sources.items, .{ .ptr = &invocation, .complete_fn = Invocation.complete }) catch |err| return self.processingFailure(path, &pending, err);
         self.inferenceCompleted(inputs.resources) catch |err| return self.processingFailure(path, &pending, err);
         self.publishGenerated(pending, generated, sources.items) catch |err| return self.processingFailure(path, &pending, err);
         pending.phase = .succeeded;

@@ -29,6 +29,16 @@ pub fn mutates(action: Action) bool {
     };
 }
 
+/// Space budgets bound newly admitted content and model-query input. Control
+/// operations and structural reads retain the transport-wide hard bound, so a
+/// small ingestion budget never locks out inspection, erasure or recovery.
+pub fn usesInputBudget(action: Action) bool {
+    return switch (action) {
+        .observe, .assertions, .correct, .outcome, .curate_entity, .stage_embeddings, .recall => true,
+        .create, .configure, .forget, .advance, .inspect, .get, .history, .operation, .list, .entities, .resolve_entity, .evidence, .configuration, .explain => false,
+    };
+}
+
 pub fn Body(comptime action: Action) type {
     return switch (action) {
         .create => t.Config,
