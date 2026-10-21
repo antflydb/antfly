@@ -3201,6 +3201,7 @@ pub const DB = struct {
     artifact_producer_baseline_pending: std.atomic.Value(bool) = .init(true),
     artifact_producer_scheduler: @import("artifact_producer_scheduler.zig").Scheduler = .{},
     local_source_completion_audit_pending: bool = true,
+    local_source_recovery_pending: bool = false,
     /// Bounded no-progress guard for `runUntilIdle` (see `OpenOptions.
     /// run_until_idle_no_progress_timeout_ms` and `ReplayDrainOptions.
     /// no_progress_timeout_ns`); 0 disables it. Copied into `ReplayDrainOptions`
@@ -31867,7 +31868,19 @@ pub const DB = struct {
             .repair => {
                 const pending = self.advanceGraphReplacement() catch self.hasPendingGraphReplacements();
                 try self.runArtifactRepairMaintenanceTurn();
-                return pending;
+                // Standalone Lite owns this DB directly, without a C ABI
+                // connection or the filesystem generation-repair driver.
+                // Its producer audit can seed durable source debt after replay
+                // catches up; the same owner must keep that debt executable.
+                if (openModeRequiresReadOnlyBackends(self.open_mode) or independentSourceRecoveryCancelled(self)) return pending;
+                const recovery = try self.repairRecoverableStartupIndexFailures(self.alloc, 1, .{
+                    .source_replay_only = true,
+                    .cancel_check = .{ .ptr = self, .is_requested = independentSourceRecoveryCancelled },
+                });
+                // Paging uses the active cadence; waiting for canonical proof
+                // uses the ordinary idle audit, never a busy retry loop.
+                self.local_source_recovery_pending = recovery.attempted != 0 and recovery.remaining != 0;
+                return pending or recovery.remaining != 0;
             },
             .column => {
                 _ = try self.runRelationalColumnMaintenancePass();
@@ -31878,6 +31891,11 @@ pub const DB = struct {
                 return false;
             },
         }
+    }
+    fn independentSourceRecoveryCancelled(ptr: *anyopaque) bool {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        return self.independent_maintenance.stopping.load(.acquire) or
+            !replicationWriteGateAllowsBackgroundWork(self.local_execution.replication_write_gate);
     }
     fn independentMaintenanceFailed(ptr: *anyopaque, work: independent_maintenance.Owner.Work) void {
         const self: *DB = @ptrCast(@alignCast(ptr));
@@ -31891,7 +31909,7 @@ pub const DB = struct {
         const self: *DB = @ptrCast(@alignCast(ptr));
         const source = self.local_execution.source_vectors.load(.acquire);
         return .{
-            .artifacts = (replicationWriteGateAllowsBackgroundWork(self.local_execution.replication_write_gate) and (self.document_authority_backfill_active.load(.acquire) or self.document_authority_backfill_requested.load(.acquire) or self.document_authority_repairs.pending.load(.acquire))) or self.hasPendingGraphReplacements() or self.artifact_repair_metadata_pending or self.artifact_footprint_pending.load(.acquire) or self.artifact_producer_baseline_pending.load(.acquire) or (if (source) |value| value.collectionPending() else false),
+            .artifacts = (replicationWriteGateAllowsBackgroundWork(self.local_execution.replication_write_gate) and (self.local_source_recovery_pending or self.document_authority_backfill_active.load(.acquire) or self.document_authority_backfill_requested.load(.acquire) or self.document_authority_repairs.pending.load(.acquire))) or self.hasPendingGraphReplacements() or self.artifact_repair_metadata_pending or self.artifact_footprint_pending.load(.acquire) or self.artifact_producer_baseline_pending.load(.acquire) or (if (source) |value| value.collectionPending() else false),
             .producers = self.artifact_producer_scheduler.active(self.independentMaintenanceNowNs()),
             .indexes = self.local_execution.relational_index_maintenance_sweep.isPending() and platform_time.monotonicNs() >= self.local_execution.relational_index_retry_after_ns.load(.acquire),
             .columns = self.relational_column_maintenance.pending.load(.acquire) and !self.relational_column_maintenance.backing_off.load(.acquire),
@@ -105534,10 +105552,8 @@ test "db managed vector admission durably seeds missing enrichment artifacts" {
         .enrichment = .{ .dense_embedder = deterministic.interface() },
     });
     defer reopened.close();
-    const final_page = try reopened.advanceIndexRepairIntent(alloc, repair_id, .{});
-    try std.testing.expect(final_page.attempted);
-    try std.testing.expect(final_page.deferred);
-    try std.testing.expectEqual(@as(u64, 1), final_page.documents_reprocessed);
+    try std.testing.expect(try DB.independentMaintenanceRun(&reopened, .repair));
+    try std.testing.expect(reopened.local_source_recovery_pending);
     var seeded = try reopened.loadIndexRepairEntryById(alloc, repair_id);
     defer seeded.deinit(alloc);
     try std.testing.expect(seeded.intent.source_replay_resume_key == null);
@@ -107018,8 +107034,7 @@ test "producer readiness local receipt migration retires only after source and c
     // Restoring the exact receipt proof permits retirement without rebuilding
     // or invoking any provider from this connection-owned control turn.
     try db.core.store.put(key, &std.mem.toBytes(std.mem.nativeToLittle(u64, 2)));
-    const finished = try db.repairRecoverableStartupIndexFailures(alloc, 1, .{ .source_replay_only = true });
-    try std.testing.expect(finished.repaired == 1);
+    _ = try DB.independentMaintenanceRun(&db, .repair);
     try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
 }
 
