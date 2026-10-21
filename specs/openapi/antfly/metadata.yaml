@@ -19258,7 +19258,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "resolvers.yaml#/components/schemas/ResolverUnmergeRequest"
+              $ref: "resolvers.yaml#/components/schemas/EntitySuppressRequest"
       responses:
         "200":
           description: Completed result
@@ -20232,7 +20232,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "resolvers.yaml#/components/schemas/ResolverUnmergeRequest"
+              $ref: "resolvers.yaml#/components/schemas/EntitySuppressRequest"
       responses:
         "200":
           description: Completed result
@@ -20329,3 +20329,449 @@ paths:
           description: Resolver owner is busy; retry with backoff
         "503":
           description: Metadata or storage owner is unavailable; retry is safe
+
+  /tables/{tableName}/curation/proposals:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: proposeCuration
+      tags: [resolver_curation]
+      summary: proposeCuration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalRequest"}
+      responses:
+        "200":
+          description: Completed curation operation
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposal"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Revision or terminal decision conflict
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    get:
+      operationId: listCurationProposals
+      tags: [resolver_curation]
+      summary: listCurationProposals
+      parameters:
+        - name: state
+          in: query
+          schema: {type: string}
+        - name: action
+          in: query
+          schema: {type: string}
+        - name: cursor
+          in: query
+          schema: {type: string}
+        - name: limit
+          in: query
+          schema: {type: integer}
+      responses:
+        "200":
+          description: Completed curation operation
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalPage"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Revision or terminal decision conflict
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/curation/proposals/{proposalId}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: proposalId
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      operationId: getCurationProposal
+      tags: [resolver_curation]
+      summary: getCurationProposal
+      responses:
+        "200":
+          description: Completed curation operation
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposal"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Revision or terminal decision conflict
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/curation/proposals/{proposalId}:accept:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: proposalId
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: acceptCurationProposal
+      tags: [resolver_curation]
+      summary: acceptCurationProposal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalDecisionRequest"}
+      responses:
+        "200":
+          description: Completed curation operation
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalDecisionResult"}
+        "202":
+          description: Accepted; resolver replay remains in progress
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalDecisionResult"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Revision or terminal decision conflict
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/curation/proposals/{proposalId}:reject:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: proposalId
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: rejectCurationProposal
+      tags: [resolver_curation]
+      summary: rejectCurationProposal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalDecisionRequest"}
+      responses:
+        "200":
+          description: Completed curation operation
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalDecisionResult"}
+        "202":
+          description: Accepted; resolver replay remains in progress
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalDecisionResult"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Revision or terminal decision conflict
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/entities/{key}:distinct:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: key
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: pinEntitiesDistinct
+      tags: [resolver_curation]
+      summary: pinEntitiesDistinct
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "resolvers.yaml#/components/schemas/EntityDistinctRequest"}
+      responses:
+        "200":
+          description: Completed curation operation
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/EntityCurationResult"}
+        "202":
+          description: Accepted; resolver replay remains in progress
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/EntityCurationResult"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Revision or terminal decision conflict
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: namespaceProposeCuration
+      tags: [resolver_curation]
+      summary: proposeCuration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalRequest"}
+      responses:
+        "200":
+          description: Completed curation operation
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposal"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Revision or terminal decision conflict
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    get:
+      operationId: namespaceListCurationProposals
+      tags: [resolver_curation]
+      summary: listCurationProposals
+      parameters:
+        - name: state
+          in: query
+          schema: {type: string}
+        - name: action
+          in: query
+          schema: {type: string}
+        - name: cursor
+          in: query
+          schema: {type: string}
+        - name: limit
+          in: query
+          schema: {type: integer}
+      responses:
+        "200":
+          description: Completed curation operation
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalPage"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Revision or terminal decision conflict
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: proposalId
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      operationId: namespaceGetCurationProposal
+      tags: [resolver_curation]
+      summary: getCurationProposal
+      responses:
+        "200":
+          description: Completed curation operation
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposal"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Revision or terminal decision conflict
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:accept:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: proposalId
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: namespaceAcceptCurationProposal
+      tags: [resolver_curation]
+      summary: acceptCurationProposal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalDecisionRequest"}
+      responses:
+        "200":
+          description: Completed curation operation
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalDecisionResult"}
+        "202":
+          description: Accepted; resolver replay remains in progress
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalDecisionResult"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Revision or terminal decision conflict
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:reject:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: proposalId
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: namespaceRejectCurationProposal
+      tags: [resolver_curation]
+      summary: rejectCurationProposal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalDecisionRequest"}
+      responses:
+        "200":
+          description: Completed curation operation
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalDecisionResult"}
+        "202":
+          description: Accepted; resolver replay remains in progress
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/CurationProposalDecisionResult"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Revision or terminal decision conflict
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:distinct:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: key
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: namespacePinEntitiesDistinct
+      tags: [resolver_curation]
+      summary: pinEntitiesDistinct
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "resolvers.yaml#/components/schemas/EntityDistinctRequest"}
+      responses:
+        "200":
+          description: Completed curation operation
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/EntityCurationResult"}
+        "202":
+          description: Accepted; resolver replay remains in progress
+          content:
+            application/json:
+              schema: {$ref: "resolvers.yaml#/components/schemas/EntityCurationResult"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Revision or terminal decision conflict
+        "500":
+          $ref: "#/components/responses/InternalServerError"

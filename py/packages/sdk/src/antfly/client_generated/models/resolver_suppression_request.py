@@ -21,6 +21,8 @@ class ResolverSuppressionRequest:
     override declarative suppression.
 
         Attributes:
+            actor (str | Unset):
+            reason (str | Unset):
             keys (list[str] | Unset):
             texts (list[str] | Unset):
             add (ResolverSuppressionSelection | Unset):
@@ -31,6 +33,8 @@ class ResolverSuppressionRequest:
                 state with applied=false; it does not undo the mutation.
     """
 
+    actor: str | Unset = UNSET
+    reason: str | Unset = UNSET
     keys: list[str] | Unset = UNSET
     texts: list[str] | Unset = UNSET
     add: ResolverSuppressionSelection | Unset = UNSET
@@ -39,6 +43,10 @@ class ResolverSuppressionRequest:
     wait: ResolverWait | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
+        actor = self.actor
+
+        reason = self.reason
+
         keys: list[str] | Unset = UNSET
         if not isinstance(self.keys, Unset):
             keys = self.keys
@@ -64,6 +72,10 @@ class ResolverSuppressionRequest:
         field_dict: dict[str, Any] = {}
 
         field_dict.update({})
+        if actor is not UNSET:
+            field_dict["actor"] = actor
+        if reason is not UNSET:
+            field_dict["reason"] = reason
         if keys is not UNSET:
             field_dict["keys"] = keys
         if texts is not UNSET:
@@ -85,6 +97,10 @@ class ResolverSuppressionRequest:
         from ..models.resolver_wait import ResolverWait
 
         d = dict(src_dict)
+        actor = d.pop("actor", UNSET)
+
+        reason = d.pop("reason", UNSET)
+
         keys = cast(list[str], d.pop("keys", UNSET))
 
         texts = cast(list[str], d.pop("texts", UNSET))
@@ -113,6 +129,8 @@ class ResolverSuppressionRequest:
             wait = ResolverWait.from_dict(_wait)
 
         resolver_suppression_request = cls(
+            actor=actor,
+            reason=reason,
             keys=keys,
             texts=texts,
             add=add,

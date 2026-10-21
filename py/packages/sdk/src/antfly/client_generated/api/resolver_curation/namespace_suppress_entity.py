@@ -7,8 +7,8 @@ import httpx
 from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.entity_curation_result import EntityCurationResult
+from ...models.entity_suppress_request import EntitySuppressRequest
 from ...models.error import Error
-from ...models.resolver_unmerge_request import ResolverUnmergeRequest
 from ...types import Response
 
 
@@ -18,7 +18,7 @@ def _get_kwargs(
     table_name: str,
     key: str,
     *,
-    body: ResolverUnmergeRequest,
+    body: EntitySuppressRequest,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
@@ -109,7 +109,7 @@ def sync_detailed(
     key: str,
     *,
     client: AuthenticatedClient,
-    body: ResolverUnmergeRequest,
+    body: EntitySuppressRequest,
 ) -> Response[Any | EntityCurationResult | Error]:
     """suppress entity
 
@@ -123,7 +123,7 @@ def sync_detailed(
         namespace_name (str):
         table_name (str):
         key (str):
-        body (ResolverUnmergeRequest):
+        body (EntitySuppressRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -155,7 +155,7 @@ def sync(
     key: str,
     *,
     client: AuthenticatedClient,
-    body: ResolverUnmergeRequest,
+    body: EntitySuppressRequest,
 ) -> Any | EntityCurationResult | Error | None:
     """suppress entity
 
@@ -169,7 +169,7 @@ def sync(
         namespace_name (str):
         table_name (str):
         key (str):
-        body (ResolverUnmergeRequest):
+        body (EntitySuppressRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -196,7 +196,7 @@ async def asyncio_detailed(
     key: str,
     *,
     client: AuthenticatedClient,
-    body: ResolverUnmergeRequest,
+    body: EntitySuppressRequest,
 ) -> Response[Any | EntityCurationResult | Error]:
     """suppress entity
 
@@ -210,7 +210,7 @@ async def asyncio_detailed(
         namespace_name (str):
         table_name (str):
         key (str):
-        body (ResolverUnmergeRequest):
+        body (EntitySuppressRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -240,7 +240,7 @@ async def asyncio(
     key: str,
     *,
     client: AuthenticatedClient,
-    body: ResolverUnmergeRequest,
+    body: EntitySuppressRequest,
 ) -> Any | EntityCurationResult | Error | None:
     """suppress entity
 
@@ -254,7 +254,7 @@ async def asyncio(
         namespace_name (str):
         table_name (str):
         key (str):
-        body (ResolverUnmergeRequest):
+        body (EntitySuppressRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

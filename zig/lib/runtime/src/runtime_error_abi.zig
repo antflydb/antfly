@@ -875,6 +875,7 @@ pub const Detail = enum(c_int) {
     resolver_curation_conflict,
     value_search_requires_scan,
     value_search_limit_exceeded,
+    invalid_embedding_identity,
 };
 
 pub const Status = extern struct {
@@ -953,6 +954,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.ChunkRequestFailed => status(.unavailable, .model_chunk_chunk_request_failed),
         error.ChunkUnitTooLarge => status(.invalid_argument, .model_chunk_chunk_unit_too_large),
         error.EmbeddingIdentityMismatch => status(.conflict, .model_chunk_embedding_identity_mismatch),
+        error.InvalidEmbeddingIdentity => status(.invalid_argument, .invalid_embedding_identity),
         error.EmptyEmbeddingInput => status(.invalid_argument, .model_chunk_empty_embedding_input),
         error.EmptyResponse => status(.unavailable, .model_chunk_empty_response),
         error.EmptySource => status(.invalid_argument, .model_chunk_empty_source),
@@ -1779,6 +1781,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .model_chunk_chunk_request_failed => "ChunkRequestFailed",
         .model_chunk_chunk_unit_too_large => "ChunkUnitTooLarge",
         .model_chunk_embedding_identity_mismatch => "EmbeddingIdentityMismatch",
+        .invalid_embedding_identity => "InvalidEmbeddingIdentity",
         .model_chunk_empty_embedding_input => "EmptyEmbeddingInput",
         .model_chunk_empty_response => "EmptyResponse",
         .model_chunk_empty_source => "EmptySource",
@@ -2828,6 +2831,7 @@ test "model-aware chunk failures preserve retry and source fencing semantics" {
         .{ .err = error.StaleChunkContinuation, .code = .conflict },
         .{ .err = error.SourceVersionChanged, .code = .conflict },
         .{ .err = error.EmbeddingIdentityMismatch, .code = .conflict },
+        .{ .err = error.InvalidEmbeddingIdentity, .code = .invalid_argument },
         .{ .err = error.IncompleteChunkCoverage, .code = .invalid_argument },
         .{ .err = error.ChunkOutputTooLarge, .code = .invalid_argument },
         .{ .err = error.MemoryBudgetExceeded, .code = .retryable },

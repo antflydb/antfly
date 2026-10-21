@@ -37,7 +37,25 @@ pub const Command = struct {
     decision: resolver.Decision,
     table: []const u8,
     key: []const u8,
+    origin: ?resolver.curation.Origin = null,
+    // Omit the extension on historical commands so their durable receipt
+    // fingerprint remains identical when replayed by a newer binary.
+    pub fn jsonStringify(self: Command, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(Command).@"struct".field_names) |field| {
+            const omit = if (comptime std.mem.eql(u8, field, "origin")) self.origin == null else false;
+            if (!omit) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
     pub fn validate(self: Command) !void {
+        if (self.origin) |origin| {
+            try origin.validate();
+            if (origin.origin != .review) return error.InvalidResolverCurationRequest;
+        }
         if (self.version != 1 or self.decision == .review or self.expected_hash.len != 64) return error.InvalidResolverCurationRequest;
         for (self.expected_hash) |byte| if (!std.ascii.isHex(byte)) return error.InvalidResolverCurationRequest;
         for ([_][]const u8{ self.resolver, self.document, self.source_artifact, self.resolution_artifact, self.local_id, self.table }) |field| if (field.len == 0 or field.len > 4096) return error.InvalidResolverCurationRequest;
@@ -103,7 +121,7 @@ pub fn plan(a: A, core: anytype, command: Command, policy_disabled: bool) !Plan 
     // Stamp the format this decision actually uses. The binary's newest reader
     // version may describe unrelated catalog features; retain an existing
     // higher floor, including when re-admitting a prior accepted receipt.
-    const minimum_reader = @max(catalog.curation_reader_version, core.index_manager.minimum_reader_version.load(.acquire));
+    const minimum_reader = @max(if (command.origin != null) catalog.curation_provenance_reader_version else catalog.curation_reader_version, core.index_manager.minimum_reader_version.load(.acquire));
     if (try receipt(a, core.store, command)) |previous| return .{ .command = command, .accepted = previous.accepted, .previous = previous, .minimum_reader = minimum_reader };
     const rejected = Plan{ .command = command };
     if (!policy_disabled) return rejected;
@@ -137,7 +155,7 @@ pub fn plan(a: A, core: anytype, command: Command, policy_disabled: bool) !Plan 
         if (try policy.pinnedDistinct(a, original, command.key)) return rejected;
     }
     const override_key = try runtime.reviewOverrideArtifactKeyAlloc(a, command.document, command.source_artifact, command.resolution_artifact);
-    return .{ .command = command, .accepted = true, .minimum_reader = minimum_reader, .override_key = override_key, .override_value = try runtime.buildReviewDecisionBytesAlloc(a, try optional(a, core.store, override_key), command.local_id, command.decision, command.table, command.key), .source_key = (try runtime.sourceExtractionKeyForResolutionKeyAlloc(a, &.{cfg}, resolution_key)) orelse return error.InvalidResolverCurationRequest };
+    return .{ .command = command, .accepted = true, .minimum_reader = minimum_reader, .override_key = override_key, .override_value = try runtime.buildReviewDecisionsBytesAlloc(a, try optional(a, core.store, override_key), &.{.{ .local_id = command.local_id, .decision = command.decision, .table = command.table, .key = command.key, .origin = command.origin }}), .source_key = (try runtime.sourceExtractionKeyForResolutionKeyAlloc(a, &.{cfg}, resolution_key)) orelse return error.InvalidResolverCurationRequest };
 }
 pub fn validateRequest(req: anytype) !void {
     const command = req.resolver_review orelse return;

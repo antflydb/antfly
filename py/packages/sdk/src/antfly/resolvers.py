@@ -8,8 +8,15 @@ from typing import TYPE_CHECKING
 from urllib.parse import quote
 
 from .client_generated.models import (
+    CurationProposal,
+    CurationProposalDecisionRequest,
+    CurationProposalDecisionResult,
+    CurationProposalPage,
+    CurationProposalRequest,
     EntityCurationResult,
+    EntityDistinctRequest,
     EntityMergeRequest,
+    EntitySuppressRequest,
     ResolverList,
     ResolverMergeRequest,
     ResolverMutationResult,
@@ -188,7 +195,7 @@ class EntityOperations:
         )
         return EntityCurationResult.from_dict(value)
 
-    def suppress(self, table: str, key: str, request: ResolverUnmergeRequest) -> EntityCurationResult:
+    def suppress(self, table: str, key: str, request: EntitySuppressRequest) -> EntityCurationResult:
         value = self._client._request(
             "POST",
             self._prefix + f"/tables/{quote(table, safe='')}/entities/{quote(key, safe='')}:suppress",
@@ -203,3 +210,72 @@ class EntityOperations:
             json=request.to_dict(),
         )
         return EntityCurationResult.from_dict(value)
+
+    def distinct(self, table: str, key: str, request: EntityDistinctRequest) -> EntityCurationResult:
+        value = self._client._request(
+            "POST",
+            self._prefix + f"/tables/{quote(table, safe='')}/entities/{quote(key, safe='')}:distinct",
+            json=request.to_dict(),
+        )
+        return EntityCurationResult.from_dict(value)
+
+
+class CurationProposalOperations:
+    """Persistent entity proposals, with explicit namespace selection."""
+
+    def __init__(self, client: AntflyClient, database: str | None = None, namespace: str | None = None) -> None:
+        self._client = client
+        self._prefix = (
+            "/db/v1"
+            if database is None
+            else f"/db/v1/databases/{quote(database, safe='')}/namespaces/{quote(namespace or 'public', safe='')}"
+        )
+
+    def in_namespace(self, database: str, namespace: str) -> CurationProposalOperations:
+        return CurationProposalOperations(self._client, database, namespace)
+
+    def create(self, table: str, request: CurationProposalRequest) -> CurationProposal:
+        value = self._client._request(
+            "POST", self._prefix + f"/tables/{quote(table, safe='')}/curation/proposals", json=request.to_dict()
+        )
+        return CurationProposal.from_dict(value)
+
+    def list(
+        self, table: str, *, state: str = "open", action: str | None = None, cursor: str | None = None, limit: int = 64
+    ) -> CurationProposalPage:
+        params = {
+            "state": state,
+            "limit": limit,
+            **({"action": action} if action is not None else {}),
+            **({"cursor": cursor} if cursor is not None else {}),
+        }
+        value = self._client._request(
+            "GET", self._prefix + f"/tables/{quote(table, safe='')}/curation/proposals", params=params
+        )
+        return CurationProposalPage.from_dict(value)
+
+    def get(self, table: str, proposal_id: str) -> CurationProposal:
+        value = self._client._request(
+            "GET", self._prefix + f"/tables/{quote(table, safe='')}/curation/proposals/{quote(proposal_id, safe='')}"
+        )
+        return CurationProposal.from_dict(value)
+
+    def accept(
+        self, table: str, proposal_id: str, request: CurationProposalDecisionRequest | None = None
+    ) -> CurationProposalDecisionResult:
+        value = self._client._request(
+            "POST",
+            self._prefix + f"/tables/{quote(table, safe='')}/curation/proposals/{quote(proposal_id, safe='')}:accept",
+            json={} if request is None else request.to_dict(),
+        )
+        return CurationProposalDecisionResult.from_dict(value)
+
+    def reject(
+        self, table: str, proposal_id: str, request: CurationProposalDecisionRequest | None = None
+    ) -> CurationProposalDecisionResult:
+        value = self._client._request(
+            "POST",
+            self._prefix + f"/tables/{quote(table, safe='')}/curation/proposals/{quote(proposal_id, safe='')}:reject",
+            json={} if request is None else request.to_dict(),
+        )
+        return CurationProposalDecisionResult.from_dict(value)

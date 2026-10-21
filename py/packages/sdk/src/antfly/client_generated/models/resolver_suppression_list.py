@@ -8,6 +8,7 @@ from attrs import field as _attrs_field
 
 if TYPE_CHECKING:
     from ..models.graph_resolver_suppression_config import GraphResolverSuppressionConfig
+    from ..models.runtime_resolver_suppression import RuntimeResolverSuppression
 
 
 T = TypeVar("T", bound="ResolverSuppressionList")
@@ -21,15 +22,12 @@ class ResolverSuppressionList:
             and promotion. Suppressed mentions remain explainable in resolution artifacts and contribute no canonical graph
             edges. Changes use the normal resolver generation and bounded backfill lifecycle. Redirects to suppressed keys
             are rejected. Runtime suppressions are additive and outlive index versions.
-        runtime (GraphResolverSuppressionConfig): Suppress mentions before candidate search, embedding, adjudication and
-            promotion. Suppressed mentions remain explainable in resolution artifacts and contribute no canonical graph
-            edges. Changes use the normal resolver generation and bounded backfill lifecycle. Redirects to suppressed keys
-            are rejected. Runtime suppressions are additive and outlive index versions.
+        runtime (RuntimeResolverSuppression):
         revision (int):
     """
 
     configured: GraphResolverSuppressionConfig
-    runtime: GraphResolverSuppressionConfig
+    runtime: RuntimeResolverSuppression
     revision: int
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -55,11 +53,12 @@ class ResolverSuppressionList:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.graph_resolver_suppression_config import GraphResolverSuppressionConfig
+        from ..models.runtime_resolver_suppression import RuntimeResolverSuppression
 
         d = dict(src_dict)
         configured = GraphResolverSuppressionConfig.from_dict(d.pop("configured"))
 
-        runtime = GraphResolverSuppressionConfig.from_dict(d.pop("runtime"))
+        runtime = RuntimeResolverSuppression.from_dict(d.pop("runtime"))
 
         revision = d.pop("revision")
 
