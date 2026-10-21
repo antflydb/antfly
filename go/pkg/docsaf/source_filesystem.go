@@ -132,7 +132,7 @@ func (fs *FilesystemSource) Traverse(ctx context.Context) (<-chan ContentItem, <
 						// Check if this directory could contain matching files
 						couldContainMatches := false
 						for _, pattern := range fs.config.IncludePatterns {
-							if strings.Contains(pattern, "**") {
+							if couldContainIncludeMatch(pattern, relPath) {
 								couldContainMatches = true
 								break
 							}
@@ -184,4 +184,20 @@ func (fs *FilesystemSource) Traverse(ctx context.Context) (<-chan ContentItem, <
 	}()
 
 	return items, errs
+}
+
+// couldContainIncludeMatch reports whether files below the directory relDir
+// can match the include pattern, so the walk only prunes directories that
+// cannot lead to a match.
+func couldContainIncludeMatch(pattern, relDir string) bool {
+	if relDir == "." || strings.Contains(pattern, "**") {
+		return true
+	}
+	patternParts := strings.Split(pattern, "/")
+	dirParts := strings.Split(relDir, string(filepath.Separator))
+	if len(patternParts) <= len(dirParts) {
+		return false
+	}
+	matched, err := doublestar.Match(strings.Join(patternParts[:len(dirParts)], "/"), strings.Join(dirParts, "/"))
+	return err != nil || matched
 }
