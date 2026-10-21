@@ -55,7 +55,7 @@ pub const OwnedCursor = struct {
     pub fn setUpperBound(self: *@This(), bound: ?[]const u8) !void {
         if (self.captured) |trace| {
             try trace.check();
-            try trace.record(.upper_bound, bound orelse "", null);
+            try trace.record(if (bound != null) .upper_bound else .clear_upper_bound, bound orelse "", null);
         }
         self.cursor.setUpperBound(bound);
     }
@@ -372,7 +372,7 @@ const Row = struct {
         return .{ .key = try Fingerprint.of(entry.key, control, failure), .value = try Fingerprint.of(entry.value, control, failure) };
     }
 };
-pub const Kind = enum { seek_after, seek_before, next, prev, first, last, upper_bound };
+pub const Kind = enum { seek_after, seek_before, next, prev, first, last, upper_bound, clear_upper_bound };
 const Operation = struct { kind: Kind, argument: []const u8, expected: ?Row };
 const Point = struct { key: []const u8, expected: ?Fingerprint };
 
@@ -528,7 +528,11 @@ pub const Owned = struct {
                     .first => try cursor.first(),
                     .last => try cursor.last(),
                     .upper_bound => blk: {
-                        cursor.setUpperBound(if (operation.argument.len != 0) operation.argument else null);
+                        cursor.setUpperBound(operation.argument);
+                        break :blk null;
+                    },
+                    .clear_upper_bound => blk: {
+                        cursor.setUpperBound(null);
                         break :blk null;
                     },
                 };
@@ -537,5 +541,240 @@ pub const Owned = struct {
             }
         }
         try checkpoint(control, null);
+    }
+};
+
+/// Durable observations for an exact accepted effect/participant contract.
+/// Encoding does not install a lease or grant a PREPARE vote. A future owner
+/// must atomically bind these bytes to the decision and enforce them on writers.
+pub const Durable = struct {
+    const effects = @import("prepared_transaction_effects.zig");
+    pub const Binding = struct {
+        contract: effects.Contract,
+        participant: effects.Binding,
+        namespace: [24]u8,
+        frame_digest: [32]u8,
+    };
+    pub const max_frame_bytes = 64 * 1024 * 1024;
+    pub const max_observations = 65_536;
+    const header_bytes = 250;
+    const checksum_bytes = 32;
+    const version: u16 = 1;
+
+    const Writer = struct {
+        data: ?[]u8 = null,
+        offset: usize = 0,
+        control: ?admission.Port,
+        fn bytes(self: *@This(), value: []const u8) !void {
+            try checkpoint(self.control, null);
+            const end = std.math.add(usize, self.offset, value.len) catch return error.TransactionTooLarge;
+            if (end > max_frame_bytes - checksum_bytes) return error.TransactionTooLarge;
+            if (self.data) |buffer| {
+                if (end > buffer.len) return error.InvalidTxnRecord;
+                var start: usize = 0;
+                while (start < value.len) {
+                    try checkpoint(self.control, null);
+                    const next = start + @min(@as(usize, 4096), value.len - start);
+                    @memcpy(buffer[self.offset + start .. self.offset + next], value[start..next]);
+                    start = next;
+                }
+            }
+            self.offset = end;
+        }
+        fn int(self: *@This(), comptime T: type, value: T) !void {
+            var buffer: [@sizeOf(T)]u8 = undefined;
+            std.mem.writeInt(T, &buffer, value, .little);
+            try self.bytes(&buffer);
+        }
+        fn slice(self: *@This(), value: []const u8) !void {
+            try self.int(u32, std.math.cast(u32, value.len) orelse return error.TransactionTooLarge);
+            try self.bytes(value);
+        }
+        fn fingerprint(self: *@This(), value: Fingerprint) !void {
+            try self.int(u64, value.len);
+            try self.bytes(&value.digest);
+        }
+    };
+    fn write(writer: *Writer, owned: *const Owned, binding: Binding, size: u32) !void {
+        if (!owned.sealed or owned.failure != null or owned.control != null) return error.InvalidArgument;
+        if (binding.contract.intent_revision == 0) return error.InvalidPreparationRequirement;
+        const participant = try binding.participant.encode();
+        if (owned.points.items.len > max_observations or owned.cursors.items.len > max_observations) return error.TransactionTooLarge;
+        var observations: usize = owned.points.items.len + owned.cursors.items.len;
+        if (observations > max_observations) return error.TransactionTooLarge;
+        try writer.bytes("ATRO");
+        try writer.int(u16, version);
+        try writer.int(u16, 0);
+        try writer.int(u32, size);
+        try writer.bytes(&binding.contract.txn_id);
+        try writer.int(u64, binding.contract.intent_revision);
+        try writer.bytes(&binding.contract.intent_digest);
+        try writer.bytes(&binding.contract.catalog_digest);
+        try writer.int(u8, @intFromBool(binding.contract.schema_version != null));
+        try writer.int(u32, binding.contract.schema_version orelse 0);
+        try writer.int(u8, @backingInt(binding.contract.mode));
+        try writer.bytes(&participant);
+        try writer.bytes(&binding.frame_digest);
+        try writer.bytes(&binding.namespace);
+        try writer.int(u32, @intCast(owned.points.items.len));
+        try writer.int(u32, @intCast(owned.cursors.items.len));
+        for (owned.points.items) |point| {
+            try writer.slice(point.key);
+            try writer.int(u8, @intFromBool(point.expected != null));
+            if (point.expected) |expected| try writer.fingerprint(expected);
+        }
+        for (owned.cursors.items) |cursor| {
+            if (cursor.active or cursor.control != null or cursor.failure != null) return error.InvalidArgument;
+            observations = std.math.add(usize, observations, cursor.operations.items.len) catch return error.TransactionTooLarge;
+            if (observations > max_observations) return error.TransactionTooLarge;
+            try writer.int(u8, @intFromBool(cursor.physical_payloads));
+            try writer.int(u32, @intCast(cursor.operations.items.len));
+            for (cursor.operations.items) |operation| {
+                if ((operation.kind != .seek_after and operation.kind != .seek_before and operation.kind != .upper_bound and operation.argument.len != 0) or ((operation.kind == .upper_bound or operation.kind == .clear_upper_bound) and operation.expected != null)) return error.InvalidArgument;
+                // Wire tags are explicit and independent of compiler enum tags.
+                try writer.int(u8, switch (operation.kind) {
+                    .seek_after => 0,
+                    .seek_before => 1,
+                    .next => 2,
+                    .prev => 3,
+                    .first => 4,
+                    .last => 5,
+                    .upper_bound => 6,
+                    .clear_upper_bound => 7,
+                });
+                try writer.slice(operation.argument);
+                try writer.int(u8, @intFromBool(operation.expected != null));
+                if (operation.expected) |expected| {
+                    try writer.fingerprint(expected.key);
+                    try writer.fingerprint(expected.value);
+                }
+            }
+        }
+    }
+    pub fn encode(alloc: A, owned: *const Owned, binding: Binding, original: ?admission.Port) ![]u8 {
+        var trace: admission.RejectionTrace = .{};
+        return encodeInner(alloc, owned, binding, trace.bind(original)) catch |err| return trace.failure orelse err;
+    }
+    fn encodeInner(alloc: A, owned: *const Owned, binding: Binding, control: ?admission.Port) ![]u8 {
+        var size: Writer = .{ .control = control };
+        try write(&size, owned, binding, 0);
+        const frame = try alloc.alloc(u8, size.offset + checksum_bytes);
+        errdefer alloc.free(frame);
+        var writer: Writer = .{ .data = frame, .control = control };
+        try write(&writer, owned, binding, @intCast(frame.len));
+        if (writer.offset != size.offset) return error.InvalidTxnRecord;
+        const hash = try Fingerprint.of(frame[0..writer.offset], control, null);
+        @memcpy(frame[writer.offset..], &hash.digest);
+        try checkpoint(control, null);
+        return frame;
+    }
+
+    const Reader = struct {
+        data: []const u8,
+        offset: usize = 0,
+        control: ?admission.Port,
+        fn bytes(self: *@This(), length: usize) ![]const u8 {
+            try checkpoint(self.control, null);
+            if (length > self.data.len - self.offset) return error.InvalidTxnRecord;
+            const value = self.data[self.offset..][0..length];
+            self.offset += length;
+            return value;
+        }
+        fn int(self: *@This(), comptime T: type) !T {
+            return std.mem.readInt(T, (try self.bytes(@sizeOf(T)))[0..@sizeOf(T)], .little);
+        }
+        fn boolean(self: *@This()) !bool {
+            return switch (try self.int(u8)) {
+                0 => false,
+                1 => true,
+                else => error.InvalidTxnRecord,
+            };
+        }
+        fn slice(self: *@This(), alloc: A) ![]const u8 {
+            const length = try self.int(u32);
+            return copy(alloc, try self.bytes(length), self.control, null);
+        }
+        fn fingerprint(self: *@This()) !Fingerprint {
+            const length = std.math.cast(usize, try self.int(u64)) orelse return error.InvalidTxnRecord;
+            return .{ .len = length, .digest = (try self.bytes(32))[0..32].* };
+        }
+    };
+    pub fn decode(alloc: A, frame: []const u8, expected: Binding, original: ?admission.Port) !Owned {
+        var trace: admission.RejectionTrace = .{};
+        return decodeInner(alloc, frame, expected, trace.bind(original)) catch |err| return trace.failure orelse err;
+    }
+    fn decodeInner(alloc: A, frame: []const u8, expected: Binding, control: ?admission.Port) !Owned {
+        try checkpoint(control, null);
+        if (frame.len < header_bytes + checksum_bytes or frame.len > max_frame_bytes) return error.InvalidTxnRecord;
+        const end = frame.len - checksum_bytes;
+        const actual = try Fingerprint.of(frame[0..end], control, null);
+        if (!std.mem.eql(u8, &actual.digest, frame[end..])) return error.InvalidTxnRecord;
+        var reader: Reader = .{ .data = frame[0..end], .control = control };
+        if (!std.mem.eql(u8, try reader.bytes(4), "ATRO")) return error.InvalidTxnRecord;
+        if (try reader.int(u16) != version) return error.UnsupportedVersion;
+        if (try reader.int(u16) != 0 or try reader.int(u32) != frame.len) return error.InvalidTxnRecord;
+        var binding: Binding = undefined;
+        binding.contract.txn_id = (try reader.bytes(16))[0..16].*;
+        binding.contract.intent_revision = try reader.int(u64);
+        binding.contract.intent_digest = (try reader.bytes(32))[0..32].*;
+        binding.contract.catalog_digest = (try reader.bytes(32))[0..32].*;
+        const has_schema = try reader.boolean();
+        const schema_version = try reader.int(u32);
+        if (!has_schema and schema_version != 0) return error.InvalidTxnRecord;
+        binding.contract.schema_version = if (has_schema) schema_version else null;
+        binding.contract.mode = std.enums.fromInt(effects.Mode, try reader.int(u8)) orelse return error.InvalidTxnRecord;
+        binding.participant = try effects.Binding.decode(try reader.bytes(effects.Binding.encoded_bytes));
+        binding.frame_digest = (try reader.bytes(32))[0..32].*;
+        binding.namespace = (try reader.bytes(24))[0..24].*;
+        if (binding.contract.intent_revision == 0) return error.InvalidTxnRecord;
+        if (!std.meta.eql(binding, expected)) return error.PreparedEffectsMismatch;
+        const points = try reader.int(u32);
+        const cursors = try reader.int(u32);
+        if (points > max_observations or cursors > max_observations) return error.InvalidTxnRecord;
+        var observations = @as(usize, points) + cursors;
+        if (observations > max_observations or @as(u64, points) * 5 + @as(u64, cursors) * 5 > reader.data.len - reader.offset) return error.InvalidTxnRecord;
+        var result = Owned.init(alloc, null);
+        errdefer result.deinit();
+        try result.points.ensureTotalCapacityPrecise(alloc, points);
+        for (0..points) |_| {
+            const key = try reader.slice(alloc);
+            errdefer alloc.free(key);
+            const fingerprint = if (try reader.boolean()) try reader.fingerprint() else null;
+            result.points.appendAssumeCapacity(.{ .key = key, .expected = fingerprint });
+        }
+        try result.cursors.ensureTotalCapacityPrecise(alloc, cursors);
+        for (0..cursors) |_| {
+            const physical = try reader.boolean();
+            const operations = try reader.int(u32);
+            if (operations > max_observations) return error.InvalidTxnRecord;
+            observations += operations;
+            if (observations > max_observations or @as(u64, operations) * 6 > reader.data.len - reader.offset) return error.InvalidTxnRecord;
+            const cursor = try alloc.create(Cursor);
+            cursor.* = .{ .allocator = alloc, .control = null, .failure = null, .active = false, .physical_payloads = physical };
+            result.cursors.appendAssumeCapacity(cursor);
+            try cursor.operations.ensureTotalCapacityPrecise(alloc, operations);
+            for (0..operations) |_| {
+                const kind: Kind = switch (try reader.int(u8)) {
+                    0 => .seek_after,
+                    1 => .seek_before,
+                    2 => .next,
+                    3 => .prev,
+                    4 => .first,
+                    5 => .last,
+                    6 => .upper_bound,
+                    7 => .clear_upper_bound,
+                    else => return error.InvalidTxnRecord,
+                };
+                const argument = try reader.slice(alloc);
+                errdefer alloc.free(argument);
+                const row: ?Row = if (try reader.boolean()) .{ .key = try reader.fingerprint(), .value = try reader.fingerprint() } else null;
+                if ((kind != .seek_after and kind != .seek_before and kind != .upper_bound and argument.len != 0) or ((kind == .upper_bound or kind == .clear_upper_bound) and row != null)) return error.InvalidTxnRecord;
+                cursor.operations.appendAssumeCapacity(.{ .kind = kind, .argument = argument, .expected = row });
+            }
+        }
+        if (reader.offset != reader.data.len) return error.InvalidTxnRecord;
+        try checkpoint(control, null);
+        result.sealed = true;
+        return result;
     }
 };

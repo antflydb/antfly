@@ -1576,3 +1576,23 @@ required PREPARE drivers and broader scheduler/default/session rollout remain
 open. Existing metadata guard predicates and private ABI epochs are unchanged.
 Strong defaults remain off. No full archive/public-consumer requalification;
 full Linux qualification remains waived. No push; full goal remains active.
+
+### Durable read observations (2026-10-21)
+
+Added ATRO v1 for sealed point/cursor observations bound to the exact effect
+contract, accepted frame digest, participant/topology/route and namespace.
+Bounds: 64 MiB envelope and 65,536 combined observations. Empty upper bounds
+and clearing a bound are now distinct; Native55/storage-owner113 fence older
+native observations. Four codec regressions plus a native persistence/reopen
+case pass in durable-read-observations-v3: 172 fresh executions, 70/70 steps,
+all four native commands exit0, no skips/failures/leaks, 5491 unchanged inputs.
+See WORKLOAD_POOLING_IMPLEMENTATION.md's matching entry for format and evidence.
+
+The codec grants no lease or PREPARE vote. Atomic seal/observation admission,
+semantic point/range writer enforcement with actor-bound retirement and control
+progress, complete live dependency capture/pure assembly, executable recovery
+funding and derived-log quota, DB/execution lifetimes, raw writer/import/restore/
+restart/peer eligibility, normal required PREPARE and the broader fair/default/
+session/whole-node/tenant/remote rollout remain incomplete. Strong defaults off;
+full goal active. No push or new branch/worktree/PR. Full Linux qualification
+remains waived; public-consumer/provider-image/full-archive checks not rerun.

@@ -1071,3 +1071,226 @@ test "prepared transaction effects writer read guards serialize admission across
     defer a.free(actual);
     try std.testing.expectEqualStrings("after", actual);
 }
+
+const DurableReadTest = struct {
+    const Codec = read_set.Durable;
+    const binding: Codec.Binding = .{
+        .contract = .{ .txn_id = @splat(7), .intent_revision = 3, .intent_digest = @splat(11), .catalog_digest = @splat(13), .schema_version = 2, .mode = .deferred },
+        .participant = .{ .group_id = 9, .topology_epoch = 5, .participant_digest = @splat(17), .route_digest = @splat(19) },
+        .namespace = @splat(23),
+        .frame_digest = @splat(29),
+    };
+    fn capture(a: A, store: *DocStore) !read_set.Owned {
+        var owned = read_set.Owned.init(a, null);
+        errdefer owned.deinit();
+        const reader = read_set.observe(store, &owned);
+        const present = try reader.get(a, "r/a\x00");
+        defer a.free(present);
+        try std.testing.expectError(error.NotFound, reader.get(a, "missing"));
+        for ([_]bool{ false, true }) |physical| {
+            var cursor = try reader.openCursor(a, physical);
+            defer cursor.close();
+            try cursor.setUpperBound("");
+            try std.testing.expect((try cursor.first()) == null);
+            try cursor.setUpperBound(null);
+            try std.testing.expect((try cursor.first()) != null);
+            try cursor.setUpperBound("s/");
+            _ = try cursor.seekAtOrAfter("r/");
+            _ = try cursor.next();
+            _ = try cursor.next();
+            try cursor.setUpperBound(null);
+            _ = try cursor.last();
+            _ = try cursor.prev();
+            _ = try cursor.seekAtOrBefore("r/c");
+            _ = try cursor.seekAtOrAfter("zz/");
+        }
+        try owned.finish();
+        return owned;
+    }
+    fn rehash(frame: []u8) void {
+        const end = frame.len - 32;
+        std.crypto.hash.sha2.Sha256.hash(frame[0..end], frame[end..][0..32], .{});
+    }
+};
+
+test "prepared transaction effects durable read observations round trip owned points and every cursor operation" {
+    const a = std.testing.allocator;
+    const H = DurableReadTest;
+    var fixture: ReadCaptureTest = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    try fixture.store.put("r/a\x00", "A");
+    try fixture.store.put("r/c", "C");
+    try fixture.store.put("z", "outside");
+    var source = try H.capture(a, &fixture.store);
+    const frame = H.Codec.encode(a, &source, H.binding, null) catch |err| {
+        source.deinit();
+        return err;
+    };
+    defer a.free(frame);
+    source.deinit();
+    var decoded = try H.Codec.decode(a, frame, H.binding, null);
+    defer decoded.deinit();
+    const again = try H.Codec.encode(a, &decoded, H.binding, null);
+    defer a.free(again);
+    try std.testing.expectEqualSlices(u8, frame, again);
+    @memset(frame, 0); // Decode owns every key/argument; no retained source bytes.
+    try decoded.validate(&fixture.store, null);
+    for (decoded.cursors.items) |cursor| {
+        try std.testing.expect(!cursor.active and cursor.control == null and cursor.failure == null);
+        try std.testing.expectEqual(read_set.Kind.upper_bound, cursor.operations.items[0].kind);
+        try std.testing.expectEqual(@as(usize, 0), cursor.operations.items[0].argument.len);
+        try std.testing.expectEqual(read_set.Kind.clear_upper_bound, cursor.operations.items[2].kind);
+    }
+    try fixture.store.put("r/b", "phantom");
+    try std.testing.expectError(error.PreparedReadSetChanged, decoded.validate(&fixture.store, null));
+    try fixture.store.delete("r/b");
+    try decoded.validate(&fixture.store, null);
+    try fixture.store.put("missing", "");
+    try std.testing.expectError(error.PreparedReadSetChanged, decoded.validate(&fixture.store, null));
+    try fixture.store.delete("missing");
+    try fixture.store.put("r/a\x00", "changed");
+    try std.testing.expectError(error.PreparedReadSetChanged, decoded.validate(&fixture.store, null));
+}
+
+test "prepared transaction effects durable read observations reject corruption contract swaps malformed structure and counts" {
+    const a = std.testing.allocator;
+    const H = DurableReadTest;
+    var fixture: ReadCaptureTest = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    try fixture.store.put("r/a\x00", "A");
+    try fixture.store.put("r/c", "C");
+    var source = try H.capture(a, &fixture.store);
+    defer source.deinit();
+    const frame = try H.Codec.encode(a, &source, H.binding, null);
+    defer a.free(frame);
+    var fixed = std.heap.FixedBufferAllocator.init(&.{});
+    for (0..frame.len) |length| try std.testing.expectError(error.InvalidTxnRecord, H.Codec.decode(fixed.allocator(), frame[0..length], H.binding, null));
+    for (0..frame.len) |offset| {
+        frame[offset] ^= 1;
+        try std.testing.expectError(error.InvalidTxnRecord, H.Codec.decode(fixed.allocator(), frame, H.binding, null));
+        frame[offset] ^= 1;
+    }
+    for (0..12) |field| {
+        var wrong = H.binding;
+        switch (field) {
+            0 => wrong.contract.txn_id[0] ^= 1,
+            1 => wrong.contract.intent_revision += 1,
+            2 => wrong.contract.intent_digest[0] ^= 1,
+            3 => wrong.contract.catalog_digest[0] ^= 1,
+            4 => wrong.contract.schema_version = null,
+            5 => wrong.contract.mode = .synchronous,
+            6 => wrong.participant.group_id += 1,
+            7 => wrong.participant.topology_epoch += 1,
+            8 => wrong.participant.participant_digest[0] ^= 1,
+            9 => wrong.participant.route_digest[0] ^= 1,
+            10 => wrong.namespace[0] ^= 1,
+            11 => wrong.frame_digest[0] ^= 1,
+            else => unreachable,
+        }
+        try std.testing.expectError(error.PreparedEffectsMismatch, H.Codec.decode(fixed.allocator(), frame, wrong, null));
+    }
+    // Valid checksums cannot bless invalid reserved bits, booleans or modes.
+    for ([_]usize{ 6, 100, 105 }) |offset| {
+        const old = frame[offset];
+        frame[offset] = 255;
+        H.rehash(frame);
+        try std.testing.expectError(error.InvalidTxnRecord, H.Codec.decode(fixed.allocator(), frame, H.binding, null));
+        frame[offset] = old;
+        H.rehash(frame);
+    }
+    frame[4] = 2;
+    H.rehash(frame);
+    try std.testing.expectError(error.UnsupportedVersion, H.Codec.decode(fixed.allocator(), frame, H.binding, null));
+    frame[4] = 1;
+    H.rehash(frame);
+    for ([_]usize{ 242, 246 }) |offset| {
+        const old = frame[offset..][0..4].*;
+        @memset(frame[offset..][0..4], 255);
+        H.rehash(frame);
+        // Counts are checked before any allocation, even on a 32-bit host.
+        try std.testing.expectError(error.InvalidTxnRecord, H.Codec.decode(fixed.allocator(), frame, H.binding, null));
+        @memcpy(frame[offset..][0..4], &old);
+        H.rehash(frame);
+    }
+    // Authenticated but truncated records must unwind already-decoded owners.
+    for (250..frame.len) |length| {
+        const truncated = try a.dupe(u8, frame[0..length]);
+        defer a.free(truncated);
+        std.mem.writeInt(u32, truncated[8..12], @intCast(length), .little);
+        H.rehash(truncated);
+        try std.testing.expectError(error.InvalidTxnRecord, H.Codec.decode(a, truncated, H.binding, null));
+    }
+}
+
+test "prepared transaction effects durable read observations enforce sealed limits and unwind original controls and allocations" {
+    const a = std.testing.allocator;
+    const H = DurableReadTest;
+    const admission = @import("../../common/read_admission.zig");
+    const Checks = struct {
+        calls: usize = 0,
+        stop: usize = std.math.maxInt(usize),
+        cause: anyerror = error.NotFound,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == self.stop) return self.cause;
+        }
+        fn run(alloc: A, source: *const read_set.Owned, checks: ?*@This()) !void {
+            var payload: admission.Payload = .{ .ptr = checks orelse undefined, .vtable = &.{ .checkpoint = check } };
+            const control = if (checks != null) admission.Port.init(&payload) else null;
+            const frame = try H.Codec.encode(alloc, source, H.binding, control);
+            defer alloc.free(frame);
+            var decoded = try H.Codec.decode(alloc, frame, H.binding, control);
+            defer decoded.deinit();
+        }
+    };
+    var fixture: ReadCaptureTest = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    try fixture.store.put("r/a\x00", "A");
+    try fixture.store.put("r/c", "C");
+    var source = try H.capture(a, &fixture.store);
+    defer source.deinit();
+    try std.testing.checkAllAllocationFailures(a, Checks.run, .{ &source, @as(?*Checks, null) });
+    var baseline: Checks = .{};
+    try Checks.run(a, &source, &baseline);
+    for ([_]anyerror{ error.NotFound, error.OutOfMemory, error.DeadlineExceeded }) |cause| for (1..baseline.calls + 1) |stop| {
+        var checks: Checks = .{ .stop = stop, .cause = cause };
+        try std.testing.expectError(cause, Checks.run(a, &source, &checks));
+    };
+    source.sealed = false;
+    try std.testing.expectError(error.InvalidArgument, H.Codec.encode(a, &source, H.binding, null));
+    source.sealed = true;
+    var excessive = read_set.Owned.init(a, null);
+    defer excessive.deinit();
+    try excessive.points.ensureTotalCapacityPrecise(a, H.Codec.max_observations + 1);
+    for (0..H.Codec.max_observations + 1) |_| excessive.points.appendAssumeCapacity(.{ .key = "", .expected = null });
+    try excessive.finish();
+    var fixed = std.heap.FixedBufferAllocator.init(&.{});
+    try std.testing.expectError(error.TransactionTooLarge, H.Codec.encode(fixed.allocator(), &excessive, H.binding, null));
+}
+
+test "prepared transaction effects durable read observations freeze the v1 empty envelope" {
+    const a = std.testing.allocator;
+    const H = DurableReadTest;
+    var empty = read_set.Owned.init(a, null);
+    defer empty.deinit();
+    try empty.finish();
+    const frame = try H.Codec.encode(a, &empty, H.binding, null);
+    defer a.free(frame);
+    try std.testing.expectEqual(@as(usize, 282), frame.len);
+    // Independently packed little-endian v1 binding and empty counts, SHA256
+    // trailer, then SHA256 of the whole frame. Freeze bytes, not just round trip.
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(frame, &hash, .{});
+    const hex = std.fmt.bytesToHex(hash, .lower);
+    try std.testing.expectEqualStrings("3a411c595288d75227709aec2bfa2af614577f597ddf5e36152f5b7cbb1e1f53", &hex);
+    var fixed = std.heap.FixedBufferAllocator.init(&.{});
+    var decoded = try H.Codec.decode(fixed.allocator(), frame, H.binding, null);
+    defer decoded.deinit();
+    try std.testing.expect(decoded.sealed and decoded.control == null);
+    try std.testing.expectEqual(@as(usize, 0), decoded.points.items.len);
+    try std.testing.expectEqual(@as(usize, 0), decoded.cursors.items.len);
+}

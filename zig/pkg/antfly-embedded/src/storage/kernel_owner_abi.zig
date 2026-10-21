@@ -22,7 +22,9 @@ const failure_abi = @import("runtime_failure_abi");
 // Owners must enforce prepared replay credits through inventory mutation and HA acknowledgement.
 // Backend batches can atomically reserve prepared replay credit with seals.
 // Fence merged logical-query layouts and failure/guard contracts.
-pub const abi_version: u32 = 112;
+// Read transcripts distinguish an empty upper bound from clearing the bound.
+// Reject prior native observations before interpreting their bound operations.
+pub const abi_version: u32 = 113;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

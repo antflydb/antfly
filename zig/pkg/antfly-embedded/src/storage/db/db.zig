@@ -146552,3 +146552,63 @@ test "db prepared transaction effects required counter observation allocations a
         try std.testing.expectError(cause, Checks.run(a, &db, &checks));
     };
 }
+
+test "db prepared transaction effects required durable read observations replay after source closure and native reopen" {
+    const a = std.testing.allocator;
+    const reads = @import("prepared_read_set.zig");
+    var directory = try TestDirectory.init("durable-read-observations-reopen");
+    defer directory.cleanup();
+    const options: OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .start_independent_maintenance = false };
+    var db = try DB.open(a, directory.path(), options);
+    defer db.close();
+    const frame_key = "\x00\x00__durable_read_observations_fixture";
+    var binding: reads.Durable.Binding = .{
+        .contract = .{ .txn_id = @splat(7), .intent_revision = 3, .intent_digest = @splat(11), .catalog_digest = @splat(13), .schema_version = null, .mode = .synchronous },
+        .participant = .{ .group_id = 9, .topology_epoch = 5, .participant_digest = @splat(17), .route_digest = @splat(19) },
+        .namespace = undefined,
+        .frame_digest = @splat(29),
+    };
+    doc_identity.encodeNamespace(&binding.namespace, db.core.identity_namespace);
+    try db.core.store.put("capture/point", "value");
+    try db.core.store.put("capture/r/a\x00", "A");
+    try db.core.store.put("capture/r/c", "C");
+    {
+        var captured = reads.Owned.init(a, null);
+        defer captured.deinit();
+        const reader = reads.observe(db.core.store, &captured);
+        const point = try reader.get(a, "capture/point");
+        defer a.free(point);
+        try std.testing.expectError(error.NotFound, reader.get(a, "capture/absent"));
+        {
+            var cursor = try reader.openCursor(a, true);
+            defer cursor.close();
+            try cursor.setUpperBound("capture/s");
+            try std.testing.expectEqualStrings("capture/r/a\x00", (try cursor.seekAtOrAfter("capture/r/")).?.key);
+            try std.testing.expectEqualStrings("capture/r/c", (try cursor.next()).?.key);
+            try std.testing.expect((try cursor.next()) == null);
+        }
+        try captured.finish();
+        const frame = try reads.Durable.encode(a, &captured, binding, null);
+        defer a.free(frame);
+        // This is a codec persistence fixture, not PREPARE/lease admission.
+        try db.core.store.put(frame_key, frame);
+    }
+    db.close();
+    db = try DB.open(a, directory.path(), options);
+    var recovered: reads.Owned = blk: {
+        const frame = try db.core.store.get(a, frame_key);
+        defer a.free(frame);
+        break :blk try reads.Durable.decode(a, frame, binding, null);
+    };
+    defer recovered.deinit();
+    try recovered.validate(db.core.store, null);
+    try db.core.store.put("capture/r/b", "phantom after restart");
+    try std.testing.expectError(error.PreparedReadSetChanged, recovered.validate(db.core.store, null));
+    try db.core.store.delete("capture/r/b");
+    try recovered.validate(db.core.store, null);
+    try db.core.store.put("capture/absent", "");
+    try std.testing.expectError(error.PreparedReadSetChanged, recovered.validate(db.core.store, null));
+    try db.core.store.delete("capture/absent");
+    try db.core.store.put("capture/point", "new");
+    try std.testing.expectError(error.PreparedReadSetChanged, recovered.validate(db.core.store, null));
+}

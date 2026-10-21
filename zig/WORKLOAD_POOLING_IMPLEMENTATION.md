@@ -21882,3 +21882,49 @@ required PREPARE drivers and broader scheduler/default/session rollout remain
 open. Existing metadata guard predicates and private ABI epochs are unchanged.
 Strong defaults remain off. No full archive/public-consumer requalification;
 full Linux qualification remains waived. No push; full goal remains active.
+
+### Durable read observations and exact cursor bounds (2026-10-21)
+
+prepared_read_set.Durable now encodes/decodes sealed observations as ATRO v1.
+The envelope binds the full effect contract (transaction, intent revision and
+digest, catalog, optional schema and mode), participant/topology/route binding,
+accepted effect-frame digest and physical namespace. Point keys include value
+fingerprints or absence. Cursor programs retain physical/logical payload mode,
+explicit operation tags, owned arguments and key/value fingerprints including
+null stopping rows. Decode retains no frame, source, cursor or caller control.
+
+The little-endian format has a 250-byte header and SHA256 trailer; the empty
+envelope is 282 bytes, frozen against an independently packed golden digest.
+Frame size is capped at 64 MiB; the combined point/cursor/operation count is
+capped at 65,536. Count and minimum-body checks precede allocations, including
+32-bit overflow checks. Original rejection causes survive checksum/copy and
+allocation failures; partially decoded points/cursors/arguments unwind exactly.
+Malformed tags, booleans, lengths, reserved fields, trailing/truncated records
+and wrong contracts are rejected. This also fixes capture/replay aliasing of
+an empty upper bound with clearing a bound: they now use distinct operations.
+Native55/storage-owner113 reject prior native observations; public failure IDs,
+API59, failure67, descriptorv29 and existing prepared-reader versions are unchanged.
+
+Four codec regressions cover both payload modes, every cursor operation, binary
+keys, source/frame retirement, all-byte corruption/truncation, authenticated
+structural truncation, all 12 binding components, excessive counts, exhaustive
+allocator failures and each original NotFound/OOM/deadline checkpoint. A native
+DB fixture persists bytes, retires the original capture/handle, reopens, decodes
+and detects point/absence changes and range phantoms. Final evidence is
+durable-read-observations-v3.json/log: all four native commands exit0, 5491 input
+hashes unchanged, 70/70 build steps, 172 fresh executions (effects75, DB46,
+error/failure contracts43/1/7), no skips/failures/leaks. V1 and V2 also passed,
+but are superseded by the final accepted-frame binding and reopen regression.
+
+This is a durable observation codec, not lease installation, writer exclusion
+or a PREPARE vote. It is not wired into normal transaction admission. Next bind
+these observations atomically to accepted seals and semantic point/range writer
+authority with actor-bound retirement and mandatory control progress; the old
+metadata predicate whitelist must not simply be widened. Live core/cache/policy/
+table-catalog/opaque route capture, complete pure assembly, executable recovery
+RAM/CPU/I/O/dependency funding and derived-log quota, DB/execution lifetimes, raw
+writer/import/restore/migration/restart/peer eligibility, normal required PREPARE
+and the broader fair/default/session/whole-node/tenant/remote rollout remain open.
+Strong defaults stay off, full goal stays active. No public-consumer/provider-
+image/full-storage-archive requalification; full Linux qualification remains
+waived. Canonical worktree/branch/PR retained, normal hooks, no push.

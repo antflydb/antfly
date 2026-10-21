@@ -82,7 +82,9 @@ const builtin = @import("builtin");
 // Owners must enforce prepared replay credits through inventory mutation and HA acknowledgement.
 // Backend batches can atomically reserve prepared replay credit with seals.
 // Fence merged logical-query layouts and failure/guard contracts.
-pub const abi_version: u32 = 54;
+// Read transcripts distinguish an empty upper bound from clearing the bound.
+// Reject prior native observations before interpreting their bound operations.
+pub const abi_version: u32 = 55;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 
