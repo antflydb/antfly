@@ -162,6 +162,7 @@ pub const Captured = struct {
     term: ?[]const u8 = null,
     count: u64 = 0,
     sealed: bool = false,
+    disabled: bool = false,
     pub fn create(a: A, manager: *local.sql_spill.Manager) !*Captured {
         const self = try a.create(Captured);
         self.* = .{ .a = a, .manager = manager };
@@ -180,8 +181,27 @@ pub const Captured = struct {
     pub fn observer(self: *Captured) inverted.TermObserver {
         return .{ .ptr = self, .begin = begin, .finish = finish };
     }
+    fn discard(self: *Captured, err: anyerror) !void {
+        switch (err) {
+            error.OutOfMemory, error.SqlProgramLimitExceeded => {
+                if (self.file) |*file| file.close();
+                self.file = null;
+                self.used = 0;
+                self.term = null;
+                for (self.fields.items) |field| self.a.free(field.name);
+                self.fields.deinit(self.a);
+                self.fields = .empty;
+                self.disabled = true;
+            },
+            else => return err,
+        }
+    }
     fn begin(raw: *anyopaque, field: []const u8, term: []const u8) !void {
         const self: *Captured = @ptrCast(@alignCast(raw));
+        if (self.disabled) return;
+        self.beginTerm(field, term) catch |err| try self.discard(err);
+    }
+    fn beginTerm(self: *Captured, field: []const u8, term: []const u8) !void {
         if (self.sealed or self.term != null or field.len +| term.len > tree.max_key_bytes - 4) return error.InvalidNativeLakeTextStatistics;
         const offset = self.length();
         if (self.fields.items.len == 0 or !std.mem.eql(u8, self.fields.items[self.fields.items.len - 1].name, field)) {
@@ -195,6 +215,10 @@ pub const Captured = struct {
     }
     fn finish(raw: *anyopaque, frequency: u32, bounds: ?inverted.BlockMaxInfo, norm: ?u32) !void {
         const self: *Captured = @ptrCast(@alignCast(raw));
+        if (self.disabled) return;
+        self.finishTerm(frequency, bounds, norm) catch |err| try self.discard(err);
+    }
+    fn finishTerm(self: *Captured, frequency: u32, bounds: ?inverted.BlockMaxInfo, norm: ?u32) !void {
         const term = self.term orelse return error.InvalidNativeLakeTextStatistics;
         if (frequency == 0) {
             self.term = null;
@@ -251,9 +275,9 @@ pub const Captured = struct {
         self.used += bytes.len;
     }
     pub fn seal(self: *Captured) !void {
-        if (self.sealed) return;
+        if (self.sealed or self.disabled) return;
         if (self.term != null) return error.InvalidNativeLakeTextStatistics;
-        try self.flush();
+        self.flush() catch |err| return self.discard(err);
         if (self.file) |*file| {
             var guard = try self.io();
             defer guard.abort();
@@ -274,9 +298,16 @@ pub const Captured = struct {
         try guard.finish();
     }
     pub fn publish(self: *Captured, store: *stores.ArtifactStore, cancellation: Cancellation, executor: ?std.Io) !?Ref {
+        return self.publishConsuming(store, cancellation, executor, NoContributions{});
+    }
+    /// Synchronous borrowed records are copied by bounded reducers before the
+    /// summary is released. Checkpoints still refer only to durable trees.
+    pub fn publishConsuming(self: *Captured, store: *stores.ArtifactStore, cancellation: Cancellation, executor: ?std.Io, consumer: anytype) !?Ref {
         try self.seal();
+        if (self.disabled) return error.InvalidNativeLakeTextStatistics;
         const Source = struct {
             capture: *Captured,
+            consumer: @TypeOf(consumer),
             field: usize = 0,
             offset: ?u64 = null,
             key: ?[]u8 = null,
@@ -326,12 +357,14 @@ pub const Captured = struct {
                     try self_.read(offset + header_bytes + term_len, self_.value[0..value_len]);
                     _ = try Summary.decode(self_.value[0..value_len]);
                     self_.offset = offset + header_bytes + term_len + value_len;
-                    return .{ .key = key, .value = self_.value[0..value_len] };
+                    const record: tree.Cursor.Record = .{ .key = key, .value = self_.value[0..value_len] };
+                    try self_.consumer.record(record);
+                    return record;
                 }
                 return null;
             }
         };
-        var source: Source = .{ .capture = self };
+        var source: Source = .{ .capture = self, .consumer = consumer };
         defer if (source.key) |key| self.a.free(key);
         const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
         var reads: u64 = 0;
@@ -351,8 +384,23 @@ pub fn publishSegmentWithIo(a: A, store: *stores.ArtifactStore, bytes: []const u
     defer segment.deinit();
     return publishReaderWithIo(a, store, &segment, cancellation, io);
 }
-/// The immutable source remains caller-owned, including file-backed outputs.
+pub const NoContributions = struct {
+    pub fn record(_: @This(), _: tree.Cursor.Record) !void {}
+};
+pub const Contributions = struct {
+    global: ?*Builder = null,
+    directory: ?*@import("lake_index_term_directory.zig").Builder = null,
+    segment: [32]u8,
+    pub fn record(self: @This(), value: tree.Cursor.Record) !void {
+        if (self.global) |builder| try builder.addRecord(value, 1);
+        if (self.directory) |builder| try builder.addRecord(value, self.segment, 1);
+    }
+};
 pub fn publishReaderWithIo(a: A, store: *stores.ArtifactStore, segment: *local.segment.SegmentReader, cancellation: Cancellation, io: ?std.Io) !?Ref {
+    return publishReaderConsuming(a, store, segment, cancellation, io, NoContributions{});
+}
+/// The immutable source remains caller-owned, including file-backed outputs.
+pub fn publishReaderConsuming(a: A, store: *stores.ArtifactStore, segment: *local.segment.SegmentReader, cancellation: Cancellation, io: ?std.Io, consumer: anytype) !?Ref {
     const names = try a.alloc([]const u8, segment.fields.len);
     defer a.free(names);
     for (segment.fields, names) |field, *name| name.* = field.name;
@@ -364,6 +412,7 @@ pub fn publishReaderWithIo(a: A, store: *stores.ArtifactStore, segment: *local.s
     const Source = struct {
         a: A,
         segment: *local.segment.SegmentReader,
+        consumer: @TypeOf(consumer),
         names: []const []const u8,
         position: usize = 0,
         field: []const u8 = "",
@@ -403,7 +452,9 @@ pub fn publishReaderWithIo(a: A, store: *stores.ArtifactStore, segment: *local.s
                     }
                     const value = summary.encode(&self.value);
                     _ = try Summary.decode(value);
-                    return .{ .key = self.key.?, .value = value };
+                    const record: tree.Cursor.Record = .{ .key = self.key.?, .value = value };
+                    try self.consumer.record(record);
+                    return record;
                 };
                 self.close();
                 if (self.position == self.names.len) return null;
@@ -414,7 +465,7 @@ pub fn publishReaderWithIo(a: A, store: *stores.ArtifactStore, segment: *local.s
             }
         }
     };
-    var source: Source = .{ .a = a, .segment = segment, .names = names };
+    var source: Source = .{ .a = a, .segment = segment, .names = names, .consumer = consumer };
     defer source.close();
     defer if (source.key) |key| a.free(key);
     const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
@@ -1724,6 +1775,10 @@ test "external lake captured summaries release private spills on every allocatio
                     try observer.finish(observer.ptr, 1, null, 128);
                 }
                 try captured.seal();
+                // The production observer deliberately declines optional
+                // capture on OOM. Tell the allocation-failure harness that
+                // its injected failure was observed after cleanup.
+                if (captured.disabled) return error.OutOfMemory;
             }
             try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
             try std.testing.expectEqual(@as(usize, 0), manager.files);

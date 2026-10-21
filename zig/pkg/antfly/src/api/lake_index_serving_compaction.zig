@@ -58,6 +58,7 @@ const Builder = struct {
     ties: *corpus.text_directory.Mutations,
     metadata: *corpus.text_directory.Publisher,
     staging: *local.sql_spill.Manager,
+    summary_staging: *local.sql_spill.Manager,
     open_packs: std.ArrayList(Chunk) = .empty,
     open_tails: std.ArrayList(corpus.Root.Tail) = .empty,
     candidates: [4]std.ArrayList(corpus.Root.Tail) = @splat(.empty),
@@ -164,6 +165,7 @@ const Builder = struct {
         if (count == 0) return;
         const reuse = inputs.len == 1 and count == inputs[0].original_docs;
         var group: corpus.FileGroup = undefined;
+        var contributed = false;
         if (reuse and inputs[0].staged == null) {
             const input = inputs[0];
             group = .{ .file = undefined, .sources = sources.items, .segments = try out.dupe(Chunk, &.{input.ref.?}), .admissions = try out.dupe(local.segment.SegmentReader.Admission, &.{input.admission}), .summaries = try out.dupe(?corpus.statistics.Ref, &.{input.summary}) };
@@ -173,7 +175,7 @@ const Builder = struct {
                 retained.retain();
                 break :blk retained;
             } else self.merge(a, inputs)) catch |err| switch (err) {
-                error.OutOfMemory, error.NativeLakeTextCorpusTooLarge => {
+                error.OutOfMemory, error.NativeLakeTextCorpusTooLarge, error.SqlProgramLimitExceeded => {
                     if (inputs.len == 1) return err;
                     arena.deinit();
                     arena_live = false;
@@ -206,7 +208,13 @@ const Builder = struct {
                 return;
             }
             const ref = try @import("lake_index_seekable_text.zig").publishSource(a, out, self.store, staged.source(), self.token);
-            group = .{ .file = undefined, .sources = sources.items, .segments = try out.dupe(Chunk, &.{ref}), .admissions = try out.dupe(local.segment.SegmentReader.Admission, &.{admission}), .summaries = try out.dupe(?corpus.statistics.Ref, &.{if (staged.statistics) |captured| try captured.publish(self.store, self.token, self.context.io) else try corpus.statistics.publishReaderWithIo(a, self.store, &reader, self.token, self.context.io)}) };
+            const contributions: corpus.statistics.Contributions = .{ .directory = if (self.collect_term_deltas) self.terms else null, .segment = corpus.term_directory.identity(ref.artifact_id) };
+            const summary = if (staged.statistics != null and !staged.statistics.?.disabled)
+                try staged.statistics.?.publishConsuming(self.store, self.token, self.context.io, contributions)
+            else
+                try corpus.statistics.publishReaderConsuming(a, self.store, &reader, self.token, self.context.io, contributions);
+            group = .{ .file = undefined, .sources = sources.items, .segments = try out.dupe(Chunk, &.{ref}), .admissions = try out.dupe(local.segment.SegmentReader.Admission, &.{admission}), .summaries = try out.dupe(?corpus.statistics.Ref, &.{summary}) };
+            contributed = true;
         }
         if (level < 3 and group.sources.len >= std.math.pow(usize, 8, level + 1) and group.sources.len < corpus.source_spans.max_spans and group.admissions[0].bytes < 2 * 1024 * 1024) {
             // Only final packs own directory/ownership/statistics entries.
@@ -239,7 +247,7 @@ const Builder = struct {
             try self.open_tails.append(self.out, .{ .ref = retained, .tier = @intCast(tier), .bytes = group.admissions[0].bytes, .spans = @intCast(group.sources.len) });
             self.open_counts[tier] += 1;
         }
-        try self.contribution(group, 1);
+        if (!contributed) try self.contribution(group, 1);
         self.pack_count = try std.math.add(u32, self.pack_count, 1);
         self.serving_bytes = try std.math.add(u64, self.serving_bytes, group.admissions[0].bytes);
         if (self.serving_metadata_bytes) |bytes| self.serving_metadata_bytes = try std.math.add(u64, bytes, metadataBytes(group, manifest));
@@ -275,7 +283,7 @@ const Builder = struct {
         }
         const staged = try LocalSegment.empty(self.a, self.staging, self.store);
         errdefer staged.release();
-        try staged.captureStatistics();
+        staged.captureStatistics(self.summary_staging);
         var sink = staged.sink();
         try local.segment.writeMergedSegmentToSink(a, &sink, merged[0..inputs.len]);
         try staged.seal();
@@ -320,6 +328,9 @@ pub fn publish(a: A, out: A, store: *stores.ArtifactStore, current: corpus.Root,
     return publishDelta(a, out, store, current, base, .{ .removed = removed, .added = added.items }, plan, context, token);
 }
 pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.Root, previous: ?corpus.Root, delta: Delta, plan: *const state.Plan, context: local.serverless_query_lake_read_context.Context, token: Cancellation) !Chunk {
+    return publishDeltaWithStagingLimit(a, out, store, current, previous, delta, plan, context, token, 128 * 1024 * 1024);
+}
+fn publishDeltaWithStagingLimit(a: A, out: A, store: *stores.ArtifactStore, current: corpus.Root, previous: ?corpus.Root, delta: Delta, plan: *const state.Plan, context: local.serverless_query_lake_read_context.Context, token: Cancellation, staging_bytes: u64) !Chunk {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ca = arena.allocator();
@@ -336,8 +347,11 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
     };
     var manager: local.sql_spill.Manager = .{ .alloc = a, .io = context.io orelse return error.UnsupportedSqlExecution, .context = &cancellation, .checkpoint = Check.call };
     defer manager.deinit();
-    var staging: local.sql_spill.Manager = .{ .alloc = a, .io = manager.io, .context = &cancellation, .checkpoint = Check.call, .max_bytes = 128 * 1024 * 1024, .async_writes = false };
+    var staging: local.sql_spill.Manager = .{ .alloc = a, .io = manager.io, .context = &cancellation, .checkpoint = Check.call, .max_bytes = staging_bytes - staging_bytes / 4, .async_writes = false };
     defer staging.deinit();
+    // Optional summaries cannot occupy the required segment output allowance.
+    var summary_staging: local.sql_spill.Manager = .{ .alloc = a, .io = manager.io, .context = &cancellation, .checkpoint = Check.call, .max_bytes = staging_bytes / 4, .async_writes = false };
+    defer summary_staging.deinit();
     var terms = corpus.term_directory.Builder.init(a, &manager);
     defer terms.deinit();
     terms.enableDurable(pages.store());
@@ -355,7 +369,7 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
     try metadata.init(a, store, token, context.io.?);
     defer metadata.deinit();
     metadata.preferAdditions();
-    var builder: Builder = .{ .a = a, .out = ca, .store = store, .context = context, .token = token, .pages = &pages, .terms = &terms, .ownership = &ownership, .source_routes = &source_routes, .ties = &ties, .metadata = &metadata, .staging = &staging, .pending_arena = .{ .init(a), .init(a), .init(a), .init(a) } };
+    var builder: Builder = .{ .a = a, .out = ca, .store = store, .context = context, .token = token, .pages = &pages, .terms = &terms, .ownership = &ownership, .source_routes = &source_routes, .ties = &ties, .metadata = &metadata, .staging = &staging, .summary_staging = &summary_staging, .pending_arena = .{ .init(a), .init(a), .init(a), .init(a) } };
     defer {
         for (0..4) |level| {
             for (builder.pending[level][0..builder.count[level]]) |input| if (input.staged) |staged| staged.release();
@@ -583,6 +597,14 @@ test "external lake global frontier cross file packs preserve coordinates ties r
     var current = try Helper.root(ca, &store, refs[0..128]);
     var first_plan = try Helper.plan(ca, current, store, null);
     defer first_plan.deinit();
+    // Optional compaction must still publish every row when no scratch output
+    // can fit. This exercises recursive splitting down to remote run reuse.
+    const pressure_files = try corpus.text_directory.fileRecordsPublication(ca, current, store, .none);
+    var pressure = current;
+    pressure.serving = try publishDeltaWithStagingLimit(a, ca, &store, current, null, .{ .removed = &.{}, .added = pressure_files }, &first_plan, .{ .io = std.testing.io }, .none, 1);
+    const pressure_root = try Helper.reopen(ca, &store, pressure);
+    try std.testing.expectEqual(@as(u32, 128), pressure_root.segment_count);
+    try Helper.verify(ca, store, pressure_root, 256);
     const IoProbe = struct {
         var active: *@This() = undefined;
         original: stores.ArtifactStore,
@@ -921,4 +943,55 @@ test "external lake global frontier streamed output exceeds resident quota and s
     const actual = try staged.materialize(a);
     defer a.free(actual);
     try std.testing.expectEqualSlices(u8, expected, actual);
+}
+
+test "external lake global frontier summary scratch exhaustion preserves a fitting merged segment" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("compaction-summary-quota");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(72), 1, std.testing.io);
+    var inputs: [2]Input = undefined;
+    var readers: [2]local.segment.SegmentReader = undefined;
+    var merges: [2]local.segment.MergeInput = undefined;
+    const prefix: [200]u8 = @splat('a');
+    for (&inputs, &readers, &merges, 0..) |*input, *reader, *merge_, i| {
+        const docs = try out.alloc(local.introducer.TextDocument, 512);
+        for (docs, 0..) |*doc, j| doc.* = .{
+            .id = try std.fmt.allocPrint(out, "{d:0>8}", .{i * 512 + j}),
+            .stored_data = "{}",
+            .text_fields = try out.dupe(local.introducer.TextField, &.{.{ .field_name = "body", .text = try std.fmt.allocPrint(out, "{s}{d:0>8}", .{ prefix, i * 512 + j }) }}),
+        };
+        var memory = local.segment.MemorySegmentSink.init(out);
+        defer memory.deinit();
+        var sink = memory.sink();
+        try local.storage_db_document_mapper.writeTextSegmentFromProjectionBatchToSink(out, .{ .docs = docs }, .{}, .{}, &sink);
+        const bytes = try memory.finishOwned();
+        reader.* = try local.segment.SegmentReader.init(out, bytes);
+        merge_.* = .{ .reader = reader };
+        input.* = .{ .ref = try @import("lake_index_seekable_text.zig").publish(out, out, &store, bytes, .none), .admission = try reader.admission(out), .sources = try out.dupe(Span, &.{.{ .file = .{ .id = try std.fmt.allocPrint(out, "source-{d}", .{i}), .digest = @splat(1) }, .physical = try @import("lake_index_seekable_text.zig").publish(out, out, &store, bytes, .none), .file_rows = 512, .file_lower = 0, .pack_lower = 0, .count = 512 }}), .original_docs = 512, .summary = null };
+    }
+    defer for (&readers) |*reader| reader.deinit();
+    const expected = try local.segment.mergeSegmentInputs(out, &merges);
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    var check: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &check, .checkpoint = Check.call, .max_bytes = expected.len + 8192, .async_writes = false };
+    defer manager.deinit();
+    var builder: Builder = .{ .a = a, .out = out, .store = &store, .context = .{ .io = std.testing.io }, .token = .none, .pages = undefined, .terms = undefined, .ownership = undefined, .source_routes = undefined, .ties = undefined, .metadata = undefined, .staging = &manager, .summary_staging = &manager, .pending_arena = undefined };
+    {
+        const staged = try builder.merge(a, &inputs);
+        defer staged.release();
+        try std.testing.expect(staged.statistics.?.disabled);
+        const actual = try staged.materialize(out);
+        try std.testing.expectEqualSlices(u8, expected, actual);
+    }
+    try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
+    try std.testing.expectEqual(@as(usize, 0), manager.files);
 }

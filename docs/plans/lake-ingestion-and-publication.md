@@ -3522,3 +3522,59 @@ The regression contracts cover retained-run quota reuse, full record replay,
 allocation cleanup, encoded-segment ownership, and summary-root/segment-byte
 parity against the reader path for initial construction and deletion merges.
 Provider latency and archive throughput still require controlled measurement.
+
+### Direct summary contributions and bounded encoder overlap
+
+Fresh canonical summaries now feed document-frequency and term-directory
+reducers synchronously as their immutable summary tree is built. Cross-file
+serving compaction uses the same handoff for its final term-directory entries.
+The reducers copy each borrowed record into their existing bounded sort state;
+no archive-sized summary inventory is retained. Completed canonical files are
+marked in an operation-local bitset so subsequent manifest reduction does not
+add their contributions twice. Recovered checkpoint files have no such mark
+and rebuild directory contributions from their authenticated durable summaries.
+DF checkpoint roots and completed-file inventory still advance atomically.
+Summary references and the durable publication closure remain unchanged.
+
+Summary capture is optional acceleration. Allocation or scratch-quota denial
+closes partial capture, releases its quota, and lets the native writer finish.
+Final publication then derives identical records from the completed native
+reader, feeding both reducers through the same synchronous interface. Integrity,
+cancellation, and backend I/O failures remain errors. Cross-file merge scratch
+exhaustion also splits the candidate cohort, eventually reusing unmodified
+remote inputs when necessary; it does not raise the 128 MiB serving scratch
+limit. Required deletion rewrites still enforce ordinary resource limits.
+
+Initial encoding uses an adaptive seekable sink: outputs start in memory and
+migrate their prefix once to private spill when their length exceeds 512 KiB.
+Small chunks retain the direct owned-buffer handoff; large chunks retain a
+file-backed owner through compaction and publication. Patches and checksums use
+the same native sink contract, and segment bytes are identical in either mode.
+Required output and optional summaries have independent pools within the existing
+1 GiB per-file scratch allowance (768 MiB and 256 MiB). Cross-file serving
+compaction similarly divides its 128 MiB allowance into 96 MiB of payload and
+32 MiB of optional summaries. Retained summaries cannot exhaust required output
+space; exhausted summary pools use the reader fallback.
+
+Within a projection batch, one independently admitted encoder can prepare the
+next chunk while the serial owner merges and publishes the preceding chunk.
+Admission requires known construction headroom, a separate 48 MiB node retained
+reservation, and a scheduler with more than one CPU worker. The encoder has a
+32 MiB private workspace budget and its own CPU/I/O phase bridge. Joining parks
+the owner's CPU execution without reserving an I/O slot, so a child can finish
+scratch writes even with one configured I/O lane. The owner adopts outputs in
+input order and replaces child-local capabilities before releasing the child.
+Failure/cancellation drains the child before any borrowed projection columns or
+spill manager retire. Unavailable admission stays serial; speculative encoder
+OOM retries the required encode after its workspace is released. This bounded
+lookahead ends at each projection batch, preserving the existing column leases.
+
+Regression coverage compares native artifacts, summary roots, global DF and
+term-directory roots across memory, spill, lookahead and capture-quota fallback.
+Fresh-summary GETs are rejected during that publication test. It also injects a
+publication failure with encoding in flight and checks scratch files and node
+reservations are released. Cross-file tests retain every row and ranking tie
+under a one-byte staging quota, and a prefix-heavy dictionary reproduces summary
+scratch pressure while proving the fitting merged segment remains byte-identical.
+These are work, identity and resource contracts; they do not establish an archive
+throughput or live object-provider latency improvement.

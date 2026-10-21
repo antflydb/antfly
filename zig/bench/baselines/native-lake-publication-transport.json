@@ -117,7 +117,32 @@
     "captured_statistics_append_buffer_bytes": 16384,
     "captured_statistics_replay_buffer_bytes": 65536,
     "captured_statistics_frame_header_bytes": 6,
-    "captured_statistics_ordering": "native per-field term order; sort compact field directory only"
+    "captured_statistics_ordering": "native per-field term order; sort compact field directory only",
+    "fresh_summary_provider_gets_during_canonical_publication": 0,
+    "fresh_summary_contributions": "synchronous borrowed records copied into bounded DF and term-directory reducers",
+    "recovered_summary_contributions": "authenticated durable page cursor; no local recovery dependency",
+    "optional_summary_quota_failure": "release partial capture and replay completed native reader",
+    "cross_file_merge_quota_failure": "split cohort and reuse unchanged remote inputs",
+    "cross_file_fallback_quota_in_test_bytes": 1,
+    "cross_file_fallback_documents_in_test": 256,
+    "initial_encoder_memory_length_threshold_bytes": 524288,
+    "maximum_encoder_lookahead_chunks": 1,
+    "encoder_lookahead_retained_reservation_bytes": 50331648,
+    "encoder_lookahead_private_workspace_bytes": 33554432,
+    "encoder_join_io_slots": 0,
+    "encoder_lookahead_failure": "cancel and drain child before releasing borrowed projection or spill manager",
+    "encoder_lookahead_identity_matrix": [
+      "memory serial",
+      "spill serial",
+      "spill lookahead with one I/O lane",
+      "summary capture quota fallback"
+    ],
+    "encoder_lookahead_scope": "within one borrowed projection batch",
+    "canonical_segment_output_spill_quota_bytes": 805306368,
+    "canonical_optional_summary_spill_quota_bytes": 268435456,
+    "serving_segment_output_spill_quota_bytes": 100663296,
+    "serving_optional_summary_spill_quota_bytes": 33554432,
+    "optional_summary_and_required_segment_quotas": "independent pools within unchanged total caps"
   },
   "qualification_outstanding": [
     "Controlled identical-fixture base/head HN one-file and 1024-file latency and post-GC footprint",

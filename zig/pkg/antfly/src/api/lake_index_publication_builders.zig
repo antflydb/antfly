@@ -55,34 +55,8 @@ pub const Args = struct {
 };
 /// One capability per serial worker execution. Retained-state reservation
 /// outlives both CPU and I/O phases; no shared backend stores this pointer.
-const PublicationIo = struct {
-    execution: *local.sql_parallel_scheduler.Execution,
-    io: std.Io,
-    pending: ?local.sql_parallel_scheduler.Execution.Io = null,
-    bridge: stores.IoPhase = undefined,
-    fn capability(self: *PublicationIo) ?*const stores.IoPhase {
-        // Disabling I/O lanes retains the established required-inline fallback.
-        if (self.execution.scheduler.max_io_workers == 0) return null;
-        self.bridge = .{ .io = self.io, .ptr = self, .max_parallel = @min(8, self.execution.scheduler.max_io_workers), .scheduler = self.execution.scheduler, .begin = begin, .finish = finish, .abort = abort };
-        return &self.bridge;
-    }
-    fn begin(raw: *anyopaque, count: usize) !void {
-        const self: *PublicationIo = @ptrCast(@alignCast(raw));
-        std.debug.assert(self.pending == null);
-        self.pending = try self.execution.beginIo(self.io, count);
-    }
-    fn finish(raw: *anyopaque) !void {
-        const self: *PublicationIo = @ptrCast(@alignCast(raw));
-        var pending = self.pending.?;
-        self.pending = null;
-        try pending.finish();
-    }
-    fn abort(raw: *anyopaque) void {
-        const self: *PublicationIo = @ptrCast(@alignCast(raw));
-        if (self.pending) |*pending| pending.abort();
-        self.pending = null;
-    }
-};
+const PublicationIo = stores.ExecutionIo;
+
 const Job = struct {
     args: Args,
     kind: Kind,
@@ -1280,16 +1254,19 @@ test "external lake publication adapters batch reverse statistics and text direc
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expect(self.phase.execution.active);
             self.peak_slots = @max(self.peak_slots, count);
-            try PublicationIo.begin(&self.phase, count);
+            const capability = self.phase.capability().?;
+            try capability.begin(capability.ptr, count);
         }
         fn finish(raw: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (self.cancel_resume) self.canceled = true;
-            try PublicationIo.finish(&self.phase);
+            const capability = self.phase.capability().?;
+            try capability.finish(capability.ptr);
         }
         fn abort(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            PublicationIo.abort(&self.phase);
+            const capability = self.phase.capability().?;
+            capability.abort(capability.ptr);
         }
         fn read(_: *anyopaque, a: A, id: []const u8, offset: u64, length: usize, token: Token) ![]u8 {
             const self = active;

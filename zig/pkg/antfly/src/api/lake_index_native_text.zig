@@ -1216,6 +1216,19 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             const old = try loadRecordedFile(file_arena.allocator(), store.*, record, seed.?.domain, cancellation);
             for (old.summaries) |ref| try df.add(df_pages.store(), ref, -1);
         };
+        var checkpoint: StatisticsCheckpoint = .{ .provider = provider, .cancellation = cancellation };
+        var spill_manager: local.sql_spill.Manager = .{ .alloc = a, .io = provider.context.io orelse return error.UnsupportedSqlExecution, .context = &checkpoint, .checkpoint = StatisticsCheckpoint.check };
+        defer spill_manager.deinit();
+        var directory_builder = term_directory.Builder.init(a, &spill_manager);
+        defer directory_builder.deinit();
+        var stats_reads: u64 = 512 * 1024 * 1024;
+        var stats_writes: u64 = 512 * 1024 * 1024;
+        const scope = store.upload_scope.?;
+        var stats_pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &stats_reads, .remaining_write_bytes = &stats_writes, .streaming = true };
+        stats_pages.admitPublication();
+        directory_builder.enableDurable(stats_pages.store());
+        var fresh_contributions = try std.DynamicBitSetUnmanaged.initEmpty(a, plan.count());
+        defer fresh_contributions.deinit(a);
         var planned_files = plan.scanIterator(paged_seed or (baseline != null and reference_seed));
         // Paged seeds need only changed files; legacy imports stream their full state once.
         while (try planned_files.next()) |planned| {
@@ -1262,9 +1275,11 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 fn check(raw: *anyopaque) !void {
                     try @as(*Cancellation, @ptrCast(@alignCast(raw))).check();
                 }
-            }.check };
+            }.check, .max_bytes = 256 * 1024 * 1024, .async_writes = false };
             defer capture_manager.deinit();
-            var compactor: Compactor = .{ .capture_manager = &capture_manager, .a = a, .out = fa, .store = store, .segments = &segments, .summaries = &summaries, .admissions = &admissions, .cancellation = cancellation, .file_ordinal = file_ordinal, .opening = &opening, .io = provider.context.io };
+            var output_manager: local.sql_spill.Manager = .{ .alloc = a, .io = capture_manager.io, .context = &capture_check, .checkpoint = capture_manager.checkpoint, .max_bytes = 768 * 1024 * 1024, .async_writes = false };
+            defer output_manager.deinit();
+            var compactor: Compactor = .{ .output_manager = &output_manager, .global = &df, .directory = &directory_builder, .capture_manager = &capture_manager, .a = a, .out = fa, .store = store, .segments = &segments, .summaries = &summaries, .admissions = &admissions, .cancellation = cancellation, .file_ordinal = file_ordinal, .opening = &opening, .io = provider.context.io };
             defer compactor.deinit();
             var ordinals = physical.Builder.init(a, fa, store, cancellation);
             defer ordinals.deinit();
@@ -1353,7 +1368,9 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 const old = try loadRecordedFile(fa, store.*, record, seed.?.domain, cancellation);
                 for (old.summaries) |summary| try df.add(df_pages.store(), summary, -1);
             } else if (previous_groups.get(file.id)) |old| for (old.summaries) |ref| try df.add(df_pages.store(), ref, -1);
-            for (group.summaries) |ref| try df.add(df_pages.store(), ref, 1);
+            // Fresh summaries fed both reducers during publication. Only
+            // recovered file manifests need the authenticated remote cursor.
+            fresh_contributions.set(file_ordinal);
             // Atomically checkpoint the completed file inventory and its DF
             // state. Save the first file, then at most 64 files or five seconds
             // of completed work; metadata traffic grows with the delta batch.
@@ -1377,11 +1394,6 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         global_statistics = try df.finish(df_pages.store(), global_statistics);
         // Global DF touches only changed file contributions. The spill manager
         // bounds disk independently of the sort's 4 MiB resident working set.
-        var checkpoint: StatisticsCheckpoint = .{ .provider = provider, .cancellation = cancellation };
-        var spill_manager: local.sql_spill.Manager = .{ .alloc = a, .io = provider.context.io orelse return error.UnsupportedSqlExecution, .context = &checkpoint, .checkpoint = StatisticsCheckpoint.check };
-        defer spill_manager.deinit();
-        var directory_builder = term_directory.Builder.init(a, &spill_manager);
-        defer directory_builder.deinit();
         var removed_files: std.ArrayList(text_directory.FileRecord) = .empty;
         var added_files: std.ArrayList(text_directory.FileRecord) = .empty;
         for (baseline_records) |record| {
@@ -1398,12 +1410,6 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         }
         const prior_directory: term_directory.Roots = if (baseline) |old| (if (old.term_directory.version == 2) old.term_directory else .{}) else .{};
         const incremental_directory = prior_directory.leaves != null;
-        var stats_reads: u64 = 512 * 1024 * 1024;
-        var stats_writes: u64 = 512 * 1024 * 1024;
-        const scope = store.upload_scope.?;
-        var stats_pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &stats_reads, .remaining_write_bytes = &stats_writes, .streaming = true };
-        stats_pages.admitPublication();
-        directory_builder.enableDurable(stats_pages.store());
         // A disabled optional directory has no complete base to update. Paged
         // seeds hold only changed maintenance groups, so stream unchanged
         // contributions from the canonical serving directory when bootstrapping.
@@ -1455,8 +1461,10 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 const group = try manifest_replay.load(&file_arena, &manifests, record.manifest, scope.domain);
                 if (index + 1 < added_files.items.len and !try manifest_replay.contains(added_files.items[index + 1].manifest)) manifests.prefetch(added_files.items[index + 1].manifest);
                 try metadata_publisher.add(group, record.manifest, false);
-                for (group.summaries, group.segments) |summary, segment| {
-                    try addStatisticsContribution(a, stats_pages.store(), summary, term_directory.identity(segment.artifact_id), 1, null, &directory_builder);
+                if (!fresh_contributions.isSet(plan.by_id.get(record.file.id) orelse return error.InvalidNativeLakeTextCorpus)) {
+                    for (group.summaries, group.segments) |summary, segment| {
+                        try addStatisticsContribution(a, stats_pages.store(), summary, term_directory.identity(segment.artifact_id), 1, null, &directory_builder);
+                    }
                 }
                 try totals.add(group, false);
             }
@@ -1888,11 +1896,26 @@ const Compactor = struct {
     const fan_in = 8;
     const target_bytes = 16 * 1024 * 1024;
     const Owned = struct {
-        bytes: []u8,
+        payload: union(enum) {
+            memory: []u8,
+            spill: *@import("lake_index_segment_spill.zig").LocalSegment,
+        },
         captured: ?*statistics.Captured = null,
+        fn source(self: Owned) local.index.SegmentSource {
+            return switch (self.payload) {
+                .memory => |bytes| .{ .contiguous = bytes },
+                .spill => |staged| staged.source(),
+            };
+        }
+        fn len(self: Owned) usize {
+            return self.source().len();
+        }
         fn deinit(self: Owned, a: A) void {
+            switch (self.payload) {
+                .memory => |bytes| a.free(bytes),
+                .spill => |staged| staged.release(),
+            }
             if (self.captured) |captured| captured.deinit();
-            a.free(self.bytes);
         }
     };
     a: A,
@@ -1907,6 +1930,11 @@ const Compactor = struct {
     io: ?std.Io = null,
     workspace_bytes: usize = 64 * 1024 * 1024,
     capture_manager: ?*local.sql_spill.Manager = null,
+    output_manager: ?*local.sql_spill.Manager = null,
+    encoding_memory_bytes: usize = 512 * 1024,
+    test_ahead_count: if (@import("builtin").is_test) usize else void = if (@import("builtin").is_test) 0 else {},
+    global: ?*statistics.Builder = null,
+    directory: ?*term_directory.Builder = null,
     pending: [fan_in]?Owned = @splat(null),
     count: usize = 0,
     bytes: usize = 0,
@@ -1919,12 +1947,12 @@ const Compactor = struct {
         var adopted = false;
         defer if (!adopted) owned.deinit(self.a);
         try self.cancellation.check();
-        if (self.count != 0 and owned.bytes.len > target_bytes -| self.bytes) try self.finish();
-        if (owned.bytes.len > target_bytes) return self.publishSource(.{ .contiguous = owned.bytes }, owned.captured);
+        if (self.count != 0 and owned.len() > target_bytes -| self.bytes) try self.finish();
+        if (owned.len() > target_bytes) return self.publishSource(owned.source(), owned.captured);
         self.pending[self.count] = owned;
         adopted = true;
         self.count += 1;
-        self.bytes += owned.bytes.len;
+        self.bytes += owned.len();
         if (self.count == fan_in) try self.finish();
     }
     fn finish(self: *Compactor) !void {
@@ -1953,7 +1981,7 @@ const Compactor = struct {
                 }
             }
         }
-        for (self.pending[0..self.count]) |owned| try self.publishSource(.{ .contiguous = owned.?.bytes }, owned.?.captured);
+        for (self.pending[0..self.count]) |owned| try self.publishSource(owned.?.source(), owned.?.captured);
     }
     fn check(raw: *anyopaque) !void {
         try @as(*Compactor, @ptrCast(@alignCast(raw))).cancellation.check();
@@ -1964,13 +1992,13 @@ const Compactor = struct {
         defer for (readers[0..opened]) |*reader| reader.deinit();
         var inputs: [fan_in]local.segment.MergeInput = undefined;
         for (self.pending[0..self.count], &readers, &inputs) |bytes, *reader, *input| {
-            reader.* = try local.segment.SegmentReader.init(a, bytes.?.bytes);
+            reader.* = try local.segment.SegmentReader.initSource(a, bytes.?.source());
             opened += 1;
             input.* = .{ .reader = reader };
         }
         const staged = try @import("lake_index_segment_spill.zig").LocalSegment.empty(self.a, manager, self.store);
         errdefer staged.release();
-        try staged.captureStatistics();
+        staged.captureStatistics(self.capture_manager orelse manager);
         var sink = staged.sink();
         try local.segment.writeMergedSegmentToSink(a, &sink, &inputs);
         try staged.seal();
@@ -1990,40 +2018,148 @@ const Compactor = struct {
         var reader = try local.segment.SegmentReader.initSource(a, source);
         defer reader.deinit();
         try self.admissions.append(out, try reader.admission(out));
-        const summary = (if (captured) |value| value.publish(store, cancellation, self.io) else statistics.publishReaderWithIo(a, store, &reader, cancellation, self.io)) catch |err| return buildFailure(err, "segment_statistics", self.file_ordinal, segments.items.len);
+        const contributions: statistics.Contributions = .{ .global = self.global, .directory = self.directory, .segment = term_directory.identity(ref.artifact_id) };
+        const summary = (if (captured != null and !captured.?.disabled) captured.?.publishConsuming(store, cancellation, self.io, contributions) else statistics.publishReaderConsuming(a, store, &reader, cancellation, self.io, contributions)) catch |err| return buildFailure(err, "segment_statistics", self.file_ordinal, segments.items.len);
         try self.summaries.append(out, summary);
         try segments.append(out, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len });
     }
 };
 fn flush(compactor: *Compactor, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, store_source: bool) !void {
+    return flushWithOptions(compactor, batch, analysis, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source });
+}
+fn flushWithOptions(compactor: *Compactor, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, build_options: mapper.BuildTextSegmentsOptions) !void {
     try compactor.cancellation.check();
     for (batch.docs, 0..) |doc, i| {
         if (i != 0 and std.mem.order(u8, batch.docs[i - 1].id, doc.id) != .lt) return error.InvalidNativeLakeTextCorpus;
     }
     const Consumer = struct {
+        const reservation = 48 * 1024 * 1024;
+        const Job = struct {
+            a: A,
+            manager: *local.sql_spill.Manager,
+            output_manager: *local.sql_spill.Manager,
+            store: stores.ArtifactStore,
+            chunk: mapper.TextProjectionBatch,
+            analysis: local.introducer.TextAnalysisConfig,
+            options: local.introducer.BuildTextOptions,
+            execution: local.sql_parallel_scheduler.Execution,
+            future: ?std.Io.Future(anyerror!Compactor.Owned) = null,
+            token: Cancellation,
+            threshold: usize,
+            fn check(raw: *anyopaque) !void {
+                try @as(*Job, @ptrCast(@alignCast(raw))).token.check();
+            }
+            fn run(self: *Job, io: std.Io) anyerror!Compactor.Owned {
+                defer self.execution.pause();
+                self.execution.checkpoint = .{ .ptr = self, .check = check };
+                try self.execution.enter(io);
+                var phase: stores.ExecutionIo = .{ .execution = &self.execution, .io = io };
+                self.store.io_phase = phase.capability();
+                var budget: local.sql_memory_budget = .{ .backing = self.a, .limit = 32 * 1024 * 1024 };
+                return encode(self.a, budget.allocator(), self.manager, self.output_manager, &self.store, self.chunk, self.analysis, self.options, self.threshold);
+            }
+        };
         compactor: *Compactor,
         analysis: local.introducer.TextAnalysisConfig,
-        pub fn consume(self: *@This(), chunk: mapper.TextProjectionBatch, options: local.introducer.BuildTextOptions) !void {
-            const a = self.compactor.a;
-            const captured = if (self.compactor.capture_manager) |manager| try statistics.Captured.create(a, manager) else null;
-            if (captured) |value| value.phase = self.compactor.store.io_phase;
-            var owned = false;
-            defer if (!owned) {
-                if (captured) |value| value.deinit();
-            };
-            var memory_sink = local.segment.MemorySegmentSink.init(a);
-            defer memory_sink.deinit();
-            var sink = memory_sink.sink();
+        job: ?*Job = null,
+        ready: ?Compactor.Owned = null,
+        fn encode(a: A, workspace: A, manager: *local.sql_spill.Manager, output_manager: *local.sql_spill.Manager, store: *stores.ArtifactStore, chunk: mapper.TextProjectionBatch, analysis_: local.introducer.TextAnalysisConfig, options: local.introducer.BuildTextOptions, threshold: usize) !Compactor.Owned {
+            const captured = statistics.Captured.create(a, manager) catch null;
+            if (captured) |value| value.phase = store.io_phase;
+            errdefer if (captured) |value| value.deinit();
+            var adaptive = @import("lake_index_segment_spill.zig").AdaptiveSink.init(a, output_manager, store);
+            defer adaptive.deinit();
+            adaptive.threshold = threshold;
+            var sink = adaptive.sink();
             sink.term_observer = if (captured) |value| value.observer() else null;
-            try mapper.writeTextSegmentFromProjectionBatchToSink(a, chunk, self.analysis, options, &sink);
+            try mapper.writeTextSegmentFromProjectionBatchToSink(workspace, chunk, analysis_, options, &sink);
             if (captured) |value| try value.seal();
-            const bytes = try memory_sink.finishOwned();
-            owned = true; // addOwned consumes both resources on every path.
-            try self.compactor.addOwned(.{ .bytes = bytes, .captured = captured });
+            return if (adaptive.staged) |staged| blk: {
+                try staged.seal();
+                adaptive.staged = null;
+                break :blk .{ .payload = .{ .spill = staged }, .captured = captured };
+            } else .{ .payload = .{ .memory = try adaptive.memory.finishOwned() }, .captured = captured };
+        }
+        fn inlineEncode(self: *@This(), chunk: mapper.TextProjectionBatch, options: local.introducer.BuildTextOptions) !Compactor.Owned {
+            return encode(self.compactor.a, self.compactor.a, self.compactor.capture_manager.?, self.compactor.output_manager.?, self.compactor.store, chunk, self.analysis, options, self.compactor.encoding_memory_bytes);
+        }
+        fn take(self: *@This()) !?Compactor.Owned {
+            const job = self.job orelse {
+                const ready = self.ready;
+                self.ready = null;
+                return ready;
+            };
+            self.job = null;
+            defer job.a.destroy(job);
+            defer job.execution.scheduler.releasePull(1, reservation);
+            const phase = self.compactor.store.io_phase.?;
+            phase.park.?(phase.ptr);
+            const result = job.future.?.await(phase.io);
+            var owned = result catch |err| {
+                try phase.resume_cpu.?(phase.ptr);
+                if (err == error.OutOfMemory) return try self.inlineEncode(job.chunk, job.options);
+                return err;
+            };
+            // Worker-local capabilities cannot escape into the serial owner.
+            if (owned.payload == .spill) owned.payload.spill.store = self.compactor.store;
+            if (owned.captured) |captured| captured.phase = self.compactor.store.io_phase;
+            errdefer owned.deinit(self.compactor.a);
+            try phase.resume_cpu.?(phase.ptr);
+            return owned;
+        }
+        fn start(self: *@This(), chunk: mapper.TextProjectionBatch, options: local.introducer.BuildTextOptions) !void {
+            const phase = self.compactor.store.io_phase;
+            if (phase != null and phase.?.park != null and phase.?.resume_cpu != null and phase.?.scheduler != null and
+                (@import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(self.compactor.a) orelse 0) >= reservation * 2)
+            {
+                const scheduler = phase.?.scheduler.?;
+                if (scheduler.max_workers > 1 and scheduler.reservePull(1, reservation)) {
+                    var transferred = false;
+                    defer if (!transferred) scheduler.releasePull(1, reservation);
+                    if (self.compactor.a.create(Job)) |job| {
+                        job.* = .{ .a = self.compactor.a, .manager = self.compactor.capture_manager.?, .output_manager = self.compactor.output_manager.?, .store = self.compactor.store.*, .chunk = chunk, .analysis = self.analysis, .options = options, .execution = .{ .scheduler = scheduler, .bytes = 32 * 1024 * 1024 }, .token = self.compactor.cancellation, .threshold = self.compactor.encoding_memory_bytes };
+                        job.store.io_phase = null;
+                        if (phase.?.io.concurrent(Job.run, .{ job, phase.?.io })) |future| {
+                            job.future = future;
+                            self.job = job;
+                            if (@import("builtin").is_test) self.compactor.test_ahead_count += 1;
+                            transferred = true;
+                            return;
+                        } else |_| self.compactor.a.destroy(job);
+                    } else |_| {}
+                }
+            }
+            self.ready = try self.inlineEncode(chunk, options);
+        }
+        pub fn consume(self: *@This(), chunk: mapper.TextProjectionBatch, options: local.introducer.BuildTextOptions) !void {
+            const previous = try self.take();
+            var adopted = false;
+            defer if (!adopted) if (previous) |value| value.deinit(self.compactor.a);
+            // Encode the next chunk while the owner merges/uploads this one.
+            // At most one child and one unadopted payload exist.
+            try self.start(chunk, options);
+            adopted = true;
+            if (previous) |value| try self.compactor.addOwned(value);
+        }
+        fn finish(self: *@This()) !void {
+            if (try self.take()) |value| try self.compactor.addOwned(value);
+        }
+        fn deinit(self: *@This()) void {
+            if (self.ready) |value| value.deinit(self.compactor.a);
+            if (self.job) |job| {
+                // Cancellation drains the child before borrowed projection data
+                // or its spill manager can be released. It never resumes CPU.
+                const result = job.future.?.cancel(self.compactor.io.?);
+                if (result) |value| value.deinit(self.compactor.a) else |_| {}
+                job.execution.scheduler.releasePull(1, reservation);
+                job.a.destroy(job);
+            }
         }
     };
     var consumer: Consumer = .{ .compactor = compactor, .analysis = analysis };
-    mapper.consumeTextProjectionChunks(batch, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source }, &consumer) catch |err| return buildFailure(err, "encode_segments", compactor.file_ordinal, compactor.segments.items.len);
+    defer consumer.deinit();
+    mapper.consumeTextProjectionChunks(batch, build_options, &consumer) catch |err| return buildFailure(err, "encode_segments", compactor.file_ordinal, compactor.segments.items.len);
+    try consumer.finish();
 }
 const ProjectionLeases = struct {
     const max_bytes = 8 * 1024 * 1024;
@@ -2125,7 +2261,7 @@ test "external lake text compaction preserves all physical keys in input order" 
         for (0..9) |i| {
             const key = try std.fmt.allocPrint(ca, "lake1:{s}:00000000:{x:0>16}", .{ file_id, i + 10 });
             const bytes = (try mapper.buildTextSegmentFromDocuments(a, &.{.{ .key = key, .value = "{\"body\":\"quasar\"}" }}, .{}, null)).?;
-            try compactor.addOwned(.{ .bytes = bytes });
+            try compactor.addOwned(.{ .payload = .{ .memory = bytes } });
         }
         try compactor.finish();
         try std.testing.expectEqual(@as(usize, if (workspace == 1) 9 else 2), segments.items.len);
@@ -2551,4 +2687,116 @@ test "external lake publication metadata replay captures producer bytes for repe
     try std.testing.expectEqual(@as(usize, 4), replay.hits);
     // A resumed/cache-missing group still follows the required provider path.
     try std.testing.expectError(error.InjectedReadFailure, replay.load(&scratch, &reader, missing, store.upload_scope.?.domain));
+}
+
+test "external lake publication encoding lookahead spill and direct contributions preserve roots" {
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+        fn rejectRead(_: *anyopaque, _: A, _: []const u8, _: u64, _: usize, _: Cancellation) ![]u8 {
+            return error.UnexpectedFreshSummaryRead;
+        }
+        fn failPut(_: *anyopaque, _: A, _: stores.UploadScope, _: []const u8, _: Cancellation) !stores.ArtifactMetadata {
+            return error.InjectedLakePublicationFailure;
+        }
+    };
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("encoding-lookahead-contributions");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(71), 1, std.testing.io);
+    const original_vtable = store.vtable;
+    var no_reads = original_vtable.*;
+    no_reads.get_range_alloc_with_cancellation = Check.rejectRead;
+    const docs = try out.alloc(local.introducer.TextDocument, 9);
+    const file_id: [64]u8 = @splat('0');
+    for (docs, 0..) |*doc, i| doc.* = .{
+        .id = try std.fmt.allocPrint(out, "lake1:{s}:00000000:{x:0>16}", .{ file_id, i }),
+        .stored_data = "{}",
+        .text_fields = &.{.{ .field_name = "body", .text = "quasar common common" }},
+    };
+    var expected_segments: []const artifacts.ChunkRef = &.{};
+    var expected_summaries: []const ?statistics.Ref = &.{};
+    var expected_global: ?statistics.Ref = null;
+    var expected_directory: term_directory.Roots = .{};
+    for (0..5) |mode| {
+        var memory: local.sql_memory_budget = .{ .backing = a, .limit = 128 * 1024 * 1024 };
+        const ma = memory.allocator();
+        var context: u8 = 0;
+        var scratch: local.sql_spill.Manager = .{ .alloc = ma, .io = std.testing.io, .context = &context, .checkpoint = Check.call, .max_bytes = if (mode == 3) 0 else 64 * 1024 * 1024, .async_writes = false };
+        defer scratch.deinit();
+        var output_scratch: local.sql_spill.Manager = .{ .alloc = ma, .io = std.testing.io, .context = &context, .checkpoint = Check.call, .max_bytes = 64 * 1024 * 1024, .async_writes = false };
+        defer output_scratch.deinit();
+        var reducer_scratch: local.sql_spill.Manager = .{ .alloc = ma, .io = std.testing.io, .context = &context, .checkpoint = Check.call };
+        defer reducer_scratch.deinit();
+        var global = statistics.Builder.init(ma, &reducer_scratch);
+        defer global.deinit();
+        var terms = term_directory.Builder.init(ma, &reducer_scratch);
+        defer terms.deinit();
+        var scheduler: local.sql_parallel_scheduler.Scheduler = .{ .max_workers = 2, .max_io_workers = 1, .max_bytes = 128 * 1024 * 1024, .max_pull_bytes = 128 * 1024 * 1024 };
+        var execution: local.sql_parallel_scheduler.Execution = .{ .scheduler = &scheduler, .bytes = 32 * 1024 * 1024 };
+        defer execution.pause();
+        var phase: stores.ExecutionIo = .{ .execution = &execution, .io = std.testing.io };
+        if (mode == 2 or mode == 4) {
+            try execution.enter(std.testing.io);
+            store.io_phase = phase.capability();
+        }
+        defer store.io_phase = null;
+        var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
+        var summaries: std.ArrayList(?statistics.Ref) = .empty;
+        var admissions: std.ArrayList(local.segment.SegmentReader.Admission) = .empty;
+        var compactor: Compactor = .{ .a = ma, .out = out, .store = &store, .segments = &segments, .summaries = &summaries, .admissions = &admissions, .cancellation = .none, .file_ordinal = 0, .io = std.testing.io, .capture_manager = &scratch, .output_manager = &output_scratch, .global = &global, .directory = &terms, .encoding_memory_bytes = if (mode != 0) 1 else 512 * 1024 };
+        defer compactor.deinit();
+        // Neither captured nor reader fallback publication may GET a summary
+        // it just wrote. Both reducers consume synchronous borrowed records.
+        store.vtable = &no_reads;
+        defer store.vtable = original_vtable;
+        if (mode == 4) {
+            no_reads.put_scoped = Check.failPut;
+            defer no_reads.put_scoped = original_vtable.put_scoped;
+            try std.testing.expectError(error.InjectedLakePublicationFailure, flushWithOptions(&compactor, .{ .docs = docs }, .{}, .{ .target_segment_bytes = 1, .target_build_memory_bytes = 32 * 1024 * 1024 }));
+            compactor.deinit();
+            try std.testing.expect(compactor.test_ahead_count > 0);
+            try std.testing.expectEqual(@as(u64, 0), scratch.live_bytes);
+            try std.testing.expectEqual(@as(usize, 0), scratch.files);
+            try std.testing.expectEqual(@as(u64, 0), output_scratch.live_bytes);
+            try std.testing.expectEqual(@as(usize, 0), output_scratch.files);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.pull_workers);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+            continue;
+        }
+        try flushWithOptions(&compactor, .{ .docs = docs }, .{}, .{ .target_segment_bytes = 1, .target_build_memory_bytes = 32 * 1024 * 1024 });
+        try compactor.finish();
+        store.vtable = original_vtable;
+        try std.testing.expectEqual(@as(usize, 2), segments.items.len);
+        try std.testing.expectEqual(@as(usize, if (mode == 2) 9 else 0), compactor.test_ahead_count);
+        try std.testing.expectEqual(@as(u64, 0), scratch.live_bytes);
+        try std.testing.expectEqual(@as(usize, 0), scratch.files);
+        try std.testing.expectEqual(@as(u64, 0), output_scratch.live_bytes);
+        try std.testing.expectEqual(@as(usize, 0), output_scratch.files);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+        var reads: u64 = 64 * 1024 * 1024;
+        var writes: u64 = 64 * 1024 * 1024;
+        const scope = store.upload_scope.?;
+        var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+        const df = try global.finish(pages.store(), null);
+        const term_roots = try terms.finish(pages.store(), .{});
+        if (mode == 0) {
+            expected_segments = segments.items;
+            expected_summaries = summaries.items;
+            expected_global = df;
+            expected_directory = term_roots;
+        } else {
+            try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(out, expected_segments, .{}), try std.json.Stringify.valueAlloc(out, segments.items, .{}));
+            try std.testing.expect(std.meta.eql(expected_global, df));
+            try std.testing.expect(std.meta.eql(expected_directory, term_roots));
+            try std.testing.expectEqualSlices(?statistics.Ref, expected_summaries, summaries.items);
+        }
+    }
 }

@@ -50,6 +50,7 @@ test {
     _ = @import("api/lake_index_gc.zig");
     _ = @import("api/lake_index_ordered_rows.zig");
     _ = @import("api/lake_index_native_files.zig");
+    _ = @import("api/lake_index_native_text.zig");
     _ = @import("api/lake_index_native_directory.zig");
     _ = @import("api/lake_index_metadata_ownership.zig");
     _ = @import("api/lake_index_native_rows.zig");

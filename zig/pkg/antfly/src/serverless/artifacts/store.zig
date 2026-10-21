@@ -200,6 +200,47 @@ pub const IoPhase = struct {
     begin: *const fn (*anyopaque, usize) anyerror!void,
     finish: *const fn (*anyopaque) anyerror!void,
     abort: *const fn (*anyopaque) void,
+    /// Joining an independently admitted CPU child parks without occupying an
+    /// I/O lane. The child may need the last I/O lane to finish its scratch.
+    park: ?*const fn (*anyopaque) void = null,
+    resume_cpu: ?*const fn (*anyopaque) anyerror!void = null,
+};
+pub const ExecutionIo = struct {
+    execution: *@import("antfly_local_sources").sql_parallel_scheduler.Execution,
+    io: std.Io,
+    pending: ?@import("antfly_local_sources").sql_parallel_scheduler.Execution.Io = null,
+    bridge: IoPhase = undefined,
+    pub fn capability(self: *ExecutionIo) ?*const IoPhase {
+        // Disabling I/O lanes retains the established required-inline fallback.
+        if (self.execution.scheduler.max_io_workers == 0) return null;
+        self.bridge = .{ .io = self.io, .ptr = self, .max_parallel = @min(8, self.execution.scheduler.max_io_workers), .scheduler = self.execution.scheduler, .begin = begin, .finish = finish, .abort = abort, .park = park, .resume_cpu = resumeCpu };
+        return &self.bridge;
+    }
+    fn park(raw: *anyopaque) void {
+        const self: *ExecutionIo = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.pending == null);
+        self.execution.pause();
+    }
+    fn resumeCpu(raw: *anyopaque) !void {
+        const self: *ExecutionIo = @ptrCast(@alignCast(raw));
+        try self.execution.enter(self.io);
+    }
+    fn begin(raw: *anyopaque, count: usize) !void {
+        const self: *ExecutionIo = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.pending == null);
+        self.pending = try self.execution.beginIo(self.io, count);
+    }
+    fn finish(raw: *anyopaque) !void {
+        const self: *ExecutionIo = @ptrCast(@alignCast(raw));
+        var pending = self.pending.?;
+        self.pending = null;
+        try pending.finish();
+    }
+    fn abort(raw: *anyopaque) void {
+        const self: *ExecutionIo = @ptrCast(@alignCast(raw));
+        if (self.pending) |*pending| pending.abort();
+        self.pending = null;
+    }
 };
 pub const IoGuard = struct {
     phase: ?*const IoPhase = null,
