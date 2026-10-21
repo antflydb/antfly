@@ -169,11 +169,14 @@ const Segments = struct {
     }
 };
 /// Metadata construction streams one record at a time into bounded sorts and
-/// durable runs. Replacement tails and last-write ordering remain explicit.
+/// private local runs. Only the final tree is durable; replacement tails and
+/// last-write ordering remain explicit.
 pub const Mutations = struct {
     a: A,
     sort: local.sql_spill.Sort,
     forest: @import("lake_index_delta_runs.zig").Forest,
+    destination: tree.Store,
+    private_pages: pages_mod.PrivatePages,
     reduction: @FieldType(tree.Store, "reduce") = null,
     ordinal: u64 = 0,
     addition_first: bool = false,
@@ -181,9 +184,10 @@ pub const Mutations = struct {
         var sort = local.sql_spill.Sort.init(a, manager, &.{.{}}, 1024 * 1024);
         sort.shared_runs = true;
         sort.encoded_bytes = true;
-        return .{ .a = a, .sort = sort, .forest = .{ .a = a, .store = storage, .policy = .latest } };
+        return .{ .a = a, .sort = sort, .forest = .{ .a = a, .store = storage, .policy = .latest }, .destination = storage, .private_pages = .{ .manager = manager, .domain = storage.domain, .attempt = storage.attempt } };
     }
     pub fn deinit(self: *Mutations) void {
+        self.private_pages.deinit();
         self.sort.deinit();
     }
     fn add(self: *Mutations, id: Id, value: ?[]const u8, previous_length: usize) !void {
@@ -234,6 +238,7 @@ pub const Mutations = struct {
         var source: Source = .{ .sort = &self.sort, .scratch = .init(self.a), .owned = .init(self.a), .addition_first = self.addition_first };
         defer source.scratch.deinit();
         defer source.owned.deinit();
+        self.forest.store = self.private_pages.store();
         try self.forest.add(&source);
         const manager = self.sort.manager;
         self.sort.deinit();
@@ -244,9 +249,9 @@ pub const Mutations = struct {
     pub fn finish(self: *Mutations, prior: ?tree.Ref) !?tree.Ref {
         try self.flush();
         const changes = try self.forest.finish() orelse return prior;
-        var storage = self.forest.store;
+        var storage = self.destination;
         if (self.reduction) |reduction| storage.reduce = reduction;
-        var delta = try tree.Cursor.init(self.a, storage, changes, "", null);
+        var delta = try tree.Cursor.init(self.a, self.forest.store, changes, "", null);
         defer delta.deinit();
         if (prior != null and changes.records < @max(4096, prior.?.records / 4)) {
             var cache: tree.Cache = .{ .alloc = self.a, .underlying = storage };
@@ -325,6 +330,7 @@ pub const Publisher = struct {
         self.pages = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = token, .remaining_read_bytes = &self.reads, .remaining_write_bytes = &self.writes, .streaming = true };
         self.pages.admitPublication();
         self.initReducers(a, self.pages.store(), io);
+        inline for (.{ "files", "segments", "routing" }) |name| @field(self, name).private_pages.phase = store.io_phase;
     }
     fn initReducers(self: *Publisher, a: A, storage: tree.Store, io: std.Io) void {
         self.manager = .{ .alloc = a, .io = io, .context = self, .checkpoint = check };
@@ -385,6 +391,7 @@ pub fn publishFileRecords(a: A, store: *stores.ArtifactStore, records: []const F
     var manager: local.sql_spill.Manager = .{ .alloc = a, .io = io, .context = &check, .checkpoint = Check.call };
     defer manager.deinit();
     var mutations = Mutations.init(a, &manager, pages.store());
+    mutations.private_pages.phase = store.io_phase;
     defer mutations.deinit();
     for ([_]bool{ true, false }) |deleting| for (if (deleting) removed else records) |record| {
         try token.check();
@@ -1280,6 +1287,9 @@ test "external lake serving metadata additions override late deletions within an
     try publisher.files.add(id, null, 11);
     try publisher.files.add(removed, null, 3);
     try publisher.files.flush();
+    try std.testing.expectEqual(@as(u64, 0), publisher.writes);
+    try std.testing.expectEqual(@as(u64, 0), publisher.reads);
+    try std.testing.expect(publisher.files.private_pages.file != null);
     try publisher.files.add(id, "newest", 6);
     try publisher.files.add(id, null, 6);
     const root = (try publisher.files.finish(null)).?;

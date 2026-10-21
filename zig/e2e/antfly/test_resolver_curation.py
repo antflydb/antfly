@@ -72,6 +72,10 @@ def test_entity_curation_namespace_wait_and_resolver_routes(stateful_api):
         assert {first["proposals"][0]["id"], second["proposals"][0]["id"]} == proposed
         assert api.get(path + "?state=rejected&limit=1")["proposals"] == []
         assert api.get(path + "?state=open&action=merge&limit=1")["proposals"] == []
+    # Main also checks a single open proposal later in this flow. Close these
+    # pagination fixtures so both checks own their expected proposal set.
+    for proposal_id in proposed:
+        api.post(f"{proposals}/{proposal_id}:reject", {})
     key = quote("concept/alpha", safe="")
     entity = f"/tables/{destination}/entities/{key}"
     wait = {"timeout_ms": 5000}

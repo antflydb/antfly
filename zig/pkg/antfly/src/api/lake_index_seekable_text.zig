@@ -105,10 +105,15 @@ fn upload(a: A, store: *stores.ArtifactStore, bytes: []const u8, cancellation: C
     defer if (ref.provider_version) |version| writer.allocator.free(version);
     return .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
 }
-fn initialMetadata(a: A, bytes: []const u8) ![]const Range {
+fn initialMetadata(a: A, source: local.index.SegmentSource) ![]const Range {
+    const length = std.math.cast(usize, source.len()) orelse return error.NativeLakeTextCorpusTooLarge;
+    var footer: [24]u8 = undefined;
     // Opaque/legacy fixtures keep their existing all-block representation.
-    if (bytes.len < 56 or !std.mem.eql(u8, bytes[bytes.len - 4 ..], "AFSM")) return &.{};
-    var reader = try local.segment.RangeSegmentReader.init(a, .{ .contiguous = bytes }, .{});
+    if (length < 56) return &.{};
+    try source.readInto(length - footer.len, &footer);
+    if (!std.mem.eql(u8, footer[20..], "AFSM")) return &.{};
+    var reader = try local.segment.RangeSegmentReader.init(a, source, .{});
+    reader.owns_source = false;
     defer reader.deinit();
     var ranges: std.ArrayList(Range) = .empty;
     try ranges.append(a, .{ .offset = @intCast(reader.stored_offset), .len = @intCast(@min(21, reader.stored_metadata_length)) });
@@ -116,8 +121,8 @@ fn initialMetadata(a: A, bytes: []const u8) ![]const Range {
         .offset = @intCast(reader.stored_offset + 21 + @as(u64, reader.doc_count) * 24),
         .len = @as(usize, reader.num_blocks) * 8,
     });
-    const tail = if (reader.paged_source) |paged| paged.directory.offset else std.mem.readInt(u64, bytes[bytes.len - 24 ..][0..8], .big);
-    try ranges.append(a, .{ .offset = @intCast(tail), .len = bytes.len - @as(usize, @intCast(tail)) });
+    const tail = if (reader.paged_source) |paged| paged.directory.offset else std.mem.readInt(u64, footer[0..8], .big);
+    try ranges.append(a, .{ .offset = @intCast(tail), .len = length - @as(usize, @intCast(tail)) });
     for (reader.fields) |field| for (field.sections) |section| {
         if (section.section_type != .inverted_text or section.length == 0) continue;
         const view = (try reader.sectionView(field.name, .inverted_text)).?;
@@ -137,7 +142,7 @@ fn initialMetadata(a: A, bytes: []const u8) ![]const Range {
         // Bundle those same pages so tiny metadata reads do not fetch adjacent
         // original-pack ranges solely to establish the native CRC proof.
         const page_start = requested.offset / block_bytes * block_bytes;
-        const page_end = @min(bytes.len, std.mem.alignForward(usize, requested.offset + requested.len, block_bytes));
+        const page_end = @min(length, std.mem.alignForward(usize, requested.offset + requested.len, block_bytes));
         const range: Range = if (reader.paged_source != null) .{ .offset = page_start, .len = page_end - page_start } else requested;
         if (merged.items.len != 0) {
             const last = &merged.items[merged.items.len - 1];
@@ -148,10 +153,10 @@ fn initialMetadata(a: A, bytes: []const u8) ![]const Range {
         }
         try merged.append(a, range);
     }
-    var length: usize = 0;
-    for (merged.items) |range| length = try std.math.add(usize, length, range.len);
+    var metadata_length: usize = 0;
+    for (merged.items) |range| metadata_length = try std.math.add(usize, metadata_length, range.len);
     // Oversized optional navigation stays in authenticated native blocks.
-    return if (length <= pack_bytes and length < bytes.len / 2) merged.items else &.{};
+    return if (metadata_length <= pack_bytes and metadata_length < length / 2) merged.items else &.{};
 }
 fn packedPiece(a: A, pack: Ref, offset: usize, pack_offset: usize, bytes: []const u8) !Piece {
     var digest: [32]u8 = undefined;
@@ -163,7 +168,7 @@ fn packedPiece(a: A, pack: Ref, offset: usize, pack_offset: usize, bytes: []cons
 }
 fn uploadWidth(a: A, store: *const stores.ArtifactStore) usize {
     const phase = store.io_phase orelse return 1;
-    const available = @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(a) orelse local.sql_memory_budget.headroom(a) orelse return 1;
+    const available = @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(a) orelse return 1;
     // Borrowed payloads need no capture buffer. Leave conservative headroom
     // for bounded provider staging and returned identities during parallel I/O.
     return @max(1, @min(stores.ArtifactStore.max_upload_batch, phase.max_parallel, available / (2 * pack_bytes)));
@@ -172,19 +177,31 @@ pub fn publish(a: A, out: A, store: *stores.ArtifactStore, bytes: []const u8, ca
     return publishWithOpeningCollector(a, out, store, bytes, cancellation, null);
 }
 pub fn publishWithOpeningCollector(a: A, out: A, store: *stores.ArtifactStore, bytes: []const u8, cancellation: Cancellation, opening: ?*@import("lake_index_text_opening_pack.zig").Collector) !Ref {
+    return publishSourceWithOpeningCollector(a, out, store, .{ .contiguous = bytes }, cancellation, opening);
+}
+/// Borrow an immutable source and capture at most one admitted pack wave.
+/// File-backed compaction never needs a complete contiguous output buffer.
+pub fn publishSource(a: A, out: A, store: *stores.ArtifactStore, source: local.index.SegmentSource, cancellation: Cancellation) !Ref {
+    return publishSourceWithOpeningCollector(a, out, store, source, cancellation, null);
+}
+pub fn publishSourceWithOpeningCollector(a: A, out: A, store: *stores.ArtifactStore, source: local.index.SegmentSource, cancellation: Cancellation, opening: ?*@import("lake_index_text_opening_pack.zig").Collector) !Ref {
+    const length = std.math.cast(usize, source.len()) orelse return error.NativeLakeTextCorpusTooLarge;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ca = arena.allocator();
     // Upload large immutable packs, with independently authenticated bounded
     // range units. Broad reads coalesce adjacent units into one pack range GET,
     // while sparse queries never download an entire pack to authenticate it.
-    const ranges = try initialMetadata(ca, bytes);
+    const ranges = try initialMetadata(ca, source);
     var metadata: std.ArrayList(Piece) = .empty;
     var compressed_bundle: ?Ref = null;
     var decoded_bytes: usize = 0;
     if (ranges.len != 0) {
         var bundle: std.ArrayList(u8) = .empty;
-        for (ranges) |range| try bundle.appendSlice(ca, bytes[range.offset..][0..range.len]);
+        for (ranges) |range| {
+            const target = try bundle.addManyAsSlice(ca, range.len);
+            try source.readInto(range.offset, target);
+        }
         const compressed = try local.encoding_snappy.encode(ca, bundle.items);
         if (compressed.len <= bundle.items.len - bundle.items.len / 8) {
             compressed_bundle = try upload(ca, store, compressed, cancellation);
@@ -203,15 +220,23 @@ pub fn publishWithOpeningCollector(a: A, out: A, store: *stores.ArtifactStore, b
     var blocks: std.ArrayList(Piece) = .empty;
     var position: usize = 0;
     var metadata_position: usize = 0;
-    while (position < bytes.len) {
+    while (position < length) {
+        var wave = std.heap.ArenaAllocator.init(a);
+        defer wave.deinit();
         var contents: [stores.ArtifactStore.max_upload_batch][]const u8 = undefined;
         var uploaded: [stores.ArtifactStore.max_upload_batch]stores.ArtifactMetadata = undefined;
         var count: usize = 0;
         var next = position;
         const width = uploadWidth(a, store);
-        while (count < width and next < bytes.len) : (count += 1) {
-            const end = @min(next + pack_bytes, bytes.len);
-            contents[count] = bytes[next..end];
+        while (count < width and next < length) : (count += 1) {
+            const end = @min(next + pack_bytes, length);
+            if (source == .contiguous) {
+                contents[count] = source.contiguous[next..end];
+            } else {
+                const captured = try wave.allocator().alloc(u8, end - next);
+                try source.readInto(next, captured);
+                contents[count] = captured;
+            }
             next = end;
         }
         // Payloads borrow the already-admitted immutable segment. Metadata
@@ -227,18 +252,18 @@ pub fn publishWithOpeningCollector(a: A, out: A, store: *stores.ArtifactStore, b
                 while (metadata_position < ranges.len and ranges[metadata_position].offset + ranges[metadata_position].len <= offset) metadata_position += 1;
                 if (metadata_position < ranges.len and ranges[metadata_position].offset <= offset) {
                     const end = @min(pack_end, ranges[metadata_position].offset + ranges[metadata_position].len);
-                    if (compressed_bundle != null) try metadata.append(ca, try packedPiece(ca, pack, offset, offset - position, bytes[offset..end]));
+                    if (compressed_bundle != null) try metadata.append(ca, try packedPiece(ca, pack, offset, offset - position, payload[offset - position .. end - position]));
                     offset = end;
                     continue;
                 }
-                const end = @min(@min(offset + block_bytes, pack_end), if (metadata_position < ranges.len) ranges[metadata_position].offset else bytes.len);
-                try blocks.append(ca, try packedPiece(ca, pack, offset, offset - position, bytes[offset..end]));
+                const end = @min(@min(offset + block_bytes, pack_end), if (metadata_position < ranges.len) ranges[metadata_position].offset else length);
+                try blocks.append(ca, try packedPiece(ca, pack, offset, offset - position, payload[offset - position .. end - position]));
                 offset = end;
             }
             position = pack_end;
         }
     }
-    const directory: Directory = .{ .version = if (compressed_bundle != null) 5 else 4, .metadata_bundle = compressed_bundle, .metadata_decoded_bytes = decoded_bytes, .bytes = bytes.len, .metadata = metadata.items, .blocks = blocks.items, .terms = &.{} };
+    const directory: Directory = .{ .version = if (compressed_bundle != null) 5 else 4, .metadata_bundle = compressed_bundle, .metadata_decoded_bytes = decoded_bytes, .bytes = length, .metadata = metadata.items, .blocks = blocks.items, .terms = &.{} };
     try directory.validate();
     const encoded = try std.json.Stringify.valueAlloc(ca, directory, .{});
     if (encoded.len > 4 * 1024 * 1024) return error.NativeLakeTextCorpusTooLarge;
@@ -2156,4 +2181,48 @@ test "external lake seekable metadata opens all field navigation with two authen
     var expired = packed_read;
     expired.context.deadline_ns = 1;
     try std.testing.expectError(error.DeadlineExceeded, opening.warm(a, store, collector.refs.items[0], store.upload_scope.?.domain, expired, .none));
+}
+
+test "external lake seekable source publication bounds capture and preserves byte backed identity" {
+    const Source = struct {
+        bytes: []const u8,
+        largest: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.largest = @max(self.largest, out.len);
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {
+            @panic("publication closed its borrowed source");
+        }
+        fn begin(_: *anyopaque, _: usize) !void {}
+        fn finish(_: *anyopaque) !void {}
+        fn abort(_: *anyopaque) void {}
+    };
+    const a = std.testing.allocator;
+    var temporary = try local.common_test_directory.TestDirectory.init("seekable-source-publication");
+    defer temporary.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, temporary.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(7), .attempt = @splat(1) };
+    const bytes = try a.alloc(u8, 4 * pack_bytes + 17);
+    defer a.free(bytes);
+    @memset(bytes, 7);
+    var source: Source = .{ .bytes = bytes };
+    const phase: stores.IoPhase = .{ .io = std.testing.io, .ptr = &source, .max_parallel = 4, .begin = Source.begin, .finish = Source.finish, .abort = Source.abort };
+    store.io_phase = &phase;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const expected = try publish(a, arena.allocator(), &store, bytes, .none);
+    var memory: local.sql_memory_budget = .{ .backing = a, .limit = 3 * pack_bytes };
+    const actual = try publishSource(memory.allocator(), arena.allocator(), &store, .{ .ranges = .{ .ptr = &source, .length = bytes.len, .read_into = Source.read, .close = Source.close } }, .none);
+    try std.testing.expectEqualStrings(expected.artifact_id, actual.artifact_id);
+    try std.testing.expect(source.largest <= pack_bytes);
+    try std.testing.expectEqual(@as(usize, 0), memory.live);
+    try std.testing.expect(!memory.exhausted);
+    var fixed_bytes: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&fixed_bytes);
+    var unknown: local.sql_memory_budget = .{ .backing = fixed.allocator(), .limit = 64 * pack_bytes };
+    try std.testing.expectEqual(@as(usize, 1), uploadWidth(unknown.allocator(), &store));
 }

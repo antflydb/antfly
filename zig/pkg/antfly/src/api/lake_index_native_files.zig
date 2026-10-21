@@ -174,7 +174,7 @@ pub const OutputBudget = struct {
 /// capacity overhead. Required inline and opaque allocators retain one chunk.
 pub fn captureWidth(a: A, store: *const stores.ArtifactStore) usize {
     const phase = store.io_phase orelse return 1;
-    const available = @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(a) orelse local.sql_memory_budget.headroom(a) orelse return 1;
+    const available = @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(a) orelse return 1;
     return @max(1, @min(stores.ArtifactStore.max_upload_batch, phase.max_parallel, available / (2 * chunk_bytes)));
 }
 
@@ -1490,4 +1490,40 @@ test "external lake chunk upload metadata transfer unwinds every output allocati
     var store = fs.artifactStore();
     store.upload_scope = .{ .domain = @splat(7), .attempt = @splat(1) };
     try std.testing.checkAllAllocationFailures(a, Fixture.run, .{&store});
+}
+
+test "external lake native capture stays serial through opaque SQL backing quotas" {
+    const Fixture = struct {
+        fn begin(_: *anyopaque, _: usize) !void {}
+        fn finish(_: *anyopaque) !void {}
+        fn abort(_: *anyopaque) void {}
+    };
+    const a = std.testing.allocator;
+    var temporary = try local.common_test_directory.TestDirectory.init("opaque-native-capture");
+    defer temporary.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, temporary.path());
+    defer fs.deinit();
+    var original = fs.artifactStore();
+    original.upload_scope = .{ .domain = @splat(7), .attempt = @splat(1) };
+    const bytes = try a.alloc(u8, 2 * chunk_bytes);
+    defer a.free(bytes);
+    @memset(bytes, 7);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var generation: u64 = bytes.len;
+    const file = try publishBytes(out, "manifest.bin", bytes, &original, .none, &generation, null);
+    var source: Reader = .{ .root = .{ .domain = @splat(7), .files = &.{file} }, .prefix = "/candidate", .store = original, .context = .{}, .scratch = a };
+    defer source.deinit();
+    const capability: stores.IoPhase = .{ .io = std.testing.io, .ptr = &fs, .max_parallel = 2, .begin = Fixture.begin, .finish = Fixture.finish, .abort = Fixture.abort };
+    var parallel = original;
+    parallel.io_phase = &capability;
+    var buffer: [512 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    var memory: local.sql_memory_budget = .{ .backing = fixed.allocator(), .limit = 16 * 1024 * 1024 };
+    try std.testing.expectEqual(@as(usize, 1), captureWidth(memory.allocator(), &parallel));
+    generation = bytes.len;
+    const captured = try publishPrefix(memory.allocator(), out, source.storage(), "/candidate/manifest.bin", "manifest.bin", bytes.len, &parallel, .none, &generation, null);
+    try std.testing.expectEqual(@as(usize, 0), memory.live);
+    for (file.chunks, captured.chunks) |old, current| try std.testing.expectEqualStrings(old.artifact_id, current.artifact_id);
 }

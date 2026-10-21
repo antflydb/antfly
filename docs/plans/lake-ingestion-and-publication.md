@@ -3379,8 +3379,8 @@ uploading segments and summaries that a later tier immediately reads and merges.
 Only final packs produce seekable artifacts and term summaries. Private inputs
 carry explicit retained file ownership, and range readers borrow that ownership
 until the merge drains. The existing four tiers and eight-input fan-in bound
-resident descriptors and open files; a separate 64 MiB spill quota bounds their
-live payloads. Files are unlinked on creation and closed on success, allocation
+resident descriptors and open files; a separate 128 MiB spill quota bounds their
+live payloads, including one streamed output alongside retained tier inputs. Files are unlinked on creation and closed on success, allocation
 failure, backend error, or cancellation. Local range reads and writes use the
 publication I/O capability, and each tier releases its merge workspace before
 opening the next. Final roots retain ordinary durable references only; restart
@@ -3426,3 +3426,55 @@ when supplied its local replay; coordinate, rank, restart, append, replacement,
 and removal checks remain in that same test. Allocation fault injection checks
 private segment file/allocator cleanup. These contracts establish work reduction;
 cloud latency and identical full-archive throughput remain qualification work.
+
+
+### Streamed compaction, local metadata forests, and producer handoff
+
+Both canonical per-file merges and cross-file serving merges now write through
+one buffered native segment sink backed by an unlinked, quota-accounted spill
+file. The sink supports random table patches and bounded checksum reads; the
+existing segment writer tracks append checksums and rereads only patched pages.
+Its append buffer is 16 KiB. Outputs retain the 32 MiB serving format limit, but
+no complete encoded output is allocated in memory. Final publication captures
+at most one admitted wave of 1 MiB packs from an immutable source. Navigation
+bundles remain capped at 1 MiB, and admission and term summaries read the same
+local source. Per-tier workspaces are released before promoting a staged file.
+The global 128 MiB spill quota accommodates retained small tier inputs plus one
+bounded output. Canonical merge spill has its own 32 MiB limit. Required inline
+and opaque allocator chains use one capture; optional batching never substitutes
+a permissive SQL-only estimate for unknown backing or external admission limits.
+
+Operation-private file, segment, routing, ownership, source-route, tie-bound, and
+checkpoint-file mutation forests now write their intermediate pages to local
+spill, then stream final records into the durable destination. Each forest has a
+fixed 4096-bucket directory (32 KiB) and one spill file; collision links and page
+payloads live on disk rather than in a growing heap map. Page authentication,
+namespace domains, attempts, cancellation, and spill quotas still apply. Local
+I/O borrows publication admission when available. Final tree construction uses
+ordinary artifact references; private references cannot escape through leaf
+record copying. Durable DF/statistics delta forests remain cloud-backed because
+their authenticated closure is required to resume a checkpoint. Local mutation
+files and all their buffers are reclaimed at operation teardown.
+
+Canonical file production now hands fresh manifest bytes to the operation-local
+metadata cache before releasing the file arena. Ordinary fresh groups reuse the
+JSON already serialized for publication; normalized paged groups retain their
+expanded spans. Both canonical metadata reduction and serving compaction read
+this handoff, eliminating the first fresh-manifest GET as well as the later one.
+The cache retains its 128 MiB disk bound and adds a fixed 4096-bucket directory;
+it supports repeated, unordered consumers without a per-file heap map. Reused
+checkpoint groups, cache capacity misses, and optional allocation failures use
+the authenticated artifact path. An OOM retires partial decode state before the
+required retry. Cancellation and integrity failures remain fatal. The cache is
+private to the attempt and does not change checkpoint or publication formats.
+
+Regression contracts include serial success through a 512 KiB opaque backing
+wrapped by a larger SQL budget, zero provider writes/reads during private
+metadata-run construction, rejection of fresh-manifest GETs during real Parquet
+file-first publication, repeated unordered cache consumers, and identical pack
+identities for contiguous and bounded range sources. A 4 MiB sink output is
+constructed with a 128 KiB allocator limit; native memory/file sink bytes are
+identical, including patched tables and checksums. Cross-file tests continue to
+cover coordinates, ranking ties, restart, append/replacement/removal, exact root
+identity after cache OOM, and allocation-failure cleanup. These are deterministic
+work/memory contracts; full-archive and cloud-provider latency remain unmeasured.

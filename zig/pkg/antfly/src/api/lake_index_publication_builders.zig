@@ -814,7 +814,55 @@ test "external lake file-first publication shares one decode across five native 
     args.a = a;
     var streaming_scheduler: local.sql_parallel_scheduler.Scheduler = .{ .max_bytes = 128 * 1024 * 1024 };
     args.scheduler = &streaming_scheduler;
+
+    // Fresh canonical/serving groups must flow through the local producer
+    // handoff. Reject a provider GET of any group written by this build.
+    const ManifestProbe = struct {
+        var active: *@This() = undefined;
+        backend: stores.ArtifactStore,
+        mutex: std.atomic.Mutex = .unlocked,
+        ids: [64][32]u8 = undefined,
+        count: usize = 0,
+        fn put(_: *anyopaque, alloc: A, scope: stores.UploadScope, data: []const u8, token: Token) !stores.ArtifactMetadata {
+            const self = active;
+            var backend = self.backend;
+            backend.allocator = alloc;
+            const metadata = try backend.putScoped(scope, data, token);
+            if (std.mem.startsWith(u8, data, "{\"file\":")) {
+                @import("antfly_platform").sync.lockYielding(&self.mutex);
+                defer self.mutex.unlock();
+                std.debug.assert(self.count < self.ids.len);
+                self.ids[self.count] = @import("lake_index_term_directory.zig").identity(metadata.artifact_id);
+                self.count += 1;
+            }
+            return metadata;
+        }
+        fn read(_: *anyopaque, alloc: A, id: []const u8, maximum: usize, token: Token) ![]u8 {
+            const self = active;
+            const key = @import("lake_index_term_directory.zig").identity(id);
+            {
+                @import("antfly_platform").sync.lockYielding(&self.mutex);
+                defer self.mutex.unlock();
+                for (self.ids[0..self.count]) |fresh| if (std.mem.eql(u8, &key, &fresh)) return error.InjectedReadFailure;
+            }
+            const data = try self.backend.getAllocWithCancellationUsingAllocator(alloc, id, token);
+            errdefer alloc.free(data);
+            if (data.len > maximum) return error.ArtifactTooLarge;
+            return data;
+        }
+    };
+    var manifest_probe: ManifestProbe = .{ .backend = store };
+    ManifestProbe.active = &manifest_probe;
+    const original_vtable = store.vtable;
+    var manifest_vtable = store.vtable.*;
+    manifest_vtable.put_scoped = ManifestProbe.put;
+    manifest_vtable.get_bounded_alloc_with_cancellation = ManifestProbe.read;
+    store.vtable = &manifest_vtable;
+    defer store.vtable = original_vtable;
     const result = (try build(args)) orelse return error.TestUnexpectedResult;
+    store.vtable = original_vtable;
+    try std.testing.expect(manifest_probe.count >= 6);
+
     try std.testing.expect(streaming_scheduler.peak_io_workers > 0);
     try std.testing.expect(replay.read_ahead_hits > 0);
     try std.testing.expectEqual(@as(usize, 0), streaming_scheduler.workers);

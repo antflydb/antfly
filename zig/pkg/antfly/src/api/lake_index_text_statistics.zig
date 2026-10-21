@@ -153,6 +153,10 @@ pub fn publishSegment(a: A, store: *stores.ArtifactStore, bytes: []const u8, can
 pub fn publishSegmentWithIo(a: A, store: *stores.ArtifactStore, bytes: []const u8, cancellation: Cancellation, io: ?std.Io) !?Ref {
     var segment = try local.segment.SegmentReader.init(a, bytes);
     defer segment.deinit();
+    return publishReaderWithIo(a, store, &segment, cancellation, io);
+}
+/// The immutable source remains caller-owned, including file-backed outputs.
+pub fn publishReaderWithIo(a: A, store: *stores.ArtifactStore, segment: *local.segment.SegmentReader, cancellation: Cancellation, io: ?std.Io) !?Ref {
     const names = try a.alloc([]const u8, segment.fields.len);
     defer a.free(names);
     for (segment.fields, names) |field, *name| name.* = field.name;
@@ -214,7 +218,7 @@ pub fn publishSegmentWithIo(a: A, store: *stores.ArtifactStore, bytes: []const u
             }
         }
     };
-    var source: Source = .{ .a = a, .segment = &segment, .names = names };
+    var source: Source = .{ .a = a, .segment = segment, .names = names };
     defer source.close();
     defer if (source.key) |key| a.free(key);
     const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;

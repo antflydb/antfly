@@ -514,18 +514,21 @@ pub const ManifestReader = struct {
     }
 };
 
-/// Sequential, operation-private metadata replay. The quota bounds disk rather
-/// than retaining decoded groups or a per-file lookup map. A full spool keeps
-/// its complete prefix; remaining inputs use ordinary authenticated reads.
+/// Operation-private metadata handoff with a fixed hash directory on top of
+/// quota-accounted spill. Multiple consumers can read in any order without
+/// retaining decoded groups or a per-file heap map. Misses use artifact reads.
 pub const ManifestReplay = struct {
     token: Cancellation,
     manager: local.sql_spill.Manager = undefined,
     file: ?local.sql_spill.File = null,
     count: usize = 0,
     consumed: usize = 0,
+    hits: usize = 0,
     offset: u64 = 0,
     full: bool = false,
-    const header_bytes = 72;
+    heads: [4096]u64 = @splat(0),
+    phase: ?*const stores.IoPhase = null,
+    const header_bytes = 80;
     pub fn init(self: *ManifestReplay, a: A, io: std.Io, token: Cancellation) void {
         self.* = .{ .token = token };
         self.manager = .{ .alloc = a, .io = io, .context = self, .checkpoint = check, .max_bytes = 128 * 1024 * 1024, .async_writes = false };
@@ -545,6 +548,7 @@ pub const ManifestReplay = struct {
         self.consumed = 0;
         self.offset = 0;
         self.full = true;
+        self.heads = @splat(0);
     }
     pub fn append(self: *ManifestReplay, a: A, ref: artifacts.ChunkRef, group: FileGroup) !void {
         try self.token.check();
@@ -563,6 +567,28 @@ pub const ManifestReplay = struct {
             return;
         };
         defer a.free(bytes);
+        try self.appendEncodedInner(ref, bytes);
+    }
+    /// Reuse the canonical producer's JSON bytes when no normalization is
+    /// needed. Both later consumers use a bounded disk hash index, independent
+    /// of scan order, resume holes, and consumer order.
+    fn appendEncoded(self: *ManifestReplay, ref: artifacts.ChunkRef, bytes: []const u8) !void {
+        try self.token.check();
+        if (self.full) return;
+        self.appendEncodedInner(ref, bytes) catch |err| {
+            self.discard();
+            try self.token.check();
+            if (err == error.Canceled) return err;
+        };
+    }
+    fn begin(self: *ManifestReplay) !stores.IoGuard {
+        if (self.phase) |phase| try phase.begin(phase.ptr, 1);
+        return .{ .phase = self.phase };
+    }
+    fn bucket(id: [32]u8) usize {
+        return std.mem.readInt(u16, id[0..2], .little) % 4096;
+    }
+    fn appendEncodedInner(self: *ManifestReplay, ref: artifacts.ChunkRef, bytes: []const u8) !void {
         if (bytes.len > 2 * max_root_bytes or bytes.len + header_bytes > self.manager.max_bytes -| self.manager.live_bytes) {
             self.full = true;
             return;
@@ -570,32 +596,88 @@ pub const ManifestReplay = struct {
         if (self.file == null) self.file = try self.manager.create();
         var header: [header_bytes]u8 = undefined;
         std.mem.writeInt(u64, header[0..8], bytes.len, .little);
-        header[8..40].* = term_directory.identity(ref.artifact_id);
+        const id = term_directory.identity(ref.artifact_id);
+        header[8..40].* = id;
         std.crypto.hash.sha2.Sha256.hash(bytes, header[40..72], .{});
+        std.mem.writeInt(u64, header[72..80], self.heads[bucket(id)], .little);
         const offset = self.file.?.size;
-        try self.file.?.writeRaw(offset, &header);
-        try self.file.?.writeRaw(offset + header.len, bytes);
+        var guard = try self.begin();
+        defer guard.abort();
+        self.file.?.writeRaw(offset, &header) catch |err| return guard.failed(err);
+        self.file.?.writeRaw(offset + header.len, bytes) catch |err| return guard.failed(err);
+        try guard.finish();
+        self.heads[bucket(id)] = offset + 1;
         self.count += 1;
+    }
+    fn find(self: *ManifestReplay, ref: artifacts.ChunkRef) !?u64 {
+        const id = term_directory.identity(ref.artifact_id);
+        var following = self.heads[bucket(id)];
+        if (following == 0) return null;
+        var guard = try self.begin();
+        defer guard.abort();
+        while (following != 0) {
+            const offset = following - 1;
+            var header: [header_bytes]u8 = undefined;
+            self.file.?.readRaw(offset, &header) catch |err| return guard.failed(err);
+            if (std.mem.eql(u8, header[8..40], &id)) {
+                try guard.finish();
+                return offset;
+            }
+            following = std.mem.readInt(u64, header[72..80], .little);
+            if (following != 0 and following - 1 >= offset) return error.InvalidNativeLakeTextCorpus;
+        }
+        try guard.finish();
+        return null;
+    }
+    pub fn contains(self: *ManifestReplay, ref: artifacts.ChunkRef) !bool {
+        const found = self.find(ref) catch |err| {
+            if (err != error.OutOfMemory) return err;
+            self.discard();
+            return false;
+        };
+        return found != null;
+    }
+    pub fn lookup(self: *ManifestReplay, a: A, ref: artifacts.ChunkRef, domain: [32]u8) !?FileGroup {
+        const offset = (try self.find(ref)) orelse return null;
+        const group = (try self.readAt(a, ref, domain, offset)).group;
+        self.hits += 1;
+        return group;
     }
     pub fn next(self: *ManifestReplay, a: A, ref: artifacts.ChunkRef, domain: [32]u8) !?FileGroup {
         if (self.consumed == self.count) return null;
+        const frame = try self.readAt(a, ref, domain, self.offset);
+        self.offset += header_bytes + frame.bytes;
+        self.consumed += 1;
+        return frame.group;
+    }
+    fn readAt(self: *ManifestReplay, a: A, ref: artifacts.ChunkRef, domain: [32]u8, offset: u64) !struct { group: FileGroup, bytes: u64 } {
         try text_directory.validateRef(ref, domain);
+        var guard = try self.begin();
+        defer guard.abort();
         var header: [header_bytes]u8 = undefined;
-        try self.file.?.readRaw(self.offset, &header);
+        self.file.?.readRaw(offset, &header) catch |err| return guard.failed(err);
         if (!std.mem.eql(u8, header[8..40], &term_directory.identity(ref.artifact_id))) return error.InvalidNativeLakeTextCorpus;
         const length = std.mem.readInt(u64, header[0..8], .little);
         if (length == 0 or length > 2 * max_root_bytes) return error.InvalidNativeLakeTextCorpus;
         const bytes = try a.alloc(u8, @intCast(length));
         defer a.free(bytes);
-        try self.file.?.readRaw(self.offset + header.len, bytes);
+        self.file.?.readRaw(offset + header.len, bytes) catch |err| return guard.failed(err);
+        try guard.finish();
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
         if (!std.mem.eql(u8, &digest, header[40..72])) return error.InvalidNativeLakeTextCorpus;
         const group = try std.json.parseFromSliceLeaky(FileGroup, a, bytes, .{ .allocate = .alloc_always });
         try group.validate(domain);
-        self.offset += header.len + length;
-        self.consumed += 1;
-        return group;
+        return .{ .group = group, .bytes = length };
+    }
+    pub fn load(self: *ManifestReplay, arena: *std.heap.ArenaAllocator, reader: *ManifestReader, ref: artifacts.ChunkRef, domain: [32]u8) !FileGroup {
+        const cached = self.lookup(arena.allocator(), ref, domain) catch |err| fallback: {
+            if (err != error.OutOfMemory) return err;
+            _ = arena.reset(.free_all);
+            self.discard();
+            break :fallback null;
+        };
+        return cached orelse try reader.load(arena.allocator(), ref);
     }
 };
 
@@ -1070,6 +1152,10 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var file_arena = std.heap.ArenaAllocator.init(a);
         defer file_arena.deinit();
         var input_bytes: usize = 0;
+        var manifest_replay: ManifestReplay = undefined;
+        manifest_replay.init(a, provider.context.io orelse return error.UnsupportedSqlExecution, cancellation);
+        defer manifest_replay.deinit();
+        manifest_replay.phase = store.io_phase;
         var file_manifests: std.AutoHashMapUnmanaged(usize, artifacts.ChunkRef) = .empty;
         defer file_manifests.deinit(a);
         var checkpoint_files: ?statistics.Ref = if (seed) |old| old.checkpoint_files else null;
@@ -1119,7 +1205,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         // global DF only once, including when recovering a partial refresh.
         if (seed) |old| for (old.file_groups) |group| {
             if (plan.by_id.get(group.file.id)) |index| {
-                try file_manifests.put(a, index, try publishFileManifest(a, ca, store, group, cancellation));
+                try file_manifests.put(a, index, try publishFileManifestCached(a, ca, store, group, cancellation, &manifest_replay));
             } else {
                 for (group.summaries) |ref| try df.add(df_pages.store(), ref, -1);
             }
@@ -1166,7 +1252,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 }
                 if (group.physical_manifest == null or group.descriptors.len != group.segments.len) try text_directory.prepare(fa, store, group, cancellation);
                 if (group.summaries.len != group.segments.len) return error.InvalidNativeLakeTextCorpus;
-                try file_manifests.put(a, file_ordinal, publishFileManifest(a, ca, store, group.*, cancellation) catch |err| return buildFailure(err, "file_manifest", file_ordinal, segments.items.len));
+                try file_manifests.put(a, file_ordinal, publishFileManifestCached(a, ca, store, group.*, cancellation, &manifest_replay) catch |err| return buildFailure(err, "file_manifest", file_ordinal, segments.items.len));
                 continue;
             }
             var opening: @import("lake_index_text_opening_pack.zig").Collector = .{ .a = a, .out = fa, .store = store, .cancellation = cancellation };
@@ -1255,7 +1341,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             input_bytes = 0;
             if (group.physical_manifest == null or group.descriptors.len != group.segments.len) try text_directory.prepare(fa, store, group, cancellation);
             try group.validate(store.upload_scope.?.domain);
-            try file_manifests.put(a, file_ordinal, publishFileManifest(a, ca, store, group.*, cancellation) catch |err| return buildFailure(err, "file_manifest", file_ordinal, segments.items.len));
+            try file_manifests.put(a, file_ordinal, publishFileManifestCached(a, ca, store, group.*, cancellation, &manifest_replay) catch |err| return buildFailure(err, "file_manifest", file_ordinal, segments.items.len));
             if (previous_refs.get(file.id)) |record| {
                 const old = try loadRecordedFile(fa, store.*, record, seed.?.domain, cancellation);
                 for (old.summaries) |summary| try df.add(df_pages.store(), summary, -1);
@@ -1336,9 +1422,6 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         }
         var totals: CollectionBuilder = .{ .a = a };
         defer totals.deinit();
-        var manifest_replay: ManifestReplay = undefined;
-        manifest_replay.init(a, provider.context.io orelse return error.UnsupportedSqlExecution, cancellation);
-        defer manifest_replay.deinit();
         const publication = directory_publication: {
             var metadata_publisher: text_directory.Publisher = undefined;
             try metadata_publisher.init(a, store, cancellation, provider.context.io orelse return error.UnsupportedSqlExecution);
@@ -1352,7 +1435,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 for (removed_files.items, 0..) |record, index| {
                     _ = file_arena.reset(.free_all);
                     const group = try manifests.load(file_arena.allocator(), record.manifest);
-                    if (index + 1 < removed_files.items.len) manifests.prefetch(removed_files.items[index + 1].manifest) else if (added_files.items.len != 0) manifests.prefetch(added_files.items[0].manifest);
+                    if (index + 1 < removed_files.items.len) manifests.prefetch(removed_files.items[index + 1].manifest) else if (added_files.items.len != 0 and !try manifest_replay.contains(added_files.items[0].manifest)) manifests.prefetch(added_files.items[0].manifest);
                     try metadata_publisher.add(group, record.manifest, true);
                     try totals.add(group, true);
                     if (incremental_directory) for (group.summaries, group.segments) |summary, segment| {
@@ -1362,9 +1445,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             }
             for (added_files.items, 0..) |record, index| {
                 _ = file_arena.reset(.free_all);
-                const group = try manifests.load(file_arena.allocator(), record.manifest);
-                try manifest_replay.append(a, record.manifest, group);
-                if (index + 1 < added_files.items.len) manifests.prefetch(added_files.items[index + 1].manifest);
+                const group = try manifest_replay.load(&file_arena, &manifests, record.manifest, scope.domain);
+                if (index + 1 < added_files.items.len and !try manifest_replay.contains(added_files.items[index + 1].manifest)) manifests.prefetch(added_files.items[index + 1].manifest);
                 try metadata_publisher.add(group, record.manifest, false);
                 for (group.summaries, group.segments) |summary, segment| {
                     try addStatisticsContribution(a, stats_pages.store(), summary, term_directory.identity(segment.artifact_id), 1, null, &directory_builder);
@@ -1759,6 +1841,9 @@ fn presentManifests(a: A, slots: []const ?artifacts.ChunkRef) ![]const artifacts
     return refs.toOwnedSlice(a);
 }
 pub fn publishFileManifest(a: A, out: A, store: *stores.ArtifactStore, group: FileGroup, cancellation: Cancellation) !artifacts.ChunkRef {
+    return publishFileManifestCached(a, out, store, group, cancellation, null);
+}
+fn publishFileManifestCached(a: A, out: A, store: *stores.ArtifactStore, group: FileGroup, cancellation: Cancellation, replay: ?*ManifestReplay) !artifacts.ChunkRef {
     var wire = group;
     if (wire.source_pages.len != 0) wire.sources = &.{};
     const bytes = try std.json.Stringify.valueAlloc(a, wire, .{});
@@ -1768,7 +1853,11 @@ pub fn publishFileManifest(a: A, out: A, store: *stores.ArtifactStore, group: Fi
     upload.allocator = out;
     const ref = try upload.putWithCancellation(bytes, cancellation);
     defer if (ref.provider_version) |version| upload.allocator.free(version);
-    return .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
+    const result: artifacts.ChunkRef = .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
+    if (replay) |handoff| {
+        if (group.source_pages.len == 0 and group.members.len == 0) try handoff.appendEncoded(result, bytes) else if (group.members.len == 0 and group.sources.len == group.source_count) try handoff.append(a, result, group);
+    }
+    return result;
 }
 fn publishRoot(a: A, out: A, store: *stores.ArtifactStore, name: []const u8, root: Root, cancellation: Cancellation) !Declared {
     try root.validate();
@@ -1823,29 +1912,34 @@ const Compactor = struct {
         if (self.count == 0) return;
         defer self.deinit();
         try self.cancellation.check();
-        if (self.count == fan_in) {
+        if (self.count == fan_in and self.io != null) {
             // Optional acceleration cannot exhaust the publication allocator.
             // A pathological dictionary/source shape falls back to the exact
             // original runs, rather than failing ingestion or raising limits.
             var budget: local.sql_memory_budget = .{ .backing = self.a, .limit = @min(self.workspace_bytes, local.sql_memory_budget.headroom(self.a) orelse self.workspace_bytes) };
             const a = budget.allocator();
-            const merged = self.merge(a) catch |err| switch (err) {
-                error.OutOfMemory => null,
+            var manager: local.sql_spill.Manager = .{ .alloc = self.a, .io = self.io.?, .context = self, .checkpoint = check, .max_bytes = 32 * 1024 * 1024, .async_writes = false };
+            defer manager.deinit();
+            const merged = self.merge(a, &manager) catch |err| switch (err) {
+                error.OutOfMemory, error.NativeLakeTextCorpusTooLarge => null,
                 else => return err,
             };
-            if (merged) |bytes| {
-                defer a.free(bytes);
+            if (merged) |staged| {
+                defer staged.release();
                 // A merge must save an artifact and respect the serving cap.
-                if (bytes.len <= 32 * 1024 * 1024 and bytes.len <= self.bytes + 64 * 1024) {
+                if (staged.file.size <= self.bytes + 64 * 1024) {
                     try self.cancellation.check();
-                    try self.publish(bytes);
+                    try self.publishSource(staged.source());
                     return;
                 }
             }
         }
         for (self.pending[0..self.count]) |bytes| try self.publish(bytes.?);
     }
-    fn merge(self: *Compactor, a: A) ![]u8 {
+    fn check(raw: *anyopaque) !void {
+        try @as(*Compactor, @ptrCast(@alignCast(raw))).cancellation.check();
+    }
+    fn merge(self: *Compactor, a: A, manager: *local.sql_spill.Manager) !*@import("lake_index_segment_spill.zig").LocalSegment {
         var readers: [fan_in]local.segment.SegmentReader = undefined;
         var opened: usize = 0;
         defer for (readers[0..opened]) |*reader| reader.deinit();
@@ -1855,23 +1949,31 @@ const Compactor = struct {
             opened += 1;
             input.* = .{ .reader = reader };
         }
-        return local.segment.mergeSegmentInputs(a, &inputs);
+        const staged = try @import("lake_index_segment_spill.zig").LocalSegment.empty(self.a, manager, self.store);
+        errdefer staged.release();
+        var sink = staged.sink();
+        try local.segment.writeMergedSegmentToSink(a, &sink, &inputs);
+        try staged.seal();
+        return staged;
     }
     fn publish(self: *Compactor, bytes: []const u8) !void {
+        return self.publishSource(.{ .contiguous = bytes });
+    }
+    fn publishSource(self: *Compactor, source: local.index.SegmentSource) !void {
         const a = self.a;
         const out = self.out;
         const cancellation = self.cancellation;
         const store = self.store;
         const segments = self.segments;
         try cancellation.check();
-        if (segments.items.len == max_segments or bytes.len > 32 * 1024 * 1024) return error.NativeLakeTextCorpusTooLarge;
+        if (segments.items.len == max_segments or source.len() > 32 * 1024 * 1024) return error.NativeLakeTextCorpusTooLarge;
         var upload = store.*;
         upload.allocator = out;
-        const ref = @import("lake_index_seekable_text.zig").publishWithOpeningCollector(a, out, &upload, bytes, cancellation, self.opening) catch |err| return buildFailure(err, "segment_packs", self.file_ordinal, segments.items.len);
-        var reader = try local.segment.SegmentReader.init(a, bytes);
+        const ref = @import("lake_index_seekable_text.zig").publishSourceWithOpeningCollector(a, out, &upload, source, cancellation, self.opening) catch |err| return buildFailure(err, "segment_packs", self.file_ordinal, segments.items.len);
+        var reader = try local.segment.SegmentReader.initSource(a, source);
         defer reader.deinit();
         try self.admissions.append(out, try reader.admission(out));
-        const summary = statistics.publishSegmentWithIo(a, store, bytes, cancellation, self.io) catch |err| return buildFailure(err, "segment_statistics", self.file_ordinal, segments.items.len);
+        const summary = statistics.publishReaderWithIo(a, store, &reader, cancellation, self.io) catch |err| return buildFailure(err, "segment_statistics", self.file_ordinal, segments.items.len);
         try self.summaries.append(out, summary);
         try segments.append(out, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len });
     }
@@ -1978,7 +2080,7 @@ test "external lake text compaction preserves all physical keys in input order" 
         var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
         var summaries: std.ArrayList(?statistics.Ref) = .empty;
         var admissions: std.ArrayList(local.segment.SegmentReader.Admission) = .empty;
-        var compactor: Compactor = .{ .a = a, .out = ca, .store = &store, .segments = &segments, .summaries = &summaries, .admissions = &admissions, .cancellation = .none, .file_ordinal = 0, .workspace_bytes = workspace };
+        var compactor: Compactor = .{ .a = a, .out = ca, .store = &store, .segments = &segments, .summaries = &summaries, .admissions = &admissions, .cancellation = .none, .file_ordinal = 0, .workspace_bytes = workspace, .io = std.testing.io };
         defer compactor.deinit();
         // Eight tiny runs become one; the next current-data run remains separate.
         const file_id: [64]u8 = @splat('0');
@@ -2368,4 +2470,48 @@ test "external lake publication metadata replay declines allocation failures aft
         } else try std.testing.expectEqual(@as(usize, 1), replay.count);
     }
     try std.testing.expect(saw_open_failure);
+}
+
+test "external lake publication metadata replay captures producer bytes for repeated unordered consumers" {
+    const Denied = struct {
+        fn read(_: *anyopaque, _: A, _: []const u8, _: usize, _: Cancellation) ![]u8 {
+            return error.InjectedReadFailure;
+        }
+    };
+    const a = std.testing.allocator;
+    var temporary = try local.common_test_directory.TestDirectory.init("producer-manifest-handoff");
+    defer temporary.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, temporary.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(7), .attempt = @splat(1) };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var replay: ManifestReplay = undefined;
+    replay.init(a, std.testing.io, .none);
+    defer replay.deinit();
+    const first: FileGroup = .{ .file = .{ .id = "first", .digest = @splat(1) }, .segments = &.{} };
+    const second: FileGroup = .{ .file = .{ .id = "second", .digest = @splat(2) }, .segments = &.{} };
+    const one = try publishFileManifestCached(a, arena.allocator(), &store, first, .none, &replay);
+    const two = try publishFileManifestCached(a, arena.allocator(), &store, second, .none, &replay);
+    const missing = try publishFileManifest(a, arena.allocator(), &store, .{ .file = .{ .id = "resumed", .digest = @splat(3) }, .segments = &.{} }, .none);
+    var denied = store;
+    var vtable = store.vtable.*;
+    vtable.get_bounded_alloc_with_cancellation = Denied.read;
+    denied.vtable = &vtable;
+    var reader: ManifestReader = .{ .a = a, .store = denied, .domain = store.upload_scope.?.domain, .token = .none };
+    defer reader.deinit();
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    for (0..2) |_| {
+        _ = scratch.reset(.free_all);
+        try std.testing.expectEqualStrings("second", (try replay.load(&scratch, &reader, two, store.upload_scope.?.domain)).file.id);
+        try std.testing.expect(!try replay.contains(missing));
+        try std.testing.expect(try replay.lookup(scratch.allocator(), missing, store.upload_scope.?.domain) == null);
+        _ = scratch.reset(.free_all);
+        try std.testing.expectEqualStrings("first", (try replay.load(&scratch, &reader, one, store.upload_scope.?.domain)).file.id);
+    }
+    try std.testing.expectEqual(@as(usize, 4), replay.hits);
+    // A resumed/cache-missing group still follows the required provider path.
+    try std.testing.expectError(error.InjectedReadFailure, replay.load(&scratch, &reader, missing, store.upload_scope.?.domain));
 }

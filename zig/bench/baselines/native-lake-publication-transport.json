@@ -16,7 +16,8 @@
     },
     "unchanged_refresh_new_uploads": 0,
     "ordered_parallel_and_inline_identities": "equal",
-    "failure_contract": "drain children, release metadata, restore CPU before returning backend error"
+    "failure_contract": "drain children, release metadata, restore CPU before returning backend error",
+    "capture_width_with_opaque_sql_backing": 1
   },
   "tree_publication": {
     "page_cache_forwards_batched_writes": true,
@@ -29,7 +30,11 @@
       "per-segment text summaries",
       "durable document frequency and term-directory deltas",
       "text file, segment, routing, and checkpoint directories"
-    ]
+    ],
+    "private_metadata_intermediate_provider_writes": 0,
+    "private_metadata_intermediate_provider_reads": 0,
+    "private_metadata_hash_buckets_per_forest": 4096,
+    "checkpointed_statistics_forests_remain_durable": true
   },
   "text_publication": {
     "shared_manifest_consumers": [
@@ -78,7 +83,7 @@
     "maximum_retained_text_column_bytes": 8388608,
     "typed_projection_reference_segment_identity": "equal across schema, selected-field, stored-source and borrowing modes",
     "unleased_projection_payloads": "owned copies",
-    "maximum_compaction_intermediate_spill_bytes": 67108864,
+    "maximum_compaction_intermediate_spill_bytes": 134217728,
     "maximum_canonical_metadata_replay_bytes": 134217728,
     "canonical_replay_quota_fallback": "complete prefix replayed; remaining manifests fetched normally",
     "canonical_manifests_in_compaction_test": 128,
@@ -89,7 +94,19 @@
     "prefetch_uses_required_reducer_quota": false,
     "maximum_prefetch_retained_reservation_bytes": 8454144,
     "canonical_replay_write_failure": "discard partial cache and use authenticated artifacts",
-    "canonical_replay_decode_oom": "reset partial decode, discard cache, retry authenticated artifacts with identical root"
+    "canonical_replay_decode_oom": "reset partial decode, discard cache, retry authenticated artifacts with identical root",
+    "compaction_output": "buffered native SegmentSink to private spill; no contiguous output",
+    "compaction_sink_append_buffer_bytes": 16384,
+    "streamed_output_bytes_in_memory_test": 4194304,
+    "streamed_output_allocator_limit_bytes": 131072,
+    "native_memory_and_file_sink_bytes": "identical",
+    "source_pack_capture_payload_bytes": 1048576,
+    "source_publication_payload_bytes_in_test": 4194321,
+    "source_publication_allocator_limit_bytes": 3145728,
+    "canonical_replay_hash_buckets": 4096,
+    "canonical_replay_consumers": "canonical metadata reduction and serving compaction, independent order",
+    "fresh_manifest_provider_gets_during_file_first_parquet_build": 0,
+    "ordinary_fresh_manifest_serializations": 1
   },
   "qualification_outstanding": [
     "Controlled identical-fixture base/head HN one-file and 1024-file latency and post-GC footprint",
