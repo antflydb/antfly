@@ -146124,7 +146124,7 @@ test "db prepared transaction effects required contender scans retain membership
     }
     var owned = try captured.take();
     defer owned.deinit();
-    try std.testing.expect(owned.cursors.items.len >= 2);
+    try std.testing.expect(owned.ranges.items.len >= 2);
     try owned.validate(db.core.store, null);
     const earlier = try internal_keys.graphGlobalEdgeContenderKeyAlloc(scratch, "g", 1, edge, 5, "earlier");
     try db.core.store.put(earlier, try graph_edge_contender.encodeAlloc(scratch, 1, 5, edge, "earlier", payload));
@@ -146630,7 +146630,7 @@ test "db prepared transaction effects required observation seal validates before
     {
         db.core.lockApply();
         defer db.core.unlockApply();
-        try db.core.index_manager.aggregateAuthoritativeReaderVersion(db.core.store, versions.read_observations_reader_version);
+        try db.core.index_manager.aggregateAuthoritativeReaderVersion(db.core.store, versions.read_ranges_reader_version);
         _ = try db.core.beginTransactionRequiringPreparedEffectsWithBinding(id, 1, 1, &.{}, false, true, .{ .mode = .deferred }, binding, .{}, null);
     }
     try db.core.store.put("read-input", "before");
@@ -146638,6 +146638,11 @@ test "db prepared transaction effects required observation seal validates before
     defer observed.deinit();
     const value = try reads.observe(db.core.store, &observed).get(a, "read-input");
     a.free(value);
+    const page = try reads.observe(db.core.store, &observed).scanPrefixKeysPage(a, "read-", null, 1);
+    defer {
+        for (page) |key| a.free(key);
+        a.free(page);
+    }
     try observed.finish();
     const frame = blk: {
         var manager = try db.core.initTxnManager();
@@ -146674,6 +146679,7 @@ test "db prepared transaction effects required observation seal validates before
         defer manager.deinit();
         var recovered = (try manager.loadPreparedReadObservations(a, id, namespace, binding, null)).?;
         defer recovered.deinit();
+        try std.testing.expectEqual(@as(usize, 1), recovered.ranges.items.len);
         try recovered.validate(db.core.store, null);
         var compiled = try db.core.compilePreparedReadFootprint(a, id, binding, null);
         defer compiled.deinit();

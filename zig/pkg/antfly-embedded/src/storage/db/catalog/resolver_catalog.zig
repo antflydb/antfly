@@ -76,6 +76,7 @@ pub const grouped_sources_reader_version = reader_versions.grouped_sources_reade
 pub const namespace_curation_reader_version = reader_versions.namespace_curation_reader_version;
 pub const prepared_transaction_reader_version = reader_versions.prepared_transaction_reader_version;
 pub const read_observations_reader_version = reader_versions.read_observations_reader_version;
+pub const read_ranges_reader_version = reader_versions.read_ranges_reader_version;
 pub const supported_reader_version = reader_versions.supported_reader_version;
 pub const curation_provenance_reader_version = reader_versions.curation_provenance_reader_version;
 pub const scoped_curation_reader_version = reader_versions.scoped_curation_reader_version;
@@ -96,6 +97,7 @@ pub fn readerVersionBytes(version: u32) ![]const u8 {
         12 => "12",
         13 => "13",
         14 => "14",
+        15 => "15",
         else => error.UnsupportedDatabaseReaderVersion,
     };
 }

@@ -88,7 +88,9 @@ const builtin = @import("builtin");
 // Reject owners which can silently drop that durable preparation state.
 // Snapshot cursor semantics are explicit when compiling read-conflict gaps.
 // Reject older capability layouts before trusting those semantics.
-pub const abi_version: u32 = 57;
+// Semantic range observations own bounds and membership predicates.
+// Fence prior native owners before interpreting the expanded read set.
+pub const abi_version: u32 = 58;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

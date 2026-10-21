@@ -28,7 +28,9 @@ const failure_abi = @import("runtime_failure_abi");
 // Reject owners which can silently drop that durable preparation state.
 // Snapshot cursor semantics are explicit when compiling read-conflict gaps.
 // Reject older capability layouts before trusting those semantics.
-pub const abi_version: u32 = 115;
+// Semantic range observations own bounds and membership predicates.
+// Fence prior native owners before interpreting the expanded read set.
+pub const abi_version: u32 = 116;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

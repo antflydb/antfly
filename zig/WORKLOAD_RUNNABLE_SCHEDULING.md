@@ -6590,3 +6590,20 @@ pure assembly, executable recovery/derived-log funding, lifetimes, raw/import/
 restore/restart/peer eligibility, normal required PREPARE and broader fair/default/
 session/tenant/remote rollout remain incomplete. Strong defaults off, full goal
 active; full Linux qualification waived; no push.
+
+### Semantic scan observations (2026-10-21)
+
+Observed bounded scans, prefix reads, key pages and prefix probes now retain
+owned semantic intervals without unused out-of-range stopping rows. Key-only
+pages track membership separately from payload dependencies. ATRO v2 ranges
+require reader 15 at acceptance and recovery; range-free ATRO v1 remains
+reader 14. Native ABI 58/storage owner 116 fence the expanded layout.
+Focused native/memory, native reopen, counter/group/cleanup and ABI checks pass:
+239 fresh executions, 106/106 build steps, no skips/failures/leaks. Latest main
+`ae0b8856fd` was merged as `6a2992f3b7` in the same worktree/branch/PR.
+See [the implementation ledger](WORKLOAD_POOLING_IMPLEMENTATION.md) for exact
+scope. Atomic predicate registration/recovery, all-writer enforcement and
+actor-bound retirement remain next; in-range mandatory control dependencies
+still require refinement. Stronger remote-read defaults and normal required
+PREPARE integration remain disabled. The whole design remains incomplete;
+full Linux qualification remains waived.

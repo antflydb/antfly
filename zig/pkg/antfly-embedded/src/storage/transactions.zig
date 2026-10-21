@@ -1712,7 +1712,7 @@ pub const TxnManager = struct {
         if (trace.failure) |cause| return cause;
     }
 
-    fn requireReadObservationReader(self: *TxnManager, control: ?read_control.Port) !void {
+    fn requireReadObservationReader(self: *TxnManager, control: ?read_control.Port, required: u32) !void {
         if (control) |owner| try owner.checkpoint();
         if (!self.store.capabilities().accounted_prepared_observations) return error.Unsupported;
         const catalog = @import("db/catalog/resolver_catalog.zig");
@@ -1729,7 +1729,7 @@ pub const TxnManager = struct {
         var floors: Floors = .{ .txn = &read };
         const minimum = try catalog.readMinimumReaderVersion(&floors, catalog.supported_reader_version);
         const authoritative = try catalog.readAuthoritativeReaderVersion(&floors, catalog.supported_reader_version);
-        if (minimum < catalog.read_observations_reader_version or authoritative < catalog.read_observations_reader_version) return error.PreparedTransactionProtocolDisabled;
+        if (minimum < required or authoritative < required) return error.PreparedTransactionProtocolDisabled;
         if (control) |owner| try owner.checkpoint();
     }
 
@@ -1757,7 +1757,7 @@ pub const TxnManager = struct {
             return if (err == error.NotFound) null else err;
         };
         defer alloc.free(raw);
-        self.requireReadObservationReader(control) catch |err| return trace.failure orelse err;
+        self.requireReadObservationReader(control, try prepared_reads.Durable.requiredReaderVersion(raw)) catch |err| return trace.failure orelse err;
         _ = self.getBoundPreparedSealReceipt(txn_id, binding, control) catch |err| return trace.failure orelse err;
         const effect_key = makePreparedEffectsKey(txn_id);
         const effects_raw = self.getBoundedPreparedBytes(alloc, &effect_key, prepared_effects.max_frame_bytes, error.InvalidPreparedEffects, control) catch |err| return trace.failure orelse err;
@@ -1785,7 +1785,7 @@ pub const TxnManager = struct {
         if (try self.loadPreparationRequirementInner(txn_id, control)) |required| if (required.mode != mode) return error.PreparationContractConflict;
         const inspection = try prepared_effects.inspect(frame, control);
         if (observations) |selected| {
-            try self.requireReadObservationReader(control);
+            try self.requireReadObservationReader(control, try prepared_reads.Durable.requiredReaderVersion(selected.frame));
             if (record.preparation_requirement == null) return error.PreparationContractConflict;
             const participant = binding orelse return error.PreparationContractConflict;
             var decoded = try prepared_reads.Durable.decode(self.alloc, selected.frame, .{ .contract = inspection.contract, .participant = participant, .namespace = selected.namespace, .frame_digest = inspection.fingerprint }, control);
@@ -8686,4 +8686,48 @@ test "prepared transaction effects observation recovery unwinds allocations and 
         try std.testing.expectError(cause, Checks.run(a, &f, &checks));
         try std.testing.expectEqualDeep(before, try f.debt());
     };
+}
+
+test "prepared transaction effects range observation seals require reader fifteen on acceptance and recovery" {
+    const a = std.testing.allocator;
+    const F = PreparedObservationSealFixture;
+    var f: F = .{};
+    try f.init();
+    defer f.deinit();
+    const effect = try f.frame();
+    defer a.free(effect);
+    var captured = prepared_reads.Owned.init(a, null);
+    defer captured.deinit();
+    const keys = try prepared_reads.observe(&f.store, &captured).scanPrefixKeysPage(a, "read-", null, 1);
+    defer {
+        for (keys) |key| a.free(key);
+        a.free(keys);
+    }
+    try captured.finish();
+    const inspection = try prepared_effects.inspect(effect, null);
+    const frame = try prepared_reads.Durable.encode(a, &captured, .{ .contract = inspection.contract, .participant = F.binding, .namespace = F.namespace, .frame_digest = inspection.fingerprint }, null);
+    defer a.free(frame);
+    try std.testing.expectError(error.PreparedTransactionProtocolDisabled, f.seal(effect, frame, false, null));
+    try f.noSeal();
+    try f.floor(15);
+    // A replacement-reader base lower than the canonical floor still fences
+    // acceptance. Absent base uses the canonical floor, as for older formats.
+    const catalog_module = @import("db/catalog/resolver_catalog.zig");
+    try f.store.put(catalog_module.replacement_reader_base_key, "14");
+    try std.testing.expectError(error.PreparedTransactionProtocolDisabled, f.seal(effect, frame, false, null));
+    try f.noSeal();
+    try f.store.delete(catalog_module.replacement_reader_base_key);
+    try f.seal(effect, frame, false, null);
+    {
+        var decoded = (try f.manager.loadPreparedReadObservations(a, F.id, F.namespace, F.binding, null)).?;
+        defer decoded.deinit();
+        try decoded.validate(&f.store, null);
+        try f.store.put("read-input", "payload-only update");
+        try decoded.validate(&f.store, null);
+    }
+    try f.floor(14);
+    try std.testing.expectError(error.PreparedTransactionProtocolDisabled, f.manager.loadPreparedReadObservations(a, F.id, F.namespace, F.binding, null));
+    try f.floor(15);
+    try f.manager.resolveIntents(F.id, .aborted, 2);
+    try std.testing.expectError(error.NotFound, f.store.get(a, &makePreparedReadObservationsKey(F.id)));
 }

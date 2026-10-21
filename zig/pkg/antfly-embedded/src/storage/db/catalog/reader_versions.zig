@@ -30,6 +30,7 @@ pub const prepared_transaction_reader_version: u32 = 12;
 pub const replay_credit_reader_version: u32 = 13;
 /// Accepted seals retain bound read observations and their backlog accounting.
 pub const read_observations_reader_version: u32 = 14;
-pub const supported_reader_version: u32 = read_observations_reader_version;
+pub const read_ranges_reader_version: u32 = 15;
+pub const supported_reader_version: u32 = read_ranges_reader_version;
 pub const minimum_reader_key = "\x00\x00__metadata__:minimum_reader_version";
 pub const replacement_reader_base_key = "\x00\x00__metadata__:replacement_reader_base_v1";

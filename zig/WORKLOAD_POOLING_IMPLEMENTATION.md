@@ -22043,3 +22043,73 @@ import/restore/restart/peer eligibility, reader14 activation/normal required
 PREPARE and broader fair/default/session/whole-node/tenant/remote rollout remain
 incomplete. Strong defaults off; full goal active. Full Linux qualification
 remains waived. Canonical worktree/branch/PR retained, normal hooks, no push.
+
+### Semantic bounded scan observations (2026-10-21)
+
+Merged latest `origin/main` (`ae0b8856fdc62c7c164125ade966d3ed0cd2dc8e`)
+into the existing branch as `6a2992f3b7`; this upstream change only updates
+`actions/upload-artifact`. The canonical worktree, branch and PR remain unchanged.
+
+Preparation's observed bounded scans, prefix reads, prefix key pages and prefix
+existence probes now retain semantic ranges instead of raw stopping-row cursor
+transcripts. Capture and replay manually check physical keys against both bounds
+before resolving logical payloads. This works on snapshot adapters whose cursor
+upper bound is only a hint. Forward and reverse early stops close the examined
+interval at the final returned key; unread tails remain unconstrained. Generic
+scan lower-exclusion semantics remain unchanged, while a key-page continuation
+can explicitly exclude the empty key. Prefix successors are copied with admission
+checkpoints, including all-0xff prefixes with no finite successor.
+
+Each owned range retains bounds, inclusivity, direction, payload mode, row count
+and a SHA256 stream of framed row fingerprints. No callback, skip function,
+cursor, source value or admission Port survives sealing. Active scans prevent
+reentrant sealing; failures poison partial owners and unwind allocations.
+Skipped in-range rows remain conservative observations because their callback
+filter is not retained. Raw cursor APIs still capture their exact transcripts.
+
+Key-only pages and existence probes hash membership without resolving or hashing
+payloads. Footprints normalize value intervals and membership intervals
+separately. `conflictsMutation(key, existed, present, control)` distinguishes an
+existing-key payload replacement from insert/delete; callers must supply
+existence from the same atomic writer view. `conflicts(key, control)` remains a
+conservative union. Value observations dominate overlapping membership predicates.
+Compilation remains optimistic validation, not predicate registration or a lease.
+
+ATRO version 2 adds a bounded range count and range records to the existing
+participant/namespace/effect binding and checksum. Range-free records keep the
+exact version 1 encoding and reader-14 requirement. Range records require
+reader 15 on both seal acceptance and recovery, including the authoritative
+replacement-reader base when present. An absent base uses the canonical floor.
+The shared 64 MiB frame and 65,536 descriptor/operation budgets still apply.
+Native ABI 58 and storage owner ABI 116 fence expanded owned layouts. The
+compiler-local engine error-name table was regenerated; public failure IDs are
+unchanged.
+
+Focused evidence covers native and hint-only memory adapters; ignored predecessor
+and successor mutations; early forward/reverse pages; membership-only payload
+updates; gap phantoms; mixed point/membership constraints; empty/NUL/0xff keys;
+zero limits; absent/present prefix probes; every insert/update/delete in a finite
+key universe; callback sealing rejection; all capture/codec/replay/compiler
+allocation failures and original control causes; corruption, invalid flags,
+excessive descriptor counts and swapped bindings; reader-14 rejection and
+reader-15 acceptance/recovery; native DB close/reopen recovery and stale rejection.
+Real external-reference tests prove out-of-range stopping rows are not hydrated,
+while in-range logical values resolve during capture, replay and compilation.
+The focused counter, grouped-read and cleanup suites cover affected helper paths.
+
+This refines unused scan boundaries; it does not classify every *in-range*
+mandatory control dependency. Durable atomic predicate registration/recovery,
+all-writer conflict enforcement and actor-bound retirement remain next. Counter
+and progress inputs may require commit-owned deltas. Complete live policy/cache/
+catalog/route capture, pure assembly before vote, executable recovery resources,
+derived-log quota, DB/execution lifetimes, raw-writer/import/restore/migration/
+restart/peer eligibility and required-PREPARE activation still remain. Existing
+bounded query scheduling defaults are separate from the still-disabled stronger
+remote-read guarantees. The full design remains incomplete. Full Linux
+qualification remains waived; Linux builds must use pinned Nix/glibc Zig.
+
+Final `semantic-scans-v5` evidence: all four native commands exited 0;
+106/106 build steps passed; 239 fresh test executions (94 effects, 47 DB,
+22 catalog, 4 counters, 7 grouped reads, 14 cleanup and 51 ABI companions),
+with no skips, failures or leaks. All 5,491 source-input hashes were verified.
+The pinned generated-error check and whitespace checks passed.

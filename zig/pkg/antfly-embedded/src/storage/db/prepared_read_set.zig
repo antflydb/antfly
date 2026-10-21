@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Owned point observations and cursor transcripts. Replaying a transcript
+//! Owned point, semantic range observations and raw cursor transcripts. Replaying a transcript
 //! detects changed results and scan phantoms without retaining source buffers.
 //! This is optimistic validation, not durable exclusion across a decision.
 const std = @import("std");
@@ -123,10 +123,28 @@ pub const TxnReader = struct {
         return .{ .allocator = self.txn.alloc, .read = self.txn, .cursor = cursor, .owns_read = false, .captured = if (self.observations) |captured| try captured.openCursorWithMode(physical) else null };
     }
     pub fn hasPrefix(self: TxnReader, prefix: []const u8) !bool {
+        if (self.observations) |captured| return self.hasPrefixCaptured(captured, prefix) catch |err| {
+            if (captured.failure == null) captured.failure = err;
+            return err;
+        };
         var cursor = try self.openPhysicalCursorAdapter();
         defer cursor.close();
         const row = (try cursor.seekAtOrAfter(prefix)) orelse return false;
         return std.mem.startsWith(u8, row.key, prefix);
+    }
+    fn hasPrefixCaptured(self: TxnReader, captured: *Owned, prefix: []const u8) !bool {
+        const Callback = struct {
+            fn visit(raw: ?*anyopaque, _: []const u8, _: []const u8) !DocStore.ScanAction {
+                const found: *bool = @ptrCast(@alignCast(raw.?));
+                found.* = true;
+                return .stop;
+            }
+        };
+        const end = try prefixEnd(captured.allocator, prefix, captured);
+        defer if (end) |key| captured.allocator.free(key);
+        var found = false;
+        try captureScan(self.txn, captured, prefix, end, .{ .physical_payloads = true }, true, &found, Callback.visit);
+        return found;
     }
 };
 /// Owns the snapshot returned to a preparation helper. The scope is movable
@@ -162,7 +180,8 @@ pub const Transaction = struct {
         };
     }
     fn scanInner(self: *Transaction, lower: []const u8, upper: []const u8, options: DocStore.ScanOptions, ctx: ?*anyopaque, callback: DocStore.ScanWithContextCallback) !void {
-        var cursor = try observeTxn(&self.txn, self.observations).open(options.physical_payloads);
+        if (self.observations) |captured| return captureScan(&self.txn, captured, lower, if (upper.len == 0) null else upper, options, false, ctx, callback);
+        var cursor = try observeTxn(&self.txn, null).open(options.physical_payloads);
         defer cursor.close();
         try scanCursor(&cursor, lower, upper, options, ctx, callback);
     }
@@ -234,25 +253,32 @@ pub fn ObservedReader(comptime Store: type) type {
         }
         fn scanPrefixKeysInner(self: @This(), a: A, prefix: []const u8, after_key: ?[]const u8, limit: usize) ![][]u8 {
             if (limit == 0) return a.alloc([]u8, 0);
-            var cursor = try self.openCursor(a, true);
-            defer cursor.close();
-            var keys: std.ArrayListUnmanaged([]u8) = .empty;
+            const captured = self.observations.?;
+            const Context = struct {
+                allocator: A,
+                captured: *Owned,
+                keys: std.ArrayListUnmanaged([]u8) = .empty,
+                limit: usize,
+                fn visit(raw: ?*anyopaque, key: []const u8, _: []const u8) anyerror!DocStore.ScanAction {
+                    const context: *@This() = @ptrCast(@alignCast(raw.?));
+                    const owned = try copy(context.allocator, key, context.captured.control, &context.captured.failure);
+                    errdefer context.allocator.free(owned);
+                    try context.keys.append(context.allocator, @constCast(owned));
+                    return if (context.keys.items.len == context.limit) .stop else .@"continue";
+                }
+            };
+            var context: Context = .{ .allocator = a, .captured = captured, .limit = limit };
             errdefer {
-                for (keys.items) |key| a.free(key);
-                keys.deinit(a);
+                for (context.keys.items) |key| a.free(key);
+                context.keys.deinit(a);
             }
             const after = if (after_key) |key| if (std.mem.startsWith(u8, key, prefix)) key else null else null;
-            var next = try cursor.seekAtOrAfter(after orelse prefix);
-            while (next) |row| : (next = try cursor.next()) {
-                if (!std.mem.startsWith(u8, row.key, prefix)) break;
-                if (after) |key| if (std.mem.order(u8, row.key, key) != .gt) continue;
-                const captured = self.observations.?;
-                const key = try copy(a, row.key, captured.control, &captured.failure);
-                errdefer a.free(key);
-                try keys.append(a, @constCast(key));
-                if (keys.items.len >= limit) break;
-            }
-            return keys.toOwnedSlice(a);
+            const end = try prefixEnd(a, prefix, captured);
+            defer if (end) |key| a.free(key);
+            var read = try self.store.beginReadTxn();
+            defer read.abort();
+            try captureScan(&read, captured, after orelse prefix, end, .{ .lower_exclusive = after != null, .physical_payloads = true }, true, &context, Context.visit);
+            return context.keys.toOwnedSlice(a);
         }
         pub fn getOptional(self: @This(), a: A, key: []const u8) !?[]u8 {
             const raw = self.get(a, key) catch |err| return if (err == error.NotFound) null else err;
@@ -276,27 +302,35 @@ pub fn ObservedReader(comptime Store: type) type {
             };
         }
         fn scanPrefixInner(self: @This(), a: A, prefix: []const u8) ![]@import("../docstore.zig").OwnedKVPair {
-            var cursor = try self.openCursor(a, false);
-            defer cursor.close();
-            var results: std.ArrayListUnmanaged(@import("../docstore.zig").OwnedKVPair) = .empty;
+            const captured = self.observations.?;
+            const Context = struct {
+                allocator: A,
+                captured: *Owned,
+                results: std.ArrayListUnmanaged(@import("../docstore.zig").OwnedKVPair) = .empty,
+                fn visit(raw: ?*anyopaque, key: []const u8, value: []const u8) anyerror!DocStore.ScanAction {
+                    const context: *@This() = @ptrCast(@alignCast(raw.?));
+                    const owned_key = try copy(context.allocator, key, context.captured.control, &context.captured.failure);
+                    errdefer context.allocator.free(owned_key);
+                    const owned_value = try copy(context.allocator, value, context.captured.control, &context.captured.failure);
+                    errdefer context.allocator.free(owned_value);
+                    try context.results.append(context.allocator, .{ .key = @constCast(owned_key), .value = @constCast(owned_value) });
+                    return .@"continue";
+                }
+            };
+            var context: Context = .{ .allocator = a, .captured = captured };
             errdefer {
-                for (results.items) |row| {
+                for (context.results.items) |row| {
                     a.free(row.key);
                     a.free(row.value);
                 }
-                results.deinit(a);
+                context.results.deinit(a);
             }
-            var next = try cursor.seekAtOrAfter(prefix);
-            while (next) |row| : (next = try cursor.next()) {
-                if (!std.mem.startsWith(u8, row.key, prefix)) break;
-                const captured = self.observations.?;
-                const key = try copy(a, row.key, captured.control, &captured.failure);
-                errdefer a.free(key);
-                const value = try copy(a, row.value, captured.control, &captured.failure);
-                errdefer a.free(value);
-                try results.append(a, .{ .key = @constCast(key), .value = @constCast(value) });
-            }
-            return results.toOwnedSlice(a);
+            const end = try prefixEnd(a, prefix, captured);
+            defer if (end) |key| a.free(key);
+            var read = try self.store.beginReadTxn();
+            defer read.abort();
+            try captureScan(&read, captured, prefix, end, .{}, false, &context, Context.visit);
+            return context.results.toOwnedSlice(a);
         }
         pub fn scanWithContext(self: @This(), lower: []const u8, upper: []const u8, options: DocStore.ScanOptions, ctx: ?*anyopaque, callback: DocStore.ScanWithContextCallback) !void {
             if (self.observations == null) return self.store.scanWithContext(lower, upper, options, ctx, callback);
@@ -306,9 +340,9 @@ pub fn ObservedReader(comptime Store: type) type {
             };
         }
         fn scanInner(self: @This(), lower: []const u8, upper: []const u8, options: DocStore.ScanOptions, ctx: ?*anyopaque, callback: DocStore.ScanWithContextCallback) !void {
-            var cursor = try self.openCursor(self.observations.?.allocator, options.physical_payloads);
-            defer cursor.close();
-            try scanCursor(&cursor, lower, upper, options, ctx, callback);
+            var read = try self.store.beginReadTxn();
+            defer read.abort();
+            try captureScan(&read, self.observations.?, lower, if (upper.len == 0) null else upper, options, false, ctx, callback);
         }
 
         pub fn get(self: @This(), a: A, key: []const u8) ![]const u8 {
@@ -372,6 +406,145 @@ const Row = struct {
         return .{ .key = try Fingerprint.of(entry.key, control, failure), .value = try Fingerprint.of(entry.value, control, failure) };
     }
 };
+fn prefixEnd(a: A, prefix: []const u8, captured: *Owned) !?[]const u8 {
+    const result = try copy(a, prefix, captured.control, &captured.failure);
+    errdefer a.free(result);
+    var length = result.len;
+    while (length != 0) {
+        try captured.check();
+        length -= 1;
+        if (result[length] == 0xff) continue;
+        const mutable = @constCast(result);
+        mutable[length] += 1;
+        return try a.realloc(mutable, length + 1);
+    }
+    a.free(result);
+    return null;
+}
+/// Semantic scan bounds exclude rows fetched only to detect exhaustion. A page
+/// that stops early closes its interval at its last observed key. Keys-only
+/// scans depend on membership, not the payloads of existing members.
+const Range = struct {
+    lower: []const u8,
+    upper: ?[]const u8,
+    lower_inclusive: bool = true,
+    upper_inclusive: bool = false,
+    reverse: bool = false,
+    physical_payloads: bool = false,
+    keys_only: bool = false,
+    count: u64 = 0,
+    digest: [32]u8 = undefined,
+    fn valid(self: Range) bool {
+        return !(self.upper_inclusive and self.upper == null) and !(self.keys_only and !self.physical_payloads);
+    }
+    fn deinit(self: *Range, a: A) void {
+        a.free(self.lower);
+        if (self.upper) |end| a.free(end);
+    }
+};
+const RangeHash = struct {
+    hash: std.crypto.hash.sha2.Sha256 = std.crypto.hash.sha2.Sha256.init(.{}),
+    count: u64 = 0,
+    fn add(self: *@This(), key: []const u8, value: []const u8, control: ?admission.Port, failure: ?*?anyerror) !void {
+        const row = try Row.of(.{ .key = key, .value = value }, control, failure);
+        var size: [8]u8 = undefined;
+        for ([_]Fingerprint{ row.key, row.value }) |part| {
+            std.mem.writeInt(u64, &size, part.len, .little);
+            self.hash.update(&size);
+            self.hash.update(&part.digest);
+        }
+        self.count = std.math.add(u64, self.count, 1) catch return error.TransactionTooLarge;
+    }
+    fn finish(self: *@This()) [32]u8 {
+        var digest: [32]u8 = undefined;
+        self.hash.final(&digest);
+        return digest;
+    }
+};
+/// Bounds are checked on physical keys before resolving any logical payload.
+/// This also works on adapters whose upper bound is only an optimization hint.
+const RangeCursor = struct {
+    cursor: DocStore.Txn.CursorAdapter,
+    spec: *const Range,
+    started: bool = false,
+    fn next(self: *@This(), control: ?admission.Port, failure: ?*?anyerror) !?Entry {
+        while (true) {
+            try checkpoint(control, failure);
+            const entry = if (!self.started) blk: {
+                self.started = true;
+                break :blk if (self.spec.reverse)
+                    if (self.spec.upper) |end| try self.cursor.seekAtOrBefore(end) else try self.cursor.last()
+                else
+                    try self.cursor.seekAtOrAfter(self.spec.lower);
+            } else if (self.spec.reverse) try self.cursor.prev() else try self.cursor.next();
+            const row = entry orelse return null;
+            const low = try Footprint.compare(row.key, self.spec.lower, control);
+            if (low == .lt or (low == .eq and !self.spec.lower_inclusive)) {
+                if (self.spec.reverse) return null;
+                continue;
+            }
+            if (self.spec.upper) |end| {
+                const high = try Footprint.compare(row.key, end, control);
+                if (high == .gt or (high == .eq and !self.spec.upper_inclusive)) {
+                    if (!self.spec.reverse) return null;
+                    continue;
+                }
+            }
+            return row;
+        }
+    }
+};
+fn captureScan(read: *DocStore.Txn, captured: *Owned, lower: []const u8, upper: ?[]const u8, options: DocStore.ScanOptions, keys_only: bool, ctx: ?*anyopaque, callback: DocStore.ScanWithContextCallback) !void {
+    if (captured.sealed) return error.TransactionClosed;
+    try captured.check();
+    captured.active_scans += 1;
+    defer captured.active_scans -= 1;
+    // Generic scan lower_exclusive ignores an empty lower. Page continuations
+    // instead treat an explicitly supplied empty key as a real exclusive key.
+    var spec: Range = .{ .lower = try copy(captured.allocator, lower, captured.control, &captured.failure), .upper = null, .lower_inclusive = options.reverse or !options.lower_exclusive or (lower.len == 0 and !keys_only), .reverse = options.reverse, .physical_payloads = options.physical_payloads, .keys_only = keys_only };
+    errdefer spec.deinit(captured.allocator);
+    if (upper) |end| spec.upper = try copy(captured.allocator, end, captured.control, &captured.failure);
+    var cursor: RangeCursor = .{ .cursor = try read.openPhysicalCursorAdapter(), .spec = &spec };
+    defer cursor.cursor.close();
+    var hash: RangeHash = .{};
+    while (try cursor.next(captured.control, &captured.failure)) |row| {
+        // Point resolution and callbacks may invalidate borrowed buffers.
+        const key = try copy(captured.allocator, row.key, captured.control, &captured.failure);
+        defer captured.allocator.free(key);
+        const value = if (keys_only) "" else if (options.physical_payloads) row.value else try read.get(key);
+        try hash.add(key, value, captured.control, &captured.failure);
+        if (options.skip_fn) |skip| if (skip(key)) continue;
+        if (try callback(ctx, key, value) == .stop) {
+            const endpoint = try copy(captured.allocator, key, captured.control, &captured.failure);
+            if (options.reverse) {
+                captured.allocator.free(spec.lower);
+                spec.lower = endpoint;
+                spec.lower_inclusive = true;
+            } else {
+                if (spec.upper) |end| captured.allocator.free(end);
+                spec.upper = endpoint;
+                spec.upper_inclusive = true;
+            }
+            break;
+        }
+    }
+    spec.count = hash.count;
+    spec.digest = hash.finish();
+    try captured.ranges.append(captured.allocator, spec);
+}
+fn validateRange(spec: *const Range, read: *DocStore.Txn, a: A, control: ?admission.Port) !void {
+    if (!spec.valid()) return error.InvalidArgument;
+    var cursor: RangeCursor = .{ .cursor = try read.openPhysicalCursorAdapter(), .spec = spec };
+    defer cursor.cursor.close();
+    var hash: RangeHash = .{};
+    while (try cursor.next(control, null)) |row| {
+        const key = try copy(a, row.key, control, null);
+        defer a.free(key);
+        const value = if (spec.keys_only) "" else if (spec.physical_payloads) row.value else try read.get(key);
+        try hash.add(key, value, control, null);
+    }
+    if (hash.count != spec.count or !std.mem.eql(u8, &hash.finish(), &spec.digest)) return error.PreparedReadSetChanged;
+}
 pub const Kind = enum { seek_after, seek_before, next, prev, first, last, upper_bound, clear_upper_bound };
 const Operation = struct { kind: Kind, argument: []const u8, expected: ?Row };
 const Point = struct { key: []const u8, expected: ?Fingerprint };
@@ -426,6 +599,8 @@ pub const Owned = struct {
     positions: std.StringHashMapUnmanaged(usize) = .empty,
     cursors: std.ArrayListUnmanaged(*Cursor) = .empty,
     sealed: bool = false,
+    ranges: std.ArrayListUnmanaged(Range) = .empty,
+    active_scans: usize = 0,
 
     pub fn init(a: A, control: ?admission.Port) Owned {
         return .{ .allocator = a, .control = control };
@@ -474,6 +649,7 @@ pub const Owned = struct {
     /// No source cursor or borrowed control/failure address may escape capture.
     pub fn finish(self: *Owned) !void {
         try checkpoint(self.control, &self.failure);
+        if (self.active_scans != 0) return error.InvalidArgument;
         for (self.cursors.items) |cursor| if (cursor.active) return error.InvalidArgument;
         self.control = null;
         for (self.cursors.items) |cursor| {
@@ -497,10 +673,13 @@ pub const Owned = struct {
             self.allocator.destroy(cursor);
         }
         self.cursors.deinit(self.allocator);
+        for (self.ranges.items) |*range| range.deinit(self.allocator);
+        self.ranges.deinit(self.allocator);
         self.* = undefined;
     }
     /// Caller retains publication/apply exclusion. All observations are compared
-    /// with one fresh immutable primary read, including each cursor's stopping row.
+    /// with one fresh immutable primary read. Raw cursor traces include stopping
+    /// rows; semantic scan records include only their examined interval.
     pub fn validate(self: *const Owned, store: *DocStore, original: ?admission.Port) !void {
         var trace: admission.RejectionTrace = .{};
         self.validateInner(store, trace.bind(original)) catch |err| return trace.failure orelse err;
@@ -509,7 +688,7 @@ pub const Owned = struct {
     fn validateInner(self: *const Owned, store: *DocStore, control: ?admission.Port) !void {
         try checkpoint(control, null);
         if (!self.sealed or self.failure != null) return error.InvalidArgument;
-        if (self.points.items.len == 0 and self.cursors.items.len == 0) return;
+        if (self.points.items.len == 0 and self.cursors.items.len == 0 and self.ranges.items.len == 0) return;
         var read = if (control) |original| try store.beginReadTxnWithAdmission(.retain, original) else try store.beginReadTxn();
         defer read.abort();
         for (self.points.items) |point| {
@@ -518,6 +697,7 @@ pub const Owned = struct {
             const actual = if (value) |bytes| try Fingerprint.of(bytes, control, null) else null;
             if (!std.meta.eql(actual, point.expected)) return error.PreparedReadSetChanged;
         }
+        for (self.ranges.items) |*range| try validateRange(range, &read, self.allocator, control);
         for (self.cursors.items) |captured| {
             if (captured.active) return error.InvalidArgument;
             var cursor = if (captured.physical_payloads) try read.openPhysicalCursorAdapter() else try read.openCursor();
@@ -563,7 +743,15 @@ pub const Durable = struct {
     pub const max_observations = 65_536;
     const header_bytes = 250;
     const checksum_bytes = 32;
-    const version: u16 = 1;
+    /// Structural peek only; decode still verifies checksum and exact binding.
+    pub fn requiredReaderVersion(frame: []const u8) !u32 {
+        if (frame.len < header_bytes + checksum_bytes or frame.len > max_frame_bytes or !std.mem.eql(u8, frame[0..4], "ATRO")) return error.InvalidTxnRecord;
+        return switch (std.mem.readInt(u16, frame[4..6], .little)) {
+            1 => @import("catalog/reader_versions.zig").read_observations_reader_version,
+            2 => @import("catalog/reader_versions.zig").read_ranges_reader_version,
+            else => error.UnsupportedVersion,
+        };
+    }
 
     const Writer = struct {
         data: ?[]u8 = null,
@@ -600,14 +788,14 @@ pub const Durable = struct {
         }
     };
     fn write(writer: *Writer, owned: *const Owned, binding: Binding, size: u32) !void {
-        if (!owned.sealed or owned.failure != null or owned.control != null) return error.InvalidArgument;
+        if (!owned.sealed or owned.failure != null or owned.control != null or owned.active_scans != 0) return error.InvalidArgument;
         if (binding.contract.intent_revision == 0) return error.InvalidPreparationRequirement;
         const participant = try binding.participant.encode();
-        if (owned.points.items.len > max_observations or owned.cursors.items.len > max_observations) return error.TransactionTooLarge;
-        var observations: usize = owned.points.items.len + owned.cursors.items.len;
+        if (owned.points.items.len > max_observations or owned.cursors.items.len > max_observations or owned.ranges.items.len > max_observations) return error.TransactionTooLarge;
+        var observations: usize = owned.points.items.len + owned.cursors.items.len + owned.ranges.items.len;
         if (observations > max_observations) return error.TransactionTooLarge;
         try writer.bytes("ATRO");
-        try writer.int(u16, version);
+        try writer.int(u16, if (owned.ranges.items.len == 0) 1 else 2);
         try writer.int(u16, 0);
         try writer.int(u32, size);
         try writer.bytes(&binding.contract.txn_id);
@@ -622,6 +810,7 @@ pub const Durable = struct {
         try writer.bytes(&binding.namespace);
         try writer.int(u32, @intCast(owned.points.items.len));
         try writer.int(u32, @intCast(owned.cursors.items.len));
+        if (owned.ranges.items.len != 0) try writer.int(u32, @intCast(owned.ranges.items.len));
         for (owned.points.items) |point| {
             try writer.slice(point.key);
             try writer.int(u8, @intFromBool(point.expected != null));
@@ -653,6 +842,20 @@ pub const Durable = struct {
                     try writer.fingerprint(expected.value);
                 }
             }
+        }
+        for (owned.ranges.items) |range| {
+            if (!range.valid()) return error.InvalidArgument;
+            const flags: u8 = @as(u8, @intFromBool(range.lower_inclusive)) |
+                (@as(u8, @intFromBool(range.upper_inclusive)) << 1) |
+                (@as(u8, @intFromBool(range.reverse)) << 2) |
+                (@as(u8, @intFromBool(range.physical_payloads)) << 3) |
+                (@as(u8, @intFromBool(range.upper != null)) << 4) |
+                (@as(u8, @intFromBool(range.keys_only)) << 5);
+            try writer.int(u8, flags);
+            try writer.slice(range.lower);
+            if (range.upper) |end| try writer.slice(end);
+            try writer.int(u64, range.count);
+            try writer.bytes(&range.digest);
         }
     }
     pub fn encode(alloc: A, owned: *const Owned, binding: Binding, original: ?admission.Port) ![]u8 {
@@ -715,7 +918,8 @@ pub const Durable = struct {
         if (!std.mem.eql(u8, &actual.digest, frame[end..])) return error.InvalidTxnRecord;
         var reader: Reader = .{ .data = frame[0..end], .control = control };
         if (!std.mem.eql(u8, try reader.bytes(4), "ATRO")) return error.InvalidTxnRecord;
-        if (try reader.int(u16) != version) return error.UnsupportedVersion;
+        const version = try reader.int(u16);
+        if (version != 1 and version != 2) return error.UnsupportedVersion;
         if (try reader.int(u16) != 0 or try reader.int(u32) != frame.len) return error.InvalidTxnRecord;
         var binding: Binding = undefined;
         binding.contract.txn_id = (try reader.bytes(16))[0..16].*;
@@ -734,9 +938,10 @@ pub const Durable = struct {
         if (!std.meta.eql(binding, expected)) return error.PreparedEffectsMismatch;
         const points = try reader.int(u32);
         const cursors = try reader.int(u32);
-        if (points > max_observations or cursors > max_observations) return error.InvalidTxnRecord;
-        var observations = @as(usize, points) + cursors;
-        if (observations > max_observations or @as(u64, points) * 5 + @as(u64, cursors) * 5 > reader.data.len - reader.offset) return error.InvalidTxnRecord;
+        const ranges = if (version == 2) try reader.int(u32) else 0;
+        if (points > max_observations or cursors > max_observations or ranges > max_observations) return error.InvalidTxnRecord;
+        var observations = @as(usize, points) + cursors + ranges;
+        if (observations > max_observations or @as(u64, points) * 5 + @as(u64, cursors) * 5 + @as(u64, ranges) * 45 > reader.data.len - reader.offset) return error.InvalidTxnRecord;
         var result = Owned.init(alloc, null);
         errdefer result.deinit();
         try result.points.ensureTotalCapacityPrecise(alloc, points);
@@ -776,6 +981,17 @@ pub const Durable = struct {
                 cursor.operations.appendAssumeCapacity(.{ .kind = kind, .argument = argument, .expected = row });
             }
         }
+        try result.ranges.ensureTotalCapacityPrecise(alloc, ranges);
+        for (0..ranges) |_| {
+            const flags = try reader.int(u8);
+            if (flags & 0xc0 != 0 or (flags & 2 != 0 and flags & 16 == 0) or (flags & 32 != 0 and flags & 8 == 0)) return error.InvalidTxnRecord;
+            var range: Range = .{ .lower = try reader.slice(alloc), .upper = null, .lower_inclusive = flags & 1 != 0, .upper_inclusive = flags & 2 != 0, .reverse = flags & 4 != 0, .physical_payloads = flags & 8 != 0, .keys_only = flags & 32 != 0 };
+            errdefer range.deinit(alloc);
+            if (flags & 16 != 0) range.upper = try reader.slice(alloc);
+            range.count = try reader.int(u64);
+            range.digest = (try reader.bytes(32))[0..32].*;
+            result.ranges.appendAssumeCapacity(range);
+        }
         if (reader.offset != reader.data.len) return error.InvalidTxnRecord;
         try checkpoint(control, null);
         result.sealed = true;
@@ -791,6 +1007,7 @@ pub const Durable = struct {
 pub const Footprint = struct {
     arena: std.heap.ArenaAllocator,
     spans: []const Span,
+    membership_spans: []const Span = &.{},
     pub const max_predicates = 65_536;
     pub const max_key_bytes = 64 * 1024 * 1024;
     pub const Span = struct {
@@ -805,20 +1022,34 @@ pub const Footprint = struct {
     }
     pub fn conflicts(self: *const Footprint, key: []const u8, original: ?admission.Port) !bool {
         var trace: admission.RejectionTrace = .{};
-        return self.conflictsInner(key, trace.bind(original)) catch |err| return trace.failure orelse err;
+        const control = trace.bind(original);
+        return (contains(self.spans, key, control) catch |err| return trace.failure orelse err) or
+            (contains(self.membership_spans, key, control) catch |err| return trace.failure orelse err);
     }
-    fn conflictsInner(self: *const Footprint, key: []const u8, control: ?admission.Port) !bool {
+    /// Caller supplies existence before/after the proposed write in its atomic
+    /// writer view. Replacing an existing payload cannot change a key-only page.
+    pub fn conflictsMutation(self: *const Footprint, key: []const u8, existed: bool, present: bool, original: ?admission.Port) !bool {
+        if (!existed and !present) {
+            try checkpoint(original, null);
+            return false;
+        }
+        var trace: admission.RejectionTrace = .{};
+        const control = trace.bind(original);
+        return (contains(self.spans, key, control) catch |err| return trace.failure orelse err) or
+            (existed != present and (contains(self.membership_spans, key, control) catch |err| return trace.failure orelse err));
+    }
+    fn contains(spans: []const Span, key: []const u8, control: ?admission.Port) !bool {
         try checkpoint(control, null);
         var lower: usize = 0;
-        var upper = self.spans.len;
+        var upper = spans.len;
         while (lower < upper) {
             const mid = lower + (upper - lower) / 2;
-            const span = self.spans[mid];
+            const span = spans[mid];
             const order = try compare(span.lower, key, control);
             if (order == .gt or (order == .eq and !span.lower_inclusive)) upper = mid else lower = mid + 1;
         }
         if (lower == 0) return false;
-        const span = self.spans[lower - 1];
+        const span = spans[lower - 1];
         const end = span.upper orelse return true;
         const order = try compare(key, end, control);
         return order == .lt or (order == .eq and span.upper_inclusive);
@@ -926,9 +1157,10 @@ pub const Footprint = struct {
     }
     fn compileInner(alloc: A, captured: *const Owned, store: *DocStore, control: ?admission.Port) !Footprint {
         try checkpoint(control, null);
-        if (!captured.sealed or captured.failure != null or captured.control != null) return error.InvalidArgument;
-        if (captured.points.items.len == 0 and captured.cursors.items.len == 0) return .{ .arena = std.heap.ArenaAllocator.init(alloc), .spans = &.{} };
+        if (!captured.sealed or captured.failure != null or captured.control != null or captured.active_scans != 0) return error.InvalidArgument;
+        if (captured.points.items.len == 0 and captured.cursors.items.len == 0 and captured.ranges.items.len == 0) return .{ .arena = std.heap.ArenaAllocator.init(alloc), .spans = &.{} };
         var observations = std.math.add(usize, captured.points.items.len, captured.cursors.items.len) catch return error.TransactionTooLarge;
+        observations = std.math.add(usize, observations, captured.ranges.items.len) catch return error.TransactionTooLarge;
         if (observations > max_predicates) return error.TransactionTooLarge;
         for (captured.cursors.items) |program| {
             try checkpoint(control, null);
@@ -1025,8 +1257,19 @@ pub const Footprint = struct {
                 position = selected;
             }
         }
+        for (captured.ranges.items) |*range| {
+            try validateRange(range, &read, alloc, control);
+            if (!range.keys_only) try builder.add(range.lower, range.lower_inclusive, range.upper, range.upper_inclusive);
+        }
         const spans = try builder.normalize();
+        // Reuse the arena and the copied-key budget, but sort membership spans
+        // independently so value-only writes retain their narrower conflicts.
+        builder.spans = .empty;
+        for (captured.ranges.items) |range| {
+            if (range.keys_only) try builder.add(range.lower, range.lower_inclusive, range.upper, range.upper_inclusive);
+        }
+        const membership_spans = try builder.normalize();
         try checkpoint(control, null);
-        return .{ .arena = builder.arena, .spans = spans };
+        return .{ .arena = builder.arena, .spans = spans, .membership_spans = membership_spans };
     }
 };

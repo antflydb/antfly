@@ -1200,7 +1200,7 @@ test "prepared transaction effects durable read observations reject corruption c
         frame[offset] = old;
         H.rehash(frame);
     }
-    frame[4] = 2;
+    frame[4] = 99;
     H.rehash(frame);
     try std.testing.expectError(error.UnsupportedVersion, H.Codec.decode(fixed.allocator(), frame, H.binding, null));
     frame[4] = 1;
@@ -1564,6 +1564,46 @@ test "prepared transaction effects read footprints distinguish logical external 
         try std.testing.expectEqual(@as(usize, 1), footprint.spans.len);
         try std.testing.expect(try footprint.conflicts(key, null));
     }
+    // The only row is a logical external reference. These empty semantic scans
+    // encounter it as an out-of-range boundary in opposite directions. Neither
+    // capture nor recovery/compilation may hydrate it just to detect exhaustion.
+    const after = try std.mem.concat(a, u8, &.{ key, "\x00" });
+    defer a.free(after);
+    for ([_]bool{ false, true }) |reverse| {
+        var captured = read_set.Owned.init(a, null);
+        defer captured.deinit();
+        var remaining: usize = 0;
+        const before = payload.reads;
+        try read_set.observe(&fixture.store, &captured).scanWithContext(if (reverse) after else "", if (reverse) "" else key, .{ .reverse = reverse }, &remaining, SemanticScanTest.visit);
+        try captured.finish();
+        try captured.validate(&fixture.store, null);
+        var footprint = try read_set.Footprint.compile(a, &captured, &fixture.store, null);
+        defer footprint.deinit();
+        try std.testing.expectEqual(before, payload.reads);
+        try std.testing.expect(!try footprint.conflicts(key, null));
+        try std.testing.expectEqual(@as(usize, 0), payload.refs);
+    }
+    {
+        var captured = read_set.Owned.init(a, null);
+        defer captured.deinit();
+        const before = payload.reads;
+        const rows = try read_set.observe(&fixture.store, &captured).scanPrefix(a, key);
+        defer {
+            for (rows) |row| {
+                a.free(row.key);
+                a.free(row.value);
+            }
+            a.free(rows);
+        }
+        try std.testing.expectEqualSlices(u8, bytes, rows[0].value);
+        try captured.finish();
+        try captured.validate(&fixture.store, null);
+        var footprint = try read_set.Footprint.compile(a, &captured, &fixture.store, null);
+        defer footprint.deinit();
+        try std.testing.expectEqual(before + 3, payload.reads);
+        try std.testing.expect(try footprint.conflictsMutation(key, true, true, null));
+        try std.testing.expectEqual(@as(usize, 0), payload.refs);
+    }
 }
 
 test "prepared transaction effects read footprints reject excessive descriptors invalid programs and non snapshot capabilities" {
@@ -1600,4 +1640,325 @@ test "prepared transaction effects read footprints reject excessive descriptors 
     try observed.recordPoint("absent", null);
     try observed.finish();
     try std.testing.expectError(error.Unsupported, read_set.Footprint.compile(a, &observed, &fixture.store, null));
+}
+
+const SemanticScanTest = struct {
+    fn visit(raw: ?*anyopaque, _: []const u8, _: []const u8) !DocStore.ScanAction {
+        const remaining: *usize = @ptrCast(@alignCast(raw.?));
+        if (remaining.* != 0) {
+            remaining.* -= 1;
+            if (remaining.* == 0) return .stop;
+        }
+        return .@"continue";
+    }
+    fn capture(a: A, store: *DocStore, mode: usize, control: ?@import("../../common/read_admission.zig").Port) !read_set.Owned {
+        var captured = read_set.Owned.init(a, control);
+        errdefer captured.deinit();
+        const reader = read_set.observe(store, &captured);
+        if (mode == 2) {
+            const rows = try reader.scanPrefix(a, "p/");
+            defer {
+                for (rows) |row| {
+                    a.free(row.key);
+                    a.free(row.value);
+                }
+                a.free(rows);
+            }
+        } else if (mode == 3 or mode == 4 or mode == 7) {
+            const keys = try reader.scanPrefixKeysPage(a, "p/", if (mode == 7) "p/a" else null, if (mode == 4) 100 else 1);
+            defer {
+                for (keys) |key| a.free(key);
+                a.free(keys);
+            }
+        } else {
+            var remaining: usize = if (mode == 5 or mode == 6) 1 else 0;
+            try reader.scanWithContext("p/", "p/z", .{ .reverse = mode == 1 or mode == 6 }, &remaining, visit);
+        }
+        try captured.finish();
+        return captured;
+    }
+    fn roundTrip(a: A, store: *DocStore, captured: *const read_set.Owned) !read_set.Owned {
+        const frame = try read_set.Durable.encode(a, captured, DurableReadTest.binding, null);
+        defer a.free(frame);
+        try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, frame[4..6], .little));
+        try std.testing.expectEqual(@as(u32, 15), try read_set.Durable.requiredReaderVersion(frame));
+        var decoded = try read_set.Durable.decode(a, frame, DurableReadTest.binding, null);
+        errdefer decoded.deinit();
+        try decoded.validate(store, null);
+        return decoded;
+    }
+    fn exercise(store: *DocStore) !void {
+        const a = std.testing.allocator;
+        try ReadFootprintTest.seed(store);
+        for (0..8) |mode| {
+            var captured = try capture(a, store, mode, null);
+            defer captured.deinit();
+            try std.testing.expectEqual(@as(usize, 0), captured.cursors.items.len);
+            try std.testing.expectEqual(@as(usize, 1), captured.ranges.items.len);
+            var decoded = try roundTrip(a, store, &captured);
+            defer decoded.deinit();
+            var footprint = try read_set.Footprint.compile(a, &decoded, store, null);
+            defer footprint.deinit();
+            for ([_][]const u8{ "", "a", "z", "\x00\x00__txn_participant_ack__:progress" }) |key| {
+                try std.testing.expect(!try footprint.conflicts(key, null));
+            }
+            // Both predecessor/successor stopping rows can change or disappear.
+            try store.put("a", "changed outside lower");
+            try store.put("z", "changed outside upper");
+            try decoded.validate(store, null);
+            try store.delete("a");
+            try store.delete("z");
+            try decoded.validate(store, null);
+            try store.put("a", "a");
+            try store.put("z", "z");
+            const membership = mode == 3 or mode == 4 or mode == 7;
+            const selected = if (mode == 6 or mode == 7) "p/c" else "p/a";
+            try std.testing.expect(try footprint.conflicts(selected, null));
+            try std.testing.expectEqual(!membership, try footprint.conflictsMutation(selected, true, true, null));
+            try std.testing.expect(try footprint.conflictsMutation(selected, true, false, null));
+            try std.testing.expect(!try footprint.conflictsMutation(selected, false, false, null));
+            try store.put(selected, "new payload");
+            if (membership) try decoded.validate(store, null) else try std.testing.expectError(error.PreparedReadSetChanged, decoded.validate(store, null));
+            try store.put(selected, selected);
+            try store.delete(selected);
+            try std.testing.expectError(error.PreparedReadSetChanged, decoded.validate(store, null));
+            try store.put(selected, selected);
+            // Tail beyond an early page is unconstrained in either direction.
+            if (mode == 3 or mode == 5 or mode == 6 or mode == 7) {
+                const tail = if (mode == 6 or mode == 7) "p/0" else "p/b";
+                try std.testing.expect(!try footprint.conflicts(tail, null));
+                try store.put(tail, "unread tail");
+                try decoded.validate(store, null);
+                try store.delete(tail);
+            }
+            // Insertions into an examined gap are phantoms, including empty
+            // prefix gaps before the first member and after a page continuation.
+            const phantom = if (mode == 6) "p/d" else if (mode == 7) "p/b" else "p/0";
+            try std.testing.expect(try footprint.conflictsMutation(phantom, false, true, null));
+            try store.put(phantom, "phantom");
+            try std.testing.expectError(error.PreparedReadSetChanged, decoded.validate(store, null));
+            try std.testing.expectError(error.PreparedReadSetChanged, read_set.Footprint.compile(a, &decoded, store, null));
+            try store.delete(phantom);
+            try decoded.validate(store, null);
+        }
+    }
+};
+
+test "prepared transaction effects semantic scans exclude stopping rows and preserve page membership on native and hint-only adapters" {
+    var fixture: ReadCaptureTest = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    try SemanticScanTest.exercise(&fixture.store);
+    const a = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(a, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    try SemanticScanTest.exercise(&store);
+}
+
+test "prepared transaction effects semantic scan owners cannot seal inside callbacks and retain errors" {
+    const Callback = struct {
+        fn visit(raw: ?*anyopaque, _: []const u8, _: []const u8) !DocStore.ScanAction {
+            const captured: *read_set.Owned = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectError(error.InvalidArgument, captured.finish());
+            return error.TestScanCallbackFailure;
+        }
+    };
+    const a = std.testing.allocator;
+    var fixture: ReadCaptureTest = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    try ReadFootprintTest.seed(&fixture.store);
+    var captured = read_set.Owned.init(a, null);
+    defer captured.deinit();
+    try std.testing.expectError(error.TestScanCallbackFailure, read_set.observe(&fixture.store, &captured).scanWithContext("p/", "p/z", .{}, &captured, Callback.visit));
+    try std.testing.expectEqual(@as(usize, 0), captured.active_scans);
+    try std.testing.expectEqual(@as(?anyerror, error.TestScanCallbackFailure), captured.failure);
+    try std.testing.expectError(error.ReadAdmissionRejected, captured.finish());
+}
+
+test "prepared transaction effects semantic range codec rejects corruption invalid flags excessive counts and swapped bindings" {
+    const a = std.testing.allocator;
+    var fixture: ReadCaptureTest = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    try ReadFootprintTest.seed(&fixture.store);
+    var captured = try SemanticScanTest.capture(a, &fixture.store, 3, null);
+    defer captured.deinit();
+    const frame = try read_set.Durable.encode(a, &captured, DurableReadTest.binding, null);
+    defer a.free(frame);
+    var fixed = std.heap.FixedBufferAllocator.init(&.{});
+    for (0..frame.len) |offset| {
+        frame[offset] ^= 1;
+        try std.testing.expectError(error.InvalidTxnRecord, read_set.Durable.decode(fixed.allocator(), frame, DurableReadTest.binding, null));
+        frame[offset] ^= 1;
+    }
+    for (0..frame.len) |length| try std.testing.expectError(error.InvalidTxnRecord, read_set.Durable.decode(fixed.allocator(), frame[0..length], DurableReadTest.binding, null));
+    // First range flag follows the v2 header, with no points or cursors.
+    const flags = frame[254];
+    for ([_]u8{ 0x40, 0x80, 2, 32 }) |invalid| {
+        frame[254] = invalid;
+        DurableReadTest.rehash(frame);
+        try std.testing.expectError(error.InvalidTxnRecord, read_set.Durable.decode(a, frame, DurableReadTest.binding, null));
+    }
+    frame[254] = flags;
+    const count = frame[250..254].*;
+    @memset(frame[250..254], 255);
+    DurableReadTest.rehash(frame);
+    try std.testing.expectError(error.InvalidTxnRecord, read_set.Durable.decode(fixed.allocator(), frame, DurableReadTest.binding, null));
+    @memcpy(frame[250..254], &count);
+    DurableReadTest.rehash(frame);
+    var wrong = DurableReadTest.binding;
+    wrong.namespace[0] ^= 1;
+    try std.testing.expectError(error.PreparedEffectsMismatch, read_set.Durable.decode(fixed.allocator(), frame, wrong, null));
+}
+
+const SemanticScanFailureTest = struct {
+    fn run(a: A, store: *DocStore, mode: usize, checks: ?*Checks) !void {
+        const admission = @import("../../common/read_admission.zig");
+        var payload: admission.Payload = .{ .ptr = checks orelse undefined, .vtable = &.{ .checkpoint = Checks.check } };
+        const control = if (checks != null) admission.Port.init(&payload) else null;
+        var captured = SemanticScanTest.capture(a, store, mode, control) catch |err| return if (checks) |state| state.failure orelse err else err;
+        defer captured.deinit();
+        const frame = try read_set.Durable.encode(a, &captured, DurableReadTest.binding, control);
+        defer a.free(frame);
+        var decoded = try read_set.Durable.decode(a, frame, DurableReadTest.binding, control);
+        defer decoded.deinit();
+        try decoded.validate(store, control);
+        var footprint = try read_set.Footprint.compile(a, &decoded, store, control);
+        defer footprint.deinit();
+        try std.testing.expect(try footprint.conflicts("p/a", control));
+        _ = try footprint.conflictsMutation("p/a", true, true, control);
+    }
+    const Checks = struct {
+        calls: usize = 0,
+        stop: usize = 0,
+        cause: anyerror = error.OutOfMemory,
+        failure: ?anyerror = null,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == self.stop) {
+                self.failure = self.cause;
+                return self.cause;
+            }
+        }
+    };
+};
+
+test "prepared transaction effects semantic scans unwind every allocation and preserve each original control failure" {
+    const a = std.testing.allocator;
+    var fixture: ReadCaptureTest = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    try ReadFootprintTest.seed(&fixture.store);
+    const H = SemanticScanFailureTest;
+    for ([_]usize{ 0, 2, 3 }) |mode| {
+        try std.testing.checkAllAllocationFailures(a, H.run, .{ &fixture.store, mode, @as(?*H.Checks, null) });
+        var baseline: H.Checks = .{};
+        try H.run(a, &fixture.store, mode, &baseline);
+        for ([_]anyerror{ error.NotFound, error.OutOfMemory, error.DeadlineExceeded }) |cause| for (1..baseline.calls + 1) |stop| {
+            var checks: H.Checks = .{ .stop = stop, .cause = cause };
+            try std.testing.expectError(cause, H.run(a, &fixture.store, mode, &checks));
+        };
+    }
+}
+
+test "prepared transaction effects semantic prefix existence and binary pages retain exact empty-key continuation" {
+    const a = std.testing.allocator;
+    var fixture: ReadCaptureTest = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    try fixture.store.put("", "empty");
+    try fixture.store.put("\x00", "nul");
+    try fixture.store.put("\xff\xff", "max");
+    var captured = read_set.Owned.init(a, null);
+    defer captured.deinit();
+    const reader = read_set.observe(&fixture.store, &captured);
+    const keys = try reader.scanPrefixKeysPage(a, "", "", 1);
+    defer {
+        for (keys) |key| a.free(key);
+        a.free(keys);
+    }
+    try std.testing.expectEqual(@as(usize, 1), keys.len);
+    try std.testing.expectEqualStrings("\x00", keys[0]);
+    const high = try reader.scanPrefixKeysPage(a, "\xff", null, 4);
+    defer {
+        for (high) |key| a.free(key);
+        a.free(high);
+    }
+    try std.testing.expectEqual(@as(usize, 1), high.len);
+    try std.testing.expectEqualStrings("\xff\xff", high[0]);
+    const count = captured.ranges.items.len;
+    const empty = try reader.scanPrefixKeysPage(a, "", null, 0);
+    a.free(empty);
+    try std.testing.expectEqual(count, captured.ranges.items.len);
+    {
+        var read = try reader.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(!try read.hasPrefix("p/"));
+        try std.testing.expect(try read.hasPrefix("\xff"));
+    }
+    try captured.finish();
+    var decoded = try SemanticScanTest.roundTrip(a, &fixture.store, &captured);
+    defer decoded.deinit();
+    var footprint = try read_set.Footprint.compile(a, &decoded, &fixture.store, null);
+    defer footprint.deinit();
+    try std.testing.expect(!try footprint.conflicts("", null));
+    try std.testing.expect(!try footprint.conflicts("a", null));
+    try std.testing.expect(try footprint.conflicts("p/x", null));
+    try std.testing.expect(!try footprint.conflictsMutation("\xff\xff", true, true, null));
+    try fixture.store.delete("");
+    try fixture.store.put("\xff\xff", "new bytes");
+    try decoded.validate(&fixture.store, null);
+    try fixture.store.put("p/x", "membership changed");
+    try std.testing.expectError(error.PreparedReadSetChanged, decoded.validate(&fixture.store, null));
+}
+
+test "prepared transaction effects semantic scan footprints cover every result-changing mutation and mixed predicates" {
+    const a = std.testing.allocator;
+    const universe = [_][]const u8{ "", "\x00", "a", "p", "p/", "p/0", "p/a", "p/a\x00", "p/b", "p/c", "p/d", "p/y", "p/z", "p0", "z", "\xff" };
+    var fixture: ReadCaptureTest = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    try ReadFootprintTest.seed(&fixture.store);
+    for (0..8) |mode| {
+        var captured = try SemanticScanTest.capture(a, &fixture.store, mode, null);
+        defer captured.deinit();
+        var footprint = try read_set.Footprint.compile(a, &captured, &fixture.store, null);
+        defer footprint.deinit();
+        for (universe) |key| {
+            const old = fixture.store.get(a, key) catch |err| if (err == error.NotFound) null else return err;
+            defer if (old) |bytes| a.free(bytes);
+            const put_conflict = try footprint.conflictsMutation(key, old != null, true, null);
+            try fixture.store.put(key, "different");
+            if (try ReadFootprintTest.changed(&captured, &fixture.store)) try std.testing.expect(put_conflict);
+            if (old) |bytes| try fixture.store.put(key, bytes) else try fixture.store.delete(key);
+            if (old) |bytes| {
+                const delete_conflict = try footprint.conflictsMutation(key, true, false, null);
+                try fixture.store.delete(key);
+                if (try ReadFootprintTest.changed(&captured, &fixture.store)) try std.testing.expect(delete_conflict);
+                try fixture.store.put(key, bytes);
+            }
+            try captured.validate(&fixture.store, null);
+        }
+    }
+    // The value interval must dominate the overlapping membership constraint.
+    var mixed = read_set.Owned.init(a, null);
+    defer mixed.deinit();
+    const reader = read_set.observe(&fixture.store, &mixed);
+    const keys = try reader.scanPrefixKeysPage(a, "p/", null, 100);
+    defer {
+        for (keys) |key| a.free(key);
+        a.free(keys);
+    }
+    const value = try reader.get(a, "p/a");
+    a.free(value);
+    try mixed.finish();
+    var footprint = try read_set.Footprint.compile(a, &mixed, &fixture.store, null);
+    defer footprint.deinit();
+    try std.testing.expect(try footprint.conflictsMutation("p/a", true, true, null));
+    try std.testing.expect(!try footprint.conflictsMutation("p/c", true, true, null));
+    try std.testing.expect(try footprint.conflictsMutation("p/b", false, true, null));
 }
