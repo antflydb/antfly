@@ -8890,6 +8890,7 @@ fn parseGeneratedBleveQueryBoost(query: query_openapi.Query) !f32 {
         .date_range_string_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
         .doc_id_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
         .bool_field_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .bool_query => |value| parseGeneratedBoost(value.bool.boost.valueOrNull()),
         .boolean_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
         .conjunction_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
         .disjunction_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
@@ -9056,6 +9057,13 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
             .value = bool_field.bool,
             .boost = query_boost,
         } },
+        .bool_query => |boolean_query| blk: {
+            const json = try std.json.Stringify.valueAlloc(alloc, boolean_query.bool, .{});
+            defer alloc.free(json);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+            defer parsed.deinit();
+            break :blk try parseDirectDslBoolTextQuery(alloc, parsed.value);
+        },
         .boolean_query => |boolean_query| .{
             .bool_query = try parseGeneratedBleveBooleanQuery(alloc, boolean_query, query_boost),
         },
