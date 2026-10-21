@@ -236,7 +236,7 @@ fn inspectPortable(allocator: Allocator, io: std.Io, file: std.Io.File, options:
     var inspector: preflight.Inspector = .{ .allocator = allocator, .report = report, .options = options };
     defer inspector.deinit();
     if (catalog) |json| try inspector.indexCatalogJson(json);
-    _ = try portable_backup.inspectPortableFileBlocks(allocator, io, file, .{ .metadata_first = true, .max_input_bytes = options.max_input_bytes, .max_logical_bytes = options.max_expanded_bytes, .max_metadata_bytes = options.max_metadata_bytes, .cancellation = options.cancellation }, &inspector, preflight.Inspector.visit);
+    _ = try portable_backup.inspectPortableFileBlocks(allocator, io, file, .{ .metadata_first = true, .max_input_bytes = options.max_input_bytes, .max_logical_bytes = options.max_expanded_bytes, .max_metadata_bytes = options.max_metadata_bytes, .max_document_bytes = options.max_document_bytes, .cancellation = options.cancellation }, &inspector, preflight.Inspector.visit);
 }
 
 pub fn defaultBackupIdAlloc(allocator: Allocator, path: []const u8) ![]u8 {
@@ -2348,6 +2348,13 @@ test "backup preflight native multishard scans later shards and table producers"
         try backups_api.populateShardArtifactIntegrity(a, io, .native, absolute, shard);
         initialized += 1;
     }
+    var replication: std.ArrayListUnmanaged(u8) = .empty;
+    defer replication.deinit(a);
+    try replication.appendSlice(a, "[{\"type\":\"postgres\",\"dsn\":\"${secret:replication.pg}\",\"postgres_table\":\"public.documents\",\"metadata\":");
+    try replication.appendNTimes(a, '[', 20000);
+    try replication.appendSlice(a, "null");
+    try replication.appendNTimes(a, ']', 20000);
+    try replication.appendSlice(a, "}]");
     const manifest: backups_api.TableBackupManifest = .{
         .format = .native,
         .backup_id = "test",
@@ -2355,7 +2362,7 @@ test "backup preflight native multishard scans later shards and table producers"
         .description = "",
         .schema_json = "{}",
         .read_schema_json = "",
-        .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"${secret:replication.pg}\",\"postgres_table\":\"public.documents\"}]",
+        .replication_sources_json = replication.items,
         .indexes_json = "{\"default\":{\"type\":\"embeddings\",\"field\":\"media\",\"dimension\":3,\"embedder\":{\"model\":\"mock\"}},\"enrichments\":[{\"name\":\"pdf\",\"kind\":\"asset\",\"field\":\"media\",\"producer\":{\"type\":\"reader\"}}]}",
         .shards = &shards,
     };
@@ -2590,4 +2597,84 @@ test "backup preflight metadata admission precedes validation and permits bounde
     defer a.free(admitted);
     try std.testing.expect(std.mem.indexOf(u8, admitted, "\"scan_complete\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, admitted, "\"compatibility\":{\"verdict\":\"compatible\"") != null);
+}
+
+test "backup preflight artifact document admission precedes validation with exact record limits" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const doc = try a.dupe(u8, "doc");
+    defer a.free(doc);
+    const doc2 = try a.dupe(u8, "doc2");
+    defer a.free(doc2);
+    const name = try a.dupe(u8, "retained");
+    defer a.free(name);
+    const value = try a.alloc(u8, 8192);
+    defer a.free(value);
+    @memset(value, 'a');
+    const prefix = "{\"text\":\"";
+    @memcpy(value[0..prefix.len], prefix);
+    @memcpy(value[value.len - 2 ..], "\"}");
+    for ([_]db_types.ArtifactKind{ .asset, .chunk }) |kind| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const key = try @import("../db/artifact_ids.zig").artifactPublicIdAlloc(a, .{ .document_id = doc, .name = name, .kind = kind, .chunk_id = if (kind == .chunk) 1 else null });
+        defer a.free(key);
+        const key2 = try @import("../db/artifact_ids.zig").artifactPublicIdAlloc(a, .{ .document_id = doc2, .name = name, .kind = kind, .chunk_id = if (kind == .chunk) 1 else null });
+        defer a.free(key2);
+        const payload = try backup_codec.encodeKeyValueBatch(a, &.{ .{ .key = key, .value = value }, .{ .key = key2, .value = value } });
+        defer a.free(payload);
+        var archive: std.ArrayListUnmanaged(u8) = .empty;
+        defer archive.deinit(a);
+        try backup_codec.writeHeader(&archive, a, .{ .format_version = backup_codec.legacy_format_version, .flags = 0, .created_at_ns = 0, .backup_id = @splat(0), .table_count = 1, .shard_count = 1 });
+        try backup_codec.writeBlock(&archive, a, if (kind == .chunk) .chunk_batch else .artifact_batch, payload);
+        try portable_backup.validatePortable(a, archive.items);
+        var file = try tmp.dir.createFile(io, "artifacts.afb", .{ .read = true });
+        defer file.close(io);
+        try file.writePositionalAll(io, archive.items, 0);
+        var counter: InspectionCounter = .{};
+        try std.testing.expectError(error.BackupExpansionLimitExceeded, portable_backup.inspectPortableFileBlocks(a, io, file, .{ .max_document_bytes = value.len - 1 }, &counter, InspectionCounter.visit));
+        try std.testing.expectEqual(@as(usize, 0), counter.blocks);
+        _ = try portable_backup.inspectPortableFileBlocks(a, io, file, .{ .max_document_bytes = value.len }, &counter, InspectionCounter.visit);
+        try std.testing.expectEqual(@as(usize, 1), counter.blocks);
+        const path = try tmp.dir.realPathFileAlloc(io, "artifacts.afb", a);
+        defer a.free(path);
+        const limited = try inspectInputJsonAlloc(a, path, null, .{ .max_document_bytes = value.len - 1 });
+        defer a.free(limited);
+        try std.testing.expect(std.mem.indexOf(u8, limited, "\"failure_code\":\"limit_exceeded\"") != null);
+        const admitted = try inspectInputJsonAlloc(a, path, "{\"version\":1,\"configuration_id\":\"empty\"}", .{ .max_document_bytes = value.len });
+        defer a.free(admitted);
+        try std.testing.expect(std.mem.indexOf(u8, admitted, "\"scan_complete\":true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, admitted, "\"compatibility\":{\"verdict\":\"compatible\"") != null);
+    }
+}
+
+test "backup preflight document limit preserves authored vector artifact validation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const doc = try a.dupe(u8, "doc");
+    defer a.free(doc);
+    const name = try a.dupe(u8, "vectors");
+    defer a.free(name);
+    const key = try @import("../db/artifact_ids.zig").artifactPublicIdAlloc(a, .{ .document_id = doc, .name = name, .kind = .embedding });
+    defer a.free(key);
+    const value = try @import("../db/enrichment/artifact_codec.zig").encodeAuthoredDenseEmbeddingAlloc(a, &.{ 1, 2 });
+    defer a.free(value);
+    const payload = try backup_codec.encodeKeyValueBatch(a, &.{.{ .key = key, .value = value }});
+    defer a.free(payload);
+    var archive: std.ArrayListUnmanaged(u8) = .empty;
+    defer archive.deinit(a);
+    try backup_codec.writeHeader(&archive, a, .{ .format_version = backup_codec.legacy_format_version, .flags = 0, .created_at_ns = 0, .backup_id = @splat(0), .table_count = 1, .shard_count = 1 });
+    try backup_codec.writeBlock(&archive, a, .artifact_batch, payload);
+    try portable_backup.validatePortable(a, archive.items);
+    var file = try tmp.dir.createFile(io, "vector.afb", .{ .read = true });
+    defer file.close(io);
+    try file.writePositionalAll(io, archive.items, 0);
+    const path = try tmp.dir.realPathFileAlloc(io, "vector.afb", a);
+    defer a.free(path);
+    const json = try inspectInputJsonAlloc(a, path, null, .{ .max_document_bytes = 1 });
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scan_complete\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"model\"") != null);
 }

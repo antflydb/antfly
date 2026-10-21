@@ -48,7 +48,10 @@ validation and inspection pass. Batch traversal borrows source bytes, so a rejec
 record is not cloned first; a batch of individually bounded records may exceed
 the per-record limit.
 The document limit bounds logical JSON before output allocation, including
-streamed zstd decompression and measured relational-row reconstruction.
+streamed zstd decompression and measured relational-row reconstruction. It also
+bounds retained asset/chunk values before validation or dependency callbacks.
+Artifact traversal borrows source bytes; vector and resolution artifacts retain
+their own format and block limits rather than the document limit.
 The expansion budget includes per-document compression inside decoded portable
 blocks and is checked before dependency callbacks. Block readers enforce the
 remaining output budget while decompressing, rather than materializing an
@@ -59,7 +62,9 @@ Source URLs, query strings, passwords, producer configuration and credentials
 are never emitted. Credential inventory uses the shared credential-field
 policy, including bearer and capability tokens, and requires separate destination
 evidence in addition to endpoint and model evidence. Digests are identity
-bindings, not encrypted secret storage.
+bindings, not encrypted secret storage. Canonical identity hashing traverses
+nested JSON with heap-backed frames, preserving sorted keys and exact numeric
+normalization without depending on the process call-stack depth.
 
 The inspector uses the restore format readers and schema decoders. It validates
 all portable records, primes metadata before visiting rows, and decodes

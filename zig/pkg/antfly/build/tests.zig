@@ -2185,7 +2185,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lite_native_test_step.dependOn(&run_lite_native_tests.step);
     const backup_preflight_tests = b.addTest(.{
         .root_module = lite_native_test_mod,
-        .filters = &.{ "backup preflight", "lite restore staging", "storage.backup_bundle_io.", "storage.backup_bundle." },
+        .filters = &.{ "backup preflight", "canonical JSON", "lite restore staging", "storage.backup_bundle_io.", "storage.backup_bundle." },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("backup-preflight-test", "Verify read-only backup dependency inspection and preparation").dependOn(&addFilteredTestRunArtifact(b, backup_preflight_tests).step);

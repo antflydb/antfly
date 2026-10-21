@@ -377,15 +377,12 @@ pub const Inspector = struct {
                 }
             },
             .chunk_batch, .artifact_batch, .resolution_batch => {
-                const entries = try codec.decodeKeyValueBatch(self.allocator, payload);
-                defer {
-                    for (entries) |e| {
-                        self.allocator.free(e.key);
-                        self.allocator.free(e.value);
-                    }
-                    self.allocator.free(entries);
-                }
-                for (entries) |e| {
+                if (kind != .resolution_batch) portable.checkArtifactDocumentLimit(self.allocator, payload, self.options.max_document_bytes) catch |err| switch (err) {
+                    error.StreamTooLong => return error.PreflightLimitExceeded,
+                    else => return err,
+                };
+                var reader = try codec.KeyValueBatchReader.init(payload);
+                while (try reader.next()) |e| {
                     self.report.artifact_records += 1;
                     if (try artifact_ids.decodeArtifactPublicIdAlloc(self.allocator, e.key)) |ref_value| {
                         var ref = ref_value;
@@ -2249,4 +2246,59 @@ test "backup preflight retained model chunk text follows the consumer source pol
     try std.testing.expectEqual(@as(u64, 0), count(report, .source_local));
     try std.testing.expectEqual(@as(u64, 1), count(report, .model));
     try std.testing.expect(report.analysis_complete);
+}
+
+test "backup preflight retained artifact admission precedes cloning" {
+    const a = std.testing.allocator;
+    const value = try a.alloc(u8, 32 * 1024 * 1024);
+    defer a.free(value);
+    @memset(value, 'a');
+    const doc = try a.dupe(u8, "doc");
+    defer a.free(doc);
+    const name = try a.dupe(u8, "copy");
+    defer a.free(name);
+    const key = try artifact_ids.artifactPublicIdAlloc(a, .{ .document_id = doc, .name = name, .kind = .asset });
+    defer a.free(key);
+    const payload = try codec.encodeKeyValueBatch(a, &.{.{ .key = key, .value = value }});
+    defer a.free(payload);
+    var archive: std.ArrayListUnmanaged(u8) = .empty;
+    defer archive.deinit(a);
+    try codec.writeHeader(&archive, a, .{ .format_version = codec.legacy_format_version, .flags = 0, .created_at_ns = 0, .backup_id = @splat(0), .table_count = 1, .shard_count = 1 });
+    try codec.writeBlock(&archive, a, .artifact_batch, payload);
+    try portable.validatePortable(a, archive.items);
+    const backing = try a.alloc(u8, 16 * 1024 * 1024);
+    defer a.free(backing);
+    var buffer = std.heap.FixedBufferAllocator.init(backing);
+    const bounded = buffer.allocator();
+    var report: Report = .{ .allocator = bounded };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = bounded, .report = &report, .options = .{ .max_document_bytes = 4096 } };
+    defer inspector.deinit();
+    try std.testing.expectError(error.PreflightLimitExceeded, inspector.visit(.artifact_batch, payload));
+}
+
+test "backup preflight deep replication metadata remains stack safe" {
+    const a = std.testing.allocator;
+    const depth = 20000;
+    const prefix = "[{\"type\":\"postgres\",\"dsn\":\"host=db.example dbname=app\",\"postgres_table\":\"public.docs\",\"metadata\":";
+    var raw: std.ArrayListUnmanaged(u8) = .empty;
+    defer raw.deinit(a);
+    try raw.appendSlice(a, prefix);
+    try raw.appendNTimes(a, '[', depth);
+    try raw.appendSlice(a, "null");
+    try raw.appendNTimes(a, ']', depth);
+    try raw.appendSlice(a, "}]");
+    // The same typed parsing policy used by replication source inspection
+    // accepts the source and skips the forward-compatible metadata field.
+    const parsed = try std.json.parseFromSlice(Value, a, raw.items, .{});
+    defer parsed.deinit();
+    const typed = try std.json.parseFromValue([]const @import("antfly_metadata_openapi").ReplicationSource, a, parsed.value, .{ .ignore_unknown_fields = true });
+    defer typed.deinit();
+    try std.testing.expectEqualStrings("public.docs", typed.value[0].postgres_table);
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    try inspector.replicationSourcesJson(raw.items);
+    try std.testing.expectEqual(@as(u64, 1), count(report, .connection));
 }

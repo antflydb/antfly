@@ -2885,6 +2885,7 @@ pub const FileInspectionOptions = struct {
     max_input_bytes: u64 = 64 * 1024 * 1024 * 1024,
     max_logical_bytes: u64 = 128 * 1024 * 1024 * 1024,
     max_metadata_bytes: usize = std.math.maxInt(usize),
+    max_document_bytes: usize = std.math.maxInt(usize),
     cancellation: @import("antfly_cancellation").CancellationToken = .none,
 };
 
@@ -2924,6 +2925,18 @@ pub const InspectionDocumentDecoder = struct {
         return alloc.dupe(u8, entry.value);
     }
 };
+
+/// Only asset/chunk payloads are materialized as documents. Vector and
+/// resolution artifacts keep their own format and block admission contracts.
+pub fn checkArtifactDocumentLimit(alloc: Allocator, payload: []const u8, max_bytes: usize) !void {
+    var reader = try backup_codec.KeyValueBatchReader.init(payload);
+    while (try reader.next()) |entry| {
+        if (entry.value.len <= max_bytes) continue;
+        var ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, entry.key)) orelse return error.InvalidBackupRequest;
+        defer ref.deinit(alloc);
+        if (ref.kind == .asset or ref.kind == .chunk) return error.StreamTooLong;
+    }
+}
 
 /// Read-only seam for preparation and dependency inspectors. First validate
 /// every logical record with the restore reader, then visit the authenticated
@@ -3010,16 +3023,26 @@ const InspectionReader = struct {
                 else => return err,
             };
         }
+        if (block.block_type == .artifact_batch or block.block_type == .chunk_batch) {
+            checkArtifactDocumentLimit(alloc, block.payload, self.options.max_document_bytes) catch |err| switch (err) {
+                error.StreamTooLong => return error.BackupExpansionLimitExceeded,
+                else => return err,
+            };
+        }
         // A document may be compressed inside an already decoded block. Charge
         // its expansion on every inspection pass, before invoking any visitor.
         if (block.block_type == .document_batch) {
             const entries = try backup_codec.decodeDocumentBatchBorrowed(alloc, block.payload);
             defer alloc.free(entries);
             for (entries) |entry| {
-                if (entry.value_flags & backup_codec.doc_value_flag_compressed == 0) continue;
+                if (entry.value_flags & backup_codec.doc_value_flag_compressed == 0) {
+                    if (entry.value_flags & backup_codec.doc_value_flag_relational_row == 0 and entry.value.len > self.options.max_document_bytes)
+                        return error.BackupExpansionLimitExceeded;
+                    continue;
+                }
                 try self.options.cancellation.check();
                 const remaining = self.options.max_logical_bytes - self.logical_bytes;
-                const limit = std.math.cast(usize, remaining +| entry.value.len) orelse std.math.maxInt(usize);
+                const limit = @min(self.options.max_document_bytes, std.math.cast(usize, remaining +| entry.value.len) orelse std.math.maxInt(usize));
                 const expanded_size = backup_codec.zstdExpandedSizeLimited(alloc, entry.value, limit) catch |err| switch (err) {
                     error.StreamTooLong => return error.BackupExpansionLimitExceeded,
                     else => return err,
@@ -4860,9 +4883,8 @@ fn validatePortableArtifactEntry(alloc: Allocator, ref: db_types.ArtifactRef, va
 }
 
 fn validatePublicArtifactBatchPayload(alloc: Allocator, payload: []const u8, allowed_kind: db_types.ArtifactKind) !void {
-    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
-    defer freeKeyValueEntries(alloc, entries);
-    for (entries) |entry| {
+    var reader = try backup_codec.KeyValueBatchReader.init(payload);
+    while (try reader.next()) |entry| {
         var artifact_ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, entry.key)) orelse return error.InvalidBackupRequest;
         defer artifact_ref.deinit(alloc);
         try validatePortableArtifactEntry(alloc, artifact_ref, entry.value, allowed_kind);
@@ -4870,9 +4892,8 @@ fn validatePublicArtifactBatchPayload(alloc: Allocator, payload: []const u8, all
 }
 
 fn validateResolutionArtifactBatchPayload(alloc: Allocator, payload: []const u8) !void {
-    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
-    defer freeKeyValueEntries(alloc, entries);
-    for (entries) |entry| {
+    var reader = try backup_codec.KeyValueBatchReader.init(payload);
+    while (try reader.next()) |entry| {
         var artifact_ref = (try decodeResolutionPublicIdAlloc(alloc, entry.key)) orelse return error.InvalidBackupRequest;
         defer artifact_ref.deinit(alloc);
     }
