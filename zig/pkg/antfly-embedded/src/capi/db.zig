@@ -9901,3 +9901,57 @@ test "capi lite standalone snapshots retain one catalog authority across embedde
         try std.testing.expectEqualStrings(antfly.public_api.tables.default_schema_json, output.ptr.?[0..output.len]);
     }
 }
+
+test "capi native memory curation content is physically scrubbed across reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-memory-curation-reopen");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const path = try std.fmt.allocPrintSentinel(alloc, "{s}/db.aflite", .{directory.path()}, 0);
+    const memory = @import("../memory/service.zig");
+    var id: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &id));
+    defer if (id != null) antfly_db_close(id);
+    _ = try nativeMemoryTestCall(id, alloc, "alice", .create, memory.types.Config{ .retention_ms = std.math.maxInt(u64) }, "create", "");
+    const evidence: memory.types.Evidence = .{ .id = "identity", .source_id = "identity-note", .source_version = "1", .text = "Identity evidence" };
+    const entities: []const memory.types.Entity = &.{
+        .{ .id = "left", .name = "Left", .evidence = &.{.{ .id = "identity" }} },
+        .{ .id = "right", .name = "Right", .evidence = &.{.{ .id = "identity" }} },
+    };
+    _ = try nativeMemoryTestCall(id, alloc, "alice", .observe, .{ .evidence = &.{evidence}, .entities = entities }, "entities", "");
+    _ = try nativeMemoryTestCall(id, alloc, "alice", .curate_entity, memory.types.EntityCorrection{ .action = .merge, .from = "left", .to = "right", .expected_revision = 3, .reason = "PRIVATE_CURATOR_REASON" }, "merge", "");
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    _ = try nativeMemoryTestCall(id, alloc, "alice", .forget, .{ .all = true }, "forget", "");
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    for (0..24) |step| _ = try nativeMemoryTestCall(id, alloc, "alice", .advance, .{}, try std.fmt.allocPrint(alloc, "cleanup-{d}", .{step}), "");
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    const guard = enterHandle(id, .exclusive) orelse return error.TestUnexpectedResult;
+    defer guard.leave();
+    try std.testing.expect(guard.entry_error == null);
+    const owner = guard.handle.parent_handle orelse guard.handle;
+    var adapter: @import("../memory/engine.zig").Native(db_mod.DB) = .{
+        .db = try @import("tables.zig").get(owner, "memory_personal"),
+        .context = .{ .space = "personal", .principal = "alice", .admin = true, .now_ms = 1 },
+    };
+    const backend = adapter.backend();
+    try std.testing.expect(try backend.get(backend.ptr, alloc, "forgotten-all") != null);
+    try std.testing.expect(try backend.get(backend.ptr, alloc, "cleanup") == null);
+    try std.testing.expect(try backend.get(backend.ptr, alloc, "entity-policy") == null);
+    try std.testing.expectEqual(@as(usize, 0), (try backend.scan(backend.ptr, alloc, "entity-curation/", null, 256)).rows.len);
+    var cursor: ?[]const u8 = null;
+    while (true) {
+        const page = try backend.scan(backend.ptr, alloc, "", cursor, 256);
+        for (page.rows) |row| try std.testing.expect(std.mem.indexOf(u8, row.json, "PRIVATE_CURATOR_REASON") == null);
+        cursor = page.next;
+        if (cursor == null) break;
+    }
+}

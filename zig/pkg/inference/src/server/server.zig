@@ -3036,6 +3036,10 @@ fn rejectDisallowedModel(
 const transient_capacity_retry_after_seconds = "1";
 const transient_capacity_retry_after_ms = 1000;
 
+fn isModelPublicationError(err: anyerror) bool {
+    return err == error.ModelArtifactsChanging or err == error.IncompleteManagedDownload;
+}
+
 fn isTransientInferenceCapacityError(err: anyerror) bool {
     return err == error.ResourceTemporarilyUnavailable or err == error.ConcurrencyUnavailable or err == error.GenerationCapacityUnavailable;
 }
@@ -3118,6 +3122,7 @@ fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
 
 fn inferenceFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
     if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
+    if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
     return switch (err) {
         error.MemoryBudgetExceeded => ctx.status(507).json(.{
             .@"error" = "MEMORY_BUDGET_EXCEEDED",
@@ -29173,6 +29178,31 @@ test "changing model publication returns an explicit retry contract" {
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"retryable\":true") != null);
 }
 
+test "embedding and execution publication races retain the retry contract" {
+    const a = std.testing.allocator;
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/embed");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    for ([_]anyerror{ error.ModelArtifactsChanging, error.IncompleteManagedDownload }) |cause| {
+        var strict = try embedDenseInputFailureResponse(&ctx, cause);
+        defer strict.deinit();
+        try std.testing.expectEqual(@as(u16, 503), strict.status.code);
+        try std.testing.expectEqualStrings("1", strict.header("Retry-After").?);
+        try std.testing.expect(std.mem.indexOf(u8, strict.body.?, "MODEL_ARTIFACTS_CHANGING") != null);
+        try std.testing.expect(std.mem.indexOf(u8, strict.body.?, "\"retryable\":true") != null);
+        const partial = embedItemFailure(3, cause, "execution");
+        try std.testing.expectEqualStrings("MODEL_ARTIFACTS_CHANGING", partial.code);
+        try std.testing.expectEqual(@as(u16, 503), partial.status);
+        try std.testing.expect(partial.retryable);
+        try std.testing.expectEqual(@as(?i64, 1000), partial.retry_after_ms);
+        var execution = try inferenceFailureResponse(&ctx, cause);
+        defer execution.deinit();
+        try std.testing.expectEqual(@as(u16, 503), execution.status.code);
+        try std.testing.expectEqualStrings("1", execution.header("Retry-After").?);
+    }
+}
+
 test "managed download markers return the model publication retry contract" {
     const allocator = std.testing.allocator;
     var request = try httpx.Request.init(allocator, .POST, "/ai/v1/transcribe");
@@ -33292,6 +33322,11 @@ const EmbedDenseInputFailure = struct {
 };
 
 fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
+    if (isModelPublicationError(err)) return .{
+        .status = 503,
+        .code = "MODEL_ARTIFACTS_CHANGING",
+        .message = "model artifacts are being published; retry with a consistent generation",
+    };
     if (isTransientInferenceCapacityError(err)) return .{
         .status = 503,
         .code = "MODEL_RESOURCE_BUSY",
@@ -33402,6 +33437,7 @@ test "EmbeddingGemma2 grouped image parse failures keep permanent image errors" 
 }
 
 fn embedDenseInputFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
     if (isTransientInferenceCapacityError(err)) {
         return modelResourceBusyResponse(ctx);
     }
@@ -33471,6 +33507,18 @@ const DenseEmbedPartialResult = struct {
 };
 
 fn embedItemFailure(index: usize, err: anyerror, stage: []const u8) EmbedItemError {
+    if (isModelPublicationError(err)) {
+        const failure = embedDenseInputFailure(err);
+        return .{
+            .index = @intCast(index),
+            .code = failure.code,
+            .message = failure.message,
+            .stage = stage,
+            .retryable = true,
+            .status = failure.status,
+            .retry_after_ms = transient_capacity_retry_after_ms,
+        };
+    }
     if (isInferenceExecutorContractError(err)) {
         const failure = generateExecutorContractError(err);
         return .{ .index = @intCast(index), .code = failure.batch.code, .message = failure.batch.message, .stage = stage, .retryable = failure.batch.retryable, .status = failure.status };

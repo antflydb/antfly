@@ -32,6 +32,16 @@ const DecisionProvenance = struct { principal: []const u8, recorded_at: i64, con
 // independent of the alternative factual support selected by a producer.
 const GenerationProvenance = struct { operation_id: []const u8, config_generation: u64, evidence_ids: []const []const u8 };
 const EntityPolicy = struct { state: curation.State = .{}, redirects: []const curation.Redirect = &.{} };
+// Free-text audit content has its own retention lifecycle. Identity origins
+// retain only attribution/revision, so forgetting can scrub content without
+// discarding a surviving suppression, distinction or redirect decision.
+const EntityCurationProvenance = struct {
+    owner: []const u8,
+    recorded_at: i64,
+    revision: u64,
+    entity_ids: []const []const u8,
+    reason: []const u8,
+};
 
 pub const Row = struct { key: []const u8, json: []const u8, version: u64 = 0, digest: ?[32]u8 = null };
 pub const Change = struct { key: []const u8, json: ?[]const u8 };
@@ -440,7 +450,20 @@ const Run = struct {
         return std.fmt.allocPrint(self.a, "generation-input/{s}/{s}", .{ kind, try hash(self.a, id) });
     }
     fn entityVisible(self: *Run, record: t.EntityRecord) !bool {
-        return try self.supportVisible(record.entity.evidence, &.{}, 0) and try self.generationVisible("entity", record.entity.id);
+        const cache_key = try self.viewKey("entity-retention", record.entity.id, 0, null, null, 0);
+        if (self.views.get(cache_key)) |result| return result;
+        const result = try self.supportVisible(record.entity.evidence, &.{}, 0) and try self.generationVisible("entity", record.entity.id);
+        try self.views.put(self.a, cache_key, result);
+        return result;
+    }
+    fn curationProvenanceRetained(self: *Run, value: EntityCurationProvenance) !bool {
+        if (value.entity_ids.len == 0 or value.entity_ids.len > 2) return error.MemoryCorruptState;
+        if (try self.read(bool, "forgotten-all") != null) return false;
+        for (value.entity_ids) |id| {
+            const record = (try self.read(t.EntityRecord, try key(self.a, "entity", id))) orelse return false;
+            if (!try self.entityVisible(record)) return false;
+        }
+        return true;
     }
     // Physical retention is independent of current belief/lifecycle. A
     // superseded premise can still support an auditable historical revision.
@@ -1057,13 +1080,16 @@ const Run = struct {
     }
     fn curateEntity(self: *Run, request: t.EntityCorrection) !void {
         try self.requireAdmin();
+        if (try self.read(bool, "forgotten-all") != null) return error.MemoryForgotten;
         if (request.expected_revision != self.state.revision - 1) return error.MemoryRevisionConflict;
         const stored = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
         const from = (try self.read(t.EntityRecord, try key(self.a, "entity", request.from))) orelse return error.MemoryNotFound;
         try self.authorize(from.owner, .private);
+        if (!try self.entityVisible(from)) return error.MemoryForgotten;
         if (request.to) |target| {
             const to = (try self.read(t.EntityRecord, try key(self.a, "entity", target))) orelse return error.MemoryNotFound;
             try self.authorize(to.owner, .private);
+            if (!try self.entityVisible(to)) return error.MemoryForgotten;
             if (request.action == .merge) {
                 if (from.entity.visibility != to.entity.visibility or (from.entity.visibility == .private and !eql(u8, from.owner, to.owner))) return error.MemoryVisibilityConflict;
             }
@@ -1074,7 +1100,7 @@ const Run = struct {
             try affected_names.put(self.a, name, {});
         };
         if (request.reason.len > t.max_text_bytes) return error.InvalidMemoryRequest;
-        const plan = try curation.plan(self.a, try self.encode(stored.state), stored.redirects, stored.redirects, .{
+        const plan = try curation.planWithOrigin(self.a, try self.encode(stored.state), stored.redirects, stored.redirects, .{
             .action = switch (request.action) {
                 .merge => .merge,
                 .unmerge => .unmerge,
@@ -1089,11 +1115,23 @@ const Run = struct {
                 .release => .release,
                 .suppress => .suppress,
             },
-            .actor = self.service.context.principal,
-            .reason = request.reason,
             .replace = request.replace,
             .pin_distinct = request.pin_distinct,
+        }, .{
+            .actor = self.service.context.principal,
+            .created_at_ms = @intCast(@max(0, self.service.context.now_ms)),
+            .revision = self.state.revision,
         });
+        if (request.reason.len > 0) {
+            const ids = if (request.to) |target| &[_][]const u8{ request.from, target } else &[_][]const u8{request.from};
+            try self.put(try std.fmt.allocPrint(self.a, "entity-curation/{d:0>20}", .{self.state.revision}), EntityCurationProvenance{
+                .owner = self.service.context.principal,
+                .recorded_at = self.service.context.now_ms,
+                .revision = self.state.revision,
+                .entity_ids = ids,
+                .reason = request.reason,
+            });
+        }
         const redirects = try curation.RedirectIndex.init(self.a, plan.merges);
         // Check all members against the proposed graph. Re-pointing one alias
         // need not move its old component, but no declared distinction may fold.
@@ -1323,7 +1361,17 @@ const Run = struct {
     fn forget(self: *Run, request: t.Forget) !void {
         if (request.all) try self.requireAdmin();
         if (request.evidence_ids.len + request.assertion_ids.len + request.source_ids.len > t.max_items) return error.MemoryInputTooLarge;
-        if (request.all) try self.put("forgotten-all", true);
+        if (request.all) {
+            try self.put("forgotten-all", true);
+            // Forget-all permanently closes evidence/identity admission. Its
+            // durable fence replaces every projection-level identity guard,
+            // so discard the entire curation payload, including free-text
+            // provenance, without retaining another copy in audit metadata.
+            try self.remove("entity-policy");
+            self.identity_policy = null;
+            self.identity_index = null;
+            self.suppression_index = null;
+        }
         for (request.source_ids) |id| {
             try t.validateId(id);
             try self.requireAdmin();
@@ -1572,8 +1620,16 @@ const Run = struct {
             // Include history appended by this quantum's invalidation work;
             // completing cleanup cannot leave newly written forgotten text.
             const page = try self.scanOverlay("", cleanup.cursor, 64);
+            var continuation = page.next;
+            var position = cleanup.cursor;
+            var deferred = false;
+            const forgetting_all = try self.read(bool, "forgotten-all") != null;
             for (page.rows) |row| {
-                if (std.mem.startsWith(u8, row.key, "evidence/")) {
+                if (eql(u8, row.key, "entity-policy")) {
+                    // Also scrub policy rows left by earlier implementations
+                    // or a restored pre-cleanup snapshot of a forgotten space.
+                    if (try self.read(bool, "forgotten-all") != null) try self.remove(row.key);
+                } else if (std.mem.startsWith(u8, row.key, "evidence/")) {
                     const source = try parse(t.StoredEvidence, self.a, row.json);
                     const expires = self.evidenceExpiry(source);
                     if (expires) |time| if (time > self.service.context.now_ms and (self.state.next_expiry_at == null or time < self.state.next_expiry_at.?)) {
@@ -1583,6 +1639,18 @@ const Run = struct {
                         try self.remove(row.key);
                         try self.put(try key(self.a, "forgotten-evidence", source.evidence.id), true);
                     }
+                } else if (std.mem.startsWith(u8, row.key, "entity-curation/")) {
+                    // At most two entities, each with 256 direct evidence refs
+                    // and 512 admitted generation inputs. Yield before a new
+                    // artifact can exhaust this quantum's shared work quota.
+                    const reserve = 2 * (t.max_items + 2 * t.max_items);
+                    if (!forgetting_all and self.support_work > max_support_work - reserve) {
+                        continuation = position;
+                        deferred = true;
+                        break;
+                    }
+                    const provenance = try parse(EntityCurationProvenance, self.a, row.json);
+                    if (!try self.curationProvenanceRetained(provenance)) try self.remove(row.key);
                 } else if (std.mem.startsWith(u8, row.key, "entity/")) {
                     const stored = try parse(t.EntityRecord, self.a, row.json);
                     if (try self.read(bool, "forgotten-all") != null or !try self.entityVisible(stored)) {
@@ -1621,8 +1689,9 @@ const Run = struct {
                         if (std.mem.startsWith(u8, row.key, "assertion/")) try self.retireAssertion(record.assertion.id) else try self.remove(row.key);
                     } else try self.put(row.key, try self.publicRecord(record));
                 }
+                position = row.key;
             }
-            if (page.next) |cursor| try self.put("cleanup", .{ .cursor = cursor }) else try self.remove("cleanup");
+            if (deferred or continuation != null) try self.put("cleanup", .{ .cursor = continuation }) else try self.remove("cleanup");
         }
     }
     fn encodeCursor(self: *Run, prefix: []const u8, position: ?[]const u8) !?[]const u8 {

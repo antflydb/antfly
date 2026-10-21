@@ -116,6 +116,16 @@ def test_entity_curation_namespace_wait_and_resolver_routes(stateful_api):
     assert decision["changed"], decision
     assert api.get(resolver + "/redirects")["redirects"] == []
 
+    proposals = f"/tables/{destination}/curation/proposals"
+    proposed = api.post(proposals, {"action": "suppress", "key": "concept/alpha"})
+    for prefix in ("", "/databases/default/namespaces/public"):
+        route = prefix + proposals
+        page = api.get(route + "?state=open&action=suppress&limit=1")
+        assert [item["id"] for item in page["proposals"]] == [proposed["id"]]
+        assert api.get(route + "?state=accepted&limit=1")["proposals"] == []
+        invalid = api._request("GET", route + "?limit=0")
+        assert invalid.status_code == 400, invalid.text
+
 
 @pytest.mark.parametrize("raft", [False, True], ids=["standalone", "raft"])
 @pytest.mark.parametrize("promote", [False, True], ids=["resolution", "promotion"])

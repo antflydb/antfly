@@ -985,7 +985,7 @@ The proposed assertion model adds structured subject/predicate/value, explicit s
 
 ### Main integration and constrained-output follow-up (#1223)
 
-The native memory branch incorporates main through `6e014d9b45`, including merged
+The native memory branch incorporates main through `dd49f55102`, including merged
 [#1223](https://github.com/antflydb/antfly/pull/1223). Memory continues to use shared
 constrained-producer schema admission, exact-number validation, bounded JSON
 ownership, and provider qualification; it does not maintain a second schema
@@ -1003,9 +1003,25 @@ HTTP and the embedded C ABI.
 Main now uses topology versions 36–37 for curation provenance and durable proposal
 queues. Native service ownership therefore requires version **38** independently
 of resolver-namespace support (37); older peers cannot admit private memory tables.
-Memory identity corrections forward the authenticated actor and supplied reason
-to shared curation. Suppressing an identity with absorbed aliases defaults to
+Memory identity corrections forward authenticated actor, revision and time to
+shared curation. Free-text reasons are stored separately in bounded, entity-bound
+curation records; identity policy retains decision metadata without reason text.
+Source/evidence forgetting and expiry retire a reason when either bound identity
+loses its support, while preserving applicable redirect/suppression decisions.
+Global forgetting immediately removes identity policy; resumable physical cleanup
+removes curation content and legacy inline policy behind the permanent fence.
+Forgotten identities reject new curation content, including after restart. Suppressing an identity with absorbed aliases defaults to
 `absorbed: reject`; callers explicitly choose `release` or `suppress`. Shared
 curation removes the affected redirects. Unsuppressing a target does not silently
 reattach or unsuppress its former aliases; restoration is explicit and revision
 fenced. These choices share the resolver semantics introduced on main.
+
+
+MCP must preserve exact JSON numeric tokens at the JSON-RPC ingress, tool argument
+and structured-result boundaries, before memory's typed admission. Both HTTP and
+standalone JSON-RPC transports use the shared lossless parser and iterative
+writer. Integer count/dimension arguments accept exact integral decimal and
+exponent forms within bounds; fractional, negative and overflowing values reject
+rather than truncate or silently default. Regressions cover values beyond binary64
+precision, extreme exponents, deep nesting, exact JSON-RPC IDs, and an actual MCP
+memory assertion round trip.

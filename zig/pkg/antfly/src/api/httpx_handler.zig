@@ -9304,17 +9304,16 @@ pub const AntflyApiHandler = struct {
         return self.proposeCuration(ctx, table_name);
     }
 
-    pub fn listCurationProposals(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, params: anytype) !httpx.Response {
-        // Shared resolver admission owns query validation and pagination;
-        // resolverRequest forwards the original query, including these fields.
-        _ = params;
+    pub fn listCurationProposals(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, _: metadata_server_openapi.server.ListCurationProposalsParams) !httpx.Response {
+        // The shared resolver adapter validates and forwards the raw query for
+        // both public routes, including proposal filters and pagination.
         return self.resolverRequest(ctx, .proposals, table_name, "", "");
     }
 
-    pub fn namespaceListCurationProposals(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, params: anytype) !httpx.Response {
+    pub fn namespaceListCurationProposals(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, _: metadata_server_openapi.server.NamespaceListCurationProposalsParams) !httpx.Response {
         _ = database_name;
         _ = namespace_name;
-        return self.listCurationProposals(ctx, table_name, params);
+        return self.resolverRequest(ctx, .proposals, table_name, "", "");
     }
 
     pub fn getCurationProposal(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, proposal_id: []const u8) !httpx.Response {
@@ -18012,6 +18011,25 @@ test "native memory HTTP and MCP share persistent storage and private provenance
     defer mcp_response.deinit(a);
     try std.testing.expectEqual(@as(u16, 200), mcp_response.status);
     try std.testing.expect(std.mem.indexOf(u8, mcp_response.body, "Production uses Terraform") != null);
+    // Verify exact integer-valued decimal tokens through the actual MCP
+    // ingress and the native policy, rather than only the tool adapter.
+    var exact_observation = try @import("protocol_adapters.zig").executeMcpRequest(&api, .{
+        .method = .post,
+        .endpoint_path = "/mcp/v1",
+        .session_id = session_id,
+        .body =
+        \\{"jsonrpc":"2.0","id":9007199254740993.0,"method":"tools/call","params":{"name":"memory","arguments":{"space":"team","request":{"action":"assertions","idempotency_key":"exact-mcp","body":{"assertions":[{"id":"exact","subject":"counter","predicate":"value","value":"Exact","statement":"Exact business boundary","valid_from":9007199254740993.0,"evidence":[{"id":"e1"}]}]}}}}}
+        ,
+    }, @as(?AuthenticatedIdentity, null));
+    defer exact_observation.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), exact_observation.status);
+    try std.testing.expect(std.mem.indexOf(u8, exact_observation.body, "9007199254740993.0") != null);
+    var exact = try api.executeMemoryService("team", .{ .action = .get, .id = "exact" }, null, .{});
+    defer exact.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), exact.status);
+    const exact_record = try std.json.parseFromSlice(@import("memory.zig").memory.types.StoredAssertion, a, exact.body, .{});
+    defer exact_record.deinit();
+    try std.testing.expectEqual(@as(i64, 9007199254740993), exact_record.value.assertion.valid_from.?);
     const permission = [_]usermgr.Permission{.{ .resource_type = .table, .resource = @constCast("memory_team"), .type = .read }};
     const bob: AuthenticatedIdentity = .{ .username = @constCast("bob"), .permissions = @constCast(&permission) };
     var denied = try api.executeMemoryService("team", .{ .action = .get, .id = "a1" }, bob, .{});

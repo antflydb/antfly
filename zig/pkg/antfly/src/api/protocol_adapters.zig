@@ -395,7 +395,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
             defer alloc.free(table_name);
             var body = std.json.ObjectMap.empty;
             const default_shards: i64 = if (ctx.server.cfg.deployment_mode.isStandalone()) 1 else 3;
-            try body.put(alloc, "num_shards", .{ .integer = jsonIntArg(args, "numShards") orelse default_shards });
+            try body.put(alloc, "num_shards", .{ .integer = (try jsonIntArg(alloc, args, "numShards")) orelse default_shards });
             if (jsonStringArg(args, "fields")) |fields_json| {
                 if (fields_json.len != 0) {
                     const fields = std.json.parseFromSliceLeaky(std.json.Value, alloc, fields_json, .{}) catch return mcpError(alloc, "invalid fields JSON");
@@ -416,7 +416,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
             var body = std.json.ObjectMap.empty;
             try body.put(alloc, "name", .{ .string = index_name });
             try body.put(alloc, "type", .{ .string = "embeddings" });
-            if (jsonIntArg(args, "dimension")) |dimension| try body.put(alloc, "dimension", .{ .integer = dimension });
+            if (try jsonIntArg(alloc, args, "dimension")) |dimension| try body.put(alloc, "dimension", .{ .integer = dimension });
             if (jsonStringArg(args, "field")) |field| if (field.len != 0) try body.put(alloc, "field", .{ .string = field });
             if (jsonStringArg(args, "template")) |template| if (template.len != 0) try body.put(alloc, "template", .{ .string = template });
             if (jsonStringArg(args, "embedder")) |embedder_json| {
@@ -472,7 +472,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         fn sampleDocuments(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch return mcpError(alloc, "invalid table target");
             defer alloc.free(table_name);
-            const limit = jsonIntArg(args, "limit") orelse 5;
+            const limit = (try jsonIntArg(alloc, args, "limit")) orelse 5;
             if (limit <= 0) return mcpError(alloc, "limit must be greater than 0");
             if (limit > max_mcp_sample_documents_limit) return mcpError(alloc, "limit exceeds maximum sample size");
             var body = std.json.ObjectMap.empty;
@@ -530,7 +530,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
             if (jsonValueArg(args, "orderBy")) |order_by| try body.put(alloc, "order_by", order_by);
             if (jsonValueArg(args, "indexes")) |indexes| try body.put(alloc, "indexes", indexes);
             if (jsonStringArg(args, "filterPrefix")) |prefix| if (prefix.len != 0) try body.put(alloc, "filter_prefix", .{ .string = prefix });
-            try body.put(alloc, "limit", .{ .integer = jsonIntArg(args, "limit") orelse 10 });
+            try body.put(alloc, "limit", .{ .integer = (try jsonIntArg(alloc, args, "limit")) orelse 10 });
             return try ctx.executeOperation(alloc, .{ .query = .{
                 .table_name = table_name,
                 .body = try stringifyJsonValue(alloc, .{ .object = body }),
@@ -1622,13 +1622,13 @@ fn buildA2aDispatcher(
                         var full_text = std.json.ObjectMap.empty;
                         try full_text.put(alloc, "query", .{ .string = text });
                         try query_obj.put(alloc, "full_text_search", .{ .object = full_text });
-                        try query_obj.put(alloc, "limit", .{ .integer = jsonIntObjectField(data.object, "limit") orelse 5 });
+                        try query_obj.put(alloc, "limit", .{ .integer = (try jsonIntObjectField(alloc, data.object, "limit")) orelse 5 });
                         var queries = std.json.Array.init(alloc);
                         try queries.append(.{ .object = query_obj });
                         try body.put(alloc, "queries", .{ .array = queries });
                     }
                     if (data.object.get("steps")) |steps| try body.put(alloc, "steps", steps);
-                    if (jsonIntObjectField(data.object, "max_internal_iterations")) |max_iterations| try body.put(alloc, "max_internal_iterations", .{ .integer = max_iterations });
+                    if (try jsonIntObjectField(alloc, data.object, "max_internal_iterations")) |max_iterations| try body.put(alloc, "max_internal_iterations", .{ .integer = max_iterations });
                 }
             }
             const body_json = try stringifyJsonValue(alloc, .{ .object = body });
@@ -1748,18 +1748,21 @@ fn jsonStringObjectField(object: anytype, key: []const u8) ?[]const u8 {
     };
 }
 
-fn jsonIntArg(value: std.json.Value, key: []const u8) ?i64 {
-    if (value != .object) return null;
-    return jsonIntObjectField(value.object, key);
+fn jsonIntArg(alloc: std.mem.Allocator, value: std.json.Value, key: []const u8) !?i64 {
+    if (value != .object) return error.InvalidParams;
+    return jsonIntObjectField(alloc, value.object, key);
 }
 
-fn jsonIntObjectField(object: anytype, key: []const u8) ?i64 {
+fn jsonIntObjectField(alloc: std.mem.Allocator, object: anytype, key: []const u8) !?i64 {
     const value = object.get(key) orelse return null;
-    return switch (value) {
-        .integer => |n| n,
-        .float => |n| @intFromFloat(n),
-        else => null,
+    // MCP integer arguments are counts and dimensions. Missing values may
+    // default; present values must be exact, nonnegative, bounded integers.
+    // Reuse the decimal contract instead of rounding/truncating through f64.
+    const integer = @import("antfly_jsonschema").unsignedInteger(alloc, value, std.math.maxInt(i64)) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidParams,
     };
+    return @intCast(integer);
 }
 
 fn jsonBoolArg(value: std.json.Value, key: []const u8) ?bool {
@@ -1834,7 +1837,7 @@ fn putFullTextSearchArg(
 }
 
 fn stringifyJsonValue(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    return @import("antfly-json").stringifyValueAlloc(alloc, value);
 }
 
 fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), text: []const u8) !void {
@@ -1859,10 +1862,29 @@ fn mcpResultFromOwnedResponse(alloc: std.mem.Allocator, resp: contextual_operati
     }
     var structured: ?std.json.Value = null;
     if (std.mem.indexOf(u8, resp.content_type, "json") != null and resp.body.len != 0) {
-        structured = std.json.parseFromSliceLeaky(std.json.Value, alloc, resp.body, .{}) catch null;
+        structured = @import("antfly-json").parseValueLosslessLeaky(alloc, resp.body) catch null;
     }
     return .{
         .text = try alloc.dupe(u8, if (resp.body.len == 0) "ok" else resp.body),
         .structured = structured,
     };
+}
+
+test "native memory MCP numeric helpers accept only exact bounded integer arguments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "2.0", "2e0", "2", "9007199254740993.0", "9223372036854775807.0" }, [_]i64{ 2, 2, 2, 9007199254740993, std.math.maxInt(i64) }) |raw, expected| {
+        const input = try @import("antfly-json").parseValueLosslessLeaky(a, try std.fmt.allocPrint(a, "{{\"limit\":{s}}}", .{raw}));
+        try std.testing.expectEqual(expected, (try jsonIntArg(a, input, "limit")).?);
+    }
+    for ([_][]const u8{ "1.0000000000000001", "9223372036854775808", "1e100000", "1e-400", "-1.0", "true", "null", "\"2\"" }) |raw| {
+        const input = try @import("antfly-json").parseValueLosslessLeaky(a, try std.fmt.allocPrint(a, "{{\"limit\":{s}}}", .{raw}));
+        try std.testing.expectError(error.InvalidParams, jsonIntArg(a, input, "limit"));
+    }
+    const empty = try @import("antfly-json").parseValueLosslessLeaky(a, "{}");
+    try std.testing.expectEqual(@as(?i64, null), try jsonIntArg(a, empty, "limit"));
+    const raw = "{\"value\":1.0000000000000001}";
+    const result = try mcpResultFromOwnedResponse(a, .{ .status = 200, .content_type = "application/json", .body = try a.dupe(u8, raw) });
+    try std.testing.expectEqualStrings("1.0000000000000001", result.structured.?.object.get("value").?.number_string);
 }

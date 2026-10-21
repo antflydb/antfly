@@ -16985,6 +16985,8 @@ export interface components {
             provider: string;
             /** @description Configured provider model when applicable. */
             model?: string;
+            /** @description Pinned immutable embedding asset and recipe identity. */
+            model_identity?: string;
             models?: string[];
             project_id?: string;
             location?: string;

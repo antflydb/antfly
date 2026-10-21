@@ -2054,3 +2054,85 @@ test "memory generation plans mark client sources as distillation context and re
     claim.evidence = &.{.{ .id = "unknown" }};
     try std.testing.expectError(error.MemoryUngroundedOutput, plan.validatePublication(.{ .assertions = &.{claim} }));
 }
+
+fn curationPayloadSetup(store: *Store, expires: bool) ![]const u8 {
+    const a = store.arena.allocator();
+    try discard(store, .create, "", "{}", "create", 1);
+    const evidence: m.types.Evidence = .{ .id = "identity", .source_id = "identity-note", .source_version = "1", .text = "Identity evidence", .expires_at = if (expires) 50 else null };
+    const entities: []const m.types.Entity = &.{
+        .{ .id = "left", .name = "Left", .evidence = &.{.{ .id = "identity" }} },
+        .{ .id = "right", .name = "Right", .evidence = &.{.{ .id = "identity" }} },
+    };
+    try discard(store, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{evidence}, .entities = entities }, .{}), "entities", 2);
+    const body =
+        \\{"action":"merge","from":"left","to":"right","expected_revision":3,"reason":"PRIVATE_CURATOR_REASON"}
+    ;
+    try discard(store, .curate_entity, "", body, "merge", 3);
+    const policy = store.values.get("entity-policy").?;
+    try std.testing.expect(std.mem.indexOf(u8, policy, "PRIVATE_CURATOR_REASON") == null);
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, a, policy, .{});
+    const origin = value.object.get("state").?.object.get("redirect_origins").?.array.items[0].object.get("origin").?;
+    try std.testing.expectEqualStrings("alice", origin.object.get("actor").?.string);
+    try std.testing.expectEqual(@as(i64, 4), origin.object.get("revision").?.integer);
+    try std.testing.expectEqual(@as(usize, 1), (try Store.scan(store, a, "entity-curation/", null, 256)).rows.len);
+    return body;
+}
+
+test "memory curation content retires on global source evidence forgetting and expiry without losing fences" {
+    for (0..4) |mode| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        const replay = try curationPayloadSetup(&store, mode == 3);
+        if (mode < 3) try discard(&store, .forget, "", switch (mode) {
+            0 => "{\"all\":true}",
+            1 => "{\"source_ids\":[\"identity-note\"]}",
+            2 => "{\"evidence_ids\":[\"identity\"]}",
+            else => unreachable,
+        }, "forget", 4);
+        const revision = (try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{})).revision;
+        try std.testing.expectError(error.MemoryForgotten, store.service("alice", true, 60).execute(a, .curate_entity, "", try std.json.Stringify.valueAlloc(a, m.types.EntityCorrection{ .action = .unmerge, .from = "left", .expected_revision = revision, .reason = "LATE_FORGOTTEN_REASON" }, .{}), "late-curation"));
+        if (mode == 0) {
+            try std.testing.expect(store.values.get("entity-policy") == null);
+            _ = try store.service("alice", true, 60).execute(a, .curate_entity, "", replay, "merge");
+            try std.testing.expect(store.values.get("entity-policy") == null);
+        }
+        for (0..30) |i| try discard(&store, .advance, "", "{}", try std.fmt.allocPrint(a, "cleanup-{d}", .{i}), 60);
+        try std.testing.expect(store.values.get("cleanup") == null);
+        try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "entity-curation/", null, 256)).rows.len);
+        try std.testing.expectEqual(@as(usize, 2), (try Store.scan(&store, a, "forgotten-entity/", null, 256)).rows.len);
+        var it = store.values.iterator();
+        while (it.next()) |entry| {
+            try std.testing.expect(std.mem.indexOf(u8, entry.value_ptr.*, "PRIVATE_CURATOR_REASON") == null);
+            try std.testing.expect(std.mem.indexOf(u8, entry.value_ptr.*, "LATE_FORGOTTEN_REASON") == null);
+        }
+        if (mode != 0) {
+            // Retention of decision metadata is independent of free-text audit
+            // content. A future rebuild cannot silently reverse this decision.
+            const policy = try std.json.parseFromSliceLeaky(std.json.Value, a, store.values.get("entity-policy").?, .{});
+            const redirects = policy.object.get("redirects").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), redirects.len);
+            try std.testing.expectEqualStrings("left", redirects[0].object.get("key").?.string);
+            try std.testing.expectEqualStrings("right", redirects[0].object.get("target").?.string);
+        }
+    }
+}
+
+test "memory legacy forgotten identity policy is scrubbed and unrelated retirement keeps supported curation content" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    _ = try curationPayloadSetup(&store, false);
+    try discard(&store, .observe, "", "{\"evidence\":[{\"id\":\"unrelated\",\"source_id\":\"unrelated\",\"source_version\":\"1\",\"text\":\"Unrelated\"}]}", "unrelated", 4);
+    try discard(&store, .forget, "", "{\"source_ids\":[\"unrelated\"]}", "forget-unrelated", 5);
+    for (0..8) |i| try discard(&store, .advance, "", "{}", try std.fmt.allocPrint(a, "retain-{d}", .{i}), 6);
+    try std.testing.expectEqual(@as(usize, 1), (try Store.scan(&store, a, "entity-curation/", null, 256)).rows.len);
+    try discard(&store, .forget, "", "{\"all\":true}", "forget-all", 7);
+    // A restored snapshot from the previous format may contain inline origin
+    // text behind a permanent global fence. Cleanup must remove it too.
+    try store.values.put(a, "entity-policy", "{\"legacy_reason\":\"LEGACY_PRIVATE_REASON\"}");
+    for (0..12) |i| try discard(&store, .advance, "", "{}", try std.fmt.allocPrint(a, "legacy-{d}", .{i}), 8);
+    try std.testing.expect(store.values.get("entity-policy") == null);
+    try std.testing.expect(store.values.get("cleanup") == null);
+    try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "entity-curation/", null, 256)).rows.len);
+}
