@@ -21,9 +21,18 @@ const A = std.mem.Allocator;
 
 pub const Scope = struct {
     identity: [32]u8,
+    source_identity: [32]u8,
     expires_ms: u64,
     pub fn init(path: []const u8, id: []const u8, namespace: anytype, expires_ms: u64) Scope {
-        return .{ .identity = digest(.{ "logical-values-v1", path, id, namespace }), .expires_ms = expires_ms };
+        return .{ .identity = digest(.{ "logical-values-v1", path, id, namespace }), .source_identity = digest(.{ "logical-source-v1", path, namespace }), .expires_ms = expires_ms };
+    }
+    /// Only a validated physical owner may supply this proof. It covers source
+    /// revision, schema/index publication, replay state and the owner's lifetime.
+    /// A segment ID alone cannot prove unchanged unindexed source values.
+    pub fn withSourceProof(self: Scope, proof: ?[32]u8) Scope {
+        var result = self;
+        if (proof) |value| result.identity = digest(.{ "logical-values-source-v2", self.source_identity, value });
+        return result;
     }
 };
 fn digest(value: anytype) [32]u8 {
@@ -76,6 +85,15 @@ pub const Cache = struct {
         shared: *Shared,
         pub fn facts(self: Lease) *const Facts {
             return &self.shared.facts;
+        }
+        /// Transfer the pin into a generic immutable view without allocating.
+        pub fn intoBorrowed(self: Lease) @import("../encoding/roaring.zig").BorrowedBitmap {
+            return .{ .bitmap = &self.shared.facts.matched, .context = .{ self.cache, self.shared }, .release = releaseBorrowed };
+        }
+        fn releaseBorrowed(context: [2]*anyopaque) void {
+            const cache: *Cache = @ptrCast(@alignCast(context[0]));
+            const shared: *Shared = @ptrCast(@alignCast(context[1]));
+            cache.release(shared);
         }
         pub fn deinit(self: *Lease) void {
             self.cache.release(self.shared);
@@ -468,4 +486,36 @@ test "logical value staggered expiry is logarithmic and keeps pins alive" {
     std.debug.print("logical_membership_expiry keys={d} comparisons={d} peak_bytes={d}\n", .{ count, cache.expiry_comparisons, cache.budget.peak });
     try std.testing.expect(pin.facts().known.contains(7));
     try std.testing.expect(cache.budget.live != 0);
+}
+
+test "logical value source proof shares cuts only for identical authoritative state" {
+    const first = Scope.init("table", "cut-a", @as(u64, 7), 100);
+    const second = Scope.init("table", "cut-b", @as(u64, 7), 200);
+    try std.testing.expect(!std.mem.eql(u8, &first.identity, &second.identity));
+    const proof: [32]u8 = @splat(42);
+    const a = first.withSourceProof(proof);
+    const b = second.withSourceProof(proof);
+    try std.testing.expectEqualSlices(u8, &a.identity, &b.identity);
+    try std.testing.expectEqual(@as(u64, 200), b.expires_ms);
+    const changed = second.withSourceProof(@as([32]u8, @splat(43)));
+    try std.testing.expect(!std.mem.eql(u8, &a.identity, &changed.identity));
+    const other = Scope.init("table", "cut-b", @as(u64, 8), 200).withSourceProof(proof);
+    try std.testing.expect(!std.mem.eql(u8, &a.identity, &other.identity));
+    try std.testing.expectEqualSlices(u8, &second.identity, &second.withSourceProof(null).identity);
+}
+
+test "logical value borrowed bitmap survives cache expiry without a clone" {
+    const a = std.testing.allocator;
+    var cache: Cache = .{ .budget = .{ .backing = a, .limit = 32768 } };
+    defer cache.deinit();
+    var facts = Facts.init(a);
+    defer facts.deinit();
+    facts.complete = true;
+    try facts.matched.addRange(0, 10000);
+    const key_ = digest(.{"borrowed"});
+    cache.put(key_, 10, 1, facts);
+    var view = cache.borrow(key_, 2).?.intoBorrowed();
+    defer view.deinit();
+    try std.testing.expect(cache.borrow(key_, 11) == null);
+    try std.testing.expectEqual(@as(usize, 10000), view.bitmap.cardinality());
 }

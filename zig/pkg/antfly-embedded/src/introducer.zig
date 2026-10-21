@@ -1249,9 +1249,23 @@ const TermAcc = struct {
 const FieldAcc = struct {
     scratch: Allocator,
     token_offset: u32 = 0,
+    term_chunk: []u8 = &.{},
+    term_used: usize = 0,
     term_map: std.StringHashMapUnmanaged(TermAcc) = .empty,
     fn init(a: Allocator) FieldAcc {
         return .{ .scratch = @import("sql/memory_budget.zig").reclaimingAllocator(a) };
+    }
+    // Keys have document lifetime; pack short borrowed terms into arena slabs
+    // instead of invoking the arena allocator for every distinct suffix.
+    inline fn intern(self: *@This(), a: Allocator, term: []const u8) ![]const u8 {
+        if (self.term_chunk.len - self.term_used < term.len) {
+            self.term_chunk = try a.alloc(u8, @max(4096, term.len));
+            self.term_used = 0;
+        }
+        const owned = self.term_chunk[self.term_used..][0..term.len];
+        @memcpy(owned, term);
+        self.term_used += term.len;
+        return owned;
     }
     fn deinit(self: *@This()) void {
         var values = self.term_map.valueIterator();
@@ -1633,7 +1647,7 @@ inline fn accumulateToken(a: Allocator, field: *FieldAcc, token: analysis_mod.To
     if (!slot.found_existing) {
         // Initialize before allocating so caller cleanup remains valid on OOM.
         slot.value_ptr.* = .{};
-        slot.key_ptr.* = if (borrowed) a.dupe(u8, token.term) catch |err| {
+        slot.key_ptr.* = if (borrowed) field.intern(a, token.term) catch |err| {
             _ = field.term_map.remove(token.term);
             return err;
         } else token.term;

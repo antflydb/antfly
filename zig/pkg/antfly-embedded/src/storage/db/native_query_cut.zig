@@ -75,6 +75,11 @@ pub fn finishWithReuseDigest(a: A, io: std.Io, root: []const u8, request: Reques
     try fs_paths.syncDirPortable(io, root);
 }
 pub fn validate(a: A, io: std.Io, root: []const u8, request: Request, namespace: Namespace, cancellation: Cancellation) !void {
+    _ = try validateWithSourceProof(a, io, root, request, namespace, cancellation);
+}
+/// Return the already-fenced owner proof only after validating this cut's
+/// complete physical manifest. Legacy cuts deliberately return null.
+pub fn validateWithSourceProof(a: A, io: std.Io, root: []const u8, request: Request, namespace: Namespace, cancellation: Cancellation) !?[32]u8 {
     try request.validate(nowMs());
     const path = try std.fmt.allocPrint(a, "{s}/query-cut.json", .{root});
     defer a.free(path);
@@ -102,6 +107,7 @@ pub fn validate(a: A, io: std.Io, root: []const u8, request: Request, namespace:
         };
         if (stat.inode != file.inode or stat.size != file.size or stat.mtime.toNanoseconds() != file.mtime_ns) return error.CatalogGenerationChanged;
     }
+    return manifest.reuse_digest;
 }
 
 pub const Guard = struct {
@@ -391,4 +397,24 @@ test "external lake native cache recomputes shared extent bytes after idle evict
         defer a.free(root);
         if (i < 2) try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, root, .{})) else try std.Io.Dir.accessAbsolute(io, root, .{});
     }
+}
+
+test "logical value source reuse proof requires a validated complete cut" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("value-source-proof");
+    defer directory.cleanup();
+    const source = try std.fmt.allocPrint(a, "{s}/source.data", .{directory.path()});
+    defer a.free(source);
+    _ = try backup.writeFileDurable(io, source, "original");
+    const id: [64]u8 = @splat('c');
+    const request: Request = .{ .id = &id, .table_id = 7, .expires_ms = nowMs() + 60000 };
+    const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+    const proof: [32]u8 = @splat(77);
+    try finishWithReuseDigest(a, io, directory.path(), request, namespace, 10, proof, .{});
+    try std.testing.expectEqualSlices(u8, &proof, &(try validateWithSourceProof(a, io, directory.path(), request, namespace, .{})).?);
+    _ = try backup.writeFileDurable(io, source, "different content");
+    try std.testing.expectError(error.CatalogGenerationChanged, validateWithSourceProof(a, io, directory.path(), request, namespace, .{}));
+    try finish(a, io, directory.path(), request, namespace, 11, .{});
+    try std.testing.expect(try validateWithSourceProof(a, io, directory.path(), request, namespace, .{}) == null);
 }

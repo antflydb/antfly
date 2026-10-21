@@ -2124,6 +2124,9 @@ pub const DocIdFilter = struct {
 pub const DocNumProducer = struct {
     ptr: *anyopaque,
     produce: *const fn (*anyopaque, Allocator, u32, u32, ?*const roaring.RoaringBitmap) anyerror!roaring.RoaringBitmap,
+    /// Optional complete segment-local membership. The consumer releases its
+    /// pin after synchronous use; a miss must not evaluate or read sources.
+    borrow: ?*const fn (*anyopaque, u32, u32) anyerror!?roaring.BorrowedBitmap = null,
     /// Borrow a complete global membership after adaptive materialization.
     /// The borrowed bitmap stays immutable and valid until the owner is released.
     /// Candidate-local answers must never be exposed through this hook.
@@ -2323,6 +2326,21 @@ pub fn countFilter(
     for (snap.segments, 0..) |_, segment_idx| {
         var seg = &snap.segments[segment_idx];
         const next_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch return error.CountOverflow;
+        if (filter == .doc_num and filter.doc_num.producer != null) {
+            if (filter.doc_num.bitmap != null or filter.doc_num.doc_nums.len != 0) return error.InvalidArgument;
+            const producer = filter.doc_num.producer.?;
+            if (producer.borrow) |borrow| if (try borrow(producer.ptr, doc_offset, seg.reader.doc_count)) |view| {
+                var held = view;
+                defer held.deinit();
+                seg.shared.lockDeletionShared();
+                defer seg.shared.unlockDeletionShared();
+                var count = held.bitmap.cardinality();
+                if (seg.shared.deleted) |*deleted| count -= held.bitmap.intersectionCardinality(deleted);
+                total = std.math.add(usize, total, count) catch return error.CountOverflow;
+                doc_offset = next_offset;
+                continue;
+            };
+        }
         if (filter == .doc_num and filter.doc_num.bitmap != null and filter.doc_num.producer == null and filter.doc_num.doc_nums.len == 0) {
             seg.shared.lockDeletionShared();
             defer seg.shared.unlockDeletionShared();
@@ -4387,4 +4405,43 @@ test "external lake metadata navigation compiled programs share immutable plans 
         }
     };
     try testing.checkAllAllocationFailures(a, Failure.run, .{&writer.snapshot().segments[0]});
+}
+
+test "logical value borrowed counts allocate nothing and respect deletions and errors" {
+    const a = testing.allocator;
+    const bytes = try buildTestSegmentWithTerms(a, &.{ .{ .terms = &.{} }, .{ .terms = &.{} }, .{ .terms = &.{} } });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const State = struct {
+        bitmap: roaring.RoaringBitmap,
+        releases: usize = 0,
+        cancel: bool = false,
+        fn borrow(raw: *anyopaque, _: u32, _: u32) anyerror!?roaring.BorrowedBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.cancel) return error.Canceled;
+            return .{ .bitmap = &self.bitmap, .context = .{ self, self }, .release = release };
+        }
+        fn release(context: [2]*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context[0]));
+            self.releases += 1;
+        }
+        fn produce(_: *anyopaque, _: Allocator, _: u32, _: u32, _: ?*const roaring.RoaringBitmap) anyerror!roaring.RoaringBitmap {
+            return error.UnexpectedMaterialization;
+        }
+    };
+    var state: State = .{ .bitmap = roaring.RoaringBitmap.init(a) };
+    defer state.bitmap.deinit();
+    try state.bitmap.addRange(0, 3);
+    var empty: [0]u8 = .{};
+    var no_alloc = std.heap.FixedBufferAllocator.init(&empty);
+    const filter: Filter = .{ .doc_num = .{ .doc_nums = &.{}, .producer = .{ .ptr = &state, .produce = State.produce, .borrow = State.borrow } } };
+    try testing.expectEqual(@as(usize, 3), try countFilter(no_alloc.allocator(), writer.snapshot(), filter));
+    try testing.expect(try writer.deleteById("1"));
+    try testing.expectEqual(@as(usize, 2), try countFilter(no_alloc.allocator(), writer.snapshot(), filter));
+    try testing.expectEqual(@as(usize, 2), state.releases);
+    state.cancel = true;
+    try testing.expectError(error.Canceled, countFilter(no_alloc.allocator(), writer.snapshot(), filter));
+    try testing.expectEqual(@as(usize, 2), state.releases);
 }

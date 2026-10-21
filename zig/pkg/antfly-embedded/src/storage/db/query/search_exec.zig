@@ -19002,7 +19002,7 @@ const ValueExecution = struct {
         };
         (self.req.value_search_work orelse &self.local_work).registerLeaf();
         self.clearGroups();
-        return .{ .doc_num = .{ .ids = &.{}, .producer = .{ .ptr = producer, .produce = ValueProducer.produce }, .boost = spec.boost } };
+        return .{ .doc_num = .{ .ids = &.{}, .producer = .{ .ptr = producer, .produce = ValueProducer.produce, .borrow = ValueProducer.borrow }, .boost = spec.boost } };
     }
 };
 
@@ -19013,6 +19013,9 @@ const ValueExecution = struct {
 /// Byte limits and allocator admission remain authoritative over learned sizes.
 const SourceReadTuner = struct {
     const sizes = [_]usize{ 16, 1, 2, 4, 8, 32, 64 };
+    const exploration_order = [_]usize{ 0, 5, 6, 4, 3, 2, 1 };
+    observations: [sizes.len]usize = @splat(0),
+    exploration_cursor: usize = 0,
     ns: [sizes.len]u64 = @splat(0),
     rows: [sizes.len]usize = @splat(0),
     choice: usize = 0,
@@ -19065,6 +19068,8 @@ const SourceReadTuner = struct {
         // A truncated batch is not a sample of a full arm. Scalar fallbacks
         // always train scalar, independently of the requested window size.
         if (mode == .batch and rows != requested) return;
+        // The required cold bootstrap estimates bytes, never steady-state cost.
+        if (bootstrap) return;
         const effective = for (sizes, 0..) |size, i| {
             if (size == (if (mode == .scalar) @as(usize, 1) else rows)) break i;
         } else unreachable;
@@ -19075,17 +19080,27 @@ const SourceReadTuner = struct {
         }
         self.rows[effective] += rows;
         self.ns[effective] +|= elapsed_ns;
-        // Bootstrap is a required source sample, not a completed exploration arm.
-        if (bootstrap) return;
+        self.observations[effective] += 1;
         // Falling back must not complete exploration of an untested arm.
         if (sizes[effective] != requested) return;
         self.calls += 1;
-        if (self.exploring and self.rows[effective] >= 16) {
-            self.choice += 1;
-            if (self.choice == sizes.len) {
-                self.exploring = false;
-                self.choice = self.best();
-                self.calls = 0;
+        // Each batch is already required verification work. Explore coarse
+        // windows first and take three scalar samples rather than sixteen
+        // tiny reads per arm. Skip capped or already sampled classes.
+        if (self.exploring and self.observations[effective] >= (if (effective == 1) @as(usize, 3) else 1)) {
+            while (true) {
+                self.exploration_cursor += 1;
+                if (self.exploration_cursor == exploration_order.len) {
+                    self.exploring = false;
+                    self.choice = self.best();
+                    self.calls = 0;
+                    break;
+                }
+                const next = exploration_order[self.exploration_cursor];
+                if (sizes[next] <= self.allowedRows() and self.observations[next] == 0) {
+                    self.choice = next;
+                    break;
+                }
             }
         } else if (!self.exploring) {
             if (self.calls >= 64) {
@@ -19104,7 +19119,7 @@ test "logical value source bootstrap bounds initial originals without changing s
     try std.testing.expect(tuner.bootstrapped);
     try std.testing.expectEqual(@as(usize, 4), tuner.desired());
     try std.testing.expectEqual(@as(usize, 0), tuner.choice);
-    try std.testing.expectEqual(@as(usize, 2), tuner.rows[2]);
+    try std.testing.expectEqual(@as(usize, 0), tuner.rows[2]);
     var scalar: SourceReadTuner = .{ .max_rows = 1 };
     try std.testing.expectEqual(@as(usize, 1), scalar.desired());
     scalar.observe(.scalar, 1, 1024, 1000);
@@ -19164,7 +19179,22 @@ test "logical value tuner distinguishes scalar fallback and truncated batches" {
     try std.testing.expectEqual(@as(usize, 0), tuner.rows[0]);
     tuner.observe(.batch, 16, 2048, 2000);
     try std.testing.expectEqual(@as(usize, 16), tuner.rows[0]);
-    try std.testing.expectEqual(@as(usize, 1), tuner.desired());
+    try std.testing.expectEqual(@as(usize, 32), tuner.desired());
+}
+
+test "logical value source exploration has bounded calls and skips capped arms" {
+    for ([_]usize{ 1, 2, 4, 8, 16, 32, 64 }) |cap| {
+        var tuner: SourceReadTuner = .{ .max_rows = cap };
+        var calls: usize = 0;
+        while (tuner.exploring and calls < 16) : (calls += 1) {
+            const rows = tuner.desired();
+            try std.testing.expect(rows <= cap);
+            tuner.observe(if (rows == 1) .scalar else .batch, rows, rows * 128, 1000 + rows * 10);
+        }
+        try std.testing.expect(!tuner.exploring);
+        try std.testing.expect(calls <= 10);
+        try std.testing.expectEqual(cap, SourceReadTuner.sizes[tuner.best()]);
+    }
 }
 
 const ValueSourceWindow = struct {
@@ -19325,6 +19355,23 @@ const ValueProducer = struct {
     exact_keyword: bool = false,
     slot: usize = 0,
     cohort: ?usize = null,
+    fn borrow(raw: *anyopaque, offset: u32, count: u32) anyerror!?roaring.BorrowedBitmap {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const owner = self.owner;
+        try (@import("../../../search/query.zig").ExecutionControl{ .cancellation = owner.req.cancellation, .deadline_ns = owner.req.execution_deadline_ns }).check();
+        const scope = owner.req.value_search_scope orelse return null;
+        const resolved = owner.snapshot.resolveDocId(offset) orelse return null;
+        const segment = &owner.snapshot.segments[resolved.seg_idx];
+        if (resolved.local_id != 0 or segment.reader.doc_count != count) return null;
+        const membership = value_query.membership;
+        const key = membership.key(scope, owner.req.index_name, segment.id, count, self.matcher.spec);
+        var pin = membership.retained.borrow(key, @import("../native_query_cut.zig").nowMs()) orelse return null;
+        if (!pin.facts().complete) {
+            pin.deinit();
+            return null;
+        }
+        return pin.intoBorrowed();
+    }
     fn produce(raw: *anyopaque, a: Allocator, offset: u32, count: u32, incoming: ?*const roaring.RoaringBitmap) anyerror!roaring.RoaringBitmap {
         const self: *@This() = @ptrCast(@alignCast(raw));
         const owner = self.owner;
@@ -34368,6 +34415,15 @@ test "logical value fusion preserves per-leaf scores and constrained retained fa
     const complete_query = try textQueryToSearchQueryWithValues(arena.allocator(), leaf, .{}, null, &complete);
     try std.testing.expectEqual(@as(u32, 3), try search_mod.countMatches(a, writer.snapshot(), complete_query));
     try std.testing.expectEqual(@as(usize, 0), loader.calls);
+    // A warmed count borrows immutable membership even with deletions. No
+    // allocator or original-source work is needed for the bitmap fast path.
+    var empty: [0]u8 = .{};
+    var no_alloc = std.heap.FixedBufferAllocator.init(&empty);
+    const borrowed_filter: @import("../../../search/query.zig").Filter = .{ .doc_num = .{ .doc_nums = &.{}, .producer = complete_query.doc_num.producer } };
+    try std.testing.expectEqual(@as(usize, 3), try writer.snapshot().countFilter(no_alloc.allocator(), borrowed_filter));
+    try std.testing.expectEqual(@as(usize, 0), loader.calls);
+    try std.testing.expectEqual(@as(u64, 0), complete.local_work.documents.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), complete.local_work.bytes.load(.monotonic));
 }
 
 test "logical value lossless keyword equality bypasses synonym expansion" {

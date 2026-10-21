@@ -28,6 +28,18 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+/// Immutable membership with an explicit owner pin. Copies of this handle are
+/// not additional references; exactly one caller releases each acquired lease.
+pub const BorrowedBitmap = struct {
+    bitmap: *const RoaringBitmap,
+    context: [2]*anyopaque,
+    release: *const fn ([2]*anyopaque) void,
+    pub fn deinit(self: *@This()) void {
+        self.release(self.context);
+        self.* = undefined;
+    }
+};
+
 /// Container threshold: switch from array to bitmap at this cardinality.
 const array_max = 4096;
 
@@ -817,6 +829,43 @@ pub const RoaringBitmap = struct {
             copied.containers.appendAssumeCapacity(owned);
         }
         return copied;
+    }
+
+    /// Count an intersection directly in compressed containers, without a copy.
+    pub fn intersectionCardinality(self: *const RoaringBitmap, other: *const RoaringBitmap) usize {
+        var left: usize = 0;
+        var right: usize = 0;
+        var count: usize = 0;
+        while (left < self.keys.items.len and right < other.keys.items.len) {
+            const lk = self.keys.items[left];
+            const rk = other.keys.items[right];
+            if (lk < rk) {
+                left += 1;
+                continue;
+            }
+            if (rk < lk) {
+                right += 1;
+                continue;
+            }
+            const a = &self.containers.items[left];
+            const b = &other.containers.items[right];
+            switch (a.*) {
+                .array => |values| for (values.items) |v| {
+                    if (b.contains(v)) count += 1;
+                },
+                .bitmap => |words| switch (b.*) {
+                    .array => |values| for (values.items) |v| {
+                        if (a.contains(v)) count += 1;
+                    },
+                    .bitmap => |other_words| for (words, other_words) |x, y| {
+                        count += @popCount(x & y);
+                    },
+                },
+            }
+            left += 1;
+            right += 1;
+        }
+        return count;
     }
 
     /// Immutable cached membership may be much broader than the current input.
@@ -2564,4 +2613,24 @@ test "logical value immutable intersection clones only the smaller operand" {
     try std.testing.expectEqual(@as(usize, 1), intersection.cardinality());
     try std.testing.expect(intersection.contains(7));
     try std.testing.expect(narrow.contains(20_000_000) and broad.contains(14_999_999));
+}
+
+test "logical value immutable intersection cardinality covers sparse and dense containers" {
+    const a = std.testing.allocator;
+    var left = RoaringBitmap.init(a);
+    defer left.deinit();
+    var right = RoaringBitmap.init(a);
+    defer right.deinit();
+    for (0..150000) |i| {
+        if (i % 2 == 0) try left.add(@intCast(i));
+        if (i % 3 == 0 and i < 70000) try right.add(@intCast(i));
+    }
+    var expected = try left.intersectionClone(a, &right);
+    defer expected.deinit();
+    try std.testing.expectEqual(expected.cardinality(), left.intersectionCardinality(&right));
+    try std.testing.expectEqual(expected.cardinality(), right.intersectionCardinality(&left));
+    try std.testing.expectEqual(left.cardinality(), left.intersectionCardinality(&left));
+    var empty = RoaringBitmap.init(a);
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), left.intersectionCardinality(&empty));
 }
