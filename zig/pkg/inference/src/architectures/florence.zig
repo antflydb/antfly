@@ -28,6 +28,7 @@
 const std = @import("std");
 const platform = @import("antfly_platform");
 const ops = @import("../ops/ops.zig");
+const MetalCompute = @import("../ops/metal_compute.zig").MetalCompute;
 const CT = ops.CT;
 const ComputeBackend = ops.ComputeBackend;
 const florence_config = @import("../models/florence.zig");
