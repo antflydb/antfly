@@ -5929,9 +5929,9 @@ The ordinary materialization path still validates the entire grant/claim set
 before releasing claims. Transactions without grants retain their existing path.
 No ABI, reader version or durable format changes are introduced.
 
-Three new planner cases cover all physical key families through the common
-prefix projection, metadata exclusion, duplicate roots, malformed keys and
-noncanonical records. A 4 KiB bounded allocator successfully plans mutations
+Three new planner cases cover primary and embedding keys, deleted document
+roots, metadata exclusion, duplicate roots, malformed keys and noncanonical
+records. A 4 KiB bounded allocator successfully plans mutations
 with 64 KiB values, proving the planner does not copy those values. Caller-owned
 allocation failures and every enumerated original checkpoint unwind their
 owners. A new transaction case exercises auxiliary writes and absent deletions
