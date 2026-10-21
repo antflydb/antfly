@@ -5453,6 +5453,11 @@ test "ordered reduction memos cover multiple outputs floats reversals and overla
     const cases = [_]struct { text: []const u8, expected: []const v.Value, floating: bool = false }{
         .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x WITH i,x+1 AS y,x*2 AS z RETURN i,sum(y),sum(z) ORDER BY i", .expected = &.{ .{ .integer = 500500 }, .{ .integer = 999000 } } },
         .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x RETURN i,avg(x) ORDER BY i", .expected = &.{.{ .number = 499.5 }} },
+        .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x WITH i,x ORDER BY x DESC WITH i,x RETURN i,avg(x),head(collect(x)) ORDER BY i", .expected = &.{ .{ .number = 499.5 }, .{ .integer = 999 } } },
+        .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x WITH i,x ORDER BY x WITH i,x ORDER BY x DESC RETURN i,avg(x),head(collect(x)) ORDER BY i", .expected = &.{ .{ .number = 499.5 }, .{ .integer = 999 } } },
+        .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x CALL {UNWIND [x,x+1] AS y RETURN y} RETURN i,sum(y) ORDER BY i", .expected = &.{.{ .integer = 1000000 }} },
+        .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x CALL {RETURN x*2 AS y LIMIT 1} RETURN i,avg(y) ORDER BY i", .expected = &.{.{ .number = 999 }} },
+        .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x CALL {WITH DISTINCT x RETURN x*2 AS y} RETURN i,avg(y) ORDER BY i", .expected = &.{.{ .number = 999 }} },
         .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x WITH * WHERE x>500 RETURN i,avg(x) ORDER BY i", .expected = &.{.{ .number = 750 }} },
         .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x RETURN i,avg(x),any(v IN collect(x) WHERE v>500) ORDER BY i", .expected = &.{ .{ .number = 499.5 }, .{ .boolean = true } } },
         .{ .text = "UNWIND range(1,30) AS i UNWIND $xs AS x RETURN i,avg(x),head([v IN collect(x) WHERE v>500]) ORDER BY i", .expected = &.{ .{ .number = 499.5 }, .{ .integer = 501 } } },
@@ -5543,6 +5548,13 @@ test "ordered reduction snapshots match independent sequential execution across 
         const parameters: []const v.Entry = &.{.{ .name = "lists", .value = .{ .list = &lists } }};
         for ([_][]const u8{
             "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x RETURN i,sum(x),avg(x),sum(DISTINCT x),avg(DISTINCT x),count(DISTINCT x)",
+            "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x ORDER BY x DESC WITH i,x RETURN i,avg(x),head(collect(x)),last(collect(x)) ORDER BY i",
+            "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x ORDER BY x WITH i,x ORDER BY x DESC RETURN i,avg(x),head(collect(x)) ORDER BY i",
+            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {UNWIND [x,x+1] AS y RETURN y} RETURN i,sum(y),avg(y),head(collect(y)),last(collect(y)) ORDER BY i",
+            "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {WITH * CALL {UNWIND [x,7] AS t RETURN t} RETURN t AS y} RETURN i,avg(y),head(collect(y)) ORDER BY i",
+            "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {RETURN x*2 AS y LIMIT 1} RETURN i,avg(y) ORDER BY i",
+            "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {WITH DISTINCT x RETURN x*2 AS y} RETURN i,avg(y) ORDER BY i",
+            "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {UNWIND [x,7] AS t WITH t ORDER BY t DESC RETURN t AS y SKIP 1 LIMIT 1} RETURN i,head(collect(y)),last(collect(y)) ORDER BY i",
             "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x+1 AS y,x*2 AS z RETURN i,sum(y),avg(z)",
             "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND reverse(xs) AS x RETURN i,sum(x),avg(x),sum(DISTINCT x)",
             "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x RETURN i,CASE WHEN i=2 THEN avg(x) ELSE 7 END",
@@ -5590,6 +5602,11 @@ test "ordered reduction memo owners release every failed allocation" {
         "UNWIND [1,2] AS i UNWIND [1,2,3] AS x CALL {WITH x AS t RETURN t*2 AS y,7 AS z} RETURN i,avg(y),min(z)",
         "UNWIND [1,2] AS i UNWIND [1,2,3] AS x CALL {WITH * CALL {RETURN x AS t} RETURN t*2 AS y} RETURN i,avg(y)",
         "UNWIND [1,2] AS i UNWIND [3,1,2] AS x WITH i,x ORDER BY x DESC RETURN i,avg(x),head(collect(x)) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND [3,1,2] AS x WITH i,x ORDER BY x WITH i,x ORDER BY x DESC WITH i,x RETURN i,avg(x),head(collect(x)) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND [1,2] AS x CALL {UNWIND [x,x+1] AS y RETURN y} RETURN i,avg(y)",
+        "UNWIND [1,2] AS i UNWIND [1,2] AS x CALL {WITH DISTINCT x RETURN x AS y LIMIT 1} RETURN i,avg(y)",
+        "UNWIND [1,2] AS i UNWIND [1,2] AS x WITH i,x AS y WHERE y>1 RETURN i,count(y) ORDER BY i LIMIT 1",
+        "UNWIND [1,2] AS i UNWIND [1,2] AS x WITH i,x,x*2 AS unused RETURN i,count(x) ORDER BY i LIMIT 1",
     }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{text});
 }
 
@@ -5661,4 +5678,47 @@ test "ordered domain cache admission does not add depth to captured values" {
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
     for (result.rows) |row| try std.testing.expectEqual(@as(i64, 1), row[1].integer);
+}
+
+test "group windows share certified successful reduction domains" {
+    const a = std.testing.allocator;
+    const xs = try a.alloc(v.Value, 1000);
+    defer a.free(xs);
+    for (xs, 0..) |*cell, index| cell.* = .{ .integer = @intCast(index) };
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(a, "UNWIND range(1,30) AS i UNWIND $xs AS x WITH i,x+1 AS y WHERE y>100 RETURN i,count(y) ORDER BY i LIMIT 5", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{.{ .name = "xs", .value = .{ .list = xs } }}, .{ .memory_bytes = 4 << 20, .intermediate_states = 100000 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 5), result.rows.len);
+    for (result.rows, 1..) |row, index| {
+        try std.testing.expectEqual(@as(i64, @intCast(index)), row[0].integer);
+        try std.testing.expectEqual(@as(i64, 900), row[1].integer);
+    }
+}
+
+test "scoped expanding domains and group windows retain boundaries and errors" {
+    try check("UNWIND [1,2] AS i UNWIND [1,2] AS x CALL {UNWIND [1,2] AS y RETURN y} RETURN i,y,count(*) ORDER BY i,y", "[[1,1,2],[1,2,2],[2,1,2],[2,2,2]]");
+    try check("UNWIND [1,2] AS i UNWIND [1,2] AS x CALL {RETURN x AS y LIMIT 0} RETURN i,count(y)", "[]");
+    try check("UNWIND [1,2] AS i UNWIND [1,2] AS x CALL {WITH x WHERE false RETURN 1/0 AS y LIMIT 1} RETURN i,count(y)", "[]");
+    try check("UNWIND [3,1,2,1] AS i UNWIND [1,2] AS x WITH i,x+1 AS y WHERE y>1 RETURN i,count(y) ORDER BY i LIMIT 1", "[[1,4]]");
+    try check("UNWIND [3,1,2] AS i UNWIND [1,2] AS x WITH i,x+1 AS y WHERE y>1 RETURN i,count(y) ORDER BY i LIMIT 0", "[]");
+    try check("UNWIND [1,2] AS i UNWIND [1,2] AS x WITH i,x ORDER BY x DESC WITH i,x ORDER BY x LIMIT 1 RETURN i,count(*) ORDER BY i", "[[1,1]]");
+    for ([_][]const u8{
+        "UNWIND [3,1,2] AS i UNWIND [1,0] AS x RETURN i,count(1/x) ORDER BY i LIMIT 1",
+        "UNWIND [1,2] AS i UNWIND [1,2] AS x WITH i,x,1/(x-1) AS bad RETURN i,count(x) ORDER BY i LIMIT 1",
+        "UNWIND [1,2] AS i UNWIND [1,2] AS x WITH i,x,1/(x-1) AS bad RETURN i,avg(x) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND [1,2] AS x WITH i,x,1/(x-1) AS bad WHERE false RETURN i,avg(x)",
+        "UNWIND [1,2] AS i UNWIND [1,2] AS x WITH i,x,1/(x-1) AS bad UNWIND [] AS z RETURN i,avg(x)",
+        "UNWIND [3,1,2] AS i UNWIND [1,0] AS x RETURN i,count(1/x) ORDER BY i LIMIT 0",
+        "UNWIND [1,2] AS i UNWIND [1,2] AS x CALL {RETURN 1/0 AS y LIMIT 0} RETURN i,avg(y)",
+        "UNWIND [1,2] AS i UNWIND [1,2] AS x WITH i,1/0 AS bad,x ORDER BY x WITH i,x RETURN i,avg(x) ORDER BY i",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
 }

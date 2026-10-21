@@ -5959,6 +5959,11 @@ def test_dynamic_substrings_share_validation_and_unicode_offsets(graph_db, paylo
         "scalar_call",
         "scoped_call",
         "wildcard_call",
+        "ordered_forward",
+        "ordered_twice",
+        "expanding_call",
+        "limited_call",
+        "distinct_call",
     ],
 )
 def test_ordered_aggregate_domains_share_exact_reducer_states(graph_db, case):
@@ -5966,6 +5971,17 @@ def test_ordered_aggregate_domains_share_exact_reducer_states(graph_db, case):
     tails = {
         "mapped": ("UNWIND $xs AS x WITH i,x+1 AS y,x*2 AS z RETURN i,sum(y),sum(z)", [500500, 999000]),
         "avg": ("UNWIND $xs AS x RETURN i,avg(x)", [499.5]),
+        "ordered_forward": (
+            "UNWIND $xs AS x WITH i,x ORDER BY x DESC WITH i,x RETURN i,avg(x),head(collect(x))",
+            [499.5, 999],
+        ),
+        "ordered_twice": (
+            "UNWIND $xs AS x WITH i,x ORDER BY x WITH i,x ORDER BY x DESC RETURN i,avg(x),head(collect(x))",
+            [499.5, 999],
+        ),
+        "expanding_call": ("UNWIND $xs AS x CALL {UNWIND [x,x+1] AS y RETURN y} RETURN i,sum(y)", [1000000]),
+        "limited_call": ("UNWIND $xs AS x CALL {RETURN x*2 AS y LIMIT 1} RETURN i,avg(y)", [999.0]),
+        "distinct_call": ("UNWIND $xs AS x CALL {WITH DISTINCT x RETURN x*2 AS y} RETURN i,avg(y)", [999.0]),
         "wildcard": ("UNWIND $xs AS x WITH * WHERE x>500 RETURN i,avg(x)", [750.0]),
         "any": ("UNWIND $xs AS x RETURN i,avg(x),any(v IN collect(x) WHERE v>500)", [499.5, True]),
         "filtered_head": ("UNWIND $xs AS x RETURN i,avg(x),head([v IN collect(x) WHERE v>500])", [499.5, 501]),
@@ -6063,7 +6079,16 @@ def test_scalar_domain_reuse_preserves_scopes_consumers_and_order(graph_db, xs):
 
     queries = [
         "UNWIND [1,2,1] AS i UNWIND $xs AS x WITH * WHERE x IS NOT NULL RETURN i,avg(x) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $xs AS x WITH i,x ORDER BY x DESC WITH i,x RETURN i,avg(x),head(collect(x)) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $xs AS x WITH i,x ORDER BY x WITH i,x ORDER BY x DESC RETURN i,avg(x),head(collect(x)) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $xs AS x CALL {UNWIND [x,x+1] AS y RETURN y} RETURN i,sum(y),avg(y),head(collect(y)) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $xs AS x CALL {RETURN x*2 AS y LIMIT 1} RETURN i,avg(y) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $xs AS x CALL {WITH DISTINCT x RETURN x*2 AS y} RETURN i,avg(y) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $xs AS x CALL {UNWIND [x,7] AS t WITH t ORDER BY t DESC RETURN t AS y SKIP 1 LIMIT 1} RETURN i,head(collect(y)),last(collect(y)) ORDER BY i",
+        "UNWIND [3,1,2,1] AS i UNWIND $xs AS x WITH i,x+1 AS y WHERE y>1 RETURN i,count(y) ORDER BY i LIMIT 1",
         "UNWIND [1,2] AS i UNWIND $xs AS x WITH *,x AS y RETURN i,head(collect(y)) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $xs AS x WITH i,x,1/(x-1) AS bad RETURN i,avg(x) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $xs AS x WITH i,x,1/(x-1) AS bad RETURN i,count(x) ORDER BY i LIMIT 1",
         "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x RETURN i,any(v IN collect(x) WHERE v>1),all(v IN collect(x) WHERE v>1),none(v IN collect(x) WHERE v>1),single(v IN collect(x) WHERE v>1) ORDER BY i",
         "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x RETURN i,reduce(s=0,v IN collect(DISTINCT x)|s+v),last([v IN collect(DISTINCT x) WHERE v>1]),head([v IN collect(x) WHERE v>1|v*2]) ORDER BY i",
         "UNWIND [1,2] AS i UNWIND $xs AS x RETURN i,any(v IN collect(x) WHERE v>i),reduce(s=i,v IN collect(x)|s+v) ORDER BY i",
@@ -6090,3 +6115,30 @@ def test_scalar_domain_reuse_preserves_scopes_consumers_and_order(graph_db, xs):
         assert outcome(query) == expected, (query, xs)
     wildcard = queries[0]
     assert outcome(wildcard) == outcome(wildcard.replace("WITH *", "WITH i,x"))
+
+
+def test_count_group_windows_reuse_complete_successful_domains(graph_db):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND range(1,30) AS i UNWIND $xs AS x WITH i,x+1 AS y WHERE y>100 RETURN i,count(y) ORDER BY i LIMIT 5",
+            "parameters": {"xs": list(range(1000))},
+            "limits": {"memory_bytes": 4 << 20, "intermediate_states": 100000},
+        },
+    )
+    assert [[int(cell["value"]) for cell in row] for row in result["rows"]] == [[i, 900] for i in range(1, 6)]
+    # Errors in both selected and rejected groups remain observable. LIMIT 0
+    # must still evaluate the original COUNT argument before discarding rows.
+    for limit in (0, 1):
+        with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
+            graph_db.cypher_json(
+                "g", {"query": f"UNWIND [3,1,2] AS i UNWIND [1,0] AS x RETURN i,count(1/x) ORDER BY i LIMIT {limit}"}
+            )
+
+        with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
+            graph_db.cypher_json(
+                "g",
+                {
+                    "query": f"UNWIND [1,2] AS i UNWIND [1,2] AS x WITH i,x,1/(x-1) AS bad RETURN i,count(x) ORDER BY i LIMIT {limit}"
+                },
+            )

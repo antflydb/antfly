@@ -2430,9 +2430,11 @@ const Engine = struct {
             if (self.capacity == 0 or (full and try engine.compareProjected(candidate, projected(fold.groups.items[self.heap.items[0]]), fold.projection.order) != .lt)) {
                 // These values would have been consumed even for discarded
                 // groups. Do not hide type/arithmetic/pattern errors in args.
-                for (fold.calls) |expression| {
+                if (fold.axis_packet == null) for (fold.calls) |expression| {
                     if (!expression.value.call.star) _ = try engine.eval(expression.value.call.args[0], row, null);
-                }
+                };
+                // An axis packet already certifies every pure argument in the
+                // complete captured domain, including losing group candidates.
                 return null;
             }
             var arena = std.heap.ArenaAllocator.init(engine.scratch_allocator);
@@ -2851,7 +2853,7 @@ const Engine = struct {
                     step.value.wildcard = false;
                 },
                 .subquery => |inner| {
-                    if (!scalarReturningCall(inner)) return clauses;
+                    if (!axisReturningCall(inner)) return clauses;
                     clause.operation.subquery = try self.normalizeScalarPipeline(shape, inner);
                 },
                 else => return clauses,
@@ -2874,6 +2876,9 @@ const Engine = struct {
                         if (!axisPure(predicate)) return output;
                         try self.axisReferences(&required, predicate);
                     }
+                    for (step.value.order) |order| try self.axisReferences(&required, order.expression);
+                    if (step.value.skip) |expr| try self.axisReferences(&required, expr);
+                    if (step.value.limit) |expr| try self.axisReferences(&required, expr);
                     var before: Names = .empty;
                     var kept: std.ArrayList(ast.Item) = .empty;
                     for (step.value.items) |item| {
@@ -2892,6 +2897,10 @@ const Engine = struct {
                     }
                     step.value.items = try kept.toOwnedSlice(self.a);
                     required = before;
+                },
+                .unwind => |u| {
+                    _ = required.remove(u.alias);
+                    try self.axisReferences(&required, u.expression);
                 },
                 .subquery => |inner| {
                     var shape_after = inputs[cursor];
@@ -2915,12 +2924,18 @@ const Engine = struct {
     }
     const AxisCall = struct { names: []const []const u8, dependent: []const bool, captures: Names, sample: usize = 0 };
     fn axisCall(self: *Engine, initial: Row, incoming: Names, inner: []const ast.Clause) anyerror!?AxisCall {
-        if (!scalarReturningCall(inner)) return null;
+        if (!axisReturningCall(inner)) return null;
         var shape = initial;
         var dependent: Names = .empty;
         var outer_names = incoming.keyIterator();
         while (outer_names.next()) |name| try dependent.put(self.a, name.*, {});
         for (inner) |clause| switch (clause.operation) {
+            .unwind => |u| {
+                // Every expanded value varies inside the domain, including a
+                // constant source. It must never become a representative key.
+                try dependent.put(self.a, u.alias, {});
+                shape = try self.streamShape(shape, clause);
+            },
             .project => |step| {
                 const p = step.value;
                 if (p.wildcard) return null;
@@ -3033,11 +3048,13 @@ const Engine = struct {
                 },
                 .project => |*step| {
                     var selected: std.ArrayList(ast.Item) = .empty;
-                    // A DISTINCT stage observes every dependent output, even
-                    // when later reducers do not reference that column.
-                    if (step.value.distinct) for (step.value.items, dependent[cursor]) |item, bit| {
+                    // Dependent expressions execute for every domain row even
+                    // when their values are dead. Retain them for scalar errors
+                    // as well as DISTINCT observation; representatives cannot
+                    // evaluate them against placeholder bindings.
+                    for (step.value.items, dependent[cursor]) |item, bit| {
                         if (bit) try required.put(a, item.alias orelse try self.expressionName(item.expression), {});
-                    };
+                    }
                     if (step.value.predicate) |predicate| try self.axisReferences(&required, predicate);
                     for (step.value.order) |order| try self.axisReferences(&required, order.expression);
                     var before: Names = .empty;
@@ -3333,7 +3350,7 @@ const Engine = struct {
             }
         }
         fn memoAxis(fold: *@This(), engine: *Engine, row: Row, index: usize) anyerror!bool {
-            if (!fold.axis_enabled or !fold.has_keys or !engine.read_only or !fold.defer_aggregates or !fold.weight.isOne() or fold.consumer != null or fold.continuation != null or fold.group_window != null or fold.top.* != null or fold.active_calls != null or fold.calls.len == 0 or fold.projection.wildcard) return false;
+            if (!fold.axis_enabled or !fold.has_keys or !engine.read_only or (!fold.defer_aggregates and fold.group_window == null) or !fold.weight.isOne() or fold.consumer != null or fold.continuation != null or fold.top.* != null or fold.active_calls != null or fold.calls.len == 0 or fold.projection.wildcard) return false;
             if (fold.single_seed) {
                 const repeated = for (fold.middle[0..index]) |clause| {
                     if (clause.operation == .unwind) break true;
@@ -3373,6 +3390,14 @@ const Engine = struct {
                 if (packet == null) return false;
             }
             const summary = packet.?;
+            if (fold.group_window != null) for (summary.rows[1..][0..fold.calls.len]) |snapshot| {
+                // A group window evaluates arguments even for rejected keys.
+                // Failed probes must replay the ordinary row/error order.
+                if (snapshot[6].value.integer != 0) {
+                    plan.memo.disabled = true;
+                    return false;
+                }
+            };
             var representative = row;
             var pending: std.ArrayList(AxisPartition) = .empty;
             var support_offset = 1 + fold.calls.len + plan.sample_count;
@@ -4586,15 +4611,22 @@ const Engine = struct {
         for (clauses) |clause| if (clause.operation == .subquery and pureReturningCall(clause.operation.subquery)) return true;
         return false;
     }
-    fn scalarReturningCall(inner: []const ast.Clause) bool {
+    /// Complete pure child domains can be evaluated once inside a reducer
+    /// probe even when an individual CALL expands, sorts, deduplicates or windows.
+    /// Other CALL optimizations still require their narrower cardinality proofs.
+    fn axisReturningCall(inner: []const ast.Clause) bool {
         if (inner.len == 0 or inner[inner.len - 1].operation != .project or !inner[inner.len - 1].operation.project.final) return false;
         for (inner) |clause| switch (clause.operation) {
+            .unwind => |u| if (!axisPure(u.expression)) return false,
             .project => |step| {
                 const p = step.value;
-                if (p.distinct or p.skip != null or p.limit != null or p.order.len != 0) return false;
-                for (p.items) |item| if (aggregates(item.expression)) return false;
+                for (p.items) |item| if (aggregates(item.expression) or !axisPure(item.expression)) return false;
+                if (p.predicate) |expr| if (!axisPure(expr)) return false;
+                for (p.order) |order| if (aggregates(order.expression) or !axisPure(order.expression)) return false;
+                if (p.skip) |expr| if (!axisPure(expr)) return false;
+                if (p.limit) |expr| if (!axisPure(expr)) return false;
             },
-            .subquery => |child| if (!scalarReturningCall(child)) return false,
+            .subquery => |child| if (!axisReturningCall(child)) return false,
             else => return false,
         };
         return true;
@@ -4620,14 +4652,13 @@ const Engine = struct {
         var ordered: ?usize = null;
         for (clauses, 0..) |clause, index| switch (clause.operation) {
             .unwind => {},
-            .subquery => |inner| if (!scalarReturningCall(inner)) return null,
+            .subquery => |inner| if (!axisReturningCall(inner)) return null,
             .project => |step| {
                 var grouped = false;
                 for (step.value.items) |item| grouped = grouped or aggregates(item.expression);
-                if (grouped) return if (ordered != null and ordered.? + 1 == index) index else null;
+                if (grouped) return if (ordered != null) index else null;
                 if (step.final or step.value.skip != null or step.value.limit != null) return null;
                 if (step.value.order.len != 0) {
-                    if (ordered != null) return null;
                     ordered = index;
                 }
             },
@@ -4747,7 +4778,7 @@ const Engine = struct {
         const ordered = for (middle) |clause| {
             if (clause.operation == .project and clause.operation.project.value.order.len != 0) break true;
         } else false;
-        if (ordered and (!scalar_seed or input.len != 1 or middle.len == 0 or middle[middle.len - 1].operation != .project or middle[middle.len - 1].operation.project.value.order.len == 0)) return null;
+        if (ordered and (!scalar_seed or input.len != 1)) return null;
         var grouped = projection.distinct;
         var reducers = false;
         for (projection.items) |item| {
@@ -4771,7 +4802,7 @@ const Engine = struct {
         const fixed_hop = path.edges.len == 1 and path.edges[0].min_hops == 1 and path.edges[0].max_hops == 1;
         if (nested_graph and !scalar_seed and path.edges.len != 0 and !fixed_hop and !finite_pull) return null;
         const has_match = for (middle) |clause| {
-            if (clause.operation == .match or (clause.operation == .subquery and !scalarReturningCall(clause.operation.subquery))) break true;
+            if (clause.operation == .match or (clause.operation == .subquery and !axisReturningCall(clause.operation.subquery))) break true;
         } else false;
         // Global reducers/order remain stage barriers. This continuation path
         // is for finite unordered demand; it never enumerates a large count
