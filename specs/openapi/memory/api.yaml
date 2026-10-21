@@ -954,6 +954,209 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/MemoryOutcome'
+  /memory/v1/spaces/{space}/explain:
+    post:
+      operationId: explainMemoryResource
+      tags:
+      - memory
+      parameters:
+      - name: space
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: X-Antfly-Database
+        in: header
+        schema:
+          type: string
+          default: default
+        description: Catalog scope for this memory space.
+      - name: X-Antfly-Namespace
+        in: header
+        schema:
+          type: string
+          default: public
+        description: Catalog scope for this memory space.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryExplanation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryExplainRequest'
+  /memory/v1/spaces/{space}/memories/{id}/explain:
+    post:
+      operationId: explainMemory
+      tags:
+      - memory
+      parameters:
+      - name: space
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: X-Antfly-Database
+        in: header
+        schema:
+          type: string
+          default: default
+        description: Catalog scope for this memory space.
+      - name: X-Antfly-Namespace
+        in: header
+        schema:
+          type: string
+          default: public
+        description: Catalog scope for this memory space.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryExplanation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability,
+            or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryExplainRequest'
   /memory/v1/spaces/{space}/recall:
     post:
       operationId: recallMemory
@@ -2221,6 +2424,1053 @@ paths:
                 $ref: '#/components/schemas/MemoryError'
 components:
   schemas:
+    ProvenanceDecision:
+      type: object
+      properties:
+        schema_version:
+          type: integer
+        resource:
+          type: object
+          properties:
+            database:
+              type: string
+            namespace:
+              type: string
+            table:
+              type: string
+            table_id:
+              type: integer
+              minimum: 1
+              maximum: 18446744073709551615
+              format: uint64
+              x-go-type: uint64
+            storage_name:
+              type: string
+              nullable: true
+            kind:
+              type: string
+              enum:
+              - table
+              - record
+              - relationship
+              - trace
+              - evidence
+              - assertion
+              - entity
+              - outcome
+              - decision
+              - operation
+              - configuration
+            id:
+              type: string
+            revision:
+              type: integer
+              minimum: 1
+              maximum: 18446744073709551615
+              format: uint64
+              x-go-type: uint64
+            digest:
+              type: string
+              nullable: true
+          required:
+          - table
+          - table_id
+          - kind
+          - id
+          - revision
+          additionalProperties: false
+        operation:
+          type: object
+          properties:
+            database:
+              type: string
+            namespace:
+              type: string
+            table:
+              type: string
+            table_id:
+              type: integer
+              minimum: 1
+              maximum: 18446744073709551615
+              format: uint64
+              x-go-type: uint64
+            storage_name:
+              type: string
+              nullable: true
+            kind:
+              type: string
+              enum:
+              - table
+              - record
+              - relationship
+              - trace
+              - evidence
+              - assertion
+              - entity
+              - outcome
+              - decision
+              - operation
+              - configuration
+            id:
+              type: string
+            revision:
+              type: integer
+              minimum: 1
+              maximum: 18446744073709551615
+              format: uint64
+              x-go-type: uint64
+            digest:
+              type: string
+              nullable: true
+          required:
+          - table
+          - table_id
+          - kind
+          - id
+          - revision
+          additionalProperties: false
+        action:
+          type: string
+        status:
+          type: string
+          enum:
+          - proposed
+          - approved
+          - applied
+          - rejected
+          - cancelled
+        initiator:
+          type: object
+          properties:
+            id:
+              type: string
+            kind:
+              type: string
+              enum:
+              - user
+              - agent
+              - service
+            assurance:
+              type: string
+              enum:
+              - authenticated
+              - declared
+          required:
+          - id
+          additionalProperties: false
+        executor:
+          type: object
+          properties:
+            id:
+              type: string
+            kind:
+              type: string
+              enum:
+              - user
+              - agent
+              - service
+            assurance:
+              type: string
+              enum:
+              - authenticated
+              - declared
+          required:
+          - id
+          additionalProperties: false
+        origin:
+          type: object
+          properties:
+            agent:
+              type: object
+              properties:
+                id:
+                  type: string
+                kind:
+                  type: string
+                  enum:
+                  - user
+                  - agent
+                  - service
+                assurance:
+                  type: string
+                  enum:
+                  - authenticated
+                  - declared
+              required:
+              - id
+              additionalProperties: false
+              nullable: true
+            approver:
+              type: object
+              properties:
+                id:
+                  type: string
+                kind:
+                  type: string
+                  enum:
+                  - user
+                  - agent
+                  - service
+                assurance:
+                  type: string
+                  enum:
+                  - authenticated
+                  - declared
+              required:
+              - id
+              additionalProperties: false
+              nullable: true
+            trace:
+              type: object
+              properties:
+                database:
+                  type: string
+                namespace:
+                  type: string
+                table:
+                  type: string
+                table_id:
+                  type: integer
+                  minimum: 1
+                  maximum: 18446744073709551615
+                  format: uint64
+                  x-go-type: uint64
+                storage_name:
+                  type: string
+                  nullable: true
+                kind:
+                  type: string
+                  enum:
+                  - table
+                  - record
+                  - relationship
+                  - trace
+                  - evidence
+                  - assertion
+                  - entity
+                  - outcome
+                  - decision
+                  - operation
+                  - configuration
+                id:
+                  type: string
+                revision:
+                  type: integer
+                  minimum: 1
+                  maximum: 18446744073709551615
+                  format: uint64
+                  x-go-type: uint64
+                digest:
+                  type: string
+                  nullable: true
+              required:
+              - table
+              - table_id
+              - kind
+              - id
+              - revision
+              additionalProperties: false
+              nullable: true
+            span:
+              type: object
+              properties:
+                database:
+                  type: string
+                namespace:
+                  type: string
+                table:
+                  type: string
+                table_id:
+                  type: integer
+                  minimum: 1
+                  maximum: 18446744073709551615
+                  format: uint64
+                  x-go-type: uint64
+                storage_name:
+                  type: string
+                  nullable: true
+                kind:
+                  type: string
+                  enum:
+                  - table
+                  - record
+                  - relationship
+                  - trace
+                  - evidence
+                  - assertion
+                  - entity
+                  - outcome
+                  - decision
+                  - operation
+                  - configuration
+                id:
+                  type: string
+                revision:
+                  type: integer
+                  minimum: 1
+                  maximum: 18446744073709551615
+                  format: uint64
+                  x-go-type: uint64
+                digest:
+                  type: string
+                  nullable: true
+              required:
+              - table
+              - table_id
+              - kind
+              - id
+              - revision
+              additionalProperties: false
+              nullable: true
+            workflow:
+              type: string
+              nullable: true
+            workflow_version:
+              type: string
+              nullable: true
+          additionalProperties: false
+          nullable: true
+        decided_at:
+          type: integer
+        applied_at:
+          type: integer
+          nullable: true
+        effective_at:
+          type: integer
+          nullable: true
+        recorded_at:
+          type: integer
+        configuration:
+          type: object
+          properties:
+            database:
+              type: string
+            namespace:
+              type: string
+            table:
+              type: string
+            table_id:
+              type: integer
+              minimum: 1
+              maximum: 18446744073709551615
+              format: uint64
+              x-go-type: uint64
+            storage_name:
+              type: string
+              nullable: true
+            kind:
+              type: string
+              enum:
+              - table
+              - record
+              - relationship
+              - trace
+              - evidence
+              - assertion
+              - entity
+              - outcome
+              - decision
+              - operation
+              - configuration
+            id:
+              type: string
+            revision:
+              type: integer
+              minimum: 1
+              maximum: 18446744073709551615
+              format: uint64
+              x-go-type: uint64
+            digest:
+              type: string
+              nullable: true
+          required:
+          - table
+          - table_id
+          - kind
+          - id
+          - revision
+          additionalProperties: false
+        ontology_version:
+          type: string
+        policy_version:
+          type: string
+      required:
+      - resource
+      - operation
+      - action
+      - status
+      - initiator
+      - executor
+      - decided_at
+      - applied_at
+      - recorded_at
+      - configuration
+      - ontology_version
+      - policy_version
+      additionalProperties: false
+    ProvenanceEnvelope:
+      type: object
+      properties:
+        schema_version:
+          type: integer
+        links:
+          type: array
+          items:
+            type: object
+            properties:
+              relation:
+                type: string
+                enum:
+                - mentions
+                - retrieved
+                - used
+                - supported_by
+                - generated
+                - generated_by
+                - approved_by
+                - supersedes
+                - applied_to
+                - governed_by
+                - originated_in
+                - depends_on
+                - motivates
+                - rejected_in_favor_of
+              target:
+                type: object
+                properties:
+                  database:
+                    type: string
+                  namespace:
+                    type: string
+                  table:
+                    type: string
+                  table_id:
+                    type: integer
+                    minimum: 1
+                    maximum: 18446744073709551615
+                    format: uint64
+                    x-go-type: uint64
+                  storage_name:
+                    type: string
+                    nullable: true
+                  kind:
+                    type: string
+                    enum:
+                    - table
+                    - record
+                    - relationship
+                    - trace
+                    - evidence
+                    - assertion
+                    - entity
+                    - outcome
+                    - decision
+                    - operation
+                    - configuration
+                  id:
+                    type: string
+                  revision:
+                    type: integer
+                    minimum: 1
+                    maximum: 18446744073709551615
+                    format: uint64
+                    x-go-type: uint64
+                  digest:
+                    type: string
+                    nullable: true
+                required:
+                - table
+                - table_id
+                - kind
+                - id
+                - revision
+                additionalProperties: false
+            required:
+            - relation
+            - target
+            additionalProperties: false
+      additionalProperties: false
+    MemoryExplanation:
+      type: object
+      properties:
+        schema_version:
+          type: integer
+        nodes:
+          type: array
+          items:
+            type: object
+            properties:
+              resource:
+                type: object
+                properties:
+                  database:
+                    type: string
+                  namespace:
+                    type: string
+                  table:
+                    type: string
+                  table_id:
+                    type: integer
+                    minimum: 1
+                    maximum: 18446744073709551615
+                    format: uint64
+                    x-go-type: uint64
+                  storage_name:
+                    type: string
+                    nullable: true
+                  kind:
+                    type: string
+                    enum:
+                    - table
+                    - record
+                    - relationship
+                    - trace
+                    - evidence
+                    - assertion
+                    - entity
+                    - outcome
+                    - decision
+                    - operation
+                    - configuration
+                  id:
+                    type: string
+                  revision:
+                    type: integer
+                    minimum: 1
+                    maximum: 18446744073709551615
+                    format: uint64
+                    x-go-type: uint64
+                  digest:
+                    type: string
+                    nullable: true
+                required:
+                - table
+                - table_id
+                - kind
+                - id
+                - revision
+                additionalProperties: false
+              record: {}
+              payload_truncated:
+                type: boolean
+              links:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    relation:
+                      type: string
+                      enum:
+                      - mentions
+                      - retrieved
+                      - used
+                      - supported_by
+                      - generated
+                      - generated_by
+                      - approved_by
+                      - supersedes
+                      - applied_to
+                      - governed_by
+                      - originated_in
+                      - depends_on
+                      - motivates
+                      - rejected_in_favor_of
+                    target:
+                      type: object
+                      properties:
+                        database:
+                          type: string
+                        namespace:
+                          type: string
+                        table:
+                          type: string
+                        table_id:
+                          type: integer
+                          minimum: 1
+                          maximum: 18446744073709551615
+                          format: uint64
+                          x-go-type: uint64
+                        storage_name:
+                          type: string
+                          nullable: true
+                        kind:
+                          type: string
+                          enum:
+                          - table
+                          - record
+                          - relationship
+                          - trace
+                          - evidence
+                          - assertion
+                          - entity
+                          - outcome
+                          - decision
+                          - operation
+                          - configuration
+                        id:
+                          type: string
+                        revision:
+                          type: integer
+                          minimum: 1
+                          maximum: 18446744073709551615
+                          format: uint64
+                          x-go-type: uint64
+                        digest:
+                          type: string
+                          nullable: true
+                      required:
+                      - table
+                      - table_id
+                      - kind
+                      - id
+                      - revision
+                      additionalProperties: false
+                      nullable: true
+                    status:
+                      type: string
+                      enum:
+                      - available
+                      - changed
+                      - missing_or_denied
+                      - truncated
+                  required:
+                  - relation
+                  - target
+                  - status
+                  additionalProperties: false
+            required:
+            - resource
+            - record
+            - links
+            additionalProperties: false
+        complete:
+          type: boolean
+        truncated:
+          type: boolean
+        missing_evidence:
+          type: boolean
+        incomplete_history:
+          type: boolean
+        justification:
+          type: string
+          enum:
+          - recorded
+      required:
+      - nodes
+      - complete
+      - truncated
+      - missing_evidence
+      additionalProperties: false
+    TraceEvent:
+      type: object
+      properties:
+        schema_version:
+          type: integer
+        trace_id:
+          type: string
+        span_id:
+          type: string
+        parent_span_id:
+          type: string
+          nullable: true
+        name:
+          type: string
+        started_at:
+          type: integer
+        ended_at:
+          type: integer
+          nullable: true
+        status:
+          type: string
+          enum:
+          - running
+          - succeeded
+          - failed
+          - cancelled
+        provenance:
+          type: object
+          properties:
+            schema_version:
+              type: integer
+            links:
+              type: array
+              items:
+                type: object
+                properties:
+                  relation:
+                    type: string
+                    enum:
+                    - mentions
+                    - retrieved
+                    - used
+                    - supported_by
+                    - generated
+                    - generated_by
+                    - approved_by
+                    - supersedes
+                    - applied_to
+                    - governed_by
+                    - originated_in
+                    - depends_on
+                    - motivates
+                    - rejected_in_favor_of
+                  target:
+                    type: object
+                    properties:
+                      database:
+                        type: string
+                      namespace:
+                        type: string
+                      table:
+                        type: string
+                      table_id:
+                        type: integer
+                        minimum: 1
+                        maximum: 18446744073709551615
+                        format: uint64
+                        x-go-type: uint64
+                      storage_name:
+                        type: string
+                        nullable: true
+                      kind:
+                        type: string
+                        enum:
+                        - table
+                        - record
+                        - relationship
+                        - trace
+                        - evidence
+                        - assertion
+                        - entity
+                        - outcome
+                        - decision
+                        - operation
+                        - configuration
+                      id:
+                        type: string
+                      revision:
+                        type: integer
+                        minimum: 1
+                        maximum: 18446744073709551615
+                        format: uint64
+                        x-go-type: uint64
+                      digest:
+                        type: string
+                        nullable: true
+                    required:
+                    - table
+                    - table_id
+                    - kind
+                    - id
+                    - revision
+                    additionalProperties: false
+                required:
+                - relation
+                - target
+                additionalProperties: false
+          additionalProperties: false
+      required:
+      - trace_id
+      - span_id
+      - name
+      - started_at
+      additionalProperties: false
+    ResourceSelector:
+      type: object
+      properties:
+        database:
+          type: string
+        namespace:
+          type: string
+        table:
+          type: string
+        id:
+          type: string
+        kind:
+          type: string
+          enum:
+          - record
+          - relationship
+          - trace
+        expected_revision:
+          type: integer
+          nullable: true
+      required:
+      - table
+      - id
+      additionalProperties: false
+    ResourceReference:
+      type: object
+      properties:
+        database:
+          type: string
+        namespace:
+          type: string
+        table:
+          type: string
+        table_id:
+          type: integer
+          minimum: 1
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        storage_name:
+          type: string
+          nullable: true
+        kind:
+          type: string
+          enum:
+          - table
+          - record
+          - relationship
+          - trace
+          - evidence
+          - assertion
+          - entity
+          - outcome
+          - decision
+          - operation
+          - configuration
+        id:
+          type: string
+        revision:
+          type: integer
+          minimum: 1
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        digest:
+          type: string
+          nullable: true
+      required:
+      - table
+      - table_id
+      - kind
+      - id
+      - revision
+      additionalProperties: false
+    ProvenanceOrigin:
+      type: object
+      properties:
+        agent:
+          type: object
+          properties:
+            id:
+              type: string
+            kind:
+              type: string
+              enum:
+              - user
+              - agent
+              - service
+            assurance:
+              type: string
+              enum:
+              - authenticated
+              - declared
+          required:
+          - id
+          additionalProperties: false
+          nullable: true
+        approver:
+          type: object
+          properties:
+            id:
+              type: string
+            kind:
+              type: string
+              enum:
+              - user
+              - agent
+              - service
+            assurance:
+              type: string
+              enum:
+              - authenticated
+              - declared
+          required:
+          - id
+          additionalProperties: false
+          nullable: true
+        trace:
+          type: object
+          properties:
+            database:
+              type: string
+            namespace:
+              type: string
+            table:
+              type: string
+            table_id:
+              type: integer
+              minimum: 1
+              maximum: 18446744073709551615
+              format: uint64
+              x-go-type: uint64
+            storage_name:
+              type: string
+              nullable: true
+            kind:
+              type: string
+              enum:
+              - table
+              - record
+              - relationship
+              - trace
+              - evidence
+              - assertion
+              - entity
+              - outcome
+              - decision
+              - operation
+              - configuration
+            id:
+              type: string
+            revision:
+              type: integer
+              minimum: 1
+              maximum: 18446744073709551615
+              format: uint64
+              x-go-type: uint64
+            digest:
+              type: string
+              nullable: true
+          required:
+          - table
+          - table_id
+          - kind
+          - id
+          - revision
+          additionalProperties: false
+          nullable: true
+        span:
+          type: object
+          properties:
+            database:
+              type: string
+            namespace:
+              type: string
+            table:
+              type: string
+            table_id:
+              type: integer
+              minimum: 1
+              maximum: 18446744073709551615
+              format: uint64
+              x-go-type: uint64
+            storage_name:
+              type: string
+              nullable: true
+            kind:
+              type: string
+              enum:
+              - table
+              - record
+              - relationship
+              - trace
+              - evidence
+              - assertion
+              - entity
+              - outcome
+              - decision
+              - operation
+              - configuration
+            id:
+              type: string
+            revision:
+              type: integer
+              minimum: 1
+              maximum: 18446744073709551615
+              format: uint64
+              x-go-type: uint64
+            digest:
+              type: string
+              nullable: true
+          required:
+          - table
+          - table_id
+          - kind
+          - id
+          - revision
+          additionalProperties: false
+          nullable: true
+        workflow:
+          type: string
+          nullable: true
+        workflow_version:
+          type: string
+          nullable: true
+      additionalProperties: false
+    MemoryExplainRequest:
+      type: object
+      properties:
+        resource:
+          type: object
+          properties:
+            database:
+              type: string
+            namespace:
+              type: string
+            table:
+              type: string
+            table_id:
+              type: integer
+              minimum: 1
+              maximum: 18446744073709551615
+              format: uint64
+              x-go-type: uint64
+            storage_name:
+              type: string
+              nullable: true
+            kind:
+              type: string
+              enum:
+              - table
+              - record
+              - relationship
+              - trace
+              - evidence
+              - assertion
+              - entity
+              - outcome
+              - decision
+              - operation
+              - configuration
+            id:
+              type: string
+            revision:
+              type: integer
+              minimum: 1
+              maximum: 18446744073709551615
+              format: uint64
+              x-go-type: uint64
+            digest:
+              type: string
+              nullable: true
+          required:
+          - table
+          - table_id
+          - kind
+          - id
+          - revision
+          additionalProperties: false
+          nullable: true
+        revision:
+          type: integer
+          nullable: true
+        valid_at:
+          type: integer
+          nullable: true
+        known_at:
+          type: integer
+          nullable: true
+        max_bytes:
+          type: integer
+        max_nodes:
+          type: integer
+        max_depth:
+          type: integer
+      additionalProperties: false
     MemorySpaceConfig:
       type: object
       properties:
@@ -2396,6 +3646,82 @@ components:
           type: string
         text:
           type: string
+        resource:
+          type: object
+          properties:
+            database:
+              type: string
+            namespace:
+              type: string
+            table:
+              type: string
+            table_id:
+              type: integer
+              minimum: 1
+              maximum: 18446744073709551615
+              format: uint64
+              x-go-type: uint64
+            storage_name:
+              type: string
+              nullable: true
+            kind:
+              type: string
+              enum:
+              - table
+              - record
+              - relationship
+              - trace
+              - evidence
+              - assertion
+              - entity
+              - outcome
+              - decision
+              - operation
+              - configuration
+            id:
+              type: string
+            revision:
+              type: integer
+              minimum: 1
+              maximum: 18446744073709551615
+              format: uint64
+              x-go-type: uint64
+            digest:
+              type: string
+              nullable: true
+          required:
+          - table
+          - table_id
+          - kind
+          - id
+          - revision
+          additionalProperties: false
+          nullable: true
+        resource_selector:
+          type: object
+          properties:
+            database:
+              type: string
+            namespace:
+              type: string
+            table:
+              type: string
+            id:
+              type: string
+            kind:
+              type: string
+              enum:
+              - record
+              - relationship
+              - trace
+            expected_revision:
+              type: integer
+              nullable: true
+          required:
+          - table
+          - id
+          additionalProperties: false
+          nullable: true
         source_url:
           type: string
           nullable: true
@@ -2431,9 +3757,6 @@ components:
           nullable: true
       required:
       - id
-      - source_id
-      - source_version
-      - text
       additionalProperties: false
     MemoryAssertion:
       type: object
@@ -2623,6 +3946,159 @@ components:
     MemoryObservationRequest:
       type: object
       properties:
+        origin:
+          type: object
+          properties:
+            agent:
+              type: object
+              properties:
+                id:
+                  type: string
+                kind:
+                  type: string
+                  enum:
+                  - user
+                  - agent
+                  - service
+                assurance:
+                  type: string
+                  enum:
+                  - authenticated
+                  - declared
+              required:
+              - id
+              additionalProperties: false
+              nullable: true
+            approver:
+              type: object
+              properties:
+                id:
+                  type: string
+                kind:
+                  type: string
+                  enum:
+                  - user
+                  - agent
+                  - service
+                assurance:
+                  type: string
+                  enum:
+                  - authenticated
+                  - declared
+              required:
+              - id
+              additionalProperties: false
+              nullable: true
+            trace:
+              type: object
+              properties:
+                database:
+                  type: string
+                namespace:
+                  type: string
+                table:
+                  type: string
+                table_id:
+                  type: integer
+                  minimum: 1
+                  maximum: 18446744073709551615
+                  format: uint64
+                  x-go-type: uint64
+                storage_name:
+                  type: string
+                  nullable: true
+                kind:
+                  type: string
+                  enum:
+                  - table
+                  - record
+                  - relationship
+                  - trace
+                  - evidence
+                  - assertion
+                  - entity
+                  - outcome
+                  - decision
+                  - operation
+                  - configuration
+                id:
+                  type: string
+                revision:
+                  type: integer
+                  minimum: 1
+                  maximum: 18446744073709551615
+                  format: uint64
+                  x-go-type: uint64
+                digest:
+                  type: string
+                  nullable: true
+              required:
+              - table
+              - table_id
+              - kind
+              - id
+              - revision
+              additionalProperties: false
+              nullable: true
+            span:
+              type: object
+              properties:
+                database:
+                  type: string
+                namespace:
+                  type: string
+                table:
+                  type: string
+                table_id:
+                  type: integer
+                  minimum: 1
+                  maximum: 18446744073709551615
+                  format: uint64
+                  x-go-type: uint64
+                storage_name:
+                  type: string
+                  nullable: true
+                kind:
+                  type: string
+                  enum:
+                  - table
+                  - record
+                  - relationship
+                  - trace
+                  - evidence
+                  - assertion
+                  - entity
+                  - outcome
+                  - decision
+                  - operation
+                  - configuration
+                id:
+                  type: string
+                revision:
+                  type: integer
+                  minimum: 1
+                  maximum: 18446744073709551615
+                  format: uint64
+                  x-go-type: uint64
+                digest:
+                  type: string
+                  nullable: true
+              required:
+              - table
+              - table_id
+              - kind
+              - id
+              - revision
+              additionalProperties: false
+              nullable: true
+            workflow:
+              type: string
+              nullable: true
+            workflow_version:
+              type: string
+              nullable: true
+          additionalProperties: false
+          nullable: true
         context_evidence_ids:
           type: array
           items:
@@ -4144,6 +5620,8 @@ components:
                 additionalProperties: false
               owner:
                 type: string
+              revision:
+                type: integer
             required:
             - entity
             - owner
@@ -4164,6 +5642,8 @@ components:
         state:
           type: object
           properties:
+            table_id:
+              type: integer
             database:
               type: string
             namespace:

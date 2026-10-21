@@ -58,11 +58,40 @@ def main():
             "run",
             "--cache-dir",
             str(ROOT / "zig/.zig-cache"),
-            "pkg/antfly-embedded/src/memory/schema_export.zig",
+            "pkg/antfly-embedded/src/memory_schema_export.zig",
         ],
         cwd=ROOT / "zig",
     )
     schemas = convert(json.loads(native))
+
+    def pin_integer_contract(value):
+        if isinstance(value, list):
+            for child in value:
+                pin_integer_contract(child)
+        elif isinstance(value, dict):
+            props = value.get("properties", {})
+            if {
+                "database",
+                "namespace",
+                "table",
+                "table_id",
+                "kind",
+                "id",
+                "revision",
+            }.issubset(props):
+                for name in ("table_id", "revision"):
+                    props[name].update(
+                        {
+                            "minimum": 1,
+                            "maximum": 18446744073709551615,
+                            "format": "uint64",
+                            "x-go-type": "uint64",
+                        }
+                    )
+            for child in value.values():
+                pin_integer_contract(child)
+
+    pin_integer_contract(schemas)
 
     def ref(name):
         return {"$ref": f"#/components/schemas/{name}"}
@@ -226,6 +255,20 @@ def main():
         ("outcomes", "recordMemoryOutcome", "MemoryOutcome"),
     ):
         operation(prefix + "/{space}/" + suffix, "post", name, request, mutation=True)
+    operation(
+        prefix + "/{space}/explain",
+        "post",
+        "explainMemoryResource",
+        "MemoryExplainRequest",
+        "MemoryExplanation",
+    )
+    operation(
+        prefix + "/{space}/memories/{id}/explain",
+        "post",
+        "explainMemory",
+        "MemoryExplainRequest",
+        "MemoryExplanation",
+    )
     operation(
         prefix + "/{space}/recall",
         "post",

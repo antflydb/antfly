@@ -37,7 +37,7 @@ pub const Bridge = struct {
     }
 
     pub fn backend(self: *Bridge) service.Backend {
-        return .{ .ptr = self, .get = get, .scan = scan, .commit = commit, .generate = if (self.producer != null) generate else null, .embed = embed, .decide = if (self.producer != null) decide else null, .validate_models = validate };
+        return .{ .ptr = self, .get = get, .scan = scan, .commit = commit, .resource = if (self.base.resource != null) resource else null, .generate = if (self.producer != null) generate else null, .embed = embed, .decide = if (self.producer != null) decide else null, .validate_models = validate };
     }
     fn get(ptr: *anyopaque, a: A, key: []const u8) anyerror!?service.Row {
         const self: *Bridge = @ptrCast(@alignCast(ptr));
@@ -50,6 +50,10 @@ pub const Bridge = struct {
     fn commit(ptr: *anyopaque, a: A, expected: ?service.Row, changes: []const service.Change) anyerror!void {
         const self: *Bridge = @ptrCast(@alignCast(ptr));
         return self.base.commit(self.base.ptr, a, expected, changes);
+    }
+    fn resource(ptr: *anyopaque, a: A, reference: t.provenance.Resource) anyerror!t.provenance.Snapshot {
+        const self: *Bridge = @ptrCast(@alignCast(ptr));
+        return self.base.resource.?(self.base.ptr, a, reference);
     }
     fn validate(ptr: *anyopaque, config: t.Config) !void {
         const self: *Bridge = @ptrCast(@alignCast(ptr));

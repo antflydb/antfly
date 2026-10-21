@@ -10004,3 +10004,70 @@ test "capi native memory outcome conflicts and retirement fences survive reopen"
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_memory_json(id, .fromSlice("personal"), .fromSlice(late), &output));
     try std.testing.expect(std.mem.indexOf(u8, std.mem.span(capi.lastErrorDetail()), "MemoryForgotten") != null);
 }
+
+test "capi native memory explains ordinary row provenance across trace expiry source edits and reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-memory-resource-provenance");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const path = try std.fmt.allocPrintSentinel(alloc, "{s}/db.aflite", .{directory.path()}, 0);
+    const memory = @import("../memory/service.zig");
+    var id: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &id));
+    defer if (id != null) antfly_db_close(id);
+    var business_ref: memory.types.provenance.Resource = undefined;
+    var trace_ref: memory.types.provenance.Resource = undefined;
+    {
+        const guard = enterHandle(id, .exclusive) orelse return error.TestUnexpectedResult;
+        defer guard.leave();
+        const owner = guard.handle.parent_handle orelse guard.handle;
+        const tables = @import("tables.zig");
+        for ([_][]const u8{ "business", "traces" }) |table_name| {
+            try tables.create(owner, table_name, "{}", true);
+            const db = try tables.get(owner, table_name);
+            try db.batch(.{ .writes = &.{.{ .key = "approved", .value = "{\"message\":\"APPROVED_V1\"}" }}, .sync_level = .write });
+            const row = (try db.getDocument(alloc, "approved", .{})).?;
+            const reference: memory.types.provenance.Resource = .{ .table = table_name, .table_id = db.core.identity_namespace.table_id, .kind = if (std.mem.eql(u8, table_name, "traces")) .trace else .record, .id = "approved", .revision = row.version orelse try db.getTimestamp(alloc, "approved") };
+            if (std.mem.eql(u8, table_name, "traces")) trace_ref = reference else business_ref = reference;
+        }
+    }
+    _ = try nativeMemoryTestCall(id, alloc, "alice", .create, memory.types.Config{ .retention_ms = std.math.maxInt(u64) }, "create", "");
+    const evidence: memory.types.Evidence = .{ .id = "e", .resource_selector = .{ .table = "business", .id = "approved" } };
+    const claim: memory.types.Assertion = .{ .id = "claim", .subject = "production", .predicate = "deployment", .value = "Terraform", .statement = "Approved deployment", .evidence = &.{.{ .id = "e" }} };
+    _ = try nativeMemoryTestCall(id, alloc, "alice", .observe, .{ .origin = memory.types.provenance.Origin{ .trace = trace_ref, .agent = .{ .id = "coding-agent", .kind = .agent } }, .evidence = &.{evidence}, .assertions = &.{claim} }, "observe", "");
+    const pinned_source = try std.json.parseFromSliceLeaky(memory.types.StoredEvidence, alloc, try nativeMemoryTestCall(id, alloc, "alice", .evidence, .{}, "", "e"), .{});
+    try std.testing.expectEqual(business_ref.revision, pinned_source.evidence.resource.?.revision);
+    try std.testing.expect(pinned_source.evidence.resource_selector == null);
+    const before = try nativeMemoryTestCall(id, alloc, "alice", .explain, memory.types.provenance.ExplainRequest{}, "", "claim");
+    try std.testing.expect(std.mem.indexOf(u8, before, "APPROVED_V1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, before, "originated_in") != null);
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    {
+        const guard = enterHandle(id, .exclusive) orelse return error.TestUnexpectedResult;
+        defer guard.leave();
+        const db = try @import("tables.zig").get(guard.handle.parent_handle orelse guard.handle, "traces");
+        try db.batch(.{ .deletes = &.{"approved"}, .sync_level = .write });
+    }
+    const after = try nativeMemoryTestCall(id, alloc, "alice", .explain, memory.types.provenance.ExplainRequest{}, "", "claim");
+    try std.testing.expect(std.mem.indexOf(u8, after, "coding-agent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "APPROVED_V1") != null);
+    try std.testing.expect((try std.json.parseFromSliceLeaky(std.json.Value, alloc, after, .{})).object.get("missing_evidence").?.bool);
+    {
+        const guard = enterHandle(id, .exclusive) orelse return error.TestUnexpectedResult;
+        defer guard.leave();
+        const db = try @import("tables.zig").get(guard.handle.parent_handle orelse guard.handle, "business");
+        try db.batch(.{ .writes = &.{.{ .key = "approved", .value = "{\"message\":\"CHANGED_V2\"}" }}, .sync_level = .write });
+    }
+    var output: capi.Buffer = .{};
+    const request = "{\"action\":\"get\",\"principal\":\"alice\",\"id\":\"claim\"}";
+    try std.testing.expectEqual(capi.ErrorCode.not_found, antfly_db_memory_json(id, .fromSlice("personal"), .fromSlice(request), &output));
+    const historical = try nativeMemoryTestCall(id, alloc, "alice", .explain, .{ .revision = @as(u64, 3) }, "", "claim");
+    try std.testing.expect(std.mem.indexOf(u8, historical, "APPROVED_V1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, historical, "CHANGED_V2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, historical, "\"status\":\"changed\"") != null);
+}

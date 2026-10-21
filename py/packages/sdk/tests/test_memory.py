@@ -42,3 +42,22 @@ def test_memory_mutations_require_keys_and_unknown_actions_fail_locally() -> Non
         client.memory.execute("team", "forget")
     with pytest.raises(ValueError, match="unknown"):
         client.memory.execute("team", "invent")
+
+
+def test_memory_explanation_is_read_only_post_with_resource_scope() -> None:
+    client = AntflyClient("http://memory.test", token="reader")
+    seen = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"nodes": [], "complete": True})
+
+    with httpx.Client(base_url=client.base_url, transport=httpx.MockTransport(respond)) as http:
+        client._client.set_httpx_client(http)
+        client.memory.execute("team", "explain", id="claim/a", body={"revision": 7})
+        client.memory.execute("team", "explain", body={"resource": {"kind": "record"}}, database="business")
+    assert seen[0].method == "POST"
+    assert seen[0].url.raw_path == b"/memory/v1/spaces/team/memories/claim%2Fa/explain"
+    assert "idempotency-key" not in seen[0].headers
+    assert seen[1].url.path == "/memory/v1/spaces/team/explain"
+    assert seen[1].headers["x-antfly-database"] == "business"

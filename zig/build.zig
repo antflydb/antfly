@@ -88,7 +88,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const target = shared.target;
     const optimize = shared.optimize;
     const memory_tests = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/memory/service_test.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/memory_policy_test_root.zig"),
         .imports = &.{.{ .name = "antfly_resolver", .module = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/resolver/src/memory_contract.zig"), .target = target, .optimize = optimize }) }},
         .target = target,
         .optimize = optimize,

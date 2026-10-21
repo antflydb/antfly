@@ -1046,3 +1046,76 @@ bounded to 64 KiB. Retiring an outcome records a durable ID fence before removin
 its content, so source retirement cannot silently release its identity for reuse.
 The global forgetting fence rejects new outcomes, including empty-citation
 feedback. Receipt replay remains content-free and cannot recreate retired records.
+
+### Shared native provenance and recorded explanations
+
+The [shared provenance requirements in issue #1211](https://github.com/antflydb/antfly/issues/1211#issuecomment-6307482701)
+are implemented as native contracts in `common/provenance.zig`. Memory and ordinary
+records share versioned resource references: database, namespace, logical table,
+immutable table incarnation, kind, row ID, committed revision, and optional content
+digest. The optional storage binding permits server table renames while reads
+recheck permission against the current logical table. Recreating a table with the
+same name cannot resolve an old reference to new content.
+
+An observation may supply `evidence.resource_selector` with a table, row ID and
+optional expected revision. Admission authorizes the ordinary row, captures its
+exact JSON, revision and digest, and replaces the selector with an immutable
+`resource` reference. Callers can also submit an already pinned reference. Supplied
+text must match the authorized snapshot. An ordinary row remains authoritative;
+importing evidence is an explicit memory admission operation. Merely storing a
+trace never promotes its contents into memory.
+
+Native consequential mutations atomically record a versioned decision alongside
+publication and the operation receipt. Decisions distinguish the authenticated
+initiator and execution principal from caller-declared agents and approvers.
+They capture action, status, times, configuration generation, ontology and policy
+versions, target versions, and optional workflow and trace/span origins. Caller
+metadata cannot claim authenticated actor assurance. Exact configuration records
+preserve model and extractor settings. Normalized target, event and artifact
+indexes support bounded traversal without rescanning all decisions.
+
+`POST /memory/v1/spaces/{space}/memories/{id}/explain` explains an assertion;
+`POST /memory/v1/spaces/{space}/explain` accepts a resource reference, including an
+ordinary record, relationship or trace. `revision`, `known_at` and `valid_at`
+separate recorded history from temporal applicability. Explanations traverse typed
+`retrieved`, `used`, `supported_by`, `generated_by`, `approved_by`, `supersedes` and
+other declared edges without treating retrieval as evidence of use. Native
+assertion support alternatives remain separate in the assertion payload. Outcome
+usage links select memory as known when the outcome was recorded.
+
+Every resource edge is authorized separately. The HTTP reader checks current
+ordinary-table permissions and rejects unsupported row-filter policies; memory
+permission alone does not grant business-table access. Embedded reads use the
+local database owner's authority. Missing and denied targets share a redacted
+edge result. Detailed trace expiration leaves the minimal native admission
+decision available, with a missing-detail flag. Changed ordinary rows cannot
+silently replace historical evidence: current recall excludes the old support,
+while authorized historical explanations can use the admitted exact snapshot.
+Deletion retires dependent evidence; loss of access hides it from that reader
+immediately. A worker credential denied access cannot erase another principal's
+support. Independent support can keep an assertion available. Background checks use the saved execution identity,
+scan at most 16 watched sources per quantum, and revisit sources every 30 seconds;
+foreground reads recheck source state immediately.
+
+Explanations contain recorded justification only, never a model-generated
+reconstruction. Node, depth and encoded-byte limits produce explicit truncation. Ordinary source
+snapshots retained during traversal are limited to 64 KiB; larger rows report
+truncated payload and incomplete history. Transports release temporary row buffers
+after each lookup. Admission rejects an oversized source instead of storing a partial
+evidence snapshot.
+`missing_evidence` and `incomplete_history` prevent an absent source or an ordinary
+row without a provenance envelope from appearing to have complete lineage.
+Ordinary rows can carry a versioned `provenance` envelope of typed links; it is
+labeled source-declared metadata, not a native authenticated attestation. This
+service does not invent historical catalog decisions for ordinary tables.
+
+Traces remain ordinary tables using the versioned `TraceEvent` schema. The Python
+SDK supplies `resource_reference` and `trace_event` helpers, and the native, HTTP
+and SDK memory clients expose explanation. A separate trace service and a full
+cross-product Explain UI are outside this implementation's agreed scope.
+
+Retention is distinct from temporary identity suppression. Suppressing an entity
+can hide a memory without destroying outcome feedback, so unsuppressing restores
+that feedback. Assertion admission checks the same retained, authorized entity
+references for subjects and typed objects, including durable forgetting fences
+after physical entity cleanup.

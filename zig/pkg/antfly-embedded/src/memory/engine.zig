@@ -53,10 +53,16 @@ pub const Routed = struct {
     reads: reads_mod.TableReadSource,
     writes: writes_mod.TableWriteSource,
     context: service.Context,
+    resource_ptr: ?*anyopaque = null,
+    resource_fn: ?*const fn (*anyopaque, A, service.types.provenance.Resource) anyerror!service.types.provenance.Snapshot = null,
     request: @import("../api/operation.zig").RequestContext = .{},
 
     pub fn backend(self: *Routed) service.Backend {
-        return .{ .ptr = self, .get = get, .scan = scan, .commit = commit };
+        return .{ .ptr = self, .get = get, .scan = scan, .commit = commit, .resource = if (self.resource_fn != null) resource else null };
+    }
+    fn resource(ptr: *anyopaque, a: A, reference: service.types.provenance.Resource) !service.types.provenance.Snapshot {
+        const self: *Routed = @ptrCast(@alignCast(ptr));
+        return self.resource_fn.?(self.resource_ptr.?, a, reference);
     }
     fn get(ptr: *anyopaque, a: A, key: []const u8) !?service.Row {
         const self: *Routed = @ptrCast(@alignCast(ptr));
@@ -104,9 +110,15 @@ pub fn Native(comptime DB: type) type {
     return struct {
         db: *DB,
         context: service.Context,
+        resource_ptr: ?*anyopaque = null,
+        resource_fn: ?*const fn (*anyopaque, A, service.types.provenance.Resource) anyerror!service.types.provenance.Snapshot = null,
         const Self = @This();
         pub fn backend(self: *Self) service.Backend {
-            return .{ .ptr = self, .get = get, .scan = scan, .commit = commit };
+            return .{ .ptr = self, .get = get, .scan = scan, .commit = commit, .resource = if (self.resource_fn != null) resource else null };
+        }
+        fn resource(ptr: *anyopaque, a: A, reference: service.types.provenance.Resource) !service.types.provenance.Snapshot {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            return self.resource_fn.?(self.resource_ptr.?, a, reference);
         }
         fn get(ptr: *anyopaque, a: A, key: []const u8) !?service.Row {
             const self: *Self = @ptrCast(@alignCast(ptr));

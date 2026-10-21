@@ -16,6 +16,7 @@
 //! Versioned memory contracts. No server, model runtime, or extension imports.
 const std = @import("std");
 
+pub const provenance = @import("../common/provenance.zig");
 pub const schema_version: u32 = 1;
 pub const max_items = 256;
 pub const max_text_bytes = 64 * 1024;
@@ -102,9 +103,11 @@ pub const Config = struct {
 pub const Span = struct { start: u32, end: u32 };
 pub const Evidence = struct {
     id: []const u8,
-    source_id: []const u8,
-    source_version: []const u8,
-    text: []const u8,
+    source_id: []const u8 = "",
+    source_version: []const u8 = "",
+    text: []const u8 = "",
+    resource: ?provenance.Resource = null,
+    resource_selector: ?provenance.Selector = null,
     source_url: ?[]const u8 = null,
     author: ?[]const u8 = null,
     event_time: ?i64 = null,
@@ -149,7 +152,7 @@ pub const Assertion = struct {
     embedding_model: ?Model = null,
     reconciliation_reason: ?[]const u8 = null,
 };
-pub const ObservationRequest = struct { context_evidence_ids: []const []const u8 = &.{}, evidence: []const Evidence, assertions: []const Assertion = &.{}, entities: []const Entity = &.{} };
+pub const ObservationRequest = struct { origin: ?provenance.Origin = null, context_evidence_ids: []const []const u8 = &.{}, evidence: []const Evidence, assertions: []const Assertion = &.{}, entities: []const Entity = &.{} };
 pub const AssertionRequest = struct { assertions: []const Assertion };
 pub const Correction = struct {
     id: []const u8,
@@ -195,6 +198,7 @@ pub const Recall = struct {
     embedding_model: ?Model = null,
 };
 pub const State = struct {
+    table_id: u64 = 0,
     database: []const u8 = "default",
     namespace: []const u8 = "public",
     space: []const u8 = "",
@@ -204,6 +208,8 @@ pub const State = struct {
     config: Config,
     pending_config: ?Config = null,
     next_expiry_at: ?i64 = null,
+    next_resource_check_at: ?i64 = null,
+    resource_cursor: ?[]const u8 = null,
     revision: u64 = 1,
     owner: []const u8,
     created_at: i64,
@@ -251,6 +257,7 @@ pub const StoredAssertion = struct {
 pub const Stage = enum { pending, running, succeeded, failed, cancelled };
 pub const RequiredGrant = enum { write, admin };
 pub const Operation = struct {
+    origin: ?provenance.Origin = null,
     required_grant: ?RequiredGrant = null,
     execution_principal: []const u8 = "",
     execution_signature: []const u8 = "",
@@ -335,9 +342,10 @@ pub const RecallResult = struct {
     retrieval: enum { lexical, lexical_vector },
 };
 pub const RecordPage = struct { items: []const StoredAssertion, next_cursor: ?[]const u8, complete: bool, revision: u64 };
-pub const EntityRecord = struct { entity: Entity, owner: []const u8 };
+pub const EntityRecord = struct { entity: Entity, owner: []const u8, revision: u64 = 0 };
 pub const EntityPage = struct { items: []const EntityRecord, next_cursor: ?[]const u8, complete: bool };
 pub const SpaceInfo = struct {
+    table_id: u64 = 0,
     database: []const u8,
     namespace: []const u8,
     space: []const u8,

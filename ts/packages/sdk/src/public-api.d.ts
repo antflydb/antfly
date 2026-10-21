@@ -5730,6 +5730,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/memory/v1/spaces/{space}/explain": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["explainMemoryResource"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/memory/v1/spaces/{space}/memories/{id}/explain": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["explainMemory"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/memory/v1/spaces/{space}/recall": {
         parameters: {
             query?: never;
@@ -23076,6 +23108,311 @@ export interface components {
         ExtensionError: {
             error: string;
         };
+        ProvenanceDecision: {
+            schema_version?: number;
+            resource: {
+                database?: string;
+                namespace?: string;
+                table: string;
+                /** Format: uint64 */
+                table_id: number;
+                storage_name?: string | null;
+                /** @enum {string} */
+                kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
+                id: string;
+                /** Format: uint64 */
+                revision: number;
+                digest?: string | null;
+            };
+            operation: {
+                database?: string;
+                namespace?: string;
+                table: string;
+                /** Format: uint64 */
+                table_id: number;
+                storage_name?: string | null;
+                /** @enum {string} */
+                kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
+                id: string;
+                /** Format: uint64 */
+                revision: number;
+                digest?: string | null;
+            };
+            action: string;
+            /** @enum {string} */
+            status: "proposed" | "approved" | "applied" | "rejected" | "cancelled";
+            initiator: {
+                id: string;
+                /** @enum {string} */
+                kind?: "user" | "agent" | "service";
+                /** @enum {string} */
+                assurance?: "authenticated" | "declared";
+            };
+            executor: {
+                id: string;
+                /** @enum {string} */
+                kind?: "user" | "agent" | "service";
+                /** @enum {string} */
+                assurance?: "authenticated" | "declared";
+            };
+            origin?: {
+                agent?: {
+                    id: string;
+                    /** @enum {string} */
+                    kind?: "user" | "agent" | "service";
+                    /** @enum {string} */
+                    assurance?: "authenticated" | "declared";
+                } | null;
+                approver?: {
+                    id: string;
+                    /** @enum {string} */
+                    kind?: "user" | "agent" | "service";
+                    /** @enum {string} */
+                    assurance?: "authenticated" | "declared";
+                } | null;
+                trace?: {
+                    database?: string;
+                    namespace?: string;
+                    table: string;
+                    /** Format: uint64 */
+                    table_id: number;
+                    storage_name?: string | null;
+                    /** @enum {string} */
+                    kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
+                    id: string;
+                    /** Format: uint64 */
+                    revision: number;
+                    digest?: string | null;
+                } | null;
+                span?: {
+                    database?: string;
+                    namespace?: string;
+                    table: string;
+                    /** Format: uint64 */
+                    table_id: number;
+                    storage_name?: string | null;
+                    /** @enum {string} */
+                    kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
+                    id: string;
+                    /** Format: uint64 */
+                    revision: number;
+                    digest?: string | null;
+                } | null;
+                workflow?: string | null;
+                workflow_version?: string | null;
+            } | null;
+            decided_at: number;
+            applied_at: number | null;
+            effective_at?: number | null;
+            recorded_at: number;
+            configuration: {
+                database?: string;
+                namespace?: string;
+                table: string;
+                /** Format: uint64 */
+                table_id: number;
+                storage_name?: string | null;
+                /** @enum {string} */
+                kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
+                id: string;
+                /** Format: uint64 */
+                revision: number;
+                digest?: string | null;
+            };
+            ontology_version: string;
+            policy_version: string;
+        };
+        ProvenanceEnvelope: {
+            schema_version?: number;
+            links?: {
+                /** @enum {string} */
+                relation: "mentions" | "retrieved" | "used" | "supported_by" | "generated" | "generated_by" | "approved_by" | "supersedes" | "applied_to" | "governed_by" | "originated_in" | "depends_on" | "motivates" | "rejected_in_favor_of";
+                target: {
+                    database?: string;
+                    namespace?: string;
+                    table: string;
+                    /** Format: uint64 */
+                    table_id: number;
+                    storage_name?: string | null;
+                    /** @enum {string} */
+                    kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
+                    id: string;
+                    /** Format: uint64 */
+                    revision: number;
+                    digest?: string | null;
+                };
+            }[];
+        };
+        MemoryExplanation: {
+            schema_version?: number;
+            nodes: {
+                resource: {
+                    database?: string;
+                    namespace?: string;
+                    table: string;
+                    /** Format: uint64 */
+                    table_id: number;
+                    storage_name?: string | null;
+                    /** @enum {string} */
+                    kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
+                    id: string;
+                    /** Format: uint64 */
+                    revision: number;
+                    digest?: string | null;
+                };
+                record: unknown;
+                payload_truncated?: boolean;
+                links: {
+                    /** @enum {string} */
+                    relation: "mentions" | "retrieved" | "used" | "supported_by" | "generated" | "generated_by" | "approved_by" | "supersedes" | "applied_to" | "governed_by" | "originated_in" | "depends_on" | "motivates" | "rejected_in_favor_of";
+                    target: {
+                        database?: string;
+                        namespace?: string;
+                        table: string;
+                        /** Format: uint64 */
+                        table_id: number;
+                        storage_name?: string | null;
+                        /** @enum {string} */
+                        kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
+                        id: string;
+                        /** Format: uint64 */
+                        revision: number;
+                        digest?: string | null;
+                    } | null;
+                    /** @enum {string} */
+                    status: "available" | "changed" | "missing_or_denied" | "truncated";
+                }[];
+            }[];
+            complete: boolean;
+            truncated: boolean;
+            missing_evidence: boolean;
+            incomplete_history?: boolean;
+            /** @enum {string} */
+            justification?: "recorded";
+        };
+        TraceEvent: {
+            schema_version?: number;
+            trace_id: string;
+            span_id: string;
+            parent_span_id?: string | null;
+            name: string;
+            started_at: number;
+            ended_at?: number | null;
+            /** @enum {string} */
+            status?: "running" | "succeeded" | "failed" | "cancelled";
+            provenance?: {
+                schema_version?: number;
+                links?: {
+                    /** @enum {string} */
+                    relation: "mentions" | "retrieved" | "used" | "supported_by" | "generated" | "generated_by" | "approved_by" | "supersedes" | "applied_to" | "governed_by" | "originated_in" | "depends_on" | "motivates" | "rejected_in_favor_of";
+                    target: {
+                        database?: string;
+                        namespace?: string;
+                        table: string;
+                        /** Format: uint64 */
+                        table_id: number;
+                        storage_name?: string | null;
+                        /** @enum {string} */
+                        kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
+                        id: string;
+                        /** Format: uint64 */
+                        revision: number;
+                        digest?: string | null;
+                    };
+                }[];
+            };
+        };
+        ResourceSelector: {
+            database?: string;
+            namespace?: string;
+            table: string;
+            id: string;
+            /** @enum {string} */
+            kind?: "record" | "relationship" | "trace";
+            expected_revision?: number | null;
+        };
+        ResourceReference: {
+            database?: string;
+            namespace?: string;
+            table: string;
+            /** Format: uint64 */
+            table_id: number;
+            storage_name?: string | null;
+            /** @enum {string} */
+            kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
+            id: string;
+            /** Format: uint64 */
+            revision: number;
+            digest?: string | null;
+        };
+        ProvenanceOrigin: {
+            agent?: {
+                id: string;
+                /** @enum {string} */
+                kind?: "user" | "agent" | "service";
+                /** @enum {string} */
+                assurance?: "authenticated" | "declared";
+            } | null;
+            approver?: {
+                id: string;
+                /** @enum {string} */
+                kind?: "user" | "agent" | "service";
+                /** @enum {string} */
+                assurance?: "authenticated" | "declared";
+            } | null;
+            trace?: {
+                database?: string;
+                namespace?: string;
+                table: string;
+                /** Format: uint64 */
+                table_id: number;
+                storage_name?: string | null;
+                /** @enum {string} */
+                kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
+                id: string;
+                /** Format: uint64 */
+                revision: number;
+                digest?: string | null;
+            } | null;
+            span?: {
+                database?: string;
+                namespace?: string;
+                table: string;
+                /** Format: uint64 */
+                table_id: number;
+                storage_name?: string | null;
+                /** @enum {string} */
+                kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
+                id: string;
+                /** Format: uint64 */
+                revision: number;
+                digest?: string | null;
+            } | null;
+            workflow?: string | null;
+            workflow_version?: string | null;
+        };
+        MemoryExplainRequest: {
+            resource?: {
+                database?: string;
+                namespace?: string;
+                table: string;
+                /** Format: uint64 */
+                table_id: number;
+                storage_name?: string | null;
+                /** @enum {string} */
+                kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
+                id: string;
+                /** Format: uint64 */
+                revision: number;
+                digest?: string | null;
+            } | null;
+            revision?: number | null;
+            valid_at?: number | null;
+            known_at?: number | null;
+            max_bytes?: number;
+            max_nodes?: number;
+            max_depth?: number;
+        };
         MemorySpaceConfig: {
             version?: number;
             generation?: number;
@@ -23139,9 +23476,32 @@ export interface components {
         };
         MemoryEvidence: {
             id: string;
-            source_id: string;
-            source_version: string;
-            text: string;
+            source_id?: string;
+            source_version?: string;
+            text?: string;
+            resource?: {
+                database?: string;
+                namespace?: string;
+                table: string;
+                /** Format: uint64 */
+                table_id: number;
+                storage_name?: string | null;
+                /** @enum {string} */
+                kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
+                id: string;
+                /** Format: uint64 */
+                revision: number;
+                digest?: string | null;
+            } | null;
+            resource_selector?: {
+                database?: string;
+                namespace?: string;
+                table: string;
+                id: string;
+                /** @enum {string} */
+                kind?: "record" | "relationship" | "trace";
+                expected_revision?: number | null;
+            } | null;
             source_url?: string | null;
             author?: string | null;
             event_time?: number | null;
@@ -23211,6 +23571,52 @@ export interface components {
             reconciliation_reason?: string | null;
         };
         MemoryObservationRequest: {
+            origin?: {
+                agent?: {
+                    id: string;
+                    /** @enum {string} */
+                    kind?: "user" | "agent" | "service";
+                    /** @enum {string} */
+                    assurance?: "authenticated" | "declared";
+                } | null;
+                approver?: {
+                    id: string;
+                    /** @enum {string} */
+                    kind?: "user" | "agent" | "service";
+                    /** @enum {string} */
+                    assurance?: "authenticated" | "declared";
+                } | null;
+                trace?: {
+                    database?: string;
+                    namespace?: string;
+                    table: string;
+                    /** Format: uint64 */
+                    table_id: number;
+                    storage_name?: string | null;
+                    /** @enum {string} */
+                    kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
+                    id: string;
+                    /** Format: uint64 */
+                    revision: number;
+                    digest?: string | null;
+                } | null;
+                span?: {
+                    database?: string;
+                    namespace?: string;
+                    table: string;
+                    /** Format: uint64 */
+                    table_id: number;
+                    storage_name?: string | null;
+                    /** @enum {string} */
+                    kind: "table" | "record" | "relationship" | "trace" | "evidence" | "assertion" | "entity" | "outcome" | "decision" | "operation" | "configuration";
+                    id: string;
+                    /** Format: uint64 */
+                    revision: number;
+                    digest?: string | null;
+                } | null;
+                workflow?: string | null;
+                workflow_version?: string | null;
+            } | null;
             context_evidence_ids?: string[];
             evidence: components["schemas"]["MemoryEvidence"][];
             assertions?: components["schemas"]["MemoryAssertion"][];
@@ -23678,12 +24084,14 @@ export interface components {
                     distinct_from?: string[];
                 };
                 owner: string;
+                revision?: number;
             }[];
             next_cursor: string | null;
             complete: boolean;
         };
         MemoryInspection: {
             state: {
+                table_id?: number;
                 database: string;
                 namespace: string;
                 space: string;
@@ -37804,6 +38212,231 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MemoryOperation"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+        };
+    };
+    explainMemoryResource: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Database"?: string;
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Namespace"?: string;
+            };
+            path: {
+                space: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryExplainRequest"];
+            };
+        };
+        responses: {
+            /** @description Accepted durable operation or requested memory result. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryExplanation"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+            /** @description Memory validation, authorization, concurrency, capability, or execution error. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryError"];
+                };
+            };
+        };
+    };
+    explainMemory: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Database"?: string;
+                /** @description Catalog scope for this memory space. */
+                "X-Antfly-Namespace"?: string;
+            };
+            path: {
+                space: string;
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryExplainRequest"];
+            };
+        };
+        responses: {
+            /** @description Accepted durable operation or requested memory result. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryExplanation"];
                 };
             };
             /** @description Memory validation, authorization, concurrency, capability, or execution error. */

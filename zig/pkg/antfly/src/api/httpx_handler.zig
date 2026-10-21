@@ -18051,11 +18051,32 @@ test "native memory HTTP and MCP share persistent storage and private provenance
     const exact_record = try std.json.parseFromSlice(@import("memory.zig").memory.types.StoredAssertion, a, exact.body, .{});
     defer exact_record.deinit();
     try std.testing.expectEqual(@as(i64, 9007199254740993), exact_record.value.assertion.valid_from.?);
+    const explain_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/memories/a1/explain", .{base});
+    defer a.free(explain_url);
+    const explain_headers = [_][2][]const u8{.{ "content-type", "application/json" }};
+    var explanation = try requestWithRetry(&client, threaded.io(), .POST, explain_url, "{}", &explain_headers, 20);
+    defer explanation.deinit();
+    try std.testing.expectEqual(@as(u16, 200), explanation.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, explanation.body.?, "supported_by") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explanation.body.?, "authenticated") != null);
     const permission = [_]usermgr.Permission{.{ .resource_type = .table, .resource = @constCast("memory_team"), .type = .read }};
     const bob: AuthenticatedIdentity = .{ .username = @constCast("bob"), .permissions = @constCast(&permission) };
     var denied = try api.executeMemoryService("team", .{ .action = .get, .id = "a1" }, bob, .{});
     defer denied.deinit(a);
     try std.testing.expectEqual(@as(u16, 403), denied.status);
+    const foreign: module.memory.types.provenance.Resource = .{ .table = "business", .table_id = 7, .kind = .record, .id = "PRIVATE_ROW", .revision = 1 };
+    const foreign_body = try std.json.Stringify.valueAlloc(a, .{ .resource = foreign }, .{});
+    defer a.free(foreign_body);
+    const native_authority = struct {
+        fn allowed(_: *const anyopaque, _: []const u8) bool {
+            return true;
+        }
+    };
+    var foreign_parsed = try std.json.parseFromSlice(std.json.Value, a, foreign_body, .{});
+    defer foreign_parsed.deinit();
+    var foreign_denied = try api.executeMemoryService("team", .{ .action = .explain, .body = foreign_parsed.value }, bob, .{ .table_read_authorization = .{ .ptr = &bob, .allows = native_authority.allowed } });
+    defer foreign_denied.deinit(a);
+    try std.testing.expectEqual(@as(u16, 403), foreign_denied.status);
     // Table grants never grant raw access to native service storage.
     // This path used to bypass memory's private provenance checks entirely.
     var raw_document = try api.executeMcpApplicationOperation(.{ .get_document = .{ .table_name = "memory_team", .key = "a1" } }, bob);

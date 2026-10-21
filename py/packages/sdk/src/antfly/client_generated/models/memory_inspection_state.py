@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
+from ..types import UNSET, Unset
+
 if TYPE_CHECKING:
     from ..models.memory_inspection_state_config import MemoryInspectionStateConfig
     from ..models.memory_inspection_state_pending_config_type_0 import MemoryInspectionStatePendingConfigType0
@@ -25,6 +27,7 @@ class MemoryInspectionState:
         revision (int):
         owner (str):
         created_at (int):
+        table_id (int | Unset):
     """
 
     database: str
@@ -35,6 +38,7 @@ class MemoryInspectionState:
     revision: int
     owner: str
     created_at: int
+    table_id: int | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.memory_inspection_state_pending_config_type_0 import MemoryInspectionStatePendingConfigType0
@@ -59,6 +63,8 @@ class MemoryInspectionState:
 
         created_at = self.created_at
 
+        table_id = self.table_id
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -73,6 +79,8 @@ class MemoryInspectionState:
                 "created_at": created_at,
             }
         )
+        if table_id is not UNSET:
+            field_dict["table_id"] = table_id
 
         return field_dict
 
@@ -111,6 +119,8 @@ class MemoryInspectionState:
 
         created_at = d.pop("created_at")
 
+        table_id = d.pop("table_id", UNSET)
+
         memory_inspection_state = cls(
             database=database,
             namespace=namespace,
@@ -120,6 +130,7 @@ class MemoryInspectionState:
             revision=revision,
             owner=owner,
             created_at=created_at,
+            table_id=table_id,
         )
 
         return memory_inspection_state

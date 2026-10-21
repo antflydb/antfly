@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 
+from ..types import UNSET, Unset
+
 if TYPE_CHECKING:
     from ..models.memory_entity_page_items_item_entity import MemoryEntityPageItemsItemEntity
 
@@ -18,15 +20,19 @@ class MemoryEntityPageItemsItem:
     Attributes:
         entity (MemoryEntityPageItemsItemEntity):
         owner (str):
+        revision (int | Unset):
     """
 
     entity: MemoryEntityPageItemsItemEntity
     owner: str
+    revision: int | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         entity = self.entity.to_dict()
 
         owner = self.owner
+
+        revision = self.revision
 
         field_dict: dict[str, Any] = {}
 
@@ -36,6 +42,8 @@ class MemoryEntityPageItemsItem:
                 "owner": owner,
             }
         )
+        if revision is not UNSET:
+            field_dict["revision"] = revision
 
         return field_dict
 
@@ -48,9 +56,12 @@ class MemoryEntityPageItemsItem:
 
         owner = d.pop("owner")
 
+        revision = d.pop("revision", UNSET)
+
         memory_entity_page_items_item = cls(
             entity=entity,
             owner=owner,
+            revision=revision,
         )
 
         return memory_entity_page_items_item

@@ -1179,7 +1179,26 @@ from .memory_entity_page_items_item_entity_visibility import MemoryEntityPageIte
 from .memory_entity_visibility import MemoryEntityVisibility
 from .memory_error import MemoryError_
 from .memory_evidence import MemoryEvidence
+from .memory_evidence_resource_selector_type_0 import MemoryEvidenceResourceSelectorType0
+from .memory_evidence_resource_selector_type_0_kind import MemoryEvidenceResourceSelectorType0Kind
+from .memory_evidence_resource_type_0 import MemoryEvidenceResourceType0
+from .memory_evidence_resource_type_0_kind import MemoryEvidenceResourceType0Kind
 from .memory_evidence_visibility import MemoryEvidenceVisibility
+from .memory_explain_request import MemoryExplainRequest
+from .memory_explain_request_resource_type_0 import MemoryExplainRequestResourceType0
+from .memory_explain_request_resource_type_0_kind import MemoryExplainRequestResourceType0Kind
+from .memory_explanation import MemoryExplanation
+from .memory_explanation_justification import MemoryExplanationJustification
+from .memory_explanation_nodes_item import MemoryExplanationNodesItem
+from .memory_explanation_nodes_item_links_item import MemoryExplanationNodesItemLinksItem
+from .memory_explanation_nodes_item_links_item_relation import MemoryExplanationNodesItemLinksItemRelation
+from .memory_explanation_nodes_item_links_item_status import MemoryExplanationNodesItemLinksItemStatus
+from .memory_explanation_nodes_item_links_item_target_type_0 import MemoryExplanationNodesItemLinksItemTargetType0
+from .memory_explanation_nodes_item_links_item_target_type_0_kind import (
+    MemoryExplanationNodesItemLinksItemTargetType0Kind,
+)
+from .memory_explanation_nodes_item_resource import MemoryExplanationNodesItemResource
+from .memory_explanation_nodes_item_resource_kind import MemoryExplanationNodesItemResourceKind
 from .memory_forget_request import MemoryForgetRequest
 from .memory_inspection import MemoryInspection
 from .memory_inspection_capabilities import MemoryInspectionCapabilities
@@ -1233,6 +1252,27 @@ from .memory_observation_request_entities_item_evidence_item_span_type_0 import 
     MemoryObservationRequestEntitiesItemEvidenceItemSpanType0,
 )
 from .memory_observation_request_entities_item_visibility import MemoryObservationRequestEntitiesItemVisibility
+from .memory_observation_request_origin_type_0 import MemoryObservationRequestOriginType0
+from .memory_observation_request_origin_type_0_agent_type_0 import MemoryObservationRequestOriginType0AgentType0
+from .memory_observation_request_origin_type_0_agent_type_0_assurance import (
+    MemoryObservationRequestOriginType0AgentType0Assurance,
+)
+from .memory_observation_request_origin_type_0_agent_type_0_kind import (
+    MemoryObservationRequestOriginType0AgentType0Kind,
+)
+from .memory_observation_request_origin_type_0_approver_type_0 import MemoryObservationRequestOriginType0ApproverType0
+from .memory_observation_request_origin_type_0_approver_type_0_assurance import (
+    MemoryObservationRequestOriginType0ApproverType0Assurance,
+)
+from .memory_observation_request_origin_type_0_approver_type_0_kind import (
+    MemoryObservationRequestOriginType0ApproverType0Kind,
+)
+from .memory_observation_request_origin_type_0_span_type_0 import MemoryObservationRequestOriginType0SpanType0
+from .memory_observation_request_origin_type_0_span_type_0_kind import MemoryObservationRequestOriginType0SpanType0Kind
+from .memory_observation_request_origin_type_0_trace_type_0 import MemoryObservationRequestOriginType0TraceType0
+from .memory_observation_request_origin_type_0_trace_type_0_kind import (
+    MemoryObservationRequestOriginType0TraceType0Kind,
+)
 from .memory_operation import MemoryOperation
 from .memory_operation_phase import MemoryOperationPhase
 from .memory_outcome import MemoryOutcome
@@ -1439,6 +1479,49 @@ from .predicate_decision_question import PredicateDecisionQuestion
 from .predicate_decision_question_type import PredicateDecisionQuestionType
 from .prefix_query import PrefixQuery
 from .prior_artifact_context import PriorArtifactContext
+from .provenance_decision import ProvenanceDecision
+from .provenance_decision_configuration import ProvenanceDecisionConfiguration
+from .provenance_decision_configuration_kind import ProvenanceDecisionConfigurationKind
+from .provenance_decision_executor import ProvenanceDecisionExecutor
+from .provenance_decision_executor_assurance import ProvenanceDecisionExecutorAssurance
+from .provenance_decision_executor_kind import ProvenanceDecisionExecutorKind
+from .provenance_decision_initiator import ProvenanceDecisionInitiator
+from .provenance_decision_initiator_assurance import ProvenanceDecisionInitiatorAssurance
+from .provenance_decision_initiator_kind import ProvenanceDecisionInitiatorKind
+from .provenance_decision_operation import ProvenanceDecisionOperation
+from .provenance_decision_operation_kind import ProvenanceDecisionOperationKind
+from .provenance_decision_origin_type_0 import ProvenanceDecisionOriginType0
+from .provenance_decision_origin_type_0_agent_type_0 import ProvenanceDecisionOriginType0AgentType0
+from .provenance_decision_origin_type_0_agent_type_0_assurance import ProvenanceDecisionOriginType0AgentType0Assurance
+from .provenance_decision_origin_type_0_agent_type_0_kind import ProvenanceDecisionOriginType0AgentType0Kind
+from .provenance_decision_origin_type_0_approver_type_0 import ProvenanceDecisionOriginType0ApproverType0
+from .provenance_decision_origin_type_0_approver_type_0_assurance import (
+    ProvenanceDecisionOriginType0ApproverType0Assurance,
+)
+from .provenance_decision_origin_type_0_approver_type_0_kind import ProvenanceDecisionOriginType0ApproverType0Kind
+from .provenance_decision_origin_type_0_span_type_0 import ProvenanceDecisionOriginType0SpanType0
+from .provenance_decision_origin_type_0_span_type_0_kind import ProvenanceDecisionOriginType0SpanType0Kind
+from .provenance_decision_origin_type_0_trace_type_0 import ProvenanceDecisionOriginType0TraceType0
+from .provenance_decision_origin_type_0_trace_type_0_kind import ProvenanceDecisionOriginType0TraceType0Kind
+from .provenance_decision_resource import ProvenanceDecisionResource
+from .provenance_decision_resource_kind import ProvenanceDecisionResourceKind
+from .provenance_decision_status import ProvenanceDecisionStatus
+from .provenance_envelope import ProvenanceEnvelope
+from .provenance_envelope_links_item import ProvenanceEnvelopeLinksItem
+from .provenance_envelope_links_item_relation import ProvenanceEnvelopeLinksItemRelation
+from .provenance_envelope_links_item_target import ProvenanceEnvelopeLinksItemTarget
+from .provenance_envelope_links_item_target_kind import ProvenanceEnvelopeLinksItemTargetKind
+from .provenance_origin import ProvenanceOrigin
+from .provenance_origin_agent_type_0 import ProvenanceOriginAgentType0
+from .provenance_origin_agent_type_0_assurance import ProvenanceOriginAgentType0Assurance
+from .provenance_origin_agent_type_0_kind import ProvenanceOriginAgentType0Kind
+from .provenance_origin_approver_type_0 import ProvenanceOriginApproverType0
+from .provenance_origin_approver_type_0_assurance import ProvenanceOriginApproverType0Assurance
+from .provenance_origin_approver_type_0_kind import ProvenanceOriginApproverType0Kind
+from .provenance_origin_span_type_0 import ProvenanceOriginSpanType0
+from .provenance_origin_span_type_0_kind import ProvenanceOriginSpanType0Kind
+from .provenance_origin_trace_type_0 import ProvenanceOriginTraceType0
+from .provenance_origin_trace_type_0_kind import ProvenanceOriginTraceType0Kind
 from .prune_stats import PruneStats
 from .pruner import Pruner
 from .put_artifact_enrichment_response_201 import PutArtifactEnrichmentResponse201
@@ -1636,6 +1719,10 @@ from .resolver_suppression_request import ResolverSuppressionRequest
 from .resolver_suppression_selection import ResolverSuppressionSelection
 from .resolver_unmerge_request import ResolverUnmergeRequest
 from .resolver_wait import ResolverWait
+from .resource_reference import ResourceReference
+from .resource_reference_kind import ResourceReferenceKind
+from .resource_selector import ResourceSelector
+from .resource_selector_kind import ResourceSelectorKind
 from .resource_type import ResourceType
 from .restore_job import RestoreJob
 from .restore_job_list import RestoreJobList
@@ -1814,6 +1901,13 @@ from .topology_changed_error import TopologyChangedError
 from .topology_changed_error_action import TopologyChangedErrorAction
 from .topology_changed_error_error import TopologyChangedErrorError
 from .topology_changed_error_status import TopologyChangedErrorStatus
+from .trace_event import TraceEvent
+from .trace_event_provenance import TraceEventProvenance
+from .trace_event_provenance_links_item import TraceEventProvenanceLinksItem
+from .trace_event_provenance_links_item_relation import TraceEventProvenanceLinksItemRelation
+from .trace_event_provenance_links_item_target import TraceEventProvenanceLinksItemTarget
+from .trace_event_provenance_links_item_target_kind import TraceEventProvenanceLinksItemTargetKind
+from .trace_event_status import TraceEventStatus
 from .trained_choice_answer import TrainedChoiceAnswer
 from .trained_choice_answer_confidence_method import TrainedChoiceAnswerConfidenceMethod
 from .trained_choice_answer_decision_method import TrainedChoiceAnswerDecisionMethod
@@ -3066,7 +3160,24 @@ __all__ = (
     "MemoryEntityVisibility",
     "MemoryError_",
     "MemoryEvidence",
+    "MemoryEvidenceResourceSelectorType0",
+    "MemoryEvidenceResourceSelectorType0Kind",
+    "MemoryEvidenceResourceType0",
+    "MemoryEvidenceResourceType0Kind",
     "MemoryEvidenceVisibility",
+    "MemoryExplainRequest",
+    "MemoryExplainRequestResourceType0",
+    "MemoryExplainRequestResourceType0Kind",
+    "MemoryExplanation",
+    "MemoryExplanationJustification",
+    "MemoryExplanationNodesItem",
+    "MemoryExplanationNodesItemLinksItem",
+    "MemoryExplanationNodesItemLinksItemRelation",
+    "MemoryExplanationNodesItemLinksItemStatus",
+    "MemoryExplanationNodesItemLinksItemTargetType0",
+    "MemoryExplanationNodesItemLinksItemTargetType0Kind",
+    "MemoryExplanationNodesItemResource",
+    "MemoryExplanationNodesItemResourceKind",
     "MemoryForgetRequest",
     "MemoryInspection",
     "MemoryInspectionCapabilities",
@@ -3100,6 +3211,17 @@ __all__ = (
     "MemoryObservationRequestEntitiesItemEvidenceItem",
     "MemoryObservationRequestEntitiesItemEvidenceItemSpanType0",
     "MemoryObservationRequestEntitiesItemVisibility",
+    "MemoryObservationRequestOriginType0",
+    "MemoryObservationRequestOriginType0AgentType0",
+    "MemoryObservationRequestOriginType0AgentType0Assurance",
+    "MemoryObservationRequestOriginType0AgentType0Kind",
+    "MemoryObservationRequestOriginType0ApproverType0",
+    "MemoryObservationRequestOriginType0ApproverType0Assurance",
+    "MemoryObservationRequestOriginType0ApproverType0Kind",
+    "MemoryObservationRequestOriginType0SpanType0",
+    "MemoryObservationRequestOriginType0SpanType0Kind",
+    "MemoryObservationRequestOriginType0TraceType0",
+    "MemoryObservationRequestOriginType0TraceType0Kind",
     "MemoryOperation",
     "MemoryOperationPhase",
     "MemoryOutcome",
@@ -3248,6 +3370,47 @@ __all__ = (
     "PredicateDecisionQuestionType",
     "PrefixQuery",
     "PriorArtifactContext",
+    "ProvenanceDecision",
+    "ProvenanceDecisionConfiguration",
+    "ProvenanceDecisionConfigurationKind",
+    "ProvenanceDecisionExecutor",
+    "ProvenanceDecisionExecutorAssurance",
+    "ProvenanceDecisionExecutorKind",
+    "ProvenanceDecisionInitiator",
+    "ProvenanceDecisionInitiatorAssurance",
+    "ProvenanceDecisionInitiatorKind",
+    "ProvenanceDecisionOperation",
+    "ProvenanceDecisionOperationKind",
+    "ProvenanceDecisionOriginType0",
+    "ProvenanceDecisionOriginType0AgentType0",
+    "ProvenanceDecisionOriginType0AgentType0Assurance",
+    "ProvenanceDecisionOriginType0AgentType0Kind",
+    "ProvenanceDecisionOriginType0ApproverType0",
+    "ProvenanceDecisionOriginType0ApproverType0Assurance",
+    "ProvenanceDecisionOriginType0ApproverType0Kind",
+    "ProvenanceDecisionOriginType0SpanType0",
+    "ProvenanceDecisionOriginType0SpanType0Kind",
+    "ProvenanceDecisionOriginType0TraceType0",
+    "ProvenanceDecisionOriginType0TraceType0Kind",
+    "ProvenanceDecisionResource",
+    "ProvenanceDecisionResourceKind",
+    "ProvenanceDecisionStatus",
+    "ProvenanceEnvelope",
+    "ProvenanceEnvelopeLinksItem",
+    "ProvenanceEnvelopeLinksItemRelation",
+    "ProvenanceEnvelopeLinksItemTarget",
+    "ProvenanceEnvelopeLinksItemTargetKind",
+    "ProvenanceOrigin",
+    "ProvenanceOriginAgentType0",
+    "ProvenanceOriginAgentType0Assurance",
+    "ProvenanceOriginAgentType0Kind",
+    "ProvenanceOriginApproverType0",
+    "ProvenanceOriginApproverType0Assurance",
+    "ProvenanceOriginApproverType0Kind",
+    "ProvenanceOriginSpanType0",
+    "ProvenanceOriginSpanType0Kind",
+    "ProvenanceOriginTraceType0",
+    "ProvenanceOriginTraceType0Kind",
     "Pruner",
     "PruneStats",
     "PutArtifactEnrichmentResponse201",
@@ -3445,6 +3608,10 @@ __all__ = (
     "ResolverSuppressionSelection",
     "ResolverUnmergeRequest",
     "ResolverWait",
+    "ResourceReference",
+    "ResourceReferenceKind",
+    "ResourceSelector",
+    "ResourceSelectorKind",
     "ResourceType",
     "RestoreJob",
     "RestoreJobList",
@@ -3623,6 +3790,13 @@ __all__ = (
     "TopologyChangedErrorAction",
     "TopologyChangedErrorError",
     "TopologyChangedErrorStatus",
+    "TraceEvent",
+    "TraceEventProvenance",
+    "TraceEventProvenanceLinksItem",
+    "TraceEventProvenanceLinksItemRelation",
+    "TraceEventProvenanceLinksItemTarget",
+    "TraceEventProvenanceLinksItemTargetKind",
+    "TraceEventStatus",
     "TrainedChoiceAnswer",
     "TrainedChoiceAnswerConfidenceMethod",
     "TrainedChoiceAnswerDecisionMethod",

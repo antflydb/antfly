@@ -42,9 +42,10 @@ def main() -> None:
             else antfly_embedded.create(args.database)
         )
 
-        def call(action: str, body: dict, key: str = ""):
+        def call(action: str, body: dict, key: str = "", *, id: str = ""):
             return client.memory(
-                args.space, {"action": action, "body": body, "idempotency_key": key}
+                args.space,
+                {"action": action, "body": body, "idempotency_key": key, "id": id},
             )
 
         call("create", config, "create")
@@ -54,9 +55,9 @@ def main() -> None:
         client = AntflyClient(args.url, token=os.environ.get("ANTFLY_TOKEN"))
         client.memory.create(args.space, config=config, idempotency_key="create")
 
-        def call(action: str, body: dict, key: str = ""):
+        def call(action: str, body: dict, key: str = "", *, id: str = ""):
             return client.memory.execute(
-                args.space, action, body=body, idempotency_key=key
+                args.space, action, body=body, idempotency_key=key, id=id
             )
 
     try:
@@ -98,7 +99,17 @@ def main() -> None:
         assert [hit["memory"]["assertion"]["value"] for hit in historical["items"]] == [
             "Helm"
         ]
-        print(json.dumps({"current": current, "historical": historical}, indent=2))
+        explanation = call("explain", {}, id="terraform")
+        print(
+            json.dumps(
+                {
+                    "current": current,
+                    "historical": historical,
+                    "explanation": explanation,
+                },
+                indent=2,
+            )
+        )
     finally:
         if args.database:
             client.close()

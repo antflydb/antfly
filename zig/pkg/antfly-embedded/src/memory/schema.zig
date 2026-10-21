@@ -22,6 +22,7 @@ pub fn wire(comptime T: type, a: std.mem.Allocator) !std.json.Value {
     return build(T, a, false);
 }
 fn build(comptime T: type, a: std.mem.Allocator, comptime strict: bool) anyerror!std.json.Value {
+    if (T == std.json.Value) return .{ .object = .empty };
     var object: std.json.ObjectMap = .empty;
     switch (@typeInfo(T)) {
         .@"struct" => |info| {

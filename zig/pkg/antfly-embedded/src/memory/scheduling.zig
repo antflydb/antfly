@@ -43,7 +43,8 @@ fn blocked(err: anyerror) bool {
     };
 }
 fn cleanup(backend: m.Backend, a: A, now: i64, state: m.types.State, executor: Executor) !bool {
-    if ((state.next_expiry_at == null or state.next_expiry_at.? > now) and
+    if ((state.next_resource_check_at == null or state.next_resource_check_at.? > now) and
+        (state.next_expiry_at == null or state.next_expiry_at.? > now) and
         (try backend.get(backend.ptr, a, "cleanup")) == null and
         (try backend.scan(backend.ptr, a, "dependency/work/", null, 1)).rows.len == 0) return false;
     executor.execute(executor.ptr, null) catch |err| {

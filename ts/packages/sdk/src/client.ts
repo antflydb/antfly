@@ -654,6 +654,17 @@ export class AntflyClient {
       }),
     recall: (space: string, body: components["schemas"]["MemoryRecallRequest"]) =>
       this.client.POST("/memory/v1/spaces/{space}/recall", { body, params: { path: { space } } }),
+    explain: (
+      space: string,
+      id: string,
+      body: components["schemas"]["MemoryExplainRequest"] = {}
+    ) =>
+      this.client.POST("/memory/v1/spaces/{space}/memories/{id}/explain", {
+        body,
+        params: { path: { space, id } },
+      }),
+    explainResource: (space: string, body: components["schemas"]["MemoryExplainRequest"]) =>
+      this.client.POST("/memory/v1/spaces/{space}/explain", { body, params: { path: { space } } }),
     get: (space: string, id: string) =>
       this.client.GET("/memory/v1/spaces/{space}/memories/{id}", {
         params: { path: { space, id } },

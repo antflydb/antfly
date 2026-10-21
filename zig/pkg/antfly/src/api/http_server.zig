@@ -5471,6 +5471,15 @@ pub const ApiHttpServer = struct {
             context.require_grant_fn = MemoryPublicationAuthority.requireGrant;
             context.final_check_ptr = &publication;
             context.final_check_fn = MemoryPublicationAuthority.check;
+            context.execution_principal = executor;
+            context.execution_signature = signature;
+            context.table_id = state.table_id;
+            context.database = state.database;
+            context.namespace = state.namespace;
+            context.space = state.space;
+            var resources: MemoryResourceReader = .{ .server = server, .executor = executor, .database = state.database, .request = .{ .deadline_ns = work.deadline_ns } };
+            adapter.resource_ptr = &resources;
+            adapter.resource_fn = MemoryResourceReader.read;
             adapter.context = context;
             adapter.request = .{ .deadline_ns = work.deadline_ns };
             const Runtime = @import("antfly_local_sources").asset_producer_runtime.Runtime;
@@ -21384,6 +21393,66 @@ pub const ApiHttpServer = struct {
         return alloc.dupe(u8, table.name);
     }
 
+    const MemoryResourceReader = struct {
+        server: *ApiHttpServer,
+        identity: ?*const ?AuthenticatedIdentity = null,
+        executor: []const u8 = "",
+        database: []const u8,
+        request: api_operation.RequestContext = .{},
+        fn read(ptr: *anyopaque, a: std.mem.Allocator, reference: @import("memory.zig").memory.types.provenance.Resource) !@import("memory.zig").memory.types.provenance.Snapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const server = self.server;
+            if (!std.mem.eql(u8, reference.database, self.database)) return .{ .state = .denied };
+            var identity: ?AuthenticatedIdentity = null;
+            defer if (identity) |*value| value.deinit(server.alloc);
+            if (self.identity) |borrowed| {
+                identity = try cloneCatalogIdentity(server.alloc, borrowed.*);
+            } else if (server.cfg.auth_enabled) {
+                const manager = server.cfg.user_manager orelse return .{ .state = .denied };
+                const permissions = if (std.mem.startsWith(u8, self.executor, "basic:")) try manager.getPermissionsForUser(self.executor[6..]) else if (std.mem.startsWith(u8, self.executor, "api-key:")) try manager.effectiveApiKeyPermissions(self.executor[8..]) else return .{ .state = .denied };
+                defer {
+                    for (permissions) |*permission| permission.deinit(manager.alloc);
+                    manager.alloc.free(permissions);
+                }
+                const filters = try manager.durableCredentialRowFilters(self.executor);
+                defer {
+                    for (filters) |*filter| filter.deinit(manager.alloc);
+                    manager.alloc.free(filters);
+                }
+                if (filters.len > 0) return .{ .state = .denied };
+                identity = try cloneCatalogIdentity(server.alloc, .{ .username = @constCast(self.executor), .permissions = permissions, .live_user_manager = manager, .credential_principal = @constCast(self.executor) });
+            }
+            if (server.cfg.auth_enabled and identity == null) return .{ .state = .denied };
+            var context = self.request;
+            context.native_service = null;
+            context.row_policy_credential = &identity;
+            const logical = if (reference.storage_name) |storage| (server.logicalTableNamesInArena(a, context, &.{storage}) catch |err| switch (err) {
+                error.TableNotFound => return .{ .state = .missing },
+                error.Forbidden, error.Unauthorized => return .{ .state = .denied },
+                else => return err,
+            })[0] else try (system_catalog.Target{ .database = reference.database, .namespace = reference.namespace, .table = reference.table }).resourceNameAlloc(a);
+            const current_target = try system_catalog.Target.parse(logical);
+            if (!std.mem.eql(u8, current_target.database, self.database)) return .{ .state = .denied };
+            if (!try tablePermissionCurrentlyAllowed(identity, logical, .read)) return .{ .state = .denied };
+            const filter = (try resolveEffectiveRowFilterJson(a, identity, logical)) orelse "";
+            if (filter.len != 0) return .{ .state = .denied };
+            var table_id: ?u64 = null;
+            const table = server.resolveCatalogKeyAlloc(a, context, logical, &identity, &table_id) catch |err| switch (err) {
+                error.Forbidden, error.Unauthorized => return .{ .state = .denied },
+                error.TableNotFound => return .{ .state = .missing },
+                else => return err,
+            };
+            if (table_id == null or (reference.table_id != 0 and table_id.? != reference.table_id)) return .{ .state = .missing };
+            const reads = server.table_reads orelse return error.MemoryCapabilityUnavailable;
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            const row = (try reads.lookup(scratch.allocator(), table, reference.id, .{ .execution_deadline_ns = context.deadline_ns, .cancellation = context.cancellation }, .read_index)) orelse return .{ .state = .missing };
+            var snapshot = try @import("memory.zig").memory.types.provenance.snapshot(a, reference, table_id.?, row.version, row.json, row.expected_content_digest);
+            snapshot.storage_name = table;
+            return snapshot;
+        }
+    };
+
     const MemoryPublicationAuthority = struct {
         server: *ApiHttpServer,
         alloc: std.mem.Allocator,
@@ -21474,7 +21543,8 @@ pub const ApiHttpServer = struct {
             };
             if (created) _ = self.materializeCommittedTableCreate(a, physical, create);
         }
-        const table = try self.resolveCatalogKeyAlloc(a, request, logical, &identity, null);
+        var table_id: ?u64 = null;
+        const table = try self.resolveCatalogKeyAlloc(a, request, logical, &identity, &table_id);
         if (identity) |value| if (!permissionsAllow(value.permissions, .table, table, required)) return error.Forbidden;
         const row_filter = try self.authorizedReadFilter(a, request, table);
         if (row_filter.len != 0) return error.MemoryRowPolicyUnsupported;
@@ -21495,6 +21565,7 @@ pub const ApiHttpServer = struct {
         } else "";
         var publication: MemoryPublicationAuthority = .{ .server = self, .alloc = a, .executor = executor, .signature = signature, .payload = grant_payload, .logical = logical, .table = table, .identity = &identity, .request = &request, .required = required };
         const context: module.memory.Context = .{
+            .table_id = table_id orelse 0,
             .grant_ptr = &publication,
             .require_grant_fn = MemoryPublicationAuthority.requireGrant,
             .final_check_ptr = &publication,
@@ -21511,7 +21582,8 @@ pub const ApiHttpServer = struct {
             .check_ptr = &request,
             .check_fn = Check.call,
         };
-        var adapter: module.engine.Routed = .{ .table = table, .reads = self.table_reads orelse return error.MemoryCapabilityUnavailable, .writes = self.table_writes orelse return error.MemoryCapabilityUnavailable, .context = context, .request = request };
+        var resources: MemoryResourceReader = .{ .server = self, .identity = &identity, .database = input.database, .request = request };
+        var adapter: module.engine.Routed = .{ .table = table, .reads = self.table_reads orelse return error.MemoryCapabilityUnavailable, .writes = self.table_writes orelse return error.MemoryCapabilityUnavailable, .context = context, .request = request, .resource_ptr = &resources, .resource_fn = MemoryResourceReader.read };
         const models = @import("antfly_local_sources").memory_models;
         const Runtime = @import("antfly_local_sources").asset_producer_runtime.Runtime;
         const runtime = try Runtime.createOwned(a, self.inferenceIo(), .{ .antfly_provider = self.antfly_provider, .inference_api_url = self.configuredInferenceAPIURL(), .secret_store = self.cfg.secret_store, .source_table = table });

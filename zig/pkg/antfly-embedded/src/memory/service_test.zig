@@ -21,6 +21,10 @@ const Store = struct {
     arena: std.heap.ArenaAllocator,
     values: std.StringHashMapUnmanaged([]const u8) = .empty,
     revision: u64 = 0,
+    resource_state: m.types.provenance.ResourceState = .current,
+    resource_revision: u64 = 7,
+    resource_json: []const u8 = "{\"message\":\"Approved deployment\"}",
+    resource_reads: usize = 0,
     reads: usize = 0,
     scans: usize = 0,
     decisions: usize = 0,
@@ -36,7 +40,14 @@ const Store = struct {
         self.arena.deinit();
     }
     fn service(self: *Store, principal: []const u8, admin: bool, now: i64) m.Service {
-        return .{ .backend = .{ .ptr = self, .get = get, .scan = scan, .commit = commit }, .context = .{ .principal = principal, .admin = admin, .now_ms = now } };
+        return .{ .backend = .{ .ptr = self, .get = get, .scan = scan, .commit = commit, .resource = resource }, .context = .{ .principal = principal, .admin = admin, .now_ms = now } };
+    }
+    fn resource(ptr: *anyopaque, a: A, reference: m.types.provenance.Resource) !m.types.provenance.Snapshot {
+        const self: *Store = @ptrCast(@alignCast(ptr));
+        self.resource_reads += 1;
+        if ((reference.table_id != 0 and reference.table_id != 7) or !std.mem.eql(u8, reference.database, "default") or !std.mem.eql(u8, reference.namespace, "public")) return .{ .state = .denied };
+        if (self.resource_state != .current) return .{ .state = self.resource_state };
+        return m.types.provenance.snapshot(a, reference, 7, self.resource_revision, self.resource_json, null);
     }
     fn get(ptr: *anyopaque, a: A, key: []const u8) !?m.Row {
         const self: *Store = @ptrCast(@alignCast(ptr));
@@ -2269,4 +2280,242 @@ test "memory dependency maintenance commits its cursor before yielding expensive
     try discard(&store, .advance, "", "{}", "second", 4);
     try std.testing.expect(store.values.get(work) == null);
     try std.testing.expectEqual(@as(usize, 7), (try Store.scan(&store, a, "assertion/", null, 256)).rows.len);
+}
+
+test "memory outcome feedback survives identity suppression and unrelated cleanup" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try discard(&store, .create, "", "{}", "create", 1);
+    try discard(&store, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"keep\",\"source_version\":\"1\",\"text\":\"Keep\"}],\"entities\":[{\"id\":\"person\",\"name\":\"Person\",\"evidence\":[{\"id\":\"e\"}]}],\"assertions\":[{\"id\":\"claim\",\"subject\":\"person\",\"predicate\":\"p\",\"value\":\"v\",\"statement\":\"Still valid\",\"evidence\":[{\"id\":\"e\"}]}]}", "observe", 2);
+    try discard(&store, .outcome, "", "{\"id\":\"feedback\",\"task_id\":\"task\",\"success\":true,\"used_memory_ids\":[\"claim\"],\"detail\":\"Retained task feedback\"}", "outcome", 3);
+    const path = try fixtureKey(a, "outcome", "feedback");
+    const original = try a.dupe(u8, store.values.get(path).?);
+    try discard(&store, .curate_entity, "", "{\"action\":\"suppress\",\"from\":\"person\",\"expected_revision\":4}", "suppress", 4);
+    try discard(&store, .forget, "", "{\"source_ids\":[\"unrelated\"]}", "unrelated", 5);
+    for (0..20) |i| try discard(&store, .advance, "", "{}", try std.fmt.allocPrint(a, "cleanup-{d}", .{i}), 6);
+    try std.testing.expect(store.values.get("cleanup") == null);
+    try std.testing.expectEqualStrings(original, store.values.get(path).?);
+    try std.testing.expect(store.values.get(try fixtureKey(a, "forgotten-outcome", "feedback")) == null);
+    const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    try discard(&store, .curate_entity, "", try std.json.Stringify.valueAlloc(a, m.types.EntityCorrection{ .action = .unsuppress, .from = "person", .expected_revision = state.revision }, .{}), "unsuppress", 7);
+    try std.testing.expect(std.mem.indexOf(u8, try store.service("alice", true, 8).execute(a, .get, "claim", "{}", ""), "Still valid") != null);
+}
+
+test "memory admission rejects expired or forgotten typed objects and retired literal subject IDs atomically" {
+    for ([_]bool{ false, true }) |expire| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        try discard(&store, .create, "", "{\"predicates\":[{\"name\":\"knows\",\"object_type\":\"person\"}]}", "create", 1);
+        const sources = [_]m.types.Evidence{
+            .{ .id = "identity", .source_id = "identity", .source_version = "1", .text = "Person", .expires_at = if (expire) 5 else null },
+            .{ .id = "safe", .source_id = "safe", .source_version = "1", .text = "Independent claim evidence" },
+        };
+        const person: m.types.Entity = .{ .id = "person", .name = "Person", .type = "person", .evidence = &.{.{ .id = "identity" }} };
+        try discard(&store, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &sources, .entities = &.{person} }, .{}), "observe", 2);
+        if (!expire) try discard(&store, .forget, "", "{\"source_ids\":[\"identity\"]}", "forget", 3);
+        const revision = store.revision;
+        const claim: m.types.Assertion = .{ .id = "new", .subject = "someone", .predicate = "knows", .value = "person", .statement = "Someone knows person", .evidence = &.{.{ .id = "safe" }} };
+        try std.testing.expectError(error.MemoryEntityRequired, store.service("alice", true, 6).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{claim} }, .{}), "new"));
+        try std.testing.expectEqual(revision, store.revision);
+        for (0..16) |i| try discard(&store, .advance, "", "{}", try std.fmt.allocPrint(a, "cleanup-{d}", .{i}), 7);
+        try std.testing.expect(store.values.get(try fixtureKey(a, "entity", "person")) == null);
+        var literal = claim;
+        literal.id = "literal";
+        literal.subject = "person";
+        literal.predicate = "untyped";
+        try std.testing.expectError(error.MemoryForgotten, store.service("alice", true, 8).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{literal} }, .{}), "literal"));
+        try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "assertion/", null, 256)).rows.len);
+    }
+}
+
+test "memory records durable admission provenance and explains exact source revisions within bounds" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try discard(&store, .create, "", "{}", "create", 1);
+    const reference: m.types.provenance.Resource = .{ .table = "business", .table_id = 7, .kind = .record, .id = "decision", .revision = 7 };
+    const evidence: m.types.Evidence = .{ .id = "e", .source_id = "business", .source_version = "7", .resource = reference };
+    const claim: m.types.Assertion = .{ .id = "claim", .subject = "production", .predicate = "deploys", .value = "Terraform", .statement = "Approved deployment", .evidence = &.{.{ .id = "e" }} };
+    try discard(&store, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{evidence}, .assertions = &.{claim} }, .{}), "observe", 2);
+    const raw = try store.service("alice", true, 3).execute(a, .explain, "claim", "{}", "");
+    const explained = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
+    try std.testing.expect(explained.object.get("incomplete_history").?.bool);
+    try std.testing.expect(!explained.object.get("complete").?.bool);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "snapshot_json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "authenticated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "supported_by") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "policy_version") != null);
+    const bounded = try store.service("alice", true, 4).execute(a, .explain, "claim", "{\"max_nodes\":1,\"max_bytes\":1024}", "");
+    try std.testing.expect(bounded.len <= 1024);
+    try std.testing.expect((try std.json.parseFromSliceLeaky(std.json.Value, a, bounded, .{})).object.get("truncated").?.bool);
+    store.resource_revision = 8;
+    try std.testing.expectError(error.MemoryNotFound, store.service("alice", true, 5).execute(a, .get, "claim", "{}", ""));
+    const historical = try store.service("alice", true, 6).execute(a, .explain, "claim", "{\"revision\":3}", "");
+    try std.testing.expect(std.mem.indexOf(u8, historical, "Approved deployment") != null);
+    try std.testing.expect(std.mem.indexOf(u8, historical, "\"status\":\"changed\"") != null);
+    try std.testing.expect(store.values.get(try fixtureKey(a, "assertion", "claim")) != null);
+    // Source drift invalidates current use without silently substituting v8 or
+    // erasing the exact snapshot used by a previously accepted decision.
+    for (0..10) |i| try discard(&store, .advance, "", "{}", try std.fmt.allocPrint(a, "poll-{d}", .{i}), 2000);
+    try std.testing.expect(store.values.get(try fixtureKey(a, "assertion", "claim")) != null);
+    store.resource_state = .denied;
+    const denied = store.service("alice", true, 2001).execute(a, .explain, "claim", "{\"revision\":3}", "") catch |err| {
+        try std.testing.expectEqual(error.MemoryForgotten, err);
+        return;
+    };
+    _ = denied;
+    return error.TestUnexpectedResult;
+}
+
+test "memory essential explanation survives trace sampling without treating trace origin as support" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try discard(&store, .create, "", "{}", "create", 1);
+    const trace: m.types.provenance.Resource = .{ .table = "traces", .table_id = 7, .kind = .trace, .id = "span", .revision = 7 };
+    const evidence: m.types.Evidence = .{ .id = "e", .source_id = "approval", .source_version = "1", .text = "Human approved the change" };
+    const claim: m.types.Assertion = .{ .id = "claim", .subject = "production", .predicate = "deploys", .value = "Terraform", .statement = "Approved deployment", .evidence = &.{.{ .id = "e" }} };
+    const body = try std.json.Stringify.valueAlloc(a, .{ .origin = m.types.provenance.Origin{ .trace = trace, .agent = .{ .id = "coding-agent", .kind = .agent }, .workflow = "release", .workflow_version = "v1" }, .evidence = &.{evidence}, .assertions = &.{claim} }, .{});
+    try discard(&store, .observe, "", body, "observe", 2);
+    const before = try store.service("alice", true, 3).execute(a, .explain, "claim", "{}", "");
+    try std.testing.expect(std.mem.indexOf(u8, before, "originated_in") != null);
+    store.resource_state = .missing;
+    try std.testing.expect(std.mem.indexOf(u8, try store.service("alice", true, 4).execute(a, .get, "claim", "{}", ""), "Approved deployment") != null);
+    const after = try store.service("alice", true, 5).execute(a, .explain, "claim", "{}", "");
+    try std.testing.expect(std.mem.indexOf(u8, after, "coding-agent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "Human approved the change") != null);
+    try std.testing.expect((try std.json.parseFromSliceLeaky(std.json.Value, a, after, .{})).object.get("missing_evidence").?.bool);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"id\":\"span\"") == null);
+    const state_before = store.revision;
+    const denied_origin: m.types.provenance.Origin = .{ .approver = .{ .id = "admin", .assurance = .authenticated } };
+    try std.testing.expectError(error.InvalidResourceReference, store.service("alice", true, 6).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .origin = denied_origin, .evidence = &.{evidence} }, .{}), "forged"));
+    try std.testing.expectEqual(state_before, store.revision);
+}
+
+test "memory resolves ordinary row selectors into exact immutable evidence without caller-supplied storage versions" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try discard(&store, .create, "", "{}", "create", 1);
+    const evidence: m.types.Evidence = .{ .id = "selected", .resource_selector = .{ .table = "business", .id = "approved" } };
+    try discard(&store, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{evidence} }, .{}), "select", 2);
+    const stored = try std.json.parseFromSliceLeaky(m.types.StoredEvidence, a, store.values.get(try fixtureKey(a, "evidence", "selected")).?, .{});
+    try std.testing.expectEqual(@as(u64, 7), stored.evidence.resource.?.table_id);
+    try std.testing.expectEqual(@as(u64, 7), stored.evidence.resource.?.revision);
+    try std.testing.expectEqualStrings("7", stored.evidence.source_version);
+    try std.testing.expect(stored.evidence.resource_selector == null);
+    try std.testing.expect(stored.evidence.text.len > 0);
+    const before = store.revision;
+    var stale = evidence;
+    stale.id = "stale";
+    stale.resource_selector.?.expected_revision = 6;
+    try std.testing.expectError(error.MemoryResourceChanged, store.service("alice", true, 3).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{stale} }, .{}), "stale"));
+    try std.testing.expectEqual(before, store.revision);
+}
+
+test "memory cleanup cannot retire shared ordinary evidence on a worker credential denial" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try discard(&store, .create, "", "{}", "create", 1);
+    const shared_source: m.types.Evidence = .{ .id = "shared", .resource_selector = .{ .table = "business", .id = "approval" } };
+    const claim: m.types.Assertion = .{ .id = "claim", .subject = "deployment", .predicate = "approved", .value = "yes", .statement = "Approved", .evidence = &.{.{ .id = "shared" }} };
+    try discard(&store, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{shared_source}, .assertions = &.{claim} }, .{}), "observe", 2);
+    store.resource_state = .denied;
+    try std.testing.expectError(error.MemoryNotFound, store.service("alice", true, 3).execute(a, .get, "claim", "{}", ""));
+    // Force an unrelated cleanup while the worker cannot see the ordinary row.
+    try discard(&store, .forget, "", "{\"source_ids\":[\"unrelated\"]}", "forget", 4);
+    for (0..16) |i| try discard(&store, .advance, "", "{}", try std.fmt.allocPrint(a, "denied-cleanup-{d}", .{i}), 40000);
+    try std.testing.expect(store.values.get(try fixtureKey(a, "evidence", "shared")) != null);
+    try std.testing.expect(store.values.get(try fixtureKey(a, "assertion", "claim")) != null);
+    store.resource_state = .current;
+    _ = try store.service("alice", true, 40001).execute(a, .get, "claim", "{}", "");
+}
+
+test "memory explanation preserves independent support and decision-time outcome usage through correction" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try discard(&store, .create, "", "{}", "create", 1);
+    const ordinary: m.types.Evidence = .{ .id = "ordinary", .resource_selector = .{ .table = "business", .id = "approval" } };
+    const independent: m.types.Evidence = .{ .id = "human", .source_id = "human", .source_version = "1", .text = "Human independently approved" };
+    const claim: m.types.Assertion = .{ .id = "claim", .subject = "deployment", .predicate = "approved", .value = "yes", .statement = "Approved", .evidence = &.{.{ .id = "ordinary" }}, .support_sets = &.{.{ .evidence = &.{.{ .id = "human" }} }} };
+    try discard(&store, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{ ordinary, independent }, .assertions = &.{claim} }, .{}), "observe", 2);
+    const original = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try store.service("alice", true, 3).execute(a, .get, "claim", "{}", ""), .{});
+    try discard(&store, .outcome, "", "{\"id\":\"feedback\",\"task_id\":\"release\",\"success\":true,\"used_memory_ids\":[\"claim\"]}", "feedback", 4);
+    const outcome_revision = store.revision + 1;
+    try discard(&store, .correct, "", try std.json.Stringify.valueAlloc(a, m.types.Correction{ .id = "claim", .expected_revision = original.revision, .lifecycle = .retracted, .reason = "Human correction", .evidence = &.{.{ .id = "human" }} }, .{}), "correct", 5);
+    const outcome_ref: m.types.provenance.Resource = .{ .table = "memory_", .table_id = 0, .kind = .outcome, .id = "feedback", .revision = outcome_revision };
+    const raw = try store.service("alice", true, 6).execute(a, .explain, "", try std.json.Stringify.valueAlloc(a, m.types.provenance.ExplainRequest{ .resource = outcome_ref }, .{}), "");
+    const explanation = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
+    const used = explanation.object.get("nodes").?.array.items[0].object.get("links").?.array.items[0];
+    try std.testing.expectEqualStrings("used", used.object.get("relation").?.string);
+    try std.testing.expectEqual(original.revision, @as(u64, @intCast(used.object.get("target").?.object.get("revision").?.integer)));
+    store.resource_revision = 8;
+    const corrected = try store.service("alice", true, 7).execute(a, .explain, "claim", "{}", "");
+    try std.testing.expect(std.mem.indexOf(u8, corrected, "Human correction") != null);
+    try std.testing.expect(std.mem.indexOf(u8, corrected, "Human independently approved") != null);
+    try std.testing.expect(std.mem.indexOf(u8, corrected, "\"status\":\"changed\"") != null);
+}
+
+test "memory source watch pages remain immediately due until the bounded round completes" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try discard(&store, .create, "", "{}", "create", 1);
+    var sources: [17]m.types.Evidence = undefined;
+    for (&sources, 0..) |*item, i| item.* = .{ .id = try std.fmt.allocPrint(a, "source-{d}", .{i}), .resource_selector = .{ .table = "business", .id = "approved" } };
+    try discard(&store, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &sources }, .{}), "observe", 2);
+    try discard(&store, .advance, "", "{}", "page-one", 40000);
+    const first = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    try std.testing.expect(first.resource_cursor != null);
+    try std.testing.expectEqual(@as(i64, 40000), first.next_resource_check_at.?);
+    try discard(&store, .advance, "", "{}", "page-two", 40000);
+    const second = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    try std.testing.expect(second.resource_cursor == null);
+    try std.testing.expectEqual(@as(i64, 70000), second.next_resource_check_at.?);
+}
+
+test "memory explanation reports invalid source metadata and authorizes cross-database edges independently" {
+    for (0..2) |mode| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        try discard(&store, .create, "", "{}", "create", 1);
+        const target: m.types.provenance.Resource = .{ .database = if (mode == 0) "default" else "other", .table = "business", .table_id = 7, .kind = .record, .id = "target", .revision = if (mode == 0) 0 else 7 };
+        store.resource_json = try std.json.Stringify.valueAlloc(a, .{ .provenance = m.types.provenance.Envelope{ .links = &.{.{ .relation = .used, .target = target }} } }, .{});
+        const root: m.types.provenance.Resource = .{ .table = "business", .table_id = 7, .kind = .record, .id = "root", .revision = 7 };
+        const raw = try store.service("alice", true, 2).execute(a, .explain, "", try std.json.Stringify.valueAlloc(a, m.types.provenance.ExplainRequest{ .resource = root }, .{}), "");
+        const result = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
+        try std.testing.expect(!result.object.get("complete").?.bool);
+        try std.testing.expectEqual(@as(usize, 1), result.object.get("nodes").?.array.items.len);
+        if (mode == 0) {
+            try std.testing.expect(result.object.get("incomplete_history").?.bool);
+        } else {
+            try std.testing.expect(result.object.get("missing_evidence").?.bool);
+            const edge = result.object.get("nodes").?.array.items[0].object.get("links").?.array.items[0];
+            try std.testing.expect(edge.object.get("target").? == .null);
+        }
+    }
+}
+
+test "memory bounds oversized ordinary snapshots and never admits a partial source" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try discard(&store, .create, "", "{}", "create", 1);
+    store.resource_json = try a.alloc(u8, m.types.provenance.max_snapshot_bytes + 1);
+    @memset(@constCast(store.resource_json), 'x');
+    const root: m.types.provenance.Resource = .{ .table = "business", .table_id = 7, .kind = .record, .id = "oversized", .revision = 7 };
+    const raw = try store.service("alice", true, 2).execute(a, .explain, "", try std.json.Stringify.valueAlloc(a, m.types.provenance.ExplainRequest{ .resource = root, .max_bytes = 1024 }, .{}), "");
+    const result = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
+    try std.testing.expect(result.object.get("truncated").?.bool);
+    try std.testing.expect(!result.object.get("complete").?.bool);
+    try std.testing.expect(raw.len <= 1024);
+    const before = store.revision;
+    const evidence: m.types.Evidence = .{ .id = "oversized", .resource_selector = .{ .table = "business", .id = "oversized" } };
+    try std.testing.expectError(error.MemoryInputTooLarge, store.service("alice", true, 3).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{evidence} }, .{}), "oversized"));
+    try std.testing.expectEqual(before, store.revision);
 }

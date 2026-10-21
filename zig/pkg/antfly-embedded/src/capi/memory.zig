@@ -26,6 +26,25 @@ pub const Request = struct {
     body: std.json.Value = .{ .object = .empty },
 };
 
+const ResourceReader = struct {
+    owner: *h.Handle,
+    fn read(ptr: *anyopaque, a: std.mem.Allocator, reference: memory.types.provenance.Resource) !memory.types.provenance.Snapshot {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, reference.database, "default") or !std.mem.eql(u8, reference.namespace, "public")) return .{ .state = .denied };
+        const db = @import("tables.zig").get(self.owner, reference.table) catch |err| switch (err) {
+            error.UndefinedTable, error.TableNotFound => return .{ .state = .missing },
+            else => return err,
+        };
+        if (reference.table_id != 0 and db.core.identity_namespace.table_id != reference.table_id) return .{ .state = .missing };
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        const row = (try db.getDocument(scratch.allocator(), reference.id, .{})) orelse return .{ .state = .missing };
+        var snapshot = try memory.types.provenance.snapshot(a, reference, db.core.identity_namespace.table_id, row.version orelse try db.getTimestamp(a, reference.id), row.json, row.expected_content_digest);
+        snapshot.storage_name = try std.fmt.allocPrint(a, "table:{d}", .{db.core.identity_namespace.table_id});
+        return snapshot;
+    }
+};
+
 /// The local database owner is the authority for embedded callers. There are
 /// no HTTP credentials or caller-supplied server permissions in this contract.
 pub fn execute(guard: *@import("db.zig").HandleGuard, handle_ptr: ?*anyopaque, alloc: std.mem.Allocator, space: []const u8, request_json: []const u8) ![]u8 {
@@ -47,8 +66,9 @@ pub fn execute(guard: *@import("db.zig").HandleGuard, handle_ptr: ?*anyopaque, a
     if (memory.mutates(request.action) and !h.liteOpenModeCanWrite(handle.open_mode)) return error.SqlReadOnlyTransaction;
     if (request.action == .create) try tables.create(handle.parent_handle orelse handle, table, "{}", true);
     const database = try tables.get(handle.parent_handle orelse handle, table);
-    const context: memory.Context = .{ .space = space, .principal = request.principal, .admin = true, .now_ms = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms) };
-    var adapter: engine.Native(h.db_mod.DB) = .{ .db = database, .context = context };
+    const context: memory.Context = .{ .table_id = database.core.identity_namespace.table_id, .space = space, .principal = request.principal, .admin = true, .now_ms = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms) };
+    var resources: ResourceReader = .{ .owner = handle.parent_handle orelse handle };
+    var adapter: engine.Native(h.db_mod.DB) = .{ .db = database, .context = context, .resource_ptr = &resources, .resource_fn = ResourceReader.read };
     // Provider lifetime is independent of the storage generation. Retain it
     // across every model call and writer-lease release in this operation.
     var provider_owner = handle;

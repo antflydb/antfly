@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
 from ..models.memory_evidence_visibility import MemoryEvidenceVisibility
 from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.memory_evidence_resource_selector_type_0 import MemoryEvidenceResourceSelectorType0
+    from ..models.memory_evidence_resource_type_0 import MemoryEvidenceResourceType0
+
 
 T = TypeVar("T", bound="MemoryEvidence")
 
@@ -16,9 +21,11 @@ class MemoryEvidence:
     """
     Attributes:
         id (str):
-        source_id (str):
-        source_version (str):
-        text (str):
+        source_id (str | Unset):
+        source_version (str | Unset):
+        text (str | Unset):
+        resource (MemoryEvidenceResourceType0 | None | Unset):
+        resource_selector (MemoryEvidenceResourceSelectorType0 | None | Unset):
         source_url (None | str | Unset):
         author (None | str | Unset):
         event_time (int | None | Unset):
@@ -33,9 +40,11 @@ class MemoryEvidence:
     """
 
     id: str
-    source_id: str
-    source_version: str
-    text: str
+    source_id: str | Unset = UNSET
+    source_version: str | Unset = UNSET
+    text: str | Unset = UNSET
+    resource: MemoryEvidenceResourceType0 | None | Unset = UNSET
+    resource_selector: MemoryEvidenceResourceSelectorType0 | None | Unset = UNSET
     source_url: None | str | Unset = UNSET
     author: None | str | Unset = UNSET
     event_time: int | None | Unset = UNSET
@@ -49,6 +58,9 @@ class MemoryEvidence:
     expires_at: int | None | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.memory_evidence_resource_selector_type_0 import MemoryEvidenceResourceSelectorType0
+        from ..models.memory_evidence_resource_type_0 import MemoryEvidenceResourceType0
+
         id = self.id
 
         source_id = self.source_id
@@ -56,6 +68,22 @@ class MemoryEvidence:
         source_version = self.source_version
 
         text = self.text
+
+        resource: dict[str, Any] | None | Unset
+        if isinstance(self.resource, Unset):
+            resource = UNSET
+        elif isinstance(self.resource, MemoryEvidenceResourceType0):
+            resource = self.resource.to_dict()
+        else:
+            resource = self.resource
+
+        resource_selector: dict[str, Any] | None | Unset
+        if isinstance(self.resource_selector, Unset):
+            resource_selector = UNSET
+        elif isinstance(self.resource_selector, MemoryEvidenceResourceSelectorType0):
+            resource_selector = self.resource_selector.to_dict()
+        else:
+            resource_selector = self.resource_selector
 
         source_url: None | str | Unset
         if isinstance(self.source_url, Unset):
@@ -118,11 +146,18 @@ class MemoryEvidence:
         field_dict.update(
             {
                 "id": id,
-                "source_id": source_id,
-                "source_version": source_version,
-                "text": text,
             }
         )
+        if source_id is not UNSET:
+            field_dict["source_id"] = source_id
+        if source_version is not UNSET:
+            field_dict["source_version"] = source_version
+        if text is not UNSET:
+            field_dict["text"] = text
+        if resource is not UNSET:
+            field_dict["resource"] = resource
+        if resource_selector is not UNSET:
+            field_dict["resource_selector"] = resource_selector
         if source_url is not UNSET:
             field_dict["source_url"] = source_url
         if author is not UNSET:
@@ -150,14 +185,51 @@ class MemoryEvidence:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.memory_evidence_resource_selector_type_0 import MemoryEvidenceResourceSelectorType0
+        from ..models.memory_evidence_resource_type_0 import MemoryEvidenceResourceType0
+
         d = dict(src_dict)
         id = d.pop("id")
 
-        source_id = d.pop("source_id")
+        source_id = d.pop("source_id", UNSET)
 
-        source_version = d.pop("source_version")
+        source_version = d.pop("source_version", UNSET)
 
-        text = d.pop("text")
+        text = d.pop("text", UNSET)
+
+        def _parse_resource(data: object) -> MemoryEvidenceResourceType0 | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                resource_type_0 = MemoryEvidenceResourceType0.from_dict(data)
+
+                return resource_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(MemoryEvidenceResourceType0 | None | Unset, data)
+
+        resource = _parse_resource(d.pop("resource", UNSET))
+
+        def _parse_resource_selector(data: object) -> MemoryEvidenceResourceSelectorType0 | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                resource_selector_type_0 = MemoryEvidenceResourceSelectorType0.from_dict(data)
+
+                return resource_selector_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(MemoryEvidenceResourceSelectorType0 | None | Unset, data)
+
+        resource_selector = _parse_resource_selector(d.pop("resource_selector", UNSET))
 
         def _parse_source_url(data: object) -> None | str | Unset:
             if data is None:
@@ -247,6 +319,8 @@ class MemoryEvidence:
             source_id=source_id,
             source_version=source_version,
             text=text,
+            resource=resource,
+            resource_selector=resource_selector,
             source_url=source_url,
             author=author,
             event_time=event_time,

@@ -31,12 +31,15 @@ pub fn route(method: []const u8, path: []const u8) !Route {
     const resource = parts.next() orelse return .{ .space = space, .action = if (std.mem.eql(u8, method, "GET")) .inspect else if (std.mem.eql(u8, method, "PATCH")) .configure else if (std.mem.eql(u8, method, "PUT")) .create else return error.MethodNotAllowed };
     const id = parts.next();
     if (std.mem.eql(u8, resource, "memories")) {
-        if (!std.mem.eql(u8, method, "GET")) return error.MethodNotAllowed;
+        if (id == null and !std.mem.eql(u8, method, "GET")) return error.MethodNotAllowed;
         if (id == null) return .{ .space = space, .action = .list };
         if (parts.next()) |suffix| {
-            if (!std.mem.eql(u8, suffix, "history") or parts.next() != null) return error.MemoryRouteNotFound;
+            if (parts.next() != null) return error.MemoryRouteNotFound;
+            if (std.mem.eql(u8, suffix, "explain") and std.mem.eql(u8, method, "POST")) return .{ .space = space, .id = id.?, .action = .explain };
+            if (!std.mem.eql(u8, suffix, "history") or !std.mem.eql(u8, method, "GET")) return error.MemoryRouteNotFound;
             return .{ .space = space, .id = id.?, .action = .history };
         }
+        if (!std.mem.eql(u8, method, "GET")) return error.MethodNotAllowed;
         return .{ .space = space, .id = id.?, .action = .get };
     }
     if (std.mem.eql(u8, resource, "operations")) {
@@ -50,7 +53,7 @@ pub fn route(method: []const u8, path: []const u8) !Route {
     if (std.mem.eql(u8, resource, "entity-corrections") and std.mem.eql(u8, method, "POST")) return .{ .space = space, .action = .curate_entity };
     if (std.mem.eql(u8, resource, "entities") and std.mem.eql(u8, method, "GET")) return .{ .space = space, .action = .entities };
     if (!std.mem.eql(u8, method, "POST")) return error.MethodNotAllowed;
-    inline for (.{ .{ "embeddings", memory.Action.stage_embeddings }, .{ "observations", memory.Action.observe }, .{ "assertions", memory.Action.assertions }, .{ "recall", memory.Action.recall }, .{ "corrections", memory.Action.correct }, .{ "forget", memory.Action.forget }, .{ "outcomes", memory.Action.outcome }, .{ "maintenance", memory.Action.advance } }) |entry| {
+    inline for (.{ .{ "explain", memory.Action.explain }, .{ "embeddings", memory.Action.stage_embeddings }, .{ "observations", memory.Action.observe }, .{ "assertions", memory.Action.assertions }, .{ "recall", memory.Action.recall }, .{ "corrections", memory.Action.correct }, .{ "forget", memory.Action.forget }, .{ "outcomes", memory.Action.outcome }, .{ "maintenance", memory.Action.advance } }) |entry| {
         if (std.mem.eql(u8, resource, entry[0])) return .{ .space = space, .action = entry[1] };
     }
     return error.MemoryRouteNotFound;
@@ -62,7 +65,7 @@ pub fn status(err: anyerror) u16 {
         error.Unauthorized => 401,
         error.Forbidden, error.MemoryVisibilityConflict, error.MemoryRowPolicyUnsupported => 403,
         error.MethodNotAllowed => 405,
-        error.MemoryRevisionConflict, error.MemorySpaceBindingChanged, error.MemoryCursorStale, error.MemorySpaceExists, error.MemoryIdempotencyConflict, error.MemoryEvidenceConflict, error.MemoryAssertionConflict, error.MemoryOutcomeConflict, error.MemoryProducerConflict, error.MemoryEntityConflict, error.MemoryConfigurationTransition, error.MemoryForgotten, error.MemoryConfigurationChanged => 409,
+        error.MemoryRevisionConflict, error.MemorySpaceBindingChanged, error.MemoryCursorStale, error.MemorySpaceExists, error.MemoryIdempotencyConflict, error.MemoryEvidenceConflict, error.MemoryAssertionConflict, error.MemoryOutcomeConflict, error.MemoryProducerConflict, error.MemoryEntityConflict, error.MemoryConfigurationTransition, error.MemoryForgotten, error.MemoryConfigurationChanged, error.MemoryResourceChanged => 409,
         error.MemoryInputTooLarge, error.MemoryWorkLimit => 413,
         error.MemoryModelRequired, error.MemoryCapabilityUnavailable, error.MemoryExecutionIdentityRequired, error.MemoryModelRevisionUnavailable, error.MemoryModelRevisionMismatch => 422,
         error.MemoryRetryNotReady, error.MemoryRetryExhausted, error.MemoryOverloaded => 429,

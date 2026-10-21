@@ -55,6 +55,7 @@ class MemoryOperations:
             "observe": ("POST", "/observations"),
             "assertions": ("POST", "/assertions"),
             "recall": ("POST", "/recall"),
+            "explain": ("POST", "/memories/" + quote(id, safe="") + "/explain" if id else "/explain"),
             "list": ("GET", "/memories"),
             "get": ("GET", "/memories/" + quote(id, safe="")),
             "history": ("GET", "/memories/" + quote(id, safe="") + "/history"),
@@ -73,7 +74,7 @@ class MemoryOperations:
         if action not in routes:
             raise ValueError("unknown native memory action")
         method, suffix = routes[action]
-        if method != "GET" and action != "recall" and not idempotency_key:
+        if method != "GET" and action not in ("recall", "explain") and not idempotency_key:
             raise ValueError("memory mutations require idempotency_key")
         headers = {"X-Antfly-Database": database, "X-Antfly-Namespace": namespace}
         if idempotency_key:

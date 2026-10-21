@@ -129,7 +129,7 @@ const mcp_capabilities_description_json =
 ;
 
 const mcp_tool_specs = [_]McpToolSpec{
-    .{ .kind = .memory, .name = "memory", .description = "Native evidence-backed temporal memory. Supply space and request with action, body, id, idempotency_key. Actions: create, inspect, configure, observe, assertions, recall, list, get, history, correct, forget, outcome, operation, advance, entities. Mutations require idempotency_key; permissions follow the selected action.", .permission = .read, .wildcard_table = true, .fields = &.{
+    .{ .kind = .memory, .name = "memory", .description = "Native evidence-backed temporal memory. Supply space and request with action, body, id, idempotency_key. Actions: create, inspect, configure, observe, assertions, recall, list, get, history, explain, correct, forget, outcome, operation, advance, entities. Mutations require idempotency_key; permissions follow the selected action.", .permission = .read, .wildcard_table = true, .fields = &.{
         .{ .name = "space", .schema_type = .string, .required = true },
         .{ .name = "request", .schema_type = .object, .required = true },
     } },
