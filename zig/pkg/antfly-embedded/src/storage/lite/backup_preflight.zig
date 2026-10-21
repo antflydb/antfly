@@ -34,7 +34,7 @@ pub const report_version = 1;
 pub const inspector_version = "antfly-backup-preflight/1";
 pub const Digest = [64]u8;
 pub const Verdict = enum { compatible, blocked, unknown };
-pub const Kind = enum { embedded, source_local, source_external, source_expiring, archive_retrieval, page_retrieval, connection, model, producer_model, dynamic_loader, source_unresolved };
+pub const Kind = enum { embedded, source_local, source_external, source_expiring, archive_retrieval, page_retrieval, connection, replication_source, model, producer_model, dynamic_loader, source_unresolved };
 pub const Options = struct {
     max_input_bytes: u64 = 64 * 1024 * 1024 * 1024,
     max_expanded_bytes: u64 = 128 * 1024 * 1024 * 1024,
@@ -213,14 +213,15 @@ pub fn evaluate(r: *const Requirement, destination: ?Destination) Evaluation {
     const d = destination orelse return e;
     if (d.version != 1 or d.configuration_id.len == 0) return e;
     for (d.requirements) |cap| if (std.mem.eql(u8, cap.requirement_sha256, &r.sha256)) {
-        const supported = cap.supported and (r.kind != .producer_model or (cap.future_ingestion and cap.model_revision_verified)) and (r.kind != .model or (cap.query_embedding and cap.future_ingestion and cap.model_revision_verified and cap.preprocessing_verified and cap.vector_space_verified and r.dimensions > 0 and cap.dimensions == r.dimensions));
+        const supported = cap.supported and (r.kind != .replication_source or cap.future_ingestion) and (r.kind != .producer_model or (cap.future_ingestion and cap.model_revision_verified)) and (r.kind != .model or (cap.query_embedding and cap.future_ingestion and cap.model_revision_verified and cap.preprocessing_verified and cap.vector_space_verified and r.dimensions > 0 and cap.dimensions == r.dimensions));
         e.verdict = if (supported) .compatible else .blocked;
         e.reason_code = if (supported) "capability_verified" else switch (r.kind) {
             .model, .producer_model => "model_incompatible",
             .connection => "connection_missing",
+            .replication_source => "replication_incompatible",
             else => "source_unresolved",
         };
-        e.remediation = if (supported) "Revalidate this capability at restore admission." else if (r.kind == .model) "Verify the same model revision, preprocessing, dimensions and vector space for both query embedding and future ingestion." else "Configure durable access and the required retrieval semantics at the destination.";
+        e.remediation = if (supported) "Revalidate this capability at restore admission." else if (r.kind == .model) "Verify the same model revision, preprocessing, dimensions and vector space for both query embedding and future ingestion." else if (r.kind == .replication_source) "Verify destination-managed PostgreSQL credentials, source table, slot/publication access and future logical replication ingestion for this exact source contract." else "Configure durable access and the required retrieval semantics at the destination.";
         return e;
     };
     return e;
@@ -507,25 +508,34 @@ pub const Inspector = struct {
 
     pub fn replicationSourcesJson(self: *@This(), bytes: []const u8) !void {
         if (bytes.len > self.options.max_metadata_bytes) return error.PreflightLimitExceeded;
-        var parsed = try std.json.parseFromSlice(Value, self.allocator, bytes, .{});
-        defer parsed.deinit();
-        try self.replicationSources(parsed.value);
+        var raw = try std.json.parseFromSlice(Value, self.allocator, bytes, .{});
+        defer raw.deinit();
+        try self.replicationSources(raw.value);
     }
 
-    fn replicationSources(self: *@This(), value: Value) !void {
-        if (value != .array) return error.InvalidBackupRequest;
-        const parsed = try std.json.parseFromValue([]const @import("antfly_metadata_openapi").ReplicationSource, self.allocator, value, .{ .ignore_unknown_fields = true });
+    fn replicationSources(self: *@This(), raw: Value) !void {
+        if (raw != .array) return error.InvalidBackupRequest;
+        const Source = @import("antfly_metadata_openapi").ReplicationSource;
+        var parsed = try std.json.parseFromValue([]Source, self.allocator, raw, .{});
         defer parsed.deinit();
-        for (parsed.value, value.array.items) |source, raw| {
+        if (parsed.value.len > self.options.max_definitions) return error.PreflightLimitExceeded;
+        for (parsed.value) |source| {
             try self.options.cancellation.check();
-            // DSNs may be libpq keyword strings or secret references. Keep
-            // them opaque and require destination evidence for the complete
-            // source scope, including table, publication and slot privileges.
-            // Never resolve credentials or claim to have probed connectivity.
-            const identity = try canonical.canonicalJsonValueAlloc(self.allocator, raw);
+            if (!eq(source.type, "postgres") or std.mem.trim(u8, source.dsn, " \t\r\n").len == 0 or std.mem.trim(u8, source.postgres_table, " \t\r\n").len == 0)
+                return error.UnsupportedReplicationInspection;
+            // Bind the whole declarative source: a capability for another
+            // source table, route, slot or publication cannot satisfy this one.
+            // Runtime status and action hints are observations, not contracts.
+            var contract = source;
+            contract.status = null;
+            contract.action_hint = null;
+            const json = try std.json.Stringify.valueAlloc(self.allocator, contract, .{});
+            defer self.allocator.free(json);
+            var value = try std.json.parseFromSlice(Value, self.allocator, json, .{});
+            defer value.deinit();
+            const identity = try canonical.canonicalJsonValueAlloc(self.allocator, value.value);
             defer self.allocator.free(identity);
-            const kind: Kind = if (eq(source.type, "postgres") and source.dsn.len > 0 and source.postgres_table.len > 0) .connection else .source_unresolved;
-            try self.report.add(self.options, kind, identity, "", "replication_source", 0);
+            try self.report.add(self.options, .replication_source, identity, "", "replication_sources", 0);
         }
     }
 
@@ -756,7 +766,7 @@ pub const Inspector = struct {
     pub fn document(self: *@This(), id: []const u8, bytes: []const u8, artifact: []const u8) !void {
         if (bytes.len > self.options.max_document_bytes) return error.PreflightLimitExceeded;
         if (self.definitions.items.len == 0) return;
-        var parsed = std.json.parseFromSlice(Value, self.allocator, bytes, .{}) catch |err| switch (err) {
+        var parsed = @import("antfly-json").parseValueLossless(self.allocator, bytes) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => {
                 if (artifact.len > 0) {
@@ -856,16 +866,26 @@ pub const Inspector = struct {
     }
 
     fn directives(self: *@This(), text: []const u8, doc: []const u8, field: []const u8) !void {
+        return self.directivesKnown(text, doc, field, false);
+    }
+
+    fn directivesKnown(self: *@This(), text: []const u8, doc: []const u8, field: []const u8, definition: bool) !void {
         const prefix = "<<<dotprompt:media:url ";
         var pos: usize = 0;
         while (std.mem.indexOfPos(u8, text, pos, prefix)) |start| {
             const begin = start + prefix.len;
             const end = std.mem.indexOfPos(u8, text, begin, ">>>") orelse {
+                // Unknown substitutions may supply the closing delimiter too.
+                if (definition and std.mem.indexOfScalar(u8, text[begin..], 0) != null) return;
                 try self.report.add(self.options, .source_unresolved, "media_directive", doc, field, 0);
                 return;
             };
             const reference = text[begin..end];
             if (std.mem.indexOfScalar(u8, reference, 0) != null) {
+                if (definition) {
+                    pos = end + 3;
+                    continue;
+                }
                 try self.report.add(self.options, .dynamic_loader, "composed_media", doc, field, 0);
             } else try self.locator(reference, doc, field);
             pos = end + 3;
@@ -995,6 +1015,16 @@ pub const Inspector = struct {
                             safe_node.mustache.expression = inert;
                             safe_node.mustache.unescaped = true;
                         }
+                    } else if (definition) {
+                        // A document substitution is unknown at definition time.
+                        // Preserve its position instead of inventing an empty URL
+                        // component; concrete documents are evaluated separately.
+                        const literal = try a.create(hbs.Node);
+                        literal.* = .{ .string_literal = .{ .value = "\x00" } };
+                        const inert = try a.create(hbs.Node);
+                        inert.* = .{ .expression = .{ .path = literal } };
+                        safe_node.mustache.expression = inert;
+                        safe_node.mustache.unescaped = true;
                     }
                 },
                 else => {
@@ -1019,11 +1049,12 @@ pub const Inspector = struct {
         if (locator_mode and has_helper) {
             if (program.program.body.len != 1) try self.report.add(self.options, .dynamic_loader, "composed_locator", doc, field, 0);
         } else if (locator_mode) {
-            try self.locator(output.items, doc, field);
+            if (!definition or std.mem.indexOfScalar(u8, output.items, 0) == null)
+                try self.locator(output.items, doc, field);
         } else if (input.interpretsTemplateOutput()) {
             // Scan the complete known output, including markers assembled from
             // several literals/references, with no producer or helper execution.
-            try self.directives(output.items, doc, field);
+            try self.directivesKnown(output.items, doc, field, definition);
         }
     }
 
@@ -1091,15 +1122,43 @@ pub const Inspector = struct {
 fn isLocalHost(host: []const u8) bool {
     if (host.len == 0) return false;
     if (host[0] == '[' and host[host.len - 1] == ']') {
-        const address = std.Io.net.Ip6Address.parse(host[1 .. host.len - 1], 0) catch return true;
+        const literal = host[1 .. host.len - 1];
+        // Normalize mixed dotted/hex notation without resolving the address.
+        // The pinned std parser only accepts dotted tails after ::ffff:.
+        var hexadecimal: [64]u8 = undefined;
+        const hex = if (std.mem.indexOfScalar(u8, literal, '.') != null) blk: {
+            const colon = std.mem.lastIndexOfScalar(u8, literal, ':') orelse return true;
+            const ip4 = std.Io.net.Ip4Address.parse(literal[colon + 1 ..], 0) catch return true;
+            break :blk std.fmt.bufPrint(&hexadecimal, "{s}{x}:{x}", .{
+                literal[0 .. colon + 1],
+                std.mem.readInt(u16, ip4.bytes[0..2], .big),
+                std.mem.readInt(u16, ip4.bytes[2..4], .big),
+            }) catch return true;
+        } else literal;
+        // The same parser special-cases ::ffff: as dotted IPv4 only. Expand
+        // that prefix so hexadecimal mapped addresses use its general parser.
+        var expanded: [64]u8 = undefined;
+        const input = if (std.ascii.startsWithIgnoreCase(hex, "::ffff:"))
+            std.fmt.bufPrint(&expanded, "0:0:0:0:0:ffff:{s}", .{hex[7..]}) catch return true
+        else
+            hex;
+        const address = std.Io.net.Ip6Address.parse(input, 0) catch return true;
         const b = address.bytes;
-        if ((std.mem.allEqual(u8, b[0..15], 0) and b[15] <= 1) or b[0] & 0xfe == 0xfc or (b[0] == 0xfe and b[1] & 0xc0 == 0x80) or (std.mem.allEqual(u8, b[0..10], 0) and b[10] == 255 and b[11] == 255)) return true;
+        // Classify mapped IPv4 by its actual address, not by the IPv6 prefix.
+        if (std.mem.allEqual(u8, b[0..10], 0) and b[10] == 255 and b[11] == 255)
+            return isLocalIpv4(b[12], b[13]);
+        // Return for public literals too: they must not fall through to the
+        // single-label hostname rule below.
+        return (std.mem.allEqual(u8, b[0..15], 0) and b[15] <= 1) or b[0] & 0xfe == 0xfc or (b[0] == 0xfe and b[1] & 0xc0 == 0x80);
     }
-    if (eq(host, "localhost") or std.mem.endsWith(u8, host, ".localhost") or std.mem.endsWith(u8, host, ".local") or eq(host, "[::1]") or eq(host, "[::]") or std.mem.indexOf(u8, host, "::ffff:") != null) return true;
-    if (std.mem.startsWith(u8, host, "[fc") or std.mem.startsWith(u8, host, "[fd") or std.mem.startsWith(u8, host, "[fe80:")) return true;
+    if (eq(host, "localhost") or std.mem.endsWith(u8, host, ".localhost") or std.mem.endsWith(u8, host, ".local")) return true;
     var octets = std.mem.splitScalar(u8, host, '.');
     const first = std.fmt.parseUnsigned(u16, octets.next() orelse return false, 10) catch return std.mem.indexOfScalar(u8, host, '.') == null;
     const second = std.fmt.parseUnsigned(u16, octets.next() orelse return true, 10) catch return false;
+    return isLocalIpv4(first, second);
+}
+
+fn isLocalIpv4(first: u16, second: u16) bool {
     return first == 127 or first == 0 or first == 10 or (first == 169 and second == 254) or (first == 192 and second == 168) or (first == 172 and second >= 16 and second <= 31);
 }
 
@@ -1200,7 +1259,7 @@ test "backup preflight replication sources require exact destination connection 
     var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
     defer inspector.deinit();
     try inspector.replicationSourcesJson(bytes);
-    try std.testing.expectEqual(@as(u64, 1), count(report, .connection));
+    try std.testing.expectEqual(@as(u64, 1), count(report, .replication_source));
     const json = try report.jsonAlloc("{\"version\":1,\"configuration_id\":\"empty-destination\"}");
     defer a.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"compatibility\":{\"verdict\":\"unknown\"") != null);
@@ -1210,6 +1269,7 @@ test "backup preflight replication sources require exact destination connection 
     const destination: Destination = .{ .version = 1, .configuration_id = "postgres-access", .requirements = &caps };
     try std.testing.expectEqual(Verdict.blocked, evaluate(&report.requirements.items[0], destination).verdict);
     caps[0].supported = true;
+    caps[0].future_ingestion = true;
     try std.testing.expectEqual(Verdict.compatible, evaluate(&report.requirements.items[0], destination).verdict);
     const evidence = try std.json.Stringify.valueAlloc(a, destination, .{});
     defer a.free(evidence);
@@ -1222,11 +1282,9 @@ test "backup preflight replication sources require exact destination connection 
     try inspector.metadataJson(
         \\{"replication_sources":[{"type":"postgres","dsn":"${secret:pg.dsn}","postgres_table":"public.other"},{"type":"postgres","dsn":"host=db.example dbname=app user=replicator","postgres_table":"public.documents"}]}
     );
-    try std.testing.expectEqual(@as(u64, 3), count(report, .connection));
+    try std.testing.expectEqual(@as(u64, 3), count(report, .replication_source));
     for (report.requirements.items[1..]) |*r| try std.testing.expectEqual(Verdict.unknown, evaluate(r, destination).verdict);
-    try inspector.replicationSourcesJson("[{\"type\":\"future-source\",\"dsn\":\"opaque\",\"postgres_table\":\"rows\"}]");
-    try std.testing.expect(!report.analysis_complete);
-    try std.testing.expectEqual(@as(u64, 1), count(report, .source_unresolved));
+    try std.testing.expectError(error.UnsupportedReplicationInspection, inspector.replicationSourcesJson("[{\"type\":\"future-source\",\"dsn\":\"opaque\",\"postgres_table\":\"rows\"}]"));
 }
 
 test "backup preflight prior context static fetches cannot be certified by model evidence" {
@@ -2277,7 +2335,7 @@ test "backup preflight retained artifact admission precedes cloning" {
     try std.testing.expectError(error.PreflightLimitExceeded, inspector.visit(.artifact_batch, payload));
 }
 
-test "backup preflight deep replication metadata remains stack safe" {
+test "backup preflight rejects deeply nested unknown replication metadata without recursion" {
     const a = std.testing.allocator;
     const depth = 20000;
     const prefix = "[{\"type\":\"postgres\",\"dsn\":\"host=db.example dbname=app\",\"postgres_table\":\"public.docs\",\"metadata\":";
@@ -2299,6 +2357,196 @@ test "backup preflight deep replication metadata remains stack safe" {
     defer report.deinit();
     var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
     defer inspector.deinit();
-    try inspector.replicationSourcesJson(raw.items);
-    try std.testing.expectEqual(@as(u64, 1), count(report, .connection));
+    // Main's strict replication contract rejects unknown executable fields.
+    try std.testing.expectError(error.UnknownField, inspector.replicationSourcesJson(raw.items));
+    try std.testing.expectEqual(@as(usize, 0), report.requirements.items.len);
+}
+
+test "backup preflight replication binds credentials and CDC configuration without visiting inert transforms" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "${secret:private-pg}", "${REVIEW_PG_DSN}", "postgres://user:private-password@localhost/db", "host=localhost dbname=private-db password=private-password" }) |dsn| {
+        const source = try std.json.Stringify.valueAlloc(a, .{.{ .type = "postgres", .dsn = dsn, .postgres_table = "public.users", .on_update = .{.{ .op = "$set", .path = "url", .value = "file:///inert-transform" }} }}, .{});
+        defer a.free(source);
+        var report: Report = .{ .allocator = a, .scan_complete = true };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        try inspector.replicationSourcesJson(source);
+        try std.testing.expectEqual(@as(usize, 1), report.requirements.items.len);
+        const requirement = &report.requirements.items[0];
+        try std.testing.expectEqual(Kind.replication_source, requirement.kind);
+        try std.testing.expectEqual(Verdict.unknown, evaluate(requirement, .{ .version = 1, .configuration_id = "empty" }).verdict);
+        const digest = requirement.sha256;
+        var cap: Capability = .{ .requirement_sha256 = &digest, .supported = true };
+        try std.testing.expectEqual(Verdict.blocked, evaluate(requirement, .{ .version = 1, .configuration_id = "read-only", .requirements = &.{cap} }).verdict);
+        cap.future_ingestion = true;
+        try std.testing.expectEqual(Verdict.compatible, evaluate(requirement, .{ .version = 1, .configuration_id = "cdc-verified", .requirements = &.{cap} }).verdict);
+        const output = try report.jsonAlloc(null);
+        defer a.free(output);
+        for ([_][]const u8{ dsn, "private-password", "private-db", "inert-transform" }) |secret| try std.testing.expect(std.mem.indexOf(u8, output, secret) == null);
+        // Table/slot changes need new evidence even when the DSN is unchanged.
+        const other = try std.json.Stringify.valueAlloc(a, .{.{ .type = "postgres", .dsn = dsn, .postgres_table = "public.other", .slot_name = "different-slot" }}, .{});
+        defer a.free(other);
+        try inspector.replicationSourcesJson(other);
+        try std.testing.expectEqual(@as(usize, 2), report.requirements.items.len);
+        try std.testing.expectEqual(Verdict.unknown, evaluate(&report.requirements.items[1], .{ .version = 1, .configuration_id = "old-source-only", .requirements = &.{cap} }).verdict);
+    }
+}
+
+test "backup preflight replication rejects unknown providers malformed contracts and limits" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "[{\"type\":\"future-provider\",\"dsn\":\"opaque\",\"postgres_table\":\"users\"}]",
+        "[{\"type\":\"postgres\",\"dsn\":\"\",\"postgres_table\":\"users\"}]",
+        "[{\"type\":\"postgres\",\"postgres_table\":\"users\"}]",
+        "[{\"type\":\"postgres\",\"dsn\":\"opaque\",\"postgres_table\":\"users\",\"future_connection\":{\"dsn\":\"other\"}}]",
+        "{}",
+    }) |source| {
+        var report: Report = .{ .allocator = a };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        if (inspector.replicationSourcesJson(source)) |_| return error.TestUnexpectedResult else |_| {}
+        try std.testing.expectEqual(@as(usize, 0), report.requirements.items.len);
+    }
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{ .max_definitions = 0 } };
+    defer inspector.deinit();
+    try std.testing.expectError(error.PreflightLimitExceeded, inspector.replicationSourcesJson("[{\"type\":\"postgres\",\"dsn\":\"opaque\",\"postgres_table\":\"users\"}]"));
+}
+
+test "backup preflight IP literals retain public and local scope" {
+    const a = std.testing.allocator;
+    for ([_]struct { url: []const u8, local: bool }{
+        .{ .url = "https://[2606:4700:4700::1111]/file.txt", .local = false },
+        .{ .url = "https://[2606:4700:4700:0:0:0:0:1111]/file.txt", .local = false },
+        .{ .url = "https://[::ffff:808:808]/file.txt", .local = false },
+        .{ .url = "https://[::ffff:8.8.8.8]/file.txt", .local = false },
+        .{ .url = "https://[0:0:0:0:0:ffff:8.8.8.8]/file.txt", .local = false },
+        .{ .url = "https://[64:ff9b::8.8.8.8]/file.txt", .local = false },
+        .{ .url = "https://8.8.8.8/file.txt", .local = false },
+        .{ .url = "https://[::]/file.txt", .local = true },
+        .{ .url = "https://[::1]/file.txt", .local = true },
+        .{ .url = "https://[fc00::1]/file.txt", .local = true },
+        .{ .url = "https://[fe80::1]/file.txt", .local = true },
+        .{ .url = "https://[::ffff:127.0.0.1]/file.txt", .local = true },
+        .{ .url = "https://[0:0:0:0:0:ffff:192.168.1.1]/file.txt", .local = true },
+        .{ .url = "https://[0:0:0:0:0:ffff:c0a8:101]/file.txt", .local = true },
+        .{ .url = "https://192.168.1.1/file.txt", .local = true },
+        .{ .url = "https://localhost/file.txt", .local = true },
+    }) |case| {
+        var report: Report = .{ .allocator = a, .scan_complete = true };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        try inspector.locator(case.url, "", "");
+        try std.testing.expectEqual(@as(u64, if (case.local) 1 else 0), count(report, .source_local));
+        try std.testing.expectEqual(@as(u64, 1), count(report, .source_external));
+        var capabilities: std.ArrayListUnmanaged(Capability) = .empty;
+        defer capabilities.deinit(a);
+        for (report.requirements.items) |*requirement| try capabilities.append(a, .{ .requirement_sha256 = &requirement.sha256, .supported = true });
+        const destination = try std.json.Stringify.valueAlloc(a, Destination{ .version = 1, .configuration_id = "verified", .requirements = capabilities.items }, .{});
+        defer a.free(destination);
+        const json = try report.jsonAlloc(destination);
+        defer a.free(json);
+        var parsed = try std.json.parseFromSlice(Value, a, json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(if (case.local) "blocked" else "compatible", parsed.value.object.get("compatibility").?.object.get("verdict").?.string);
+    }
+}
+
+test "backup preflight embedded inference identity retains model requirements without a media locator" {
+    const a = std.testing.allocator;
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    try inspector.metadataJson(
+        \\{"kind":"embedding","name":"dense","field":"body","expected_dims":384,"producer":{"version":2,"provider":"antfly","model":"BAAI/bge-small-en-v1.5","endpoint":"antfly:embedded","sparse":false}}
+    );
+    try std.testing.expectEqual(@as(u64, 1), count(report, .model));
+    try std.testing.expectEqual(@as(u64, 1), count(report, .producer_model));
+    try std.testing.expectEqual(@as(u64, 0), count(report, .source_unresolved));
+    // The same token in actual source content is still an unsupported URI.
+    try inspector.locator("antfly:embedded", "doc", "media");
+    try std.testing.expectEqual(@as(u64, 1), count(report, .source_unresolved));
+}
+
+test "backup preflight numeric template origin matches runtime" {
+    const a = std.testing.allocator;
+    const source_template = "https://{{tenant}}.example.org/file.pdf";
+    for ([_][]const u8{ "1e3", "1.0", "18446744073709551615" }) |number_token| {
+        const document_json = try std.fmt.allocPrint(a, "{{\"tenant\":{s}}}", .{number_token});
+        defer a.free(document_json);
+        const actual = try template_runtime.renderDocument(a, source_template, document_json);
+        defer a.free(actual);
+        const expected_url = try std.fmt.allocPrint(a, "https://{s}.example.org/file.pdf", .{number_token});
+        defer a.free(expected_url);
+        try std.testing.expectEqualStrings(expected_url, actual);
+        var report: Report = .{ .allocator = a };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        const catalog = try std.json.Stringify.valueAlloc(a, .{ .kind = "asset", .source_template = source_template, .producer = .{ .type = "reader" } }, .{});
+        defer a.free(catalog);
+        try inspector.metadataJson(catalog);
+        try std.testing.expectEqual(@as(usize, 0), report.requirements.items.len);
+        try inspector.document("doc", document_json, "");
+        const origin = try std.fmt.allocPrint(a, "https://{s}.example.org:443", .{number_token});
+        defer a.free(origin);
+        const expected = requirementHash(.source_external, origin);
+        try std.testing.expectEqual(@as(usize, 1), report.requirements.items.len);
+        try std.testing.expectEqualStrings(&expected, &report.requirements.items[0].sha256);
+    }
+}
+
+test "backup preflight hostname substitutions defer until documents" {
+    const a = std.testing.allocator;
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    const catalog = try std.json.Stringify.valueAlloc(a, .{ .kind = "asset", .source_template = "https://{{host}}/file.pdf", .producer = .{ .type = "reader" } }, .{});
+    defer a.free(catalog);
+    try inspector.metadataJson(catalog);
+    try inspector.document("doc", "{\"host\":\"example.org\"}", "");
+    try std.testing.expectEqual(@as(u64, 1), count(report, .source_external));
+    try std.testing.expectEqual(@as(u64, 0), count(report, .source_unresolved));
+    try std.testing.expect(report.analysis_complete);
+}
+
+test "backup preflight definition substitutions retain independent static media" {
+    const a = std.testing.allocator;
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    const catalog = try std.json.Stringify.valueAlloc(a, .{ .kind = "asset", .source_template = "{{media url=\"https://static.example.org/a\"}} <<<dotprompt:media:url https://{{host}}/b>>>", .producer = .{ .type = "generator" } }, .{});
+    defer a.free(catalog);
+    try inspector.metadataJson(catalog);
+    try std.testing.expectEqual(@as(u64, 1), count(report, .source_external));
+    try std.testing.expectEqual(@as(u64, 0), count(report, .source_unresolved));
+    try std.testing.expect(report.analysis_complete);
+    try inspector.document("doc", "{\"host\":\"dynamic.example.org\"}", "");
+    try std.testing.expectEqual(@as(u64, 3), count(report, .source_external));
+    try std.testing.expectEqual(@as(u64, 0), count(report, .source_unresolved));
+    try std.testing.expect(report.analysis_complete);
+}
+
+test "backup preflight definition substitutions may complete media delimiters" {
+    const a = std.testing.allocator;
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    const catalog = try std.json.Stringify.valueAlloc(a, .{ .kind = "asset", .source_template = "<<<dotprompt:media:url https://{{host}}{{{tail}}}", .producer = .{ .type = "generator" } }, .{});
+    defer a.free(catalog);
+    try inspector.metadataJson(catalog);
+    try std.testing.expectEqual(@as(u64, 0), count(report, .source_external));
+    try std.testing.expectEqual(@as(u64, 0), count(report, .source_unresolved));
+    try inspector.document("doc", "{\"host\":\"example.org\",\"tail\":\"/a>>>\"}", "");
+    try std.testing.expectEqual(@as(u64, 1), count(report, .source_external));
+    try std.testing.expectEqual(@as(u64, 0), count(report, .source_unresolved));
+    try std.testing.expect(report.analysis_complete);
 }

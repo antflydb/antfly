@@ -1234,7 +1234,7 @@ fn appendDefaultFullTextIndexEntry(
 }
 
 fn validateCreateTableIndexName(index_name: []const u8) !void {
-    if (index_name.len == 0 or (std.mem.eql(u8, index_name, "_resolver_curation") or std.mem.eql(u8, index_name, "_resolver_namespaces"))) return error.InvalidCreateTableRequest;
+    if (index_name.len == 0 or (std.mem.eql(u8, index_name, "_resolver_curation") or std.mem.eql(u8, index_name, "_resolver_namespaces") or std.mem.eql(u8, index_name, "_curation_proposals"))) return error.InvalidCreateTableRequest;
     if (isReservedFullTextIndexName(index_name)) return error.InvalidCreateTableRequest;
 }
 
@@ -1243,7 +1243,7 @@ fn isReservedFullTextIndexName(index_name: []const u8) bool {
 }
 
 fn isReservedPublicCreateIndexName(index_name: []const u8) bool {
-    return (std.mem.eql(u8, index_name, "_resolver_curation") or std.mem.eql(u8, index_name, "_resolver_namespaces")) or isReservedFullTextIndexName(index_name) or
+    return (std.mem.eql(u8, index_name, "_resolver_curation") or std.mem.eql(u8, index_name, "_resolver_namespaces") or std.mem.eql(u8, index_name, "_curation_proposals")) or isReservedFullTextIndexName(index_name) or
         std.mem.eql(u8, index_name, "default");
 }
 
@@ -1591,6 +1591,24 @@ test "table contract rejects malformed multi-source members" {
             parseCreateIndexRequest(std.testing.allocator, "multi", body),
         );
     }
+}
+
+test "table contract retains pinned embedding identity through table and index admission and responses" {
+    const a = std.testing.allocator;
+    const identity = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const index = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"google/embeddinggemma-2\",\"api_url\":\"http://localhost:8082\",\"model_identity\":\"" ++ identity ++ "\"}}";
+    var table = try parseCreateTableRequest(a, "{\"indexes\":{\"vectors\":" ++ index ++ "}}");
+    defer table.deinit(a);
+    var catalog = try std.json.parseFromSlice(std.json.Value, a, table.indexes_json.?, .{});
+    defer catalog.deinit();
+    try std.testing.expectEqualStrings(identity, catalog.value.object.get("vectors").?.object.get("embedder").?.object.get("model_identity").?.string);
+    const normalized = try parseCreateIndexRequest(a, "vectors", index);
+    defer a.free(normalized);
+    const response = try indexes_api.encodeCreatedIndexConfig(a, "vectors", normalized);
+    defer a.free(response);
+    var created = try std.json.parseFromSlice(std.json.Value, a, response, .{});
+    defer created.deinit();
+    try std.testing.expectEqualStrings(identity, created.value.object.get("embedder").?.object.get("model_identity").?.string);
 }
 
 test "table contract public response omits unknown nested provider fields" {

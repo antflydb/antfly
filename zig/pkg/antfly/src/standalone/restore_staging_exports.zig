@@ -68,7 +68,7 @@ pub fn inspect(context: *const bridge.InspectContext) callconv(.c) c_int {
     context.result_ptr.* = null;
     context.result_len.* = 0;
     const destination = if (context.destination_ptr) |ptr| ptr[0..context.destination_len] else null;
-    const json = restore_staging.inspectInputJsonAlloc(std.heap.c_allocator, context.input_ptr[0..context.input_len], destination, .{ .max_input_bytes = context.max_input_bytes, .max_expanded_bytes = context.max_expanded_bytes }) catch |err| return if (err == error.OutOfMemory) bridge.Status.out_of_memory else bridge.Status.invalid_arguments;
+    const json = @import("backup_inspection.zig").inspectInputJsonAlloc(std.heap.c_allocator, context.input_ptr[0..context.input_len], destination, .{ .max_input_bytes = context.max_input_bytes, .max_expanded_bytes = context.max_expanded_bytes }) catch |err| return if (err == error.OutOfMemory) bridge.Status.out_of_memory else bridge.Status.invalid_arguments;
     context.result_ptr.* = json.ptr;
     context.result_len.* = json.len;
     return bridge.Status.ok;

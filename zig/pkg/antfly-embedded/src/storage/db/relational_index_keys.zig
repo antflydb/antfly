@@ -581,6 +581,36 @@ fn vectorValue(vector: @import("../rowsource/types.zig").ColumnVector, kind: sch
     };
 }
 
+/// The same self-delimiting scalar codec for SQL-owned homogeneous tuples.
+/// Callers bind the SQL type separately; comparison domains are never mixed.
+pub fn appendSqlScalar(a: std.mem.Allocator, out: *std.ArrayList(u8), datum: @import("../../sql/scalar.zig").Datum, nulls_first: bool) !void {
+    if (datum.array != null or datum.patterns != null) return error.InvalidRelationalIndexBound;
+    if (!datum.sql_null) if (datum.numeric) |number| {
+        var context: NumericContext = .{ .alloc = a };
+        const bytes = try @import("../../sql/numeric_key.zig").encodeAlloc(&context, number.*);
+        defer a.free(bytes);
+        try out.append(a, 0x80);
+        try out.appendSlice(a, bytes);
+        return;
+    };
+    const value: Value = if (datum.sql_null) .null else switch (datum.value) {
+        .integer => |v| .{ .integer = v },
+        .float => |v| .{ .number = v },
+        .string => |v| .{ .string = v },
+        .bool => |v| .{ .boolean = v },
+        else => return error.InvalidRelationalIndexBound,
+    };
+    const kind: schema.RelationalColumnType = switch (value) {
+        .integer => .integer,
+        .number => .number,
+        .string => .string,
+        .boolean => .boolean,
+        .null => .string,
+        else => unreachable,
+    };
+    try appendValue(a, out, 0, @import("relational_index_limits.zig").max_stored_key_bytes, .{ .ordinal = 0, .column_type = kind, .descending = false, .nulls_first = nulls_first, .fold_ascii = false }, value);
+}
+
 fn appendValue(alloc: Allocator, out: *std.ArrayList(u8), tuple_start: usize, max_bytes: usize, key: BoundKey, value: Value) !void {
     return appendValueWithContext(alloc, out, tuple_start, max_bytes, key, value, null);
 }

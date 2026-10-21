@@ -90,13 +90,23 @@ const PortableManifestMetadata = struct {
 };
 
 pub const preflight = @import("backup_preflight.zig");
+const lite_backend = @import("backend.zig");
+const embedded_catalog = @import("embedded_catalog.zig");
+
+/// The owner of a Lite catalog resolves logical tables. Shared storage never
+/// guesses a server catalog's key format or treats an unknown owner as root.
+pub const LiteInspector = *const fn (Allocator, std.Io, *lite_backend.Handle, *StoreInspection) anyerror!void;
 
 /// Always returns a versioned report for source failures. Partial counts are
 /// explicitly incomplete, and no failed scan can produce a compatible verdict.
 pub fn inspectInputJsonAlloc(allocator: Allocator, input_path: []const u8, destination_json: ?[]const u8, options: preflight.Options) ![]u8 {
+    return inspectInputJsonAllocWithLiteInspector(allocator, input_path, destination_json, options, inspectEmbeddedLite);
+}
+
+pub fn inspectInputJsonAllocWithLiteInspector(allocator: Allocator, input_path: []const u8, destination_json: ?[]const u8, options: preflight.Options, lite_inspector: LiteInspector) ![]u8 {
     var report: preflight.Report = .{ .allocator = allocator };
     defer report.deinit();
-    inspectInput(allocator, input_path, options, &report) catch |err| {
+    inspectInput(allocator, input_path, options, &report, lite_inspector) catch |err| {
         if (err == error.OutOfMemory) return err;
         report.analysis_complete = false;
         report.failure_code = switch (err) {
@@ -105,16 +115,19 @@ pub fn inspectInputJsonAlloc(allocator: Allocator, input_path: []const u8, desti
             error.SourceFileChanged => "source_changed",
             error.WriterLocked => "source_busy",
             error.BackupBaseRequired => "base_required",
+            error.UnsupportedLiteInspectionLayout, error.StandaloneLiteCatalogRequiresApi => "unsupported_lite_layout",
+            error.UnsupportedReplicationInspection => "unsupported_replication_source",
             else => "input_uninspectable",
         };
     };
     return report.jsonAlloc(destination_json);
 }
 
-fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight.Options, report: *preflight.Report) !void {
+fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight.Options, report: *preflight.Report, lite_inspector: LiteInspector) !void {
     var io_impl = std.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
+    var stores = StoreInspection.init(allocator, io, options, report);
     try options.cancellation.check();
     var source = try openInputFile(io, input_path);
     defer source.close(io);
@@ -129,13 +142,13 @@ fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight
     if (std.mem.startsWith(u8, &magic, "AFLITE")) {
         report.format = "lite";
         report.format_version = magic[6];
-        var lite = try LiteDb.open(allocator, input_path, .query_readonly);
-        defer lite.close();
+        var lite = try lite_backend.Handle.open(allocator, input_path, .{ .read_only = true });
+        defer lite.deinit();
         // The reopened path must still identify the descriptor hashed above.
         var reopened = try openInputFile(io, input_path);
         defer reopened.close(io);
         if (!backups_api.localArtifactStatsEqual(initial, try reopened.stat(io))) return error.SourceFileChanged;
-        try inspectStore(allocator, io, lite.db.core.store, options, report, null);
+        try lite_inspector(allocator, io, &lite, &stores);
     } else if (backup_codec.isAfbFormat(&magic)) {
         var framing = backup_codec.FileReader.init(io, source, initial.size);
         const header = try framing.readHeader();
@@ -154,6 +167,10 @@ fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight
             try backup_bundle.validatePreparationSizeLimit(root.value, if (native) options.max_expanded_bytes / 2 else options.max_expanded_bytes);
             if (native) {
                 report.format = "native";
+                // Extraction keeps included blobs and materialized objects.
+                // Charge both before allowing exports of any shard.
+                for (root.value.objects) |object| try stores.reserveExpansion(object.size_bytes);
+                for (root.value.blobs) |blob| if (blob.included) try stores.reserveExpansion(blob.logical_size_bytes);
                 const scratch = try temporaryPreparationPath(allocator, io, "antfly-inspect-", "");
                 defer allocator.free(scratch);
                 defer std.Io.Dir.cwd().deleteTree(io, scratch) catch {};
@@ -176,13 +193,13 @@ fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight
                     defer allocator.free(path);
                     var store = try @import("../docstore.zig").DocStore.open(allocator, path, .{ .read_only = true });
                     defer store.close();
-                    try inspectStore(allocator, io, &store, options, report, manifest.indexes_json);
+                    try stores.inspect(&store, .{ .indexes_json = manifest.indexes_json });
                 }
             }
         }
         if (!native) {
             report.format = "portable";
-            try inspectPortable(allocator, io, source, options, report, null);
+            _ = try inspectPortableCatalogs(allocator, io, source, options, report, .{});
         }
     } else return error.InvalidMagic;
     if (!backups_api.localArtifactStatsEqual(initial, try source.stat(io))) return error.SourceFileChanged;
@@ -213,30 +230,96 @@ fn preflightFileDigest(io: std.Io, source: std.Io.File, size: u64, options: pref
     return std.fmt.bytesToHex(digest, .lower);
 }
 
-fn inspectStore(allocator: Allocator, io: std.Io, store: *@import("../docstore.zig").DocStore, options: preflight.Options, report: *preflight.Report, catalog: ?[]const u8) !void {
-    const scratch = try temporaryPortablePath(allocator, io);
-    defer allocator.free(scratch);
-    defer std.Io.Dir.cwd().deleteFile(io, scratch) catch {};
-    var file = try fs_paths.createFilePortable(io, scratch, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
-    defer file.close(io);
-    var buffer: [64 * 1024]u8 = undefined;
-    var writer = file.writer(io, &buffer);
-    var limited = LimitedWriter.init(&writer.interface, options.max_expanded_bytes / 2);
-    portable_backup.exportPortableToWriterWithOptions(allocator, store, &limited.interface, .{ .cancellation = options.cancellation }) catch |err| {
-        if (limited.exceeded) return error.BackupExpansionLimitExceeded;
-        return err;
+/// One budget for the entire source, including every table/shard. Each store
+/// gets its own selector/model scope so names cannot leak between tables.
+pub const InspectionCatalogs = struct {
+    indexes_json: []const u8 = "",
+    replication_sources_json: []const u8 = "",
+};
+
+pub const StoreInspection = struct {
+    allocator: Allocator,
+    io: std.Io,
+    options: preflight.Options,
+    report: *preflight.Report,
+    remaining_expanded_bytes: u64,
+    remaining_logical_bytes: u64,
+
+    pub fn init(allocator: Allocator, io: std.Io, options: preflight.Options, report: *preflight.Report) StoreInspection {
+        return .{ .allocator = allocator, .io = io, .options = options, .report = report, .remaining_expanded_bytes = options.max_expanded_bytes, .remaining_logical_bytes = options.max_expanded_bytes };
+    }
+
+    pub fn reserveExpansion(self: *StoreInspection, bytes: u64) !void {
+        if (bytes > self.remaining_expanded_bytes) return error.BackupExpansionLimitExceeded;
+        self.remaining_expanded_bytes -= bytes;
+    }
+
+    pub fn inspectNamespace(self: *StoreInspection, backend: *lite_backend.Handle, namespace: []const u8, catalogs: InspectionCatalogs) !void {
+        var store = try @import("../docstore.zig").DocStore.openRuntime(self.allocator, try backend.runtimeStoreForNamespace(namespace));
+        defer store.close();
+        try self.inspect(&store, catalogs);
+    }
+
+    pub fn inspect(self: *StoreInspection, store: *@import("../docstore.zig").DocStore, catalogs: InspectionCatalogs) !void {
+        try self.options.cancellation.check();
+        const scratch = try temporaryPortablePath(self.allocator, self.io);
+        defer self.allocator.free(scratch);
+        defer std.Io.Dir.cwd().deleteFile(self.io, scratch) catch {};
+        var file = try fs_paths.createFilePortable(self.io, scratch, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
+        defer file.close(self.io);
+        var buffer: [64 * 1024]u8 = undefined;
+        var writer = file.writer(self.io, &buffer);
+        var limited = LimitedWriter.init(&writer.interface, self.remaining_expanded_bytes / 2);
+        portable_backup.exportPortableToWriterWithOptions(self.allocator, store, &limited.interface, .{ .cancellation = self.options.cancellation }) catch |err| {
+            if (limited.exceeded) return error.BackupExpansionLimitExceeded;
+            return err;
+        };
+        try writer.end();
+        const size = (try file.stat(self.io)).size;
+        try self.reserveExpansion(size * 2);
+        var normalized = self.options;
+        normalized.max_input_bytes = size;
+        normalized.max_expanded_bytes = self.remaining_logical_bytes;
+        const inspected = try inspectPortableCatalogs(self.allocator, self.io, file, normalized, self.report, catalogs);
+        self.remaining_logical_bytes -= inspected.logical_bytes;
+    }
+};
+
+pub fn inspectEmbeddedLite(allocator: Allocator, io: std.Io, backend: *lite_backend.Handle, stores: *StoreInspection) !void {
+    _ = io;
+    try backend.requireEmbeddedCatalogOwnership();
+    var root = try @import("../docstore.zig").DocStore.openRuntime(allocator, backend.native_runtime_store.?);
+    defer root.close();
+    var read = try root.beginReadTxn();
+    defer read.abort();
+    const raw = read.get(embedded_catalog.key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
     };
-    try writer.end();
-    var normalized = options;
-    normalized.max_input_bytes = options.max_expanded_bytes / 2;
-    try inspectPortable(allocator, io, file, normalized, report, catalog);
+    // Parse the directory before exporting anything. It is small, bounded
+    // executable metadata, not a request to open every index or provider.
+    var catalog: ?std.json.Parsed(embedded_catalog.Catalog) = null;
+    defer if (catalog) |*value| value.deinit();
+    if (raw) |bytes| {
+        if (bytes.len > stores.options.max_metadata_bytes) return error.PreflightLimitExceeded;
+        catalog = try std.json.parseFromSlice(embedded_catalog.Catalog, allocator, bytes, .{});
+        if (catalog.?.value.tables.len >= stores.options.max_definitions) return error.PreflightLimitExceeded;
+        try embedded_catalog.validate(catalog.?.value);
+    }
+    try stores.inspect(&root, .{});
+    if (catalog) |value| for (value.value.tables) |table| {
+        const namespace = try embedded_catalog.namespaceAlloc(allocator, table.id);
+        defer allocator.free(namespace);
+        try stores.inspectNamespace(backend, namespace, .{});
+    };
 }
 
-fn inspectPortable(allocator: Allocator, io: std.Io, file: std.Io.File, options: preflight.Options, report: *preflight.Report, catalog: ?[]const u8) !void {
+fn inspectPortableCatalogs(allocator: Allocator, io: std.Io, file: std.Io.File, options: preflight.Options, report: *preflight.Report, catalogs: InspectionCatalogs) !portable_backup.FileInspection {
     var inspector: preflight.Inspector = .{ .allocator = allocator, .report = report, .options = options };
     defer inspector.deinit();
-    if (catalog) |json| try inspector.indexCatalogJson(json);
-    _ = try portable_backup.inspectPortableFileBlocks(allocator, io, file, .{ .metadata_first = true, .max_input_bytes = options.max_input_bytes, .max_logical_bytes = options.max_expanded_bytes, .max_metadata_bytes = options.max_metadata_bytes, .max_document_bytes = options.max_document_bytes, .cancellation = options.cancellation }, &inspector, preflight.Inspector.visit);
+    if (catalogs.indexes_json.len != 0) try inspector.indexCatalogJson(catalogs.indexes_json);
+    if (catalogs.replication_sources_json.len != 0) try inspector.replicationSourcesJson(catalogs.replication_sources_json);
+    return portable_backup.inspectPortableFileBlocks(allocator, io, file, .{ .metadata_first = true, .max_input_bytes = options.max_input_bytes, .max_logical_bytes = options.max_expanded_bytes, .max_metadata_bytes = options.max_metadata_bytes, .max_document_bytes = options.max_document_bytes, .cancellation = options.cancellation }, &inspector, preflight.Inspector.visit);
 }
 
 pub fn defaultBackupIdAlloc(allocator: Allocator, path: []const u8) ![]u8 {
@@ -649,6 +732,113 @@ fn freeKeyValueEntries(allocator: Allocator, entries: []backup_codec.KeyValueEnt
     allocator.free(entries);
 }
 
+// Adoption must publish the embedded definitions before reconciliation opens
+// the table. Defaults here would replace its schema and drop its producers.
+pub fn embeddedTableDefinition(
+    alloc: std.mem.Allocator,
+    store: *@import("../backend_erased.zig").Store,
+) !tables_api.CreateTableRequest {
+    var txn = try store.beginRead();
+    defer txn.abort();
+    const embedded_tables = txn.get(embedded_catalog.key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (embedded_tables) |raw| {
+        var catalog = try std.json.parseFromSlice(embedded_catalog.Catalog, alloc, raw, .{ .ignore_unknown_fields = true });
+        defer catalog.deinit();
+        if (catalog.value.tables.len != 0) {
+            std.log.err("embedded Lite adoption supports only the default root table; transfer additional embedded tables through a supported explicit restore", .{});
+            return error.UnsupportedEmbeddedLiteTables;
+        }
+    }
+    const raw_resolvers = txn.get("\x00\x00__metadata__:resolvers") catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (raw_resolvers) |raw| {
+        const resolver_catalog = @import("../db/catalog/resolver_catalog.zig");
+        const resolvers = try resolver_catalog.deserializeCatalog(alloc, raw);
+        defer {
+            for (resolvers) |*resolver| resolver.deinit(alloc);
+            alloc.free(resolvers);
+        }
+        if (resolvers.len != 0) {
+            std.log.err("embedded Lite adoption cannot translate resolver catalogs; prepare a supported public catalog before transfer", .{});
+            return error.UnsupportedEmbeddedLiteResolvers;
+        }
+    }
+    var definition: tables_api.CreateTableRequest = .{};
+    errdefer definition.deinit(alloc);
+    const schema = txn.get("\x00\x00__metadata__:schema_json") catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    const runtime_schema = @import("../schema.zig");
+    const encoded = txn.get(runtime_schema.schema_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    // A missing public contract is not an absent schema. Native setSchema()
+    // deliberately stores only the lowered runtime representation; there is no
+    // lossless inverse for its validation and indexing semantics. Refuse the
+    // transfer while the embedded owner can still publish an explicit contract.
+    if (encoded != null and schema == null) {
+        std.log.err("embedded Lite adoption cannot transfer a binary-only schema; publish the intended public schema with setSchemaJson (or lite schema set) at a newer version before serving the file", .{});
+        return error.UnsupportedEmbeddedLiteSchema;
+    }
+    if (schema) |value| {
+        const bytes = encoded orelse return error.InvalidEmbeddedLiteSchema;
+        const stored = try runtime_schema.deserializeSchema(alloc, bytes);
+        defer runtime_schema.freeSchema(alloc, stored);
+        var public = try tables_api.parseValidatedTableSchema(alloc, value);
+        defer public.deinit(alloc);
+        const derived = try tables_api.deriveRuntimeTableSchema(alloc, public);
+        defer runtime_schema.freeSchema(alloc, derived);
+        if (!try runtime_schema.schemasEqualForPublicBinding(alloc, stored, derived)) return error.InvalidEmbeddedLiteSchema;
+        definition.schema_json = try alloc.dupe(u8, value);
+    }
+    const indexes = txn.get("\x00\x00__metadata__:indexes") catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    const enrichments = txn.get("\x00\x00__metadata__:enrichments") catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (indexes != null or enrichments != null) {
+        const stored = try tableIndexesJsonFromPortableMetadata(alloc, indexes, enrichments);
+        defer alloc.free(stored);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
+        defer parsed.deinit();
+        const arena = parsed.arena.allocator();
+        var it = parsed.value.object.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+            const value = entry.value_ptr.*;
+            if (value != .object) return error.InvalidEmbeddedLiteIndex;
+            const kind = value.object.get("kind") orelse return error.InvalidEmbeddedLiteIndex;
+            // Native vector/graph configs need an explicit public catalog
+            // translation. Fail closed until that translation is qualified;
+            // never reinterpret a native index as the default full-text kind.
+            if (kind != .string or !std.mem.eql(u8, kind.string, "full_text")) {
+                std.log.err("embedded Lite adoption cannot translate index {s}; serve a supported full-text fixture or prepare an explicitly supported public catalog before transfer", .{entry.key_ptr.*});
+                return error.UnsupportedEmbeddedLiteIndex;
+            }
+            const raw = value.object.get("config_json") orelse return error.InvalidEmbeddedLiteIndex;
+            if (raw != .string) return error.InvalidEmbeddedLiteIndex;
+            var config = try std.json.parseFromSliceLeaky(std.json.Value, arena, raw.string, .{});
+            if (config != .object) return error.InvalidEmbeddedLiteIndex;
+            try config.object.put(arena, "type", .{ .string = "full_text" });
+            if (value.object.get("coverage_generation")) |generation|
+                try config.object.put(arena, "_index_incarnation", generation);
+            entry.value_ptr.* = config;
+        }
+        definition.indexes_json = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    }
+    return definition;
+}
+
 pub fn tableIndexesJsonFromPortableMetadata(
     allocator: Allocator,
     raw_indexes_json: ?[]const u8,
@@ -694,6 +884,28 @@ pub fn tableIndexesJsonFromPortableMetadata(
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, enrichments_json, .{});
         defer parsed.deinit();
         if (parsed.value != .array) return error.InvalidBackupRequest;
+        // Persisted enrichment catalogs use internal selector names and JSON
+        // strings for nested policy. Table catalogs consume the public shape.
+        // Preserve public-shaped inputs too; reject ambiguous mixed records.
+        const arena = parsed.arena.allocator();
+        for (parsed.value.array.items) |*item| {
+            if (item.* != .object) return error.InvalidBackupRequest;
+            inline for (.{ .{ "source_field", "field" }, .{ "source_template", "template" } }) |names| {
+                if (item.object.fetchOrderedRemove(names[0])) |entry| {
+                    if (item.object.contains(names[1])) return error.InvalidBackupRequest;
+                    try item.object.put(arena, names[1], entry.value);
+                }
+            }
+            inline for (.{ .{ "neighbor_context_json", "neighbor_context" }, .{ "execution_json", "execution" } }) |names| {
+                if (item.object.fetchOrderedRemove(names[0])) |entry| {
+                    if (entry.value != .string or item.object.contains(names[1])) return error.InvalidBackupRequest;
+                    if (entry.value.string.len > 0) {
+                        const nested = try std.json.parseFromSlice(std.json.Value, arena, entry.value.string, .{});
+                        try item.object.put(arena, names[1], nested.value);
+                    }
+                }
+            }
+        }
         try appendJsonObjectField(allocator, &out, &first, "enrichments", parsed.value);
     }
 
@@ -1281,6 +1493,9 @@ test "lite restore staging preserves portable afb schema index and enrichment me
     const enrichments = parsed_indexes.value.object.get("enrichments") orelse return error.TestExpectedEqual;
     try std.testing.expect(enrichments == .array);
     try std.testing.expectEqual(@as(usize, 1), enrichments.array.items.len);
+    const chunk = enrichments.array.items[0].object;
+    try std.testing.expectEqualStrings("body", chunk.get("field").?.string);
+    try std.testing.expect(chunk.get("source_field") == null);
 }
 
 test "lite restore staging preflights afb before publishing staged files" {
@@ -2266,56 +2481,72 @@ test "backup preflight Lite and portable inspect all records without changing so
     }
 }
 
-test "backup preflight Lite and portable preserve resolver and model media dependencies" {
+test "backup preflight Lite enumerates named embedded tables with isolated selectors and one expansion budget" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
-    const lite_path = try std.fs.path.join(a, &.{ root, "dependencies.aflite" });
-    defer a.free(lite_path);
-    const portable_path = try std.fs.path.join(a, &.{ root, "dependencies.afb2" });
-    defer a.free(portable_path);
-    const policy =
-        \\{"decider":{"provider":"antfly","model":"fixture","api_key":"private-key"},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Are these the same entity?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9}}
-    ;
-    const resolvers = @import("../db/catalog/resolver_catalog.zig");
-    const cfg: resolvers.ResolverConfig = .{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{_entity.text}}", .scorer_json = "{\"comparisons\":[]}", .adjudicate_json = policy };
-    try cfg.validate();
-    const resolver_json = try resolvers.serializeCatalog(a, &.{cfg});
-    defer a.free(resolver_json);
-    const producers = @import("../db/catalog/enrichment_catalog.zig");
-    const enrichment_json = try producers.serializeCatalog(a, &.{.{ .name = "chunks", .kind = .chunk, .source_field = "body", .chunker_json = "{\"provider\":\"antfly\",\"embedding\":{\"model\":\"media-model\",\"dimensions\":3}}" }});
-    defer a.free(enrichment_json);
+    const path = try std.fs.path.join(a, &.{ root, "multi.aflite" });
+    defer a.free(path);
     {
-        var lite = try LiteDb.createWithOptions(a, lite_path, true, .{ .fsync = false });
-        defer lite.close();
-        try lite.db.core.store.put("\x00\x00__metadata__:resolvers", resolver_json);
-        try lite.db.core.store.put("\x00\x00__metadata__:enrichments", enrichment_json);
-        const key = try internal_keys.documentKeyAlloc(a, "clip");
+        var backend = try lite_backend.Handle.openOrCreate(a, path, .{ .no_sync = true });
+        defer backend.deinit();
+        var write = try backend.native_runtime_store.?.beginWrite();
+        errdefer write.abort();
+        try write.put(embedded_catalog.key, "{\"next_id\":3,\"tables\":[{\"name\":\"later\",\"id\":2}]}");
+        const key = try internal_keys.documentKeyAlloc(a, "root-row");
         defer a.free(key);
-        try lite.db.core.store.put(key, "{\"body\":{\"type\":\"source\",\"uri\":\"s3://bucket/clip.mp4\",\"mime_type\":\"video/mp4\",\"version\":\"immutable-v1\",\"version_kind\":\"s3_version_id\",\"length\":419430400}}");
-        var file = try tmp.dir.createFile(io, "dependencies.afb2", .{});
-        defer file.close(io);
-        var buffer: [4096]u8 = undefined;
-        var writer = file.writer(io, &buffer);
-        try portable_backup.exportPortableToWriter(a, lite.db.core.store, &writer.interface);
-        try writer.end();
+        try write.put(key, "{\"media\":\"file:///private/inert-root.pdf\"}");
+        try write.commit();
+        const namespace = try embedded_catalog.namespaceAlloc(a, 2);
+        defer a.free(namespace);
+        const table = try backend.runtimeStoreForNamespace(namespace);
+        var named = try table.beginWrite();
+        errdefer named.abort();
+        const named_key = try internal_keys.documentKeyAlloc(a, "named-row");
+        defer a.free(named_key);
+        try named.put(named_key, "{\"media\":\"file:///private/active-named.pdf\"}");
+        const enrichment_json = try @import("../db/catalog/enrichment_catalog.zig").serializeCatalog(a, &.{.{ .name = "reader", .kind = .asset, .source_field = "media", .producer_json = "{\"type\":\"reader\"}" }});
+        defer a.free(enrichment_json);
+        try named.put("\x00\x00__metadata__:enrichments", enrichment_json);
+        try named.commit();
     }
-    for ([_][]const u8{ lite_path, portable_path }) |path| {
-        const json = try inspectInputJsonAlloc(a, path, "{\"version\":1,\"configuration_id\":\"empty-destination\"}", .{});
-        defer a.free(json);
-        try std.testing.expect(std.mem.indexOf(u8, json, "\"scan_complete\":true") != null);
-        try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"producer_model\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"model\"") != null);
-        // The connection inventory contains both the frozen model credential
-        // and the source bucket; neither raw value may escape into the report.
-        try std.testing.expect(std.mem.indexOf(u8, json, "\"field\":\"body\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, json, "\"verdict\":\"unknown\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, json, "private-key") == null);
-        try std.testing.expect(std.mem.indexOf(u8, json, "s3://bucket") == null);
-    }
+    const destination = "{\"version\":1,\"configuration_id\":\"test\",\"requirements\":[]}";
+    const json = try inspectInputJsonAlloc(a, path, destination, .{});
+    defer a.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer parsed.deinit();
+    const report = parsed.value;
+    if (!report.object.get("completeness").?.object.get("scan_complete").?.bool) std.debug.print("inspection report: {s}\n", .{json});
+    try std.testing.expect(report.object.get("completeness").?.object.get("scan_complete").?.bool);
+    try std.testing.expectEqual(@as(i64, 2), report.object.get("inventory").?.object.get("documents").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), report.object.get("inventory").?.object.get("shards").?.integer);
+    try std.testing.expectEqualStrings("blocked", report.object.get("compatibility").?.object.get("verdict").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, json, "named-row") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "root-row") == null);
+    // Compute each bounded export's size, then admit each individually while
+    // refusing their aggregate. This catches resetting the budget per table.
+    var backend = try lite_backend.Handle.open(a, path, .{ .read_only = true });
+    defer backend.deinit();
+    var report_scratch: preflight.Report = .{ .allocator = a };
+    defer report_scratch.deinit();
+    var stores = StoreInspection.init(a, io, .{}, &report_scratch);
+    var root_store = try @import("../docstore.zig").DocStore.openRuntime(a, backend.native_runtime_store.?);
+    defer root_store.close();
+    const before = stores.remaining_expanded_bytes;
+    try stores.inspect(&root_store, .{});
+    const root_size = before - stores.remaining_expanded_bytes;
+    const mid = stores.remaining_expanded_bytes;
+    try stores.inspectNamespace(&backend, "embedded/tables/2", .{});
+    const named_size = mid - stores.remaining_expanded_bytes;
+    const limited = try inspectInputJsonAlloc(a, path, destination, .{ .max_expanded_bytes = @max(root_size, named_size) });
+    defer a.free(limited);
+    try std.testing.expect(std.mem.indexOf(u8, limited, "limit_exceeded") != null);
+    const catalog_limited = try inspectInputJsonAlloc(a, path, destination, .{ .max_definitions = 1 });
+    defer a.free(catalog_limited);
+    try std.testing.expect(std.mem.indexOf(u8, catalog_limited, "limit_exceeded") != null);
 }
 
 test "backup preflight native multishard scans later shards and table producers" {
@@ -2348,13 +2579,6 @@ test "backup preflight native multishard scans later shards and table producers"
         try backups_api.populateShardArtifactIntegrity(a, io, .native, absolute, shard);
         initialized += 1;
     }
-    var replication: std.ArrayListUnmanaged(u8) = .empty;
-    defer replication.deinit(a);
-    try replication.appendSlice(a, "[{\"type\":\"postgres\",\"dsn\":\"${secret:replication.pg}\",\"postgres_table\":\"public.documents\",\"metadata\":");
-    try replication.appendNTimes(a, '[', 20000);
-    try replication.appendSlice(a, "null");
-    try replication.appendNTimes(a, ']', 20000);
-    try replication.appendSlice(a, "}]");
     const manifest: backups_api.TableBackupManifest = .{
         .format = .native,
         .backup_id = "test",
@@ -2362,7 +2586,7 @@ test "backup preflight native multishard scans later shards and table producers"
         .description = "",
         .schema_json = "{}",
         .read_schema_json = "",
-        .replication_sources_json = replication.items,
+        .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"${secret:replication.pg}\",\"postgres_table\":\"public.documents\"}]",
         .indexes_json = "{\"default\":{\"type\":\"embeddings\",\"field\":\"media\",\"dimension\":3,\"embedder\":{\"model\":\"mock\"}},\"enrichments\":[{\"name\":\"pdf\",\"kind\":\"asset\",\"field\":\"media\",\"producer\":{\"type\":\"reader\"}}]}",
         .shards = &shards,
     };
@@ -2384,7 +2608,7 @@ test "backup preflight native multishard scans later shards and table producers"
     try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("inventory").?.object.get("shards").?.integer);
     try std.testing.expect(std.mem.indexOf(u8, json, "source_local") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"model\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"connection\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"replication_source\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "replication.pg") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"document_id\":\"z\"") != null);
 }
@@ -2677,4 +2901,140 @@ test "backup preflight document limit preserves authored vector artifact validat
     defer a.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scan_complete\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"model\"") != null);
+}
+
+test "lite restore staging refuses binary-only or mismatched schemas before ownership transfer" {
+    @import("antfly_test_error_logs").expectErrorLogs(1);
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/typed-schema.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var lite = try LiteDb.create(a, path, true);
+    defer lite.close();
+    try lite.db.setSchema(.{ .version = 1, .ttl_duration_ns = 1_000_000_000 });
+    try std.testing.expectError(error.UnsupportedEmbeddedLiteSchema, embeddedTableDefinition(a, lite.backend.native_runtime_store.?));
+    try lite.backend.requireEmbeddedCatalogOwnership();
+    try std.testing.expect(!lite.backend.hasStandaloneRootAdoption());
+    try std.testing.expect(!try lite.backend.isStandaloneArtifact());
+
+    // Refusal leaves the supported repair path available to the embedded owner.
+    const public = "{\"version\":2,\"default_type\":\"doc\",\"ttl_duration\":\"1s\"}";
+    try lite.db.setSchemaJson(a, public);
+    var definition = try embeddedTableDefinition(a, lite.backend.native_runtime_store.?);
+    defer definition.deinit(a);
+    try std.testing.expectEqualStrings(public, definition.schema_json.?);
+    {
+        var write = try lite.backend.native_runtime_store.?.beginWrite();
+        errdefer write.abort();
+        try write.put("\x00\x00__metadata__:schema_json", "{\"version\":3}");
+        try write.commit();
+    }
+    try std.testing.expectError(error.InvalidEmbeddedLiteSchema, embeddedTableDefinition(a, lite.backend.native_runtime_store.?));
+    try lite.backend.requireEmbeddedCatalogOwnership();
+    try std.testing.expect(!lite.backend.hasStandaloneRootAdoption());
+}
+
+test "lite restore staging standalone adoption preserves full text incarnation and rejects unsupported catalogs" {
+    @import("antfly_test_error_logs").expectErrorLogs(5);
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/catalog-contract.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var lite = try LiteDb.create(a, path, true);
+    defer lite.close();
+    try lite.db.setSchemaJson(a, tables_api.default_schema_json);
+    const full_text = "{\"body\":{\"kind\":\"full_text\",\"config_json\":\"{\\\"field\\\":\\\"body\\\"}\",\"coverage_generation\":42}}";
+    {
+        var txn = try lite.backend.native_runtime_store.?.beginWrite();
+        errdefer txn.abort();
+        try txn.put("\x00\x00__metadata__:indexes", full_text);
+        try txn.commit();
+    }
+    {
+        var definition = try embeddedTableDefinition(a, lite.backend.native_runtime_store.?);
+        defer definition.deinit(a);
+        try std.testing.expectEqualStrings(tables_api.default_schema_json, definition.schema_json.?);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, definition.indexes_json.?, .{});
+        defer parsed.deinit();
+        const index = parsed.value.object.get("body").?.object;
+        try std.testing.expectEqualStrings("full_text", index.get("type").?.string);
+        try std.testing.expectEqualStrings("body", index.get("field").?.string);
+        try std.testing.expectEqual(@as(i64, 42), index.get("_index_incarnation").?.integer);
+    }
+    for ([_][]const u8{ "dense_vector", "sparse_vector", "graph", "algebraic" }) |kind| {
+        const raw = try std.fmt.allocPrint(a, "{{\"other\":{{\"kind\":\"{s}\",\"config_json\":\"{{}}\"}}}}", .{kind});
+        defer a.free(raw);
+        {
+            var txn = try lite.backend.native_runtime_store.?.beginWrite();
+            errdefer txn.abort();
+            try txn.put("\x00\x00__metadata__:indexes", raw);
+            try txn.commit();
+        }
+        try std.testing.expectError(error.UnsupportedEmbeddedLiteIndex, embeddedTableDefinition(a, lite.backend.native_runtime_store.?));
+        try lite.backend.requireEmbeddedCatalogOwnership();
+        try std.testing.expect(!lite.backend.hasStandaloneRootAdoption());
+    }
+    {
+        var txn = try lite.backend.native_runtime_store.?.beginWrite();
+        errdefer txn.abort();
+        try txn.put("\x00\x00__metadata__:indexes", full_text);
+        try txn.put("\x00antfly/embedded/tables/v1", "{\"next_id\":3,\"tables\":[{\"name\":\"other\",\"id\":2}]}");
+        try txn.commit();
+    }
+    try std.testing.expectError(error.UnsupportedEmbeddedLiteTables, embeddedTableDefinition(a, lite.backend.native_runtime_store.?));
+    try lite.backend.requireEmbeddedCatalogOwnership();
+}
+
+test "backup preflight Lite and portable preserve resolver and model media dependencies" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const lite_path = try std.fs.path.join(a, &.{ root, "dependencies.aflite" });
+    defer a.free(lite_path);
+    const portable_path = try std.fs.path.join(a, &.{ root, "dependencies.afb2" });
+    defer a.free(portable_path);
+    const policy =
+        \\{"decider":{"provider":"antfly","model":"fixture","api_key":"private-key"},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Are these the same entity?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9}}
+    ;
+    const resolvers = @import("../db/catalog/resolver_catalog.zig");
+    const cfg: resolvers.ResolverConfig = .{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{_entity.text}}", .scorer_json = "{\"comparisons\":[]}", .adjudicate_json = policy };
+    try cfg.validate();
+    const resolver_json = try resolvers.serializeCatalog(a, &.{cfg});
+    defer a.free(resolver_json);
+    const producers = @import("../db/catalog/enrichment_catalog.zig");
+    const enrichment_json = try producers.serializeCatalog(a, &.{.{ .name = "chunks", .kind = .chunk, .source_field = "body", .chunker_json = "{\"provider\":\"antfly\",\"embedding\":{\"model\":\"media-model\",\"dimensions\":3}}" }});
+    defer a.free(enrichment_json);
+    {
+        var lite = try LiteDb.createWithOptions(a, lite_path, true, .{ .fsync = false });
+        defer lite.close();
+        try lite.db.core.store.put("\x00\x00__metadata__:resolvers", resolver_json);
+        try lite.db.core.store.put("\x00\x00__metadata__:enrichments", enrichment_json);
+        const key = try internal_keys.documentKeyAlloc(a, "clip");
+        defer a.free(key);
+        try lite.db.core.store.put(key, "{\"body\":{\"type\":\"source\",\"uri\":\"s3://bucket/clip.mp4\",\"mime_type\":\"video/mp4\",\"version\":\"immutable-v1\",\"version_kind\":\"s3_version_id\",\"length\":419430400}}");
+        var file = try tmp.dir.createFile(io, "dependencies.afb2", .{});
+        defer file.close(io);
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        try portable_backup.exportPortableToWriter(a, lite.db.core.store, &writer.interface);
+        try writer.end();
+    }
+    for ([_][]const u8{ lite_path, portable_path }) |path| {
+        const json = try inspectInputJsonAlloc(a, path, "{\"version\":1,\"configuration_id\":\"empty-destination\"}", .{});
+        defer a.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"scan_complete\":true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"producer_model\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"model\"") != null);
+        // The connection inventory contains both the frozen model credential
+        // and the source bucket; neither raw value may escape into the report.
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"field\":\"body\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"verdict\":\"unknown\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "private-key") == null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "s3://bucket") == null);
+    }
 }

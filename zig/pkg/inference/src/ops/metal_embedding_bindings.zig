@@ -142,9 +142,19 @@ pub const CompactGeometry = struct {
 
 /// Model-owned vision arena. Encoded consumers share a serial device queue;
 /// no host upload writes these ranges while either frame is live.
+/// Immutable coefficients are shared by every admitted arena capacity.
+pub const VisionCoefficients = struct {
+    owner: tape.Plan = .{ .host_bytes = @sizeOf(VisionCoefficients), .metadata_bytes = @sizeOf(VisionCoefficients) },
+    views: [96]?ops.CT = @splat(null),
+};
+
 pub const VisionWorkspace = struct {
     owner: tape.Plan = .{ .host_bytes = @sizeOf(VisionWorkspace), .metadata_bytes = @sizeOf(VisionWorkspace) },
     spec: ops.EmbeddingVisionSpec,
+    capacity_rows: usize,
+    arena_bytes: usize,
+    /// Maximum tile for the currently packed layout, not the initial geometry.
+    tile_capacity: usize,
     stamp: u64,
     tile: usize,
     views: [107]?ops.CT = @splat(null),

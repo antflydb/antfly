@@ -679,6 +679,31 @@ unsafe extern "C" {
         request_json: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
+    pub fn antfly_db_propose_curation_json(
+        db: *mut antfly_db,
+        entity_table: antfly_slice,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_db_list_curation_proposals_json(
+        db: *mut antfly_db,
+        entity_table: antfly_slice,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_db_get_curation_proposal_json(
+        db: *mut antfly_db,
+        entity_table: antfly_slice,
+        proposal_id: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_db_decide_curation_proposal_json(
+        db: *mut antfly_db,
+        entity_table: antfly_slice,
+        proposal_id: antfly_slice,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
     pub fn antfly_db_curate_entity_json(
         db: *mut antfly_db,
         entity_table: antfly_slice,

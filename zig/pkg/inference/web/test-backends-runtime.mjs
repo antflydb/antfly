@@ -208,12 +208,14 @@ test('EmbeddingGemma2 full geometry: native identity, cosine prototypes and mult
   const runtime = await session();
   try {
     const files = await embeddingFixture(directory);
-    const tokenizer = files.get('tokenizer.json');
-    const missingVideo = JSON.parse(await tokenizer.text());
-    missingVideo.added_tokens = missingVideo.added_tokens.filter(token => token.id !== 258884);
-    files.set('tokenizer.json', json(missingVideo));
-    await assert.rejects(runtime.load(files, 'bf16'), /InvalidEmbeddingGemma2Tokenizer/);
-    files.set('tokenizer.json', tokenizer);
+    // The real checkpoint contract requires the video marker even for text
+    // decisions. Reject incomplete sidecars before admitting any weights.
+    const incomplete = new Map(files);
+    const tokenizer = JSON.parse(await files.get('tokenizer.json').text());
+    tokenizer.added_tokens = tokenizer.added_tokens.filter(token => token.id !== 258884);
+    incomplete.set('tokenizer.json', json(tokenizer));
+    await assert.rejects(runtime.load(incomplete, 'bf16'), /InvalidEmbeddingGemma2Tokenizer/);
+    assert.equal(runtime.handle, 0);
     await runtime.load(files, 'bf16');
     const question = { name: 'tool', type: 'choice', choices: [{ value: 'search' }, { value: 'fetch' }], instructions: 'question', embedding_options: { min_margin: 0.1 } };
     const input = { model: 'local', input: 'state', questions: [question] };

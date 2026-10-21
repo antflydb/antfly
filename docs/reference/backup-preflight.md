@@ -1,23 +1,28 @@
-# Read-only backup preflight
+# Offline backup inspection
 
-`antfly restore --preflight --input snapshot.afb2` emits one JSON report without
-creating a table, connecting to a server, fetching media, executing remote
-helpers, or running producers. Input detection uses bytes, so the filename suffix is not
+`antfly backup inspect --input snapshot.afb2` emits one JSON report without
+creating a table, connecting to a server, fetching media, rendering helpers, or
+running producers. Input detection uses bytes, so the filename suffix is not
 significant. Supported sources are closed/stable Lite databases, full portable
 AFB1/AFB2 archives, and supported full native AFB2 table archives, including
 multiple shards. Deltas require a base and are not admitted by this interface.
 
 ```sh
-antfly restore --preflight --input snapshot.aflite \
+antfly backup inspect --input snapshot.aflite \
   --destination-capabilities destination.json \
   --max-input-bytes 68719476736 \
   --max-expanded-bytes 137438953472
 ```
 
-Preflight options cannot be combined with restore target, connection, location,
+Inspection options cannot be combined with restore target, connection, location,
 wait, URL, mode, backup ID, or idempotency options. Successful execution means a
 report was emitted; callers must read its completeness and compatibility fields.
 An incomplete, blocked, or unknown report is not admission to restore.
+
+This is source inspection, rather than a dry run of a restore request. It does
+not initialize a server client or read server credentials. Restore target,
+connection and catalog-scope flags are not accepted. The draft
+`restore --preflight` spelling has been replaced by `backup inspect`.
 
 ## Report version 1
 
@@ -69,7 +74,22 @@ normalization without depending on the process call-stack depth.
 The inspector uses the restore format readers and schema decoders. It validates
 all portable records, primes metadata before visiting rows, and decodes
 relational rows with their historical schema. Lite uses the existing read-only
-snapshot/export path. Native archives are authenticated into private scratch;
+snapshot/export path and enumerates the embedded table directory or the
+standalone metadata owner's authoritative tables and ranges. Standalone index
+and replication definitions are inspected alongside each table's physical
+catalog and records, including definitions not yet reconciled into that table.
+Selectors and model names are scoped to one table; the expansion budget covers
+the entire file, rather than restarting for each namespace. Catalog discovery
+is bounded by the definition and metadata-byte limits.
+
+Unknown ownership profiles, unsupported mixed-engine/migrating layouts,
+missing standalone catalogs, and private FK publication owners cannot produce
+a complete compatible report. They return an incomplete report; unsupported
+Lite layouts use `unsupported_lite_layout`. An embedded-only library reader
+also returns this code for a standalone-owned file, whose catalog requires the
+server inspector.
+
+Native archives are authenticated into private scratch;
 every shard is opened read-only and exported through the same bounded portable
 visitor. No target table or enrichment runtime is started. Scratch uses
 `TMPDIR`, then `TEMP`, then `/tmp`, and is removed on normal completion/error.
@@ -124,7 +144,11 @@ Simple field paths, simple substitutions and static `media`, `remoteMedia`,
 `remoteText` and `remotePDF` URL arguments are analyzed without fetching resources.
 The inspector uses the runtime's Handlebars parser and path lookup, and combines
 supported literal/substitution output before scanning media directives, using
-the same whitespace-control functions as execution. The pure `media` formatter
+the same whitespace-control functions as execution. Numeric substitutions
+preserve the runtime's exact JSON number tokens.
+Document-dependent URL components stay unknown during definition inspection;
+concrete documents supply their values, while independent static fetches are
+still inventoried. The pure `media` formatter
 is shared with runtime; remote helpers are never called. Remote helpers use
 `credentials="name"` (or a supported field reference); quoting and argument order
 follow the runtime parser.
@@ -185,11 +209,19 @@ the source connection/credential reference or object-storage scheme/bucket.
 Retrieval requirements separately bind archive/page semantics. Neither the CLI
 nor the library performs arbitrary-URL requests.
 
-PostgreSQL replication sources require connection evidence bound to the complete
-source configuration, including its DSN, source table, publication and slot.
-DSNs remain opaque, including libpq keyword strings and secret references;
-preflight neither resolves credentials nor probes PostgreSQL. The trusted
-caller must attest durable access and the privileges required for replication.
+PostgreSQL replication definitions produce `replication_source` requirements.
+Each digest binds the declarative source, including its DSN or secret/environment
+reference, source table, slot, publication, routes and transforms. Runtime status
+and action hints are excluded. The inspector does not resolve credentials or
+open a database connection, and literal transform values are not media sources.
+Unknown providers or malformed contracts produce incomplete reports.
+
+A replication capability requires both `supported: true` and
+`future_ingestion: true`. The caller must verify destination-managed credentials,
+source-table access, and the slot/publication and logical replication behavior
+needed for future ingestion. Empty capability files and generic connection
+evidence cannot satisfy a replication requirement. DSNs and credentials are
+hashed into the identity and are never emitted in the report.
 
 Embedding requirements bind the canonical complete source definition, including
 model configuration, input/preprocessing/template, dimensions and vector-space
