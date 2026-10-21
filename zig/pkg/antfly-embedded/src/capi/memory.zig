@@ -151,6 +151,12 @@ test "capi native memory resource reader follows a resumed storage generation" {
     // same cached runtime without forcing a generation replacement.
     guard.suspendQuery();
     {
+        // Exclude this process's maintenance publications while the fixture
+        // acts as an independent writer. They take the same gate before the
+        // kernel lease, so contention cannot make this handoff timing-dependent.
+        const gate = guard.connection.?.gate;
+        gate.mutex.lockUncancelable(h.handleLockIo());
+        defer gate.mutex.unlock(h.handleLockIo());
         var lease = try @import("../storage/lite/native.zig").lockWriterPathWithIo(a, h.handleLockIo(), path);
         defer lease.close();
         const writer = try api.openLiteHandleAllocWithSharedInference(a, path, .{ .no_sync = true, .profile = .hosted, .externally_locked = true }, false, h.handleLockIo(), null, null);
