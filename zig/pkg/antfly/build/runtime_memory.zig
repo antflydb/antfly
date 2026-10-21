@@ -175,7 +175,7 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         // ARM64 Linux ReleaseFast CLI peaked at 3.52 GB during the logical
         // query API qualification; 4 GiB retains headroom above that peak.
         // macOS CLI exceeded the newer 3 GiB claim too; provision 4 GiB
-        // pending a fresh cold-build trace. Keep the Linux claim unchanged.
+        // pending a fresh cold-build trace.
         .cli => 4 * 1024 * 1024 * 1024,
     };
 }
