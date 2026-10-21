@@ -145722,3 +145722,64 @@ test "db prepared transaction effects required resolver review retains accepted 
         }
     }
 }
+
+test "db prepared transaction effects required contender scans retain membership and priority winner proofs" {
+    const a = std.testing.allocator;
+    const reads = @import("prepared_read_set.zig");
+    var directory = try TestDirectory.init("observed-contender-winner");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .start_independent_maintenance = false });
+    defer db.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const edge = try internal_keys.graphEdgeArtifactKeyAlloc(scratch, "source", "g", "links", "target");
+    const payload = try enrichment_artifact_codec.encodeGraphEdgeWithTtlAlloc(scratch, null, 1, 1, 0, 0, 0, "{}");
+    const count_key = try internal_keys.graphEdgeContenderCountKeyAlloc(scratch, "source", "g");
+    const count = try graph_edge_contender.encodeVisibleCount(1, 1);
+    try db.core.store.put(count_key, &count);
+    for ([_][]const u8{ "primary", "fallback" }, [_]usize{ 10, 20 }) |state, priority| {
+        try db.core.store.put(try internal_keys.graphEdgeContenderKeyAlloc(scratch, "source", "g", edge, state), try graph_edge_contender.encodeAlloc(scratch, 1, priority, edge, state, ""));
+        try db.core.store.put(try internal_keys.graphGlobalEdgeContenderKeyAlloc(scratch, "g", 1, edge, priority, state), try graph_edge_contender.encodeAlloc(scratch, 1, priority, edge, state, payload));
+    }
+    var changes: GraphContenderChanges = .empty;
+    defer {
+        var it = changes.valueIterator();
+        while (it.next()) |items| items.deinit(scratch);
+        changes.deinit(scratch);
+    }
+    try appendGraphContenderChange(scratch, &changes, edge, "retired", 0, null);
+    var captured = reads.Owned.init(a, null);
+    defer captured.deinit();
+    {
+        var temporary = std.heap.ArenaAllocator.init(a);
+        defer temporary.deinit();
+        var result = try reconcileGraphEdgeContenders(temporary.allocator(), reads.observe(db.core.store, &captured), "source", "g", 1, 0, &changes, &.{}, &.{});
+        defer result.deinit(temporary.allocator());
+        try std.testing.expectEqual(@as(usize, 1), result.visible_count);
+        try std.testing.expectEqualStrings("primary", result.winners.map.get(edge).?.owner_state_key);
+        try captured.finish();
+    }
+    var owned = try captured.take();
+    defer owned.deinit();
+    try std.testing.expect(owned.cursors.items.len >= 2);
+    try owned.validate(db.core.store, null);
+    const earlier = try internal_keys.graphGlobalEdgeContenderKeyAlloc(scratch, "g", 1, edge, 5, "earlier");
+    try db.core.store.put(earlier, try graph_edge_contender.encodeAlloc(scratch, 1, 5, edge, "earlier", payload));
+    try std.testing.expectError(error.PreparedReadSetChanged, owned.validate(db.core.store, null));
+    {
+        var result = try reconcileGraphEdgeContenders(a, db.core.store, "source", "g", 1, 0, &changes, &.{}, &.{});
+        defer result.deinit(a);
+        try std.testing.expectEqualStrings("earlier", result.winners.map.get(edge).?.owner_state_key);
+    }
+    try db.core.store.delete(earlier);
+    try owned.validate(db.core.store, null);
+    const extra_member = try internal_keys.graphEdgeContenderKeyAlloc(scratch, "source", "g", edge, "new-member");
+    try db.core.store.put(extra_member, try graph_edge_contender.encodeAlloc(scratch, 1, 30, edge, "new-member", ""));
+    try std.testing.expectError(error.PreparedReadSetChanged, owned.validate(db.core.store, null));
+    try db.core.store.delete(extra_member);
+    try owned.validate(db.core.store, null);
+    const changed_count = try graph_edge_contender.encodeVisibleCount(1, 2);
+    try db.core.store.put(count_key, &changed_count);
+    try std.testing.expectError(error.PreparedReadSetChanged, owned.validate(db.core.store, null));
+}

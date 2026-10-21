@@ -2354,7 +2354,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             );
             try appendMixedDirectGraphContenderMutations(
                 S.ownerField(self, "alloc").*,
-                S.ownerField(self, "core").*.store,
+                observed_store,
                 S.ownerField(self, "core").*.index_manager,
                 explicit_graph_artifact_writes.items,
                 &store_writes,
@@ -2365,7 +2365,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             );
             if (effective_req.merge_artifacts.len != 0) try appendImportedGraphContenderMutations(
                 S.ownerField(self, "alloc").*,
-                S.ownerField(self, "core").*.store,
+                observed_store,
                 S.ownerField(self, "core").*.index_manager,
                 effective_req.merge_artifacts,
                 &store_writes,

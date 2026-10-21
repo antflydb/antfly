@@ -1242,3 +1242,45 @@ conflict authority, full predecision assembly/lifetime ownership and recovery
 resources/derived-log quota remain required, along with migration/peer eligibility,
 normal required PREPARE drivers and the broader scheduler/default/session scope.
 Strong defaults remain off; the full objective is incomplete.
+
+
+### Owned graph contender scan observations (2026-10-20)
+
+Imported and mixed direct contender reconciliation now use the observed read
+surface for local membership/counts, global winner scans and TTL/lifetime/
+tombstone point reads. Imported TTL-state traversal no longer escapes into an
+unobserved transaction. Raw-store callers keep ordinary behavior, and capture
+eligibility is unchanged. Index/config selection remains inside the apply fence.
+
+`ObservedReader` adds owned prefix results and borrowed streaming scans. The
+shared owned cursor retains its read until close and records logical/physical
+payload mode, first/last movement and forward upper-bound configuration as well
+as seeks/next/prev. Validation replays those settings and operations against one
+fresh immutable read. Upper bounds are applied before seek, preserving DocStore's
+avoidance of unrelated payload decoding beyond the range. Callback stop, skip,
+reverse and lower-exclusive behavior matches the current DocStore contract.
+Stopped scans observe the selected winner; newly inserted earlier contenders
+invalidate it, while later unvisited contenders do not. Failed scan allocations,
+callbacks and original controls poison the owner and prevent partial transfer.
+
+Final receipt `observed-contender-scans-v2`: 88/88 steps, 102 test executions
+(prepared55, requiredDB36, grouped7, existing graph4), no skips/failures/leaks.
+Unit coverage compares observed scans with DocStore across forward/reverse,
+empty bounds, skip, exclusive lower, physical payload and early-stop modes;
+checks owned prefix results, phantoms, unchanged outside-upper-bound values,
+all exercised allocation failures and every original NotFound/OOM/deadline
+checkpoint, plus callback failure poisoning. A DB case retires reconciliation
+scratch, validates actual sidecar/count observations, inserts an earlier global
+contender and proves both invalidation and the changed selected winner, then
+checks local membership and count changes. Four unchanged local production
+regressions cover priority fallback, TTL/reopen and restored provenance through
+`docstore-prepared-contender-scan-test`, without full provider archive gates.
+
+No ABI/wire/reader/durable-format change. This is optimistic validation under
+current apply exclusion; it is not durable read authority across global vote.
+Earlier probes, identity/route/schema and other graph/artifact/cleanup/merge
+helpers still need coverage. Full predecision assembly and lifetime ownership,
+writer-honored durable exclusion, executable recovery resources/derived-log
+quota, migration/peer eligibility, normal required PREPARE drivers and the
+broader scheduler/default/session scope remain incomplete. Strong defaults stay
+off; full qualification remains waived. The full objective remains active.

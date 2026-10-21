@@ -101,42 +101,7 @@ pub const Plan = struct {
 };
 const DocStore = @import("../docstore.zig").DocStore;
 const read_set = @import("prepared_read_set.zig");
-pub const OwnedCursor = struct {
-    allocator: A,
-    read: *DocStore.Txn,
-    cursor: DocStore.Txn.CursorAdapter,
-    captured: ?*read_set.Cursor = null,
-    pub fn seekAtOrAfter(self: *@This(), selected: []const u8) !?@import("../backend_erased.zig").Entry {
-        if (self.captured) |trace| try trace.check();
-        const entry = try self.cursor.seekAtOrAfter(selected);
-        if (self.captured) |trace| try trace.record(.seek_after, selected, entry);
-        return entry;
-    }
-    pub fn next(self: *@This()) !?@import("../backend_erased.zig").Entry {
-        if (self.captured) |trace| try trace.check();
-        const entry = try self.cursor.next();
-        if (self.captured) |trace| try trace.record(.next, "", entry);
-        return entry;
-    }
-    pub fn prev(self: *@This()) !?@import("../backend_erased.zig").Entry {
-        if (self.captured) |trace| try trace.check();
-        const entry = try self.cursor.prev();
-        if (self.captured) |trace| try trace.record(.prev, "", entry);
-        return entry;
-    }
-    pub fn seekAtOrBefore(self: *@This(), selected: []const u8) !?@import("../backend_erased.zig").Entry {
-        if (self.captured) |trace| try trace.check();
-        const entry = try self.cursor.seekAtOrBefore(selected);
-        if (self.captured) |trace| try trace.record(.seek_before, selected, entry);
-        return entry;
-    }
-    pub fn close(self: *@This()) void {
-        self.cursor.close();
-        self.read.abort();
-        self.allocator.destroy(self.read);
-        if (self.captured) |trace| trace.close();
-    }
-};
+pub const OwnedCursor = read_set.OwnedCursor;
 pub const Reader = struct {
     ptr: *anyopaque,
     get_fn: *const fn (*anyopaque, A, []const u8) anyerror![]const u8,
@@ -462,4 +427,135 @@ test "prepared transaction effects group read capture poisons partial owners and
     try std.testing.expectError(error.TransactionClosed, late.recordPoint("late", "unobserved"));
     try std.testing.expectError(error.InvalidArgument, late.take());
     try std.testing.expectError(error.InvalidArgument, late.validate(&fixture.store, null));
+}
+
+test "prepared transaction effects observed scans preserve prefix streaming direction limits and stopping witnesses" {
+    const a = std.testing.allocator;
+    const Collector = struct {
+        allocator: A,
+        keys: std.ArrayListUnmanaged([]const u8) = .empty,
+        stop: usize = std.math.maxInt(usize),
+        fn visit(ptr: ?*anyopaque, key: []const u8, _: []const u8) !DocStore.ScanAction {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            const owned = try self.allocator.dupe(u8, key);
+            errdefer self.allocator.free(owned);
+            try self.keys.append(self.allocator, owned);
+            return if (self.keys.items.len == self.stop) .stop else .@"continue";
+        }
+        fn skip(key: []const u8) bool {
+            return std.mem.eql(u8, key, "r/b");
+        }
+        fn deinit(self: *@This()) void {
+            for (self.keys.items) |key| self.allocator.free(key);
+            self.keys.deinit(self.allocator);
+        }
+    };
+    var fixture: ReadCaptureTest = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    for ([_][]const u8{ "a", "r/a", "r/b", "r/c", "z" }) |key| try fixture.store.put(key, key);
+    for ([_]DocStore.ScanOptions{ .{}, .{ .reverse = true }, .{ .lower_exclusive = true }, .{ .skip_fn = Collector.skip }, .{ .physical_payloads = true }, .{ .reverse = true, .lower_exclusive = true, .skip_fn = Collector.skip } }) |options| {
+        for ([_]bool{ false, true }) |unbounded| for ([_]usize{ 1, 99 }) |stop| {
+            var captured = read_set.Owned.init(a, null);
+            defer captured.deinit();
+            var expected: Collector = .{ .allocator = a, .stop = stop };
+            defer expected.deinit();
+            var actual: Collector = .{ .allocator = a, .stop = stop };
+            defer actual.deinit();
+            const lower = if (unbounded) "" else "r/a";
+            const upper = if (unbounded) "" else "r/c";
+            try fixture.store.scanWithContext(lower, upper, options, &expected, Collector.visit);
+            try read_set.observe(&fixture.store, &captured).scanWithContext(lower, upper, options, &actual, Collector.visit);
+            try std.testing.expectEqual(expected.keys.items.len, actual.keys.items.len);
+            for (expected.keys.items, actual.keys.items) |left, right| try std.testing.expectEqualStrings(left, right);
+            try captured.finish();
+            try captured.validate(&fixture.store, null);
+        };
+    }
+    var captured = read_set.Owned.init(a, null);
+    defer captured.deinit();
+    {
+        const rows = try read_set.observe(&fixture.store, &captured).scanPrefix(a, "r/");
+        defer DocStore.freeResults(a, rows);
+        try std.testing.expectEqual(@as(usize, 3), rows.len);
+        try std.testing.expectEqualStrings("r/b", rows[1].value);
+        try captured.finish();
+    }
+    var owned = try captured.take();
+    defer owned.deinit();
+    try owned.validate(&fixture.store, null);
+    try fixture.store.put("r/ab", "new member");
+    try std.testing.expectError(error.PreparedReadSetChanged, owned.validate(&fixture.store, null));
+    try fixture.store.delete("r/ab");
+    try owned.validate(&fixture.store, null);
+    var bounded = read_set.Owned.init(a, null);
+    defer bounded.deinit();
+    var all: Collector = .{ .allocator = a };
+    defer all.deinit();
+    try read_set.observe(&fixture.store, &bounded).scanWithContext("r/", "s", .{}, &all, Collector.visit);
+    try bounded.finish();
+    try fixture.store.put("z", "outside upper bound");
+    try bounded.validate(&fixture.store, null);
+    var stopping = read_set.Owned.init(a, null);
+    defer stopping.deinit();
+    var first: Collector = .{ .allocator = a, .stop = 1 };
+    defer first.deinit();
+    try read_set.observe(&fixture.store, &stopping).scanWithContext("r/", "s", .{}, &first, Collector.visit);
+    try stopping.finish();
+    try fixture.store.put("r/zz", "after stopping winner");
+    try stopping.validate(&fixture.store, null);
+    try fixture.store.put("r/0", "new earlier winner");
+    try std.testing.expectError(error.PreparedReadSetChanged, stopping.validate(&fixture.store, null));
+}
+
+test "prepared transaction effects observed scan owners unwind allocation callback and original control failures" {
+    const a = std.testing.allocator;
+    const admission = @import("../../common/read_admission.zig");
+    const Checks = struct {
+        calls: usize = 0,
+        stop: usize = std.math.maxInt(usize),
+        cause: anyerror = error.NotFound,
+        fn check(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == self.stop) return self.cause;
+        }
+        fn visit(_: ?*anyopaque, _: []const u8, _: []const u8) !DocStore.ScanAction {
+            return .@"continue";
+        }
+        fn reject(_: ?*anyopaque, _: []const u8, _: []const u8) !DocStore.ScanAction {
+            return error.NotFound;
+        }
+        fn run(allocator: A, store: *DocStore, checks: ?*@This()) !void {
+            var payload: admission.Payload = .{ .ptr = checks orelse undefined, .vtable = &.{ .checkpoint = check } };
+            var captured = read_set.Owned.init(allocator, if (checks != null) admission.Port.init(&payload) else null);
+            defer captured.deinit();
+            const reader = read_set.observe(store, &captured);
+            const rows = reader.scanPrefix(allocator, "r/") catch |err| return captured.failure orelse err;
+            defer DocStore.freeResults(allocator, rows);
+            reader.scanWithContext("", "", .{ .reverse = true }, null, visit) catch |err| return captured.failure orelse err;
+            captured.finish() catch |err| return captured.failure orelse err;
+            var owned = try captured.take();
+            defer owned.deinit();
+        }
+    };
+    var fixture: ReadCaptureTest = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const value: [17000]u8 = @splat('v');
+    try fixture.store.put("r/a", &value);
+    try fixture.store.put("r/b", "B");
+    try std.testing.checkAllAllocationFailures(a, Checks.run, .{ &fixture.store, @as(?*Checks, null) });
+    var baseline: Checks = .{};
+    try Checks.run(a, &fixture.store, &baseline);
+    for ([_]anyerror{ error.NotFound, error.OutOfMemory, error.DeadlineExceeded }) |cause| for (1..baseline.calls + 1) |stop| {
+        var checks: Checks = .{ .stop = stop, .cause = cause };
+        try std.testing.expectError(cause, Checks.run(a, &fixture.store, &checks));
+    };
+    var poisoned = read_set.Owned.init(a, null);
+    defer poisoned.deinit();
+    try std.testing.expectError(error.NotFound, read_set.observe(&fixture.store, &poisoned).scanWithContext("r/", "s", .{}, null, Checks.reject));
+    try std.testing.expectEqual(@as(?anyerror, error.NotFound), poisoned.failure);
+    try std.testing.expectError(error.ReadAdmissionRejected, poisoned.finish());
+    try std.testing.expectError(error.InvalidArgument, poisoned.take());
 }

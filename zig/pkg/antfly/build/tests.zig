@@ -6069,6 +6069,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("docstore-required-prepare-db-test", "Verify durable required preparation through DB intent, resolution and recovery paths")
         .dependOn(&addCuratedTestRunArtifact(b, required_prepare_db_tests, &.{ "db prepared transaction effects required", "ordered artifact inventory DB authored acceptance survives projection and reopen" }).step);
+    const prepared_contender_filters = [_][]const u8{ "db graph untimed migration", "db graph ttl projects source contenders across reopen", "db portable restore rebuilds multi-source graph contender provenance" };
+    const prepared_contender_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &prepared_contender_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("docstore-prepared-contender-scan-test", "Verify local graph winner priority, TTL and imported provenance semantics")
+        .dependOn(&addCuratedTestRunArtifact(b, prepared_contender_tests, &prepared_contender_filters).step);
     const group_read_capture_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{"grouped sources production"},

@@ -2223,7 +2223,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn appendImportedGraphContenderMutations(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             manager: *index_manager_mod.IndexManager,
             imported: []const types.BatchWrite,
             writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
@@ -2243,10 +2243,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 changes: GraphContenderChanges = .empty,
                 extra_deletes: std.ArrayListUnmanaged([]const u8) = .empty,
             };
+            const Store = @TypeOf(store);
             const Capture = struct {
                 alloc: Allocator,
                 backing_alloc: Allocator,
-                store: *docstore_mod.DocStore,
+                store: Store,
                 writes: []const docstore_mod.KVPair,
                 positions: *const StoreWritePositions,
                 groups: std.ArrayListUnmanaged(Group) = .empty,
@@ -2337,16 +2338,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const key = try internal_keys.rebindGraphEdgeTtlStateKeyGenerationAlloc(scratch, row.key, entry.config.coverage_generation);
                     const state: docstore_mod.KVPair = .{ .key = key, .value = row.value };
                     const prefix = try internal_keys.graphGlobalEdgeContenderPrefixForTtlStateAlloc(scratch, key);
-                    var txn = try store.beginReadTxn();
-                    defer txn.abort();
-                    var cursor = try txn.openCursor();
-                    defer cursor.close();
-                    var next = try cursor.seekAtOrAfter(prefix);
-                    while (next) |existing| : (next = try cursor.next()) {
-                        if (!std.mem.startsWith(u8, existing.key, prefix)) break;
-                        if (positions.contains(existing.key)) continue;
-                        try capture.contender(entry, existing.key, existing.value, state);
-                    }
+                    const Scan = struct {
+                        capture: *Capture,
+                        index: *index_manager_mod.IndexManager.GraphIndex,
+                        state: docstore_mod.KVPair,
+                        fn visit(ptr: ?*anyopaque, selected: []const u8, value: []const u8) !docstore_mod.DocStore.ScanAction {
+                            const context: *@This() = @ptrCast(@alignCast(ptr.?));
+                            if (!context.capture.positions.contains(selected)) try context.capture.contender(context.index, selected, value, context.state);
+                            return .@"continue";
+                        }
+                    };
+                    var scan: Scan = .{ .capture = &capture, .index = entry, .state = state };
+                    const upper = try internal_keys.nextPrefixAlloc(scratch, prefix);
+                    try store.scanWithContext(prefix, upper orelse "", .{}, &scan, Scan.visit);
                     for (writes.items) |pending| {
                         if (std.mem.startsWith(u8, pending.key, prefix))
                             try capture.contender(entry, pending.key, pending.value, state);
@@ -2561,7 +2565,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn appendMixedDirectGraphContenderMutations(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             index_manager: *index_manager_mod.IndexManager,
             direct_writes: []const types.BatchWrite,
             store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
@@ -10604,7 +10608,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn reconcileGlobalGraphEdgeWinner(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             index_name: []const u8,
             expected_generation: u64,
             ttl_duration_ns: u64,
@@ -10856,7 +10860,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn reconcileGraphEdgeContenders(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             doc_key: []const u8,
             index_name: []const u8,
             expected_generation: u64,
@@ -10870,7 +10874,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn reconcileGraphEdgeContendersWithLifetimePolicy(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             doc_key: []const u8,
             index_name: []const u8,
             expected_generation: u64,
@@ -10887,7 +10891,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn reconcileGraphEdgeContendersWithOverlay(
             alloc: Allocator,
-            store: *docstore_mod.DocStore,
+            store: anytype,
             doc_key: []const u8,
             index_name: []const u8,
             expected_generation: u64,

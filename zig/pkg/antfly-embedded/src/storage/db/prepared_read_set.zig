@@ -22,16 +22,142 @@ const DocStore = @import("../docstore.zig").DocStore;
 const Entry = @import("../backend_erased.zig").Entry;
 const A = std.mem.Allocator;
 
-/// A read-only point surface for preparation helpers. It returns caller-owned
+pub const OwnedCursor = struct {
+    allocator: A,
+    read: *DocStore.Txn,
+    cursor: DocStore.Txn.CursorAdapter,
+    captured: ?*Cursor = null,
+    pub fn seekAtOrAfter(self: *@This(), selected: []const u8) !?@import("../backend_erased.zig").Entry {
+        if (self.captured) |trace| try trace.check();
+        const entry = try self.cursor.seekAtOrAfter(selected);
+        if (self.captured) |trace| try trace.record(.seek_after, selected, entry);
+        return entry;
+    }
+    pub fn next(self: *@This()) !?@import("../backend_erased.zig").Entry {
+        if (self.captured) |trace| try trace.check();
+        const entry = try self.cursor.next();
+        if (self.captured) |trace| try trace.record(.next, "", entry);
+        return entry;
+    }
+    pub fn prev(self: *@This()) !?@import("../backend_erased.zig").Entry {
+        if (self.captured) |trace| try trace.check();
+        const entry = try self.cursor.prev();
+        if (self.captured) |trace| try trace.record(.prev, "", entry);
+        return entry;
+    }
+    pub fn seekAtOrBefore(self: *@This(), selected: []const u8) !?@import("../backend_erased.zig").Entry {
+        if (self.captured) |trace| try trace.check();
+        const entry = try self.cursor.seekAtOrBefore(selected);
+        if (self.captured) |trace| try trace.record(.seek_before, selected, entry);
+        return entry;
+    }
+    pub fn setUpperBound(self: *@This(), bound: ?[]const u8) !void {
+        if (self.captured) |trace| {
+            try trace.check();
+            try trace.record(.upper_bound, bound orelse "", null);
+        }
+        self.cursor.setUpperBound(bound);
+    }
+    pub fn first(self: *@This()) !?Entry {
+        if (self.captured) |trace| try trace.check();
+        const entry = try self.cursor.first();
+        if (self.captured) |trace| try trace.record(.first, "", entry);
+        return entry;
+    }
+    pub fn last(self: *@This()) !?Entry {
+        if (self.captured) |trace| try trace.check();
+        const entry = try self.cursor.last();
+        if (self.captured) |trace| try trace.record(.last, "", entry);
+        return entry;
+    }
+    pub fn close(self: *@This()) void {
+        self.cursor.close();
+        self.read.abort();
+        self.allocator.destroy(self.read);
+        if (self.captured) |trace| trace.close();
+    }
+};
+/// A read-only observed surface for preparation helpers. It returns caller-owned
 /// bytes just like the physical store; the witness owns only keys/fingerprints.
 /// It deliberately exposes no writes or unobserved transaction/cursor escape.
-pub fn observe(store: anytype, observations: ?*Owned) PointReader(@TypeOf(store)) {
+pub fn observe(store: anytype, observations: ?*Owned) ObservedReader(@TypeOf(store)) {
     return .{ .store = store, .observations = observations };
 }
-pub fn PointReader(comptime Store: type) type {
+pub fn ObservedReader(comptime Store: type) type {
     return struct {
         store: Store,
         observations: ?*Owned,
+        pub fn openCursor(self: @This(), a: A, physical_payloads: bool) !OwnedCursor {
+            if (self.observations) |captured| try captured.check();
+            const read = try a.create(DocStore.Txn);
+            errdefer a.destroy(read);
+            read.* = try self.store.beginReadTxn();
+            errdefer read.abort();
+            var cursor = if (physical_payloads) try read.openPhysicalCursorAdapter() else try read.openCursor();
+            errdefer cursor.close();
+            return .{ .allocator = a, .read = read, .cursor = cursor, .captured = if (self.observations) |captured| try captured.openCursorWithMode(physical_payloads) else null };
+        }
+        pub fn scanPrefix(self: @This(), a: A, prefix: []const u8) ![]@import("../docstore.zig").OwnedKVPair {
+            if (self.observations == null) return self.store.scanPrefix(a, prefix);
+            return self.scanPrefixInner(a, prefix) catch |err| {
+                if (self.observations.?.failure == null) self.observations.?.failure = err;
+                return err;
+            };
+        }
+        fn scanPrefixInner(self: @This(), a: A, prefix: []const u8) ![]@import("../docstore.zig").OwnedKVPair {
+            var cursor = try self.openCursor(a, false);
+            defer cursor.close();
+            var results: std.ArrayListUnmanaged(@import("../docstore.zig").OwnedKVPair) = .empty;
+            errdefer {
+                for (results.items) |row| {
+                    a.free(row.key);
+                    a.free(row.value);
+                }
+                results.deinit(a);
+            }
+            var next = try cursor.seekAtOrAfter(prefix);
+            while (next) |row| : (next = try cursor.next()) {
+                if (!std.mem.startsWith(u8, row.key, prefix)) break;
+                const captured = self.observations.?;
+                const key = try copy(a, row.key, captured.control, &captured.failure);
+                errdefer a.free(key);
+                const value = try copy(a, row.value, captured.control, &captured.failure);
+                errdefer a.free(value);
+                try results.append(a, .{ .key = @constCast(key), .value = @constCast(value) });
+            }
+            return results.toOwnedSlice(a);
+        }
+        pub fn scanWithContext(self: @This(), lower: []const u8, upper: []const u8, options: DocStore.ScanOptions, ctx: ?*anyopaque, callback: DocStore.ScanWithContextCallback) !void {
+            if (self.observations == null) return self.store.scanWithContext(lower, upper, options, ctx, callback);
+            self.scanInner(lower, upper, options, ctx, callback) catch |err| {
+                if (self.observations.?.failure == null) self.observations.?.failure = err;
+                return err;
+            };
+        }
+        fn scanInner(self: @This(), lower: []const u8, upper: []const u8, options: DocStore.ScanOptions, ctx: ?*anyopaque, callback: DocStore.ScanWithContextCallback) !void {
+            var cursor = try self.openCursor(self.observations.?.allocator, options.physical_payloads);
+            defer cursor.close();
+            if (!options.reverse) {
+                try cursor.setUpperBound(if (upper.len != 0) upper else null);
+                var next = if (lower.len == 0) try cursor.first() else try cursor.seekAtOrAfter(lower);
+                while (next) |row| : (next = try cursor.next()) {
+                    if (upper.len != 0 and std.mem.order(u8, row.key, upper) != .lt) break;
+                    if (options.lower_exclusive and lower.len != 0 and std.mem.eql(u8, row.key, lower)) continue;
+                    if (options.skip_fn) |skip| if (skip(row.key)) continue;
+                    if (try callback(ctx, row.key, row.value) == .stop) break;
+                }
+            } else {
+                // Match DocStore's reverse scan contract: upper is exclusive;
+                // lower_exclusive only applies to forward scans.
+                var next = if (upper.len == 0) try cursor.last() else try cursor.seekAtOrBefore(upper);
+                while (next) |row| : (next = try cursor.prev()) {
+                    if (upper.len != 0 and std.mem.order(u8, row.key, upper) != .lt) continue;
+                    if (lower.len != 0 and std.mem.order(u8, row.key, lower) == .lt) break;
+                    if (options.skip_fn) |skip| if (skip(row.key)) continue;
+                    if (try callback(ctx, row.key, row.value) == .stop) break;
+                }
+            }
+        }
         pub fn get(self: @This(), a: A, key: []const u8) ![]const u8 {
             if (self.observations) |captured| try captured.check();
             const value = self.store.get(a, key) catch |err| {
@@ -93,7 +219,7 @@ const Row = struct {
         return .{ .key = try Fingerprint.of(entry.key, control, failure), .value = try Fingerprint.of(entry.value, control, failure) };
     }
 };
-pub const Kind = enum { seek_after, seek_before, next, prev };
+pub const Kind = enum { seek_after, seek_before, next, prev, first, last, upper_bound };
 const Operation = struct { kind: Kind, argument: []const u8, expected: ?Row };
 const Point = struct { key: []const u8, expected: ?Fingerprint };
 
@@ -102,6 +228,7 @@ pub const Cursor = struct {
     control: ?admission.Port,
     failure: ?*?anyerror,
     active: bool = true,
+    physical_payloads: bool = true,
     operations: std.ArrayListUnmanaged(Operation) = .empty,
 
     pub fn record(self: *Cursor, kind: Kind, argument: []const u8, entry: ?Entry) !void {
@@ -170,17 +297,20 @@ pub const Owned = struct {
         self.points.appendAssumeCapacity(.{ .key = owned, .expected = expected });
     }
     pub fn openCursor(self: *Owned) !*Cursor {
-        return self.openCursorInner() catch |err| {
+        return self.openCursorWithMode(true);
+    }
+    pub fn openCursorWithMode(self: *Owned, physical_payloads: bool) !*Cursor {
+        return self.openCursorInner(physical_payloads) catch |err| {
             if (self.failure == null) self.failure = err;
             return err;
         };
     }
-    fn openCursorInner(self: *Owned) !*Cursor {
+    fn openCursorInner(self: *Owned, physical_payloads: bool) !*Cursor {
         if (self.sealed) return error.TransactionClosed;
         try checkpoint(self.control, &self.failure);
         const cursor = try self.allocator.create(Cursor);
         errdefer self.allocator.destroy(cursor);
-        cursor.* = .{ .allocator = self.allocator, .control = self.control, .failure = &self.failure };
+        cursor.* = .{ .allocator = self.allocator, .control = self.control, .failure = &self.failure, .physical_payloads = physical_payloads };
         try self.cursors.append(self.allocator, cursor);
         return cursor;
     }
@@ -233,7 +363,7 @@ pub const Owned = struct {
         }
         for (self.cursors.items) |captured| {
             if (captured.active) return error.InvalidArgument;
-            var cursor = try read.openPhysicalCursorAdapter();
+            var cursor = if (captured.physical_payloads) try read.openPhysicalCursorAdapter() else try read.openCursor();
             defer cursor.close();
             for (captured.operations.items) |operation| {
                 try checkpoint(control, null);
@@ -242,6 +372,12 @@ pub const Owned = struct {
                     .seek_before => try cursor.seekAtOrBefore(operation.argument),
                     .next => try cursor.next(),
                     .prev => try cursor.prev(),
+                    .first => try cursor.first(),
+                    .last => try cursor.last(),
+                    .upper_bound => blk: {
+                        cursor.setUpperBound(if (operation.argument.len != 0) operation.argument else null);
+                        break :blk null;
+                    },
                 };
                 const actual = if (entry) |row| try Row.of(row, control, null) else null;
                 if (!std.meta.eql(actual, operation.expected)) return error.PreparedReadSetChanged;
