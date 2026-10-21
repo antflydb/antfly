@@ -6283,3 +6283,51 @@ DB/execution lifetime ownership, executable recovery resources/derived-log quota
 migration/peer eligibility, normal required PREPARE drivers and the broader
 scheduler/default/session scope remain incomplete. Strong defaults remain off;
 the full objective remains active.
+
+
+### Observed identity, range and merge inputs (2026-10-20)
+
+Preparation helpers can now open owned read/probe scopes through the observed
+reader. Each scope preserves its original snapshot, exposes read operations,
+and explicitly aborts its snapshot after borrowed cursors close. Scoped and
+standalone scans share the same mode/bound/direction/stop implementation;
+null-observation scoped scans delegate to DocStore. Optional allocated reads
+retain caller ownership while recording absence.
+
+Identity fast/general preparation, ordinal statistics and pristine-summary
+proofs now use observed scopes. Range counters and legacy row-count fallbacks,
+merge state/cardinality, page/integrity values and range-tracking activation
+also feed the retained read set. Related counter and row scans retain one
+snapshot. Observed preparation invalidates the mutable bulk identity cache
+under apply before assembly, so ordinal reservation and overwrite probes use
+persistent inputs. Ordinary unobserved bulk paths retain the optimization.
+
+The new failure sweep exposed preexisting identity allocation cleanup bugs.
+Key/value builders now transfer key ownership immediately and unwind value/list
+allocation failures correctly. Visibility-chunk transfers end before later
+fallible work, preventing double frees of buffers already owned by output;
+failed deleted-key appends free their untransferred keys. New chunk-map slots
+start empty before fallible observation/decode, so cleanup cannot inspect
+uninitialized state. Normal metadata byte formats and ordering are unchanged.
+
+Final receipt `observed-identity-range-v6`: 97/97 steps; 144 test executions
+(prepared62, DB38, grouped7, graph4, full identity33; four new identity tests run
+in both selections), no skips/failures/leaks. Coverage includes all-new,
+unchanged and general/delete identity plans; pristine root and mapping/state
+witnesses after scratch retirement; legacy counts, range bounds, missing
+counters and phantoms; active merge state/count/identity dependencies; exhaustive
+allocation and original NotFound/OOM/deadline failures on pristine, populated
+and deleting sources. Native primary bulk ingestion verifies cache invalidation,
+ordinals, live/tombstone counts and authored acceptance through finish/reopen.
+`docstore-identity-ownership-test` also runs all33 identity component cases.
+
+This remains optimistic validation under apply. Earlier pre-apply graph reads,
+cleanup/retirement planning, manifest callbacks and live core-cache inputs still
+need coverage. Direct DocStore transaction/batch writes do not universally
+consult TxnManager read guards; widening the metadata predicate whitelist would
+not establish durable exclusion. Central writer coverage and mandatory control
+progress must be proved before adding broader guards. Full assembly before
+vote, DB/execution lifetimes, executable recovery resources/derived-log quota,
+migration/peer eligibility, normal required PREPARE drivers and broader
+scheduler/default/session scope remain incomplete. Strong defaults remain off.
+No ABI/wire/reader/durable-format change; full qualification remains waived.

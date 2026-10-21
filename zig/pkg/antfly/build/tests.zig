@@ -6062,6 +6062,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("docstore-prepared-transaction-effects-test", "Verify bounded durable prepared effect encoding and original controls")
         .dependOn(&addCuratedTestRunArtifact(b, prepared_effects_tests, &.{"prepared transaction effects"}).step);
+    const identity_ownership_tests = b.addTest(.{
+        .root_module = prepared_effects_mod,
+        .filters = &.{"storage.db.doc_identity."},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("docstore-identity-ownership-test", "Run identity allocation, visibility, snapshot and failure-cleanup regressions")
+        .dependOn(&addCuratedTestRunArtifact(b, identity_ownership_tests, &.{"storage.db.doc_identity."}).step);
     const required_prepare_db_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "db prepared transaction effects required", "ordered artifact inventory DB authored acceptance survives projection and reopen" },

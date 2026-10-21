@@ -972,6 +972,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var apply_mutex_held = true;
             const apply_lock_acquired_ns = monotonicTimeNs();
             errdefer if (apply_mutex_held) unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
+            // Trusted bulk state is a mutable allocation cache, not a retained
+            // read witness. Observe the persistent ordinal inputs before voting.
+            if (preparation_observations != null and S.ownerField(self, "bulk_identity").*.enabled) self.clearBulkIngestIdentityAllNewLocked();
             // A durable epoch survives active-schema publication, not replacement
             // of the entire database namespace with reused version/transaction IDs.
             if (schema_namespace != S.ownerField(self, "core").*.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
@@ -1029,7 +1032,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 req.graph_writes.len != 0 or req.graph_deletes.len != 0))
                 return error.InvalidBatchRequest;
             if (req.merge_replication) |replication| if (req.merge_checkpoint == null) {
-                const raw = try merge_state_mod.loadRawAlloc(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store);
+                const raw = try merge_state_mod.loadRawAlloc(S.ownerField(self, "alloc").*, observed_store);
                 defer if (raw) |value| S.ownerField(self, "alloc").*.free(value);
                 var state = if (raw) |value| try merge_state_mod.decodeAlloc(S.ownerField(self, "alloc").*, value) else null;
                 defer if (state) |*value| value.deinit(S.ownerField(self, "alloc").*);
@@ -1050,7 +1053,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     return;
                 }
                 const pages = @import("merge_page_contract.zig");
-                const page_raw = try S.ownerField(self, "core").*.getStoreValue(S.ownerField(self, "alloc").*, pages.key);
+                const page_raw = try observed_store.getOptional(S.ownerField(self, "alloc").*, pages.key);
                 defer if (page_raw) |value| S.ownerField(self, "alloc").*.free(value);
                 if (req.merge_page != null or page_raw != null) {
                     var progress = if (page_raw) |value| try pages.decode(S.ownerField(self, "alloc").*, value) else return error.MergePageSourceMissing;
@@ -1420,7 +1423,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (req.activate_range_tracking) {
                 const ranges = @import("../range_protection.zig");
                 try ranges.validateRequest(req);
-                var probe = try S.ownerField(self, "core").*.store.beginReadTxn();
+                var probe = try observed_store.beginReadTxn();
                 defer probe.abort();
                 if (!try ranges.isActive(&probe)) {
                     if (try S.ownerField(self, "core").*.hasTopologySensitiveTransactions()) return error.IntentConflict;
@@ -2559,7 +2562,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (profile) |active_profile| active_profile.source_sequence = sequence;
             const identity_metadata_start_ns = monotonicTimeNs();
             const identity_live_before = if (identity_upsert_keys.items.len != 0 or effective_req.deletes.len != 0)
-                (try doc_identity.fastStatsFromStore(S.ownerField(self, "core").*.store)).live_ordinals
+                (try doc_identity.fastStatsFromStore(observed_store)).live_ordinals
             else
                 0;
             var used_trusted_identity_path = false;
@@ -2585,7 +2588,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (!used_trusted_identity_path) {
                 try doc_identity.appendBatchIdentityMetadataForNamespaceWithDeletesAlloc(
                     S.ownerField(self, "alloc").*,
-                    S.ownerField(self, "core").*.store,
+                    observed_store,
                     S.ownerField(self, "core").*.identity_namespace,
                     sequence,
                     &identity_writes,
@@ -2601,17 +2604,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const pending_identity_visibility_summary = try doc_identity.visibilitySummaryFromWrites(identity_writes.items);
             // Plan once under the apply lock: counts, page state, and the durable
             // transition must agree on whether a delayed checkpoint has authority.
-            const merge_existing_raw = if (req.merge_checkpoint != null) try merge_state_mod.loadRawAlloc(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store) else null;
+            const merge_existing_raw = if (req.merge_checkpoint != null) try merge_state_mod.loadRawAlloc(S.ownerField(self, "alloc").*, observed_store) else null;
             defer if (merge_existing_raw) |value| S.ownerField(self, "alloc").*.free(value);
             var merge_existing_state: ?merge_state_mod.State = if (merge_existing_raw) |value| try merge_state_mod.decodeAlloc(S.ownerField(self, "alloc").*, value) else null;
             defer if (merge_existing_state) |*state| state.deinit(S.ownerField(self, "alloc").*);
             const merge_plan: ?merge_state_mod.ApplyPlan = if (req.merge_checkpoint) |checkpoint| try merge_state_mod.planCheckpointApply(S.ownerField(self, "alloc").*, if (merge_existing_state) |*state| state else null, S.ownerField(self, "core").*.byteRange(), checkpoint) else null;
             defer if (merge_plan) |plan| plan.deinit(S.ownerField(self, "alloc").*);
-            const merge_count_prepared = try @import("merge_cardinality.zig").prepare(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, effective_req, if (merge_plan) |plan| plan.applies_checkpoint else false, identity_upsert_keys.items, effective_req.deletes, identity_live_before, if (pending_identity_visibility_summary) |summary| summary.live_ordinals else identity_live_before, &identity_writes);
+            const merge_count_prepared = try @import("merge_cardinality.zig").prepare(S.ownerField(self, "alloc").*, observed_store, effective_req, if (merge_plan) |plan| plan.applies_checkpoint else false, identity_upsert_keys.items, effective_req.deletes, identity_live_before, if (pending_identity_visibility_summary) |summary| summary.live_ordinals else identity_live_before, &identity_writes);
             if (!merge_count_prepared) if (pending_identity_visibility_summary) |summary| {
                 try range_cardinality.appendIdentityTransitionAlloc(
                     S.ownerField(self, "alloc").*,
-                    S.ownerField(self, "core").*.store,
+                    observed_store,
                     S.ownerField(self, "core").*.byteRange(),
                     identity_live_before,
                     summary.live_ordinals,
@@ -2634,7 +2637,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // Persist only the empty/non-empty transition. Exact cardinality
                 // is already transactional in the range-local counter. A split
                 // intentionally retains foreign identities in the shared namespace.
-                catalog.row_count = @intFromBool(try range_cardinality.afterIdentityTransition(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, identity_writes.items) != 0);
+                catalog.row_count = @intFromBool(try range_cardinality.afterIdentityTransition(S.ownerField(self, "alloc").*, observed_store, identity_writes.items) != 0);
                 catalog.reconciled = true;
                 if (catalog.mode_initialized != previous.mode_initialized or
                     catalog.storage_mode != previous.storage_mode or
@@ -2884,7 +2887,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             if (req.split_checkpoint) |checkpoint| {
                 if (coordinated_handoff and checkpoint.kind == .destination_complete) {
-                    const raw_catalog = (try S.ownerField(self, "core").*.getStoreValue(S.ownerField(self, "alloc").*, @import("relational_integrity_catalog.zig").key)) orelse return error.IntegrityCatalogChanged;
+                    const raw_catalog = (try observed_store.getOptional(S.ownerField(self, "alloc").*, @import("relational_integrity_catalog.zig").key)) orelse return error.IntegrityCatalogChanged;
                     defer S.ownerField(self, "alloc").*.free(raw_catalog);
                     integrity_coverage_value = try @import("relational_integrity_handoff.zig").coverageForRange(S.ownerField(self, "alloc").*, raw_catalog, S.ownerField(self, "core").*.identity_namespace, .{ .start = checkpoint.range_start, .end = checkpoint.range_end });
                     try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("relational_integrity_activation.zig").key, .value = integrity_coverage_value.? });
@@ -2926,7 +2929,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const pages = @import("merge_page_contract.zig");
                 if ((checkpoint.page_source != null) != (checkpoint.page_receiver_namespace != null) or
                     (checkpoint.page_source != null and checkpoint.kind != .begin_copy and !(checkpoint.kind == .accept and (checkpoint.page_source.?.integrity != null or checkpoint.page_source.?.artifact_catalog != null)))) return error.InvalidMergeCheckpoint;
-                const page_raw = try S.ownerField(self, "core").*.getStoreValue(S.ownerField(self, "alloc").*, pages.key);
+                const page_raw = try observed_store.getOptional(S.ownerField(self, "alloc").*, pages.key);
                 defer if (page_raw) |value| S.ownerField(self, "alloc").*.free(value);
                 var page_progress = if (page_raw) |value| try pages.decode(S.ownerField(self, "alloc").*, value) else null;
                 defer if (page_progress) |*value| value.deinit();

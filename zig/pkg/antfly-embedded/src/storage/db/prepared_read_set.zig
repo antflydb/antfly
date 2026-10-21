@@ -129,6 +129,66 @@ pub const TxnReader = struct {
         return std.mem.startsWith(u8, row.key, prefix);
     }
 };
+/// Owns the snapshot returned to a preparation helper. The scope is movable
+/// before reads/cursors start; callers close every borrowed cursor before abort.
+/// No writer or raw-transaction accessor is part of this read interface.
+pub const Transaction = struct {
+    txn: DocStore.Txn,
+    observations: ?*Owned,
+    pub fn abort(self: *Transaction) void {
+        self.txn.abort();
+    }
+    pub fn get(self: *Transaction, key: []const u8) ![]const u8 {
+        return observeTxn(&self.txn, self.observations).get(key);
+    }
+    pub fn getManySorted(self: *Transaction, keys: []const []const u8, values: []?[]const u8) !void {
+        return observeTxn(&self.txn, self.observations).getManySorted(keys, values);
+    }
+    pub fn openCursor(self: *Transaction) !OwnedCursor {
+        return observeTxn(&self.txn, self.observations).openCursor();
+    }
+    pub fn openPhysicalCursorAdapter(self: *Transaction) !OwnedCursor {
+        return observeTxn(&self.txn, self.observations).openPhysicalCursorAdapter();
+    }
+    pub fn hasPrefix(self: *Transaction, prefix: []const u8) !bool {
+        return observeTxn(&self.txn, self.observations).hasPrefix(prefix);
+    }
+    fn scan(self: *Transaction, lower: []const u8, upper: []const u8, options: DocStore.ScanOptions, ctx: ?*anyopaque, callback: DocStore.ScanWithContextCallback) !void {
+        self.scanInner(lower, upper, options, ctx, callback) catch |err| {
+            if (self.observations) |captured| if (captured.failure == null) {
+                captured.failure = err;
+            };
+            return err;
+        };
+    }
+    fn scanInner(self: *Transaction, lower: []const u8, upper: []const u8, options: DocStore.ScanOptions, ctx: ?*anyopaque, callback: DocStore.ScanWithContextCallback) !void {
+        var cursor = try observeTxn(&self.txn, self.observations).open(options.physical_payloads);
+        defer cursor.close();
+        try scanCursor(&cursor, lower, upper, options, ctx, callback);
+    }
+};
+fn scanCursor(cursor: *OwnedCursor, lower: []const u8, upper: []const u8, options: DocStore.ScanOptions, ctx: ?*anyopaque, callback: DocStore.ScanWithContextCallback) !void {
+    if (!options.reverse) {
+        try cursor.setUpperBound(if (upper.len != 0) upper else null);
+        var next = if (lower.len == 0) try cursor.first() else try cursor.seekAtOrAfter(lower);
+        while (next) |row| : (next = try cursor.next()) {
+            if (upper.len != 0 and std.mem.order(u8, row.key, upper) != .lt) break;
+            if (options.lower_exclusive and lower.len != 0 and std.mem.eql(u8, row.key, lower)) continue;
+            if (options.skip_fn) |skip| if (skip(row.key)) continue;
+            if (try callback(ctx, row.key, row.value) == .stop) break;
+        }
+    } else {
+        // Match DocStore's reverse scan contract: upper is exclusive;
+        // lower_exclusive only applies to forward scans.
+        var next = if (upper.len == 0) try cursor.last() else try cursor.seekAtOrBefore(upper);
+        while (next) |row| : (next = try cursor.prev()) {
+            if (upper.len != 0 and std.mem.order(u8, row.key, upper) != .lt) continue;
+            if (lower.len != 0 and std.mem.order(u8, row.key, lower) == .lt) break;
+            if (options.skip_fn) |skip| if (skip(row.key)) continue;
+            if (try callback(ctx, row.key, row.value) == .stop) break;
+        }
+    }
+}
 /// A read-only observed surface for preparation helpers. It returns caller-owned
 /// bytes just like the physical store; the witness owns only keys/fingerprints.
 /// It deliberately exposes no writes or unobserved transaction/cursor escape.
@@ -139,6 +199,26 @@ pub fn ObservedReader(comptime Store: type) type {
     return struct {
         store: Store,
         observations: ?*Owned,
+        pub fn beginProbeTxn(self: @This()) !Transaction {
+            if (self.observations) |captured| try captured.check();
+            return .{ .txn = try self.store.beginProbeTxn(), .observations = self.observations };
+        }
+        pub fn beginReadTxn(self: @This()) !Transaction {
+            if (self.observations) |captured| try captured.check();
+            return .{ .txn = try self.store.beginReadTxn(), .observations = self.observations };
+        }
+        pub fn beginReadTxnWithBlockCacheAdmission(self: @This(), mode: @import("../backend_types.zig").Namespace.BlockCacheAdmission) !Transaction {
+            if (self.observations) |captured| try captured.check();
+            return .{ .txn = try self.store.beginReadTxnWithBlockCacheAdmission(mode), .observations = self.observations };
+        }
+        pub fn scanReadTxnWithContext(self: @This(), txn: *Transaction, lower: []const u8, upper: []const u8, options: DocStore.ScanOptions, ctx: ?*anyopaque, callback: DocStore.ScanWithContextCallback) !void {
+            if (self.observations == null) return self.store.scanReadTxnWithContext(&txn.txn, lower, upper, options, ctx, callback);
+            return txn.scan(lower, upper, options, ctx, callback);
+        }
+        pub fn getOptional(self: @This(), a: A, key: []const u8) !?[]u8 {
+            const raw = self.get(a, key) catch |err| return if (err == error.NotFound) null else err;
+            return @constCast(raw);
+        }
         pub fn openCursor(self: @This(), a: A, physical_payloads: bool) !OwnedCursor {
             if (self.observations) |captured| try captured.check();
             const read = try a.create(DocStore.Txn);
@@ -189,27 +269,9 @@ pub fn ObservedReader(comptime Store: type) type {
         fn scanInner(self: @This(), lower: []const u8, upper: []const u8, options: DocStore.ScanOptions, ctx: ?*anyopaque, callback: DocStore.ScanWithContextCallback) !void {
             var cursor = try self.openCursor(self.observations.?.allocator, options.physical_payloads);
             defer cursor.close();
-            if (!options.reverse) {
-                try cursor.setUpperBound(if (upper.len != 0) upper else null);
-                var next = if (lower.len == 0) try cursor.first() else try cursor.seekAtOrAfter(lower);
-                while (next) |row| : (next = try cursor.next()) {
-                    if (upper.len != 0 and std.mem.order(u8, row.key, upper) != .lt) break;
-                    if (options.lower_exclusive and lower.len != 0 and std.mem.eql(u8, row.key, lower)) continue;
-                    if (options.skip_fn) |skip| if (skip(row.key)) continue;
-                    if (try callback(ctx, row.key, row.value) == .stop) break;
-                }
-            } else {
-                // Match DocStore's reverse scan contract: upper is exclusive;
-                // lower_exclusive only applies to forward scans.
-                var next = if (upper.len == 0) try cursor.last() else try cursor.seekAtOrBefore(upper);
-                while (next) |row| : (next = try cursor.prev()) {
-                    if (upper.len != 0 and std.mem.order(u8, row.key, upper) != .lt) continue;
-                    if (lower.len != 0 and std.mem.order(u8, row.key, lower) == .lt) break;
-                    if (options.skip_fn) |skip| if (skip(row.key)) continue;
-                    if (try callback(ctx, row.key, row.value) == .stop) break;
-                }
-            }
+            try scanCursor(&cursor, lower, upper, options, ctx, callback);
         }
+
         pub fn get(self: @This(), a: A, key: []const u8) ![]const u8 {
             if (self.observations) |captured| try captured.check();
             const value = self.store.get(a, key) catch |err| {

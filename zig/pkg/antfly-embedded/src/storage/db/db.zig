@@ -145809,3 +145809,47 @@ test "db prepared transaction effects required graph TTL preparation propagates 
     defer a.free(unchanged);
     try std.testing.expectEqualSlices(u8, old, unchanged);
 }
+
+test "db prepared transaction effects required native bulk writes use observed persistent ordinals through reopen" {
+    const a = std.testing.allocator;
+    const publication = @import("artifact_publication.zig");
+    var directory = try TestDirectory.init("native-observed-bulk-identity");
+    defer directory.cleanup();
+    const options: OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .start_independent_maintenance = false, .online_source_authority = .native, .identity_namespace = .{ .table_id = 7, .shard_id = 11, .range_id = 14 } };
+    var db = try DB.open(a, directory.path(), options);
+    defer db.close();
+    try db.addIndex(.{ .name = "vector", .kind = .dense_vector, .config_json = "{\"field\":\"v\",\"dims\":2}" });
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        var namespace: publication.Namespace = undefined;
+        doc_identity.encodeNamespace(&namespace, db.core.identity_namespace);
+        const catalog = try @import("artifact_inventory.zig").local(&txn);
+        try publication.stageAuthority(&txn, .{ .mode = .activate, .namespace = namespace, .authority_epoch = 1, .catalog_digest = catalog.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
+        try txn.commit();
+    }
+    try db.beginPrimaryStoreAutoBulkIngestSession();
+    try std.testing.expect(db.bulk_identity.enabled);
+    try db.batch(.{ .writes = &.{.{ .key = "first", .value = "{\"v\":[1,2]}" }}, .timestamp_ns = 17 });
+    try std.testing.expect(!db.bulk_identity.enabled);
+    try db.batch(.{ .writes = &.{.{ .key = "second", .value = "{\"v\":[3,4]}" }}, .timestamp_ns = 18 });
+    try db.batch(.{ .writes = &.{.{ .key = "first", .value = "{\"v\":[5,6]}" }}, .timestamp_ns = 19 });
+    try db.batch(.{ .deletes = &.{"second"}, .timestamp_ns = 20 });
+    try db.batch(.{ .writes = &.{.{ .key = "third", .value = "{\"v\":[7,8]}" }}, .timestamp_ns = 21 });
+    try db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(.{});
+    db.close();
+    db = try DB.open(a, directory.path(), options);
+    const stats = try doc_identity.fastStatsFromStore(db.core.store);
+    try std.testing.expectEqual(@as(u32, 4), stats.next_ordinal);
+    try std.testing.expectEqual(@as(u64, 2), stats.live_ordinals);
+    try std.testing.expectEqual(@as(u64, 1), stats.tombstone_ordinals);
+    try std.testing.expectEqual(@as(?u64, 2), try range_cardinality.load(a, db.core.store));
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqual(@as(?u32, 1), try doc_identity.lookupOrdinalTxn(a, &read, "first"));
+    try std.testing.expectEqual(@as(?u32, 3), try doc_identity.lookupOrdinalTxn(a, &read, "third"));
+    const artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "third", "vector");
+    defer a.free(artifact);
+    const accepted = (try @import("artifact_authored_acceptance.zig").readCurrent(&read, db.root_incarnation, "third", artifact)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 21), accepted.source.timestamp);
+}

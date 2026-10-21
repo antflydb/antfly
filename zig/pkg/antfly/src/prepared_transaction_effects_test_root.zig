@@ -21,4 +21,5 @@ test {
     _ = @import("antfly_local_sources").storage_db_artifact_authored_acceptance;
     _ = @import("antfly_local_sources").storage_db_group_source_mutations;
     _ = @import("antfly_local_sources").storage_db_relational_index_records;
+    _ = @import("antfly_local_sources").storage_db_doc_identity;
 }

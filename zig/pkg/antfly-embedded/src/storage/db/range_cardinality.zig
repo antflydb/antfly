@@ -24,7 +24,7 @@ pub fn decode(raw: []const u8) !u64 {
     return std.mem.readInt(u64, raw[0..8], .little);
 }
 
-pub fn load(alloc: Allocator, store: *docstore_mod.DocStore) !?u64 {
+pub fn load(alloc: Allocator, store: anytype) !?u64 {
     const raw = store.get(alloc, &internal_keys.range_document_count_key) catch |err| switch (err) {
         error.NotFound => return null,
         else => return err,
@@ -34,7 +34,7 @@ pub fn load(alloc: Allocator, store: *docstore_mod.DocStore) !?u64 {
 }
 
 /// Read related publication counters through the same pinned store revision.
-pub fn loadFromTxn(txn: *docstore_mod.DocStore.Txn) !?u64 {
+pub fn loadFromTxn(txn: anytype) !?u64 {
     const raw = txn.get(&internal_keys.range_document_count_key) catch |err| switch (err) {
         error.NotFound => return null,
         else => return err,
@@ -45,7 +45,7 @@ pub fn loadFromTxn(txn: *docstore_mod.DocStore.Txn) !?u64 {
 /// Read the range-local result after appendIdentityTransitionAlloc, without
 /// confusing retained namespace-wide identities with owned primary rows. This
 /// is the authoritative empty/non-empty input for transactional table metadata.
-pub fn afterIdentityTransition(alloc: Allocator, store: *docstore_mod.DocStore, writes: []const docstore_mod.KVPair) !u64 {
+pub fn afterIdentityTransition(alloc: Allocator, store: anytype, writes: []const docstore_mod.KVPair) !u64 {
     var i = writes.len;
     while (i != 0) {
         i -= 1;
@@ -59,7 +59,7 @@ pub fn afterIdentityTransition(alloc: Allocator, store: *docstore_mod.DocStore, 
 /// Prove that case with a single bounded user-key probe. Any user record keeps
 /// a missing counter unknown, including legacy documents without identity
 /// metadata and orphaned artifacts; never count a populated corpus here.
-pub fn loadOrProveEmpty(alloc: Allocator, store: *docstore_mod.DocStore) !?u64 {
+pub fn loadOrProveEmpty(alloc: Allocator, store: anytype) !?u64 {
     if (try load(alloc, store)) |count| return count;
     const Probe = struct {
         found: bool = false,
@@ -82,7 +82,7 @@ pub fn loadOrProveEmpty(alloc: Allocator, store: *docstore_mod.DocStore) !?u64 {
 
 pub fn countPrimaryDocuments(
     alloc: Allocator,
-    store: *docstore_mod.DocStore,
+    store: anytype,
     byte_range: types.ByteRange,
 ) !u64 {
     var txn = try store.beginReadTxn();
@@ -92,8 +92,8 @@ pub fn countPrimaryDocuments(
 
 fn countPrimaryDocumentsFromTxn(
     alloc: Allocator,
-    store: *docstore_mod.DocStore,
-    txn: *docstore_mod.DocStore.Txn,
+    store: anytype,
+    txn: anytype,
     byte_range: types.ByteRange,
 ) !u64 {
     const lower = try internal_keys.documentRangeLowerAlloc(alloc, byte_range.start);
@@ -122,7 +122,7 @@ fn countPrimaryDocumentsFromTxn(
 
 pub fn loadOrCount(
     alloc: Allocator,
-    store: *docstore_mod.DocStore,
+    store: anytype,
     byte_range: types.ByteRange,
 ) !u64 {
     var txn = try store.beginReadTxn();
@@ -132,8 +132,8 @@ pub fn loadOrCount(
 
 pub fn loadOrCountFromTxn(
     alloc: Allocator,
-    store: *docstore_mod.DocStore,
-    txn: *docstore_mod.DocStore.Txn,
+    store: anytype,
+    txn: anytype,
     byte_range: types.ByteRange,
 ) !u64 {
     return (try loadFromTxn(txn)) orelse try countPrimaryDocumentsFromTxn(alloc, store, txn, byte_range);
@@ -145,7 +145,7 @@ pub fn loadOrCountFromTxn(
 /// primary mutation is admitted.
 pub fn appendIdentityTransitionAlloc(
     alloc: Allocator,
-    store: *docstore_mod.DocStore,
+    store: anytype,
     byte_range: types.ByteRange,
     before_live: u64,
     after_live: u64,

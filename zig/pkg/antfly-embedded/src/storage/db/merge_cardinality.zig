@@ -43,7 +43,7 @@ fn changed(current: u64, delta: i128) !u64 {
 
 /// Returns true when this transition supplied the authoritative range count.
 /// Work is O(touched keys), with no scans, row decoding, or payload reads.
-pub fn prepare(alloc: Allocator, store: *Store, req: types.BatchRequest, checkpoint_applied: bool, upserts: []const []const u8, deletes: []const []const u8, before: u64, after: u64, out: *std.ArrayListUnmanaged(KV)) !bool {
+pub fn prepare(alloc: Allocator, store: anytype, req: types.BatchRequest, checkpoint_applied: bool, upserts: []const []const u8, deletes: []const []const u8, before: u64, after: u64, out: *std.ArrayListUnmanaged(KV)) !bool {
     const admitted_checkpoint = if (checkpoint_applied) req.merge_checkpoint else null;
     var txn = try store.beginProbeTxn();
     defer txn.abort();

@@ -28,14 +28,15 @@ const docstore = @import("../docstore.zig");
 pub const key = "\x00\x00__metadata__:raftmerge";
 pub const legacy_key = "raftmerge:state";
 
-pub fn loadRawAlloc(alloc: std.mem.Allocator, store: *docstore.DocStore) !?[]u8 {
-    return store.get(alloc, key) catch |err| switch (err) {
+pub fn loadRawAlloc(alloc: std.mem.Allocator, store: anytype) !?[]u8 {
+    const raw = store.get(alloc, key) catch |err| switch (err) {
         error.NotFound => store.get(alloc, legacy_key) catch |legacy_err| switch (legacy_err) {
             error.NotFound => null,
             else => return legacy_err,
         },
         else => return err,
     };
+    return if (raw) |value| @constCast(value) else null;
 }
 
 /// Upgrade existing production receipts before a physical split can move or
