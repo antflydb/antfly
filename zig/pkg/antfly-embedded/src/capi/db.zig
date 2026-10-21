@@ -742,6 +742,8 @@ pub const HandleAccess = enum {
     /// Schema, index, enrichment, range, and restore changes. Waits for
     /// in-flight calls and blocks new ones until done.
     exclusive,
+    /// Catalog definitions require embedded ownership as well as an exclusive lock.
+    catalog,
 };
 
 /// Held for the duration of one export call; see `enterHandle`.
@@ -840,12 +842,28 @@ pub const HandleGuard = struct {
                 self.lock_handle.maintenance_mutex.unlock(io);
                 self.lock_handle.api_lock.unlockShared(io);
             },
-            .exclusive => self.lock_handle.api_lock.unlock(io),
+            .exclusive, .catalog => self.lock_handle.api_lock.unlock(io),
         }
         if (self.parent_slot) |slot| HandleRegistry.leave(slot);
         HandleRegistry.leave(self.slot);
     }
 };
+
+pub fn requireEmbeddedCatalogOwnership(handle: *Handle) !void {
+    const root = handle.parent_handle orelse handle;
+    if (root.owned_lite_backend) |*backend| try backend.requireEmbeddedCatalogOwnership();
+}
+
+pub fn requireEmbeddedSqlCatalogOwnership(handle: *Handle, statement: anytype) !void {
+    switch (statement) {
+        .create_table, .drop_table, .catalog_ddl, .policy_ddl => try requireEmbeddedCatalogOwnership(handle),
+        else => {},
+    }
+}
+
+fn catalogOwnershipError(err: anyerror) capi.ErrorCode {
+    return capi.mapErrorContext(err, "this Lite catalog is owned by standalone; use antfly standalone and the /db/v1 API for schema, index, enrichment and table changes");
+}
 
 /// Entry point for every export that takes a DB handle. Returns null for a
 /// null handle or one that is being closed. Must be taken exactly once per
@@ -909,6 +927,10 @@ fn enterHandleInternal(ptr: ?*anyopaque, access: HandleAccess, pinned: bool) ?Ha
             handle.parent_handle = root;
             guard.handle = handle;
         }
+        if (access == .catalog) requireEmbeddedCatalogOwnership(guard.handle) catch |err| {
+            guard.entry_error = catalogOwnershipError(err);
+            return guard;
+        };
         if (!pinned) @import("sql_commit.zig").recover(root) catch |err| {
             guard.entry_error = capi.mapError(err);
         };
@@ -929,9 +951,13 @@ fn enterHandleInternal(ptr: ?*anyopaque, access: HandleAccess, pinned: bool) ?Ha
             lock_handle.api_lock.lockSharedUncancelable(io);
             lock_handle.maintenance_mutex.lockUncancelable(io);
         },
-        .exclusive => lock_handle.api_lock.lockUncancelable(io),
+        .exclusive, .catalog => lock_handle.api_lock.lockUncancelable(io),
     }
-    const guard: HandleGuard = .{ .handle = handle, .lock_handle = lock_handle, .parent_slot = parent_slot, .slot = slot, .access = effective_access };
+    var guard: HandleGuard = .{ .handle = handle, .lock_handle = lock_handle, .parent_slot = parent_slot, .slot = slot, .access = effective_access };
+    if (access == .catalog) requireEmbeddedCatalogOwnership(handle) catch |err| {
+        guard.entry_error = catalogOwnershipError(err);
+        return guard;
+    };
     if (lock_handle.embedded_path != null) {
         @import("sql_commit.zig").recover(lock_handle) catch {
             guard.leave();
@@ -3123,7 +3149,7 @@ pub fn antfly_db_import_backup(handle_ptr: ?*anyopaque, backup: capi.Slice) call
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_import_backup), .{ .name = "antfly_db_import_backup" }), .{ handle_ptr, backup });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4723,7 +4749,7 @@ pub fn antfly_db_set_schema_json(
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_set_schema_json), .{ .name = "antfly_db_set_schema_json" }), .{ handle_ptr, schema_json });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -4963,7 +4989,7 @@ pub fn antfly_db_update_range(
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_update_range), .{ .name = "antfly_db_update_range" }), .{ handle_ptr, start, end });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -5027,7 +5053,7 @@ pub fn antfly_db_set_split_state_json(
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_set_split_state_json), .{ .name = "antfly_db_set_split_state_json" }), .{ handle_ptr, state_json });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -5069,7 +5095,7 @@ pub fn antfly_db_clear_split_state(handle_ptr: ?*anyopaque) callconv(.c) capi.Er
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_clear_split_state), .{ .name = "antfly_db_clear_split_state" }), .{handle_ptr});
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -5123,7 +5149,7 @@ pub fn antfly_db_set_split_delta_final_seq(
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_set_split_delta_final_seq), .{ .name = "antfly_db_set_split_delta_final_seq" }), .{ handle_ptr, seq });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -5138,7 +5164,7 @@ pub fn antfly_db_clear_split_delta_final_seq(handle_ptr: ?*anyopaque) callconv(.
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_clear_split_delta_final_seq), .{ .name = "antfly_db_clear_split_delta_final_seq" }), .{handle_ptr});
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -5186,7 +5212,7 @@ pub fn antfly_db_clear_split_delta_entries(handle_ptr: ?*anyopaque) callconv(.c)
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_clear_split_delta_entries), .{ .name = "antfly_db_clear_split_delta_entries" }), .{handle_ptr});
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -5733,6 +5759,7 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
         return err;
     };
     defer compiled.deinit();
+    try requireEmbeddedSqlCatalogOwnership(handle, compiled.statement);
     // Allocate the fallback receipt before entering any commit path.
     var commit_receipt: ?[]u8 = switch (compiled.statement) {
         .insert, .update, .delete, .commit, .create_table, .drop_table, .catalog_ddl => try std.heap.c_allocator.alloc(u8, 512),
@@ -8218,7 +8245,7 @@ pub fn antfly_db_drop_resolver_identity(handle_ptr: ?*anyopaque, name: capi.Slic
     capi.clearLastError();
     const out = out_deleted orelse return capi.mapError(error.InvalidArgument);
     out.* = false;
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapError(error.InvalidArgument);
     defer guard.leave();
     if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
     out.* = guard.handle.database().dropRetiredResolverIdentity(name.bytes()) catch |err| return capi.mapErrorContext(err, "retire all declaring indexes before dropping resolver identity");
@@ -8231,7 +8258,7 @@ pub fn antfly_db_set_resolver_namespace_json(handle_ptr: ?*anyopaque, resolver_n
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_set_resolver_namespace_json), .{ .name = "antfly_db_set_resolver_namespace_json" }), .{ handle_ptr, resolver_name, request_json });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, "invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, "invalid or closed database handle");
     defer guard.leave();
     if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
     const handle = guard.handle;
@@ -8317,7 +8344,7 @@ fn addIndexJsonRegistered(
     generation: *u64,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -8489,7 +8516,7 @@ pub fn antfly_db_cancel_replacement(
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_cancel_replacement), .{ .name = "antfly_db_cancel_replacement" }), .{ handle_ptr, name, out_deleted });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -8510,7 +8537,7 @@ pub fn antfly_db_delete_index(
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_delete_index), .{ .name = "antfly_db_delete_index" }), .{ handle_ptr, name, out_deleted });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -8530,7 +8557,7 @@ pub fn antfly_db_add_enrichment_json(
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_add_enrichment_json), .{ .name = "antfly_db_add_enrichment_json" }), .{ handle_ptr, config_json });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -8555,7 +8582,7 @@ pub fn antfly_db_delete_enrichment(
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_delete_enrichment), .{ .name = "antfly_db_delete_enrichment" }), .{ handle_ptr, kind_slice, name, out_deleted });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -8959,7 +8986,7 @@ pub fn antfly_db_create_shadow_index_manager(
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_create_shadow_index_manager), .{ .name = "antfly_db_create_shadow_index_manager" }), .{ handle_ptr, split_key, original_range_end });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -9037,7 +9064,7 @@ pub fn antfly_db_split(
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_split), .{ .name = "antfly_db_split" }), .{ handle_ptr, curr_start, curr_end, split_key, dest_dir1, dest_dir2, prepare_only });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -9065,7 +9092,7 @@ pub fn antfly_db_finalize_split(
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_finalize_split), .{ .name = "antfly_db_finalize_split" }), .{ handle_ptr, new_start, new_end });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    const guard = enterHandle(handle_ptr, .catalog) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
@@ -9654,4 +9681,56 @@ test "inline resolver replacement C API admits the same public name with fresh a
     }
     // Replaying the declarative config after activation remains idempotent.
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(id, .fromSlice(next)));
+}
+
+test "capi lite standalone snapshots retain one catalog authority across embedded edits" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("standalone-catalog-authority");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const source = try std.fmt.allocPrintSentinel(alloc, "{s}/source.aflite", .{directory.path()}, 0);
+    defer alloc.free(source);
+    const snapshot = try std.fmt.allocPrintSentinel(alloc, "{s}/snapshot.aflite", .{directory.path()}, 0);
+    defer alloc.free(snapshot);
+    {
+        var lite = try antfly.lite.connection.Connection.create(alloc, source, true);
+        defer lite.close();
+        try lite.db.setSchemaJson(alloc, antfly.public_api.tables.default_schema_json);
+        try lite.backend.adoptEmbeddedRootAsNamespace("group-42/table-db");
+        try lite.backend.markStandaloneArtifact();
+        _ = try lite.backend.copyStableSnapshot(snapshot, false);
+    }
+    // Exercise the public connection/refresh path, including a snapshot reopen.
+    for ([_][:0]const u8{ source, snapshot }) |path| {
+        const handle = try openLiteHandleAlloc(path, .{ .no_sync = true, .profile = .hosted }, false);
+        const id = try publishHandle(handle);
+        defer antfly_db_close(id);
+        const schema = "{\"version\":0}";
+        try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_set_schema_json(id, .fromSlice(schema)));
+        try std.testing.expect(std.mem.indexOf(u8, std.mem.span(capi.lastErrorDetail()), "owned by standalone") != null);
+        try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_add_index_json(id, .fromSlice("{\"name\":\"other\",\"type\":\"full_text\"}")));
+        var removed = false;
+        try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_delete_index(id, .fromSlice("full_text_index_v0"), &removed));
+        try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_add_enrichment_json(id, .fromSlice("{\"name\":\"chunks\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":8}")));
+        try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_delete_enrichment(id, .fromSlice("chunk"), .fromSlice("chunks"), &removed));
+        try std.testing.expectEqual(capi.ErrorCode.unsupported, @import("tables.zig").antfly_db_create_table_json(id, .fromSlice("other"), .fromSlice(schema)));
+        var output: capi.Buffer = .{};
+        defer antfly_buffer_free(&output);
+        for ([_][]const u8{
+            "{\"statement\":\"CREATE TABLE other (n BIGINT)\"}",
+            "{\"statement\":\"DROP TABLE other\"}",
+        }) |request| {
+            try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_sql_json(id, .fromSlice(request), &output));
+            antfly_buffer_free(&output);
+            var cursor: u64 = 0;
+            try std.testing.expectEqual(capi.ErrorCode.unsupported, @import("sql_cursor.zig").antfly_db_sql_open_cursor_json(id, .fromSlice(request), &cursor, &output));
+            try std.testing.expectEqual(@as(u64, 0), cursor);
+            antfly_buffer_free(&output);
+        }
+        const batch = "{\"inserts\":{\"edited-offline\":{\"body\":\"portable document edit\"}},\"sync_level\":\"write\"}";
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(id, .fromSlice(batch), &output));
+        antfly_buffer_free(&output);
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_schema_json(id, &output));
+        try std.testing.expectEqualStrings(antfly.public_api.tables.default_schema_json, output.ptr.?[0..output.len]);
+    }
 }

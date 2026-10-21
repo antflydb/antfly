@@ -21708,6 +21708,57 @@ pub const RaftApplyStore = struct {
         return out;
     }
 
+    pub const InspectionCatalog = struct {
+        tables: []metadata.TableRecord,
+        ranges: []metadata.RangeRecord,
+    };
+
+    /// Offline inspection uses the normal record codecs, but bounds the whole
+    /// projection before copying/decoding each row. Never load an unbounded
+    /// catalog and only then discover that its inspection budget was exceeded.
+    pub fn captureInspectionCatalog(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, max_records: usize, max_bytes: usize, cancellation: @import("antfly_cancellation").CancellationToken) !InspectionCatalog {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var bytes_left = max_bytes;
+        var table_buf: [128]u8 = undefined;
+        const tables = try inspectionRows(metadata.TableRecord, alloc, &txn, try tablePrefixForGroup(&table_buf, group_id), max_records, &bytes_left, cancellation, decodeTableRecord, metadata_table_manager.freeTable);
+        errdefer self.freeTables(alloc, tables);
+        var range_buf: [128]u8 = undefined;
+        const ranges = try inspectionRows(metadata.RangeRecord, alloc, &txn, try rangePrefixForGroup(&range_buf, group_id), max_records, &bytes_left, cancellation, decodeRangeRecord, metadata_table_manager.freeRange);
+        errdefer self.freeRanges(alloc, ranges);
+        // Private FK owners have no public table/range projection yet. Until
+        // their source generations can be inventoried, do not certify them.
+        var private_buf: [160]u8 = undefined;
+        const private_prefix = try fk_generation_publication.initialPrefixForGroup(&private_buf, group_id);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        if (try cursor.seekAtOrAfter(private_prefix)) |kv| {
+            if (std.mem.startsWith(u8, kv.key, private_prefix)) return error.UnsupportedLiteInspectionLayout;
+        }
+        return .{ .tables = tables, .ranges = ranges };
+    }
+
+    fn inspectionRows(comptime Row: type, alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, prefix: []const u8, max_records: usize, bytes_left: *usize, cancellation: @import("antfly_cancellation").CancellationToken, comptime decode: anytype, comptime free: anytype) ![]Row {
+        var rows: std.ArrayList(Row) = .empty;
+        errdefer {
+            for (rows.items) |row| free(alloc, row);
+            rows.deinit(alloc);
+        }
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry = try cursor.seekAtOrAfter(prefix);
+        while (entry) |kv| : (entry = try cursor.next()) {
+            try cancellation.check();
+            if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+            if (rows.items.len >= max_records or kv.value.len > bytes_left.*) return error.PreflightLimitExceeded;
+            bytes_left.* -= kv.value.len;
+            const row = try decode(alloc, kv.value);
+            errdefer free(alloc, row);
+            try rows.append(alloc, row);
+        }
+        return rows.toOwnedSlice(alloc);
+    }
+
     /// Capture the table and range namespaces from one committed storage
     /// revision without acquiring either the apply or outer Raft runtime lock.
     pub fn captureCatalogProjection(

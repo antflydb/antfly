@@ -192,6 +192,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SavepointLimitExceeded => .{ .code = "54000", .message = "The transaction savepoint limit was exceeded.", .hint = "Release earlier savepoints before creating more.", .retryable = false },
         error.ExternalLakeReadOnly => .{ .code = "25006", .message = "External lake tables are read-only.", .retryable = false },
         error.ExternalLakeSnapshotMismatch => .{ .code = "40001", .message = "The pinned external lake snapshot changed.", .retryable = true },
+        error.StandaloneLiteCatalogRequiresApi => .{ .code = "0A000", .message = "This Lite catalog is owned by standalone.", .hint = "Use antfly standalone and the /db/v1 API for catalog changes.", .retryable = false },
         error.UnsupportedSqlExecution, error.UnsupportedSqlShape => .{ .code = "0A000", .message = "This SQL statement or expression is not supported.", .hint = "Use a supported relational SELECT, INSERT, UPDATE, or DELETE statement." },
         error.UnsupportedNativeIndexOwner => .{ .code = "0A000", .message = "This table's owners cannot execute atomic index publication.", .hint = "Use owners with the required index publication capabilities; no index build was admitted.", .retryable = false },
         error.SqlSchemaRewriteRequiresMetadataOwner => .{ .code = "0A000", .message = "This schema rewrite requires the metadata-owned SQL endpoint.", .hint = "Submit the DDL to the metadata API; no rewrite job was admitted on this data node.", .retryable = false },

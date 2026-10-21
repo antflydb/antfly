@@ -2879,6 +2879,7 @@ pub fn validatePortable(alloc: Allocator, data: []const u8) !void {
 }
 
 pub const FileInspectionOptions = struct {
+    metadata_first: bool = false,
     max_input_bytes: u64 = 64 * 1024 * 1024 * 1024,
     max_logical_bytes: u64 = 128 * 1024 * 1024 * 1024,
     cancellation: @import("antfly_cancellation").CancellationToken = .none,
@@ -2889,6 +2890,32 @@ pub const FileInspection = struct {
     size_bytes: u64,
     logical_bytes: u64,
     fingerprint: backup_codec.FileReader.Fingerprint,
+};
+
+/// Logical document decoding for read-only visitors. Uses the restore reader's
+/// bounded schema cache and spool, including historical relational row layouts.
+/// Only feed blocks authenticated by inspectPortableFileBlocks.
+pub const InspectionDocumentDecoder = struct {
+    archive: PortableArchiveValidation = .{ .format_version = 2, .min_afb_reader = backup_bundle.afb_reader_version },
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        self.archive.deinit(alloc);
+    }
+
+    pub fn metadata(self: *@This(), alloc: Allocator, payload: []const u8) !void {
+        try validateMetadataBatchPayload(alloc, payload, &self.archive);
+    }
+
+    pub fn documentJsonAlloc(self: *@This(), alloc: Allocator, entry: backup_codec.DocumentEntry) ![]u8 {
+        if (entry.value_flags & backup_codec.doc_value_flag_relational_row != 0) {
+            const version = try relational_store.rowSchemaVersion(entry.value);
+            const layout = (try self.archive.layoutForVersion(version)) orelse return error.InvalidBackupRequest;
+            return relational_store.decodeValueForSchemaAndLayoutAlloc(alloc, entry.value, layout.schema.*, layout.physical);
+        }
+        if (entry.value_flags & backup_codec.doc_value_flag_compressed != 0)
+            return backup_codec.decompressZstd(alloc, entry.value);
+        return alloc.dupe(u8, entry.value);
+    }
 };
 
 /// Read-only seam for preparation and dependency inspectors. First validate
@@ -2920,11 +2947,22 @@ pub fn inspectPortableFileBlocks(
     try validatePortableImportReader(alloc, &reader, .{ .cancellation = options.cancellation });
     const fingerprint = try reader.verifiedFingerprint();
     try reader.reset(alloc);
+    if (options.metadata_first) {
+        _ = try reader.readHeader();
+        while (reader.hasRemaining()) {
+            const block = try reader.readBlock(alloc);
+            defer alloc.free(block.payload);
+            if (block.block_type == .metadata_batch) try visit(context, block.block_type, block.payload);
+        }
+        try reader.inner.verifyFingerprint(fingerprint);
+        try reader.reset(alloc);
+    }
     const header = try reader.readHeader();
     while (reader.hasRemaining()) {
         const block = try reader.readBlock(alloc);
         defer alloc.free(block.payload);
-        try visit(context, block.block_type, block.payload);
+        if (!options.metadata_first or block.block_type != .metadata_batch)
+            try visit(context, block.block_type, block.payload);
     }
     try reader.inner.verifyFingerprint(fingerprint);
     const final_stat = try file.stat(io);
