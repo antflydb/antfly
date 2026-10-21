@@ -64,14 +64,20 @@ def test_logical_source_authority_upgrade_and_rollback(stateful_api):
         api.resume_server()
 
     def query(expected):
+        # Exercise each preserved binary's own public protocol. This fixture
+        # proves on-disk upgrade/rollback, not support for removed API aliases.
+        legacy = Path(server.binary).resolve() == Path(baseline)
+        wire = dict(payload)
+        if legacy:
+            wire["value_search_execution"] = wire.pop("execution")["value_verification"]
         response = requests.post(
-            api.url + f"/tables/{table}/query", json=payload, timeout=60
+            api.url + f"/tables/{table}/query", json=wire, timeout=60
         )
         assert response.status_code == 200, response.text
         result = response.json()["responses"][0]
         assert not result.get("error"), result
         assert result["hits"]["total"]["value"] == expected, result
-        profile = result["profile"]["value_verification"]
+        profile = result["profile"]["value_search" if legacy else "value_verification"]
         assert profile["documents"] == count, profile
         assert profile["bytes"] > count * 32 * 1024, profile
         return profile
