@@ -58,11 +58,11 @@ pub fn parse(
                     try prompt.appendSlice(alloc, text.string);
                 } else if (std.mem.eql(u8, type_value.string, "media")) {
                     if (part.object.get("url")) |url| {
-                        if (url == .string) try images.append(alloc, try alloc.dupe(u8, url.string));
+                        if (url == .string) try appendOwnedImage(alloc, &images, try alloc.dupe(u8, url.string));
                     } else if (part.object.get("mime_type")) |mime| {
                         const data = part.object.get("data") orelse continue;
                         if (mime == .string and data == .string) {
-                            try images.append(alloc, try std.fmt.allocPrint(alloc, "data:{s};base64,{s}", .{ mime.string, data.string }));
+                            try appendOwnedImage(alloc, &images, try std.fmt.allocPrint(alloc, "data:{s};base64,{s}", .{ mime.string, data.string }));
                         }
                     }
                 }
@@ -153,6 +153,12 @@ fn singleReaderImage(alloc: Allocator, url: []const u8) !Source {
     return .{ .images = images };
 }
 
+// Ownership transfers to the list only after append succeeds.
+fn appendOwnedImage(alloc: Allocator, images: *std.ArrayListUnmanaged([]const u8), image: []u8) !void {
+    errdefer alloc.free(image);
+    try images.append(alloc, image);
+}
+
 /// A reader JSON URL list ignores non-string elements.
 pub fn parseArray(alloc: Allocator, values: []const std.json.Value) !Source {
     var images = std.ArrayListUnmanaged([]const u8).empty;
@@ -161,7 +167,7 @@ pub fn parseArray(alloc: Allocator, values: []const std.json.Value) !Source {
         images.deinit(alloc);
     }
     for (values) |item| {
-        if (item == .string) try images.append(alloc, try alloc.dupe(u8, item.string));
+        if (item == .string) try appendOwnedImage(alloc, &images, try alloc.dupe(u8, item.string));
     }
     return .{ .images = try images.toOwnedSlice(alloc) };
 }
@@ -211,4 +217,45 @@ test "backup preflight reader JSON templates preserve unknown string positions a
         } else try std.testing.expect(parsed == null);
     }
     try std.testing.expectError(error.StreamTooLong, parseTemplate(a, "\"\x00\"", 7));
+}
+
+test "backup preflight reader sources release allocations at every failure point" {
+    const Fixture = struct {
+        fn source(a: Allocator, text: []const u8, parts: ?[]const u8, metadata_only: bool) !void {
+            var result = try parse(a, text, parts, metadata_only);
+            defer result.deinit(a);
+        }
+
+        fn template(a: Allocator, text: []const u8) !void {
+            var result = (try parseTemplate(a, text, 4096)) orelse return error.TestUnexpectedResult;
+            defer result.deinit(a);
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "https://example.org/image",
+        "\"https://example.org/image\"",
+        "[\"https://example.org/one\",null,\"https://example.org/two\"]",
+        "[]",
+        "[invalid JSON",
+    }) |text| {
+        try std.testing.checkAllAllocationFailures(a, Fixture.source, .{ text, null, false });
+    }
+    for ([_][]const u8{
+        "\"https://example.org/\x00\"",
+        "[\"https://example.org/one\",\"https://example.org/\x00\"]",
+    }) |text| {
+        try std.testing.checkAllAllocationFailures(a, Fixture.template, .{text});
+    }
+    const text_parts = "[{\"type\":\"text\",\"text\":\"first\"},{\"type\":\"text\",\"text\":\"second\"}]";
+    try std.testing.checkAllAllocationFailures(a, Fixture.source, .{ "[\"https://example.org/fallback\"]", text_parts, false });
+    try std.testing.checkAllAllocationFailures(a, Fixture.source, .{ "ignored", text_parts, true });
+    // Exercise each media representation as the first image, where growing the
+    // list can fail after allocating the image, and alongside a prompt.
+    for ([_][]const u8{
+        "[{\"type\":\"media\",\"url\":\"https://example.org/image\"},{\"type\":\"text\",\"text\":\"prompt\"}]",
+        "[{\"type\":\"media\",\"mime_type\":\"image/png\",\"data\":\"aGVsbG8=\"},{\"type\":\"text\",\"text\":\"prompt\"}]",
+    }) |parts| {
+        try std.testing.checkAllAllocationFailures(a, Fixture.source, .{ "ignored", parts, false });
+    }
 }
