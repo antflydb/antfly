@@ -2457,6 +2457,10 @@ test "backup preflight relational rows use archived schema for active media fiel
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scan_complete\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "source_local") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "row:late") != null);
+    const limited = try inspectInputJsonAlloc(a, path, null, .{ .max_document_bytes = 1 });
+    defer a.free(limited);
+    try std.testing.expect(std.mem.indexOf(u8, limited, "\"failure_code\":\"limit_exceeded\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, limited, "\"scan_complete\":false") != null);
 }
 
 test "backup preflight document decompression respects expanded byte limit" {
@@ -2496,6 +2500,10 @@ test "backup preflight document decompression respects expanded byte limit" {
     counter = .{};
     try std.testing.expectError(error.BackupExpansionLimitExceeded, portable_backup.inspectPortableFileBlocks(a, io, file, .{ .max_logical_bytes = inspected.logical_bytes - 1 }, &counter, InspectionCounter.visit));
     try std.testing.expectEqual(@as(usize, 0), counter.blocks);
+    const document_limited = try inspectInputJsonAlloc(a, path, null, .{ .max_document_bytes = 4096 });
+    defer a.free(document_limited);
+    try std.testing.expect(std.mem.indexOf(u8, document_limited, "\"failure_code\":\"limit_exceeded\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, document_limited, "\"scan_complete\":false") != null);
 }
 
 test "backup preflight bounds outer expansion before allocation" {

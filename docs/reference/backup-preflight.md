@@ -42,6 +42,8 @@ An incomplete, blocked, or unknown report is not admission to restore.
 The default library limits are 64 GiB input, 128 GiB scratch/expansion admission,
 4,096 selectors and requirement groups, 16 MiB retained selector bytes, 64 MiB
 per materialized document, and 32 total examples (at most four per group).
+The document limit bounds logical JSON before output allocation, including
+streamed zstd decompression and measured relational-row reconstruction.
 The expansion budget includes per-document compression inside decoded portable
 blocks and is checked before dependency callbacks. Block readers enforce the
 remaining output budget while decompressing, rather than materializing an
@@ -119,14 +121,18 @@ follow the runtime parser.
 When output is interpreted as media or a locator, remote helper output is
 opaque: it can contain or complete media directives even when the fetch URL is
 known. Its dependencies remain incomplete and cannot be certified by destination
-evidence. Literal copy output does not undergo that interpretation; its known
-helper fetch URLs and credentials still require destination evidence. Unsupported
+evidence. Copy output, fixed chunker input, and model chunker text do not
+interpret media markers. Their executed template helper fetch URLs and
+credentials still require destination evidence; structured model chunker media
+and source references follow the shared runtime parser. Unsupported
 helper syntax, opaque output in interpreted positions, and custom loaders are
 reported as `dependency_uninspectable`. This deliberately does not claim to
 interpret all Handlebars programs. Unsupported schemes and structured locators
 are `source_unresolved`. Local paths/gateways and credential-bearing or expiring
 URLs block compatibility. Archive-member and page/fragment selection generate
-separate destination retrieval requirements. Query parameters are split before
+separate destination retrieval requirements. URL credentials use the shared
+credential policy, including API keys, bearer tokens, and fragment parameters.
+Query parameters are split before
 percent-decoding their names; encoded delimiters inside values do not create
 credential or retrieval parameters. No resolver or URL rewrite occurs.
 

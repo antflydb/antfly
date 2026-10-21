@@ -295,7 +295,20 @@ fn modelBackedProducer(producer: Value) bool {
     };
 }
 
-const SourceInput = enum { text, literal, locator, model_chunk, prior_context };
+const SourceInput = enum {
+    text,
+    literal,
+    locator,
+    model_chunk,
+    prior_context,
+
+    fn interpretsTemplateOutput(self: @This()) bool {
+        return switch (self) {
+            .literal, .model_chunk => false,
+            .text, .locator, .prior_context => true,
+        };
+    }
+};
 const Selector = struct { field: []const u8, template: []const u8, program: ?hbs.Template = null, artifact: []const u8, input: SourceInput, dynamic: bool, grouped: bool };
 pub const Inspector = struct {
     allocator: Allocator,
@@ -358,8 +371,10 @@ pub const Inspector = struct {
                 defer self.allocator.free(entries);
                 for (entries) |e| {
                     try self.options.cancellation.check();
-                    if (e.value.len > self.options.max_document_bytes) return error.PreflightLimitExceeded;
-                    const json = try self.decoder.documentJsonAlloc(self.allocator, e);
+                    const json = self.decoder.documentJsonLimitedAlloc(self.allocator, e, self.options.max_document_bytes) catch |err| switch (err) {
+                        error.StreamTooLong => return error.PreflightLimitExceeded,
+                        else => return err,
+                    };
                     defer self.allocator.free(json);
                     try self.document(e.key, json, "");
                     self.report.documents += 1;
@@ -624,7 +639,8 @@ pub const Inspector = struct {
         if (is_definition and (field.len > 0 or template.len > 0 or artifact.len > 0)) {
             const locator_mode = eq(producer_type, "reader") or eq(producer_type, "transcriber") or eq(producer_type, "document_extraction") or eq(str(get(value, "embedding_input")), "pdf_page_images") or eq(str(get(value, "input")), "pdf_page_images") or eq(str(get(value, "embedding_input")), "image") or eq(str(get(value, "embedding_input")), "audio") or eq(str(get(value, "embedding_input")), "video") or get(value, "transcriber") != .null;
             const parsed_type = ProducerType.parse(producer_type) orelse .copy;
-            const literal_output = eq(kind, "asset") and known and !parsed_type.rendersTemplateParts();
+            const literal_output = (eq(kind, "asset") and known and !parsed_type.rendersTemplateParts()) or
+                (eq(kind, "chunk") and !model_chunk);
             try self.selector(field, template, artifact, if (model_chunk) .model_chunk else if (locator_mode) .locator else if (literal_output) .literal else .text, !known, group != null);
         }
         if (is_embedding) {
@@ -766,8 +782,8 @@ pub const Inspector = struct {
         };
         defer parsed.deinit();
         for (self.definitions.items) |s| {
-            // A copy's retained output is inert. Its template helpers are still
-            // inspected at definition time and with each document's context.
+            // Literal consumers do not interpret media markers. Their helpers
+            // are inspected at definition time and with each document's context.
             if (s.input == .literal and s.template.len == 0) continue;
             if (s.grouped) {
                 // Retained group assets and private unit documents are the two
@@ -812,7 +828,7 @@ pub const Inspector = struct {
         };
         switch (source) {
             .none => {},
-            .text => |text| try self.directives(text, doc, field),
+            .text => {},
             .source => |reference| try self.locator(reference.uri, doc, field),
             .media => try self.report.add(self.options, .embedded, "inline", doc, field, 0),
         }
@@ -969,7 +985,7 @@ pub const Inspector = struct {
                             // Fetch results can contain or complete media markers. Keep
                             // known surrounding output for inventory, but never certify
                             // an opaque result, even with destination URL evidence.
-                            if (input != .literal) try self.report.add(self.options, .dynamic_loader, "helper_output", doc, field, 0);
+                            if (input.interpretsTemplateOutput()) try self.report.add(self.options, .dynamic_loader, "helper_output", doc, field, 0);
                             const literal = try a.create(hbs.Node);
                             literal.* = .{ .string_literal = .{ .value = "\x00" } };
                             const inert = try a.create(hbs.Node);
@@ -1002,7 +1018,7 @@ pub const Inspector = struct {
             if (program.program.body.len != 1) try self.report.add(self.options, .dynamic_loader, "composed_locator", doc, field, 0);
         } else if (locator_mode) {
             try self.locator(output.items, doc, field);
-        } else if (input != .literal) {
+        } else if (input.interpretsTemplateOutput()) {
             // Scan the complete known output, including markers assembled from
             // several literals/references, with no producer or helper execution.
             try self.directives(output.items, doc, field);
@@ -1029,7 +1045,7 @@ pub const Inspector = struct {
             return;
         }
         const host = if (uri.host) |h| std.mem.trimEnd(u8, try std.ascii.allocLowerString(a, try h.toRawMaybeAlloc(a)), ".") else "";
-        if (uri.user != null or uri.password != null) try self.report.add(self.options, .source_expiring, "embedded_credentials", doc, field, 0);
+        var temporary_access = @import("../../common/credential_safety.zig").urlContainsCredentials(text);
         if (uri.query) |q| {
             // Split before decoding: escaped '&' and '=' belong to a query
             // component and must never manufacture another parameter.
@@ -1041,11 +1057,12 @@ pub const Inspector = struct {
                 const encoded_key = part[0 .. std.mem.indexOfScalar(u8, part, '=') orelse part.len];
                 const component: std.Uri.Component = .{ .percent_encoded = encoded_key };
                 const key = try std.ascii.allocLowerString(a, try component.toRawMaybeAlloc(a));
-                if (eq(key, "sig") or eq(key, "signature") or eq(key, "token") or eq(key, "expires") or eq(key, "se") or eq(key, "x-amz-signature") or eq(key, "x-goog-signature") or eq(key, "x-amz-credential") or eq(key, "x-goog-credential") or eq(key, "access_token") or eq(key, "auth") or eq(key, "key") or eq(key, "expiry") or eq(key, "expires_at") or eq(key, "x-amz-expires") or eq(key, "x-goog-expires")) try self.report.add(self.options, .source_expiring, "temporary_access", doc, field, 0);
+                if (eq(key, "expires") or eq(key, "se") or eq(key, "expiry") or eq(key, "expires_at") or eq(key, "x-amz-expires") or eq(key, "x-goog-expires")) temporary_access = true;
                 if (eq(key, "page") or eq(key, "pages") or eq(key, "range") or eq(key, "page_number") or eq(key, "page_index") or eq(key, "page_range")) try self.report.add(self.options, .page_retrieval, "page_selection", doc, field, 0);
                 if (eq(key, "member") or eq(key, "entry") or eq(key, "archive")) try self.report.add(self.options, .archive_retrieval, "archive_member", doc, field, 0);
             }
         }
+        if (temporary_access) try self.report.add(self.options, .source_expiring, "temporary_access", doc, field, 0);
         if (uri.fragment != null) try self.report.add(self.options, .page_retrieval, "fragment_selection", doc, field, 0);
         const path = try uri.path.toRawMaybeAlloc(a);
         if (eq(uri.scheme, "zip") or std.mem.endsWith(u8, path, ".zip") or std.mem.endsWith(u8, path, ".tar") or std.mem.endsWith(u8, path, ".tgz") or std.mem.indexOf(u8, path, ".zip/") != null or std.mem.indexOf(u8, path, ".zip!") != null or std.mem.indexOf(u8, path, "!/") != null) try self.report.add(self.options, .archive_retrieval, "archive_member", doc, field, 0);
@@ -2059,4 +2076,131 @@ test "backup preflight literal copy still inventories executed template fetches 
     );
     try inspector.document("doc", "{\"body\":\"<<<dotprompt:media:url file:///private/active.pdf>>>\"}", "");
     try std.testing.expectEqual(@as(u64, 2), count(report, .source_local));
+}
+
+test "backup preflight credential URL aliases share the URL safety policy" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "https://media.example.org/doc.pdf?api_key=TEST_SECRET",
+        "https://media.example.org/doc.pdf?%61pi_key=TEST_SECRET",
+        "https://media.example.org/doc.pdf?bearer_token=TEST_SECRET",
+        "https://media.example.org/doc.pdf#capability_token=TEST_SECRET",
+    }) |source| {
+        try std.testing.expect(@import("../../common/credential_safety.zig").urlContainsCredentials(source));
+        var report: Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        try inspector.locator(source, "doc", "image");
+        const caps = try a.alloc(Capability, report.requirements.items.len);
+        defer a.free(caps);
+        for (report.requirements.items, caps) |*r, *cap| cap.* = .{ .requirement_sha256 = &r.sha256, .supported = true };
+        const evidence = try std.json.Stringify.valueAlloc(a, Destination{ .version = 1, .configuration_id = "public", .requirements = caps }, .{});
+        defer a.free(evidence);
+        const json = try report.jsonAlloc(evidence);
+        defer a.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"compatibility\":{\"verdict\":\"blocked\"") != null);
+        try std.testing.expect(count(report, .source_expiring) > 0);
+        try std.testing.expect(std.mem.indexOf(u8, json, "TEST_SECRET") == null);
+    }
+}
+
+test "backup preflight fixed chunk input is literal text" {
+    const a = std.testing.allocator;
+    const text = "Documentation example: <<<dotprompt:media:url file:///private/example.pdf>>>";
+    const chunks = try @import("../db/enrichment/chunker_stub.zig").chunkText(a, text, 1024, 0);
+    defer {
+        for (chunks) |*chunk| chunk.deinit(a);
+        a.free(chunks);
+    }
+    try std.testing.expectEqualStrings(text, chunks[0].text.?);
+    for ([_][]const u8{ "", "{{{body}}}" }) |source_template| {
+        try @import("../db/enrichment/config_validation.zig").validatePublicConfig(a, .{ .template = source_template, .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 1024 });
+        const metadata = try @import("../db/catalog/enrichment_catalog.zig").serializeCatalog(a, &.{.{ .name = "chunks", .kind = .chunk, .source_template = source_template, .source_field = "body", .chunk_size = 1024 }});
+        defer a.free(metadata);
+        const raw = try std.json.Stringify.valueAlloc(a, .{ .body = text }, .{});
+        defer a.free(raw);
+        var report: Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        try inspector.metadataJson(metadata);
+        try inspector.document("doc", raw, "");
+        const json = try report.jsonAlloc("{\"version\":1,\"configuration_id\":\"empty\"}");
+        defer a.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"compatibility\":{\"verdict\":\"compatible\"") != null);
+        try std.testing.expectEqual(@as(u64, 0), count(report, .source_local));
+    }
+}
+
+test "backup preflight compressed documents respect the logical materialization budget" {
+    const a = std.testing.allocator;
+    // Zstd frame without a content-size field: raw JSON delimiters around
+    // 256 RLE blocks, each expanding to 128 KiB. No external encoder needed.
+    var compressed: std.ArrayListUnmanaged(u8) = .empty;
+    defer compressed.deinit(a);
+    try compressed.appendSlice(a, &.{ 0x28, 0xb5, 0x2f, 0xfd, 0, 0x58, 0x48, 0, 0 });
+    try compressed.appendSlice(a, "{\"body\":\"");
+    for (0..256) |_| try compressed.appendSlice(a, &.{ 2, 0, 0x10, 'a' });
+    try compressed.appendSlice(a, &.{ 0x11, 0, 0 });
+    try compressed.appendSlice(a, "\"}");
+    try std.testing.expect(compressed.items.len < 4096);
+    const decoded = try codec.decompressZstd(a, compressed.items);
+    defer a.free(decoded);
+    try std.testing.expectEqual(@as(usize, 32 * 1024 * 1024 + 11), decoded.len);
+    const payload = try codec.encodeDocumentBatch(a, &.{.{ .key = "doc", .value_flags = codec.doc_value_flag_compressed, .value = compressed.items, .timestamp_ns = 0 }});
+    defer a.free(payload);
+    const backing = try a.alloc(u8, 16 * 1024 * 1024);
+    defer a.free(backing);
+    var buffer = std.heap.FixedBufferAllocator.init(backing);
+    const bounded = buffer.allocator();
+    var report: Report = .{ .allocator = bounded };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = bounded, .report = &report, .options = .{ .max_document_bytes = 4096 } };
+    defer inspector.deinit();
+    try std.testing.expectError(error.PreflightLimitExceeded, inspector.visit(.document_batch, payload));
+}
+
+test "backup preflight model chunk text does not activate media markers" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "", "{{{body}}}" }) |source_template| {
+        const metadata = try @import("../db/catalog/enrichment_catalog.zig").serializeCatalog(a, &.{.{ .name = "chunks", .kind = .chunk, .source_field = "body", .source_template = source_template, .chunker_json = "{\"provider\":\"antfly\",\"embedding\":{\"model\":\"media-model\",\"dimensions\":3}}" }});
+        defer a.free(metadata);
+        var report: Report = .{ .allocator = a };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        try inspector.metadataJson(metadata);
+        try inspector.document("doc", "{\"body\":\"<<<dotprompt:media:url file:///private/example.pdf>>>\"}", "");
+        try std.testing.expectEqual(@as(u64, 1), count(report, .model));
+        try std.testing.expectEqual(@as(u64, 0), count(report, .source_local));
+        try std.testing.expect(report.analysis_complete);
+    }
+}
+
+test "backup preflight uncompressed document admission uses exact output boundaries" {
+    const a = std.testing.allocator;
+    var decoder: portable.InspectionDocumentDecoder = .{};
+    defer decoder.deinit(a);
+    const entry: codec.DocumentEntry = .{ .key = "doc", .value_flags = 0, .value = "{}", .timestamp_ns = 0 };
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.StreamTooLong, decoder.documentJsonLimitedAlloc(failing.allocator(), entry, 1));
+    const json = try decoder.documentJsonLimitedAlloc(a, entry, 2);
+    defer a.free(json);
+    try std.testing.expectEqualStrings("{}", json);
+}
+
+test "backup preflight compressed output boundary is independent of frame overhead" {
+    const a = std.testing.allocator;
+    const frame = &[_]u8{ 0x28, 0xb5, 0x2f, 0xfd, 0, 0, 0x11, 0, 0, '{', '}' };
+    const payload = try codec.encodeDocumentBatch(a, &.{.{ .key = "doc", .value_flags = codec.doc_value_flag_compressed, .value = frame, .timestamp_ns = 0 }});
+    defer a.free(payload);
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{ .max_document_bytes = 1 } };
+    defer inspector.deinit();
+    try std.testing.expectError(error.PreflightLimitExceeded, inspector.visit(.document_batch, payload));
+    inspector.options.max_document_bytes = 2;
+    try inspector.visit(.document_batch, payload);
+    try std.testing.expectEqual(@as(u64, 1), report.documents);
 }

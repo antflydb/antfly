@@ -2908,14 +2908,16 @@ pub const InspectionDocumentDecoder = struct {
         try validateMetadataBatchPayload(alloc, payload, &self.archive);
     }
 
-    pub fn documentJsonAlloc(self: *@This(), alloc: Allocator, entry: backup_codec.DocumentEntry) ![]u8 {
+    /// Enforce the logical output budget before retaining document JSON.
+    pub fn documentJsonLimitedAlloc(self: *@This(), alloc: Allocator, entry: backup_codec.DocumentEntry, max_bytes: usize) ![]u8 {
         if (entry.value_flags & backup_codec.doc_value_flag_relational_row != 0) {
             const version = try relational_store.rowSchemaVersion(entry.value);
             const layout = (try self.archive.layoutForVersion(version)) orelse return error.InvalidBackupRequest;
-            return relational_store.decodeValueForSchemaAndLayoutAlloc(alloc, entry.value, layout.schema.*, layout.physical);
+            return relational_store.decodeValueForSchemaAndLayoutLimitedAlloc(alloc, entry.value, layout.schema.*, layout.physical, max_bytes);
         }
         if (entry.value_flags & backup_codec.doc_value_flag_compressed != 0)
-            return backup_codec.decompressZstd(alloc, entry.value);
+            return backup_codec.decompressZstdLimited(alloc, entry.value, max_bytes);
+        if (entry.value.len > max_bytes) return error.StreamTooLong;
         return alloc.dupe(u8, entry.value);
     }
 };
