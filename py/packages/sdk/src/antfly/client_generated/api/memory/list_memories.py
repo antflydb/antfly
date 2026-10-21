@@ -27,7 +27,8 @@ def _get_kwargs(
     missing_relationship: str | Unset = UNSET,
     include_history: bool | Unset = UNSET,
     include_provisional: bool | Unset = UNSET,
-    valid_at: int | Unset = UNSET,
+    valid_at: int | None | Unset = UNSET,
+    known_at: int | None | Unset = UNSET,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
 ) -> dict[str, Any]:
@@ -66,7 +67,19 @@ def _get_kwargs(
 
     params["include_provisional"] = include_provisional
 
-    params["valid_at"] = valid_at
+    json_valid_at: int | None | Unset
+    if isinstance(valid_at, Unset):
+        json_valid_at = UNSET
+    else:
+        json_valid_at = valid_at
+    params["valid_at"] = json_valid_at
+
+    json_known_at: int | None | Unset
+    if isinstance(known_at, Unset):
+        json_known_at = UNSET
+    else:
+        json_known_at = known_at
+    params["known_at"] = json_known_at
 
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
@@ -169,7 +182,8 @@ def sync_detailed(
     missing_relationship: str | Unset = UNSET,
     include_history: bool | Unset = UNSET,
     include_provisional: bool | Unset = UNSET,
-    valid_at: int | Unset = UNSET,
+    valid_at: int | None | Unset = UNSET,
+    known_at: int | None | Unset = UNSET,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
 ) -> Response[MemoryError_ | MemoryRecordPage]:
@@ -189,7 +203,8 @@ def sync_detailed(
         missing_relationship (str | Unset):
         include_history (bool | Unset):
         include_provisional (bool | Unset):
-        valid_at (int | Unset):
+        valid_at (int | None | Unset):
+        known_at (int | None | Unset):
         x_antfly_database (str | Unset):  Default: 'default'.
         x_antfly_namespace (str | Unset):  Default: 'public'.
 
@@ -217,6 +232,7 @@ def sync_detailed(
         include_history=include_history,
         include_provisional=include_provisional,
         valid_at=valid_at,
+        known_at=known_at,
         x_antfly_database=x_antfly_database,
         x_antfly_namespace=x_antfly_namespace,
     )
@@ -245,7 +261,8 @@ def sync(
     missing_relationship: str | Unset = UNSET,
     include_history: bool | Unset = UNSET,
     include_provisional: bool | Unset = UNSET,
-    valid_at: int | Unset = UNSET,
+    valid_at: int | None | Unset = UNSET,
+    known_at: int | None | Unset = UNSET,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
 ) -> MemoryError_ | MemoryRecordPage | None:
@@ -265,7 +282,8 @@ def sync(
         missing_relationship (str | Unset):
         include_history (bool | Unset):
         include_provisional (bool | Unset):
-        valid_at (int | Unset):
+        valid_at (int | None | Unset):
+        known_at (int | None | Unset):
         x_antfly_database (str | Unset):  Default: 'default'.
         x_antfly_namespace (str | Unset):  Default: 'public'.
 
@@ -294,6 +312,7 @@ def sync(
         include_history=include_history,
         include_provisional=include_provisional,
         valid_at=valid_at,
+        known_at=known_at,
         x_antfly_database=x_antfly_database,
         x_antfly_namespace=x_antfly_namespace,
     ).parsed
@@ -316,7 +335,8 @@ async def asyncio_detailed(
     missing_relationship: str | Unset = UNSET,
     include_history: bool | Unset = UNSET,
     include_provisional: bool | Unset = UNSET,
-    valid_at: int | Unset = UNSET,
+    valid_at: int | None | Unset = UNSET,
+    known_at: int | None | Unset = UNSET,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
 ) -> Response[MemoryError_ | MemoryRecordPage]:
@@ -336,7 +356,8 @@ async def asyncio_detailed(
         missing_relationship (str | Unset):
         include_history (bool | Unset):
         include_provisional (bool | Unset):
-        valid_at (int | Unset):
+        valid_at (int | None | Unset):
+        known_at (int | None | Unset):
         x_antfly_database (str | Unset):  Default: 'default'.
         x_antfly_namespace (str | Unset):  Default: 'public'.
 
@@ -364,6 +385,7 @@ async def asyncio_detailed(
         include_history=include_history,
         include_provisional=include_provisional,
         valid_at=valid_at,
+        known_at=known_at,
         x_antfly_database=x_antfly_database,
         x_antfly_namespace=x_antfly_namespace,
     )
@@ -390,7 +412,8 @@ async def asyncio(
     missing_relationship: str | Unset = UNSET,
     include_history: bool | Unset = UNSET,
     include_provisional: bool | Unset = UNSET,
-    valid_at: int | Unset = UNSET,
+    valid_at: int | None | Unset = UNSET,
+    known_at: int | None | Unset = UNSET,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
 ) -> MemoryError_ | MemoryRecordPage | None:
@@ -410,7 +433,8 @@ async def asyncio(
         missing_relationship (str | Unset):
         include_history (bool | Unset):
         include_provisional (bool | Unset):
-        valid_at (int | Unset):
+        valid_at (int | None | Unset):
+        known_at (int | None | Unset):
         x_antfly_database (str | Unset):  Default: 'default'.
         x_antfly_namespace (str | Unset):  Default: 'public'.
 
@@ -440,6 +464,7 @@ async def asyncio(
             include_history=include_history,
             include_provisional=include_provisional,
             valid_at=valid_at,
+            known_at=known_at,
             x_antfly_database=x_antfly_database,
             x_antfly_namespace=x_antfly_namespace,
         )

@@ -62,3 +62,64 @@ func TestMemorySupersessionBoundaryPreservesUnknownAndEpoch(t *testing.T) {
 		})
 	}
 }
+
+// Temporal presence must survive generated typed requests, not just raw JSON.
+func TestMemoryNullableNumbersPreserveZeroAndAbsence(t *testing.T) {
+	cases := []struct {
+		name, raw string
+		newValue  func() any
+		fields    []string
+	}{
+		{"recall", `{"known_at":0,"valid_at":0}`, func() any { return &MemoryRecallRequest{} }, []string{"known_at", "valid_at"}},
+		{"explain", `{"known_at":0,"valid_at":0}`, func() any { return &MemoryExplainRequest{} }, []string{"known_at", "valid_at"}},
+		{"assertion", `{"valid_from":0,"valid_to":0}`, func() any { return &MemoryAssertion{} }, []string{"valid_from", "valid_to"}},
+		{"evidence", `{"event_time":0,"expires_at":0,"ordinal":0}`, func() any { return &MemoryEvidence{} }, []string{"event_time", "expires_at", "ordinal"}},
+		{"config", `{"retention_ms":0}`, func() any { return &MemorySpaceConfig{} }, []string{"retention_ms"}},
+		{"record", `{"asserted_valid_to":0,"recorded_to":0}`, func() any { return &MemoryRecord{} }, []string{"asserted_valid_to", "recorded_to"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, present := range []bool{false, true} {
+				raw := `{}`
+				if present {
+					raw = tc.raw
+				}
+				value := tc.newValue()
+				if err := json.Unmarshal([]byte(raw), value); err != nil {
+					t.Fatal(err)
+				}
+				encoded, err := json.Marshal(value)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var fields map[string]json.RawMessage
+				if err = json.Unmarshal(encoded, &fields); err != nil {
+					t.Fatal(err)
+				}
+				for _, name := range tc.fields {
+					field, exists := fields[name]
+					if present && (!exists || string(field) != "0") {
+						t.Fatalf("explicit zero %s lost: %s", name, encoded)
+					}
+					if !present && exists && string(field) != "null" {
+						t.Fatalf("absent %s became a timestamp: %s", name, encoded)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestMemoryListQueryPreservesEpochZero(t *testing.T) {
+	epoch := int64(0)
+	request, err := NewListMemoriesRequest("http://memory.test", "team", &ListMemoriesParams{KnownAt: &epoch, ValidAt: &epoch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := request.URL.Query()
+	for _, name := range []string{"known_at", "valid_at"} {
+		if !query.Has(name) || query.Get(name) != "0" {
+			t.Fatalf("epoch query %s lost: %s", name, request.URL)
+		}
+	}
+}

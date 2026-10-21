@@ -534,6 +534,7 @@ pub const ListMemoriesParams = struct {
     include_history: ?[]const u8 = null,
     include_provisional: ?[]const u8 = null,
     valid_at: ?[]const u8 = null,
+    known_at: ?[]const u8 = null,
 };
 
 pub const GetMemoryHistoryParams = struct {
@@ -5268,6 +5269,14 @@ pub const Client = struct {
             defer self.allocator.free(encoded_query_value);
             try query_buf.appendSlice(self.allocator, &.{sep});
             try query_buf.appendSlice(self.allocator, "valid_at=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.known_at) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "known_at=");
             try query_buf.appendSlice(self.allocator, encoded_query_value);
             sep = '&';
         }

@@ -1157,3 +1157,27 @@ numeric fields; its ordinary `api` routes retain their existing numeric types.
 Use `stringifyMemoryJSON` when serializing a decoded HTTP memory value outside
 the client. This keeps the native wire contract identical for Go, Python, Rust,
 HTTP, MCP and embedded callers.
+
+
+### Outcome retirement, publication coverage, and nullable numbers
+
+Outcome explanations, retries with a new key, and physical cleanup use one
+retention gate. Global forgetting and retirement of any used assertion's support
+hide feedback immediately, before the cleanup cursor reaches its row. Graph
+traversal redacts the same unavailable outcome. Current source authorization is
+also required to read feedback; temporary source denial and identity suppression
+do not authorize its physical deletion.
+
+Configuration publication counts every durably retained assertion as a coverage
+obligation. Temporary source denial pauses the build at its committed cursor and
+leaves the serving generation intact. Such a pause does not consume a producer
+attempt or discard pending external vectors. Restoring access lets the same build
+resume. Irreversibly retired assertions can be omitted. Ontology validation uses
+the same coverage rule, so access loss cannot silently exclude retained knowledge
+from a configuration migration.
+
+Nullable numeric wire fields preserve presence in generated clients. Epoch zero,
+zero retention duration, and zero-valued selectors remain distinct from absent
+or null fields. The OpenAPI generator derives this rule from native optional
+numeric types, including nested records, rather than maintaining a list of time
+field names. List and recall time filters share that contract.

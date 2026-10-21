@@ -1337,6 +1337,15 @@ paths:
         in: query
         schema:
           type: integer
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+          format: int64
+      - name: known_at
+        in: query
+        schema:
+          type: integer
+          nullable: true
+          x-go-type-skip-optional-pointer: false
           format: int64
       responses:
         '200':
@@ -2735,9 +2744,11 @@ components:
         applied_at:
           type: integer
           nullable: true
+          x-go-type-skip-optional-pointer: false
         effective_at:
           type: integer
           nullable: true
+          x-go-type-skip-optional-pointer: false
         recorded_at:
           type: integer
         configuration:
@@ -3080,6 +3091,7 @@ components:
         ended_at:
           type: integer
           nullable: true
+          x-go-type-skip-optional-pointer: false
         status:
           type: string
           enum:
@@ -3195,6 +3207,7 @@ components:
         expected_revision:
           type: integer
           nullable: true
+          x-go-type-skip-optional-pointer: false
       required:
       - table
       - id
@@ -3458,12 +3471,15 @@ components:
         revision:
           type: integer
           nullable: true
+          x-go-type-skip-optional-pointer: false
         valid_at:
           type: integer
           nullable: true
+          x-go-type-skip-optional-pointer: false
         known_at:
           type: integer
           nullable: true
+          x-go-type-skip-optional-pointer: false
         max_bytes:
           type: integer
         max_nodes:
@@ -3523,6 +3539,7 @@ components:
                 dimensions:
                   type: integer
                   nullable: true
+                  x-go-type-skip-optional-pointer: false
               required:
               - provider
               - model
@@ -3541,6 +3558,7 @@ components:
                 dimensions:
                   type: integer
                   nullable: true
+                  x-go-type-skip-optional-pointer: false
               required:
               - provider
               - model
@@ -3559,6 +3577,7 @@ components:
                 dimensions:
                   type: integer
                   nullable: true
+                  x-go-type-skip-optional-pointer: false
               required:
               - provider
               - model
@@ -3577,6 +3596,7 @@ components:
                 dimensions:
                   type: integer
                   nullable: true
+                  x-go-type-skip-optional-pointer: false
               required:
               - provider
               - model
@@ -3634,6 +3654,7 @@ components:
         retention_ms:
           type: integer
           nullable: true
+          x-go-type-skip-optional-pointer: false
       additionalProperties: false
     MemoryEvidence:
       type: object
@@ -3717,6 +3738,7 @@ components:
             expected_revision:
               type: integer
               nullable: true
+              x-go-type-skip-optional-pointer: false
           required:
           - table
           - id
@@ -3731,6 +3753,7 @@ components:
         event_time:
           type: integer
           nullable: true
+          x-go-type-skip-optional-pointer: false
         timezone:
           type: string
           nullable: true
@@ -3743,6 +3766,7 @@ components:
         ordinal:
           type: integer
           nullable: true
+          x-go-type-skip-optional-pointer: false
         producer:
           type: string
         managed:
@@ -3755,6 +3779,7 @@ components:
         expires_at:
           type: integer
           nullable: true
+          x-go-type-skip-optional-pointer: false
       required:
       - id
       additionalProperties: false
@@ -3816,9 +3841,11 @@ components:
         valid_from:
           type: integer
           nullable: true
+          x-go-type-skip-optional-pointer: false
         valid_to:
           type: integer
           nullable: true
+          x-go-type-skip-optional-pointer: false
         evidence:
           type: array
           items:
@@ -3926,6 +3953,7 @@ components:
             dimensions:
               type: integer
               nullable: true
+              x-go-type-skip-optional-pointer: false
           required:
           - provider
           - model
@@ -4320,9 +4348,11 @@ components:
         valid_at:
           type: integer
           nullable: true
+          x-go-type-skip-optional-pointer: false
         known_at:
           type: integer
           nullable: true
+          x-go-type-skip-optional-pointer: false
         include_history:
           type: boolean
         include_provisional:
@@ -4351,6 +4381,7 @@ components:
             dimensions:
               type: integer
               nullable: true
+              x-go-type-skip-optional-pointer: false
           required:
           - provider
           - model
@@ -4395,6 +4426,7 @@ components:
         next_retry_at:
           type: integer
           nullable: true
+          x-go-type-skip-optional-pointer: false
       required:
       - id
       - action
@@ -4471,9 +4503,11 @@ components:
             valid_from:
               type: integer
               nullable: true
+              x-go-type-skip-optional-pointer: false
             valid_to:
               type: integer
               nullable: true
+              x-go-type-skip-optional-pointer: false
             evidence:
               type: array
               items:
@@ -4581,6 +4615,7 @@ components:
                 dimensions:
                   type: integer
                   nullable: true
+                  x-go-type-skip-optional-pointer: false
               required:
               - provider
               - model
@@ -4603,6 +4638,7 @@ components:
         asserted_valid_to:
           type: integer
           nullable: true
+          x-go-type-skip-optional-pointer: false
         explicit_disposition:
           type: object
           properties:
@@ -4653,6 +4689,7 @@ components:
             valid_to:
               type: integer
               nullable: true
+              x-go-type-skip-optional-pointer: false
             superseded_by:
               type: string
               nullable: true
@@ -4663,6 +4700,7 @@ components:
             recorded_to:
               type: integer
               nullable: true
+              x-go-type-skip-optional-pointer: false
             conflicts_with:
               type: array
               items:
@@ -4706,6 +4744,7 @@ components:
         recorded_to:
           type: integer
           nullable: true
+          x-go-type-skip-optional-pointer: false
         superseded_by:
           type: string
           nullable: true
@@ -4821,6 +4860,7 @@ components:
             dimensions:
               type: integer
               nullable: true
+              x-go-type-skip-optional-pointer: false
           required:
           - provider
           - model
@@ -4915,9 +4955,11 @@ components:
                       valid_from:
                         type: integer
                         nullable: true
+                        x-go-type-skip-optional-pointer: false
                       valid_to:
                         type: integer
                         nullable: true
+                        x-go-type-skip-optional-pointer: false
                       evidence:
                         type: array
                         items:
@@ -5025,6 +5067,7 @@ components:
                           dimensions:
                             type: integer
                             nullable: true
+                            x-go-type-skip-optional-pointer: false
                         required:
                         - provider
                         - model
@@ -5047,6 +5090,7 @@ components:
                   asserted_valid_to:
                     type: integer
                     nullable: true
+                    x-go-type-skip-optional-pointer: false
                   explicit_disposition:
                     type: object
                     properties:
@@ -5097,6 +5141,7 @@ components:
                       valid_to:
                         type: integer
                         nullable: true
+                        x-go-type-skip-optional-pointer: false
                       superseded_by:
                         type: string
                         nullable: true
@@ -5107,6 +5152,7 @@ components:
                       recorded_to:
                         type: integer
                         nullable: true
+                        x-go-type-skip-optional-pointer: false
                       conflicts_with:
                         type: array
                         items:
@@ -5150,6 +5196,7 @@ components:
                   recorded_to:
                     type: integer
                     nullable: true
+                    x-go-type-skip-optional-pointer: false
                   superseded_by:
                     type: string
                     nullable: true
@@ -5298,9 +5345,11 @@ components:
                   valid_from:
                     type: integer
                     nullable: true
+                    x-go-type-skip-optional-pointer: false
                   valid_to:
                     type: integer
                     nullable: true
+                    x-go-type-skip-optional-pointer: false
                   evidence:
                     type: array
                     items:
@@ -5408,6 +5457,7 @@ components:
                       dimensions:
                         type: integer
                         nullable: true
+                        x-go-type-skip-optional-pointer: false
                     required:
                     - provider
                     - model
@@ -5430,6 +5480,7 @@ components:
               asserted_valid_to:
                 type: integer
                 nullable: true
+                x-go-type-skip-optional-pointer: false
               explicit_disposition:
                 type: object
                 properties:
@@ -5480,6 +5531,7 @@ components:
                   valid_to:
                     type: integer
                     nullable: true
+                    x-go-type-skip-optional-pointer: false
                   superseded_by:
                     type: string
                     nullable: true
@@ -5490,6 +5542,7 @@ components:
                   recorded_to:
                     type: integer
                     nullable: true
+                    x-go-type-skip-optional-pointer: false
                   conflicts_with:
                     type: array
                     items:
@@ -5533,6 +5586,7 @@ components:
               recorded_to:
                 type: integer
                 nullable: true
+                x-go-type-skip-optional-pointer: false
               superseded_by:
                 type: string
                 nullable: true
@@ -5625,6 +5679,7 @@ components:
               recorded_at:
                 type: integer
                 nullable: true
+                x-go-type-skip-optional-pointer: false
             required:
             - entity
             - owner
@@ -5705,6 +5760,7 @@ components:
                         dimensions:
                           type: integer
                           nullable: true
+                          x-go-type-skip-optional-pointer: false
                       required:
                       - provider
                       - model
@@ -5723,6 +5779,7 @@ components:
                         dimensions:
                           type: integer
                           nullable: true
+                          x-go-type-skip-optional-pointer: false
                       required:
                       - provider
                       - model
@@ -5741,6 +5798,7 @@ components:
                         dimensions:
                           type: integer
                           nullable: true
+                          x-go-type-skip-optional-pointer: false
                       required:
                       - provider
                       - model
@@ -5759,6 +5817,7 @@ components:
                         dimensions:
                           type: integer
                           nullable: true
+                          x-go-type-skip-optional-pointer: false
                       required:
                       - provider
                       - model
@@ -5816,6 +5875,7 @@ components:
                 retention_ms:
                   type: integer
                   nullable: true
+                  x-go-type-skip-optional-pointer: false
               additionalProperties: false
             pending_config:
               type: object
@@ -5869,6 +5929,7 @@ components:
                         dimensions:
                           type: integer
                           nullable: true
+                          x-go-type-skip-optional-pointer: false
                       required:
                       - provider
                       - model
@@ -5887,6 +5948,7 @@ components:
                         dimensions:
                           type: integer
                           nullable: true
+                          x-go-type-skip-optional-pointer: false
                       required:
                       - provider
                       - model
@@ -5905,6 +5967,7 @@ components:
                         dimensions:
                           type: integer
                           nullable: true
+                          x-go-type-skip-optional-pointer: false
                       required:
                       - provider
                       - model
@@ -5923,6 +5986,7 @@ components:
                         dimensions:
                           type: integer
                           nullable: true
+                          x-go-type-skip-optional-pointer: false
                       required:
                       - provider
                       - model
@@ -5980,6 +6044,7 @@ components:
                 retention_ms:
                   type: integer
                   nullable: true
+                  x-go-type-skip-optional-pointer: false
               additionalProperties: false
               nullable: true
             revision:

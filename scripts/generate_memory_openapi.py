@@ -32,13 +32,13 @@ def convert(value):
         return value
     if "anyOf" in value and any(item.get("type") == "null" for item in value["anyOf"]):
         inner = next(item for item in value["anyOf"] if item.get("type") != "null")
-        return {**convert(inner), "nullable": True}
-    result = {key: convert(child) for key, child in value.items()}
-    boundary = result.get("properties", {}).get("superseded_valid_at")
-    if boundary is not None:
-        # Unknown replacement time must not collapse into Unix epoch zero.
-        boundary["x-go-type-skip-optional-pointer"] = False
-    return result
+        result = {**convert(inner), "nullable": True}
+        if result.get("type") in ("integer", "number", "boolean"):
+            # Presence is semantic: zero is a valid epoch, revision selector,
+            # retention duration or score. Go value fields lose it on marshal.
+            result["x-go-type-skip-optional-pointer"] = False
+        return result
+    return {key: convert(child) for key, child in value.items()}
 
 
 def optional(schema, required=()):
@@ -196,7 +196,11 @@ def main():
                         for key in ("include_history", "include_provisional")
                     }
                 )
-                fields["valid_at"] = {"type": "integer", "format": "int64"}
+                for field in ("valid_at", "known_at"):
+                    fields[field] = {
+                        **schemas["MemoryRecallRequest"]["properties"][field],
+                        "format": "int64",
+                    }
             params.extend(
                 {"name": key, "in": "query", "schema": schema}
                 for key, schema in fields.items()

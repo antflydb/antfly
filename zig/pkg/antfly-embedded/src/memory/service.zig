@@ -555,6 +555,28 @@ const Run = struct {
         try self.views.put(self.a, cache_key, result);
         return result;
     }
+    // Publication coverage excludes only irreversible retirement. A denied
+    // source remains an obligation; never publish a generation that silently
+    // skipped it, and never spend the model retry budget waiting for access.
+    fn publicationCandidate(self: *Run, record: t.StoredAssertion) !bool {
+        const previous = self.retention_maintenance;
+        self.retention_maintenance = true;
+        const durable = self.retained(record, 0);
+        self.retention_maintenance = previous;
+        if (!try durable) return false;
+        if (!try self.retained(record, 0)) return error.Forbidden;
+        return true;
+    }
+    fn outcomeRetained(self: *Run, record: StoredOutcome) !bool {
+        if (try self.read(bool, "forgotten-all") != null or
+            try self.read(bool, try key(self.a, "forgotten-outcome", record.outcome.id)) != null) return false;
+        for (record.outcome.used_memory_ids) |id| {
+            const parent = (try self.assertion(id)) orelse return false;
+            self.authorize(parent.owner, parent.assertion.visibility) catch return false;
+            if (!try self.retained(parent, 0)) return false;
+        }
+        return true;
+    }
     fn retainedInner(self: *Run, record: t.StoredAssertion, depth: u8) anyerror!bool {
         if (depth >= max_dependency_depth) return error.MemoryWorkLimit;
         if (try self.read(bool, "forgotten-all") != null or try self.read(bool, try key(self.a, "forgotten-assertion", record.assertion.id)) != null) return false;
@@ -1164,7 +1186,7 @@ const Run = struct {
             const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "assertion/", after, 64);
             for (page.rows) |row| {
                 const record = try parse(t.StoredAssertion, self.a, row.json);
-                if (!try self.retained(record, 0)) continue;
+                if (!try self.publicationCandidate(record)) continue;
                 if (affected.count() >= t.max_items) return error.MemoryWorkLimit;
                 try self.validateOntology(record.assertion);
                 try affected.put(self.a, record.assertion.id, record);
@@ -1540,6 +1562,7 @@ const Run = struct {
         const path = try key(self.a, "outcome", request.id);
         if (try self.read(StoredOutcome, path)) |old| {
             try self.authorize(old.owner, .private);
+            if (!try self.outcomeRetained(old)) return error.MemoryForgotten;
             if (!eql(u8, try self.encode(old.outcome), try self.encode(request))) return error.MemoryOutcomeConflict;
             return;
         }
@@ -1566,6 +1589,9 @@ const Run = struct {
         defer self.service.context.principal = caller;
         if (eql(u8, pending.action, "configure")) {
             self.reindex(path, &pending, receipt) catch |err| {
+                // Source authorization is a publication prerequisite, not a
+                // producer failure. Keep the durable cursor and retry budget.
+                if (err == error.Forbidden or err == error.Unauthorized) return err;
                 if (err != error.MemoryExternalVectorRequired) pending.attempts += 1;
                 try self.processingFailure(path, &pending, receipt, err);
                 if (pending.phase == .failed) {
@@ -1697,7 +1723,7 @@ const Run = struct {
         const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "assertion/", pending.cursor, 8);
         for (page.rows) |row| {
             const record = try parse(t.StoredAssertion, self.a, row.json);
-            if (!try self.retained(record, 0)) continue;
+            if (!try self.publicationCandidate(record)) continue;
             if (eql(u8, config.models.embedder.?.provider, "external")) {
                 if (try self.vectorFor(config, record.assertion) == null) return error.MemoryExternalVectorRequired;
             } else {
@@ -1880,12 +1906,7 @@ const Run = struct {
             if ((!serving and !staging) or record == null or !try self.retained(record.?, 0)) try self.remove(row.key);
         } else if (std.mem.startsWith(u8, row.key, "outcome/")) {
             const stored = try parse(StoredOutcome, self.a, row.json);
-            var remove_outcome = try self.read(bool, "forgotten-all") != null;
-            for (stored.outcome.used_memory_ids) |used| {
-                const parent = try self.assertion(used);
-                if (parent == null or !try self.retained(parent.?, 0)) remove_outcome = true;
-            }
-            if (remove_outcome) {
+            if (!try self.outcomeRetained(stored)) {
                 try self.put(try key(self.a, "forgotten-outcome", stored.outcome.id), true);
                 try self.remove(row.key);
             }
@@ -2284,6 +2305,7 @@ const Run = struct {
             .outcome => {
                 const record = (try self.read(StoredOutcome, try key(self.a, "outcome", ref.id))) orelse return error.MemoryNotFound;
                 try self.authorize(record.owner, .private);
+                if (!try self.outcomeRetained(record)) return error.MemoryForgotten;
                 if (ref.revision > 0 and ref.revision != record.revision) return error.MemoryNotFound;
                 ref.revision = record.revision;
                 try self.requireKnownAt(ref.*, record.recorded_at, request);

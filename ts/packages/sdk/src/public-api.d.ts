@@ -38801,7 +38801,8 @@ export interface operations {
                 missing_relationship?: string;
                 include_history?: boolean;
                 include_provisional?: boolean;
-                valid_at?: number;
+                valid_at?: number | null;
+                known_at?: number | null;
             };
             header?: {
                 /** @description Catalog scope for this memory space. */
