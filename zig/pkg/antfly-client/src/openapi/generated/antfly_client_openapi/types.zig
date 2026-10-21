@@ -28714,6 +28714,8 @@ pub const InferenceModelRef = struct {
 };
 
 pub const InferenceModelsResponse = struct {
+    /// Whether public inference execution is enabled on this deployment. Internal database inference is independent. Omitted by standalone inference runtimes without deployment policy.
+    public_inference_enabled: ?bool = null,
     /// OpenAI-compatible response object type.
     object: []const u8,
     /// OpenAI-compatible flat model list for generation/embedding models.
@@ -28739,6 +28741,67 @@ pub const InferenceModelsResponse = struct {
     readers: std.json.ArrayHashMap(InferenceModelInfo),
     /// Available transcriber/speech-to-text models from models_dir/transcribers/
     transcribers: std.json.ArrayHashMap(InferenceModelInfo),
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "public_inference_enabled", "public_inference_enabled", true },
+        .{ "object", "object", false },
+        .{ "data", "data", false },
+        .{ "allow_downloads", "allow_downloads", false },
+        .{ "backends", "backends", false },
+        .{ "chunkers", "chunkers", false },
+        .{ "rerankers", "rerankers", false },
+        .{ "embedders", "embedders", false },
+        .{ "extractors", "extractors", false },
+        .{ "deciders", "deciders", false },
+        .{ "generators", "generators", false },
+        .{ "rewriters", "rewriters", false },
+        .{ "readers", "readers", false },
+        .{ "transcribers", "transcribers", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.public_inference_enabled) |value| {
+            try jw.objectField("public_inference_enabled");
+            try jw.write(value);
+        }
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        try jw.objectField("allow_downloads");
+        try jw.write(self.allow_downloads);
+        try jw.objectField("backends");
+        try jw.write(self.backends);
+        try jw.objectField("chunkers");
+        try jw.write(self.chunkers);
+        try jw.objectField("rerankers");
+        try jw.write(self.rerankers);
+        try jw.objectField("embedders");
+        try jw.write(self.embedders);
+        try jw.objectField("extractors");
+        try jw.write(self.extractors);
+        try jw.objectField("deciders");
+        try jw.write(self.deciders);
+        try jw.objectField("generators");
+        try jw.write(self.generators);
+        try jw.objectField("rewriters");
+        try jw.write(self.rewriters);
+        try jw.objectField("readers");
+        try jw.write(self.readers);
+        try jw.objectField("transcribers");
+        try jw.write(self.transcribers);
+        try jw.endObject();
+    }
 };
 
 pub const InferencePredictRequest = struct {
@@ -28837,10 +28900,40 @@ pub const InferencePredictorTask = enum {
 };
 
 pub const InferencePredictorsResponse = struct {
+    /// Whether public inference execution is enabled on this deployment.
+    public_inference_enabled: ?bool = null,
     /// Response object type.
     object: []const u8,
     /// Traditional ML predictors keyed by predictor name.
     predictors: std.json.ArrayHashMap(InferencePredictorInfo),
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "public_inference_enabled", "public_inference_enabled", true },
+        .{ "object", "object", false },
+        .{ "predictors", "predictors", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.public_inference_enabled) |value| {
+            try jw.objectField("public_inference_enabled");
+            try jw.write(value);
+        }
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("predictors");
+        try jw.write(self.predictors);
+        try jw.endObject();
+    }
 };
 
 /// Native generator prompt KV cache configuration.

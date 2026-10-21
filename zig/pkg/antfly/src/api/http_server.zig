@@ -8017,11 +8017,16 @@ pub const ApiHttpServer = struct {
         return self.rowPolicyProof(alloc, identity, context, table_id, physical_table, database, schema_version, .write);
     }
 
+    pub fn publicInferenceEnabled(self: *const ApiHttpServer) bool {
+        return if (self.cfg.node_config) |config| config.public_inference.enabled else true;
+    }
+
     pub fn authorizeInferenceRequest(
         self: *ApiHttpServer,
         request: AuthenticatedRequest,
         permission: kernel_abi.InferencePermission,
     ) !kernel_abi.AuthorizationDecision {
+        if (permission == .write and !self.publicInferenceEnabled()) return .forbidden;
         if (!self.cfg.auth_enabled and self.cfg.trusted_principal_secret == null and
             request.trusted_principal == null)
             return .allowed;

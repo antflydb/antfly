@@ -303,6 +303,8 @@ pub const Config = struct {
     ha: ?HotStandbyConfig = null,
     hot_standby: ?HotStandbyConfig = null,
     metadata: ?MetadataInfo = null,
+    /// Deployment policy for public inference APIs. Does not disable internal database inference.
+    public_inference: ?std.json.Value = null,
     inference: ?antfly_inference_config_openapi.RuntimeConfig = null,
     tls: ?TLSInfo = null,
     remote_content: ?antfly_scraping_openapi.RemoteContentConfig = null,
@@ -376,6 +378,7 @@ pub const Config = struct {
         .{ "ha", "ha", true },
         .{ "hot_standby", "hot_standby", true },
         .{ "metadata", "metadata", true },
+        .{ "public_inference", "public_inference", true },
         .{ "inference", "inference", false },
         .{ "tls", "tls", true },
         .{ "remote_content", "remote_content", false },
@@ -482,6 +485,10 @@ pub const Config = struct {
         }
         if (self.metadata) |value| {
             try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        if (self.public_inference) |value| {
+            try jw.objectField("public_inference");
             try jw.write(value);
         }
         if (self.inference) |value| {

@@ -21072,6 +21072,8 @@ export interface components {
             source_framework?: string;
         };
         InferencePredictorsResponse: {
+            /** @description Whether public inference execution is enabled on this deployment. */
+            public_inference_enabled?: boolean;
             /**
              * @description Response object type.
              * @enum {string}
@@ -21844,6 +21846,8 @@ export interface components {
             usage: components["schemas"]["DecisionUsage"];
         };
         InferenceModelsResponse: {
+            /** @description Whether public inference execution is enabled on this deployment. Internal database inference is independent. Omitted by standalone inference runtimes without deployment policy. */
+            public_inference_enabled?: boolean;
             /**
              * @description OpenAI-compatible response object type.
              * @enum {string}

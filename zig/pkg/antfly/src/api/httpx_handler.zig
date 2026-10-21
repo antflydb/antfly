@@ -4030,6 +4030,13 @@ pub const AntflyApiHandler = struct {
 
     fn authorizeRequest(self: *AntflyApiHandler, ctx: *httpx.Context, identity: *?AuthenticatedIdentity) !?httpx.Response {
         identity.* = null;
+        const policy_path = http_server_mod.stripApiPrefix(ctx.request.uri.path);
+        if (!self.api_server.publicInferenceEnabled() and
+            ((inference_gateway.ownsPath(policy_path) and !inference_gateway.isDiscoveryPath(policy_path)) or
+                (@import("inference_route_policy.zig").isInferenceApiPath(policy_path) and
+                    ctx.request.method != .GET and ctx.request.method != .HEAD and ctx.request.method != .OPTIONS) or
+                routes.matchInferenceConnectionInvocation(policy_path) != null))
+            return try inference_gateway.disabledResponse(ctx);
         // A supplied trusted identity must be verified, even on an otherwise
         // anonymous standalone server. Missing verifier configuration is not
         // permission to execute that principal's request anonymously.
@@ -4305,7 +4312,7 @@ pub const AntflyApiHandler = struct {
         // Stream errors propagate through the boundary once committed.
         const status: u16 = switch (err) {
             error.InferenceRequestTooLarge => 413,
-            error.ConnectionCapabilityMissing => 403,
+            error.ConnectionCapabilityMissing, error.PublicInferenceDisabled => 403,
             error.ModelNotFound, error.ConnectionNotFound, error.InferenceSessionNotFound => 404,
             error.InferenceCapacityUnavailable, error.DecisionRateLimited, error.InferenceUpstreamRateLimited, error.AttemptLimitExceeded => 429,
             error.InferenceUpstreamUnavailable => 503,
@@ -4324,6 +4331,7 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        if (!self.api_server.publicInferenceEnabled()) return inference_gateway.disabledResponse(ctx);
         if (std.mem.eql(u8, connection_id, common_config.named_inference_connection_id)) {
             const task = inference_gateway.taskForOperation(operation) orelse return gatewayFailure(ctx, error.UnsupportedInferenceFeature);
             inference_gateway.prepare(self.api_server, ctx) catch |err| return gatewayFailure(ctx, err);
@@ -18256,9 +18264,12 @@ test "httpx inference gateway authorization covers inventory execution and sessi
     defer user.deinit(alloc);
     const authorization = try encodeBasicAuthorization(alloc, "gateway-reader", "reader");
     defer alloc.free(authorization);
+    var config = try common_config.Config.parseFromSlice(alloc, "{}");
+    defer config.deinit();
     var source = AuthStatusSource{};
     var target = Target{};
     var api_server = ApiHttpServer.init(alloc, .{
+        .node_config = &config,
         .auth_enabled = true,
         .user_manager = &auth.manager,
         .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke },
@@ -18291,6 +18302,11 @@ test "httpx inference gateway authorization covers inventory execution and sessi
     try auth.manager.addPermissionToUser("gateway-reader", inference_write);
     target.calls = 0;
     try Cases.request(alloc, &handler, authorization, "/ai/v1/chat/completions", 200);
+    try std.testing.expectEqual(@as(usize, 1), target.calls);
+    config.public_inference.enabled = false;
+    try Cases.request(alloc, &handler, authorization, "/ai/v1/chat/completions", 403);
+    try Cases.request(alloc, &handler, authorization, "/ai/v1/transcription/sessions", 403);
+    try Cases.request(alloc, &handler, authorization, "/ai/v1/models", 200);
     try std.testing.expectEqual(@as(usize, 1), target.calls);
 }
 
@@ -18513,4 +18529,113 @@ test "resolver curation HTTP destination checks ignore opaque control metadata" 
     try std.testing.expect(try graphResolverDestinationsAllowedInConfig(null, payload));
     const actual = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"graph\":{\"resolvers\":false}}", .{});
     try std.testing.expectError(error.InvalidCreateTableRequest, graphResolverDestinationsAllowedInConfig(null, actual));
+}
+
+test "httpx inference gateway deployment disable fences public routes but preserves internal invocation" {
+    const a = std.testing.allocator;
+    var config = try common_config.Config.parseFromSlice(a, "{\"public_inference\":{\"enabled\":false}}");
+    defer config.deinit();
+    const Target = struct {
+        calls: usize = 0,
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(context.target_context));
+            self.calls += 1;
+            const body = context.allocator.asStd().dupe(u8, "{}") catch return inference_connection_abi.statusFromError(error.OutOfMemory);
+            context.out_response.* = .{ .status = 200, .body = .{ .ptr = body.ptr, .len = body.len } };
+            return .ok;
+        }
+    };
+    var target = Target{};
+    var source = AuthStatusSource{};
+    var server = ApiHttpServer.init(a, .{
+        .node_config = &config,
+        .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke },
+    }, source.iface(), null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    // The deployment policy applies even without auth. It precedes request
+    // parsing, admission, session allocation, and any physical provider call.
+    for (inference_gateway.public_paths) |path| {
+        if (inference_gateway.isDiscoveryPath(path)) continue;
+        var request = try httpx.Request.init(a, .POST, path);
+        defer request.deinit();
+        var context = httpx.Context.init(a, std.testing.io, &request);
+        defer context.deinit();
+        var identity: ?AuthenticatedIdentity = null;
+        var response = (try handler.authorizeRequest(&context, &identity)).?;
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 403), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "PublicInferenceDisabled") != null);
+    }
+    for ([_]httpx.Method{ .GET, .DELETE, .POST }) |method| {
+        var request = try httpx.Request.init(a, method, "/ai//v1/transcription/sessions/existing/events/");
+        defer request.deinit();
+        var context = httpx.Context.init(a, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.gatewaySessionRequest(&context, .get, "/events");
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 403), response.status.code);
+    }
+    for ([_][]const u8{ "named-inference", "local-inference", "default-inference", "remote" }) |connection| {
+        const path = try std.fmt.allocPrint(a, "/db/v1/connections/{s}/inference/generate", .{connection});
+        defer a.free(path);
+        var request = try httpx.Request.init(a, .POST, path);
+        defer request.deinit();
+        var context = httpx.Context.init(a, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.invokeInferenceConnection(&context, connection, "generate");
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 403), response.status.code);
+    }
+    try std.testing.expectEqual(@as(usize, 0), target.calls);
+    try std.testing.expectEqual(@as(usize, 0), server.inferenceAdmissionStats().in_flight);
+    // Router-normalized direct invocation must not evade the handler gate.
+    {
+        var request = try httpx.Request.init(a, .POST, "/db/v1/connections//remote/inference/generate/");
+        defer request.deinit();
+        var context = httpx.Context.init(a, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.invokeInferenceConnection(&context, "remote", "generate");
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 403), response.status.code);
+    }
+    // Namespace policy covers local inference operations outside named routes.
+    {
+        var request = try httpx.Request.init(a, .POST, "/ai//v1/audio/transcriptions/");
+        defer request.deinit();
+        var context = httpx.Context.init(a, std.testing.io, &request);
+        defer context.deinit();
+        var identity: ?AuthenticatedIdentity = null;
+        var response = (try handler.authorizeRequest(&context, &identity)).?;
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 403), response.status.code);
+    }
+    // Database query requests still reach their own authorization/handler.
+    {
+        var request = try httpx.Request.init(a, .POST, "/db/v1/query");
+        defer request.deinit();
+        var context = httpx.Context.init(a, std.testing.io, &request);
+        defer context.deinit();
+        var identity: ?AuthenticatedIdentity = null;
+        try std.testing.expect((try handler.authorizeRequest(&context, &identity)) == null);
+    }
+    // The same owner is available to internal indexing/query provider calls.
+    var internal = try server.invokeInferenceConnection(a, "local-inference", "generate", "{}", null, std.math.maxInt(u64), .{});
+    defer internal.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), internal.status);
+    try std.testing.expectEqual(@as(usize, 1), target.calls);
+    try std.testing.expectEqual(@import("kernel_abi.zig").AuthorizationDecision.forbidden, try server.authorizeInferenceRequest(.{}, .write));
+    try std.testing.expectEqual(@import("kernel_abi.zig").AuthorizationDecision.allowed, try server.authorizeInferenceRequest(.{}, .read));
+    var request = try httpx.Request.init(a, .GET, "/ai/v1/models");
+    defer request.deinit();
+    var context = httpx.Context.init(a, std.testing.io, &request);
+    defer context.deinit();
+    var response = try handler.gatewayModels(&context);
+    defer response.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+    defer parsed.deinit();
+    try std.testing.expect(!parsed.value.object.get("public_inference_enabled").?.bool);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.object.get("data").?.array.items.len);
+    config.public_inference.enabled = true;
+    try std.testing.expectEqual(@import("kernel_abi.zig").AuthorizationDecision.allowed, try server.authorizeInferenceRequest(.{}, .write));
 }

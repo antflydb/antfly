@@ -42636,6 +42636,10 @@ components:
         - object
         - predictors
       properties:
+        public_inference_enabled:
+          x-go-type-skip-optional-pointer: false
+          type: boolean
+          description: Whether public inference execution is enabled on this deployment.
         object:
           type: string
           enum:
@@ -44044,6 +44048,11 @@ components:
         - readers
         - transcribers
       properties:
+        public_inference_enabled:
+          x-go-type-skip-optional-pointer: false
+          type: boolean
+          description: Whether public inference execution is enabled on this deployment. Internal database
+            inference is independent. Omitted by standalone inference runtimes without deployment policy.
         object:
           type: string
           enum:

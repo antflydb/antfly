@@ -272,7 +272,12 @@ pub fn view(server: anytype) !gateway.View {
     return .{ .providers = &config.registry, .readers = &config.readers, .transcribers = &config.transcribers, .synthesizers = &config.text_to_speech };
 }
 
+pub fn disabledResponse(ctx: *httpx.Context) !httpx.Response {
+    return ctx.status(403).json(.{ .@"error" = .{ .code = "PublicInferenceDisabled", .type = "permission_error", .message = "Public inference is disabled for this deployment" } });
+}
+
 pub fn prepare(server: anytype, ctx: *httpx.Context) !void {
+    if (!server.publicInferenceEnabled() and !isDiscoveryPath(ctx.request.uri.path)) return error.PublicInferenceDisabled;
     if (ctx.response.headers.get("x-request-id") == null) _ = try requestId(server, ctx, ctx.allocator);
     _ = try attemptBudget(ctx);
     const now = @import("antfly_platform").time.monotonicNs();
@@ -885,6 +890,7 @@ fn discoveryContext(server: anytype, ctx: *httpx.Context) @import("antfly_infere
 }
 
 pub fn predictors(server: anytype, ctx: *httpx.Context) !httpx.Response {
+    if (!server.publicInferenceEnabled()) return ctx.json(.{ .object = "list", .predictors = .{}, .public_inference_enabled = false });
     var budget: sources.sql_memory_budget = .{ .backing = ctx.allocator, .limit = 64 << 20 };
     var arena = std.heap.ArenaAllocator.init(budget.allocator());
     defer arena.deinit();
@@ -985,7 +991,7 @@ pub fn models(server: anytype, ctx: *httpx.Context) !httpx.Response {
     defer arena.deinit();
     const a = arena.allocator();
     var root: Json = .{ .object = .empty };
-    if (server.antfly_provider) |provider| if (provider.list_models_json) |list| {
+    if (server.publicInferenceEnabled()) if (server.antfly_provider) |provider| if (provider.list_models_json) |list| {
         const bytes = list(provider.ptr, a) catch null;
         if (bytes) |value| root = std.json.parseFromSliceLeaky(Json, a, value, .{}) catch .{ .object = .empty };
     };
@@ -994,6 +1000,12 @@ pub fn models(server: anytype, ctx: *httpx.Context) !httpx.Response {
     if (!root.object.contains("backends")) try root.object.put(a, "backends", .{ .object = .empty });
     inline for (.{ "chunkers", "rerankers", "embedders", "generators", "extractors", "deciders", "rewriters", "readers", "transcribers" }) |category| {
         if (!root.object.contains(category)) try root.object.put(a, category, .{ .object = .empty });
+    }
+    try root.object.put(a, "public_inference_enabled", .{ .bool = server.publicInferenceEnabled() });
+    if (!server.publicInferenceEnabled()) {
+        try root.object.put(a, "object", .{ .string = "list" });
+        try root.object.put(a, "data", .{ .array = std.array_list.Managed(Json).init(a) });
+        return ctx.json(root);
     }
     const named = try view(server);
     var data: Json = root.object.get("data") orelse .{ .array = std.array_list.Managed(Json).init(a) };

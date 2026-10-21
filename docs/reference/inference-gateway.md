@@ -281,3 +281,18 @@ schemas, sparse vectors, synthesis and the complete session lifecycle. It does
 not call paid providers. Gateway/shared-executor tests and proxy tests cover
 post-commit failure, quotas, admission ownership, credential isolation and stale
 endpoint/session handling.
+
+### Public execution policy
+
+Managed Cloud deployments should provision `public_inference.enabled: false` until the tenant explicitly enables public inference. Self-hosted deployments retain the default of `true`:
+
+```yaml
+public_inference:
+  enabled: false
+```
+
+The server rejects public named execution, batches, every session operation (including GET event streams), and direct connection invocation with HTTP 403. The linked local inference API also denies public writes. Administrator credentials do not bypass deployment policy. Existing inference RBAC and admission limits still apply when enabled.
+
+Gateway model discovery remains authorized by `inference:read`, returns `public_inference_enabled: false` with an empty catalog, and avoids upstream probing while disabled. Antfarm displays an enablement message. Internal provider calls used by indexing, extraction, and SQL/query execution remain available; this is independent of inference admission and provider configuration.
+
+Colony owns tenant enablement and provisioning this setting. The Kubernetes operator preserves it in `AntflyCluster.spec.config` for standalone and distributed deployments. Entitlements, approved targets, and billing limits remain separate control-plane responsibilities. This setting is deployment configuration and changes take effect when the deployment is restarted; it is not a tenant-writable API toggle.

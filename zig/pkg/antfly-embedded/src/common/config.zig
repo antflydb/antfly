@@ -68,6 +68,7 @@ pub const Config = struct {
     transcribers: transcribing.Registry,
     readers: readers.Registry,
     text_to_speech: synthesizing.Registry,
+    public_inference: PublicInferenceConfig = .{},
     auth_enabled: bool = false,
     deployment_mode: DeploymentMode = .distributed,
     health_enabled: bool = true,
@@ -91,6 +92,10 @@ pub const Config = struct {
     connections: ConnectionsConfig = .{},
     connectors: ConnectorsConfig = .{},
     shard_allocation: ShardAllocationConfig = .{},
+
+    pub const PublicInferenceConfig = struct {
+        enabled: bool = true,
+    };
 
     pub const RequestAdmissionConfig = struct {
         /// Zero disables this foreground admission class. Transport safeguards
@@ -792,6 +797,11 @@ pub const Config = struct {
             .object => |object| object,
             else => return error.InvalidConfig,
         };
+        if (root.contains("public_inference")) try validateObjectMemberFields(root, "public_inference", &.{"enabled"});
+        const public_inference_enabled = if (root.get("public_inference")) |policy|
+            try optionalBoolField(policy.object, "enabled") orelse true
+        else
+            true;
         var canonical_inference_max_concurrent_requests: ?u32 = null;
         if (root.get("admission")) |admission_value| {
             try validateObjectMemberFields(root, "admission", &.{ "query", "write", "inference" });
@@ -964,6 +974,7 @@ pub const Config = struct {
             .transcribers = transcribers,
             .readers = reader_registry,
             .text_to_speech = text_to_speech,
+            .public_inference = .{ .enabled = public_inference_enabled },
             .auth_enabled = try optionalBoolField(root, "enable_auth") orelse false,
             .deployment_mode = deployment_mode,
             .health_enabled = try optionalBoolField(root, "health_enabled") orelse true,
@@ -4018,4 +4029,21 @@ test "external lake cursor retention and capacity policy reject unbounded admiss
         "{\"lake_indexes\":{\"query_cursors\":{\"max_native_cuts\":0}}}",
         "{\"lake_indexes\":{\"query_cursors\":{\"max_native_retained_bytes\":0}}}",
     }) |bytes| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, bytes));
+}
+
+test "provider registry gateway public inference policy defaults on and validates explicit disable" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "{}", "{\"public_inference\":{}}", "{\"public_inference\":{\"enabled\":true}}" }) |body| {
+        var config = try Config.parseFromSlice(a, body);
+        defer config.deinit();
+        try std.testing.expect(config.public_inference.enabled);
+    }
+    var config = try Config.parseFromSlice(a, "{\"public_inference\":{\"enabled\":false}}");
+    defer config.deinit();
+    try std.testing.expect(!config.public_inference.enabled);
+    for ([_][]const u8{
+        "{\"public_inference\":false}",
+        "{\"public_inference\":{\"enabled\":\"false\"}}",
+        "{\"public_inference\":{\"enable\":false}}",
+    }) |invalid| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, invalid));
 }

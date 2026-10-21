@@ -3659,6 +3659,8 @@ export interface InferenceGatewayModel {
   gateway_capabilities?: Record<string, "supported" | "unsupported" | "unknown">;
 }
 export interface InferenceGatewayCatalog {
+  /** Deployment policy; omitted by servers predating public inference controls. */
+  public_inference_enabled?: boolean;
   object: "list";
   data: InferenceGatewayModel[];
   [group: string]: unknown;

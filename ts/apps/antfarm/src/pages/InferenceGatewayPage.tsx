@@ -105,6 +105,7 @@ export default function InferenceGatewayPage() {
 
 function InferenceGatewayPlayground({ initialModel }: { initialModel: string }) {
   const { client } = useApiConfig();
+  const [publicInferenceEnabled, setPublicInferenceEnabled] = useState<boolean | null>(null);
   const [models, setModels] = useState<InferenceGatewayModel[]>([]);
   const [{ model, operation, request }, setDraft] = useState<RequestDraft>(() => ({
     model: initialModel,
@@ -121,10 +122,12 @@ function InferenceGatewayPlayground({ initialModel }: { initialModel: string }) 
   const controller = useRef<AbortController | null>(null);
   useEffect(() => {
     const abort = new AbortController();
+    setPublicInferenceEnabled(null);
     client.inference
       .models(abort.signal)
       .then((catalog) => {
         if (abort.signal.aborted) return;
+        setPublicInferenceEnabled(catalog.public_inference_enabled !== false);
         setModels(catalog.data);
         // Reconcile against the latest draft, not the deep link or the state
         // captured before discovery. Only untouched defaults may be replaced.
@@ -161,6 +164,7 @@ function InferenceGatewayPlayground({ initialModel }: { initialModel: string }) 
     setDraft((draft) => modelDefaults(draft, value, models));
   }
   async function run() {
+    if (publicInferenceEnabled !== true) return;
     controller.current?.abort();
     const abort = new AbortController();
     controller.current = abort;
@@ -240,110 +244,131 @@ function InferenceGatewayPlayground({ initialModel }: { initialModel: string }) 
           Run configured models and generation chains using their public IDs.
         </DashboardPageDescription>
       </DashboardPageHeader>
-      <Card>
-        <CardHeader>
-          <CardTitle>Request</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="space-y-2">
-            <Label htmlFor="gateway-model">
-              {operation === "generate/batch" ? "Default model (optional)" : "Model"}
-            </Label>
-            <Input
-              id="gateway-model"
-              list="gateway-models"
-              value={model}
-              onChange={(event) => selectModel(event.target.value)}
-              placeholder="generators/support-chat"
-            />
-            <datalist id="gateway-models">
-              {models.map((entry) => (
-                <option key={entry.id} value={entry.id} />
-              ))}
-            </datalist>
-          </div>
-          {selected && (
-            <p className="text-sm text-muted-foreground">
-              Availability: {selected.availability ?? "unknown"} · Catalog:{" "}
-              {selected.freshness ?? "unknown"}
-              {selected.gateway_capabilities &&
-                ` · ${Object.entries(selected.gateway_capabilities)
-                  .filter(([, support]) => support === "supported")
-                  .map(([name]) => name)
-                  .join(", ")}`}
-            </p>
-          )}
-          <div className="space-y-2">
-            <Label htmlFor="gateway-operation">Operation</Label>
-            <select
-              id="gateway-operation"
-              className="bg-background border rounded-md px-3 py-2 w-full"
-              value={operation}
-              onChange={(event) => selectOperation(event.target.value as InferenceGatewayOperation)}
-            >
-              {Object.keys(samples).map((value) => (
-                <option key={value}>{value}</option>
-              ))}
-            </select>
-          </div>
-          <Label htmlFor="gateway-body">JSON request</Label>
-          <Textarea
-            id="gateway-body"
-            className="font-mono min-h-56"
-            value={request}
-            onChange={(event) => {
-              const value = event.target.value;
-              setDraft((draft) => ({
-                ...draft,
-                request: value,
-                requestIsSample: false,
-                // An edited body belongs to the current operation. Discovery
-                // must not reinterpret it as another task's request.
-                automaticOperation: false,
-              }));
-            }}
-          />
-          <div className="flex gap-2">
-            <Button
-              disabled={running || (operation !== "generate/batch" && !model.trim())}
-              onClick={() => void run()}
-            >
-              Run
-            </Button>
-            <Button
-              variant="outline"
-              disabled={!running}
-              onClick={() => {
-                controller.current?.abort();
-                setRunning(false);
-              }}
-            >
-              Cancel
-            </Button>
-          </div>
-          {error && (
-            <p role="alert" className="text-destructive">
-              {error}
-            </p>
-          )}
-        </CardContent>
-      </Card>
-      <Card>
-        <CardHeader>
-          <CardTitle>Response</CardTitle>
-        </CardHeader>
-        <CardContent>
-          {requestId && <p className="text-sm text-muted-foreground">Request {requestId}</p>}
-          {audio && (
-            <audio controls src={audio}>
-              <track kind="captions" />
-            </audio>
-          )}
-          <pre aria-live="polite" className="whitespace-pre-wrap break-words text-sm font-mono">
-            {output || (running ? "Waiting for response…" : "Run a request to see its response.")}
-          </pre>
-        </CardContent>
-      </Card>
+      {publicInferenceEnabled === false ? (
+        <Card>
+          <CardHeader>
+            <CardTitle>Public inference is disabled</CardTitle>
+          </CardHeader>
+          <CardContent>
+            Ask your deployment administrator to enable the inference gateway. Database indexing and
+            query inference remain available.
+          </CardContent>
+        </Card>
+      ) : (
+        <>
+          <Card>
+            <CardHeader>
+              <CardTitle>Request</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="gateway-model">
+                  {operation === "generate/batch" ? "Default model (optional)" : "Model"}
+                </Label>
+                <Input
+                  id="gateway-model"
+                  list="gateway-models"
+                  value={model}
+                  onChange={(event) => selectModel(event.target.value)}
+                  placeholder="generators/support-chat"
+                />
+                <datalist id="gateway-models">
+                  {models.map((entry) => (
+                    <option key={entry.id} value={entry.id} />
+                  ))}
+                </datalist>
+              </div>
+              {selected && (
+                <p className="text-sm text-muted-foreground">
+                  Availability: {selected.availability ?? "unknown"} · Catalog:{" "}
+                  {selected.freshness ?? "unknown"}
+                  {selected.gateway_capabilities &&
+                    ` · ${Object.entries(selected.gateway_capabilities)
+                      .filter(([, support]) => support === "supported")
+                      .map(([name]) => name)
+                      .join(", ")}`}
+                </p>
+              )}
+              <div className="space-y-2">
+                <Label htmlFor="gateway-operation">Operation</Label>
+                <select
+                  id="gateway-operation"
+                  className="bg-background border rounded-md px-3 py-2 w-full"
+                  value={operation}
+                  onChange={(event) =>
+                    selectOperation(event.target.value as InferenceGatewayOperation)
+                  }
+                >
+                  {Object.keys(samples).map((value) => (
+                    <option key={value}>{value}</option>
+                  ))}
+                </select>
+              </div>
+              <Label htmlFor="gateway-body">JSON request</Label>
+              <Textarea
+                id="gateway-body"
+                className="font-mono min-h-56"
+                value={request}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  setDraft((draft) => ({
+                    ...draft,
+                    request: value,
+                    requestIsSample: false,
+                    // An edited body belongs to the current operation. Discovery
+                    // must not reinterpret it as another task's request.
+                    automaticOperation: false,
+                  }));
+                }}
+              />
+              <div className="flex gap-2">
+                <Button
+                  disabled={
+                    publicInferenceEnabled !== true ||
+                    running ||
+                    (operation !== "generate/batch" && !model.trim())
+                  }
+                  onClick={() => void run()}
+                >
+                  Run
+                </Button>
+                <Button
+                  variant="outline"
+                  disabled={!running}
+                  onClick={() => {
+                    controller.current?.abort();
+                    setRunning(false);
+                  }}
+                >
+                  Cancel
+                </Button>
+              </div>
+              {error && (
+                <p role="alert" className="text-destructive">
+                  {error}
+                </p>
+              )}
+            </CardContent>
+          </Card>
+          <Card>
+            <CardHeader>
+              <CardTitle>Response</CardTitle>
+            </CardHeader>
+            <CardContent>
+              {requestId && <p className="text-sm text-muted-foreground">Request {requestId}</p>}
+              {audio && (
+                <audio controls src={audio}>
+                  <track kind="captions" />
+                </audio>
+              )}
+              <pre aria-live="polite" className="whitespace-pre-wrap break-words text-sm font-mono">
+                {output ||
+                  (running ? "Waiting for response…" : "Run a request to see its response.")}
+              </pre>
+            </CardContent>
+          </Card>
+        </>
+      )}
     </DashboardPage>
   );
 }

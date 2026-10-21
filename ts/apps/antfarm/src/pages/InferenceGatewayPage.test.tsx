@@ -432,3 +432,20 @@ it.each([
   expect((screen.getByLabelText("Operation") as HTMLSelectElement).value).toBe(operation);
   expect((screen.getByLabelText("JSON request") as HTMLTextAreaElement).value).toBe(sample);
 });
+
+it("shows deployment enablement instead of an executable playground when public inference is disabled", async () => {
+  client.inference.models.mockResolvedValue({
+    object: "list",
+    data: [],
+    public_inference_enabled: false,
+  });
+  render(
+    <MemoryRouter>
+      <InferenceGatewayPage />
+    </MemoryRouter>
+  );
+  await screen.findByText("Public inference is disabled");
+  expect(screen.queryByRole("button", { name: "Run" })).toBeNull();
+  expect(screen.queryByLabelText("Model")).toBeNull();
+  expect(client.inference.invoke).not.toHaveBeenCalled();
+});
