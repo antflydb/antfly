@@ -21,6 +21,64 @@ export interface components {
             /** Format: double */
             lat?: number;
         };
+        /**
+         * @description Whole string equality on the original logical field value.
+         *     No normalization is applied. Case-sensitive by default; case_sensitive=false
+         *     uses Unicode simple case folding, not locale-specific or multi-character folding.
+         *     Missing, null, and non-string values do not match. Arrays use any-element
+         *     semantics; a match never spans array elements. Indexes select conservative
+         *     candidates and original values are verified before counting and pagination.
+         */
+        EqualsQuery: {
+            equals: string;
+            /** @description Logical source field path, not a companion index name. */
+            field: string;
+            /** @default true */
+            case_sensitive?: boolean;
+            boost?: components["schemas"]["Boost"];
+        };
+        /**
+         * @description Contiguous substring search on the original logical field value, including whitespace and punctuation.
+         *     No normalization is applied. Case-sensitive by default; case_sensitive=false
+         *     uses Unicode simple case folding, not locale-specific or multi-character folding.
+         *     Missing, null, and non-string values do not match. Arrays use any-element
+         *     semantics; a match never spans array elements. Indexes select conservative
+         *     candidates and original values are verified before counting and pagination.
+         */
+        ContainsQuery: {
+            contains: string;
+            /** @description Logical source field path, not a companion index name. */
+            field: string;
+            /** @default true */
+            case_sensitive?: boolean;
+            boost?: components["schemas"]["Boost"];
+        };
+        /**
+         * @description Unanchored native Unicode regular expression search on the original logical field value. Anchors refer to each complete value; indexed-term regexp semantics are unchanged.
+         *     No normalization is applied. Case-sensitive by default; case_sensitive=false
+         *     uses Unicode simple case folding, not locale-specific or multi-character folding.
+         *     Missing, null, and non-string values do not match. Arrays use any-element
+         *     semantics; a match never spans array elements. Indexes select conservative
+         *     candidates and original values are verified before counting and pagination.
+         */
+        MatchesQuery: {
+            matches: string;
+            /** @description Logical source field path, not a companion index name. */
+            field: string;
+            /** @default true */
+            case_sensitive?: boolean;
+            boost?: components["schemas"]["Boost"];
+        };
+        /**
+         * @description Analyzed bool-prefix search on a logical field. The planner selects
+         *     declared search-as-you-type root, shingle and prefix representations.
+         *     Requires a compatible representation; never silently becomes raw prefix search.
+         */
+        AutocompleteQuery: {
+            autocomplete: string;
+            field: string;
+            boost?: components["schemas"]["Boost"];
+        };
         TermQuery: {
             term: string;
             field?: string;
@@ -233,7 +291,7 @@ export interface components {
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
-        Query: components["schemas"]["TermQuery"] | components["schemas"]["MatchQuery"] | components["schemas"]["MultiMatchQuery"] | components["schemas"]["MatchPhraseQuery"] | components["schemas"]["PhraseQuery"] | components["schemas"]["MultiPhraseQuery"] | components["schemas"]["FuzzyQuery"] | components["schemas"]["PrefixQuery"] | components["schemas"]["RegexpQuery"] | components["schemas"]["WildcardQuery"] | components["schemas"]["QueryStringQuery"] | components["schemas"]["NumericRangeQuery"] | components["schemas"]["TermRangeQuery"] | components["schemas"]["DateRangeStringQuery"] | components["schemas"]["BooleanQuery"] | components["schemas"]["ConjunctionQuery"] | components["schemas"]["DisjunctionQuery"] | components["schemas"]["MatchAllQuery"] | components["schemas"]["MatchNoneQuery"] | components["schemas"]["DocIdQuery"] | components["schemas"]["BoolFieldQuery"] | components["schemas"]["IPRangeQuery"] | components["schemas"]["GeoBoundingBoxQuery"] | components["schemas"]["GeoDistanceQuery"] | components["schemas"]["GeoBoundingPolygonQuery"] | components["schemas"]["GeoShapeQuery"];
+        Query: components["schemas"]["EqualsQuery"] | components["schemas"]["ContainsQuery"] | components["schemas"]["MatchesQuery"] | components["schemas"]["AutocompleteQuery"] | components["schemas"]["TermQuery"] | components["schemas"]["MatchQuery"] | components["schemas"]["MultiMatchQuery"] | components["schemas"]["MatchPhraseQuery"] | components["schemas"]["PhraseQuery"] | components["schemas"]["MultiPhraseQuery"] | components["schemas"]["FuzzyQuery"] | components["schemas"]["PrefixQuery"] | components["schemas"]["RegexpQuery"] | components["schemas"]["WildcardQuery"] | components["schemas"]["QueryStringQuery"] | components["schemas"]["NumericRangeQuery"] | components["schemas"]["TermRangeQuery"] | components["schemas"]["DateRangeStringQuery"] | components["schemas"]["BooleanQuery"] | components["schemas"]["ConjunctionQuery"] | components["schemas"]["DisjunctionQuery"] | components["schemas"]["MatchAllQuery"] | components["schemas"]["MatchNoneQuery"] | components["schemas"]["DocIdQuery"] | components["schemas"]["BoolFieldQuery"] | components["schemas"]["IPRangeQuery"] | components["schemas"]["GeoBoundingBoxQuery"] | components["schemas"]["GeoDistanceQuery"] | components["schemas"]["GeoBoundingPolygonQuery"] | components["schemas"]["GeoShapeQuery"];
     };
     responses: never;
     parameters: never;

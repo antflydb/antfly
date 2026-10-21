@@ -330,7 +330,7 @@ run_zig_build_steps_with_retry() {
   elif [[ "$product" = lite || "$product" = embedded ]]; then
     run_zig_build_steps_with_retry archive lite
   else
-    run_zig_build_steps_with_retry archive antfly capi
+    run_zig_build_steps_with_retry archive antfly capi grep
   fi
 )
 
@@ -416,6 +416,10 @@ fi
 cp "$repo_root/THIRD_PARTY_NOTICES.md" "$stage/THIRD_PARTY_NOTICES.md"
 if [ "$product" = server ]; then
   "$repo_root/scripts/completions.sh" "$stage/completions"
+  # The server generator recreates its output directory. Stage grep assets
+  # afterwards so both commands' completions survive in the archive.
+  python3 "$repo_root/scripts/packaging/package_grep_release.py" \
+    --binary "$prefix/bin/antfly-grep" --stage "$stage"
 fi
 
 python3 "$repo_root/scripts/packaging/create_reproducible_tar.py" \
@@ -424,6 +428,11 @@ python3 "$repo_root/scripts/packaging/create_reproducible_tar.py" \
   --mtime "$source_date_epoch"
 tar -tzf "$out_dir/$archive_name" > "$work_root/archive-contents.txt"
 grep -Fx "./$binary_name" "$work_root/archive-contents.txt" >/dev/null
+if [ "$product" = server ]; then
+  for entry in antfly-grep completions/antfly-grep.bash completions/antfly-grep.zsh completions/antfly-grep.fish completions/antfly-grep.ps1 share/man/man1/antfly-grep.1 share/antfly-grep/build.json share/antfly-grep/schema/tables-v1.json; do
+    grep -Fx "./$entry" "$work_root/archive-contents.txt" >/dev/null
+  done
+fi
 if [ "$product" = embedded ]; then
   grep -Fx "./antfly-inference" "$work_root/archive-contents.txt" >/dev/null
 fi

@@ -3,6 +3,33 @@
 
 const std = @import("std");
 
+/// Analyzed bool-prefix search on a logical field. The planner selects declared search-as-you-type root, shingle and prefix representations. Requires a compatible representation; never silently becomes raw prefix search.
+pub const AutocompleteQuery = struct {
+    autocomplete: []const u8,
+    field: []const u8,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("autocomplete");
+        try jw.write(self.autocomplete);
+        try jw.objectField("field");
+        try jw.write(self.field);
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
 pub const BoolFieldQuery = struct {
     bool: bool,
     field: ?[]const u8 = null,
@@ -116,6 +143,55 @@ pub const ConjunctionQuery = struct {
         try jw.beginObject();
         try jw.objectField("conjuncts");
         try jw.write(self.conjuncts);
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+/// Contiguous substring search on the original logical field value, including whitespace and punctuation. No normalization is applied. Case-sensitive by default; case_sensitive=false uses Unicode simple case folding, not locale-specific or multi-character folding. Missing, null, and non-string values do not match. Arrays use any-element semantics; a match never spans array elements. Indexes select conservative candidates and original values are verified before counting and pagination.
+pub const ContainsQuery = struct {
+    contains: []const u8,
+    /// Logical source field path, not a companion index name.
+    field: []const u8,
+    case_sensitive: ?bool = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "contains", "contains", false },
+        .{ "field", "field", false },
+        .{ "case_sensitive", "case_sensitive", true },
+        .{ "boost", "boost", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("contains");
+        try jw.write(self.contains);
+        try jw.objectField("field");
+        try jw.write(self.field);
+        if (self.case_sensitive) |value| {
+            try jw.objectField("case_sensitive");
+            try jw.write(value);
+        }
         switch (self.boost) {
             .absent => {},
             .null_value => {
@@ -266,6 +342,55 @@ pub const DocIdQuery = struct {
         try jw.beginObject();
         try jw.objectField("ids");
         try jw.write(self.ids);
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+/// Whole string equality on the original logical field value. No normalization is applied. Case-sensitive by default; case_sensitive=false uses Unicode simple case folding, not locale-specific or multi-character folding. Missing, null, and non-string values do not match. Arrays use any-element semantics; a match never spans array elements. Indexes select conservative candidates and original values are verified before counting and pagination.
+pub const EqualsQuery = struct {
+    equals: []const u8,
+    /// Logical source field path, not a companion index name.
+    field: []const u8,
+    case_sensitive: ?bool = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "equals", "equals", false },
+        .{ "field", "field", false },
+        .{ "case_sensitive", "case_sensitive", true },
+        .{ "boost", "boost", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("equals");
+        try jw.write(self.equals);
+        try jw.objectField("field");
+        try jw.write(self.field);
+        if (self.case_sensitive) |value| {
+            try jw.objectField("case_sensitive");
+            try jw.write(value);
+        }
         switch (self.boost) {
             .absent => {},
             .null_value => {
@@ -752,6 +877,55 @@ pub const MatchQuery = struct {
     }
 };
 
+/// Unanchored native Unicode regular expression search on the original logical field value. Anchors refer to each complete value; indexed-term regexp semantics are unchanged. No normalization is applied. Case-sensitive by default; case_sensitive=false uses Unicode simple case folding, not locale-specific or multi-character folding. Missing, null, and non-string values do not match. Arrays use any-element semantics; a match never spans array elements. Indexes select conservative candidates and original values are verified before counting and pagination.
+pub const MatchesQuery = struct {
+    matches: []const u8,
+    /// Logical source field path, not a companion index name.
+    field: []const u8,
+    case_sensitive: ?bool = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "matches", "matches", false },
+        .{ "field", "field", false },
+        .{ "case_sensitive", "case_sensitive", true },
+        .{ "boost", "boost", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("matches");
+        try jw.write(self.matches);
+        try jw.objectField("field");
+        try jw.write(self.field);
+        if (self.case_sensitive) |value| {
+            try jw.objectField("case_sensitive");
+            try jw.write(value);
+        }
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
 pub const MultiMatchBody = struct {
     query: []const u8,
     fields: []const []const u8,
@@ -1026,11 +1200,15 @@ pub const Query = union(enum) {
     term_range_query: *TermRangeQuery,
     fuzzy_query: *FuzzyQuery,
     match_phrase_query: *MatchPhraseQuery,
+    contains_query: *ContainsQuery,
     disjunction_query: *DisjunctionQuery,
+    equals_query: *EqualsQuery,
     geo_distance_query: *GeoDistanceQuery,
     match_query: *MatchQuery,
+    matches_query: *MatchesQuery,
     multi_phrase_query: *MultiPhraseQuery,
     phrase_query: *PhraseQuery,
+    autocomplete_query: *AutocompleteQuery,
     bool_field_query: *BoolFieldQuery,
     conjunction_query: *ConjunctionQuery,
     doc_id_query: *DocIdQuery,
@@ -1126,10 +1304,22 @@ pub const Query = union(enum) {
             if (try parseStructuralVariant(MatchPhraseQuery, allocator, source, options)) |parsed| return .{ .match_phrase_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
+            "contains",
+            "case_sensitive",
+        })) {
+            if (try parseStructuralVariant(ContainsQuery, allocator, source, options)) |parsed| return .{ .contains_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
             "disjuncts",
             "min",
         })) {
             if (try parseStructuralVariant(DisjunctionQuery, allocator, source, options)) |parsed| return .{ .disjunction_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "equals",
+            "case_sensitive",
+        })) {
+            if (try parseStructuralVariant(EqualsQuery, allocator, source, options)) |parsed| return .{ .equals_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "location",
@@ -1144,6 +1334,12 @@ pub const Query = union(enum) {
             if (try parseStructuralVariant(MatchQuery, allocator, source, options)) |parsed| return .{ .match_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
+            "matches",
+            "case_sensitive",
+        })) {
+            if (try parseStructuralVariant(MatchesQuery, allocator, source, options)) |parsed| return .{ .matches_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
             "terms",
             "fuzziness",
         })) {
@@ -1154,6 +1350,11 @@ pub const Query = union(enum) {
             "fuzziness",
         })) {
             if (try parseStructuralVariant(PhraseQuery, allocator, source, options)) |parsed| return .{ .phrase_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "autocomplete",
+        })) {
+            if (try parseStructuralVariant(AutocompleteQuery, allocator, source, options)) |parsed| return .{ .autocomplete_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "bool",
@@ -1237,11 +1438,15 @@ pub const Query = union(enum) {
             .term_range_query => |v| try jw.write(v.*),
             .fuzzy_query => |v| try jw.write(v.*),
             .match_phrase_query => |v| try jw.write(v.*),
+            .contains_query => |v| try jw.write(v.*),
             .disjunction_query => |v| try jw.write(v.*),
+            .equals_query => |v| try jw.write(v.*),
             .geo_distance_query => |v| try jw.write(v.*),
             .match_query => |v| try jw.write(v.*),
+            .matches_query => |v| try jw.write(v.*),
             .multi_phrase_query => |v| try jw.write(v.*),
             .phrase_query => |v| try jw.write(v.*),
+            .autocomplete_query => |v| try jw.write(v.*),
             .bool_field_query => |v| try jw.write(v.*),
             .conjunction_query => |v| try jw.write(v.*),
             .doc_id_query => |v| try jw.write(v.*),

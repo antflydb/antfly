@@ -149,6 +149,52 @@ pub fn optionalHeadroom(a: std.mem.Allocator) ?usize {
     }
     return null;
 }
+/// Upper bound for optional reusable buffers. Unknown quota wrappers, spill
+/// owners, historical/monotonic budgets and opaque shared reservations cannot
+/// prove that a refused speculation leaves mandatory work's admission intact.
+pub fn reusableHeadroom(a: std.mem.Allocator) ?usize {
+    const actual = reclaimingAllocator(a);
+    if (@import("parallel_scheduler.zig").LockedAllocator.parentAllocator(actual)) |parent| {
+        const reclaimed = reclaimingAllocator(parent);
+        // Inspection cannot change the allocator hidden behind a lock. An
+        // arena there would keep speculative frees until its owner's teardown.
+        if (reclaimed.ptr != parent.ptr or reclaimed.vtable != parent.vtable) return null;
+        return reusableHeadroom(parent);
+    }
+    if (@import("spill.zig").Manager.parentAllocator(actual) != null) return null;
+    if (actual.vtable.alloc == alloc or actual.vtable.alloc == scratchAlloc) {
+        const self: *Budget = @ptrCast(@alignCast(actual.ptr));
+        self.lock();
+        const reusable = !self.monotonic and self.admission == null;
+        const available = self.limit -| self.live;
+        const backing = self.backing;
+        self.mutex.unlock();
+        if (!reusable) return null;
+        return @min(available, reusableHeadroom(backing) orelse return null);
+    }
+    if (comptime @import("builtin").is_test) {
+        if (actual.vtable == std.testing.allocator.vtable and actual.ptr == std.testing.allocator.ptr) return std.math.maxInt(usize);
+    }
+    return optionalHeadroom(actual);
+}
+
+test "logical value speculative reads refuse nonrefundable and opaque admission" {
+    const a = std.testing.allocator;
+    var live: Budget = .{ .backing = a, .limit = 65536 };
+    try std.testing.expectEqual(@as(usize, 65536), reusableHeadroom(live.allocator()).?);
+    var monotonic: Budget = .{ .backing = a, .limit = 65536, .monotonic = true };
+    try std.testing.expect(reusableHeadroom(monotonic.allocator()) == null);
+    var opaque_allocator = std.testing.FailingAllocator.init(a, .{});
+    try std.testing.expect(reusableHeadroom(opaque_allocator.allocator()) == null);
+    var region = std.heap.ArenaAllocator.init(live.allocator());
+    defer region.deinit();
+    var hidden: @import("parallel_scheduler.zig").LockedAllocator = .{ .backing = region.allocator() };
+    try std.testing.expect(reusableHeadroom(hidden.allocator()) == null);
+    var locked: @import("parallel_scheduler.zig").LockedAllocator = .{ .backing = live.allocator() };
+    try std.testing.expectEqual(@as(usize, 65536), reusableHeadroom(locked.allocator()).?);
+    try std.testing.expectEqual(@as(usize, 0), monotonic.spent);
+    try std.testing.expect(!monotonic.exhausted);
+}
 fn admit(self: *Budget, growth: usize) bool {
     if (growth > self.limit -| if (self.monotonic) self.spent else self.live) {
         self.exhausted = true;

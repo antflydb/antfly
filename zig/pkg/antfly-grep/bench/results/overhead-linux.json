@@ -1,0 +1,428 @@
+{
+  "measurement": "Repeated dense delivery, full/minimal acknowledgements and client omission.\n\nWarm processes and filesystem data. Capture/refresh and CPU-counter sampling are\noutside request timing. CPU is cumulative server process CPU divided by repeated\nrequests; Darwin counters have 10ms precision. Results include client decoding.",
+  "host": "Linux-7.0.14-linuxkit-aarch64-with-glibc2.41",
+  "cpu_count": 14,
+  "files": 1000,
+  "rounds": 256,
+  "trials": [
+    {
+      "load_average": [
+        0.0107421875,
+        0.0546875,
+        0.07470703125
+      ],
+      "baseline": {
+        "full": {
+          "seconds_per_request": 0.010553908371093712,
+          "server_cpu_seconds_per_request": 0.0080078125,
+          "bytes_per_request": 1191317.7890625,
+          "median_first_event_seconds": 0.00012093799887225032
+        },
+        "conditional": {
+          "seconds_per_request": 4.9694976809178115e-05,
+          "server_cpu_seconds_per_request": 1.220703125000001e-05,
+          "bytes_per_request": 1410.0089111328125,
+          "median_first_event_seconds": 3.8917060010135174e-05
+        }
+      },
+      "current": {
+        "full": {
+          "seconds_per_request": 0.010379800461123523,
+          "server_cpu_seconds_per_request": 0.0067578125,
+          "bytes_per_request": 1191416.25,
+          "median_first_event_seconds": 0.00011899997480213642
+        },
+        "conditional": {
+          "seconds_per_request": 5.159164929580129e-05,
+          "server_cpu_seconds_per_request": 1.098632812500001e-05,
+          "bytes_per_request": 1510.0140380859375,
+          "median_first_event_seconds": 3.958307206630707e-05
+        },
+        "minimal": {
+          "seconds_per_request": 3.888300585686011e-05,
+          "server_cpu_seconds_per_request": 9.765624999999982e-06,
+          "bytes_per_request": 256.0,
+          "median_first_event_seconds": 3.7041958421468735e-05
+        }
+      }
+    },
+    {
+      "load_average": [
+        0.09033203125,
+        0.07080078125,
+        0.080078125
+      ],
+      "current": {
+        "full": {
+          "seconds_per_request": 0.010432683921862917,
+          "server_cpu_seconds_per_request": 0.006757812500000001,
+          "bytes_per_request": 1191416.50390625,
+          "median_first_event_seconds": 0.00012087455252185464
+        },
+        "conditional": {
+          "seconds_per_request": 5.1201863655592206e-05,
+          "server_cpu_seconds_per_request": 1.220703125000001e-05,
+          "bytes_per_request": 1510.0089111328125,
+          "median_first_event_seconds": 3.958295565098524e-05
+        },
+        "minimal": {
+          "seconds_per_request": 3.892376209080339e-05,
+          "server_cpu_seconds_per_request": 8.54492187499998e-06,
+          "bytes_per_request": 256.0,
+          "median_first_event_seconds": 3.733392804861069e-05
+        }
+      },
+      "baseline": {
+        "full": {
+          "seconds_per_request": 0.010486872238288925,
+          "server_cpu_seconds_per_request": 0.007851562500000001,
+          "bytes_per_request": 1191316.5546875,
+          "median_first_event_seconds": 0.00011997896945104003
+        },
+        "conditional": {
+          "seconds_per_request": 5.045978808482232e-05,
+          "server_cpu_seconds_per_request": 1.342773437499993e-05,
+          "bytes_per_request": 1410.01123046875,
+          "median_first_event_seconds": 3.9125094190239906e-05
+        }
+      }
+    },
+    {
+      "load_average": [
+        0.16357421875,
+        0.08642578125,
+        0.08544921875
+      ],
+      "baseline": {
+        "full": {
+          "seconds_per_request": 0.010434435058414238,
+          "server_cpu_seconds_per_request": 0.007851562500000003,
+          "bytes_per_request": 1191316.9375,
+          "median_first_event_seconds": 0.00012058357242494822
+        },
+        "conditional": {
+          "seconds_per_request": 5.118095398870537e-05,
+          "server_cpu_seconds_per_request": 1.2207031249999957e-05,
+          "bytes_per_request": 1410.0106201171875,
+          "median_first_event_seconds": 3.9874925278127193e-05
+        }
+      },
+      "current": {
+        "full": {
+          "seconds_per_request": 0.0103997272185552,
+          "server_cpu_seconds_per_request": 0.0067578125,
+          "bytes_per_request": 1191416.3515625,
+          "median_first_event_seconds": 0.00012208300177007914
+        },
+        "conditional": {
+          "seconds_per_request": 5.1311838745959903e-05,
+          "server_cpu_seconds_per_request": 1.2207031249999957e-05,
+          "bytes_per_request": 1510.0064697265625,
+          "median_first_event_seconds": 3.962509799748659e-05
+        },
+        "minimal": {
+          "seconds_per_request": 3.881766247104679e-05,
+          "server_cpu_seconds_per_request": 8.544921875000035e-06,
+          "bytes_per_request": 256.0,
+          "median_first_event_seconds": 3.7209014408290386e-05
+        }
+      }
+    },
+    {
+      "load_average": [
+        0.59375,
+        0.1826171875,
+        0.1171875
+      ],
+      "current": {
+        "full": {
+          "seconds_per_request": 0.010523663742333156,
+          "server_cpu_seconds_per_request": 0.006757812500000002,
+          "bytes_per_request": 1191416.29296875,
+          "median_first_event_seconds": 0.00011854199692606926
+        },
+        "conditional": {
+          "seconds_per_request": 5.1297892213142404e-05,
+          "server_cpu_seconds_per_request": 1.2207031249999957e-05,
+          "bytes_per_request": 1510.011962890625,
+          "median_first_event_seconds": 3.977050073444843e-05
+        },
+        "minimal": {
+          "seconds_per_request": 3.915728247250172e-05,
+          "server_cpu_seconds_per_request": 9.765625000000009e-06,
+          "bytes_per_request": 256.0,
+          "median_first_event_seconds": 3.7375022657215595e-05
+        }
+      },
+      "baseline": {
+        "full": {
+          "seconds_per_request": 0.010785887535348593,
+          "server_cpu_seconds_per_request": 0.007812500000000003,
+          "bytes_per_request": 1191316.44921875,
+          "median_first_event_seconds": 0.00011854199692606926
+        },
+        "conditional": {
+          "seconds_per_request": 5.140041612605728e-05,
+          "server_cpu_seconds_per_request": 1.2207031249999957e-05,
+          "bytes_per_request": 1410.00634765625,
+          "median_first_event_seconds": 3.9499951526522636e-05
+        }
+      }
+    },
+    {
+      "load_average": [
+        0.78662109375,
+        0.2294921875,
+        0.1328125
+      ],
+      "baseline": {
+        "full": {
+          "seconds_per_request": 0.010673705406134104,
+          "server_cpu_seconds_per_request": 0.007773437500000001,
+          "bytes_per_request": 1191316.8671875,
+          "median_first_event_seconds": 0.00011943798745051026
+        },
+        "conditional": {
+          "seconds_per_request": 5.076117956548387e-05,
+          "server_cpu_seconds_per_request": 1.342773437499993e-05,
+          "bytes_per_request": 1410.0064697265625,
+          "median_first_event_seconds": 3.933394327759743e-05
+        }
+      },
+      "current": {
+        "full": {
+          "seconds_per_request": 0.010717427738200058,
+          "server_cpu_seconds_per_request": 0.006757812499999998,
+          "bytes_per_request": 1191416.42578125,
+          "median_first_event_seconds": 0.00012195901945233345
+        },
+        "conditional": {
+          "seconds_per_request": 5.149101269807943e-05,
+          "server_cpu_seconds_per_request": 1.2207031249999957e-05,
+          "bytes_per_request": 1510.0101318359375,
+          "median_first_event_seconds": 3.9541046135127544e-05
+        },
+        "minimal": {
+          "seconds_per_request": 3.806773376879846e-05,
+          "server_cpu_seconds_per_request": 9.765625000000009e-06,
+          "bytes_per_request": 256.0,
+          "median_first_event_seconds": 3.674998879432678e-05
+        }
+      }
+    },
+    {
+      "load_average": [
+        0.8837890625,
+        0.25927734375,
+        0.14306640625
+      ],
+      "current": {
+        "full": {
+          "seconds_per_request": 0.010486388187473494,
+          "server_cpu_seconds_per_request": 0.006914062500000005,
+          "bytes_per_request": 1191416.10546875,
+          "median_first_event_seconds": 0.0001198124373331666
+        },
+        "conditional": {
+          "seconds_per_request": 4.4766855964439856e-05,
+          "server_cpu_seconds_per_request": 1.0986328124999983e-05,
+          "bytes_per_request": 1510.015380859375,
+          "median_first_event_seconds": 3.5208999179303646e-05
+        },
+        "minimal": {
+          "seconds_per_request": 2.8667979009355804e-05,
+          "server_cpu_seconds_per_request": 7.324218749999844e-06,
+          "bytes_per_request": 256.0,
+          "median_first_event_seconds": 2.9395974706858397e-05
+        }
+      },
+      "baseline": {
+        "full": {
+          "seconds_per_request": 0.01056158268784202,
+          "server_cpu_seconds_per_request": 0.008046875000000002,
+          "bytes_per_request": 1191316.80859375,
+          "median_first_event_seconds": 0.00012197904288768768
+        },
+        "conditional": {
+          "seconds_per_request": 4.6252751701558736e-05,
+          "server_cpu_seconds_per_request": 1.0986328124999983e-05,
+          "bytes_per_request": 1410.0184326171875,
+          "median_first_event_seconds": 3.795791417360306e-05
+        }
+      }
+    },
+    {
+      "load_average": [
+        1.1337890625,
+        0.32177734375,
+        0.1640625
+      ],
+      "baseline": {
+        "full": {
+          "seconds_per_request": 0.010619298019264534,
+          "server_cpu_seconds_per_request": 0.0078125,
+          "bytes_per_request": 1191316.953125,
+          "median_first_event_seconds": 0.00011993758380413055
+        },
+        "conditional": {
+          "seconds_per_request": 5.071472168083346e-05,
+          "server_cpu_seconds_per_request": 1.342773437499993e-05,
+          "bytes_per_request": 1410.005859375,
+          "median_first_event_seconds": 3.945792559534311e-05
+        }
+      },
+      "current": {
+        "full": {
+          "seconds_per_request": 0.010500094894268841,
+          "server_cpu_seconds_per_request": 0.0068359375,
+          "bytes_per_request": 1191417.28125,
+          "median_first_event_seconds": 0.00012033304665237665
+        },
+        "conditional": {
+          "seconds_per_request": 5.170324206460464e-05,
+          "server_cpu_seconds_per_request": 1.2207031250000173e-05,
+          "bytes_per_request": 1510.0074462890625,
+          "median_first_event_seconds": 3.9708102121949196e-05
+        },
+        "minimal": {
+          "seconds_per_request": 3.9084050413862315e-05,
+          "server_cpu_seconds_per_request": 9.765625000000009e-06,
+          "bytes_per_request": 256.0,
+          "median_first_event_seconds": 3.729201853275299e-05
+        }
+      }
+    },
+    {
+      "load_average": [
+        1.11279296875,
+        0.3447265625,
+        0.173828125
+      ],
+      "current": {
+        "full": {
+          "seconds_per_request": 0.010670925948943477,
+          "server_cpu_seconds_per_request": 0.006679687499999996,
+          "bytes_per_request": 1191416.2265625,
+          "median_first_event_seconds": 0.00011870800517499447
+        },
+        "conditional": {
+          "seconds_per_request": 5.3288823494312965e-05,
+          "server_cpu_seconds_per_request": 1.2207031249999957e-05,
+          "bytes_per_request": 1510.01904296875,
+          "median_first_event_seconds": 3.987498348578811e-05
+        },
+        "minimal": {
+          "seconds_per_request": 3.937767540662662e-05,
+          "server_cpu_seconds_per_request": 8.544921875000035e-06,
+          "bytes_per_request": 256.0,
+          "median_first_event_seconds": 3.750005271285772e-05
+        }
+      },
+      "baseline": {
+        "full": {
+          "seconds_per_request": 0.010588139656192652,
+          "server_cpu_seconds_per_request": 0.0076953124999999956,
+          "bytes_per_request": 1191316.421875,
+          "median_first_event_seconds": 0.00011937500676140189
+        },
+        "conditional": {
+          "seconds_per_request": 5.245787048124839e-05,
+          "server_cpu_seconds_per_request": 1.3427734375000364e-05,
+          "bytes_per_request": 1410.006103515625,
+          "median_first_event_seconds": 3.9792037568986416e-05
+        }
+      }
+    },
+    {
+      "load_average": [
+        1.18408203125,
+        0.37255859375,
+        0.18408203125
+      ],
+      "baseline": {
+        "full": {
+          "seconds_per_request": 0.01078076644535031,
+          "server_cpu_seconds_per_request": 0.007773437499999994,
+          "bytes_per_request": 1191316.421875,
+          "median_first_event_seconds": 0.00011931249173358083
+        },
+        "conditional": {
+          "seconds_per_request": 4.997971606712781e-05,
+          "server_cpu_seconds_per_request": 1.2207031250000173e-05,
+          "bytes_per_request": 1410.0096435546875,
+          "median_first_event_seconds": 3.945804201066494e-05
+        }
+      },
+      "current": {
+        "full": {
+          "seconds_per_request": 0.010775978843412304,
+          "server_cpu_seconds_per_request": 0.0067187500000000025,
+          "bytes_per_request": 1191416.27734375,
+          "median_first_event_seconds": 0.00011768750846385956
+        },
+        "conditional": {
+          "seconds_per_request": 5.2147303350125185e-05,
+          "server_cpu_seconds_per_request": 1.220703124999974e-05,
+          "bytes_per_request": 1510.010986328125,
+          "median_first_event_seconds": 4.04169550165534e-05
+        },
+        "minimal": {
+          "seconds_per_request": 3.906729627090044e-05,
+          "server_cpu_seconds_per_request": 8.544921875000035e-06,
+          "bytes_per_request": 256.0,
+          "median_first_event_seconds": 3.733299672603607e-05
+        }
+      }
+    }
+  ],
+  "cgroup_cpu_max": "200000 100000",
+  "binaries": {
+    "current": {
+      "sha256": "815e00d7e84da867d80aa25e65d538222a01c45eb83961b726a3ceccd5666237"
+    },
+    "baseline": {
+      "sha256": "389c59476fbe2fab6f80678ae5c684b4f52505ca78d84fd1386aa873209cd68c"
+    }
+  },
+  "client_omission": {
+    "seconds_per_read": 2.878977056752774e-07,
+    "requests": 0,
+    "response_bytes": 0
+  },
+  "median": {
+    "current": {
+      "full": {
+        "seconds_per_request": 0.010500094894268841,
+        "server_cpu_seconds_per_request": 0.0067578125,
+        "bytes_per_request": 1191416.29296875,
+        "median_first_event_seconds": 0.0001198124373331666
+      },
+      "conditional": {
+        "seconds_per_request": 5.149101269807943e-05,
+        "server_cpu_seconds_per_request": 1.2207031249999957e-05,
+        "bytes_per_request": 1510.010986328125,
+        "median_first_event_seconds": 3.962509799748659e-05
+      },
+      "minimal": {
+        "seconds_per_request": 3.892376209080339e-05,
+        "server_cpu_seconds_per_request": 8.544921875000035e-06,
+        "bytes_per_request": 256.0,
+        "median_first_event_seconds": 3.729201853275299e-05
+      }
+    },
+    "baseline": {
+      "full": {
+        "seconds_per_request": 0.010588139656192652,
+        "server_cpu_seconds_per_request": 0.007812500000000003,
+        "bytes_per_request": 1191316.80859375,
+        "median_first_event_seconds": 0.00011993758380413055
+      },
+      "conditional": {
+        "seconds_per_request": 5.071472168083346e-05,
+        "server_cpu_seconds_per_request": 1.2207031250000173e-05,
+        "bytes_per_request": 1410.0089111328125,
+        "median_first_event_seconds": 3.945792559534311e-05
+      }
+    }
+  }
+}

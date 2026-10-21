@@ -1,0 +1,80 @@
+{
+  "evaluation": "synthetic_decision_transport_fixture",
+  "limitations": "Constant scores; no model quality, provider tokens, or actual cost measured.",
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "cache": false,
+  "jobs": 1,
+  "keep_alive": false,
+  "source_sha256": "76bbecb2c273a836fad49cfd5aad9860a22d4f438104c1a41ac7e98da1f4aa0c",
+  "source_bytes": 19858,
+  "lines": 512,
+  "batch_size": 32,
+  "binaries": {
+    "antfly-grep": {
+      "sha256": "a7e29f4dccfd2d980b6eeaa96c1de37730f44e9c2f59dd5eb344aa2dd1b336f4",
+      "runs": [
+        {
+          "seconds": 0.23174404099999998,
+          "output_sha256": "08746913e4e964904763b70f93b6530ddbcb4d374ac50c855c781cc725708d56",
+          "requests": 17,
+          "connections": 17,
+          "request_bytes": 412521,
+          "state_bytes": 318464,
+          "questions": 513
+        },
+        {
+          "seconds": 0.23667066699999995,
+          "output_sha256": "08746913e4e964904763b70f93b6530ddbcb4d374ac50c855c781cc725708d56",
+          "requests": 17,
+          "connections": 17,
+          "request_bytes": 412521,
+          "state_bytes": 318464,
+          "questions": 513
+        },
+        {
+          "seconds": 0.23118020800000005,
+          "output_sha256": "08746913e4e964904763b70f93b6530ddbcb4d374ac50c855c781cc725708d56",
+          "requests": 17,
+          "connections": 17,
+          "request_bytes": 412521,
+          "state_bytes": 318464,
+          "questions": 513
+        }
+      ],
+      "median_seconds": 0.23174404099999998
+    },
+    "baseline": {
+      "sha256": "b042bbae3320252e14b55ac92c14164568ad3f35adae35faea862706bf093633",
+      "runs": [
+        {
+          "seconds": 0.255197916,
+          "output_sha256": "08746913e4e964904763b70f93b6530ddbcb4d374ac50c855c781cc725708d56",
+          "requests": 17,
+          "connections": 17,
+          "request_bytes": 10531047,
+          "state_bytes": 0,
+          "questions": 513
+        },
+        {
+          "seconds": 0.2567812920000001,
+          "output_sha256": "08746913e4e964904763b70f93b6530ddbcb4d374ac50c855c781cc725708d56",
+          "requests": 17,
+          "connections": 17,
+          "request_bytes": 10531047,
+          "state_bytes": 0,
+          "questions": 513
+        },
+        {
+          "seconds": 0.25153637500000015,
+          "output_sha256": "08746913e4e964904763b70f93b6530ddbcb4d374ac50c855c781cc725708d56",
+          "requests": 17,
+          "connections": 17,
+          "request_bytes": 10531047,
+          "state_bytes": 0,
+          "questions": 513
+        }
+      ],
+      "median_seconds": 0.255197916
+    }
+  }
+}

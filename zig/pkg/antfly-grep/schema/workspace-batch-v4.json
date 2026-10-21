@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "antfly-grep opt-in workspace tuple batch v4",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "type",
+    "result_schema_version",
+    "file_id",
+    "rows"
+  ],
+  "properties": {
+    "type": {
+      "const": "batch"
+    },
+    "result_schema_version": {
+      "const": 4
+    },
+    "file_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "rows": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": {
+        "type": "array",
+        "minItems": 5,
+        "maxItems": 5,
+        "prefixItems": [
+          {
+            "enum": [
+              0,
+              1
+            ]
+          },
+          {
+            "type": "integer",
+            "minimum": 1
+          },
+          {
+            "type": "integer",
+            "minimum": 0
+          },
+          {
+            "type": "object",
+            "oneOf": [
+              {
+                "required": [
+                  "text"
+                ],
+                "properties": {
+                  "text": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": false
+              },
+              {
+                "required": [
+                  "bytes"
+                ],
+                "properties": {
+                  "bytes": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": false
+              }
+            ]
+          },
+          {
+            "type": "array"
+          }
+        ]
+      }
+    }
+  },
+  "$comment": "Register compact=true,batches=true,row_format=tuples. Each row is [kind (0 match, 1 context), line_number, absolute_offset, lines, submatches]. Probability is null and scope is line for these lexical rows. First and oversized rows remain ordinary v4 events. Same 64 row / 32768 byte body bounds and transaction rules as v3. Existing protocols retain their default format."
+}
