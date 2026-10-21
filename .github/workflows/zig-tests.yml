@@ -2454,7 +2454,7 @@ jobs:
         run: scripts/ci/zig-build-e2e-binaries.sh
 
       - name: Package E2E executable
-        run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-full.tar.gz" zig-out/bin/antfly
+        run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-full.tar.gz" zig-out/bin/antfly zig-out/bin/antfly-grep
 
       - name: Upload E2E executable
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

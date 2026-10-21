@@ -171,6 +171,19 @@ document keys in different tables are distinct nodes: reverse traversal reads
 the source tag, and bidirectional traversal compares qualified endpoint
 identities. A genuine self-loop remains unoriented for bidirectional traversal.
 
+Lite traversal and neighbor queries accept `start.identities` with explicit
+`table` and `key`. Incoming expansion reads the qualified target in the queried
+index; equal keys in other tables cannot match it. Returned paths retain the
+seed table, including paths that finish in the query table. Entirely local paths
+keep the compact representation without an additional table array.
+
+Server incoming queries on cross-table resolver graphs require explicit start
+identities; bare keys return `qualified_start_identity_required` rather than a
+misleading empty result. Distributed traversal requires `deduplicate_nodes=true`;
+an unsupported false value reports `deduplicate_nodes_must_be_true`, including
+for incoming queries. Use separate queries per seed with `include_paths=true`
+when separate seed provenance is required.
+
 Native shortest-path and Yen searches preserve qualified node identity in every
 returned node, spur seed, root exclusion, and joined candidate. Native callers can specify
 `source_table` and `target_table` to distinguish equal document keys; an omitted

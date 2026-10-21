@@ -4949,6 +4949,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         try checkQueryDeadline(req);
+        try distributed_graph.validateIncomingStartIdentities(alloc, self.catalog, table_name, req);
         var routing_session = if (requiresAuthoritativeRoutingSession(req))
             try table_catalog.RoutingSession.init(alloc, self.catalog, queryRoutingDeadline(self.catalog, req))
         else
@@ -7464,6 +7465,7 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         var req = requested;
         try checkQueryDeadline(req);
+        try distributed_graph.validateIncomingStartIdentities(alloc, hosted.catalog, table_name, req);
         var routing_session = if (requiresAuthoritativeRoutingSession(req))
             try table_catalog.RoutingSession.init(alloc, hosted.catalog, queryRoutingDeadline(hosted.catalog, req))
         else

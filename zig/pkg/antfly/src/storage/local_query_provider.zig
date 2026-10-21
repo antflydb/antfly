@@ -147,6 +147,9 @@ fn executeSearch(
         ),
     } catch |err| return fail(err, parseOperation(request.dialect), out_failure);
     defer owned.deinit(alloc);
+    // Public C ABI queries name this database's owning table. Preserve that
+    // namespace when canonicalizing explicit self-table start identities.
+    if (request.dialect == .public) owned.req.graph_owning_table = table_name;
 
     @import("antfly_local_sources").storage_local_query_controls.applyExecutionOptions(&owned.req, request.execution_options);
     if (request.has_execution_deadline != 0) {

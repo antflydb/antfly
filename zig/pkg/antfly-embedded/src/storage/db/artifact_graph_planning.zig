@@ -62,6 +62,7 @@ pub const Context = struct {
     catalog: Catalog,
     index_manager: *Catalog,
     base: publication.Command,
+    inputs: @import("artifact_producer_context.zig").Token,
     source_index: u32,
     commands: std.ArrayList(publication.Command) = .empty,
     proof: provenance.Owned,
@@ -107,16 +108,17 @@ pub const Context = struct {
         }
         self.catalog = .{ .entries = entries.items, .resolvers = .{ .items = if (catalogs.resolvers.len == 0) &.{} else try resolvers.deserializeActiveCatalog(self.owned, catalogs.resolvers) } };
         self.index_manager = &self.catalog;
-        var guards: std.ArrayList(publication.ArtifactSource) = .empty;
-        for (proof.artifact_sources) |input| if (!std.mem.eql(u8, input.key, proof_key)) try guards.append(self.owned, input);
-        try guards.append(self.owned, try self.guard(proof_key));
-        std.mem.sort(publication.ArtifactSource, guards.items, {}, guardLess);
-        self.base = .{ .producer_kind = .graph, .namespace = proof.namespace, .authority_epoch = proof.authority_epoch, .catalog_digest = proof.catalog_digest, .producer_name = "", .producer_generation = 0, .producer_artifact_name = try self.owned.dupe(u8, artifact_name), .sources = proof.sources, .artifact_sources = guards.items, .mutations = &.{}, .publication_digest = @splat(0) };
+        self.inputs = .{ .arena = std.heap.ArenaAllocator.init(owner), .namespace = proof.namespace, .epoch = proof.authority_epoch, .catalog_digest = proof.catalog_digest, .producer_kind = .graph, .producer_name = "", .producer_generation = 0, .artifact_name = artifact_name, .source = proof.sources[self.source_index] };
+        errdefer self.inputs.deinit();
+        try self.inputs.inheritProof(proof);
+        try self.inputs.observe(proof_key, expected_proof, try publication.artifactRevision(read, proof.namespace, proof_key));
+        try self.refreshInputs();
         return self;
     }
 
     pub fn destroy(self: *Context) void {
         const owner = self.owner;
+        self.inputs.deinit();
         self.proof.deinit();
         self.arena.deinit();
         owner.destroy(self);
@@ -136,15 +138,29 @@ pub const Context = struct {
                 else => return err,
             };
         };
-        const sources = try self.owned.alloc(publication.ArtifactSource, self.base.artifact_sources.len + 1);
-        @memcpy(sources[0..self.base.artifact_sources.len], self.base.artifact_sources);
-        sources[sources.len - 1] = try self.guard(key);
-        std.mem.sort(publication.ArtifactSource, sources, {}, guardLess);
-        self.base.artifact_sources = sources;
-        return self.getAlloc(key) catch |err| switch (err) {
+        const raw = self.getAlloc(key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
         };
+        errdefer if (raw) |value| self.alloc.free(value);
+        // A missing/stale resolution is dependency debt, never an accepted
+        // empty graph. Inherit its causal inputs so acceptance rechecks them
+        // atomically, including neighboring documents and curator decisions.
+        if (self.inputs.source.exists) {
+            var proof = (try provenance.readCurrentForArtifact(self.owned, self.read, key, raw)) orelse return error.ArtifactPublicationPending;
+            defer proof.deinit();
+            try self.inputs.inheritProof(proof.proof);
+        }
+        try self.inputs.observe(key, raw, try publication.artifactRevision(self.read, self.proof.proof.namespace, key));
+        try self.refreshInputs();
+        return raw;
+    }
+
+    fn refreshInputs(self: *Context) !void {
+        self.base = try self.inputs.command(&.{});
+        self.source_index = for (self.base.sources, 0..) |source, index| {
+            if (std.mem.eql(u8, source.document_key, self.inputs.source.document_key)) break @intCast(index);
+        } else return error.ArtifactCatalogCorrupt;
     }
 
     fn guard(self: *Context, key: []const u8) !publication.ArtifactSource {

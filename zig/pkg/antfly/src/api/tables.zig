@@ -6852,3 +6852,22 @@ test "resolver curation HTTP enrichment summaries exclude opaque metadata" {
     try std.testing.expectEqual(@as(usize, 1), summaries.items.len);
     try std.testing.expectEqualStrings("live", summaries.items[0].object.get("name").?.string);
 }
+
+test "system catalog cached capabilities retain shorthand scalar source names" {
+    const a = std.testing.allocator;
+    const schema =
+        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"size":{"type":"number","x-antfly-types":["numeric"]},"modified_at":{"type":"string","x-antfly-types":["datetime"]}}}}}}
+    ;
+    const entry = try DefinitionCache.Entry.create(a, @splat(0), &.{ .table_id = 1, .name = "docs", .schema_json = schema });
+    defer entry.release();
+    for ([_][]const u8{ "size", "modified_at" }) |name| {
+        var found = false;
+        for (entry.capabilities.?) |capability| {
+            if (capability.field) |field| if (std.mem.eql(u8, name, field)) {
+                try std.testing.expect(!capability.sortable);
+                found = true;
+            };
+        }
+        try std.testing.expect(found);
+    }
+}

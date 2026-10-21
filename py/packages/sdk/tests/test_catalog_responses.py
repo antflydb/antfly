@@ -61,6 +61,7 @@ def test_catalog_errors_preserve_shared_envelope(operation, status, code):
 
 def test_table_capabilities_preserve_logical_groups_and_concrete_views():
     from antfly.client_generated.api.table_management import get_table
+    from antfly.client_generated.models.table_status import TableStatus
     from antfly.client_generated.types import UNSET
 
     representation = {
@@ -116,6 +117,8 @@ def test_table_capabilities_preserve_logical_groups_and_concrete_views():
             },
         ),
     )
+    assert isinstance(result, TableStatus)
+    assert isinstance(result.field_capabilities, list)
     source, score, unknown = result.field_capabilities
     assert source.field == "title"
     assert source.representations[0].field == "title._keyword"

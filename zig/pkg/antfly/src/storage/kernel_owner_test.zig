@@ -90,6 +90,49 @@ test "opaque owner retained relational read crosses checked archive boundary" {
     try std.testing.expectError(error.PreparedGenerationChanged, provider.open(alloc, "rows", "", "", .{ .relational_query = .{ .schema_version = 2, .fields = &.{} }, .limit = 1 }));
 }
 
+test "opaque owner conditional writes retain version and digest fences" {
+    const alloc = std.testing.allocator;
+    const batch = @import("antfly_local_sources").api_batch;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    var owner = try client.Owner.open(.{
+        .path = .fromSlice(root),
+        .table_name = .fromSlice("docs"),
+        .group_id = 7001,
+    });
+    defer owner.deinit();
+    var inserted = try owner.batchJson("docs",
+        \\{"inserts":{"entity/ada":{"value":"original"}},"_timestamp_ns":"5000","sync_level":"write"}
+    );
+    inserted.deinit();
+    // Both observations must cross the compiled owner boundary unchanged.
+    for ([_]u64{ 4999, 5000 }) |version| {
+        const encoded = try batch.encodeOwnerBatchRequest(alloc, .{
+            .writes = &.{.{ .key = "entity/ada", .value = "{\"value\":\"stale\"}" }},
+            .predicates = &.{.{ .key = "entity/ada", .expected_version = version, .expected_content_digest = if (version == 5000) @as([32]u8, @splat(0)) else null }},
+            .sync_level = .write,
+        });
+        defer alloc.free(encoded);
+        try std.testing.expectError(error.VersionConflict, owner.batchJson("docs", encoded));
+        var unchanged = try owner.lookupJson("docs", "{\"key\":\"entity/ada\"}");
+        defer unchanged.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, unchanged.bytes(), "original") != null);
+    }
+    const matching = try batch.encodeOwnerBatchRequest(alloc, .{
+        .writes = &.{.{ .key = "entity/ada", .value = "{\"value\":\"current\"}" }},
+        .predicates = &.{.{ .key = "entity/ada", .expected_version = 5000 }},
+        .sync_level = .write,
+    });
+    defer alloc.free(matching);
+    var committed = try owner.batchJson("docs", matching);
+    committed.deinit();
+    var current = try owner.lookupJson("docs", "{\"key\":\"entity/ada\"}");
+    defer current.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, current.bytes(), "current") != null);
+}
+
 test "opaque owner retains newer durable schema when reopening a stale descriptor" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

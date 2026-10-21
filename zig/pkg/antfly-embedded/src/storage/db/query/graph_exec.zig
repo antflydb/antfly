@@ -235,6 +235,7 @@ pub const DocSetDocIdResolver = struct {
         generation: ?u64,
     ) anyerror!?[][]u8 = null,
     identity_read_generation: ?u64 = null,
+    allow_qualified_identities: bool = false,
 };
 
 pub const SearchGraphExecutor = struct {
@@ -1668,6 +1669,7 @@ pub fn executeSingleNonPatternQueryWithSetsWithBudgets(
         .ctx = executor.ctx,
         .func = executor.resolve_doc_set_doc_ids,
         .identity_read_generation = req.identity_read_generation,
+        .allow_qualified_identities = named.query.query_type == .traverse or named.query.query_type == .neighbors,
     });
     defer freeOwnedKeySlice(alloc, start_keys);
     if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
@@ -1928,6 +1930,7 @@ pub fn executeSearchGraphWithSets(
         .ctx = executor.ctx,
         .func = executor.resolve_doc_set_doc_ids,
         .identity_read_generation = req.identity_read_generation,
+        .allow_qualified_identities = graph_query.query_type == .traverse or graph_query.query_type == .neighbors,
     });
     defer freeOwnedKeySlice(alloc, start_keys);
     if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
@@ -2019,7 +2022,7 @@ pub fn executeSearchGraph(
     base_hits: ?[]const types.SearchHit,
     executor: SearchGraphExecutor,
 ) !types.SearchResult {
-    var start_keys = try resolveGraphSelector(alloc, graph_query.start_nodes, base_hits);
+    var start_keys = try resolveGraphSelectorScoped(alloc, graph_query.start_nodes, base_hits, graph_query.query_type == .traverse or graph_query.query_type == .neighbors);
     defer freeOwnedKeySlice(alloc, start_keys);
     if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
         start_keys = try filterOwnedGraphKeys(
@@ -2676,6 +2679,10 @@ fn freeOwnedKeySlice(alloc: Allocator, keys: [][]u8) void {
 }
 
 pub fn resolveGraphSelector(alloc: Allocator, selector: graph_query_mod.NodeSelector, base_hits: ?[]const types.SearchHit) ![][]u8 {
+    return resolveGraphSelectorScoped(alloc, selector, base_hits, false);
+}
+
+fn resolveGraphSelectorScoped(alloc: Allocator, selector: graph_query_mod.NodeSelector, base_hits: ?[]const types.SearchHit, allow_qualified: bool) ![][]u8 {
     return switch (selector) {
         .keys => |keys| blk: {
             var duped = try alloc.alloc([]u8, keys.len);
@@ -2698,10 +2705,10 @@ pub fn resolveGraphSelector(alloc: Allocator, selector: graph_query_mod.NodeSele
                 alloc.free(duped);
             }
             for (identities, 0..) |identity, i| {
-                // This executor is scoped to one table. Qualified endpoints must
-                // be resolved by the distributed graph executor, which preserves
-                // the table as part of node identity throughout traversal.
-                if (identity.table != null) return error.UnsupportedQueryRequest;
+                // Traversal retains the original selector alongside these keys,
+                // preserving endpoint tables. Other local query forms still
+                // require unqualified selectors.
+                if (identity.table != null and !allow_qualified) return error.UnsupportedQueryRequest;
                 duped[i] = try alloc.dupe(u8, identity.key);
                 initialized += 1;
             }
@@ -5174,7 +5181,7 @@ pub fn resolveGraphSelectorFromSets(
 ) ![][]u8 {
     return switch (selector) {
         .keys => |keys| resolveGraphSelector(alloc, .{ .keys = keys }, null),
-        .identities => |identities| resolveGraphSelector(alloc, .{ .identities = identities }, null),
+        .identities => |identities| resolveGraphSelectorScoped(alloc, .{ .identities = identities }, null, doc_set_resolver.allow_qualified_identities),
         .result_ref => |result_ref| blk: {
             const set = findNamedSetByRef(named_sets, result_ref.ref) orelse return error.GraphResultRefNotImplemented;
             if (result_ref.binding) |binding| {
