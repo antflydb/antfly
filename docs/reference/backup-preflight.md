@@ -40,8 +40,13 @@ An incomplete, blocked, or unknown report is not admission to restore.
   Each requirement has a stable reason code and remediation.
 
 The default library limits are 64 GiB input, 128 GiB scratch/expansion admission,
-4,096 selectors and requirement groups, 16 MiB retained selector bytes, 64 MiB
-per materialized document, and 32 total examples (at most four per group).
+4,096 selectors and requirement groups, 16 MiB per metadata key or value,
+16 MiB of retained selector bytes, 64 MiB per materialized document, and 32 total
+examples (at most four per group).
+Metadata keys and values are admitted before catalog/schema decoding on every
+validation and inspection pass. Batch traversal borrows source bytes, so a rejected
+record is not cloned first; a batch of individually bounded records may exceed
+the per-record limit.
 The document limit bounds logical JSON before output allocation, including
 streamed zstd decompression and measured relational-row reconstruction.
 The expansion budget includes per-document compression inside decoded portable
@@ -98,8 +103,9 @@ model revision or preprocessing contract and remains `model_contract_unknown`.
 Retired resolver identities retain historical state without executing it and
 do not contribute active dependencies.
 
-Prior-context render templates use the same inspection rules as source
-templates. Their named retained artifacts are inspected as single values,
+Prior-context render templates inventory executed helper fetches. Their output
+is appended as literal text, including media-looking markers. Their named
+retained artifacts are inspected as single values,
 arrays, or `items` envelopes using the execution path's collection selection.
 Unsupported helpers remain uninspectable even when no prior artifact exists.
 
@@ -121,9 +127,11 @@ follow the runtime parser.
 When output is interpreted as media or a locator, remote helper output is
 opaque: it can contain or complete media directives even when the fetch URL is
 known. Its dependencies remain incomplete and cannot be certified by destination
-evidence. Copy output, fixed chunker input, and model chunker text do not
-interpret media markers. Their executed template helper fetch URLs and
-credentials still require destination evidence; structured model chunker media
+evidence. Copy output, fixed chunker input, model chunker text, and template-free
+generator or text embedding inputs do not interpret media markers. Locator
+consumers still inventory source URLs, and templates that produce media parts
+remain subject to directive inspection. Executed template helper fetch URLs
+and credentials still require destination evidence; structured model chunker media
 and source references follow the shared runtime parser. Unsupported
 helper syntax, opaque output in interpreted positions, and custom loaders are
 reported as `dependency_uninspectable`. This deliberately does not claim to

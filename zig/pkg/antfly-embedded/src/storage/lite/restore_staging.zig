@@ -236,7 +236,7 @@ fn inspectPortable(allocator: Allocator, io: std.Io, file: std.Io.File, options:
     var inspector: preflight.Inspector = .{ .allocator = allocator, .report = report, .options = options };
     defer inspector.deinit();
     if (catalog) |json| try inspector.indexCatalogJson(json);
-    _ = try portable_backup.inspectPortableFileBlocks(allocator, io, file, .{ .metadata_first = true, .max_input_bytes = options.max_input_bytes, .max_logical_bytes = options.max_expanded_bytes, .cancellation = options.cancellation }, &inspector, preflight.Inspector.visit);
+    _ = try portable_backup.inspectPortableFileBlocks(allocator, io, file, .{ .metadata_first = true, .max_input_bytes = options.max_input_bytes, .max_logical_bytes = options.max_expanded_bytes, .max_metadata_bytes = options.max_metadata_bytes, .cancellation = options.cancellation }, &inspector, preflight.Inspector.visit);
 }
 
 pub fn defaultBackupIdAlloc(allocator: Allocator, path: []const u8) ![]u8 {
@@ -2550,4 +2550,44 @@ test "backup preflight bounds outer expansion before allocation" {
     var slice = backup_codec.SliceReader.init(archive.items);
     _ = try slice.readHeader();
     try std.testing.expectError(error.BackupExpansionLimitExceeded, slice.readBlockLimited(a, 4096));
+}
+
+test "backup preflight metadata admission precedes validation and permits bounded aggregate batches" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const value = try a.alloc(u8, 64 * 1024);
+    defer a.free(value);
+    @memset(value, ' ');
+    value[0] = '[';
+    value[value.len - 1] = ']';
+    const payload = try backup_codec.encodeKeyValueBatch(a, &.{
+        .{ .key = "\x00\x00__metadata__:enrichments", .value = value },
+        .{ .key = "\x00\x00__metadata__:resolvers", .value = value },
+    });
+    defer a.free(payload);
+    var archive: std.ArrayListUnmanaged(u8) = .empty;
+    defer archive.deinit(a);
+    try backup_codec.writeHeader(&archive, a, .{ .format_version = backup_codec.legacy_format_version, .flags = 0, .created_at_ns = 0, .backup_id = @splat(0), .table_count = 1, .shard_count = 1 });
+    try backup_codec.writeBlock(&archive, a, .metadata_batch, payload);
+    try portable_backup.validatePortable(a, archive.items);
+    var file = try tmp.dir.createFile(io, "metadata.afb", .{ .read = true });
+    defer file.close(io);
+    try file.writePositionalAll(io, archive.items, 0);
+    var counter: InspectionCounter = .{};
+    try std.testing.expectError(error.BackupExpansionLimitExceeded, portable_backup.inspectPortableFileBlocks(a, io, file, .{ .max_metadata_bytes = value.len - 1 }, &counter, InspectionCounter.visit));
+    try std.testing.expectEqual(@as(usize, 0), counter.blocks);
+    _ = try portable_backup.inspectPortableFileBlocks(a, io, file, .{ .max_metadata_bytes = value.len }, &counter, InspectionCounter.visit);
+    try std.testing.expectEqual(@as(usize, 1), counter.blocks);
+    const path = try tmp.dir.realPathFileAlloc(io, "metadata.afb", a);
+    defer a.free(path);
+    const limited = try inspectInputJsonAlloc(a, path, null, .{ .max_metadata_bytes = value.len - 1 });
+    defer a.free(limited);
+    try std.testing.expect(std.mem.indexOf(u8, limited, "\"failure_code\":\"limit_exceeded\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, limited, "\"scan_complete\":false") != null);
+    const admitted = try inspectInputJsonAlloc(a, path, "{\"version\":1,\"configuration_id\":\"empty\"}", .{ .max_metadata_bytes = value.len });
+    defer a.free(admitted);
+    try std.testing.expect(std.mem.indexOf(u8, admitted, "\"scan_complete\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, admitted, "\"compatibility\":{\"verdict\":\"compatible\"") != null);
 }

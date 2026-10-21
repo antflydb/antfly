@@ -2884,6 +2884,7 @@ pub const FileInspectionOptions = struct {
     metadata_first: bool = false,
     max_input_bytes: u64 = 64 * 1024 * 1024 * 1024,
     max_logical_bytes: u64 = 128 * 1024 * 1024 * 1024,
+    max_metadata_bytes: usize = std.math.maxInt(usize),
     cancellation: @import("antfly_cancellation").CancellationToken = .none,
 };
 
@@ -2904,7 +2905,9 @@ pub const InspectionDocumentDecoder = struct {
         self.archive.deinit(alloc);
     }
 
-    pub fn metadata(self: *@This(), alloc: Allocator, payload: []const u8) !void {
+    pub fn metadataLimited(self: *@This(), alloc: Allocator, payload: []const u8, max_bytes: usize) !void {
+        const reader = try backup_codec.KeyValueBatchReader.init(payload);
+        try reader.checkEntryLimit(max_bytes);
         try validateMetadataBatchPayload(alloc, payload, &self.archive);
     }
 
@@ -3000,6 +3003,13 @@ const InspectionReader = struct {
         if (block.payload.len > self.options.max_logical_bytes -| self.logical_bytes)
             return error.BackupExpansionLimitExceeded;
         self.logical_bytes += block.payload.len;
+        if (block.block_type == .metadata_batch) {
+            const metadata = try backup_codec.KeyValueBatchReader.init(block.payload);
+            metadata.checkEntryLimit(self.options.max_metadata_bytes) catch |err| switch (err) {
+                error.StreamTooLong => return error.BackupExpansionLimitExceeded,
+                else => return err,
+            };
+        }
         // A document may be compressed inside an already decoded block. Charge
         // its expansion on every inspection pass, before invoking any visitor.
         if (block.block_type == .document_batch) {
@@ -4633,9 +4643,8 @@ fn validateIdentityBatchPayload(alloc: Allocator, payload: []const u8) !void {
 }
 
 fn validateMetadataBatchPayload(alloc: Allocator, payload: []const u8, archive: *PortableArchiveValidation) !void {
-    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
-    defer freeKeyValueEntries(alloc, entries);
-    return try validateMetadataEntries(alloc, entries, archive);
+    var reader = try backup_codec.KeyValueBatchReader.init(payload);
+    while (try reader.next()) |entry| try validateMetadataEntries(alloc, &.{entry}, archive);
 }
 
 fn validateMetadataEntries(

@@ -304,8 +304,8 @@ const SourceInput = enum {
 
     fn interpretsTemplateOutput(self: @This()) bool {
         return switch (self) {
-            .literal, .model_chunk => false,
-            .text, .locator, .prior_context => true,
+            .literal, .model_chunk, .prior_context => false,
+            .text, .locator => true,
         };
     }
 };
@@ -346,16 +346,12 @@ pub const Inspector = struct {
         switch (kind) {
             .shard_header => self.report.shards += 1,
             .metadata_batch => {
-                try self.decoder.metadata(self.allocator, payload);
-                const entries = try codec.decodeKeyValueBatch(self.allocator, payload);
-                defer {
-                    for (entries) |e| {
-                        self.allocator.free(e.key);
-                        self.allocator.free(e.value);
-                    }
-                    self.allocator.free(entries);
-                }
-                for (entries) |e| {
+                self.decoder.metadataLimited(self.allocator, payload, self.options.max_metadata_bytes) catch |err| switch (err) {
+                    error.StreamTooLong => return error.PreflightLimitExceeded,
+                    else => return err,
+                };
+                var reader = try codec.KeyValueBatchReader.init(payload);
+                while (try reader.next()) |e| {
                     self.report.metadata_records += 1;
                     if (std.mem.endsWith(u8, e.key, ":indexes")) {
                         const json = try staging.tableIndexesJsonFromPortableMetadata(self.allocator, e.value, null);
@@ -639,8 +635,8 @@ pub const Inspector = struct {
         if (is_definition and (field.len > 0 or template.len > 0 or artifact.len > 0)) {
             const locator_mode = eq(producer_type, "reader") or eq(producer_type, "transcriber") or eq(producer_type, "document_extraction") or eq(str(get(value, "embedding_input")), "pdf_page_images") or eq(str(get(value, "input")), "pdf_page_images") or eq(str(get(value, "embedding_input")), "image") or eq(str(get(value, "embedding_input")), "audio") or eq(str(get(value, "embedding_input")), "video") or get(value, "transcriber") != .null;
             const parsed_type = ProducerType.parse(producer_type) orelse .copy;
-            const literal_output = (eq(kind, "asset") and known and !parsed_type.rendersTemplateParts()) or
-                (eq(kind, "chunk") and !model_chunk);
+            const literal_output = (eq(kind, "asset") and known and !parsed_type.usesTemplateParts(template)) or
+                (eq(kind, "chunk") and !model_chunk) or (is_embedding and template.len == 0);
             try self.selector(field, template, artifact, if (model_chunk) .model_chunk else if (locator_mode) .locator else if (literal_output) .literal else .text, !known, group != null);
         }
         if (is_embedding) {
@@ -773,7 +769,7 @@ pub const Inspector = struct {
                             try self.report.add(self.options, .source_unresolved, "group_unit_text", id, s.field, 0);
                         } else if (s.input == .prior_context) {
                             try self.report.add(self.options, .source_unresolved, "prior_context_artifact", id, s.field, 0);
-                        } else try self.consumeValue(.{ .string = bytes }, id, s.field, s.input == .locator, 0);
+                        } else try self.sourceValue(.{ .string = bytes }, id, s.field, s.input);
                     };
                     return;
                 }
@@ -793,7 +789,7 @@ pub const Inspector = struct {
                 else if (eq(artifact, s.artifact)) get(parsed.value, "text") else continue;
                 if (selected != .string) {
                     try self.report.add(self.options, .source_unresolved, "group_unit_text", id, s.field, 0);
-                } else if (s.input == .model_chunk) try self.modelChunkSource(selected, id, s.field) else try self.consumeValue(selected, id, s.field, s.input == .locator, 0);
+                } else try self.sourceValue(selected, id, s.field, s.input);
                 continue;
             }
             if (!eq(s.artifact, artifact)) continue;
@@ -812,12 +808,21 @@ pub const Inspector = struct {
                 // _source_field provenance, instead of guessing stored layouts.
                 if (try @import("../../chunking/chunk.zig").artifactTextAlloc(self.allocator, bytes, s.field)) |text| {
                     defer self.allocator.free(text);
-                    try self.consumeValue(.{ .string = text }, id, s.field, s.input == .locator, 0);
+                    try self.sourceValue(.{ .string = text }, id, s.field, s.input);
                 }
             } else {
                 const selected = if (s.field.len == 0) parsed.value else enrichment_types.sourceFieldValue(parsed.value, s.field, false);
-                if (s.input == .model_chunk) try self.modelChunkSource(selected, id, s.field) else try self.consumeValue(selected, id, s.field, s.input == .locator, 0);
+                try self.sourceValue(selected, id, s.field, s.input);
             }
+        }
+    }
+
+    fn sourceValue(self: *@This(), value: Value, doc: []const u8, field: []const u8, input: SourceInput) !void {
+        switch (input) {
+            .literal, .prior_context => {},
+            .model_chunk => try self.modelChunkSource(value, doc, field),
+            .locator => try self.consumeValue(value, doc, field, true, 0),
+            .text => try self.consumeValue(value, doc, field, false, 0),
         }
     }
 
@@ -1111,7 +1116,7 @@ fn count(report: Report, kind: Kind) u64 {
 
 test "backup preflight catalog names do not hide dependencies" {
     const a = std.testing.allocator;
-    const config = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"mock\"}}";
+    const config = "{\"type\":\"embeddings\",\"field\":\"body\",\"template\":\"{{{body}}}\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"mock\"}}";
     for ([_][]const u8{ "normal", "default", "schema", "url", "api_key", "enrichments", "loader", "config_json" }) |name| {
         const metadata = try std.fmt.allocPrint(a, "{{\"{s}\":{s}}}", .{ name, config });
         defer a.free(metadata);
@@ -1277,7 +1282,7 @@ test "backup preflight prior context selects runtime artifact items and rejects 
             "{\"items\":[{\"source\":\"file:///private/c\"}],\"source\":\"file:///private/not-selected\"}",
         }) |artifact| try inspector.document("previous-unit", artifact, "claims");
         try std.testing.expectEqual(@as(u64, 3), count(report, .source_local));
-        try std.testing.expect(!report.analysis_complete);
+        try std.testing.expect(report.analysis_complete);
         try inspector.document("invalid", "invalid-json", "claims");
         try std.testing.expect(!report.analysis_complete);
     }
@@ -1547,7 +1552,7 @@ test "backup preflight embedded semantic model remains subject to complete model
     var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
     defer inspector.deinit();
     try inspector.metadataJson(
-        \\[{"name":"dense","kind":"embedding","source_field":"body","expected_dims":3,"producer_json":"{\"version\":2,\"provider\":\"antfly\",\"model\":\"exact-model\",\"endpoint\":\"antfly:embedded\",\"sparse\":false}"}]
+        \\[{"name":"dense","kind":"embedding","source_field":"body","source_template":"{{{body}}}","expected_dims":3,"producer_json":"{\"version\":2,\"provider\":\"antfly\",\"model\":\"exact-model\",\"endpoint\":\"antfly:embedded\",\"sparse\":false}"}]
     );
     try std.testing.expectEqual(@as(u64, 1), count(report, .model));
     try std.testing.expectEqual(@as(u64, 1), count(report, .producer_model));
@@ -1660,10 +1665,10 @@ test "backup preflight artifact consumers follow retained payload provenance onl
     defer report.deinit();
     var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
     defer inspector.deinit();
-    try inspector.metadataJson("[{\"kind\":\"embedding\",\"field\":\"text\",\"source_artifact_name\":\"chunks\",\"expected_dims\":3,\"producer\":{\"model\":\"exact-model\"}}]");
-    try inspector.document("d", "{\"body\":\"<<<dotprompt:media:url file:///private/active>>>\",\"_source_field\":\"body\",\"_provenance\":{\"url\":\"file:///private/historical\"}}", "chunks");
+    try inspector.metadataJson("[{\"kind\":\"embedding\",\"field\":\"text\",\"embedding_input\":\"pdf_page_images\",\"source_artifact_name\":\"chunks\",\"expected_dims\":3,\"producer\":{\"model\":\"exact-model\"}}]");
+    try inspector.document("d", "{\"body\":\"file:///private/active.pdf\",\"_source_field\":\"body\",\"_provenance\":{\"url\":\"file:///private/historical\"}}", "chunks");
     try std.testing.expectEqual(@as(u64, 1), count(report, .source_local));
-    try inspector.document("d", "{\"body\":\"plain text\",\"_source_field\":\"body\",\"_provenance\":{\"url\":\"file:///private/historical\"}}", "chunks");
+    try inspector.document("d", "{\"body\":\"https://media.example.org/pages.pdf\",\"_source_field\":\"body\",\"_provenance\":{\"url\":\"file:///private/historical\"}}", "chunks");
     try std.testing.expectEqual(@as(u64, 1), count(report, .source_local));
     try inspector.metadataJson("[{\"kind\":\"asset\",\"producer\":{\"type\":\"custom-future-loader\"}}]");
     try std.testing.expect(!report.analysis_complete);
@@ -2203,4 +2208,45 @@ test "backup preflight compressed output boundary is independent of frame overhe
     inspector.options.max_document_bytes = 2;
     try inspector.visit(.document_batch, payload);
     try std.testing.expectEqual(@as(u64, 1), report.documents);
+}
+
+test "backup preflight oversized metadata is admitted before allocation" {
+    const a = std.testing.allocator;
+    const value = try a.alloc(u8, 32 * 1024 * 1024);
+    defer a.free(value);
+    @memset(value, ' ');
+    value[0] = '[';
+    value[value.len - 1] = ']';
+    const payload = try codec.encodeKeyValueBatch(a, &.{.{ .key = "\x00\x00__metadata__:enrichments", .value = value }});
+    defer a.free(payload);
+    var archive: std.ArrayListUnmanaged(u8) = .empty;
+    defer archive.deinit(a);
+    try codec.writeHeader(&archive, a, .{ .format_version = codec.legacy_format_version, .flags = 0, .created_at_ns = 0, .backup_id = @splat(0), .table_count = 1, .shard_count = 1 });
+    try codec.writeBlock(&archive, a, .metadata_batch, payload);
+    try portable.validatePortable(a, archive.items);
+    const backing = try a.alloc(u8, 16 * 1024 * 1024);
+    defer a.free(backing);
+    var buffer = std.heap.FixedBufferAllocator.init(backing);
+    const bounded = buffer.allocator();
+    var report: Report = .{ .allocator = bounded };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = bounded, .report = &report, .options = .{ .max_metadata_bytes = 4096 } };
+    defer inspector.deinit();
+    try std.testing.expectError(error.PreflightLimitExceeded, inspector.visit(.metadata_batch, payload));
+}
+
+test "backup preflight retained model chunk text follows the consumer source policy" {
+    const a = std.testing.allocator;
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    try inspector.metadataJson(
+        \\[{"name":"chunks","kind":"chunk","source_artifact_name":"copied","source_field":"text","chunker_json":"{\"provider\":\"antfly\",\"embedding\":{\"model\":\"media-model\",\"dimensions\":3}}"}]
+    );
+    try inspector.document("doc", "{\"text\":\"<<<dotprompt:media:url file:///private/example.pdf>>>\"}", "copied");
+    try inspector.document("doc", "<<<dotprompt:media:url file:///private/example.pdf>>>", "copied");
+    try std.testing.expectEqual(@as(u64, 0), count(report, .source_local));
+    try std.testing.expectEqual(@as(u64, 1), count(report, .model));
+    try std.testing.expect(report.analysis_complete);
 }

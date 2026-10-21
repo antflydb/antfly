@@ -68,6 +68,10 @@ pub const ProducerType = enum {
         };
     }
 
+    pub fn usesTemplateParts(self: ProducerType, source_template: []const u8) bool {
+        return source_template.len > 0 and self.rendersTemplateParts();
+    }
+
     pub fn parse(text: []const u8) ?ProducerType {
         if (std.mem.eql(u8, text, "decision")) return .decision;
         if (std.mem.eql(u8, text, "copy")) return .copy;

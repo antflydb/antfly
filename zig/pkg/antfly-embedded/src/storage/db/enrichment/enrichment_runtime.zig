@@ -12904,7 +12904,7 @@ fn processAsset(
         return;
     }
 
-    var source_parts_json = if (producer_cfg.type.rendersTemplateParts() and request.source_template.len > 0)
+    var source_parts_json = if (producer_cfg.type.usesTemplateParts(request.source_template))
         try renderSourcePartsJson(runtime.alloc, runtime.config, raw, request)
     else
         null;
@@ -35871,4 +35871,71 @@ test "model aware media fused reuse rejects a changed provider generation with t
     try std.testing.expect((try compatibleModelChunkVector(std.testing.allocator, provider, request, &metadata)) == null);
     metadata.dimensions = 3;
     try std.testing.expect((try compatibleModelChunkVector(std.testing.allocator, provider, request, &metadata)) == null);
+}
+
+fn testPreflightLiteralModelInput(asset: bool) !void {
+    const a = std.testing.allocator;
+    const text = "Example: <<<dotprompt:media:url file:///private/example.pdf>>>";
+    const raw = try std.json.Stringify.valueAlloc(a, .{ .body = text }, .{});
+    defer a.free(raw);
+    const producer = if (asset) "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"mock\"}}" else "{\"version\":2,\"provider\":\"antfly\",\"model\":\"mock\",\"endpoint\":\"antfly:embedded\",\"sparse\":false}";
+    try @import("config_validation.zig").validatePublicConfig(a, .{ .name = "model", .kind = if (asset) .asset else .embedding, .field = "body", .expected_dims = if (asset) 0 else 3, .producer_json = producer });
+    const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = if (asset) .asset else .dense_embedding, .index_name = "model", .artifact_name = "model", .doc_key = "doc", .source_field = "body", .producer_json = producer, .expected_dims = if (asset) 0 else 3 };
+    const actual = if (asset) (try extractAssetSourceValue(a, .{}, raw, request)).? else (try extractSourceText(a, .{}, raw, request)).?;
+    defer a.free(actual);
+    try std.testing.expectEqualStrings(text, actual);
+    try std.testing.expect((try renderSourceParts(a, .{}, raw, request, null)) == null);
+    const preflight = @import("../../lite/backup_preflight.zig");
+    var report: preflight.Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+    defer report.deinit();
+    var inspector: preflight.Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    const catalog = try @import("../catalog/enrichment_catalog.zig").serializeCatalog(a, &.{.{ .name = "model", .kind = if (asset) .asset else .embedding, .source_field = "body", .expected_dims = if (asset) 0 else 3, .producer_json = producer }});
+    defer a.free(catalog);
+    try inspector.metadataJson(catalog);
+    try inspector.document("doc", raw, "");
+    const caps = try a.alloc(preflight.Capability, report.requirements.items.len);
+    defer a.free(caps);
+    for (report.requirements.items, caps) |*r, *cap| cap.* = .{ .requirement_sha256 = &r.sha256, .supported = true, .query_embedding = true, .future_ingestion = true, .model_revision_verified = true, .preprocessing_verified = true, .vector_space_verified = true, .dimensions = r.dimensions };
+    const evidence = try std.json.Stringify.valueAlloc(a, preflight.Destination{ .version = 1, .configuration_id = "all-model-capabilities", .requirements = caps }, .{});
+    defer a.free(evidence);
+    const json = try report.jsonAlloc(evidence);
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"compatibility\":{\"verdict\":\"compatible\"") != null);
+}
+
+test "backup preflight template free generator input" {
+    try testPreflightLiteralModelInput(true);
+}
+test "backup preflight template free embedding input" {
+    try testPreflightLiteralModelInput(false);
+}
+
+test "backup preflight prior context output remains an appended text part" {
+    const a = std.testing.allocator;
+    const producer = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"mock\"}}";
+    const prior: @import("../group_sources.zig").PriorContext = .{ .artifact = "claims", .render = "{{media url=source}}" };
+    try @import("config_validation.zig").validatePublicConfig(a, .{ .name = "model", .kind = .asset, .source_artifact_name = "turns", .producer_json = producer, .prior_context = prior });
+    const raw = "{\"source\":\"file:///private/example.pdf\"}";
+    const text = try template.renderDocument(a, prior.render, raw);
+    defer a.free(text);
+    const parts = (try appendNeighborContextTextPartAlloc(a, "[{\"type\":\"text\",\"text\":\"prompt\"}]", text)).?;
+    defer a.free(parts);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, parts, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("text", parsed.value.array.items[1].object.get("type").?.string);
+    try std.testing.expectEqualStrings(text, parsed.value.array.items[1].object.get("text").?.string);
+    const prior_json = try std.json.Stringify.valueAlloc(a, prior, .{});
+    defer a.free(prior_json);
+    const metadata = try @import("../catalog/enrichment_catalog.zig").serializeCatalog(a, &.{.{ .name = "model", .kind = .asset, .source_field = "", .source_artifact_name = "turns", .producer_json = producer, .prior_context_json = prior_json }});
+    defer a.free(metadata);
+    const preflight = @import("../../lite/backup_preflight.zig");
+    var report: preflight.Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+    defer report.deinit();
+    var inspector: preflight.Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    try inspector.metadataJson(metadata);
+    try inspector.document("prior", raw, "claims");
+    for (report.requirements.items) |requirement| try std.testing.expect(requirement.kind != .source_local);
+    try std.testing.expect(report.analysis_complete);
 }

@@ -574,49 +574,72 @@ pub fn encodeKeyValueBatch(alloc: Allocator, entries: []const KeyValueEntry) ![]
     return buf.toOwnedSlice(alloc);
 }
 
+/// Validated, allocation-free traversal of a key/value block. Entries borrow
+/// immutable payload bytes; consumers must copy only values they retain.
+pub const KeyValueBatchReader = struct {
+    data: []const u8,
+    offset: usize = 4,
+    remaining: u32,
+
+    pub fn init(data: []const u8) !@This() {
+        if (data.len < 4) return error.BatchTooShort;
+        const count = std.mem.readInt(u32, data[0..4], .little);
+        if (count > (data.len - 4) / 8) return error.Truncated;
+        const reader: @This() = .{ .data = data, .remaining = count };
+        var validation = reader;
+        while (try validation.next()) |_| {}
+        return reader;
+    }
+
+    fn take(self: *@This(), len: usize) ![]const u8 {
+        if (len > self.data.len - self.offset) return error.Truncated;
+        const bytes = self.data[self.offset..][0..len];
+        self.offset += len;
+        return bytes;
+    }
+
+    fn length(self: *@This()) !u32 {
+        return std.mem.readInt(u32, (try self.take(4))[0..4], .little);
+    }
+
+    pub fn next(self: *@This()) !?KeyValueEntry {
+        if (self.remaining == 0) {
+            if (self.offset != self.data.len) return error.TrailingBytes;
+            return null;
+        }
+        const key = try self.take(try self.length());
+        const value = try self.take(try self.length());
+        self.remaining -= 1;
+        return .{ .key = key, .value = value };
+    }
+
+    /// Validate every record before any schema/catalog allocation. Checking
+    /// both names and values also bounds metadata-key parsing and retention.
+    pub fn checkEntryLimit(self: @This(), max_bytes: usize) !void {
+        var reader = self;
+        while (try reader.next()) |entry| {
+            if (entry.key.len > max_bytes or entry.value.len > max_bytes) return error.StreamTooLong;
+        }
+    }
+};
+
 pub fn decodeKeyValueBatch(alloc: Allocator, data: []const u8) ![]KeyValueEntry {
-    if (data.len < 4) return error.BatchTooShort;
-
-    const count = std.mem.readInt(u32, data[0..4], .little);
-    if (count > (data.len - 4) / 8) return error.Truncated;
-    var off: usize = 4;
-
-    var entries = try ArrayList(KeyValueEntry).initCapacity(alloc, count);
+    var reader = try KeyValueBatchReader.init(data);
+    var entries = try ArrayList(KeyValueEntry).initCapacity(alloc, reader.remaining);
     errdefer {
-        for (entries.items) |e| {
-            alloc.free(e.key);
-            alloc.free(e.value);
+        for (entries.items) |entry| {
+            alloc.free(entry.key);
+            alloc.free(entry.value);
         }
         entries.deinit(alloc);
     }
-
-    var i: u32 = 0;
-    while (i < count) : (i += 1) {
-        if (off + 4 > data.len) return error.Truncated;
-        const key_len = std.mem.readInt(u32, data[off..][0..4], .little);
-        off += 4;
-
-        if (off + key_len > data.len) return error.Truncated;
-        const key = try alloc.dupe(u8, data[off..][0..key_len]);
+    while (try reader.next()) |entry| {
+        const key = try alloc.dupe(u8, entry.key);
         errdefer alloc.free(key);
-        off += key_len;
-
-        if (off + 4 > data.len) return error.Truncated;
-        const value_len = std.mem.readInt(u32, data[off..][0..4], .little);
-        off += 4;
-
-        if (off + value_len > data.len) return error.Truncated;
-        const value = try alloc.dupe(u8, data[off..][0..value_len]);
+        const value = try alloc.dupe(u8, entry.value);
         errdefer alloc.free(value);
-        off += value_len;
-
-        try entries.append(alloc, .{
-            .key = key,
-            .value = value,
-        });
+        try entries.append(alloc, .{ .key = key, .value = value });
     }
-
-    if (off != data.len) return error.TrailingBytes;
     return entries.toOwnedSlice(alloc);
 }
 
@@ -1643,4 +1666,29 @@ test "bounded block readers reject stored payload before allocation and accept e
     const from_file = try reader.readBlock(a);
     defer a.free(from_file.payload);
     try std.testing.expectEqualStrings("payload", from_file.payload);
+}
+
+test "backup preflight borrowed key value reader validates complete batches without allocation" {
+    const a = std.testing.allocator;
+    const payload = try encodeKeyValueBatch(a, &.{ .{ .key = "catalog", .value = "value" }, .{ .key = "schema", .value = "row" } });
+    defer a.free(payload);
+    for (0..payload.len) |end| {
+        if (KeyValueBatchReader.init(payload[0..end])) |_| return error.TestUnexpectedResult else |_| {}
+    }
+    var reader = try KeyValueBatchReader.init(payload);
+    try reader.checkEntryLimit(7);
+    try std.testing.expectError(error.StreamTooLong, reader.checkEntryLimit(6));
+    const first = (try reader.next()).?;
+    try std.testing.expectEqualStrings("catalog", first.key);
+    try std.testing.expectEqualStrings("value", first.value);
+    try std.testing.expectEqual(@intFromPtr(payload.ptr) + 8, @intFromPtr(first.key.ptr));
+    try std.testing.expectEqualStrings("schema", (try reader.next()).?.key);
+    try std.testing.expect((try reader.next()) == null);
+    const trailing = try a.alloc(u8, payload.len + 1);
+    defer a.free(trailing);
+    @memcpy(trailing[0..payload.len], payload);
+    trailing[payload.len] = 0;
+    try std.testing.expectError(error.TrailingBytes, KeyValueBatchReader.init(trailing));
+    var empty = try KeyValueBatchReader.init(&.{ 0, 0, 0, 0 });
+    try std.testing.expect((try empty.next()) == null);
 }
