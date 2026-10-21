@@ -950,6 +950,8 @@ pub fn create(b: *std.Build) ?Artifacts {
         .antfly_test_mod = antfly_test_mod,
         .run_lib_ha_compat_tests = run_lib_ha_compat_tests,
         .compiled_recall_tests = compiled_recall_tests,
+        .conformance_fetch = conformance_fetch,
+        .conformance_fixtures = conformance_fixtures,
     });
     const recall_ci_test_step = benchmarks.recall_ci_test_step;
 
