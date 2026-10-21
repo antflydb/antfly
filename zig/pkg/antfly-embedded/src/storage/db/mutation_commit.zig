@@ -3128,13 +3128,25 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (try @import("artifact_publication.zig").authority(&probe) == null) break :blk 0;
                 break :blk S.ownerField(self, "root_incarnation").*;
             };
-            var authored_acceptance = try @import("artifact_authored_acceptance.zig").Prepared.init(
-                S.ownerField(self, "alloc").*,
+            const authored = @import("artifact_authored_acceptance.zig");
+            const owns_physical = authored_root != 0 or (if (opts.transaction_resolution) |resolution| resolution.accepted_effects != null else false);
+            var prepared_physical: ?authored.OwnedPhysicalPlan = if (owns_physical) try authored.OwnedPhysicalPlan.init(
+                preparation_alloc,
                 authored_root,
                 explicit_embedding_artifact_writes.items,
                 store_writes.items,
-            );
-            defer authored_acceptance.deinit();
+                delete_keys.items,
+                if (replay_append) |entry| .{ .sequence = entry.sequence, .payload = entry.payload } else null,
+                publication_control,
+            ) else null;
+            defer if (prepared_physical) |*plan| plan.deinit();
+            const commit_writes = if (prepared_physical) |plan| plan.bytes.writes else store_writes.items;
+            const commit_deletes = if (prepared_physical) |plan| plan.bytes.deletes else delete_keys.items;
+            const commit_replay: ?docstore_mod.DocStore.ReplayAppend = if (prepared_physical) |plan|
+                if (plan.bytes.replay) |entry| .{ .sequence = entry.sequence, .payload = entry.payload } else null
+            else
+                replay_append;
+            const commit_participant = if (prepared_physical) |*plan| plan.participant() else null;
             if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
             // Known mandatory publication envelopes are funded before the
             // local primary decision. Native allocation failure is final here;
@@ -3163,10 +3175,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     resolution.status,
                     resolution.commit_version,
                     .{
-                        .commit_participant = if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null,
-                        .writes = store_writes.items,
-                        .deletes = delete_keys.items,
-                        .replay = if (replay_append) |entry| .{ .sequence = entry.sequence, .payload = entry.payload } else null,
+                        .commit_participant = commit_participant,
+                        .writes = commit_writes,
+                        .deletes = commit_deletes,
+                        .replay = if (commit_replay) |entry| .{ .sequence = entry.sequence, .payload = entry.payload } else null,
                         .expected_intent_revision = resolution.expected_intent_revision,
                         .known_intent_keys = resolution.intent_keys,
                         .skip_all_intent_application = relationalColumns(self) != null,
@@ -3186,15 +3198,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.store(true, .release);
                 try S.ownerField(self, "core").*.store.putBatchWithReplayAndParticipant(
                     S.ownerField(self, "backend_runtime").*.io(),
-                    store_writes.items,
-                    delete_keys.items,
-                    replay_append,
+                    commit_writes,
+                    commit_deletes,
+                    commit_replay,
                     store_batch_options,
-                    if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null,
+                    commit_participant,
                 );
                 schedule_replication_recovery_on_exit = durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null;
                 break :blk transactions_mod.ResolutionOutcome{ .applied = true, .replay_sequence = sequence };
             };
+            // Backend commit has joined every participant callback. Detached
+            // postimages must not retain preparation capacity across remote
+            // durability or derived-visibility waits below.
+            if (prepared_physical) |*plan| plan.deinit();
+            prepared_physical = null;
             local_coverage_guard.release();
             // Staged effects own their buffers; no post-commit work reads the
             // base transaction. Retire its storage generation before waits.

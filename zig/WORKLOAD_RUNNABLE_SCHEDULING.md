@@ -5999,3 +5999,43 @@ normal required PREPARE activation remain off.
 preparation, replay credit/encoding, remote-initialization metadata, Lite restore,
 resolver HTTP and embedded API/DB targets. All native inputs stayed unchanged.
 Full Linux qualification remains waived.
+
+
+### Owned assembled bytes and authored native commit participant
+
+`OwnedPhysicalPlan` now owns the complete explicit physical write/delete/replay
+batch together with its authored-vector commit observer. The observer resolves
+artifact keys against the final owned batch, preserving last-postimage semantics
+without retaining the ingress descriptors. The combined owner can move before
+callback attachment; its allocator and stable address must survive attachment
+through backend commit. Schema/route/policy/read witnesses remain separate.
+
+The mutation assembler constructs this owner for accepted prepared resolution
+and native authored-vector ingress using its existing preparation allocator.
+Detached bytes and participant maps/vectors share the preparation working-set
+budget. Native content hashing polls the original control every 4 KiB; map and
+vector assembly also poll it. Backend publication uses exactly these owned
+bytes and the matching observer. After local commit joins the callbacks, the
+extra owner retires before remote durability or derived-visibility waits.
+Legacy non-authoritative ordinary batches retain their prior path.
+
+Three new cases cover mutation/free of every input and ingress key, moving the
+owner, actual erased callback attachment and validation of its emitted native
+acceptance, reset without false acceptance, every caller allocation/original
+checkpoint, and native metadata quota refusal when the detached slab itself
+fits. The existing authored acceptance DB regression now runs in the focused
+required-preparation suite, covering document/relational modes, transaction
+resolution and reopen. `owned-native-physical-plan-v3.json` records 77 passing
+executions and 70/70 build steps, zero skips, failures or leaks.
+
+This is complete explicit byte ownership plus the authored-vector participant
+at local publication, not complete predecision capture or an executable recovery
+bundle. The assembler's orchestration and retained schema/catalog/route/policy
+and mutable read-set witnesses still need to move ahead of the global vote.
+Backend-synthesized effects, separate derived-log funding, minimum recovery
+RAM/CPU/I/O/dependency ownership, migration eligibility, normal required PREPARE
+negotiation and broader scheduler/default/session scope remain incomplete.
+Strong defaults remain off. No ABI/reader/durable format changes are introduced
+here; main's integrated floors remain preparation 12, replay retention 13 and
+remote-initialization topology 38. Public consumer/provider/storage archive and
+external HA qualification were not rerun; full Linux qualification remains waived.

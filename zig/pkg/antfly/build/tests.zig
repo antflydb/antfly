@@ -6063,11 +6063,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addCuratedTestRunArtifact(b, prepared_effects_tests, &.{"prepared transaction effects"}).step);
     const required_prepare_db_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{"db prepared transaction effects required"},
+        .filters = &.{ "db prepared transaction effects required", "ordered artifact inventory DB authored acceptance survives projection and reopen" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("docstore-required-prepare-db-test", "Verify durable required preparation through DB intent, resolution and recovery paths")
-        .dependOn(&addCuratedTestRunArtifact(b, required_prepare_db_tests, &.{"db prepared transaction effects required"}).step);
+        .dependOn(&addCuratedTestRunArtifact(b, required_prepare_db_tests, &.{ "db prepared transaction effects required", "ordered artifact inventory DB authored acceptance survives projection and reopen" }).step);
     const replay_encoding_filters = [_][]const u8{ "change journal", "db encodeThinReplayRecordPayload", "db transaction committed transform", "db graph fact materialized scopes match journal" };
     const replay_encoding_tests = b.addTest(.{
         .root_module = antfly_test_mod,

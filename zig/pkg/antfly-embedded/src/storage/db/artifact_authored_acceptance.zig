@@ -20,6 +20,8 @@ const std = @import("std");
 const publication = @import("artifact_publication.zig");
 const keys = @import("../internal_keys.zig");
 const codec = @import("enrichment/artifact_codec.zig");
+const admission = @import("../../common/read_admission.zig");
+const mutation_bytes = @import("../transaction_batch_admission.zig");
 const prefix = "\x00\x00__artifact_publication__:authored:";
 pub const Key = [prefix.len + 24 + 8 + 16 + 32]u8;
 const record_len = 237;
@@ -73,17 +75,32 @@ pub const Prepared = struct {
         self.* = undefined;
     }
 
-    fn remember(self: *Prepared, alloc: std.mem.Allocator, selected: []const u8, bytes: []const u8) !publication.Digest {
+    fn remember(self: *Prepared, alloc: std.mem.Allocator, selected: []const u8, bytes: []const u8, control: ?admission.Port) !publication.Digest {
         if (self.postimages.get(selected)) |existing| return existing.value_digest;
-        const value_digest = digest(bytes);
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            if (control) |owner| try owner.checkpoint();
+            const end = offset + @min(@as(usize, 4096), bytes.len - offset);
+            hash.update(bytes[offset..end]);
+            offset = end;
+        }
+        var value_digest: publication.Digest = undefined;
+        hash.final(&value_digest);
         try self.postimages.put(alloc, selected, .{ .bytes = bytes, .value_digest = value_digest });
         return value_digest;
     }
 
     /// `authored` comes ONLY from explicit ingress extraction, never from a
-    /// scan of arbitrary stored/imported bytes. Both slices outlive commit.
+    /// scan of arbitrary stored/imported bytes. Writes outlive this owner;
+    /// authored keys are inspected only during construction.
     /// Last postimages win, including repeated row keys in the input batch.
     pub fn init(alloc: std.mem.Allocator, root: u128, authored: anytype, writes: anytype) !Prepared {
+        return initWithAdmission(alloc, root, authored, writes, null);
+    }
+
+    pub fn initWithAdmission(alloc: std.mem.Allocator, root: u128, authored: anytype, writes: anytype, control: ?admission.Port) !Prepared {
+        if (control) |owner| try owner.checkpoint();
         var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
         const a = arena.allocator();
@@ -92,10 +109,14 @@ pub const Prepared = struct {
             var scratch = std.heap.ArenaAllocator.init(alloc);
             defer scratch.deinit();
             var final: std.StringHashMapUnmanaged([]const u8) = .empty;
-            for (writes) |write| try final.put(scratch.allocator(), write.key, write.value);
+            for (writes) |write| {
+                if (control) |owner| try owner.checkpoint();
+                try final.put(scratch.allocator(), write.key, write.value);
+            }
             var seen: std.StringHashMapUnmanaged(void) = .empty;
             var vectors: std.ArrayListUnmanaged(Vector) = .empty;
             for (authored) |write| {
+                if (control) |owner| try owner.checkpoint();
                 if (seen.contains(write.key)) continue;
                 const value = final.get(write.key) orelse continue;
                 const header = try codec.decodeHeader(value);
@@ -112,13 +133,17 @@ pub const Prepared = struct {
                 const timestamp = std.mem.readInt(u64, timestamp_bytes[0..8], .little);
                 if (timestamp == 0) return error.InvalidBatchRequest;
                 try seen.put(scratch.allocator(), write.key, {});
-                const source_digest = try result.remember(a, primary, source);
-                _ = try result.remember(a, ttl, timestamp_bytes);
-                const output_digest = try result.remember(a, write.key, value);
-                try vectors.append(a, .{ .document = parsed.doc_key, .artifact = write.key, .primary = primary, .ttl = ttl, .source_digest = source_digest, .output_digest = output_digest, .timestamp = timestamp });
+                // Use the final batch's key, not the ingress descriptor's key.
+                // An OwnedPhysicalPlan may outlive every ingress buffer.
+                const artifact = final.getKey(write.key).?;
+                const source_digest = try result.remember(a, primary, source, control);
+                _ = try result.remember(a, ttl, timestamp_bytes, control);
+                const output_digest = try result.remember(a, artifact, value, control);
+                try vectors.append(a, .{ .document = parsed.doc_key, .artifact = artifact, .primary = primary, .ttl = ttl, .source_digest = source_digest, .output_digest = output_digest, .timestamp = timestamp });
             }
             result.vectors = try vectors.toOwnedSlice(a);
         }
+        if (control) |owner| try owner.checkpoint();
         result.arena = arena;
         return result;
     }
@@ -178,6 +203,32 @@ pub const Prepared = struct {
             @memcpy(raw[checksum_offset..], &recordDigest(&selected, raw[0..checksum_offset]));
             try txn.put(&selected, &raw);
         }
+    }
+};
+
+/// Complete explicit physical bytes and their native authored-vector observer
+/// share a lifetime. Movable until participant() is attached to a writer; no
+/// pointer into this struct is retained during preparation. Schema/read/policy
+/// witnesses and backend-generated effects still belong to the caller.
+pub const OwnedPhysicalPlan = struct {
+    bytes: mutation_bytes.OwnedBatch,
+    acceptance: Prepared,
+
+    pub fn init(alloc: std.mem.Allocator, root: u128, authored: anytype, writes: []const @import("../docstore.zig").KVPair, deletes: []const []const u8, replay: ?mutation_bytes.Replay, control: ?admission.Port) !OwnedPhysicalPlan {
+        var bytes = try mutation_bytes.OwnedBatch.capture(alloc, writes, deletes, replay, control);
+        errdefer bytes.deinit();
+        const acceptance = try Prepared.initWithAdmission(alloc, root, authored, bytes.writes, control);
+        return .{ .bytes = bytes, .acceptance = acceptance };
+    }
+
+    pub fn participant(self: *OwnedPhysicalPlan) ?@import("../commit_participant.zig").Participant {
+        return if (self.acceptance.vectors.len != 0) self.acceptance.participant() else null;
+    }
+
+    pub fn deinit(self: *OwnedPhysicalPlan) void {
+        self.acceptance.deinit();
+        self.bytes.deinit();
+        self.* = undefined;
     }
 };
 
@@ -880,4 +931,148 @@ fn testPreparedAllocations(alloc: std.mem.Allocator) !void {
 
 test "ordered artifact inventory authored preparation is deduplicated and allocation safe" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testPreparedAllocations, .{});
+}
+
+const OwnedPlanTest = struct {
+    fn prepare(a: std.mem.Allocator, control: ?admission.Port) !OwnedPhysicalPlan {
+        const primary = try keys.documentKeyAlloc(a, "doc");
+        defer a.free(primary);
+        const ttl = try keys.ttlKeyAlloc(a, "doc");
+        defer a.free(ttl);
+        const artifact = try keys.embeddingArtifactKeyForDocumentAlloc(a, "doc", "vector");
+        defer a.free(artifact);
+        const ingress = try a.dupe(u8, artifact);
+        defer a.free(ingress);
+        const value = try a.alloc(u8, 17000);
+        defer a.free(value);
+        @memset(value, 'v');
+        const vector = try codec.encodeAuthoredDenseEmbeddingAlloc(a, &.{ 1, 2 });
+        defer a.free(vector);
+        var timestamp: [8]u8 = undefined;
+        std.mem.writeInt(u64, &timestamp, 17, .little);
+        const KV = @import("../docstore.zig").KVPair;
+        const writes = [_]KV{
+            .{ .key = primary, .value = "superseded" },
+            .{ .key = artifact, .value = vector },
+            .{ .key = ttl, .value = &timestamp },
+            .{ .key = primary, .value = value },
+        };
+        const result = try OwnedPhysicalPlan.init(a, 23, &[_]KV{.{ .key = ingress, .value = vector }}, &writes, &.{"deleted\x00key"}, .{ .sequence = 7, .payload = "opaque-replay" }, control);
+        @memset(primary, 'p');
+        @memset(artifact, 'a');
+        @memset(ingress, 'i');
+        @memset(value, 'x');
+        @memset(vector, 0);
+        @memset(&timestamp, 0);
+        return result;
+    }
+    fn run(a: std.mem.Allocator, control: ?admission.Port) !void {
+        var plan = try prepare(a, control);
+        defer plan.deinit();
+        try std.testing.expectEqual(@as(usize, 1), plan.acceptance.vectors.len);
+        try std.testing.expectEqual(@as(u64, 17), plan.acceptance.vectors[0].timestamp);
+    }
+};
+
+test "prepared transaction effects owned physical plan moves native participant beyond every source buffer" {
+    var plan = try OwnedPlanTest.prepare(std.testing.allocator, null);
+    defer plan.deinit();
+    const Sink = struct {
+        authority: [100]u8 = undefined,
+        selected: Key = undefined,
+        raw: [record_len]u8 = undefined,
+        count: usize = 0,
+        pub fn get(self: *@This(), selected: []const u8) ![]const u8 {
+            if (std.mem.eql(u8, selected, publication.authority_key)) return &self.authority;
+            return error.NotFound;
+        }
+        pub fn put(self: *@This(), selected: []const u8, value: []const u8) !void {
+            if (selected.len != self.selected.len or value.len != self.raw.len) return error.InvalidBatchRequest;
+            @memcpy(&self.selected, selected);
+            @memcpy(&self.raw, value);
+            self.count += 1;
+        }
+    };
+    var sink: Sink = .{};
+    @memcpy(sink.authority[0..4], "APA1");
+    @memset(sink.authority[4..28], 1);
+    std.mem.writeInt(u64, sink.authority[28..36], 1, .little);
+    @memset(sink.authority[36..68], 2);
+    std.crypto.hash.Blake3.hash(sink.authority[0..68], sink.authority[68..100], .{});
+    const position: publication.Position = .{ .raft = .{ .term = 3, .index = 9 } };
+    const observer = plan.participant().?;
+    observer.reset(observer.ptr);
+    for (plan.bytes.deletes) |selected| observer.observe(observer.ptr, selected, null);
+    for (plan.bytes.writes) |write| observer.observe(observer.ptr, write.key, write.value);
+    try observer.stage(observer.ptr, @import("../commit_participant.zig").View.from(&sink), &try position.encode());
+    try std.testing.expectEqual(@as(usize, 1), sink.count);
+    try validateRecord(&sink.selected, &sink.raw);
+    try std.testing.expectEqualSlices(u8, &digest(plan.bytes.writes[3].value), sink.raw[68..100]);
+    try std.testing.expectEqualSlices(u8, &digest(plan.bytes.writes[1].value), sink.raw[141..173]);
+    try std.testing.expectEqualStrings("opaque-replay", plan.bytes.replay.?.payload);
+    try std.testing.expectEqualStrings("deleted\x00key", plan.bytes.deletes[0]);
+    // A reset or mismatched final postimage never manufactures acceptance.
+    observer.reset(observer.ptr);
+    try observer.stage(observer.ptr, @import("../commit_participant.zig").View.from(&sink), &try position.encode());
+    try std.testing.expectEqual(@as(usize, 1), sink.count);
+}
+
+test "prepared transaction effects owned physical plan unwinds allocation and original controls through native hashing" {
+    const Checks = struct {
+        calls: usize = 0,
+        stop: usize = std.math.maxInt(usize),
+        cause: anyerror = error.DeadlineExceeded,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == self.stop) return self.cause;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, OwnedPlanTest.run, .{@as(?admission.Port, null)});
+    var baseline: Checks = .{};
+    var source: admission.Payload = .{ .ptr = &baseline, .vtable = &.{ .checkpoint = Checks.check } };
+    try OwnedPlanTest.run(std.testing.allocator, admission.Port.init(&source));
+    for ([_]anyerror{ error.DeadlineExceeded, error.NotFound }) |cause| for (1..baseline.calls + 1) |stop| {
+        var checks: Checks = .{ .stop = stop, .cause = cause };
+        source.ptr = &checks;
+        try std.testing.expectError(cause, OwnedPlanTest.run(std.testing.allocator, admission.Port.init(&source)));
+    };
+}
+
+test "prepared transaction effects owned physical plan charges native participant beyond detached bytes" {
+    const a = std.testing.allocator;
+    const resources_mod = @import("../resource_manager.zig");
+    const primary = try keys.documentKeyAlloc(a, "doc");
+    defer a.free(primary);
+    const ttl = try keys.ttlKeyAlloc(a, "doc");
+    defer a.free(ttl);
+    const artifact = try keys.embeddingArtifactKeyForDocumentAlloc(a, "doc", "vector");
+    defer a.free(artifact);
+    const vector = try codec.encodeAuthoredDenseEmbeddingAlloc(a, &.{ 1, 2 });
+    defer a.free(vector);
+    var timestamp: [8]u8 = undefined;
+    std.mem.writeInt(u64, &timestamp, 17, .little);
+    const KV = @import("../docstore.zig").KVPair;
+    const writes = [_]KV{ .{ .key = primary, .value = "body" }, .{ .key = ttl, .value = &timestamp }, .{ .key = artifact, .value = vector } };
+    const byte_bound = try mutation_bytes.OwnedBatch.allocationBytes(&writes, &.{}, null, null);
+    for ([_]u64{ @intCast(byte_bound), 128 * 1024 }) |limit| {
+        var options: resources_mod.Options = .{ .identity_allocator = a };
+        options.budgets[@backingInt(resources_mod.Slice.relational_preparation_working_set)] = .{ .hard_limit_bytes = limit };
+        var resources = resources_mod.ResourceManager.init(options);
+        defer resources.deinit(a);
+        var budget = resources_mod.BudgetedAllocator.init(&resources, .relational_preparation_working_set, a, 1);
+        defer budget.deinit();
+        if (limit == byte_bound) {
+            // The exact detached slab fits. Building the participant's maps and
+            // vectors must still use the same budget rather than an uncharged heap.
+            try std.testing.expectError(error.OutOfMemory, OwnedPhysicalPlan.init(budget.allocator(), 23, writes[2..], &writes, &.{}, null, null));
+            try std.testing.expect(budget.denied());
+        } else {
+            var plan = try OwnedPhysicalPlan.init(budget.allocator(), 23, writes[2..], &writes, &.{}, null, null);
+            try std.testing.expectEqual(@as(usize, 1), plan.acceptance.vectors.len);
+            plan.deinit();
+        }
+        try std.testing.expectEqual(@as(u64, 0), budget.live_bytes);
+        try std.testing.expectEqual(@as(u64, 0), resources.sliceStats(.relational_preparation_working_set).used_bytes);
+    }
 }

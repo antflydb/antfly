@@ -18,4 +18,5 @@ test {
     _ = @import("antfly_local_sources").storage_prepared_transaction_effects;
     _ = @import("antfly_local_sources").storage_transactions;
     _ = @import("antfly_local_sources").storage_transaction_batch_admission;
+    _ = @import("antfly_local_sources").storage_db_artifact_authored_acceptance;
 }
