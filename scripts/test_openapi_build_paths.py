@@ -25,7 +25,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import yaml
-from jsonschema import Draft4Validator
+from jsonschema import Draft4Validator, ValidationError
 
 # The generators are standalone scripts with sibling imports. Support both
 # unittest's repository-root module invocation and discovery in scripts/.
@@ -76,6 +76,27 @@ class OpenApiBuildPathsTest(unittest.TestCase):
                 "EmbeddingMultiChoiceAnswer",
             ],
         )
+
+    def test_pinned_embedding_identity_is_representable_in_created_config(self):
+        schemas = join_public_openapi.join_antfly_spec()["components"]["schemas"]
+        pin = "0123456789abcdef" * 4
+        request = schemas["AntflyEmbedderConfig"]
+        response = schemas["CreatedProviderConfig"]
+        self.assertEqual(
+            request["properties"]["model_identity"]["pattern"],
+            response["properties"]["model_identity"]["pattern"],
+        )
+        Draft4Validator(response).validate(
+            {
+                "provider": "antfly",
+                "model": "google/embeddinggemma-2",
+                "model_identity": pin,
+            }
+        )
+        with self.assertRaises(ValidationError):
+            Draft4Validator(response).validate(
+                {"provider": "antfly", "model_identity": "unversioned-model"}
+            )
 
     def test_joined_relational_query_preserves_optional_zero_epoch(self):
         # Exercise the authoritative metadata input and join pipeline, not a
