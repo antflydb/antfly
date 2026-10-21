@@ -5556,6 +5556,12 @@ test "ordered reduction snapshots match independent sequential execution across 
         for ([_][]const u8{
             "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x RETURN i,sum(x),avg(x),sum(DISTINCT x),avg(DISTINCT x),count(DISTINCT x)",
             "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {RETURN avg(x) AS y} RETURN i,avg(y),head(collect(y)) ORDER BY i",
+            "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {WITH i,avg(x) AS y RETURN y} RETURN i,avg(y),head(collect(y)) ORDER BY i",
+            "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {UNWIND [x,x+1] AS k WITH i,sum(k) AS y RETURN y} RETURN i,avg(y) ORDER BY i",
+            "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {UNWIND CASE WHEN x IS NULL THEN [] ELSE [x] END AS k WITH i,count(k) AS n RETURN n} RETURN i,sum(n) ORDER BY i",
+            "UNWIND [3,1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {RETURN x AS y} RETURN i,count(y) ORDER BY i LIMIT 1",
+            "UNWIND [3,1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {CALL {RETURN x AS z} RETURN z AS y} RETURN i,count(y) ORDER BY i%2 SKIP 1 LIMIT 1",
+
             "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {WITH x WHERE x>0 RETURN count(*) AS n} RETURN i,n,count(*) ORDER BY i,n",
             "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {CALL {WITH x WHERE x>0 RETURN 7 AS y} RETURN count(*) AS n} RETURN i,n,count(*) ORDER BY i,n",
             "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {UNWIND [1,2] AS k WITH k,count(*) AS n RETURN n} RETURN i,sum(n),head(collect(n)) ORDER BY i",
@@ -5769,4 +5775,125 @@ test "local reducer cardinality and ordered discovery retain scoped semantics" {
         var fixture: Fixture = .{};
         try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
     }
+}
+
+test "invocation constant grouping keys preserve empty cardinality and varying keys" {
+    try check("UNWIND [1,2] AS i UNWIND [1,2] AS x CALL {WITH i,avg(x) AS y RETURN y} RETURN i,avg(y) ORDER BY i", "[[1,1.5],[2,1.5]]");
+    try check("UNWIND [1,2] AS i UNWIND [1,2] AS x CALL {UNWIND [] AS k WITH i,count(k) AS n RETURN n} RETURN i,count(*) ORDER BY i", "[]");
+    try check("UNWIND [1,2] AS i UNWIND [1,2] AS x CALL {UNWIND [] AS k WITH count(k) AS n RETURN n} RETURN i,sum(n) ORDER BY i", "[[1,0],[2,0]]");
+    try check("UNWIND [1,2] AS i UNWIND [1,2] AS x CALL {WITH i AS j UNWIND [1,2] AS k WITH j,count(k) AS n RETURN n} RETURN i,sum(n) ORDER BY i", "[[1,4],[2,4]]");
+    try check("UNWIND [1,2] AS i UNWIND [1,2] AS x CALL {UNWIND [1,2] AS k WITH k,count(*) AS n RETURN n} RETURN i,sum(n) ORDER BY i", "[[1,4],[2,4]]");
+    try check("UNWIND [1,2] AS i UNWIND [1,2] AS x CALL {UNWIND [1,2] AS k WITH k AS j WITH j,count(*) AS n RETURN n} RETURN i,count(*) ORDER BY i", "[[1,4],[2,4]]");
+    try check("UNWIND [1,2] AS i UNWIND [1,2] AS x CALL {UNWIND [x,x+1] AS k WITH i,count(k) AS n WHERE i=1 RETURN n} RETURN i,sum(n) ORDER BY i", "[[1,4]]");
+}
+
+test "singleton CALL group windows retain filters global reducers ties and errors" {
+    try check("UNWIND [3,1,2,3,1] AS i CALL {RETURN i+1 AS y} RETURN i,count(y) ORDER BY i LIMIT 2", "[[1,2],[2,1]]");
+    try check("UNWIND [3,1,2,3,1] AS i CALL {CALL {RETURN i+1 AS z} RETURN z+1 AS y} RETURN i,count(y) ORDER BY i%2 LIMIT 2", "[[2,1],[3,2]]");
+    try check("UNWIND [1,2,3] AS i CALL {WITH i WHERE i=2 RETURN i+1 AS y} RETURN i,count(y) ORDER BY i LIMIT 1", "[[2,1]]");
+    try check("UNWIND [1,2,3] AS i CALL {WITH i WHERE i=2 RETURN count(*) AS y} RETURN i,count(y) ORDER BY i LIMIT 1", "[[1,1]]");
+    for ([_][]const u8{
+        "UNWIND [1,2] AS i CALL {RETURN 1/(2-i) AS y} RETURN i,count(y) ORDER BY i LIMIT 1",
+        "UNWIND [1,2] AS i CALL {WITH i,1/(2-i) AS z RETURN count(z) AS y} RETURN i,count(y) ORDER BY i LIMIT 0",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}
+
+test "COUNT group windows require logical multiplicity certificates" {
+    // Physical work is not a logical count bound. Retry an unpublished fold
+    // without eviction so symbolic counts report their exact overflow.
+    for ([_][]const u8{
+        "UNWIND [1,2] AS i UNWIND range(0,CASE WHEN i=2 THEN 9223372036854775807 ELSE 0 END) AS x RETURN i,count(*) ORDER BY i LIMIT 1",
+        "UNWIND [1,2] AS i UNWIND range(0,CASE WHEN i=2 THEN 9223372036854775807 ELSE 0 END) AS x RETURN i,count(*) ORDER BY i LIMIT 0",
+        "UNWIND [1,2] AS i UNWIND range(0,CASE WHEN i=2 THEN 9223372036854775807 ELSE 0 END) AS x CALL {RETURN 7 AS y} RETURN i,count(y) ORDER BY i LIMIT 1",
+        "UNWIND [1,2] AS i UNWIND range(1,1000000000000000) AS x UNWIND range(1,1000000000000000) AS y RETURN i,count(*) ORDER BY i LIMIT 1",
+        "UNWIND [1,2] AS i UNWIND range(-9223372036854775807-1,9223372036854775807) AS x RETURN i,count(*) ORDER BY i LIMIT 1",
+    }, 0..) |text, index| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(if (index == 2) error.CypherStateBudgetExceeded else error.CypherNumericOverflow, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 2000 }));
+    }
+    // Safe compression remains cheap even when logical rows exceed the work
+    // budget; physical contributions each have a certified bounded count.
+    try check("UNWIND [1,2] AS i UNWIND range(1,1000000) AS x RETURN i,count(*) ORDER BY i LIMIT 1", "[[1,1000000]]");
+    try check("UNWIND [3,1,2,1] AS i UNWIND range(1,CASE WHEN i=3 THEN 1 ELSE 1000000000000000 END) AS x RETURN i,count(*) ORDER BY i LIMIT 1", "[[1,2000000000000000]]");
+}
+
+test "constant grouping normalization and singleton CALL windows release failed allocations" {
+    const Campaign = struct {
+        fn run(backing: std.mem.Allocator, text: []const u8) !void {
+            // Keep failure positions independent of adjacent allocator activity.
+            var vtable = backing.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const a: std.mem.Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, text, .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expect(result.rows.len != 0);
+        }
+    };
+    for ([_][]const u8{
+        "UNWIND [1,2] AS i UNWIND [1,2] AS x CALL {WITH i,avg(x) AS y RETURN y} RETURN i,avg(y)",
+        "UNWIND [3,1,2] AS i CALL {CALL {RETURN i+1 AS z} RETURN z AS y} RETURN i,count(y) ORDER BY i LIMIT 1",
+        "UNWIND [3,1,2,1] AS i UNWIND range(1,CASE WHEN i=3 THEN 1 ELSE 1000000000000000 END) AS x RETURN i,count(*) ORDER BY i LIMIT 1",
+    }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{text});
+}
+
+test "constant entity keys retain backend reads even when their values are dead" {
+    const Host = struct {
+        fn project(_: *anyopaque, _: std.mem.Allocator, _: *const v.Node) anyerror!?*const v.Node {
+            return error.CypherInvalidArgument;
+        }
+    };
+    for ([_][]const u8{
+        "UNWIND [1,2] AS i UNWIND [1,2] AS x CALL {WITH $node AS dead,x WITH dead,count(x) AS y RETURN y} RETURN i,sum(y) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND [1,2] AS x CALL {WITH $node AS dead,x WITH dead,x RETURN count(x) AS y} RETURN i,sum(y) ORDER BY i",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var callbacks = fixture.backend().vtable.*;
+        callbacks.project_node = Host.project;
+        try std.testing.expectError(error.CypherInvalidArgument, runtime.execute(std.testing.allocator, .{ .ptr = &fixture, .vtable = &callbacks }, graph, &compiled, &.{.{ .name = "node", .value = .{ .node = &Fixture.nodes[0] } }}, .{}));
+    }
+}
+
+test "CALL count windows preserve middle stage error precedence over argument errors" {
+    for ([_][]const u8{
+        "UNWIND [1,2] AS i UNWIND [0] AS x CALL {RETURN CASE WHEN i=2 THEN true+1 ELSE 1 END AS y} RETURN i,count(1/x) ORDER BY i LIMIT 1",
+        "UNWIND [1,2] AS i UNWIND [0] AS x CALL {RETURN CASE WHEN i=2 THEN true+1 ELSE 1 END AS y} RETURN i,count(1/x) ORDER BY i LIMIT 0",
+        "UNWIND [1,3,2] AS i UNWIND [CASE WHEN i=3 THEN 0 ELSE 1 END] AS x CALL {RETURN CASE WHEN i=2 THEN true+1 ELSE 1 END AS y} RETURN i,count(1/x) ORDER BY i LIMIT 1",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherTypeMismatch, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}
+
+test "dead constant container keys retain structural depth validation" {
+    const a = std.testing.allocator;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(a);
+    try text.appendSlice(a, "UNWIND [1,2] AS i UNWIND [1,2] AS x CALL {WITH [] AS dead,x ");
+    for (0..65) |_| try text.appendSlice(a, "WITH [dead] AS dead,x ");
+    try text.appendSlice(a, "WITH dead,count(x) AS y RETURN y} RETURN i,sum(y)");
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(a, text.items, .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    try std.testing.expectError(error.CypherValueDepthExceeded, runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{}));
 }

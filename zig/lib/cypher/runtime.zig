@@ -2366,8 +2366,9 @@ const Engine = struct {
     };
     /// A group-key ranked window is monotone: an evicted key can never enter
     /// again. Only scalar COUNT reducers are currently licensed. Their count
-    /// cannot overflow within the work budget; rejected argument expressions
-    /// are still evaluated, preserving their errors and effects.
+    /// cannot overflow: each charged transition represents at most
+    /// maxInt(i64) / work_budget logical rows. Compressed domains and memo
+    /// packets must carry that bound too. Rejected arguments still execute.
     const GroupWindow = struct {
         const Owned = struct { arena: std.heap.ArenaAllocator, rank: []const v.Value, hash: u64, sequence: usize };
         capacity: usize,
@@ -2415,6 +2416,27 @@ const Engine = struct {
             const limit = try engine.count(projection.limit.?);
             return .{ .capacity = if (limit == 0) 0 else (if (projection.skip) |skip| try engine.count(skip) else 0) + limit, .slots = slots };
         }
+        fn contributionLimit(engine: *Engine) u64 {
+            return @as(u64, std.math.maxInt(i64)) / @max(1, engine.limits.intermediate_states);
+        }
+        fn permitsWeight(engine: *Engine, weight: Count) bool {
+            return (weight.exact() orelse return false) <= contributionLimit(engine);
+        }
+        fn permitsProduct(engine: *Engine, weight: Count, length: u128) bool {
+            const prior = weight.exact() orelse return false;
+            const cardinality = std.math.cast(u64, length) orelse return false;
+            return cardinality == 0 or prior <= contributionLimit(engine) / cardinality;
+        }
+        fn permitsPacket(engine: *Engine, packet: WeightedRows, calls: usize) bool {
+            for (packet.rows[1..][0..calls]) |snapshot| {
+                if (snapshot[6].value.integer != 0) return false;
+                // COUNT's exact non-NULL cardinality is sufficient: a packet
+                // can represent arbitrarily many rows whose arguments are NULL.
+                const cardinality: u64 = @bitCast(snapshot[0].value.integer);
+                if (cardinality > contributionLimit(engine)) return false;
+            }
+            return true;
+        }
         fn projected(group: StreamGroup) Projected {
             return .{ .row = &.{}, .source = &.{}, .group = null, .keys = group.window.?.rank, .sequence = group.window.?.sequence };
         }
@@ -2431,7 +2453,12 @@ const Engine = struct {
                 // These values would have been consumed even for discarded
                 // groups. Do not hide type/arithmetic/pattern errors in args.
                 if (fold.axis_packet == null) for (fold.calls) |expression| {
-                    if (!expression.value.call.star) _ = try engine.eval(expression.value.call.args[0], row, null);
+                    if (!expression.value.call.star) _ = engine.eval(expression.value.call.args[0], row, null) catch |err| {
+                        // A later middle-stage failure precedes RETURN's
+                        // argument failures. Retry with deferred aggregates.
+                        if (fold.window_retry and StreamingAggregate.consumerFailure(err)) return error.CypherGroupWindowDeclined;
+                        return err;
+                    };
                 };
                 // An axis packet already certifies every pure argument in the
                 // complete captured domain, including losing group candidates.
@@ -2831,13 +2858,58 @@ const Engine = struct {
         while (keys.next()) |name| if (@import("expressions.zig").references(expression, name.*)) return true;
         return false;
     }
+    // Eliding a variable read requires a primitive result: entity reads may
+    // invoke authority projection, and container reads validate structural depth.
+    fn plainExpression(expression: *const ast.Expr, names: Names) bool {
+        return switch (expression.value) {
+            .literal => true,
+            .variable => |name| names.contains(name),
+            .unary => |u| plainExpression(u.operand, names),
+            .binary => |b| plainExpression(b.left, names) and plainExpression(b.right, names),
+            .call => |call_value| blk: {
+                for ([_][]const u8{ "count", "sum", "avg" }) |name| if (std.ascii.eqlIgnoreCase(call_value.name, name)) break :blk true;
+                break :blk false;
+            },
+            else => false,
+        };
+    }
+    fn plainItems(expression: *const ast.Expr, names: Names) bool {
+        return switch (expression.value) {
+            // Successful ranges always contain integers; argument evaluation
+            // remains in the original producer, including all of its errors.
+            .call => |call_value| std.ascii.eqlIgnoreCase(call_value.name, "range"),
+            .list => |items| blk: {
+                for (items) |item| if (!plainExpression(item, names)) break :blk false;
+                break :blk true;
+            },
+            else => false,
+        };
+    }
     /// Expand bound wildcard columns without changing expression evaluation
     /// or CALL scope. A single scalar seed gives every stage one static schema.
     fn normalizeScalarPipeline(self: *Engine, initial: Row, clauses: []const ast.Clause) anyerror![]const ast.Clause {
+        var plain: Names = .empty;
+        for (initial) |entry| switch (entry.value) {
+            .null, .boolean, .integer, .number, .string => try plain.put(self.a, entry.name, {}),
+            else => {},
+        };
+        return self.normalizeScalarPipelineTyped(initial, clauses, plain);
+    }
+    fn normalizeScalarPipelineTyped(self: *Engine, initial: Row, clauses: []const ast.Clause, imported_plain: Names) anyerror![]const ast.Clause {
+        var plain: Names = .empty;
+        var imports = imported_plain.keyIterator();
+        while (imports.next()) |name| try plain.put(self.a, name.*, {});
         var shape = initial;
         const output = try self.a.dupe(ast.Clause, clauses);
         const inputs = try self.a.alloc(Row, output.len);
-        for (output, inputs) |*clause, *input| {
+        // All imports are constant within this invocation. Track variation
+        // across child rows separately from captures varying between callers.
+        var varying: Names = .empty;
+        const variations = try self.a.alloc(Names, output.len);
+        const plain_inputs = try self.a.alloc(Names, output.len);
+        for (output, inputs, variations, plain_inputs) |*clause, *input, *variation, *plain_input| {
+            variation.* = varying;
+            plain_input.* = plain;
             input.* = shape;
             switch (clause.operation) {
                 .unwind => {},
@@ -2854,16 +2926,50 @@ const Engine = struct {
                 },
                 .subquery => |inner| {
                     if (!axisReturningCall(inner)) return clauses;
-                    clause.operation.subquery = try self.normalizeScalarPipeline(shape, inner);
+                    clause.operation.subquery = try self.normalizeScalarPipelineTyped(shape, inner, plain);
                 },
                 else => return clauses,
+            }
+            switch (clause.operation) {
+                .unwind => |u| {
+                    try varying.put(self.a, u.alias, {});
+                    if (plainItems(u.expression, plain)) try plain.put(self.a, u.alias, {}) else _ = plain.remove(u.alias);
+                },
+                .project => |step| {
+                    var next: Names = .empty;
+                    var next_plain: Names = .empty;
+                    for (step.value.items) |item| if (plainExpression(item.expression, plain)) {
+                        try next_plain.put(self.a, item.alias orelse try self.expressionName(item.expression), {});
+                    };
+                    plain = next_plain;
+                    var varying_keys = false;
+                    for (step.value.items) |item| {
+                        varying_keys = varying_keys or (!aggregates(item.expression) and axisDepends(item.expression, varying));
+                    }
+                    for (step.value.items) |item| {
+                        const varies = if (aggregates(item.expression)) varying_keys else axisDepends(item.expression, varying);
+                        if (varies) try next.put(self.a, item.alias orelse try self.expressionName(item.expression), {});
+                    }
+                    varying = next;
+                },
+                .subquery => |inner| {
+                    // Conservatively treat exported child values as varying;
+                    // recursive normalization still handles its own constants.
+                    var child = shape;
+                    for (inner) |step| child = try self.streamShape(child, step);
+                    for (child) |entry| {
+                        try varying.put(self.a, entry.name, {});
+                        _ = plain.remove(entry.name);
+                    }
+                },
+                else => unreachable,
             }
             shape = try self.streamShape(shape, clause.*);
         }
         if (output.len == 0 or output[output.len - 1].operation != .project or !output[output.len - 1].operation.project.final) return output;
         // A CALL's internal forwarding columns are not observable outputs.
-        // Prune only bound variable copies; every potentially failing scalar
-        // expression still executes even when its result is dead.
+        // Prune only primitive variable copies; entity/container reads and
+        // potentially failing scalar expressions execute even when dead.
         var required: Names = .empty;
         for (shape) |entry| try required.put(self.a, entry.name, {});
         var cursor = output.len;
@@ -2886,9 +2992,17 @@ const Engine = struct {
                     } else false;
                     for (step.value.items) |item| {
                         const name = item.alias orelse try self.expressionName(item.expression);
-                        // Local grouping keys determine child multiplicity even
-                        // when their columns are dead after this projection.
-                        if (step.final or step.value.distinct or grouped or item.expression.value != .variable or required.contains(name)) {
+                        // Keep an unobserved invocation-constant grouping slot:
+                        // empty grouped inputs still return zero rows, without
+                        // capturing the caller's otherwise unobserved value.
+                        if (!step.final and !required.contains(name) and (grouped or step.value.distinct) and item.expression.value == .variable and plain_inputs[cursor].contains(item.expression.value.variable) and !axisDepends(item.expression, variations[cursor])) {
+                            const constant_key = try self.a.create(ast.Expr);
+                            constant_key.* = .{ .span = item.expression.span, .value = .{ .literal = .null } };
+                            try kept.append(self.a, .{ .expression = constant_key, .alias = name });
+                            continue;
+                        }
+                        // Varying keys still determine child multiplicity.
+                        if (step.final or step.value.distinct or grouped or item.expression.value != .variable or required.contains(name) or !plain_inputs[cursor].contains(item.expression.value.variable)) {
                             try kept.append(self.a, item);
                             try self.axisReferences(&before, item.expression);
                         }
@@ -3311,6 +3425,7 @@ const Engine = struct {
         projection: ast.Projection,
         calls: []const *const ast.Expr,
         group_window: ?*GroupWindow = null,
+        window_retry: bool = false,
         membership_leaders: []const usize = &.{},
         call_aliases: ?*const std.AutoHashMapUnmanaged(*const ast.Expr, usize) = null,
         retention: ?*const GroupRetention = null,
@@ -3369,6 +3484,11 @@ const Engine = struct {
                 try set.factored.?.put(engine, fold.retained, partition.key, support);
             }
         }
+        fn permitsWindowProduct(fold: *@This(), engine: *Engine, length: u128) !bool {
+            if (fold.group_window == null or fold.calls.len == 0 or GroupWindow.permitsProduct(engine, fold.weight, length)) return true;
+            if (fold.window_retry) return error.CypherGroupWindowDeclined;
+            return false;
+        }
         fn memoAxis(fold: *@This(), engine: *Engine, row: Row, index: usize) anyerror!bool {
             if (!fold.axis_enabled or !fold.has_keys or !engine.read_only or (!fold.defer_aggregates and fold.group_window == null) or !fold.weight.isOne() or fold.consumer != null or fold.continuation != null or fold.top.* != null or fold.active_calls != null or fold.calls.len == 0 or fold.projection.wildcard) return false;
             if (fold.single_seed) {
@@ -3410,14 +3530,13 @@ const Engine = struct {
                 if (packet == null) return false;
             }
             const summary = packet.?;
-            if (fold.group_window != null) for (summary.rows[1..][0..fold.calls.len]) |snapshot| {
-                // A group window evaluates arguments even for rejected keys.
-                // Failed probes must replay the ordinary row/error order.
-                if (snapshot[6].value.integer != 0) {
-                    plan.memo.disabled = true;
-                    return false;
-                }
-            };
+            if (fold.group_window != null and !GroupWindow.permitsPacket(engine, summary, fold.calls.len)) {
+                // No group has been published. Retry without eviction when
+                // possible so exact weighted reductions retain their errors.
+                if (fold.window_retry) return error.CypherGroupWindowDeclined;
+                plan.memo.disabled = true;
+                return false;
+            }
             var representative = row;
             var pending: std.ArrayList(AxisPartition) = .empty;
             var support_offset = 1 + fold.calls.len + plan.sample_count;
@@ -3554,7 +3673,9 @@ const Engine = struct {
                         // its elements are unobserved. Arithmetic ranges also
                         // carry the non-NULL/uniqueness proof for COUNT(alias).
                         // Both proofs cover every remaining binding and consumer.
-                        if ((source.values == .range or source.values == .list) and (counts != null or list_counts != null or fold.independentTail(unwind.alias, index + 1))) {
+                        if ((source.values == .range or source.values == .list) and (counts != null or list_counts != null or fold.independentTail(unwind.alias, index + 1)) and
+                            try fold.permitsWindowProduct(engine, source.length()))
+                        {
                             const length = source.length();
                             if (length == 0) return;
                             const cardinality = if (std.math.cast(u64, length)) |n| Count.init(n) else try Count.init(std.math.maxInt(u64)).add(engine.a, Count.one);
@@ -3722,6 +3843,15 @@ const Engine = struct {
                 if (fold.projection.limit != null and fold.projection.order.len == 0 and top.capacity != 0 and top.total == top.capacity) return error.CypherStreamComplete;
                 return;
             }
+            if (fold.group_window != null and fold.calls.len != 0) {
+                // One bounded logical contribution per charged transition.
+                // Packet replay carries its own exact COUNT bound.
+                try engine.state();
+                if (fold.axis_packet == null and !GroupWindow.permitsWeight(engine, fold.weight)) {
+                    if (fold.window_retry) return error.CypherGroupWindowDeclined;
+                    return error.CypherStateBudgetExceeded;
+                }
+            }
             // Each expanded input row owns its source-address epoch. Never
             // carry these keys across UNWIND branches or nested scratch frames.
             var input_scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
@@ -3850,6 +3980,7 @@ const Engine = struct {
                 };
                 defer accumulator.function = saved_function;
                 accumulator.addWeighted(engine, row, multiplicity) catch |err| {
+                    if (fold.group_window != null and fold.window_retry and StreamingAggregate.consumerFailure(err)) return error.CypherGroupWindowDeclined;
                     if (!fold.defer_aggregates or !StreamingAggregate.consumerFailure(err)) return err;
                     accumulator.failure = err;
                 };
@@ -4651,6 +4782,18 @@ const Engine = struct {
         };
         return true;
     }
+    /// From one unit input these pure bodies return at most one unit row.
+    /// Reducers, filtering, DISTINCT and windows cannot expand that input;
+    /// nested singleton CALLs preserve the same cardinality bound.
+    fn unitReturningCall(inner: []const ast.Clause) bool {
+        if (!axisReturningCall(inner)) return false;
+        for (inner) |clause| switch (clause.operation) {
+            .project => {},
+            .subquery => |child| if (!unitReturningCall(child)) return false,
+            else => return false,
+        };
+        return true;
+    }
     fn streamableCall(inner: []const ast.Clause) bool {
         if (inner.len == 0 or !weightedExpression(inner)) return false;
         const last = inner[inner.len - 1].operation;
@@ -4796,11 +4939,10 @@ const Engine = struct {
             if (StreamingAggregate.consumerFailure(err) or err == error.CypherAxisMemoDeclined) return false;
             return err;
         };
-        if (fold.group_window != null) for (packet.rows[1..][0..fold.calls.len]) |snapshot| {
-            // An ordered packet is mandatory after admission. Failed COUNT
-            // probes must decline before publishing any group or sort state.
-            if (snapshot[6].value.integer != 0) return false;
-        };
+        if (fold.group_window != null and !GroupWindow.permitsPacket(self, packet, fold.calls.len)) {
+            if (fold.window_retry) return error.CypherGroupWindowDeclined;
+            return false;
+        }
         self.validateOrderedRepresentatives(fold, plan, packet, input, outer.alias, source) catch |err| {
             if (StreamingAggregate.consumerFailure(err)) return false;
             return err;
@@ -4818,6 +4960,15 @@ const Engine = struct {
         return true;
     }
     fn streamMatchProjectionInto(self: *Engine, input: []const Row, input_weights: ?[]const Count, operation: ast.Match, projection: ast.Projection, original_middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span, continuation: @FieldType(StreamFold, "continuation"), consumer: ?*PatternConsumer) anyerror!?[]const Row {
+        return self.streamMatchProjectionAttempt(input, input_weights, operation, projection, original_middle, match_span, projection_span, continuation, consumer, true) catch |err| {
+            if (err != error.CypherGroupWindowDeclined) return err;
+            // Only a read-only fold with no downstream observer can request a
+            // retry. Its arenas/caches have closed and no stage/result escaped.
+            // Keep already charged work; never repeat writes or refund budgets.
+            return self.streamMatchProjectionAttempt(input, input_weights, operation, projection, original_middle, match_span, projection_span, continuation, consumer, false);
+        };
+    }
+    fn streamMatchProjectionAttempt(self: *Engine, input: []const Row, input_weights: ?[]const Count, operation: ast.Match, projection: ast.Projection, original_middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span, continuation: @FieldType(StreamFold, "continuation"), consumer: ?*PatternConsumer, allow_group_window: bool) anyerror!?[]const Row {
         // The row pipeline nests only within the statement's stack allowance.
         // Longer clause sequences retain the iterative general executor.
         if (original_middle.len > self.limits.recursion_depth -| self.recursion) return null;
@@ -4977,11 +5128,12 @@ const Engine = struct {
             if (input_weights) |weights| for (weights) |weight| if (!weight.isOne()) break :blk false;
             for (middle) |clause| switch (clause.operation) {
                 .project, .unwind => {},
+                .subquery => |inner| if (!unitReturningCall(inner)) break :blk false,
                 else => break :blk false,
             };
             break :blk true;
         };
-        var group_window = if (grouped) try GroupWindow.init(self, projection, scalar_groups or (projection.distinct and calls.items.len == 0)) else null;
+        var group_window = if (grouped and allow_group_window) try GroupWindow.init(self, projection, scalar_groups or (projection.distinct and calls.items.len == 0)) else null;
         defer if (group_window) |*window| {
             window.heap.deinit(self.scratch_allocator);
             group_index.deinit(self.scratch_allocator);
@@ -5001,7 +5153,7 @@ const Engine = struct {
         for (probes, middle) |*probe, clause| probe.* = .{ .budget = .{ .backing = self.scratch_allocator, .limit = @min(4 << 20, self.limits.memory_bytes / 32) }, .disabled = clause.operation != .match and clause.operation != .subquery };
         defer for (probes) |*probe| probe.deinit();
         const retention: GroupRetention = if (grouped) try self.groupRetention(projection) else .{ .a = self.a };
-        var fold: StreamFold = .{ .partitioned_order = ordered, .single_seed = scalar_seed and input.len == 1 and (input_weights == null or input_weights.?[0].isOne()), .defer_aggregates = scalar_seed and group_window == null, .consumer = consumer, .retention = &retention, .probes = probes, .optional = operation.optional, .applies = applies, .continuation = continuation, .distinct = distinct_stages, .retained = retained, .middle = middle, .projection = projection, .calls = calls.items, .membership_leaders = calls.distinct_leaders.items, .group_window = if (group_window) |*window| window else null, .call_aliases = &calls.index.pointers, .top = &top, .groups = &groups, .group_index = &group_index, .has_keys = has_keys, .stage_counts = stage_counts, .matched = &matched };
+        var fold: StreamFold = .{ .partitioned_order = ordered, .single_seed = scalar_seed and input.len == 1 and (input_weights == null or input_weights.?[0].isOne()), .defer_aggregates = scalar_seed and group_window == null, .consumer = consumer, .retention = &retention, .probes = probes, .optional = operation.optional, .applies = applies, .continuation = continuation, .distinct = distinct_stages, .retained = retained, .middle = middle, .projection = projection, .calls = calls.items, .membership_leaders = calls.distinct_leaders.items, .group_window = if (group_window) |*window| window else null, .window_retry = self.read_only and continuation == null and consumer == null, .call_aliases = &calls.index.pointers, .top = &top, .groups = &groups, .group_index = &group_index, .has_keys = has_keys, .stage_counts = stage_counts, .matched = &matched };
         defer fold.closeAxes();
         var adaptive_probe = adaptive_candidate;
         if (adaptive_probe) for (input) |row| {

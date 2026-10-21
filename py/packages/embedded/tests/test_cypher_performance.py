@@ -5965,6 +5965,8 @@ def test_dynamic_substrings_share_validation_and_unicode_offsets(graph_db, paylo
         "limited_call",
         "distinct_call",
         "aggregate_call",
+        "constant_key_call",
+        "expanding_constant_key_call",
         "ordered_no_final",
         "ordered_by_value",
     ],
@@ -5975,6 +5977,11 @@ def test_ordered_aggregate_domains_share_exact_reducer_states(graph_db, case):
         "mapped": ("UNWIND $xs AS x WITH i,x+1 AS y,x*2 AS z RETURN i,sum(y),sum(z)", [500500, 999000]),
         "avg": ("UNWIND $xs AS x RETURN i,avg(x)", [499.5]),
         "aggregate_call": ("UNWIND $xs AS x CALL {RETURN avg(x) AS y} RETURN i,avg(y)", [499.5]),
+        "constant_key_call": ("UNWIND $xs AS x CALL {WITH i,avg(x) AS y RETURN y} RETURN i,avg(y)", [499.5]),
+        "expanding_constant_key_call": (
+            "UNWIND $xs AS x CALL {UNWIND [x,x+1] AS k WITH i,sum(k) AS y RETURN y} RETURN i,avg(y)",
+            [1000.0],
+        ),
         "ordered_no_final": ("UNWIND $xs AS x WITH i,x ORDER BY x DESC RETURN i,avg(x),head(collect(x))", [499.5, 999]),
         "ordered_by_value": (
             "UNWIND $xs AS x WITH i,x ORDER BY x DESC RETURN i,avg(x) AS a,head(collect(x))",
@@ -6187,3 +6194,117 @@ def test_ordered_count_windows_reuse_validated_domains(graph_db):
                     "query": f"UNWIND [3,1,2] AS i UNWIND [1,0] AS x WITH i,x ORDER BY x RETURN i,count(1/x) ORDER BY i LIMIT {limit}"
                 },
             )
+
+
+@pytest.mark.parametrize("child", ["RETURN x+1 AS y", "CALL {RETURN x AS z} RETURN z+1 AS y", "RETURN count(x) AS y"])
+def test_singleton_call_keeps_count_group_window_bounded(graph_db, child):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": f"UNWIND range(1,10000) AS i UNWIND [0,1] AS x CALL {{{child}}} RETURN i,count(y) ORDER BY i LIMIT 5",
+            "limits": {"memory_bytes": 2 << 20, "intermediate_states": 400000},
+        },
+    )
+    assert [[int(cell["value"]) for cell in row] for row in result["rows"]] == [[i, 2] for i in range(1, 6)]
+    assert result["stats"]["memory_bytes"] < 256 << 10
+
+
+@pytest.mark.parametrize("limit", [0, 1])
+def test_count_window_does_not_hide_uncertified_symbolic_cardinality(graph_db, limit):
+    with pytest.raises(af.AntflyError, match="CypherNumericOverflow"):
+        graph_db.cypher_json(
+            "g",
+            {
+                "query": "UNWIND [1,2] AS i UNWIND range(0,CASE WHEN i=2 THEN 9223372036854775807 ELSE 0 END) AS x "
+                f"RETURN i,count(*) ORDER BY i LIMIT {limit}",
+                "limits": {"intermediate_states": 2000},
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "WITH i,avg(x) AS y RETURN y",
+        "UNWIND [x,x+1] AS k WITH i,sum(k) AS y RETURN y",
+        "UNWIND CASE WHEN x IS NULL THEN [] ELSE [x] END AS k WITH i,count(k) AS y RETURN y",
+        "WITH i AS j UNWIND [x,x] AS k WITH j,sum(k) AS y RETURN y",
+        "UNWIND [x,x] AS k WITH DISTINCT i,k WITH i,count(k) AS y RETURN y",
+        "UNWIND [1,2] AS k WITH k,count(*) AS y RETURN y",
+        "CALL {WITH i,avg(x) AS z RETURN z} RETURN z AS y",
+        "WITH i,avg(x) AS y,1/(2-i) AS bad RETURN y",
+    ],
+)
+def test_constant_call_keys_match_execution_without_scalar_normalization(graph_db, body):
+    graph_db.sql("INSERT INTO docs (_id,id) VALUES ('guard','guard')")
+
+    def run(query, values):
+        try:
+            return ("rows", graph_db.cypher_json("g", {"query": query, "parameters": {"xs": values}})["rows"])
+        except af.AntflyError as error:
+            return ("error", str(error))
+
+    # A single graph row preserves the child domain while routing the control
+    # through the original executor, without scalar normalization or axis reuse.
+    for values in (
+        [],
+        [None],
+        [1],
+        [1, 1.0, None],
+        [0, 2, -2],
+        [2**63 - 1, 1, -1],
+        [1e16, 1.0, -1e16],
+        [True],
+        ["bad"],
+        [[]],
+        [{}],
+    ):
+        for source in ("[3,1,2]", "[1,2,1]"):
+            queries = [
+                f"UNWIND {source} AS i UNWIND $xs AS x CALL {{{guard}{body}}} "
+                "RETURN i,avg(y),head(collect(y)),count(*) ORDER BY i"
+                for guard in ("", "MATCH (__guard:D) WHERE __guard.id='guard' ")
+            ]
+            assert run(queries[0], values) == run(queries[1], values)
+
+
+def test_count_window_retry_keeps_exact_large_counts_and_publishes_stages_once(graph_db):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND [3,1,2,1] AS i UNWIND range(1,1000000000000000) AS x RETURN i,count(*) ORDER BY i LIMIT 1",
+            "limits": {"memory_bytes": 1 << 20, "intermediate_states": 2000},
+        },
+    )
+    assert [[int(cell["value"]) for cell in row] for row in result["rows"]] == [[1, 2000000000000000]]
+    assert [stage["operation"] for stage in result["plan"]] == ["unwind", "unwind", "project"]
+    assert result["plan"][0]["output_rows"] == 4
+    assert result["plan"][1]["output_rows"] == 4000000000000000
+    with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
+        graph_db.cypher_json(
+            "g",
+            {
+                "query": "UNWIND [1,2] AS i UNWIND range(0,CASE WHEN i=2 THEN 9223372036854775807 ELSE 0 END) AS x "
+                "WITH i,CASE WHEN i=2 THEN 1/0 ELSE 0 END AS bad RETURN i,count(*) ORDER BY i LIMIT 1",
+                "limits": {"intermediate_states": 2000},
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "source,limit",
+    [
+        ("UNWIND [1,2] AS i UNWIND [0] AS x", 1),
+        ("UNWIND [1,2] AS i UNWIND [0] AS x", 0),
+        ("UNWIND [1,3,2] AS i UNWIND [CASE WHEN i=3 THEN 0 ELSE 1 END] AS x", 1),
+    ],
+)
+def test_call_count_window_keeps_middle_error_before_return_argument_error(graph_db, source, limit):
+    with pytest.raises(af.AntflyError, match="CypherTypeMismatch"):
+        graph_db.cypher_json(
+            "g",
+            {
+                "query": source + " CALL {RETURN CASE WHEN i=2 THEN true+1 ELSE 1 END AS y} "
+                f"RETURN i,count(1/x) ORDER BY i LIMIT {limit}"
+            },
+        )

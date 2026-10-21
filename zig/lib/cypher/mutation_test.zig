@@ -1435,7 +1435,12 @@ test "write folds cache closed scalar work locally without crossing deleted enti
 
 test "ordinary expression loops own write epoch constants and release them on failure" {
     const Campaign = struct {
-        fn run(a: A) !void {
+        fn run(backing: A) !void {
+            // Keep injected failure positions independent of arena growth layout.
+            var vtable = backing.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const a: A = .{ .ptr = backing.ptr, .vtable = &vtable };
             var fixture = Fixture.init();
             defer fixture.arena.deinit();
             var diagnostic: root.compiler.Diagnostic = .{};

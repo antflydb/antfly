@@ -1975,6 +1975,14 @@ COUNT(*) consumes preceding filters, expansions and nested child domains even
 without a value argument. An ungrouped child reduction resets cardinality to one
 before applying its predicate or window. Grouping keys retain their effect on
 child multiplicity, including keys whose output columns are later discarded.
+Invocation-local variation is tracked separately from caller correlation. A dead
+bound-variable key that is constant throughout the child invocation becomes a
+NULL grouping slot. Keeping the slot preserves zero rows on empty grouped input;
+removing its value dependency allows reducer domains to share across callers.
+Only proven primitive bindings qualify: entity reads may invoke backend
+visibility projection, and container reads enforce structural depth limits even
+when their values are dead. Varying keys, entity/container reads and potentially
+failing expressions keep their original evaluation.
 
 An intermediate ORDER BY can share one sorted inner domain only after proving a
 unique outer source, unchanged partition lineage in every DISTINCT and grouping
@@ -1996,7 +2004,25 @@ Count-only group windows may reuse a successful complete domain, including a
 validated ordered domain, before ranking its group key. Such a packet certifies
 argument evaluation for rejected and LIMIT 0 groups as well as selected groups.
 A failed argument probe disables reuse and resumes ordinary row/error order; it
-never hides an error behind eviction.
+never hides an error behind eviction. Every COUNT-window transition is charged
+and may contribute at most `floor(maxInt(i64) / intermediate_states_limit)`
+non-NULL values. UNWIND compression checks the product of incoming multiplicity
+and domain size without narrowing or overflowing; replay packets validate each
+COUNT state against the same bound. A larger or failed domain retries an unpublished read-only
+fold without group eviction, preserving exact symbolic COUNT overflow and error
+ordering. The failed attempt releases its window arenas and caches; work remains
+charged and no stage or result is published before retry. COUNT argument failures also
+retry with deferred aggregates, so later middle-stage errors retain precedence
+over failures in RETURN arguments for selected, rejected and LIMIT 0 groups. Folds with downstream
+observers retain ordinary contribution execution. Physical work counts alone do
+not certify logical cardinality. This bound covers repeated and evicted keys
+without retaining per-key counts outside the bounded window.
+
+Pure CALL bodies containing only projections and nested singleton CALLs preserve
+at most one unit output from one unit input, including filters, local DISTINCT,
+windows and global reducers that restore an empty input. That structural
+cardinality proof permits COUNT group windows through these bodies. Expanding,
+graph-reading and effectful bodies retain their existing execution paths.
 
 Ordinary REDUCE expressions share the collection fold's bounded accumulator
 ownership and per-transition scratch lifetime. Each ownership transfer preserves
