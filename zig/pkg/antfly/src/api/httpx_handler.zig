@@ -18076,8 +18076,19 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
     try config.registry.registerEmbedderConfig("dense", .{ .provider = .openai, .model = "backend", .url = upstream.baseUrl(), .api_key = "gateway-test-key", .dimensions = 2 });
     const hosted_url = try std.fmt.allocPrint(alloc, "{s}/v1", .{upstream.baseUrl()});
     defer alloc.free(hosted_url);
-    try config.registry.registerDeciderConfig("visual-openai", .{ .provider = .openai, .model = "backend", .url = hosted_url, .api_key = "gateway-test-key" });
-    try config.registry.registerDeciderConfig("visual-jev", .{ .provider = .jev, .model = "jev-preview", .url = upstream.baseUrl(), .api_key = "gateway-test-key" });
+    try config.registry.registerDeciderConfig("visual-openai", .{ .provider = .openai, .model = "backend", .max_image_input_tokens = 8192, .url = hosted_url, .api_key = "gateway-test-key" });
+    try config.registry.registerDeciderConfig("visual-jev", .{ .provider = .jev, .model = "jev-preview", .max_image_input_tokens = 8192, .url = upstream.baseUrl(), .api_key = "gateway-test-key" });
+    try config.connections.put(alloc, try alloc.dupe(u8, "vendor"), .{
+        .kind = .inference,
+        .capabilities = try alloc.dupe([]u8, &.{try alloc.dupe(u8, "models.decide")}),
+        .inference = .{
+            .provider = try alloc.dupe(u8, "openai"),
+            .url = try alloc.dupe(u8, hosted_url),
+            .api_key = try alloc.dupe(u8, "gateway-test-key"),
+            .max_image_input_tokens = 8192,
+        },
+    });
+    try config.registry.inference_capabilities.put(alloc, try alloc.dupe(u8, "connections/vendor/models/backend"), .{ .images = .supported });
     // SQL and HTTP names borrow the very same configuration object.
     const sql_decider = try config.registry.getDeciderConfig("deciders/triage");
     try std.testing.expectEqualStrings("backend", sql_decider.model);
@@ -18099,6 +18110,7 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
                 .{ "{\"model\":\"embedders/dense\",\"input\":\"hi\"}", "embedding" },
                 .{ "{\"model\":\"embedders/dense\",\"input\":\"hi\",\"encoding_format\":\"base64\"}", "zczMPc3MTD4=" },
                 .{ "{\"model\":\"deciders/visual-openai\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}],\"questions\":[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Damaged?\"}]}", "0.9" },
+                .{ "{\"model\":\"connections/vendor/models/backend\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}],\"questions\":[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Damaged?\"}]}", "0.9" },
                 .{ "{\"model\":\"deciders/visual-jev\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}],\"questions\":[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Damaged?\"}]}", "0.9" },
             };
             inline for (requests, 0..) |item, i| {
@@ -18109,7 +18121,7 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
                 defer ctx.deinit();
                 var response = try h.gatewayRequest(&ctx, switch (i) {
                     0 => .generate,
-                    1, 5, 6 => .decide,
+                    1, 5, 6, 7 => .decide,
                     2 => .read,
                     else => .embed,
                 });
@@ -18124,7 +18136,7 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
     var failure: ?anyerror = null;
     try group.concurrent(io, Fiber.run, .{ alloc, io, &handler, &failure });
     defer group.cancel(io);
-    for (0..7) |_| try upstream.handleOne();
+    for (0..8) |_| try upstream.handleOne();
     try group.await(io);
     if (failure) |err| return err;
     try std.testing.expectEqual(@as(usize, 0), api_server.inferenceAdmissionStats().in_flight);

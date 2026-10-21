@@ -57,9 +57,30 @@ fn parseResponse(a: std.mem.Allocator, bytes: []const u8) !decisions.Json {
 
 fn requestPayload(a: std.mem.Allocator, io: std.Io, cfg: decisions.DeciderConfig, request: decisions.Request) !decisions.WirePayload {
     if (cfg.decision_method == .generated) return .{ .body = try std.json.Stringify.valueAlloc(a, .{ .input = try request.input.requireText(), .questions = request.questions, .instructions = cfg.instructions }, .{}) };
-    if (cfg.provider == .openai) return .{ .body = try openai.requestBody(a, cfg.modelName(), request.input, request.questions) };
+    if (cfg.provider == .openai) return .{ .body = try openai.requestBody(a, cfg.modelName(), request.input, request.questions), .image_bytes = request.input.inlineImageBytes() };
     if (cfg.provider == .jev) return jev.request(a, io, cfg, request.input, request.questions);
     return .{ .body = try decisions.wireRequest(a, cfg, try request.input.requireText(), request.questions) };
+}
+
+fn estimateInputTokens(cfg: decisions.DeciderConfig, input: decisions.Input, payload: decisions.WirePayload) !u64 {
+    const text_bytes = std.math.sub(usize, payload.body.len, payload.image_bytes) catch return error.InvalidDecisionOutput;
+    const count = input.imageCount();
+    if (count == 0) return text_bytes;
+    // URLs and compressed file bytes cannot bound the visual tokenization.
+    // The operator supplies the provider/model's per-image upper bound.
+    const bound = cfg.max_image_input_tokens orelse return error.InvalidDeciderConfig;
+    const images = std.math.mul(u64, count, bound) catch return error.DecisionLimitExceeded;
+    return std.math.add(u64, text_bytes, images) catch error.DecisionLimitExceeded;
+}
+
+fn reconcileUsage(reservation: *quotas.TokenReservation, source: decisions.Json) void {
+    if (source != .object) return;
+    const usage = source.object.get("usage") orelse return;
+    if (usage != .object) return;
+    const input = usage.object.get("input_tokens") orelse return;
+    const output = usage.object.get("output_tokens") orelse return;
+    if (input != .integer or output != .integer or input.integer < 0 or output.integer < 0) return;
+    reservation.reconcile(@intCast(input.integer), @intCast(output.integer));
 }
 
 pub const Runtime = struct {
@@ -100,7 +121,7 @@ pub const Runtime = struct {
     }
     fn resolvedCapabilities(ptr: *anyopaque, name: []const u8) !decisions.Capabilities {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
-        return (try self.registry.getDeciderConfig(name)).resolvedCapabilities();
+        return self.registry.getDeciderCapabilities(name);
     }
     fn checkpoint(ptr: *anyopaque) !void {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
@@ -152,8 +173,8 @@ pub const Runtime = struct {
             try request.input.checkLimit(a, cfg.resolvedCapabilities().max_input_bytes);
             var scratch = std.heap.ArenaAllocator.init(a);
             defer scratch.deinit();
-            const body = (try requestPayload(scratch.allocator(), self.io, cfg, request)).body;
-            estimated +|= body.len;
+            const payload = try requestPayload(scratch.allocator(), self.io, cfg, request);
+            estimated = std.math.add(u64, estimated, try estimateInputTokens(cfg, request.input, payload)) catch return error.DecisionLimitExceeded;
             if (estimated > cfg.max_input_tokens) return error.DecisionLimitExceeded;
         }
         self.estimated_input_tokens = estimated;
@@ -270,7 +291,8 @@ pub const Runtime = struct {
                 .credentials = @import("../common/credential_source_identity.zig").fromSecretValue(key_source),
             } }, try quotas.Policy.fromConfig(cfg.rate_limit));
             defer quota.release();
-            const observer = quota.limiter().observer(0);
+            var reservation: quotas.TokenReservation = .{ .limiter = quota.limiter(), .input_tokens = try estimateInputTokens(cfg, self.request.input, payload) };
+            const observer = reservation.observer();
             if (cfg.provider == .antfly and cfg.url.len == 0) if (self.runtime.antfly_provider) |embedded| if (embedded.decide_json) |_| {
                 try observer.before(observer.ptr, .{
                     .io = self.runtime.io,
@@ -287,7 +309,9 @@ pub const Runtime = struct {
                     if (err == error.DecisionRateLimited) feedback = httpx.Response.init(a, 429);
                     return operationalError(err);
                 };
-                return parseResponse(a, bytes);
+                const parsed = try parseResponse(a, bytes);
+                reconcileUsage(&reservation, parsed);
+                return parsed;
             };
             const key = key_source.resolveOwned(a, self.runtime.secret_store) catch |err| return operationalError(err);
             if (cfg.provider != .antfly and key == null) return error.MissingDecisionApiKey;
@@ -327,6 +351,9 @@ pub const Runtime = struct {
             };
             const bytes = response.body orelse return error.InvalidDecisionOutput;
             const parsed = try parseResponse(a, bytes);
+            // Account usage before semantic output validation, including refused
+            // or invalid answers for which the provider has already spent tokens.
+            reconcileUsage(&reservation, parsed);
             if (cfg.provider == .antfly) {
                 const root = try decisions.object(parsed);
                 const answers = root.get("answers") orelse return error.InvalidDecisionOutput;
@@ -348,12 +375,12 @@ pub const Runtime = struct {
             const cfg = try self.registry.getDeciderConfig(request.decider);
             if (self.rows + requests.len > cfg.max_rows or self.input_tokens >= cfg.max_input_tokens) return error.DecisionLimitExceeded;
             try request.input.checkLimit(a, cfg.resolvedCapabilities().max_input_bytes);
-            // Reserve conservatively before any provider I/O. The same byte-based
-            // token estimate is used by the shared provider quota implementation.
+            // Reserve text bytes plus the configured visual token bound before
+            // any I/O. The shared quota uses this same estimate and actual usage.
             var scratch = std.heap.ArenaAllocator.init(a);
             defer scratch.deinit();
-            const body = (try requestPayload(scratch.allocator(), self.io, cfg, request)).body;
-            estimated +|= body.len;
+            const payload = try requestPayload(scratch.allocator(), self.io, cfg, request);
+            estimated = std.math.add(u64, estimated, try estimateInputTokens(cfg, request.input, payload)) catch return error.DecisionLimitExceeded;
             if (estimated > cfg.max_input_tokens) return error.DecisionLimitExceeded;
             batch_size = @min(batch_size, cfg.batch_size);
         }
@@ -858,6 +885,13 @@ test "decision functions multimodal HTTP preserves OpenAI parts and Jev multipar
                 try std.testing.expect(std.mem.indexOf(u8, req.body, "iVBORw0KGgo=") == null);
             }
         }
+        fn text(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("application/json", req.header("Content-Type").?);
+            try std.testing.expect(req.header("TypeSafe-Danger-Zone-Images") == null);
+            const parsed = try std.json.parseFromSlice(decisions.Json, a, req.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("Text only", parsed.value.object.get("state").?.array.items[0].object.get("content").?.string);
+        }
     };
     const openai_response =
         \\{"model":"vision-model","answers":[{"type":"predicate","name":"answer","probability":0.9}],"usage":{"input_tokens":42,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"output_tokens":0,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":42}}
@@ -868,6 +902,7 @@ test "decision functions multimodal HTTP preserves OpenAI parts and Jev multipar
     var server = try httpx.TestServer.start(a, io, &.{
         .{ .method = .POST, .path = "/v1/decisions", .max_uses = 1, .assert_request = Check.request, .respond = .{ .body = openai_response } },
         .{ .method = .POST, .path = "/v1/systemone", .max_uses = 1, .assert_request = Check.request, .respond = .{ .body = jev_response } },
+        .{ .method = .POST, .path = "/v1/systemone", .max_uses = 1, .assert_request = Check.text, .respond = .{ .body = jev_response } },
     });
     defer server.deinit();
     var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
@@ -877,10 +912,12 @@ test "decision functions multimodal HTTP preserves OpenAI parts and Jev multipar
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const alloc = arena.allocator();
-    try registry.registerDeciderConfig("openai", .{ .provider = .openai, .model = "vision-model", .url = try std.fmt.allocPrint(alloc, "{s}/v1", .{server.baseUrl()}), .api_key = "images-test" });
-    try registry.registerDeciderConfig("jev", .{ .provider = .jev, .model = "jev-preview", .url = server.baseUrl(), .api_key = "images-test" });
+    try registry.registerDeciderConfig("openai", .{ .provider = .openai, .model = "vision-model", .max_image_input_tokens = 8192, .url = try std.fmt.allocPrint(alloc, "{s}/v1", .{server.baseUrl()}), .api_key = "images-test" });
+    try registry.registerDeciderConfig("jev", .{ .provider = .jev, .model = "jev-preview", .max_image_input_tokens = 8192, .url = server.baseUrl(), .api_key = "images-test" });
     try registry.registerDeciderConfig("native", .{ .model = "text-model", .url = server.baseUrl() });
-    try registry.registerDeciderConfig("budgeted", .{ .provider = .jev, .model = "jev-preview", .url = server.baseUrl(), .api_key = "images-test", .max_input_tokens = 1 });
+    try registry.registerDeciderConfig("quota-small", .{ .provider = .jev, .model = "jev-preview", .url = server.baseUrl(), .api_key = "images-test", .max_image_input_tokens = 8192, .rate_limit = .{ .tokens_per_minute = 1000 } });
+    try registry.registerDeciderConfig("missing-image-bound", .{ .provider = .jev, .model = "jev-preview", .url = server.baseUrl(), .api_key = "images-test" });
+    try registry.registerDeciderConfig("budgeted", .{ .provider = .jev, .model = "jev-preview", .max_image_input_tokens = 8192, .url = server.baseUrl(), .api_key = "images-test", .max_input_tokens = 1 });
     const input = try decisions.Input.fromJson(try std.json.parseFromSliceLeaky(decisions.Json, alloc,
         \\[{"role":"user","content":"Describe damage"},{"role":"user","content":[{"type":"input_text","text":"The item"},{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo=","detail":"auto"}]}]
     , .{}));
@@ -911,7 +948,36 @@ test "decision functions multimodal HTTP preserves OpenAI parts and Jev multipar
         if (failure) |err| return err;
     }
     try std.testing.expectEqual(@as(u64, 84), runtime.input_tokens);
+    try std.testing.expectError(error.DecisionLimitExceeded, runtime.provider().evaluateBatch(alloc, &.{.{ .decider = "quota-small", .questions = questions, .input = input }}));
+    try std.testing.expectError(error.UnsupportedInferenceFeature, runtime.provider().evaluateBatch(alloc, &.{.{ .decider = "missing-image-bound", .questions = questions, .input = input }}));
+    try registry.inference_capabilities.put(a, try a.dupe(u8, "deciders/openai"), .{ .images = .unsupported });
+    try std.testing.expectError(error.UnsupportedInferenceFeature, runtime.provider().evaluateBatch(alloc, &.{.{ .decider = "openai", .questions = questions, .input = input }}));
+    try std.testing.expectError(error.UnsupportedInferenceFeature, runtime.provider().evaluateBatch(alloc, &.{.{ .decider = "deciders/openai", .questions = questions, .input = input }}));
     try std.testing.expectError(error.UnsupportedInferenceFeature, runtime.provider().evaluateBatch(alloc, &.{.{ .decider = "native", .questions = questions, .input = input }}));
     try std.testing.expectError(error.DecisionLimitExceeded, runtime.provider().evaluateBatch(alloc, &.{.{ .decider = "budgeted", .questions = questions, .input = input }}));
-    try std.testing.expectEqualSlices(usize, &.{ 1, 1 }, server.route_hits);
+    const text_input = try decisions.Input.fromJson(try std.json.parseFromSliceLeaky(decisions.Json, alloc, "[{\"role\":\"user\",\"content\":\"Text only\"}]", .{}));
+    var text_failure: ?anyerror = null;
+    try group.concurrent(io, Run.run, .{ &runtime, alloc, "missing-image-bound", questions, text_input, &text_failure });
+    try server.handleOne();
+    try group.await(io);
+    if (text_failure) |err| return err;
+    try std.testing.expectEqualSlices(usize, &.{ 1, 1, 1 }, server.route_hits);
+}
+
+test "decision functions image token estimates account for opaque URLs and require a bound" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const input = try decisions.Input.fromJson(try std.json.parseFromSliceLeaky(decisions.Json, a,
+        \\[{"role":"user","content":[{"type":"input_image","image_url":"https://example.org/a.png"},{"type":"input_image","image_url":"https://example.org/b.png"}]}]
+    , .{}));
+    const cfg: decisions.DeciderConfig = .{ .provider = .openai, .model = "vision", .max_image_input_tokens = 8192 };
+    const body: [100]u8 = @splat('x');
+    try std.testing.expectEqual(@as(u64, 16484), try estimateInputTokens(cfg, input, .{ .body = &body }));
+    try std.testing.expectEqual(@as(u64, 16404), try estimateInputTokens(cfg, input, .{ .body = &body, .image_bytes = 80 }));
+    try std.testing.expectError(error.InvalidDeciderConfig, estimateInputTokens(.{ .provider = .openai, .model = "unknown" }, input, .{ .body = &body }));
+    var overflow = cfg;
+    overflow.max_image_input_tokens = std.math.maxInt(u64);
+    try std.testing.expectError(error.DecisionLimitExceeded, estimateInputTokens(overflow, input, .{ .body = &body }));
+    try std.testing.expectEqual(@as(u64, 100), try estimateInputTokens(cfg, .{ .text = "unchanged" }, .{ .body = &body }));
 }

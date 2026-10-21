@@ -15820,6 +15820,11 @@ export interface components {
             max_rows?: number;
             /** @default 1000000 */
             max_input_tokens?: number;
+            /**
+             * Format: int64
+             * @description Provider/model upper bound on the input-token contribution of one image. Required when sending images through hosted typed deciders, including image URLs. The runtime reserves this allowance per image in addition to serialized non-image request bytes; actual usage can add shared quota debt. Omit for text-only, native, or generated deciders.
+             */
+            max_image_input_tokens?: number;
             rate_limit?: components["schemas"]["RateLimitConfig"];
             /** @default 32 */
             batch_size?: number;

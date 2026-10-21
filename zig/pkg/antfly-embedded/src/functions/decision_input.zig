@@ -46,6 +46,36 @@ pub const Input = union(enum) {
         };
     }
 
+    /// Call after validation. Image references cost tokens independently of
+    /// their URL length or compressed file size.
+    pub fn imageCount(self: Input) usize {
+        if (self == .text) return 0;
+        var count: usize = 0;
+        for (self.messages) |message| {
+            const content = message.object.get("content").?;
+            if (content == .array) for (content.array.items) |part| {
+                if (std.mem.eql(u8, part.object.get("type").?.string, "input_image")) count += 1;
+            };
+        }
+        return count;
+    }
+
+    /// Inline base64 bytes as written by JSON adapters, excluding MIME framing.
+    /// Requires a validated input; ordinary text and remote URLs remain text cost.
+    pub fn inlineImageBytes(self: Input) usize {
+        if (self == .text) return 0;
+        var bytes: usize = 0;
+        for (self.messages) |message| {
+            const content = message.object.get("content").?;
+            if (content == .array) for (content.array.items) |part| {
+                if (!std.mem.eql(u8, part.object.get("type").?.string, "input_image")) continue;
+                const url = part.object.get("image_url").?.string;
+                if (std.mem.startsWith(u8, url, "data:")) bytes += (inlineImage(url) catch unreachable).encoded.len;
+            };
+        }
+        return bytes;
+    }
+
     pub fn validate(self: Input) !void {
         switch (self) {
             .text => |s| _ = try nonempty(s),

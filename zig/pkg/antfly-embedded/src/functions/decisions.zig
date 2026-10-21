@@ -25,15 +25,18 @@ pub const Input = @import("decision_input.zig").Input;
 /// with their body so the shared executor is independent of vendor formats.
 pub const WirePayload = struct {
     body: []const u8,
+    /// Encoded/binary image bytes in the body; visual tokens are reserved
+    /// separately instead of charging compressed images as UTF-8 text.
+    image_bytes: usize = 0,
     content_type: []const u8 = "application/json",
     headers: []const [2][]const u8 = &.{},
 };
 pub const Provider = enum { antfly, jev, openai };
 pub const Kind = enum { choice, multi_choice, score, noul };
 pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability };
-pub const Capabilities = struct { max_questions: usize = 64, max_choices: usize = 64, max_levels: usize, max_input_bytes: usize = 1024 * 1024, images: bool = false, full_distribution: bool = true, embedding_similarity: bool = false, generated: bool = false };
+pub const Capabilities = struct { max_questions: usize = 64, max_choices: usize = 64, max_levels: usize, max_input_bytes: usize = 1024 * 1024, images: bool = false, messages: bool = false, full_distribution: bool = true, embedding_similarity: bool = false, generated: bool = false };
 pub fn capabilities(provider: Provider) Capabilities {
-    return .{ .max_levels = if (provider == .antfly) 64 else 10, .images = provider != .antfly };
+    return .{ .max_levels = if (provider == .antfly) 64 else 10, .images = provider != .antfly, .messages = provider != .antfly };
 }
 pub const RateLimit = struct {
     pacing: ?enum { token_bucket, completion } = null,
@@ -76,6 +79,9 @@ pub const DeciderConfig = struct {
     api_key: ?[]const u8 = null,
     max_rows: u32 = 10000,
     max_input_tokens: u64 = 1000000,
+    /// Operator-supplied upper bound for one image's token contribution for
+    /// this provider/model. Required for image calls, including remote URLs.
+    max_image_input_tokens: ?u64 = null,
     batch_size: u16 = 32,
     rate_limit: ?RateLimit = null,
     pub fn validate(self: @This()) !void {
@@ -95,6 +101,9 @@ pub const DeciderConfig = struct {
                 for (identity) |c| if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f')) return error.InvalidDeciderConfig;
             }
         }
+        if (self.max_image_input_tokens) |bound| {
+            if (bound == 0 or self.provider == .antfly or self.decision_method != .typed) return error.InvalidDeciderConfig;
+        }
         if (self.max_rows == 0 or self.max_input_tokens == 0 or self.batch_size == 0 or self.batch_size > 256) return error.InvalidDeciderConfig;
         if (self.decision_method != .generated and self.provider != .jev and std.mem.trim(u8, self.model, " \r\n\t").len == 0) return error.InvalidDeciderConfig;
         if (std.mem.indexOfAny(u8, self.url, "\r\n") != null) return error.InvalidDeciderConfig;
@@ -109,6 +118,7 @@ pub const DeciderConfig = struct {
         if (caps.generated) {
             caps.max_levels = 64;
             caps.images = false;
+            caps.messages = false;
         }
         if (self.decision_method == .embedding_similarity) {
             caps.embedding_similarity = true;
@@ -677,7 +687,8 @@ pub const DecisionProvider = struct {
             try self.validate(request.decider, request.questions);
             try request.input.validate();
             const caps = if (self.capabilities_fn) |f| try f(self.ptr, request.decider) else Capabilities{ .max_levels = 64 };
-            if (!caps.images) _ = try request.input.requireText();
+            if (!caps.messages) _ = try request.input.requireText();
+            if (!caps.images and request.input.imageCount() != 0) return error.UnsupportedInferenceFeature;
             try request.input.checkLimit(a, caps.max_input_bytes);
         }
         const scoped = if (self.source_table.len > 0) try a.dupe(Request, requests) else null;

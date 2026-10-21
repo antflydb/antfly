@@ -30,7 +30,8 @@ pub fn request(a: std.mem.Allocator, io: std.Io, cfg: d.DeciderConfig, input: d.
     var root = try std.json.parseFromSliceLeaky(d.Json, a, try d.wireRequest(a, cfg, "", questions), .{});
     var state: d.Json = .{ .array = std.array_list.Managed(d.Json).init(a) };
     var assets = d.jsonObject();
-    var parts: std.ArrayList(u8) = .empty;
+    const Part = struct { header: []const u8, bytes: []const u8 };
+    var parts: std.ArrayList(Part) = try .initCapacity(a, input.imageCount());
     for (input.messages) |message| {
         var upstream = d.jsonObject();
         try d.put(a, &upstream, "role", .{ .string = "user" });
@@ -59,9 +60,10 @@ pub fn request(a: std.mem.Allocator, io: std.Io, cfg: d.DeciderConfig, input: d.
                 try d.put(a, &asset, "part", .{ .string = name });
                 try d.put(a, &assets, reference, asset);
                 try out.array.append(.{ .string = reference });
-                try parts.appendSlice(a, try std.fmt.allocPrint(a, "--{s}\r\nContent-Disposition: form-data; name=\"{s}\"; filename=\"{s}\"\r\nContent-Type: {s}\r\n\r\n", .{ boundary, name, name, image.mime }));
-                try parts.appendSlice(a, bytes);
-                try parts.appendSlice(a, "\r\n");
+                parts.appendAssumeCapacity(.{
+                    .header = try std.fmt.allocPrint(a, "--{s}\r\nContent-Disposition: form-data; name=\"{s}\"; filename=\"{s}\"\r\nContent-Type: {s}\r\n\r\n", .{ boundary, name, name, image.mime }),
+                    .bytes = bytes,
+                });
             }
             try d.put(a, &upstream, "content", out);
         }
@@ -70,11 +72,25 @@ pub fn request(a: std.mem.Allocator, io: std.Io, cfg: d.DeciderConfig, input: d.
     try d.put(a, &root, "state", state);
     if (assets.object.count() == 0) return .{ .body = try std.json.Stringify.valueAlloc(a, root, .{}) };
     try d.put(a, &root, "assets", assets);
-    var body: std.ArrayList(u8) = .empty;
-    try body.appendSlice(a, try std.fmt.allocPrint(a, "--{s}\r\nContent-Disposition: form-data; name=\"request\"\r\nContent-Type: application/json\r\n\r\n{s}\r\n", .{ boundary, try std.json.Stringify.valueAlloc(a, root, .{}) }));
-    try body.appendSlice(a, parts.items);
-    try body.appendSlice(a, try std.fmt.allocPrint(a, "--{s}--\r\n", .{boundary}));
-    return .{ .body = try body.toOwnedSlice(a), .content_type = try std.fmt.allocPrint(a, "multipart/form-data; boundary={s}", .{boundary}), .headers = &.{.{ "TypeSafe-Danger-Zone-Images", "true" }} };
+    const header = try std.fmt.allocPrint(a, "--{s}\r\nContent-Disposition: form-data; name=\"request\"\r\nContent-Type: application/json\r\n\r\n{s}\r\n", .{ boundary, try std.json.Stringify.valueAlloc(a, root, .{}) });
+    const footer = try std.fmt.allocPrint(a, "--{s}--\r\n", .{boundary});
+    var size = header.len + footer.len;
+    var image_bytes: usize = 0;
+    for (parts.items) |part| {
+        size += part.header.len + part.bytes.len + 2;
+        image_bytes += part.bytes.len;
+    }
+    // Allocate once: growing byte arrays inside an arena retain every previous
+    // buffer. Only metadata and decoded image bytes precede this final copy.
+    var body: std.ArrayList(u8) = try .initCapacity(a, size);
+    body.appendSliceAssumeCapacity(header);
+    for (parts.items) |part| {
+        body.appendSliceAssumeCapacity(part.header);
+        body.appendSliceAssumeCapacity(part.bytes);
+        body.appendSliceAssumeCapacity("\r\n");
+    }
+    body.appendSliceAssumeCapacity(footer);
+    return .{ .body = try body.toOwnedSlice(a), .image_bytes = image_bytes, .content_type = try std.fmt.allocPrint(a, "multipart/form-data; boundary={s}", .{boundary}), .headers = &.{.{ "TypeSafe-Danger-Zone-Images", "true" }} };
 }
 
 test "decision functions Jev rejects unsupported image encodings before dispatch" {
@@ -89,4 +105,36 @@ test "decision functions Jev rejects unsupported image encodings before dispatch
     }
     const bad_signature = try d.Input.fromJson(try std.json.parseFromSliceLeaky(d.Json, a, "[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,aGVsbG8=\"}]}]", .{}));
     try std.testing.expectError(error.InvalidDecisionSpecification, request(a, std.testing.io, .{ .provider = .jev }, bad_signature, questions));
+}
+
+test "decision functions Jev multipart stays within the production arena budget" {
+    var outer = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer outer.deinit();
+    const a = outer.allocator();
+    const questions = try d.questionsFor(a, .ai_probability, &.{ .{ .string = "item" }, .{ .string = "Damaged?" }, .{ .string = "jev" } });
+    for ([_]usize{ 1, 8, 32, 128 }) |count| {
+        const bytes = try a.alloc(u8, 720000 / count);
+        @memset(bytes, 0);
+        @memcpy(bytes[0..8], "\x89PNG\r\n\x1a\n");
+        const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+        _ = std.base64.standard.Encoder.encode(encoded, bytes);
+        var part = d.jsonObject();
+        try d.put(a, &part, "type", .{ .string = "input_image" });
+        try d.put(a, &part, "image_url", .{ .string = try std.fmt.allocPrint(a, "data:image/png;base64,{s}", .{encoded}) });
+        var content: d.Json = .{ .array = std.array_list.Managed(d.Json).init(a) };
+        for (0..count) |_| try content.array.append(part);
+        var message = d.jsonObject();
+        try d.put(a, &message, "role", .{ .string = "user" });
+        try d.put(a, &message, "content", content);
+        const input: d.Input = .{ .messages = &.{message} };
+        try input.checkLimit(a, 1024 * 1024);
+        var budget: @import("../sql/memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 8 * 1024 * 1024 };
+        var arena = std.heap.ArenaAllocator.init(budget.allocator());
+        defer arena.deinit();
+        const payload = try request(arena.allocator(), std.testing.io, .{ .provider = .jev }, input, questions);
+        try std.testing.expect(payload.body.len >= 720000);
+        try std.testing.expect(!budget.exhausted);
+        // Leave room for HTTP's owned request copy and a normal decision response.
+        try std.testing.expect(budget.peak < 6 * 1024 * 1024);
+    }
 }

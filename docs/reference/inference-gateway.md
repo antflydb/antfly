@@ -154,7 +154,28 @@ preserved. Inputs allow only user messages, `input_text`, and `input_image`;
 audio, files, tools, and other roles fail validation. Limits are 128 messages,
 128 images, and 1 MiB of serialized evidence per call. Text-only native,
 embedding-similarity, and generated deciders reject message inputs explicitly.
-`gateway_capabilities.images` reports support on named hosted deciders.
+`gateway_capabilities.images` reports support on named hosted deciders with a
+configured image-token bound. Text-only message arrays remain available without
+that bound or when images are explicitly disabled.
+Explicit `inference_capabilities` declarations intersect this adapter support;
+`images: unsupported` or `unknown` rejects images in HTTP, SQL, and expressions.
+
+For connection-qualified hosted decisions, set `max_image_input_tokens` in the
+connection's `inference` configuration. The bound must cover every decision model
+admitted on that connection. Declare image support for the qualified model in
+`inference_capabilities`, just as for other connection capabilities.
+
+Configure `max_image_input_tokens` on each hosted decider used with images. Set
+it to the selected provider/model's upper bound on one image's input-token
+contribution, including its largest supported resolution/detail. For example,
+use `max_image_input_tokens: 8192` only when that bound fits the selected model.
+Image calls without a configured bound fail before provider I/O. The runtime
+adds that allowance per image to serialized non-image request bytes for both
+request budgets and shared token quotas. This also covers opaque image URLs; Antfly
+never estimates visual token usage from URL length. Provider-reported usage
+adds any excess to shared quota debt before completion releases its concurrency
+slot.
+
 SQL decision functions accept the same message array as a JSONB input, and
 expression decision functions accept it as a JSON input.
 
@@ -167,8 +188,9 @@ Antfly sends Jev images as multipart binary assets with the experimental
 Use a Jev model with image support, such as `jev-preview`. Antfly does not fetch
 image URLs for these adapters. Provider credentials, cancellation, quotas, and
 usage accounting follow the normal decision execution path; request media is
-not included in gateway telemetry. Byte estimates reserve request budgets
-before dispatch, and provider-reported usage is charged on completion.
+not included in gateway telemetry. Non-image bytes and configured image
+allowances reserve request budgets before dispatch, and provider-reported usage
+is charged on completion.
 
 Native Antfly embedding aliases preserve the runtime input contract: legacy
 content-part arrays produce one vector per part, while ordered `{content: [...]}`

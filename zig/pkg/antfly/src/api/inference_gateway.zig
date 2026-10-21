@@ -887,6 +887,9 @@ fn executeVendorConnection(server: anytype, ctx: *httpx.Context, task: gateway.T
         if (cfg.region) |value| try provider.object.put(a, "region", .{ .string = value });
         if (request.object.get("dimensions")) |value| try provider.object.put(a, "dimensions", value);
     }
+    if (task == .decide) {
+        if (cfg.max_image_input_tokens) |bound| try provider.object.put(a, "max_image_input_tokens", .{ .integer = std.math.cast(i64, bound) orelse return error.InvalidConfig });
+    }
     if (task == .rerank) try provider.object.put(a, "field", .{ .string = "text" });
     var entries: Json = .{ .object = .empty };
     const name = "connection-target";

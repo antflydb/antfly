@@ -47,6 +47,10 @@ class DeciderConfig:
         api_key (str | Unset): API key or secret reference. Defaults to the provider environment variable.
         max_rows (int | Unset):  Default: 10000.
         max_input_tokens (int | Unset):  Default: 1000000.
+        max_image_input_tokens (int | Unset): Provider/model upper bound on the input-token contribution of one image.
+            Required when sending images through hosted typed deciders, including image URLs. The runtime reserves this
+            allowance per image in addition to serialized non-image request bytes; actual usage can add shared quota debt.
+            Omit for text-only, native, or generated deciders.
         rate_limit (RateLimitConfig | Unset): Outbound provider limits shared within one Antfly process by effective
             endpoint, operation, model, credential source, project and region/location.
             Conflicting policies for an active scope are rejected. These limits do
@@ -68,6 +72,7 @@ class DeciderConfig:
     api_key: str | Unset = UNSET
     max_rows: int | Unset = 10000
     max_input_tokens: int | Unset = 1000000
+    max_image_input_tokens: int | Unset = UNSET
     rate_limit: RateLimitConfig | Unset = UNSET
     batch_size: int | Unset = 32
 
@@ -114,6 +119,8 @@ class DeciderConfig:
 
         max_input_tokens = self.max_input_tokens
 
+        max_image_input_tokens = self.max_image_input_tokens
+
         rate_limit: dict[str, Any] | Unset = UNSET
         if not isinstance(self.rate_limit, Unset):
             rate_limit = self.rate_limit.to_dict()
@@ -151,6 +158,8 @@ class DeciderConfig:
             field_dict["max_rows"] = max_rows
         if max_input_tokens is not UNSET:
             field_dict["max_input_tokens"] = max_input_tokens
+        if max_image_input_tokens is not UNSET:
+            field_dict["max_image_input_tokens"] = max_image_input_tokens
         if rate_limit is not UNSET:
             field_dict["rate_limit"] = rate_limit
         if batch_size is not UNSET:
@@ -229,6 +238,8 @@ class DeciderConfig:
 
         max_input_tokens = d.pop("max_input_tokens", UNSET)
 
+        max_image_input_tokens = d.pop("max_image_input_tokens", UNSET)
+
         _rate_limit = d.pop("rate_limit", UNSET)
         rate_limit: RateLimitConfig | Unset
         if isinstance(_rate_limit, Unset):
@@ -253,6 +264,7 @@ class DeciderConfig:
             api_key=api_key,
             max_rows=max_rows,
             max_input_tokens=max_input_tokens,
+            max_image_input_tokens=max_image_input_tokens,
             rate_limit=rate_limit,
             batch_size=batch_size,
         )
