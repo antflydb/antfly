@@ -14,6 +14,7 @@
 // limitations.
 
 const std = @import("std");
+const index_metadata = @import("antfly_local_sources").api_index_metadata;
 const group_ids = @import("antfly_local_sources").common_group_ids;
 const metadata_api = @import("../metadata/api.zig");
 const metadata_admin = @import("../metadata/admin.zig");
@@ -2606,7 +2607,7 @@ fn stringifyJsonValue(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
 }
 
 fn isReservedIndexMetadataEntry(name: []const u8) bool {
-    return std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments");
+    return @import("antfly_local_sources").api_local_indexes.isReservedIndexMetadataEntry(name);
 }
 
 fn encodeSingleTableIndex(
@@ -2752,7 +2753,7 @@ fn collectArtifactEnrichmentSummaries(
             }
             var it = object.iterator();
             while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+                if (std.mem.eql(u8, entry.key_ptr.*, "enrichments") or index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;
                 try collectArtifactEnrichmentSummaries(alloc, entry.value_ptr.*, out);
             }
         },
@@ -6587,4 +6588,17 @@ test "external lake public aggregate recipes expand through schema derivation" {
         "{\"type\":\"algebraic\",\"derive_from_schema\":true,\"aggregates\":[{\"name\":\"n\",\"op\":\"count\"},{\"name\":\"n\",\"op\":\"count\"}]}",
     };
     for (invalid) |body| try std.testing.expectError(error.InvalidCreateTableRequest, validatePublicAlgebraicIndexJson(a, body));
+}
+
+test "resolver curation HTTP enrichment summaries exclude opaque metadata" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"_curation_proposals":{"enrichments":[{"name":"fake"}]},"_resolver_curation":{"enrichments":[{"name":"fake"}]},"_resolver_namespaces":{"enrichments":[{"name":"fake"}]},"index":{"enrichments":[{"name":"live"}]}}
+    , .{});
+    var summaries = std.json.Array.init(a);
+    try collectArtifactEnrichmentSummaries(a, root, &summaries);
+    try std.testing.expectEqual(@as(usize, 1), summaries.items.len);
+    try std.testing.expectEqualStrings("live", summaries.items[0].object.get("name").?.string);
 }

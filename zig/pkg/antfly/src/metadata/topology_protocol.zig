@@ -65,12 +65,16 @@ const std = @import("std");
 /// their durable dependency index and applies bounded replay pages.
 /// Version 35 rejects incompatible resolver projection at admission and apply,
 /// and fences every namespace mutation against its validated consumer cut.
-pub const current_version: u16 = 35;
-pub const resolver_namespaces_version: u16 = 35;
+/// Version 36 decodes curation provenance, cascade dispositions and proposal
+/// queues. Even an empty newly serialized namespace has fields v35 rejects.
+/// Version 37 fences proposal-owned source corrections at primary apply and
+/// understands durable queue identities on embedded resolver receipts.
+pub const current_version: u16 = 37;
+pub const resolver_namespaces_version: u16 = 37;
 /// Conservative admission over canonical stored JSON, shared by catalog and
 /// direct table writers so neither entry path can bypass the decoder floor.
 pub fn usesResolverNamespaces(indexes_json: []const u8) bool {
-    return std.mem.indexOf(u8, indexes_json, "_resolver_namespaces") != null or std.mem.indexOf(u8, indexes_json, "namespace_owned") != null or std.mem.indexOf(u8, indexes_json, "resolvers") != null;
+    return std.mem.indexOf(u8, indexes_json, "_resolver_namespaces") != null or std.mem.indexOf(u8, indexes_json, "namespace_owned") != null or std.mem.indexOf(u8, indexes_json, "resolvers") != null or std.mem.indexOf(u8, indexes_json, "_resolver_curation") != null or std.mem.indexOf(u8, indexes_json, "_curation_proposals") != null;
 }
 
 pub const relation_mutation_version: u16 = 33;

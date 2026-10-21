@@ -4096,6 +4096,216 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/curation/proposals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /** listCurationProposals */
+        get: operations["listCurationProposals"];
+        put?: never;
+        /** proposeCuration */
+        post: operations["proposeCuration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/curation/proposals/{proposalId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                proposalId: string;
+            };
+            cookie?: never;
+        };
+        /** getCurationProposal */
+        get: operations["getCurationProposal"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/curation/proposals/{proposalId}:accept": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                proposalId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** acceptCurationProposal */
+        post: operations["acceptCurationProposal"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/curation/proposals/{proposalId}:reject": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                proposalId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** rejectCurationProposal */
+        post: operations["rejectCurationProposal"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/entities/{key}:distinct": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** pinEntitiesDistinct */
+        post: operations["pinEntitiesDistinct"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /** listCurationProposals */
+        get: operations["namespaceListCurationProposals"];
+        put?: never;
+        /** proposeCuration */
+        post: operations["namespaceProposeCuration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                proposalId: string;
+            };
+            cookie?: never;
+        };
+        /** getCurationProposal */
+        get: operations["namespaceGetCurationProposal"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:accept": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                proposalId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** acceptCurationProposal */
+        post: operations["namespaceAcceptCurationProposal"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:reject": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                proposalId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** rejectCurationProposal */
+        post: operations["namespaceRejectCurationProposal"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:distinct": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** pinEntitiesDistinct */
+        post: operations["namespacePinEntitiesDistinct"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/auth/v1/me": {
         parameters: {
             query?: never;
@@ -20161,18 +20371,47 @@ export interface components {
         IndexMaintenanceResponse: {
             acknowledged_groups: string[];
         };
+        /** @description Server-owned provenance. Clients supply actor and reason on writes. Zero time/revision denote legacy records whose creation is unknown. */
+        CurationOrigin: {
+            /** @enum {string} */
+            origin?: "manual" | "adjudicator" | "review" | "cascade" | "config";
+            /** @description UTF-8 client attribution, limited to 256 bytes. */
+            actor?: string;
+            /** @description UTF-8 explanation, limited to 4096 bytes. */
+            reason?: string;
+            /** Format: uint64 */
+            created_at_ms?: number;
+            /** Format: uint64 */
+            revision?: number;
+            proposal_id?: string | null;
+            cascade_from?: string | null;
+        };
         ResolverRedirect: {
             key: string;
             target: string;
+            origin?: components["schemas"]["CurationOrigin"];
+        };
+        CurationSuppressionEntry: {
+            key: string;
+            origin: components["schemas"]["CurationOrigin"];
+        };
+        RuntimeResolverSuppression: {
+            keys?: string[];
+            texts?: string[];
+            /** Format: uint32 */
+            min_text_chars?: number;
+            entries?: components["schemas"]["CurationSuppressionEntry"][];
+            text_entries?: components["schemas"]["CurationSuppressionEntry"][];
         };
         ResolverDistinctPair: {
             from: string;
             to: string;
+            origin?: components["schemas"]["CurationOrigin"];
         };
         ResolverCurationState: {
             /** @enum {integer} */
             version?: 1;
-            suppress?: components["schemas"]["GraphResolverSuppressionConfig"];
+            suppress?: components["schemas"]["RuntimeResolverSuppression"];
             distinct?: components["schemas"]["ResolverDistinctPair"][];
             /** @description Explicitly restored identities; declarative aliases and promotion tombstones cannot recreate the removed redirect. */
             removed_aliases?: string[];
@@ -20351,6 +20590,8 @@ export interface components {
             revision: number;
         };
         ResolverMergeRequest: {
+            actor?: string;
+            reason?: string;
             from: string;
             to: string;
             /** @default false */
@@ -20368,6 +20609,8 @@ export interface components {
             wait?: components["schemas"]["ResolverWait"];
         };
         ResolverUnmergeRequest: {
+            actor?: string;
+            reason?: string;
             /** @default false */
             pin_distinct?: boolean;
             /**
@@ -20379,7 +20622,7 @@ export interface components {
         };
         ResolverSuppressionList: {
             configured: components["schemas"]["GraphResolverSuppressionConfig"];
-            runtime: components["schemas"]["GraphResolverSuppressionConfig"];
+            runtime: components["schemas"]["RuntimeResolverSuppression"];
             /** Format: uint64 */
             revision: number;
         };
@@ -20389,6 +20632,8 @@ export interface components {
         };
         /** @description Add keys or normalized texts. The add/remove form updates both sets in one revision. Runtime removals do not override declarative suppression. */
         ResolverSuppressionRequest: {
+            actor?: string;
+            reason?: string;
             keys?: string[];
             texts?: string[];
             add?: components["schemas"]["ResolverSuppressionSelection"];
@@ -20420,6 +20665,8 @@ export interface components {
             next_cursor?: string | null;
         };
         ResolverReviewDecision: {
+            actor?: string;
+            reason?: string;
             /** @enum {string} */
             decision: "match" | "new" | "suppressed";
             key?: string;
@@ -20445,6 +20692,11 @@ export interface components {
                 };
                 /** Format: uint64 */
                 revision?: number;
+                absorbed?: {
+                    key: string;
+                    /** @enum {string} */
+                    disposition: "release" | "suppress";
+                }[];
                 changed?: boolean;
                 /** Format: uint64 */
                 replay_sequence?: number;
@@ -20458,11 +20710,112 @@ export interface components {
             }[];
         };
         EntityMergeRequest: {
+            /** Format: uint64 */
+            expected_revision?: number;
+            actor?: string;
+            reason?: string;
             into: string;
             /** @default false */
             replace?: boolean;
             /** @default false */
             pin_distinct?: boolean;
+            wait?: components["schemas"]["ResolverWait"];
+        };
+        EntitySuppressRequest: {
+            /**
+             * @description Reject absorbed keys, release all transitive redirect sources, or suppress them with cascade provenance. Unsuppress never restores redirects.
+             * @default reject
+             * @enum {string}
+             */
+            absorbed?: "reject" | "release" | "suppress";
+            /**
+             * @description With absorbed=release, pin each released source distinct from the target.
+             * @default false
+             */
+            pin_distinct?: boolean;
+            actor?: string;
+            reason?: string;
+            /** Format: uint64 */
+            expected_revision?: number;
+            wait?: components["schemas"]["ResolverWait"];
+        };
+        CurationProposalOptions: {
+            /** @default false */
+            replace?: boolean;
+            /** @default false */
+            pin_distinct?: boolean;
+            /**
+             * @default reject
+             * @enum {string}
+             */
+            absorbed?: "reject" | "release" | "suppress";
+        };
+        CurationProposalRequest: {
+            /** @enum {string} */
+            action: "merge" | "unmerge" | "suppress" | "unsuppress" | "distinct";
+            key: string;
+            into?: string | null;
+            options?: components["schemas"]["CurationProposalOptions"];
+            /** Format: double */
+            confidence?: number | null;
+            /** @description At most 16 KiB, 4096 values and depth 32. */
+            evidence?: {
+                [key: string]: unknown;
+            } | null;
+            actor?: string;
+            reason?: string;
+        };
+        CurationProposal: {
+            id: string;
+            /** @enum {string} */
+            action: "merge" | "unmerge" | "suppress" | "unsuppress" | "distinct";
+            key: string;
+            into?: string | null;
+            options?: components["schemas"]["CurationProposalOptions"];
+            /** Format: double */
+            confidence?: number | null;
+            evidence?: {
+                [key: string]: unknown;
+            } | null;
+            origin: components["schemas"]["CurationOrigin"];
+            /** @enum {string} */
+            state: "open" | "accepted" | "rejected" | "superseded";
+            decided?: components["schemas"]["CurationOrigin"] | null;
+        };
+        CurationProposalPage: {
+            proposals: components["schemas"]["CurationProposal"][];
+            next_cursor?: string | null;
+        };
+        CurationProposalDecisionRequest: {
+            options?: components["schemas"]["CurationProposalOptions"];
+            /**
+             * @description On rejection of a merge, pin the proposed pair distinct in the same commit.
+             * @default false
+             */
+            pin_distinct?: boolean;
+            actor?: string;
+            reason?: string;
+            /** Format: uint64 */
+            expected_revision?: number;
+            wait?: components["schemas"]["ResolverWait"];
+        };
+        CurationProposalDecisionResult: {
+            proposal?: components["schemas"]["CurationProposal"];
+            complete?: boolean;
+            changed?: boolean;
+            /** @enum {string} */
+            atomicity?: "namespace" | "resolver";
+            applied?: boolean;
+            results?: {
+                [key: string]: unknown;
+            }[];
+        };
+        EntityDistinctRequest: {
+            /** Format: uint64 */
+            expected_revision?: number;
+            into: string;
+            actor?: string;
+            reason?: string;
             wait?: components["schemas"]["ResolverWait"];
         };
         InferenceError: {
@@ -30612,7 +30965,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["ResolverUnmergeRequest"];
+                "application/json": components["schemas"]["EntitySuppressRequest"];
             };
         };
         responses: {
@@ -31731,7 +32084,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["ResolverUnmergeRequest"];
+                "application/json": components["schemas"]["EntitySuppressRequest"];
             };
         };
         responses: {
@@ -31857,6 +32210,506 @@ export interface operations {
                 };
                 content?: never;
             };
+        };
+    };
+    listCurationProposals: {
+        parameters: {
+            query?: {
+                state?: string;
+                action?: string;
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed curation operation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposalPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Revision or terminal decision conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    proposeCuration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CurationProposalRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed curation operation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposal"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Revision or terminal decision conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    getCurationProposal: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                proposalId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed curation operation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposal"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Revision or terminal decision conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    acceptCurationProposal: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                proposalId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CurationProposalDecisionRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed curation operation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposalDecisionResult"];
+                };
+            };
+            /** @description Accepted; resolver replay remains in progress */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposalDecisionResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Revision or terminal decision conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    rejectCurationProposal: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                proposalId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CurationProposalDecisionRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed curation operation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposalDecisionResult"];
+                };
+            };
+            /** @description Accepted; resolver replay remains in progress */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposalDecisionResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Revision or terminal decision conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    pinEntitiesDistinct: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EntityDistinctRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed curation operation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Accepted; resolver replay remains in progress */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Revision or terminal decision conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    namespaceListCurationProposals: {
+        parameters: {
+            query?: {
+                state?: string;
+                action?: string;
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed curation operation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposalPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Revision or terminal decision conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    namespaceProposeCuration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CurationProposalRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed curation operation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposal"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Revision or terminal decision conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    namespaceGetCurationProposal: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                proposalId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed curation operation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposal"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Revision or terminal decision conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    namespaceAcceptCurationProposal: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                proposalId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CurationProposalDecisionRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed curation operation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposalDecisionResult"];
+                };
+            };
+            /** @description Accepted; resolver replay remains in progress */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposalDecisionResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Revision or terminal decision conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    namespaceRejectCurationProposal: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                proposalId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CurationProposalDecisionRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed curation operation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposalDecisionResult"];
+                };
+            };
+            /** @description Accepted; resolver replay remains in progress */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurationProposalDecisionResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Revision or terminal decision conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    namespacePinEntitiesDistinct: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EntityDistinctRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed curation operation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Accepted; resolver replay remains in progress */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Revision or terminal decision conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
         };
     };
     getCurrentUser: {
