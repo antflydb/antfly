@@ -215,6 +215,13 @@ pub const OwnedPhysicalPlan = struct {
     bytes: mutation_bytes.OwnedBatch,
     acceptance: Prepared,
     dependencies: ?@import("prepared_mutation_dependencies.zig").Owned = null,
+    /// This candidate cannot authorize a vote or a direct commit. Until replay
+    /// relocation/deltas have an owner, sequence advancement invalidates it.
+    preparation: ?struct {
+        contract: @import("prepared_transaction_effects.zig").Contract,
+        fingerprint: [32]u8,
+        replay_next: u64,
+    } = null,
 
     pub fn init(alloc: std.mem.Allocator, root: u128, authored: anytype, writes: []const @import("../docstore.zig").KVPair, deletes: []const []const u8, replay: ?mutation_bytes.Replay, control: ?admission.Port) !OwnedPhysicalPlan {
         var bytes = try mutation_bytes.OwnedBatch.capture(alloc, writes, deletes, replay, control);
@@ -233,8 +240,26 @@ pub const OwnedPhysicalPlan = struct {
     }
 
     pub fn validateDependencies(self: *const OwnedPhysicalPlan, core: anytype, control: ?admission.Port) !void {
+        var trace: admission.RejectionTrace = .{};
+        self.validateDependenciesInner(core, trace.bind(control)) catch |cause| return trace.failure orelse cause;
+        if (trace.failure) |cause| return cause;
+    }
+    fn validateDependenciesInner(self: *const OwnedPhysicalPlan, core: anytype, control: ?admission.Port) !void {
         const owned = if (self.dependencies) |*value| value else return error.PreparedEffectsRequired;
         try owned.validate(core, control);
+        if (self.preparation) |expected| {
+            if (core.nextDerivedAppendSequence() != expected.replay_next) return error.PreparedGenerationChanged;
+            if (!std.meta.eql(try core.preparedEffectsCatalogDigest(control), expected.contract.catalog_digest)) return error.PreparedEffectsMismatch;
+            var manager = try core.initTxnManager();
+            defer manager.deinit();
+            if ((try manager.getPreparationDecision(expected.contract.txn_id, control)).status != .pending) return error.DecisionConflict;
+            try @import("../transactions.zig").validatePreparedReadGuardInputs(owned.alloc, core.store, expected.contract, control);
+            var read = if (control) |original| try core.store.beginReadTxnWithAdmission(.retain, original) else try core.store.beginReadTxn();
+            defer read.abort();
+            const raw = try read.get(&@import("../transactions.zig").makePreparedEffectsKey(expected.contract.txn_id));
+            const actual = try @import("prepared_transaction_effects.zig").inspect(raw, control);
+            if (!std.meta.eql(actual.contract, expected.contract) or !std.meta.eql(actual.fingerprint, expected.fingerprint)) return error.PreparedEffectsMismatch;
+        }
     }
 
     pub fn deinit(self: *OwnedPhysicalPlan) void {
@@ -242,6 +267,17 @@ pub const OwnedPhysicalPlan = struct {
         self.acceptance.deinit();
         self.bytes.deinit();
         self.* = undefined;
+    }
+};
+
+/// Synchronous output slot. The allocator and database must outlive the plan;
+/// request scratch, decoded frames and controls retire when capture returns.
+pub const Assembly = struct {
+    allocator: std.mem.Allocator,
+    plan: ?OwnedPhysicalPlan = null,
+    pub fn deinit(self: *Assembly) void {
+        if (self.plan) |*owned| owned.deinit();
+        self.plan = null;
     }
 };
 

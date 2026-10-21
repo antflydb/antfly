@@ -24448,6 +24448,119 @@ pub const DB = struct {
 
     /// Physical PREPARE validates the same table contract as local API writes.
     /// Validation scratch and principal parsing use the native preparation budget.
+    /// Assemble an existing accepted transaction without changing its decision,
+    /// primary store or replay clock. The caller owns output memory and keeps
+    /// this DB alive until deinit. This candidate does not authorize a vote.
+    pub fn prepareTransactionAssembly(self: *DB, alloc: Allocator, txn_id: types.TxnId, commit_version: u64, original: ?@import("../../common/read_admission.zig").Port) !@import("artifact_authored_acceptance.zig").OwnedPhysicalPlan {
+        return self.prepareTransactionAssemblyWithPolicyLease(alloc, txn_id, commit_version, null, original);
+    }
+
+    /// A supplied lease must be the original write admission for this DB.
+    /// Retaining it preserves expiry and policy identity; it grants no new role.
+    pub fn prepareTransactionAssemblyWithPolicyLease(self: *DB, alloc: Allocator, txn_id: types.TxnId, commit_version: u64, lease: ?*const row_policy_gate_mod.Gate.Lease, original: ?@import("../../common/read_admission.zig").Port) !@import("artifact_authored_acceptance.zig").OwnedPhysicalPlan {
+        var trace: @import("../../common/read_admission.zig").RejectionTrace = .{};
+        const control = trace.bind(original);
+        var result = (if (comptime storage_engine.enabled)
+            storage_engine.call("prepareTransactionAssemblyWithPolicyLease", .{ self, alloc, txn_id, commit_version, lease, control })
+        else
+            self.prepareTransactionAssemblyInner(alloc, txn_id, commit_version, lease, control)) catch |cause| return trace.failure orelse cause;
+        if (trace.failure) |cause| {
+            result.deinit();
+            return cause;
+        }
+        return result;
+    }
+
+    fn prepareTransactionAssemblyInner(self: *DB, alloc: Allocator, txn_id: types.TxnId, commit_version: u64, supplied_lease: ?*const row_policy_gate_mod.Gate.Lease, original: ?@import("../../common/read_admission.zig").Port) !@import("artifact_authored_acceptance.zig").OwnedPhysicalPlan {
+        const admission = @import("mutation_admission.zig");
+        if (original) |port| {
+            if (supplied_lease != null) try port.checkLifetime() else try port.checkpoint();
+        }
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (supplied_lease) |lease| {
+            if (lease.gate != &self.local_execution.row_policy_gate or lease.read_phase != null) return error.RowPolicyAuthenticationRequired;
+            try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        }
+        var raw_lease = if (supplied_lease == null) try self.local_execution.row_policy_gate.enterRaw() else null;
+        defer if (raw_lease) |*lease| lease.release();
+        const policy_lease = supplied_lease orelse &raw_lease.?;
+        const Check = struct {
+            fn lifetime(raw: *const anyopaque) !void {
+                const port: *const ?@import("../../common/read_admission.zig").Port = @ptrCast(@alignCast(raw));
+                if (port.*) |owner| try owner.checkLifetime();
+            }
+        };
+        const controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition = if (original) |owner| .{
+            .lifetime = .{ .context = &original, .check_fn = Check.lifetime },
+            .execution_wait = try owner.executionWaitAfterLifetime(),
+        } else null;
+        var preparation: RequestPreparationContext = undefined;
+        preparation.init(self);
+        defer preparation.deinit();
+        const scratch = preparation.guard.allocator();
+        var collection: admission.IntentCollection = .{};
+        const capture_control = collection.bind(admission.retainedLeaseControls(controls), self.core.apply_mutex.io);
+        const schema_namespace = self.core.schemaNamespaceGeneration();
+        var accepted: transactions_mod.PreparedResolutionInputs = blk: {
+            try admission.lockApplyPreDecision(self, admission.retainedLeaseControls(controls));
+            defer self.core.unlockApply();
+            try self.core.requirePreparedTransactionProtocol(capture_control);
+            var manager = try self.core.initTxnManager();
+            defer manager.deinit();
+            if ((try manager.getPreparationDecision(txn_id, capture_control)).status != .pending) return error.DecisionConflict;
+            break :blk (try manager.loadPreparedEffectsWithInputs(scratch, txn_id, capture_control)) orelse return error.PreparedEffectsRequired;
+        };
+        defer accepted.deinit();
+        const inputs = &accepted.inputs.batch;
+        const writes = try scratch.alloc(types.BatchWrite, inputs.writes.len);
+        defer scratch.free(writes);
+        var durable_rows: std.StringHashMapUnmanaged([]const u8) = .empty;
+        defer durable_rows.deinit(scratch);
+        for (inputs.writes, inputs.prepared_rows, writes) |write, row, *destination| {
+            if (capture_control) |owner| try owner.checkpoint();
+            destination.* = .{ .key = write.key, .value = write.value };
+            if (row) |bytes| try durable_rows.put(scratch, write.key, bytes);
+        }
+        const intent_keys = try scratch.alloc([]const u8, inputs.writes.len + inputs.deletes.len);
+        defer scratch.free(intent_keys);
+        for (inputs.writes, 0..) |write, index| intent_keys[index] = write.key;
+        @memcpy(intent_keys[inputs.writes.len..], inputs.deletes);
+        var staging = if (self.local_execution.restore_staging_required.load(.acquire)) try self.restoreStagingStatus(scratch) else null;
+        defer if (staging) |*value| value.deinit();
+        var output: @import("artifact_authored_acceptance.zig").Assembly = .{ .allocator = alloc };
+        defer output.deinit();
+        var memo = GeneratedEmbeddingMemo.init(scratch);
+        defer memo.deinit();
+        self.batchInternalPrepared(.{
+            .writes = writes,
+            .deletes = inputs.deletes,
+            .timestamp_ns = commit_version,
+            .sync_level = if (accepted.effects.decoded.plan.contract.mode == .synchronous) .enrichments else .write,
+            .restore_staging_scope = if (staging) |value| value.value.scope.digest() else null,
+        }, null, .{
+            .assembly = &output,
+            .admission_controls = controls,
+            .avoid_admission_capacity_cycle = true,
+            .row_policy_lease = policy_lease,
+            .durable_rows = &durable_rows,
+            .wait_for_sync_level = false,
+            .transaction_resolution = .{
+                .accepted_effects = &accepted.effects,
+                .txn_id = txn_id,
+                .status = .committed,
+                .commit_version = commit_version,
+                .expected_intent_revision = inputs.revision,
+                .intent_keys = intent_keys,
+                .schema_binding = inputs.schema_binding,
+                .schema_namespace_generation = schema_namespace,
+            },
+        }, &memo, &preparation.guard) catch |cause| return preparation.mapError(cause);
+        const result = output.plan orelse return error.PreparedEffectsRequired;
+        output.plan = null;
+        return result;
+    }
+
     pub fn prepareTransactionWithAdmission(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, supplied: @import("../../common/read_admission.zig").Port) !void {
         var trace: @import("../../common/read_admission.zig").RejectionTrace = .{};
         const original = trace.bind(supplied).?;
@@ -147493,4 +147606,277 @@ test "db prepared transaction effects required semantic registry checks gate rec
         try raw.commit();
     }
     try F.resolve(&db, .aborted);
+}
+
+const PreparedAssemblyFixture = struct {
+    const id: types.TxnId = @splat(197);
+    const options: OpenOptions = .{
+        .start_optional_runtimes = false,
+        .start_index_workers = false,
+        .start_independent_maintenance = false,
+        .online_source_authority = .native,
+        .identity_namespace = .{ .table_id = 7, .shard_id = 11, .range_id = 14 },
+    };
+    fn seed(db: *DB, relational: bool, grouped: bool) !void {
+        const a = std.testing.allocator;
+        if (relational) try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &.{
+            .{ .name = "thread", .path = "thread", .column_type = .string },
+            .{ .name = "ordinal", .path = "ordinal", .column_type = .integer },
+            .{ .name = "text", .path = "text", .column_type = .string },
+        } });
+        if (grouped) try db.addEnrichment(.{ .name = "turns", .kind = .group, .source = .{ .group_by = "thread", .order_by = "ordinal", .field = "text" } });
+        try db.batch(.{ .writes = &.{
+            .{ .key = "row", .value = "{\"thread\":\"t\",\"ordinal\":1,\"text\":\"before\"}" },
+            .{ .key = "removed", .value = "{\"thread\":\"t\",\"ordinal\":0,\"text\":\"old\"}" },
+        }, .timestamp_ns = 17 });
+        try db.enablePreparedTransactionProtocol();
+        {
+            db.core.lockApply();
+            defer db.core.unlockApply();
+            _ = try db.core.beginTransactionRequiringPreparedEffects(id, 1, 1, &.{}, false, false, .{ .mode = .deferred }, .{}, null);
+        }
+        try db.writeTransaction(id, .{
+            .writes = &.{.{ .key = "row", .value = "{\"thread\":\"t\",\"ordinal\":2,\"text\":\"prepared\"}" }},
+            .deletes = &.{"removed"},
+        });
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        var captured = try db.core.capturePreparedTransactionInputs(a, id, .deferred, null);
+        defer captured.deinit();
+        const artifact = try internal_keys.artifactNamedPrefixAlloc(a, "generated", "asset", "accepted");
+        defer a.free(artifact);
+        var writes = [_]types.BatchWrite{.{ .key = artifact, .value = "accepted-output" }};
+        const frame = try @import("prepared_transaction_effects.zig").encode(a, .{ .contract = captured.contract, .effects = .{ .artifact_writes = &writes } }, null);
+        defer a.free(frame);
+        try db.core.sealPreparedTransactionEffects(id, frame, .deferred, null);
+    }
+    fn snapshot(db: *DB) ![]@import("../backend_scan.zig").OwnedKVPair {
+        return @import("../backend_scan.zig").scanPrefix(std.testing.allocator, &db.core.store.runtime_store, "");
+    }
+    fn free(rows: []@import("../backend_scan.zig").OwnedKVPair) void {
+        @import("../backend_scan.zig").freeResults(std.testing.allocator, rows);
+    }
+};
+
+test "db prepared transaction effects required assembly owns complete document relational group and generated effects without publication" {
+    const a = std.testing.allocator;
+    const F = PreparedAssemblyFixture;
+    for ([_]bool{ false, true }) |relational| {
+        var directory = try TestDirectory.init("prepared-full-assembly");
+        defer directory.cleanup();
+        var db = try DB.open(a, directory.path(), F.options);
+        defer db.close();
+        try F.seed(&db, relational, true);
+        const sequence = db.core.nextDerivedAppendSequence();
+        const revision = db.core.store.query_generation_revision.load(.acquire);
+        const before = try F.snapshot(&db);
+        defer F.free(before);
+        var plan = try db.prepareTransactionAssembly(a, F.id, 19, null);
+        defer plan.deinit();
+        try std.testing.expectEqual(sequence, db.core.nextDerivedAppendSequence());
+        try std.testing.expectEqual(revision, db.core.store.query_generation_revision.load(.acquire));
+        try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(F.id));
+        const after = try F.snapshot(&db);
+        defer F.free(after);
+        try std.testing.expectEqualDeep(before, after);
+        try std.testing.expect(plan.dependencies.?.metadata_reads.?.control == null);
+        try std.testing.expect(plan.dependencies.?.preapply_reads.?.control == null);
+        var reservation = try @import("../prepared_replay_plan.zig").deriveFromMutations(a, plan.bytes.writes, plan.bytes.deletes, plan.bytes.replay.?.payload, null);
+        defer reservation.deinit();
+        try std.testing.expectEqual(plan.bytes.replay.?.payload.len, try reservation.base.encodedBytes());
+        try std.testing.expect(reservation.roots.len > 2);
+        var found_group = false;
+        for (plan.bytes.writes) |write| if (@import("group_source_transfer.zig").isKey(write.key)) {
+            found_group = true;
+            break;
+        };
+        try std.testing.expect(found_group);
+        {
+            db.core.lockApply();
+            defer db.core.unlockApply();
+            try plan.validateDependencies(db.core, null);
+        }
+        // The real resolver uses the same assembler. Every explicit final
+        // postimage and its replay record must agree with the owned candidate.
+        try db.resolveTransactionIntentsWithSyncLevel(F.id, .committed, 19, .propose);
+        for (plan.bytes.writes, 0..) |write, index| {
+            var superseded = false;
+            for (plan.bytes.writes[index + 1 ..]) |later| if (std.mem.eql(u8, later.key, write.key)) {
+                superseded = true;
+                break;
+            };
+            if (superseded) continue;
+            const actual = try db.core.store.get(a, write.key);
+            defer a.free(actual);
+            try std.testing.expectEqualStrings(write.value, actual);
+        }
+        for (plan.bytes.deletes) |key| try std.testing.expectError(error.NotFound, db.core.store.get(a, key));
+        const replay = try db.core.store.get(a, &internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence));
+        defer a.free(replay);
+        try std.testing.expectEqualStrings(plan.bytes.replay.?.payload, replay);
+    }
+}
+
+test "db prepared transaction effects required assembly releases failed output allocations and preserves every original rejection" {
+    const F = PreparedAssemblyFixture;
+    var workspace = std.heap.SafeAllocator.init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.testing.expectEqual(@as(usize, 0), workspace.deinit()) catch @panic("assembly workspace leaked");
+    const tested = workspace.allocator();
+    var directory = try TestDirectory.init("prepared-assembly-failures");
+    defer directory.cleanup();
+    var db = try DB.open(tested, directory.path(), F.options);
+    defer db.close();
+    try F.seed(&db, false, false);
+    const sequence = db.core.nextDerivedAppendSequence();
+    const before = try F.snapshot(&db);
+    defer F.free(before);
+    const Checks = struct {
+        calls: usize = 0,
+        stop: usize = std.math.maxInt(usize),
+        cause: anyerror = error.DeadlineExceeded,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == self.stop) return self.cause;
+        }
+        fn run(alloc: Allocator, owner: *DB, checks: ?*@This()) !void {
+            const controls = @import("../../common/read_admission.zig");
+            var source: controls.Payload = .{ .ptr = checks orelse undefined, .vtable = &.{ .checkpoint = check } };
+            var result = try owner.prepareTransactionAssembly(alloc, F.id, 19, if (checks != null) .init(&source) else null);
+            defer result.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(tested, Checks.run, .{ &db, @as(?*Checks, null) });
+    var baseline: Checks = .{};
+    try Checks.run(tested, &db, &baseline);
+    for ([_]anyerror{ error.NotFound, error.OutOfMemory, error.DeadlineExceeded }) |cause| for (1..baseline.calls + 1) |stop| {
+        var checks: Checks = .{ .stop = stop, .cause = cause };
+        try std.testing.expectError(cause, Checks.run(tested, &db, &checks));
+    };
+    try std.testing.expectEqual(sequence, db.core.nextDerivedAppendSequence());
+    const after = try F.snapshot(&db);
+    defer F.free(after);
+    try std.testing.expectEqualDeep(before, after);
+    try std.testing.expect(db.local_execution.row_policy_gate.quiesced());
+    try db.core.store.put("unrelated-ack", "progress");
+}
+
+test "db prepared transaction effects required assembly validates original policy lease sequence and terminal decision" {
+    const a = std.testing.allocator;
+    const F = PreparedAssemblyFixture;
+    var directory = try TestDirectory.init("prepared-assembly-authority");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), F.options);
+    defer db.close();
+    try F.seed(&db, false, false);
+    {
+        const mode = db.open_mode;
+        db.open_mode = .query_readonly;
+        defer db.open_mode = mode;
+        try std.testing.expectError(error.ReadOnly, db.prepareTransactionAssembly(a, F.id, 19, null));
+    }
+    {
+        db.local_execution.initial_child_hidden.store(true, .release);
+        defer db.local_execution.initial_child_hidden.store(false, .release);
+        try std.testing.expectError(error.InitialChildNotPublished, db.prepareTransactionAssembly(a, F.id, 19, null));
+    }
+    var foreign = row_policy_gate_mod.Gate.init(.{});
+    var other = try foreign.enterRaw();
+    defer other.release();
+    try std.testing.expectError(error.RowPolicyAuthenticationRequired, db.prepareTransactionAssemblyWithPolicyLease(a, F.id, 19, &other, null));
+    var expired = try db.local_execution.row_policy_gate.enterRaw();
+    defer expired.release();
+    expired.expires_at_monotonic_ns = 0;
+    try std.testing.expectError(error.RowPolicyAuthenticationRequired, db.prepareTransactionAssemblyWithPolicyLease(a, F.id, 19, &expired, null));
+    var reader = try db.local_execution.row_policy_gate.enterRawRead();
+    defer reader.release();
+    try std.testing.expectError(error.RowPolicyAuthenticationRequired, db.prepareTransactionAssemblyWithPolicyLease(a, F.id, 19, &reader, null));
+    var plan = try db.prepareTransactionAssembly(a, F.id, 19, null);
+    defer plan.deinit();
+    {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        _ = db.core.reserveDerivedAppendSequence();
+        try std.testing.expectError(error.PreparedGenerationChanged, plan.validateDependencies(db.core, null));
+    }
+    try db.resolveTransactionIntentsWithSyncLevel(F.id, .aborted, 19, .propose);
+    try std.testing.expectError(error.DecisionConflict, db.prepareTransactionAssembly(a, F.id, 19, null));
+}
+
+test "db prepared transaction effects required assembly retains empty and generated-only accepted obligations" {
+    const a = std.testing.allocator;
+    const F = PreparedAssemblyFixture;
+    for ([_]bool{ false, true }) |generated| {
+        var directory = try TestDirectory.init("prepared-assembly-empty-intents");
+        defer directory.cleanup();
+        var db = try DB.open(a, directory.path(), F.options);
+        defer db.close();
+        try db.enablePreparedTransactionProtocol();
+        const artifact = try internal_keys.artifactNamedPrefixAlloc(a, "generated-only", "asset", "accepted");
+        defer a.free(artifact);
+        {
+            db.core.lockApply();
+            defer db.core.unlockApply();
+            _ = try db.core.beginTransactionRequiringPreparedEffects(F.id, 1, 1, &.{}, false, false, .{ .mode = .synchronous }, .{}, null);
+            var manager = try db.core.initTxnManager();
+            defer manager.deinit();
+            try manager.writeIntents(F.id, &.{}, &.{});
+            const contract = try manager.preparedEffectsContract(F.id, try db.core.preparedEffectsCatalogDigest(null), .synchronous, null);
+            var writes = [_]types.BatchWrite{.{ .key = artifact, .value = "generated-only-output" }};
+            const frame = try @import("prepared_transaction_effects.zig").encode(a, .{ .contract = contract, .effects = .{ .artifact_writes = if (generated) &writes else &.{} } }, null);
+            defer a.free(frame);
+            try db.core.sealPreparedTransactionEffects(F.id, frame, .synchronous, null);
+        }
+        const sequence = db.core.nextDerivedAppendSequence();
+        const before = try F.snapshot(&db);
+        defer F.free(before);
+        var plan = try db.prepareTransactionAssembly(a, F.id, 19, null);
+        defer plan.deinit();
+        try std.testing.expectEqual(sequence, db.core.nextDerivedAppendSequence());
+        try std.testing.expect(plan.preparation != null and plan.bytes.replay != null);
+        const after = try F.snapshot(&db);
+        defer F.free(after);
+        try std.testing.expectEqualDeep(before, after);
+        try db.resolveTransactionIntentsWithSyncLevel(F.id, .committed, 19, .propose);
+        if (generated) {
+            const value = try db.core.store.get(a, artifact);
+            defer a.free(value);
+            try std.testing.expectEqualStrings("generated-only-output", value);
+        }
+        const replay = try db.core.store.get(a, &internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence));
+        defer a.free(replay);
+        try std.testing.expectEqualStrings(plan.bytes.replay.?.payload, replay);
+    }
+}
+
+test "db prepared transaction effects required assembly boundary preserves failure names and transfers owned results" {
+    const a = std.testing.allocator;
+    const F = PreparedAssemblyFixture;
+    const boundary = @import("prepared_assembly_boundary.zig");
+    var directory = try TestDirectory.init("prepared-assembly-boundary");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), F.options);
+    defer db.close();
+    try F.seed(&db, false, false);
+    const sequence = db.core.nextDerivedAppendSequence();
+    const revision = db.core.store.query_generation_revision.load(.acquire);
+    {
+        const mode = db.open_mode;
+        db.open_mode = .query_readonly;
+        defer db.open_mode = mode;
+        const refused = boundary.invoke(&db, a, F.id, 19, null, null);
+        try std.testing.expect(refused.failure.ptr != null);
+        try std.testing.expectEqualStrings("ReadOnly", refused.failure.ptr.?[0..refused.failure.len]);
+    }
+    const produced = boundary.invoke(&db, a, F.id, 19, null, null);
+    try std.testing.expect(produced.failure.ptr == null);
+    var owned = produced.value;
+    defer owned.deinit();
+    try std.testing.expect(owned.preparation != null and owned.bytes.replay != null);
+    try std.testing.expect(owned.bytes.writes.len != 0);
+    try std.testing.expectEqual(sequence, db.core.nextDerivedAppendSequence());
+    try std.testing.expectEqual(revision, db.core.store.query_generation_revision.load(.acquire));
+    db.core.lockApply();
+    defer db.core.unlockApply();
+    try owned.validateDependencies(db.core, null);
 }

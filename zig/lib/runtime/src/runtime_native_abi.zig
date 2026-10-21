@@ -93,7 +93,8 @@ const builtin = @import("builtin");
 // Read-guard metadata carries an exact actor through native batch dispatch.
 // Semantic predicate enforcement adds typed native batch retirement.
 // Replay reservation writers retain input contracts through final commit validation.
-pub const abi_version: u32 = 61;
+// Batch preparation can return owned uncommitted bytes and their witnesses.
+pub const abi_version: u32 = 62;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

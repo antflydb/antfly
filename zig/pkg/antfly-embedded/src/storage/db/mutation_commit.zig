@@ -258,7 +258,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 prepared_row_allocator.captureIoDomain();
                 return @import("antfly_source_root").antfly_sources.storage_engine.call("batchPrepared", .{ self, req, profile, opts, generated_memo, prepared_row_allocator });
             }
-            var metadata_reads = @import("prepared_read_set.zig").Owned.init(prepared_row_allocator.allocator(), null);
+            var metadata_reads = @import("prepared_read_set.zig").Owned.init(if (opts.assembly) |output| output.allocator else prepared_row_allocator.allocator(), null);
             defer metadata_reads.deinit();
             return batchInternalPreparedOwnedInner(self, req, profile, opts, generated_memo, prepared_row_allocator, &metadata_reads) catch |err| return metadata_reads.failure orelse err;
         }
@@ -273,11 +273,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             metadata_reads: *@import("prepared_read_set.zig").Owned,
         ) anyerror!void {
             @setEvalBranchQuota(100_000);
+            if (opts.assembly) |output| {
+                if (output.plan != null) return error.InvalidArgument;
+                const resolution = opts.transaction_resolution orelse return error.PreparedEffectsRequired;
+                if (resolution.accepted_effects == null or resolution.status != .committed or
+                    opts.ordered_apply_receipt != null or opts.replication_applied_lsn_marker != null or
+                    opts.bypass_replication_write_gate or opts.suppress_derived_replay_append or
+                    opts.group_source_command != null or opts.resolver_review_command != null or
+                    opts.extra_store_writes.len != 0 or opts.extra_store_deletes.len != 0 or
+                    req.merge_replication != null or req.merge_checkpoint != null or req.split_replication != null or
+                    req.split_checkpoint != null or req.artifact_catalog != null or req.relational_topology != null)
+                    return error.InvalidBatchRequest;
+            }
             var root_binding = try @import("mutation_admission.zig").bindReceiverMutationRoot(self, opts.mutation_root);
             defer root_binding.release();
             const maintenance_contract = @import("relational_index_maintenance_contract.zig");
             var maintenance_attempted = false;
-            defer if (maintenance_attempted) {
+            defer if (maintenance_attempted and opts.assembly == null) {
                 // Only a scheduling hint: the worker re-reads durable desired state.
                 // Also wake on an ambiguous result after the store committed.
                 S.ownerField(self, "local_execution").*.relational_index_maintenance_sweep.request();
@@ -310,7 +322,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 opts.admission_controls;
             // Startup recovery is a separate durable obligation. Do not wrap
             // its remote acknowledgement in this batch's primary mutation reader.
-            if (!opts.bypass_replication_write_gate) {
+            if (!opts.bypass_replication_write_gate and opts.assembly == null) {
                 const enclosing = opts.enclosing_mutation_retirement;
                 const reacquire_enclosing = if (enclosing) |slot| slot.* != null else false;
                 if (enclosing) |slot| releaseReplicationMutationShared(slot);
@@ -973,7 +985,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Native authored effects are only known after extraction. Begin
             // observing conservatively for vector-bearing primary writes so
             // earlier checks cannot escape the eventual retained physical plan.
-            const capture_preparation_points = (if (opts.transaction_resolution) |resolution| resolution.accepted_effects != null else false) or
+            const capture_preparation_points = opts.assembly != null or (if (opts.transaction_resolution) |resolution| resolution.accepted_effects != null else false) or
                 (S.ownerField(self, "root_incarnation").* != 0 and effective_req.writes.len != 0 and
                     (S.ownerField(self, "core").*.index_manager.dense_indexes.items.len != 0 or S.ownerField(self, "core").*.index_manager.sparse_indexes.items.len != 0));
             metadata_reads.control = publication_control;
@@ -2547,6 +2559,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 ));
             const sequence = if (elide_semantic_noop_replay)
                 S.ownerField(self, "core").*.nextDerivedSequence()
+            else if (opts.assembly != null)
+                S.ownerField(self, "core").*.nextDerivedAppendSequence()
             else
                 S.ownerField(self, "core").*.reserveDerivedAppendSequence();
             if (group_plan) |plan| {
@@ -3170,7 +3184,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // occurs while the apply fence is held. A hard-limit failure is
             // returned before the primary mutation and replay intent commit.
             const backlog_admission_start_ns = monotonicTimeNs();
-            var backlog_admission = if (append_derived_replay)
+            var backlog_admission = if (opts.assembly == null and append_derived_replay)
                 try S.ownerField(self, "executor").*.admitBacklogBytes(@intCast(replay_payload.len))
             else
                 derived_executor_mod.BacklogAdmission{};
@@ -3189,9 +3203,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 break :blk S.ownerField(self, "root_incarnation").*;
             };
             const authored = @import("artifact_authored_acceptance.zig");
-            const owns_physical = authored_root != 0 or (if (opts.transaction_resolution) |resolution| resolution.accepted_effects != null else false);
+            const owns_physical = opts.assembly != null or authored_root != 0 or (if (opts.transaction_resolution) |resolution| resolution.accepted_effects != null else false);
+            const physical_allocator = if (opts.assembly) |output| output.allocator else preparation_alloc;
             var prepared_physical: ?authored.OwnedPhysicalPlan = if (owns_physical) try authored.OwnedPhysicalPlan.init(
-                preparation_alloc,
+                physical_allocator,
                 authored_root,
                 explicit_embedding_artifact_writes.items,
                 store_writes.items,
@@ -3200,7 +3215,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 publication_control,
             ) else null;
             defer if (prepared_physical) |*plan| plan.deinit();
-            if (prepared_physical) |*plan| try plan.retainDependencies(preparation_alloc, S.ownerField(self, "core").*, .{
+            if (prepared_physical) |*plan| try plan.retainDependencies(physical_allocator, S.ownerField(self, "core").*, .{
                 .schema_namespace = schema_namespace,
                 .catalog_revision = prepared_catalog_revision orelse return error.PreparedGenerationChanged,
                 .core_facts = prepared_core_facts,
@@ -3220,6 +3235,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (prepared_physical) |*plan| {
                 plan.dependencies.?.metadata_reads = try metadata_reads.take();
                 plan.dependencies.?.preapply_reads = try preapply_reads.take();
+            }
+            if (opts.assembly) |output| {
+                const accepted = opts.transaction_resolution.?.accepted_effects.?;
+                prepared_physical.?.preparation = .{
+                    .contract = accepted.decoded.plan.contract,
+                    .fingerprint = accepted.fingerprint,
+                    .replay_next = sequence,
+                };
+                try prepared_physical.?.validateDependencies(S.ownerField(self, "core").*, publication_control);
+                output.plan = prepared_physical;
+                prepared_physical = null;
+                unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
+                return;
             }
             const commit_writes = if (prepared_physical) |plan| plan.bytes.writes else store_writes.items;
             const commit_deletes = if (prepared_physical) |plan| plan.bytes.deletes else delete_keys.items;

@@ -33,7 +33,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Read-guard metadata carries an exact actor through native batch dispatch.
 // Durable semantic predicate capture expands native writer ownership.
 // Replay reservation writers retain input contracts through final commit validation.
-pub const abi_version: u32 = 119;
+// Batch preparation can return owned uncommitted bytes and their witnesses.
+pub const abi_version: u32 = 120;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

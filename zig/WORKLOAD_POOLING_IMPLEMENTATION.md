@@ -22361,3 +22361,66 @@ PREPARE orchestration remain required. Broader scheduler/session/tenant/whole-no
 and remote rollout remains open. Strong required providers stay disabled; the
 full goal remains active. Full Linux qualification remains waived, and Linux
 builds still require pinned Nix/glibc Zig. Cross-engine performance is unproven.
+
+
+### Owned transaction assembly before publication (2026-10-21)
+
+DB.prepareTransactionAssembly loads a pending transaction's actual stored inputs
+and accepted effects under apply, then runs the shared mutation assembler with a
+preparation-only output slot. Its policy-lease variant checks the original DB
+write admission and preserves that lease's expiry; foreign, read and expired
+leases fail. Readonly and unpublished-child owners fail before assembly.
+
+The result owns explicit physical writes/deletes, canonical replay bytes, native
+authored-vector observation state and retained preparation dependencies. Grouped
+source mutations and accepted generated effects outside the original request
+enter the same final assembled batch. Metadata and pre-apply observations use
+the output allocator, so decoded input frames, temporary request scratch, cursors
+and borrowed controls can all retire before the caller inspects the result. The
+caller must keep its allocator and database alive through result destruction.
+
+This exit runs before primary/replay publication, decision transition, replay
+sequence reservation, backlog reservation and publication-envelope preparation.
+It does not start unrelated startup recovery or schedule a maintenance completion
+hint. Ordinary writes retain their existing early backlog-admission position, so
+an overloaded write is rejected before copying owned postimages. The candidate
+retains its accepted contract/frame fingerprint and provisional replay sequence.
+Validation under apply rechecks these alongside the current catalog, retained
+input digest, complete physical intent set, lock owners and existing dependency
+witnesses. Sequence advancement rejects the already encoded candidate.
+
+The whole operation crosses the compiled storage boundary once; stored-input
+iteration and assembly stay inside the storage owner. A small production adapter
+checks the exact VTable signature and transfers the owned result or error name.
+Native ABI 62 and storage-owner ABI 120 fence the expanded private options and
+plan state. Durable encodings, reader floors and startup defaults are unchanged.
+
+Pinned Debug qualification passes 66 required-PREPARE DB cases, 109 accepted-effects
+cases and 21 replay-plan cases, plus 51 runtime error/identity ABI cases and five
+native ABI cases (252 executions). The dedicated assembly target independently
+passes its five cases plus 51 ABI cases on the identical 5,494 source/schema
+inputs (308 combined executions). No cases failed, skipped or leaked. Coverage
+includes document and relational/group/generated physical batches, byte equality
+with normal commit, unchanged physical snapshots/clocks/decisions, empty inputs,
+synchronous generated effects, lease rejection, retained invalidation, compiled
+adapter result/error ownership, every output allocation failure and every
+original checkpoint. The allocation sweep uses a leak-checked allocator without
+stack-trace recording; no failure points were removed.
+
+The embedded source boundary audit passes 964 sources without server coordination
+imports. Pinned formatting, control-catalog, generated-error and whitespace checks
+pass. Source hashes and terminal command results are retained in
+`prepared-assembly-verified.json` and the boundary/final-regression cumulative
+receipts. The initial stopped run is retained and supplies no final qualification.
+The adapter's signature and error/result paths are tested; a full linked storage
+owner image has not been qualified.
+
+The result is an optimistic assembly candidate. Commit-owned sequence relocation
+and counter deltas, backend-generated commit metadata, progress-safe durable
+read-guard installation, complete live execution/route and DB lifetime ownership,
+minimum executable recovery RAM/CPU/I/O/dependencies and derived-log quota still
+need integration before a vote can rely on it. Normal required PREPARE drivers,
+raw/import/restore/migration/peer eligibility and broader scheduler/session/tenant/
+whole-node/remote coverage remain open. Strong required providers stay disabled;
+the whole goal remains active. Full Linux qualification remains waived and Linux
+builds still require pinned Nix/glibc Zig. Cross-engine performance is unproven.
