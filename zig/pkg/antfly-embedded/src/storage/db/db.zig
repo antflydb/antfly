@@ -31873,6 +31873,10 @@ pub const DB = struct {
                 // Its producer audit can seed durable source debt after replay
                 // catches up; the same owner must keep that debt executable.
                 if (openModeRequiresReadOnlyBackends(self.open_mode) or independentSourceRecoveryCancelled(self)) return pending;
+                // Source replay can finish after the last bulk-session callback
+                // declined its publication proof. Retry the existing nonblocking
+                // vector lifecycle here instead of waiting for another write.
+                _ = try self.finalizeDenseProjectionLifecycleForIdle();
                 const recovery = try self.repairRecoverableStartupIndexFailures(self.alloc, 1, .{
                     .source_replay_only = true,
                     .cancel_check = .{ .ptr = self, .is_requested = independentSourceRecoveryCancelled },
@@ -33333,7 +33337,8 @@ pub const DB = struct {
             .bounded_replay = true,
             .max_windows_per_index = 1,
         });
-        return self.core.nextDerivedSequence() > before or self.executor.snapshotStats().workers_with_replay_debt != 0 or
+        const finalized = try self.finalizeDenseProjectionLifecycleForIdle();
+        return finalized or self.core.nextDerivedSequence() > before or self.executor.snapshotStats().workers_with_replay_debt != 0 or
             self.hasPendingGraphReplacements() or self.local_execution.relational_index_maintenance_sweep.isPending();
     }
 
@@ -111573,7 +111578,10 @@ test "db inline dense generation remains rebuilding until outcomes cover the liv
     // new source write or session-close callback.
     try CounterFixture.write(alloc, db.core.store, config.name, generation, .{ 1, 1, 0 });
     const deadline = monotonicTimeNs() +| 10 * std.time.ns_per_s;
-    while (!try db.finalizeDenseProjectionLifecycleForIdle()) {
+    while (true) {
+        _ = try DB.independentMaintenanceRun(&db, .repair);
+        checkpoint = try db.core.loadProjectionCheckpoint(alloc, config.name);
+        if (checkpoint.status == .clean) break;
         if (monotonicTimeNs() >= deadline) return error.TestUnexpectedResult;
         try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
     }

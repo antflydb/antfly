@@ -6649,6 +6649,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.independent_maintenance.",
             "storage.db.index_repair_scheduler.",
             "source recovery scheduler rotates source jobs within one table",
+            "db dense target coverage reads one immutable primary commit epoch",
             "inline resolver replacement producer pages bound physical records bytes and deadlines",
             "producer readiness local receipt migration retires only after source and checkpoint proof",
             "db managed vector admission durably seeds missing enrichment artifacts",

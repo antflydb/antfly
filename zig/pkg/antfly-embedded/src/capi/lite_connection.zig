@@ -948,6 +948,10 @@ pub const Owner = struct {
         // run providers or construct replacement generations under this gate.
         if (self.options.open_mode == .writer and schedule.source_recovery_next and now >= schedule.next_source_recovery_ns) {
             const recovered = try database.repairRecoverableStartupIndexFailures(alloc, 1, .{ .source_replay_only = true });
+            // A completed source cursor may still await an idle vector
+            // certificate. Keep detached maintenance eligible to publish it;
+            // source control itself never builds files under this fence.
+            if (recovered.remaining != 0) self.maintenance_pending = true;
             if (recovered.attempted != 0 or recovered.repaired != 0) {
                 schedule.source_recovery_next = false;
                 self.notifyMutation();
