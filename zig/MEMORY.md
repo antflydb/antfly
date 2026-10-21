@@ -1183,6 +1183,13 @@ exactly sized buffer. Removing nodes never retains discarded graph encodings;
 serialization work is linear in visited payload bytes plus the final response.
 Deadline/cancellation checks accompany node sizing and truncation. Graph lookup
 and authorization remain bounded independently by the node/depth/work limits.
+Historical snapshot lookup pages the immutable resource-version index independently
+of graph node limits. It examines at most 4096 candidate bindings across the entire
+explanation, rechecking access, knowledge time, digest and retention for each.
+Rejected payloads use reusable page scratch storage; only a selected capture survives
+the page. Lookup budget exhaustion produces a truncated payload and incomplete history,
+never a false missing/changed result. Retirement removes the capture's lookup and watch
+bindings atomically, and cleanup reclaims legacy orphan bindings.
 Ordinary source snapshots retained during traversal are limited to 64 KiB; larger rows report
 truncated payload and incomplete history. Transports release temporary row buffers
 after each lookup. Admission rejects an oversized source instead of storing a partial

@@ -28,6 +28,7 @@ const curation = @import("antfly_resolver").curation;
 const max_dependency_depth: u8 = 32;
 const max_support_work = 65536;
 const resource_check_interval_ms: i64 = 30000;
+const max_explanation_snapshot_candidates = 4096;
 const ReasonBindings = struct { assertion: ?[]const u8 = null, disposition: ?[]const u8 = null };
 const DecisionInput = struct { id: []const u8, revision: u64, reasons: ReasonBindings, correction_evidence: []const t.EvidenceRef = &.{} };
 const DecisionProvenance = struct { principal: []const u8, recorded_at: i64, config_generation: u64, assertion_id: []const u8, evidence_ids: []const []const u8, inputs: []const DecisionInput, incoming_reason: ?[]const u8 = null };
@@ -136,7 +137,8 @@ pub const Service = struct {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        var run: Run = .{ .service = self, .a = a, .processing_failure = execution.processing_failure, .defer_timeouts = execution.defer_timeouts };
+        var run: Run = .{ .service = self, .a = a, .explanation_snapshot_scratch = .init(a), .processing_failure = execution.processing_failure, .defer_timeouts = execution.defer_timeouts };
+        defer run.explanation_snapshot_scratch.deinit();
         const state_row = try self.backend.get(self.backend.ptr, a, "control");
         run.state_row = state_row;
         if (action == .create and state_row == null) {
@@ -320,6 +322,8 @@ const Run = struct {
     explanation_truncated: bool = false,
     explanation_incomplete_history: bool = false,
     explanation_records: std.StringHashMapUnmanaged(ExplainedRecord) = .empty,
+    explanation_snapshot_candidates: usize = 0,
+    explanation_snapshot_scratch: std.heap.ArenaAllocator,
     decision_targets: std.ArrayList(prov.Resource) = .empty,
     views: std.StringHashMapUnmanaged(bool) = .empty,
     backend_rows: std.StringHashMapUnmanaged(?[]const u8) = .empty,
@@ -514,7 +518,15 @@ const Run = struct {
         return value;
     }
     fn cacheResource(self: *Run, reference: prov.Resource, snapshot: prov.Snapshot) !void {
-        try self.resource_states.put(self.a, try hash(self.a, .{ reference, self.service.context.principal }), .{ .reference = reference, .snapshot = snapshot, .epoch = self.inference_epoch });
+        const cache_key = try hash(self.a, .{ reference, self.service.context.principal });
+        // Snapshot candidates may borrow reusable page storage. The resource
+        // read set owns its routing metadata independently of that page.
+        var owned = reference;
+        inline for (.{ "database", "namespace", "table", "id" }) |field| @field(owned, field) = try self.a.dupe(u8, @field(reference, field));
+        inline for (.{ "storage_name", "digest" }) |field| if (@field(reference, field)) |value| {
+            @field(owned, field) = try self.a.dupe(u8, value);
+        };
+        try self.resource_states.put(self.a, cache_key, .{ .reference = owned, .snapshot = snapshot, .epoch = self.inference_epoch });
     }
     fn Captured(comptime handler: anytype) type {
         const Result = @typeInfo(@typeInfo(@TypeOf(handler)).@"fn".return_type.?).error_union.payload;
@@ -1660,8 +1672,7 @@ const Run = struct {
         for (request.evidence_ids) |id| {
             const source = (try self.evidence(id)) orelse return error.MemoryNotFound;
             try self.authorize(source.owner, .private);
-            try self.remove(try key(self.a, "evidence", id));
-            try self.put(try key(self.a, "forgotten-evidence", id), true);
+            try self.retireEvidence(source);
             try self.invalidate("evidence", id);
         }
         for (request.assertion_ids) |id| {
@@ -1927,6 +1938,14 @@ const Run = struct {
         try self.remove(try key(self.a, "assertion", id));
         try self.invalidate("assertion", id);
     }
+    fn retireEvidence(self: *Run, source: t.StoredEvidence) !void {
+        try self.remove(try key(self.a, "evidence", source.evidence.id));
+        try self.put(try key(self.a, "forgotten-evidence", source.evidence.id), true);
+        if (source.evidence.resource) |reference| {
+            try self.remove(try std.fmt.allocPrint(self.a, "resource-evidence/{s}/{s}", .{ try hash(self.a, reference.identity()), try hash(self.a, source.evidence.id) }));
+            try self.remove(try key(self.a, "resource-watch", source.evidence.id));
+        }
+    }
     // Admission arms an idle poller or brings a pending deadline forward. It
     // never postpones existing work, including an unfinished bounded round.
     fn scheduleResourceCheck(self: *Run) void {
@@ -2049,10 +2068,13 @@ const Run = struct {
             if (expires) |time| if (time > self.service.context.now_ms and (self.state.next_expiry_at == null or time < self.state.next_expiry_at.?)) {
                 self.state.next_expiry_at = time;
             };
-            if (!try self.evidenceRetained(source)) {
-                try self.remove(row.key);
-                try self.put(try key(self.a, "forgotten-evidence", source.evidence.id), true);
-            }
+            if (!try self.evidenceRetained(source)) try self.retireEvidence(source);
+        } else if (std.mem.startsWith(u8, row.key, "resource-evidence/")) {
+            // Reclaim orphaned bindings as well as bindings written before
+            // evidence retirement removed its indexes atomically.
+            const binding = try parse(struct { evidence_id: []const u8 }, self.a, row.json);
+            const source = try self.evidence(binding.evidence_id);
+            if (source == null or !try self.evidenceRetained(source.?)) try self.remove(row.key);
         } else if (std.mem.startsWith(u8, row.key, "entity-curation/")) {
             const provenance = try parse(EntityCurationProvenance, self.a, row.json);
             if (!try self.curationProvenanceRetained(provenance)) try self.remove(row.key);
@@ -2342,24 +2364,36 @@ const Run = struct {
         };
         if (observed > known) return error.MemoryNotKnownAt;
     }
-    fn capturedSource(self: *Run, ref: prov.Resource, request: prov.ExplainRequest) !?t.StoredEvidence {
+    const CapturedSource = union(enum) { found: t.StoredEvidence, missing, exhausted };
+    fn capturedSource(self: *Run, ref: prov.Resource, request: prov.ExplainRequest) !CapturedSource {
         const prefix = try std.fmt.allocPrint(self.a, "resource-evidence/{s}/", .{try hash(self.a, ref.identity())});
-        const snapshots = try self.service.backend.scan(self.service.backend.ptr, self.a, prefix, null, request.max_nodes);
-        for (snapshots.rows) |row| {
-            const binding = try parse(struct { evidence_id: []const u8 }, self.a, row.json);
-            const source = (try self.evidence(binding.evidence_id)) orelse continue;
-            self.authorize(source.owner, source.evidence.visibility) catch continue;
-            const actual = source.evidence.resource orelse return error.MemoryCorruptState;
-            if (!ref.sameVersion(actual)) continue;
-            if (ref.digest) |expected| {
-                if (actual.digest == null or !std.ascii.eqlIgnoreCase(expected, actual.digest.?)) continue;
+        var after: ?[]const u8 = null;
+        while (true) {
+            try self.service.context.check();
+            if (self.explanation_snapshot_candidates == max_explanation_snapshot_candidates) return .exhausted;
+            _ = self.explanation_snapshot_scratch.reset(.retain_capacity);
+            const page_a = self.explanation_snapshot_scratch.allocator();
+            const snapshots = try self.service.backend.scan(self.service.backend.ptr, page_a, prefix, after, @intCast(@min(64, max_explanation_snapshot_candidates - self.explanation_snapshot_candidates)));
+            for (snapshots.rows) |row| {
+                try self.service.context.check();
+                self.explanation_snapshot_candidates += 1;
+                const binding = try parse(struct { evidence_id: []const u8 }, page_a, row.json);
+                // Rejected snapshot payloads must not accumulate in the run's
+                // row cache. Only the selected immutable capture escapes this page.
+                const raw = (try self.service.backend.get(self.service.backend.ptr, page_a, try key(page_a, "evidence", binding.evidence_id))) orelse continue;
+                const source = try parse(t.StoredEvidence, page_a, raw.json);
+                self.authorize(source.owner, source.evidence.visibility) catch continue;
+                const actual = source.evidence.resource orelse return error.MemoryCorruptState;
+                if (!ref.sameVersion(actual)) continue;
+                if (ref.digest) |expected| {
+                    if (actual.digest == null or !std.ascii.eqlIgnoreCase(expected, actual.digest.?)) continue;
+                }
+                if (request.known_at) |known| if (source.recorded_at > known) continue;
+                if (!try self.evidenceRetained(source)) continue;
+                return .{ .found = try parse(t.StoredEvidence, self.a, raw.json) };
             }
-            if (request.known_at) |known| if (source.recorded_at > known) continue;
-            if (!try self.evidenceRetained(source)) continue;
-            return source;
+            after = if (snapshots.next) |cursor| try self.a.dupe(u8, cursor) else return .missing;
         }
-        if (snapshots.next != null) self.explanation_truncated = true;
-        return null;
     }
     fn loadExplanationRecord(self: *Run, ref: *prov.Resource, request: prov.ExplainRequest, links: *std.ArrayList(prov.Link)) anyerror!std.json.Value {
         if (ref.external()) {
@@ -2372,22 +2406,22 @@ const Run = struct {
                 return parse(std.json.Value, self.a, try self.encode(.{ .snapshot_json = @as(?[]const u8, null), .revision = ref.revision, .digest = ref.digest, .source_state = snapshot.state, .payload_truncated = true }));
             }
             var json = snapshot.json;
-            if (snapshot.state == .changed) {
+            if (snapshot.state == .changed or request.known_at != null) {
                 // Look up immutable identity, not mutable routing/display hints.
-                const source = (try self.capturedSource(ref.*, request)) orelse {
-                    if (request.known_at != null) {
+                const source = switch (try self.capturedSource(ref.*, request)) {
+                    .found => |source| source,
+                    .exhausted => {
+                        self.explanation_truncated = true;
                         self.explanation_incomplete_history = true;
-                        return error.MemoryNotKnownAt;
-                    }
-                    return error.MemoryResourceChanged;
-                };
-                json = source.evidence.text;
-            } else if (request.known_at != null) {
-                // Ordinary-row versions do not attest when Antfly memory learned
-                // about them. An admitted snapshot supplies that knowledge time.
-                const source = (try self.capturedSource(ref.*, request)) orelse {
-                    self.explanation_incomplete_history = true;
-                    return error.MemoryNotKnownAt;
+                        return parse(std.json.Value, self.a, try self.encode(.{ .snapshot_json = @as(?[]const u8, null), .revision = ref.revision, .digest = ref.digest, .source_state = snapshot.state, .payload_truncated = true }));
+                    },
+                    .missing => {
+                        if (request.known_at != null) {
+                            self.explanation_incomplete_history = true;
+                            return error.MemoryNotKnownAt;
+                        }
+                        return error.MemoryResourceChanged;
+                    },
                 };
                 json = source.evidence.text;
             }

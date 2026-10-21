@@ -3611,3 +3611,89 @@ test "memory source polling retires and invalidates sources during continuous in
         }
     }
 }
+
+test "memory snapshot lookup paginates independently of graph bounds and filters every capture" {
+    for (0..3) |mode| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        try discard(&store, .create, "", "{}", "create", 1);
+        var sources: [65]m.types.Evidence = undefined;
+        for (&sources, 0..) |*item, i| {
+            const id = try std.fmt.allocPrint(a, "snapshot-{d}", .{i});
+            item.* = .{ .id = id, .source_id = id, .resource_selector = .{ .table = "business", .id = "approval" } };
+        }
+        try discard(&store, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = sources }, .{}), "captures", 2);
+        const bindings = try Store.scan(&store, a, "resource-evidence/", null, 100);
+        var rejected: [64][]const u8 = undefined;
+        for (bindings.rows[0..64], &rejected) |row, *id| {
+            id.* = (try std.json.parseFromSliceLeaky(struct { evidence_id: []const u8 }, a, row.json, .{})).evidence_id;
+        }
+        if (mode == 0) {
+            try discard(&store, .forget, "", try std.json.Stringify.valueAlloc(a, .{ .source_ids = rejected }, .{}), "forget", 3);
+        } else {
+            // Model persisted captures belonging to another principal, or
+            // captures admitted after the requested knowledge horizon.
+            const rows = try Store.scan(&store, a, "evidence/", null, 100);
+            for (rows.rows) |row| {
+                var stored = try std.json.parseFromSliceLeaky(m.types.StoredEvidence, a, row.json, .{});
+                for (rejected) |id| if (std.mem.eql(u8, id, stored.evidence.id)) {
+                    if (mode == 1) stored.owner = "bob" else stored.recorded_at = 20;
+                    try store.values.put(a, row.key, try std.json.Stringify.valueAlloc(a, stored, .{}));
+                    break;
+                };
+            }
+        }
+        store.resource_revision = 8;
+        const ref: m.types.provenance.Resource = .{ .table = "business", .table_id = 7, .kind = .record, .id = "approval", .revision = 7 };
+        for ([_]u16{ 1, 64 }) |max_nodes| {
+            const request: m.types.provenance.ExplainRequest = .{ .resource = ref, .max_nodes = max_nodes, .known_at = if (mode == 2) 10 else null };
+            const raw = try store.service("alice", false, 30).execute(a, .explain, "", try std.json.Stringify.valueAlloc(a, request, .{}), "");
+            const explanation = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
+            try std.testing.expect(!explanation.object.get("truncated").?.bool);
+            const root = explanation.object.get("nodes").?.array.items[0];
+            try std.testing.expectEqualStrings(store.resource_json, root.object.get("record").?.object.get("snapshot_json").?.string);
+        }
+        if (mode == 0) {
+            // The full cleanup sweep also repairs an orphan from an older writer.
+            const prefix = bindings.rows[0].key[0 .. std.mem.lastIndexOfScalar(u8, bindings.rows[0].key, '/').? + 1];
+            try store.values.put(a, try std.fmt.allocPrint(a, "{s}orphan", .{prefix}), "{\"evidence_id\":\"absent\"}");
+            for (0..20) |i| try discard(&store, .advance, "", "{}", try std.fmt.allocPrint(a, "cleanup-{d}", .{i}), @intCast(31 + i));
+            try std.testing.expectEqual(@as(usize, 1), (try Store.scan(&store, a, "resource-evidence/", null, 100)).rows.len);
+            try std.testing.expectEqual(@as(usize, 1), (try Store.scan(&store, a, "resource-watch/", null, 100)).rows.len);
+            const last = try std.json.parseFromSliceLeaky(struct { evidence_id: []const u8 }, a, bindings.rows[64].json, .{});
+            try discard(&store, .forget, "", try std.json.Stringify.valueAlloc(a, .{ .evidence_ids = &.{last.evidence_id} }, .{}), "forget-last", 60);
+            try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "resource-evidence/", null, 100)).rows.len);
+            try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "resource-watch/", null, 100)).rows.len);
+        }
+    }
+}
+
+test "memory snapshot lookup exhaustion reports an incomplete root instead of absence" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try discard(&store, .create, "", "{}", "create", 1);
+    const source_evidence: m.types.Evidence = .{ .id = "capture", .resource_selector = .{ .table = "business", .id = "approval" } };
+    try discard(&store, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{source_evidence} }, .{}), "capture", 2);
+    const bindings = try Store.scan(&store, a, "resource-evidence/", null, 1);
+    const prefix = bindings.rows[0].key[0 .. std.mem.lastIndexOfScalar(u8, bindings.rows[0].key, '/').? + 1];
+    // Opaque binding keys sort before the genuine retained capture. These
+    // represent stale index entries left by an earlier writer or restore.
+    for (0..4096) |i| try store.values.put(a, try std.fmt.allocPrint(a, "{s}!{d:0>5}", .{ prefix, i }), "{\"evidence_id\":\"absent\"}");
+    store.resource_revision = 8;
+    for ([_]?i64{ null, 10 }) |known| {
+        const request: m.types.provenance.ExplainRequest = .{ .resource = .{ .table = "business", .table_id = 7, .kind = .record, .id = "approval", .revision = 7 }, .max_nodes = 1, .known_at = known };
+        const scans_before = store.scans;
+        const raw = try store.service("alice", false, 30).execute(a, .explain, "", try std.json.Stringify.valueAlloc(a, request, .{}), "");
+        try std.testing.expectEqual(@as(usize, 64), store.scans - scans_before);
+        const result = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
+        try std.testing.expect(result.object.get("truncated").?.bool);
+        try std.testing.expect(result.object.get("incomplete_history").?.bool);
+        try std.testing.expect(!result.object.get("complete").?.bool);
+        try std.testing.expect(!result.object.get("missing_evidence").?.bool);
+        const record = result.object.get("nodes").?.array.items[0].object.get("record").?;
+        try std.testing.expect(record.object.get("snapshot_json").? == .null);
+        try std.testing.expect(record.object.get("payload_truncated").?.bool);
+    }
+}
