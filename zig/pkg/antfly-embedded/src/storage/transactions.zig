@@ -1315,7 +1315,7 @@ pub const TxnManager = struct {
             if (status == .aborted and try self.hasPreparedEffects(txn_id)) try completion_deletes.append(self.alloc, &prepared_key);
             if (status == .aborted and try self.hasPreparationRequirement(txn_id)) try completion_deletes.append(self.alloc, &requirement_key);
             if (completion_writes.items.len != 0 or completion_deletes.items.len != 0) {
-                try self.applyResolutionResourceBatch(completion_writes.items, completion_deletes.items, null, null, null, control, if (status == .aborted) txn_id else null);
+                try self.applyResolutionResourceBatch(completion_writes.items, completion_deletes.items, null, null, null, control, if (status == .aborted) .{ .id = txn_id, .status = status } else null);
             }
             return .{
                 .applied = false,
@@ -1379,7 +1379,7 @@ pub const TxnManager = struct {
             try completion_deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
             try completion_deletes.appendSlice(self.alloc, indexed_deletes.items);
             const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-            try self.applyResolutionResourceBatch(completion_writes.items, completion_deletes.items, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, null, control, if (status == .aborted) txn_id else null);
+            try self.applyResolutionResourceBatch(completion_writes.items, completion_deletes.items, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, null, control, if (status == .aborted) .{ .id = txn_id, .status = status } else null);
             return .{
                 .applied = false,
                 .replay_sequence = record.replay_sequence,
@@ -1519,7 +1519,7 @@ pub const TxnManager = struct {
         try deletes.appendSlice(self.alloc, indexed_deletes.items);
 
         const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-        try self.applyResolutionResourceBatch(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null, control, if (status == .aborted) txn_id else null);
+        try self.applyResolutionResourceBatch(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null, control, .{ .id = txn_id, .status = status });
 
         if (self.trace_writer) |tw| {
             tw.traceEvent(&.{
@@ -3498,14 +3498,14 @@ pub const TxnManager = struct {
         return self.applyResolutionResourceBatch(writes, deletes, replay, reservation, participant, control, null);
     }
 
-    fn applyResolutionResourceBatch(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant, control: ?read_control.Port, aborted: ?TxnId) !void {
+    fn applyResolutionResourceBatch(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant, control: ?read_control.Port, transition: ?struct { id: TxnId, status: TxnStatus }) !void {
         if (control) |owner| try owner.checkpoint();
         var batch = if (control) |owner| try self.store.beginBatchWithAdmission(owner) else try self.store.beginBatch();
         errdefer batch.abort();
-        if (aborted) |id| {
+        if (transition) |decision| {
             // The authoritative decision was checked before this writer opened.
-            // Release claims before deleting their frame, in this same batch.
-            const grant_key = @import("prepared_replay_credit.zig").grantKey(id);
+            // Transition the grant before the frame deletion, in this same batch.
+            const grant_key = @import("prepared_replay_credit.zig").grantKey(decision.id);
             const has_grant = present: {
                 _ = batch.get(&grant_key) catch |err| {
                     if (err == error.NotFound) break :present false;
@@ -3513,7 +3513,22 @@ pub const TxnManager = struct {
                 };
                 break :present true;
             };
-            if (has_grant) try batch.cancelPreparedReplay(id);
+            if (has_grant) switch (decision.status) {
+                .aborted => try batch.cancelPreparedReplay(decision.id),
+                .committed => {
+                    // A raw adapter must not copy imported grant metadata
+                    // while bypassing its owner's materialization/accounting.
+                    if (batch.vtable.reserve_prepared_replay == null or batch.vtable.cancel_prepared_replay == null)
+                        return error.Unsupported;
+                    // Preserve an exact HA obligation even when a synchronous
+                    // publisher is temporarily absent. Outbox deletion is its
+                    // separate acknowledgement; local replay consumption is not.
+                    const entry = replay orelse return error.PreparedEffectsRequired;
+                    const key = makeTransactionReplicationReplayOutboxKey(decision.id);
+                    try batch.put(&key, entry.payload);
+                },
+                .pending => return error.PreparedEffectsRequired,
+            };
         }
         if (participant) |observer| try batch.setCommitParticipant(observer);
         if (reservation) |change| try retained_effects.replaceReservation(&batch, change.previous, change.next);
@@ -8002,4 +8017,169 @@ test "prepared transaction effects replay abort preserves grant and frame on eve
         const outcome = Checks.run(std.testing.allocator, &checks);
         if (checks.calls >= fail_at) try std.testing.expectError(error.DeadlineExceeded, outcome) else try outcome;
     }
+}
+
+test "prepared transaction effects replay commit consumes reserved capacity and acknowledgements remain independent" {
+    const a = std.testing.allocator;
+    const F = PreparedReplaySealFixture;
+    for ([_]bool{ false, true }) |replay_first| {
+        var f: F = .{};
+        try f.init();
+        defer f.deinit();
+        const frame = try f.frame();
+        defer a.free(frame);
+        try f.seal(frame, "row", "accepted", null);
+        var accepted = (try f.manager.loadPreparedEffects(a, F.id, null)).?;
+        defer accepted.deinit();
+        const journal = @import("db/derived/change_journal.zig");
+        const payload = try journal.encodeRecord(a, .{ .sequence = 1, .changed_doc_keys = &.{"row"} });
+        defer a.free(payload);
+        const batch_key = makeTransactionReplicationBatchOutboxKey(F.id);
+        const before = try f.debt();
+        const filler = F.backlog.transactionCreditKey(@splat(254));
+        var fill: [8]u8 = undefined;
+        std.mem.writeInt(u64, &fill, F.backlog.default_max_bytes - before.bytes - filler.len, .little);
+        try f.store.put(&filler, &fill);
+        try std.testing.expect((try f.manager.resolvePreparedIntents(F.id, 2, &accepted, .{
+            .writes = &.{.{ .key = &batch_key, .value = "batch" }},
+            .replay = .{ .sequence = 1, .payload = payload },
+        }, null)).applied);
+        try std.testing.expect(!try f.manager.hasPreparedEffects(F.id));
+        {
+            var read = try f.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqual(F.credit.Phase.materialized, (try F.credit.load(&read, F.id)).?.phase);
+        }
+        var outbox = try f.manager.loadReplicationOutbox(a, F.id);
+        defer outbox.deinit(a);
+        try std.testing.expectEqualStrings("batch", outbox.batch_payload.?);
+        try std.testing.expectEqualSlices(u8, payload, outbox.replay_payload.?);
+        // A terminal retry neither rebuilds the outbox nor applies the old row.
+        try std.testing.expect(!(try f.manager.resolvePreparedIntents(F.id, 999, &accepted, .{}, null)).applied);
+        try f.manager.clearReplicationOutbox(F.id, if (replay_first) .replay else .batch);
+        {
+            var read = try f.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqual(!replay_first, (try F.credit.load(&read, F.id)) != null);
+        }
+        var remaining = try f.manager.loadReplicationOutbox(a, F.id);
+        defer remaining.deinit(a);
+        try std.testing.expectEqual(!replay_first, remaining.replay_payload != null);
+        try std.testing.expectEqual(replay_first, remaining.batch_payload != null);
+        try f.manager.clearReplicationOutbox(F.id, if (replay_first) .batch else .replay);
+        try f.store.delete(&filler);
+        try std.testing.expectEqual(@as(u64, 0), (try f.debt()).bytes);
+    }
+}
+
+test "prepared transaction effects replay commit refuses missing and oversized replay without retiring its frame" {
+    const a = std.testing.allocator;
+    const F = PreparedReplaySealFixture;
+    var f: F = .{};
+    try f.init();
+    defer f.deinit();
+    const frame = try f.frame();
+    defer a.free(frame);
+    try f.seal(frame, "row", "accepted", null);
+    var accepted = (try f.manager.loadPreparedEffects(a, F.id, null)).?;
+    defer accepted.deinit();
+    try std.testing.expectError(error.PreparedEffectsRequired, f.manager.resolvePreparedIntents(F.id, 2, &accepted, .{}, null));
+    const journal = @import("db/derived/change_journal.zig");
+    const oversized_key: [4096]u8 = @splat('x');
+    const oversized = try journal.encodeRecord(a, .{ .sequence = 1, .changed_doc_keys = &.{&oversized_key} });
+    defer a.free(oversized);
+    try std.testing.expectError(error.InvalidHAOutbox, f.manager.resolvePreparedIntents(F.id, 2, &accepted, .{ .replay = .{ .sequence = 1, .payload = oversized } }, null));
+    try std.testing.expect(try f.manager.hasPreparedEffects(F.id));
+    try std.testing.expectEqual(TxnStatus.pending, try f.manager.getTransactionStatus(F.id));
+    var read = try f.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqual(F.credit.Phase.prepared, (try F.credit.load(&read, F.id)).?.phase);
+    var outbox = try f.manager.loadReplicationOutbox(a, F.id);
+    defer outbox.deinit(a);
+    try std.testing.expect(outbox.replay_payload == null);
+}
+
+test "prepared transaction effects replay commit unwinds every allocation and original checkpoint" {
+    const F = PreparedReplaySealFixture;
+    const Checks = struct {
+        calls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == self.fail_at) return error.DeadlineExceeded;
+        }
+        fn run(allocator: Allocator, checks: ?*@This()) !void {
+            const a = std.testing.allocator;
+            var f: F = .{};
+            try f.init();
+            defer f.deinit();
+            const frame = try f.frame();
+            defer a.free(frame);
+            try f.seal(frame, "row", "accepted", null);
+            var accepted = (try f.manager.loadPreparedEffects(a, F.id, null)).?;
+            defer accepted.deinit();
+            const payload = try @import("db/derived/change_journal.zig").encodeRecord(a, .{ .sequence = 1, .changed_doc_keys = &.{"row"} });
+            defer a.free(payload);
+            const debt = try f.debt();
+            var control: read_control.Payload = .{ .ptr = checks orelse undefined, .vtable = &.{ .checkpoint = check } };
+            f.manager.alloc = allocator;
+            const outcome = f.manager.resolvePreparedIntents(F.id, 2, &accepted, .{ .replay = .{ .sequence = 1, .payload = payload } }, if (checks != null) read_control.Port.init(&control) else null);
+            f.manager.alloc = a;
+            if (outcome) |_| {
+                try std.testing.expect(!try f.manager.hasPreparedEffects(F.id));
+                var read = try f.store.beginReadTxn();
+                defer read.abort();
+                try std.testing.expectEqual(F.credit.Phase.materialized, (try F.credit.load(&read, F.id)).?.phase);
+            } else |err| {
+                try std.testing.expect(try f.manager.hasPreparedEffects(F.id));
+                try std.testing.expectEqualDeep(debt, try f.debt());
+                try std.testing.expectEqual(TxnStatus.pending, try f.manager.getTransactionStatus(F.id));
+                var outbox = try f.manager.loadReplicationOutbox(a, F.id);
+                defer outbox.deinit(a);
+                try std.testing.expect(outbox.replay_payload == null);
+                return err;
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Checks.run, .{@as(?*Checks, null)});
+    var baseline: Checks = .{};
+    try Checks.run(std.testing.allocator, &baseline);
+    try std.testing.expect(baseline.calls > 10);
+    for (1..baseline.calls + 1) |fail_at| {
+        var checks: Checks = .{ .fail_at = fail_at };
+        const outcome = Checks.run(std.testing.allocator, &checks);
+        if (checks.calls >= fail_at) try std.testing.expectError(error.DeadlineExceeded, outcome) else try outcome;
+    }
+}
+
+test "prepared transaction effects replay commit rejects grant metadata on unsupported raw backends" {
+    const a = std.testing.allocator;
+    var native = mem_backend.Backend.init(a, .{});
+    defer native.close();
+    var runtime = try native.runtimeStore(a, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(a, &runtime);
+    defer manager.deinit();
+    const id: TxnId = @splat(158);
+    try manager.initTransaction(id, 1);
+    try manager.writeIntents(id, &.{.{ .key = "row", .value = "{}" }}, &.{});
+    const contract = try manager.preparedEffectsContract(id, @splat(5), .deferred, null);
+    const frame = try prepared_effects.encode(a, .{ .contract = contract, .effects = .{} }, null);
+    defer a.free(frame);
+    try manager.sealPreparedEffects(id, frame, @splat(5), .deferred, null);
+    var accepted = (try manager.loadPreparedEffects(a, id, null)).?;
+    defer accepted.deinit();
+    // Raw imported bytes do not authorize this adapter to serve funded work.
+    const credit = @import("prepared_replay_credit.zig");
+    const grant: credit.Grant = .{ .owner = id, .frame = accepted.fingerprint, .roots = @splat(0), .root_count = 0, .base = .{}, .current = .{} };
+    try manager.applyBatch(&.{.{ .key = &credit.grantKey(id), .value = &try grant.encode() }}, &.{}, null);
+    const payload = try @import("db/derived/change_journal.zig").encodeRecord(a, .{ .sequence = 1, .changed_doc_keys = &.{"row"} });
+    defer a.free(payload);
+    try std.testing.expectError(error.Unsupported, manager.resolvePreparedIntents(id, 2, &accepted, .{ .replay = .{ .sequence = 1, .payload = payload } }, null));
+    try std.testing.expect(try manager.hasPreparedEffects(id));
+    try std.testing.expectEqual(TxnStatus.pending, try manager.getTransactionStatus(id));
+    var outbox = try manager.loadReplicationOutbox(a, id);
+    defer outbox.deinit(a);
+    try std.testing.expect(outbox.replay_payload == null);
 }

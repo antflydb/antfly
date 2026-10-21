@@ -5825,3 +5825,42 @@ backends. The unchanged independent ReleaseSafe package consumer passed 25/25
 compile steps. Generated error-table and storage control-catalog checks also
 passed. This is module-consumer qualification, not a full provider/storage
 archive or cold-runtime qualification. Full Linux qualification remains waived.
+
+
+### Committed resolution consumes the HA replay grant
+
+Funded committed resolution now stages the exact canonical replay outbox before
+deleting the accepted frame, within the same backend batch as local replay,
+primary/effect changes and the terminal record. The DocStore outbox hook consumes
+the existing reservation and releases its document claims while retaining the
+HA replay debt. No new HA byte/record credit is acquired. Terminal completion
+retries skip this transition and cannot rebuild old outboxes over newer data.
+
+A funded transition without replay or with a payload exceeding its bound fails
+before publication, retaining the prepared frame, grant and pending record.
+Raw adapters without the replay reservation/cancellation capabilities reject
+imported grant metadata instead of bypassing owner accounting. Confirmed abort
+keeps its atomic cancellation path. Batch and replay outboxes retain independent
+acknowledgements; deleting the replay outbox through the existing HA cleanup
+path retires the replay grant. Missing publishers preserve the durable obligation.
+
+Five new tests cover saturated-pool commit, both acknowledgement orders,
+missing/oversized replay, caller allocation/checkpoint rollback, unsupported raw
+adapters and actual DB commit/reopen/retry with retained HA debt. The restart case
+also writes a newer row while the old replay is retained and verifies terminal
+retries preserve it. Acknowledgement in these fixtures uses the explicit trusted
+cleanup API; this is not external HA-cluster acknowledgement qualification.
+`prepared-replay-commit-v4.json` and its log record 123 executed tests and 88/88
+build steps, zero skips, failures or leaks, across prepared effects, required DB
+preparation, durable replay credits and canonical replay encoding. No ABI,
+reader-version or durable-format changes are introduced by this integration.
+
+This supersedes the earlier limitation that committed resolution cannot consume
+the sealed grant. It does not certify the predecision canonical request or its
+auxiliary/group physical effects, fund the separate derived-log quota or reserve
+the minimum executable recovery RAM/CPU/I/O/dependency bundle. Normal required
+PREPARE negotiation and strong provider defaults remain off. Legacy/import/
+restore eligibility and the full original scheduling/default-policy scope remain
+incomplete. Full Linux qualification remains waived. Public package consumer and
+full storage/provider archive qualification were not rerun for this private
+behavior change.

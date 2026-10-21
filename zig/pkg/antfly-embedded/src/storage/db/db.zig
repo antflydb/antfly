@@ -145021,3 +145021,73 @@ test "db prepared transaction effects required paired resolution preserves canon
     try db.resolveTransactionIntentsWithSyncLevel(id, .committed, 99, .propose);
     try std.testing.expectEqual(next_sequence, db.core.nextDerivedAppendSequence());
 }
+
+test "db prepared transaction effects required funded replay commit retains HA debt through reopen and acknowledgement" {
+    const a = std.testing.allocator;
+    const credit = @import("../prepared_replay_credit.zig");
+    const inventory = @import("../artifact_replay_inventory.zig");
+    const floors = @import("catalog/reader_versions.zig");
+    var directory = try TestDirectory.init("funded-replay-resolve");
+    defer directory.cleanup();
+    const id: types.TxnId = @splat(0xf5);
+    const options: OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false };
+    {
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        // Fresh-file primitive fixture; this does not qualify legacy migration
+        // or enable the normal required PREPARE negotiation/provider path.
+        try @import("../artifact_footprint.zig").initializeEmpty(db.core.store);
+        try inventory.initialize(db.core.store);
+        try db.core.store.put(floors.minimum_reader_key, "11");
+        try db.core.store.put(floors.replacement_reader_base_key, "11");
+        {
+            db.core.lockApply();
+            defer db.core.unlockApply();
+            var manager = try db.core.initTxnManager();
+            defer manager.deinit();
+            try manager.initTransactionRequiringPreparedEffects(id, 1, 1, &.{}, false, false, .{ .mode = .deferred }, .{}, null);
+            try manager.writeIntents(id, &.{.{ .key = "row", .value = "{\"body\":\"committed\"}" }}, &.{});
+            const catalog = try db.core.preparedEffectsCatalogDigest(null);
+            const contract = try manager.preparedEffectsContract(id, catalog, .deferred, null);
+            const frame = try @import("prepared_transaction_effects.zig").encode(a, .{ .contract = contract, .effects = .{} }, null);
+            defer a.free(frame);
+            try manager.sealPreparedEffectsAndReplayPlan(id, frame, catalog, .deferred, null, .{ .documents = &.{.{ .key = "row" }} }, .{}, null);
+        }
+        try db.resolveTransactionIntentsWithSyncLevel(id, .committed, 2, .propose);
+        try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(id));
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(credit.Phase.materialized, (try credit.load(&read, id)).?.phase);
+    }
+    var db = try DB.open(a, directory.path(), options);
+    defer db.close();
+    var manager = try db.core.initTxnManager();
+    defer manager.deinit();
+    try std.testing.expect(!try manager.hasPreparedEffects(id));
+    var outbox = try manager.loadReplicationOutbox(a, id);
+    defer outbox.deinit(a);
+    var decoded = try change_journal_mod.decodeRecord(a, outbox.replay_payload.?);
+    defer decoded.deinit();
+    var found = false;
+    for (decoded.record.changed_doc_keys) |key| if (std.mem.eql(u8, key, "row")) {
+        found = true;
+    };
+    try std.testing.expect(found);
+    // Releasing claims after materialization permits later local writes while
+    // this immutable HA replay remains retained. Terminal retries cannot undo it.
+    try db.batch(.{ .writes = &.{.{ .key = "row", .value = "{\"body\":\"newer\"}" }} });
+    // No configured publisher can acknowledge the durable HA obligation.
+    try std.testing.expectError(error.ReplicationPublisherUnavailable, db.resolveTransactionIntentsWithSyncLevel(id, .committed, 99, .propose));
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(credit.Phase.materialized, (try credit.load(&read, id)).?.phase);
+    }
+    const sequence = db.core.nextDerivedAppendSequence();
+    try manager.clearReplicationOutbox(id, .replay);
+    try db.resolveTransactionIntentsWithSyncLevel(id, .committed, 99, .propose);
+    try std.testing.expectEqual(sequence, db.core.nextDerivedAppendSequence());
+    const row = (try db.get(a, "row")).?;
+    defer a.free(row);
+    try std.testing.expectEqualStrings("{\"body\":\"newer\"}", row);
+}
