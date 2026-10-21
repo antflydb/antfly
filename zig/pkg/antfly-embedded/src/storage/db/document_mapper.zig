@@ -899,6 +899,11 @@ pub const BuildTextSegmentResult = struct {
 pub const default_text_segment_target_bytes: usize = 32 * 1024 * 1024;
 
 pub const BuildTextSegmentsOptions = struct {
+    /// Encoded results belong to the caller's allocator. Transient builders
+    /// may have a shorter, reclaiming lifetime even when results use a region.
+    scratch_allocator: ?Allocator = null,
+    postings_run_io: ?std.Io = null,
+    postings_run_directory: []const u8 = ".",
     target_segment_bytes: usize = default_text_segment_target_bytes,
     target_build_memory_bytes: ?usize = null,
     doc_scratch_retained_bytes: ?usize = null,
@@ -1418,6 +1423,8 @@ fn buildTextOptionsFromSegmentOptions(options: BuildTextSegmentsOptions) introdu
     var build_options = introducer_mod.BuildTextOptions{
         .profile = options.profile,
         .resource_manager = options.resource_manager,
+        .postings_run_io = options.postings_run_io,
+        .postings_run_directory = options.postings_run_directory,
         .index_sort = options.index_sort,
         .store_document_source = options.store_document_source,
     };
@@ -1446,9 +1453,14 @@ pub fn buildTextSegmentsFromProjectionBatch(
     const Collector = struct {
         alloc: Allocator,
         analysis: introducer_mod.TextAnalysisConfig,
+        scratch_allocator: Allocator,
         segments: std.ArrayListUnmanaged([]u8) = .empty,
         pub fn consume(self: *@This(), chunk: TextProjectionBatch, build_options: introducer_mod.BuildTextOptions) !void {
-            const bytes = try introducer_mod.buildSegmentFromTextWithAnalysisOptions(self.alloc, chunk.docs, &analysis_mod.default_analyzer, self.analysis, build_options);
+            var output = segment_mod.MemorySegmentSink.init(self.alloc);
+            defer output.deinit();
+            var sink = output.sink();
+            try introducer_mod.writeSegmentFromTextWithAnalysisOptions(self.scratch_allocator, chunk.docs, &analysis_mod.default_analyzer, self.analysis, build_options, &sink);
+            const bytes = try output.finishOwned();
             errdefer self.alloc.free(bytes);
             if (bytes.len == 0) {
                 self.alloc.free(bytes);
@@ -1457,7 +1469,7 @@ pub fn buildTextSegmentsFromProjectionBatch(
             try self.segments.append(self.alloc, bytes);
         }
     };
-    var collector: Collector = .{ .alloc = alloc, .analysis = text_analysis };
+    var collector: Collector = .{ .alloc = alloc, .analysis = text_analysis, .scratch_allocator = options.scratch_allocator orelse alloc };
     errdefer {
         for (collector.segments.items) |bytes| alloc.free(bytes);
         collector.segments.deinit(alloc);
@@ -1477,7 +1489,7 @@ pub fn consumeTextProjectionChunks(batch_: TextProjectionBatch, options: BuildTe
             .target_build_memory_bytes = options.target_build_memory_bytes orelse build_options.build_memory_target_bytes,
             .target_segment_bytes = @max(@as(usize, 1), options.target_segment_bytes),
         });
-        try consumer.consume(.{ .docs = batch_.docs[start..split.end] }, build_options);
+        try consumer.consume(.{ .docs = batch_.docs[start..split.end], .observed_field_analyzers = &.{} }, build_options);
         start = split.end;
     }
 }

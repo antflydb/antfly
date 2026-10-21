@@ -20,8 +20,7 @@ class SQLPreparedExecutionRequest:
     Attributes:
         read_requirements (ReadRequirements | Unset): Freshness requirements for writable Iceberg reads. Search supports
             accepted and published (default accepted); SQL supports accepted and committed (default committed). Unsupported
-            visibility modes fail explicitly. Cannot be combined with legacy lake_read or lake_visibility. A pinned
-            transaction snapshot never advances to satisfy a newer receipt.
+            visibility modes fail explicitly. A pinned transaction snapshot never advances to satisfy a newer receipt.
         parameters (list[Any] | Unset):
         limit (int | Unset):  Default: 128.
         session_id (str | Unset): Optional durable transaction session. Required when the resource was prepared against

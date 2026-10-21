@@ -144,7 +144,7 @@ Reads authorize the saved name and every leaf. Definitions permit literal union
 or overlay leaves only, preventing recursion. Drop/recreate changes the source ID
 and invalidates previous cursors; definitions do not freeze table contents.
 
-HTTP SQL SELECT requests accept `lake_visibility: "accepted"`; the default remains
+HTTP SQL SELECT requests accept `read_requirements: {visibility: "accepted"}`; the default remains
 `"committed"`. Idle statements and prepared execution outside a transaction take
 one statement cut. Inside an HTTP SQL session transaction, the first accepted
 read persists its visibility mode and binds each writable lake table once.

@@ -2038,8 +2038,8 @@ pub fn handleTableQueryRequest(
                 std.log.warn("public table query embedding upstream failure table={s}", .{table_name});
                 return try queryDependencyErrorOwnedResponse(alloc, 502, "query_embedding_upstream_failure", "query embedding provider failed", false);
             },
-            error.ValueSearchRequiresScan => return try queryDependencyErrorOwnedResponse(alloc, 422, "value_search_requires_scan", "no compatible indexed candidate plan; explicitly permit scans with value_search_execution.allow_scan", false),
-            error.ValueSearchLimitExceeded => return try queryDependencyErrorOwnedResponse(alloc, 422, "value_search_limit_exceeded", "logical value search exceeded its verification budget", false),
+            error.ValueSearchRequiresScan => return try queryDependencyErrorOwnedResponse(alloc, 422, "value_verification_requires_scan", "no compatible indexed candidate plan; explicitly permit scans with execution.value_verification.allow_scan", false),
+            error.ValueSearchLimitExceeded => return try queryDependencyErrorOwnedResponse(alloc, 422, "value_verification_limit_exceeded", "logical value search exceeded its verification budget", false),
             error.DecisionLimitExceeded => return try queryDependencyErrorOwnedResponse(alloc, 422, "decision_limit_exceeded", "decision evaluation budget exceeded", false),
             error.RerankRateLimited => {
                 return try queryDependencyErrorOwnedResponse(alloc, 429, "reranker_rate_limited", "reranker rate limited", true);

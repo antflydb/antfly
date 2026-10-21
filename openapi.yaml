@@ -15764,10 +15764,6 @@ components:
     SQLRequest:
       type: object
       additionalProperties: false
-      not:
-        required:
-          - read_requirements
-          - lake_visibility
       required:
         - statement
       description: >
@@ -15789,17 +15785,6 @@ components:
       properties:
         read_requirements:
           $ref: '#/components/schemas/ReadRequirements'
-        lake_visibility:
-          deprecated: true
-          type: string
-          enum:
-            - committed
-            - accepted
-          description: Read visibility for writable Iceberg sources. Accepted pins typed WAL changes over
-            the committed snapshot; unavailable coverage fails closed. HTTP sessions and prepared executions
-            inside a transaction retain the first accepted read cut for each table, including across savepoint
-            rollback. Cuts expire after one hour. Serializable write transactions over external sources
-            are not supported. Prefer read_requirements.visibility; this field is a deprecated alias.
         statement:
           type: string
           minLength: 1
@@ -16534,8 +16519,8 @@ components:
             - reranker_upstream_failure
             - decision_limit_exceeded
             - invalid_decision_evaluation
-            - value_search_requires_scan
-            - value_search_limit_exceeded
+            - value_verification_requires_scan
+            - value_verification_limit_exceeded
             - decision_provider_unavailable
             - decision_rate_limited
             - decision_upstream_failure
@@ -19601,7 +19586,10 @@ components:
               - matches
               - autocomplete
           description: >
-            Supported original-value operations on field. Availability does not
+            Supported logical query operations on field. Equals, contains and matches
+
+            verify original values; autocomplete performs analyzed bool-prefix matching. Availability
+            does not
 
             attest index coverage or authorize scans. Case sensitivity, execution
 
@@ -25115,8 +25103,7 @@ components:
       additionalProperties: false
       description: Freshness requirements for writable Iceberg reads. Search supports accepted and published
         (default accepted); SQL supports accepted and committed (default committed). Unsupported visibility
-        modes fail explicitly. Cannot be combined with legacy lake_read or lake_visibility. A pinned transaction
-        snapshot never advances to satisfy a newer receipt.
+        modes fail explicitly. A pinned transaction snapshot never advances to satisfy a newer receipt.
       properties:
         visibility:
           type: string
@@ -25136,45 +25123,7 @@ components:
           maximum: 60000
           description: Readiness wait budget within the query or statement timeout. Defaults to 5000 ms
             when requirements are supplied; zero fails immediately if coverage is unavailable.
-    LakeReadReceipt:
-      type: object
-      additionalProperties: false
-      required:
-        - table_id
-        - object_generation
-        - wal_lsn
-      properties:
-        table_id:
-          type: integer
-          format: uint64
-        object_generation:
-          type: integer
-          format: uint64
-        wal_lsn:
-          type: integer
-          format: uint64
-    LakeReadRequirement:
-      type: object
-      additionalProperties: false
-      properties:
-        visibility:
-          type: string
-          enum:
-            - accepted
-            - published
-          description: Accepted requires current WAL visibility; vector/hybrid reads wait for matching
-            publication. Published explicitly permits the retained archive generation. Applies to native
-            writable Iceberg reads.
-        through:
-          $ref: '#/components/schemas/LakeReadReceipt'
-        wait_ms:
-          type: integer
-          format: uint32
-          minimum: 0
-          maximum: 60000
-          description: Bounded readiness wait, default 5000 ms when lake_read is supplied; also bounded
-            by query timeout and cancellation.
-    ValueSearchExecution:
+    ValueVerification:
       type: object
       additionalProperties: false
       description: >
@@ -25205,13 +25154,23 @@ components:
           default: 100000000
           description: Bound on the sum of original string bytes multiplied by compiled regex states.
             Charged before regex evaluation; sensitive literals bypass this work.
+    QueryExecution:
+      type: object
+      additionalProperties: false
+      description: Execution controls; these affect admitted work, never predicate meaning or read freshness.
+      properties:
+        value_verification:
+          $ref: '#/components/schemas/ValueVerification'
     QueryRequest:
       type: object
       not:
         anyOf:
           - required:
-              - read_requirements
               - lake_read
+          - required:
+              - lake_visibility
+          - required:
+              - value_search_execution
           - description: Hierarchy grouping requires an explicit top-level field projection.
             allOf:
               - required:
@@ -25375,21 +25334,19 @@ components:
                   - required:
                       - foreign_sources
                   - required:
-                      - value_search_execution
+                      - execution
       properties:
-        value_search_execution:
-          $ref: '#/components/schemas/ValueSearchExecution'
+        execution:
+          $ref: '#/components/schemas/QueryExecution'
         read_requirements:
           $ref: '#/components/schemas/ReadRequirements'
-        lake_read:
-          deprecated: true
-          $ref: '#/components/schemas/LakeReadRequirement'
         remote_snapshot:
           type: string
           description: Opaque retained snapshot token returned by an ordered native or external-table
             query. Echo with search_after or search_before. Native and lake cuts expire within the configured
             retention period (default five minutes; maximum one hour); missing, expired or incompatible
-            generations return 409.
+            generations return 409. Also supported when resuming hierarchy.children; its revision-bound
+            ascending position cursor remains required.
         evaluate:
           $ref: '#/components/schemas/QueryEvaluation'
         table_target:
@@ -26504,7 +26461,7 @@ components:
 
         when the request sets `profile: true`.
       properties:
-        value_search:
+        value_verification:
           type: object
           description: Actual logical value verification work, summed across participating shards; plans
             describe selected physical fields and scan fallback reasons. Budgets remain per shard.
@@ -26515,6 +26472,55 @@ components:
             bytes:
               type: integer
               format: int64
+            verification_metrics_version:
+              type: integer
+              format: int64
+              minimum: 0
+              description: One when every participating shard supplied these verification counters; zero
+                means aggregate coverage is incomplete.
+            source_read_us:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Sum of measured provider-read time in microseconds, including admitted source
+                lookup work.
+            source_parse_us:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Sum of original-value parsing time in microseconds.
+            source_batches:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Number of completed source read windows.
+            source_scalar_reads:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Number of required individual source reads.
+            projected_sources:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Rows observed while considering projected reads, including rows that require
+                a full-source fallback.
+            stored_field_sources:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Rows actually verified from stored-field projections.
+            batch_refusals:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Source windows refused by allocation admission before bounded fallback.
+            batch_peak_bytes:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Largest admitted source-window allocation observed on any participating shard;
+                not process RSS or a sum of concurrent allocations.
             plans:
               type: array
               items:
@@ -38534,6 +38540,7 @@ components:
         - query
     NumericRangeQuery:
       type: object
+      additionalProperties: false
       properties:
         min:
           type: number
@@ -38559,6 +38566,7 @@ components:
           $ref: '#/components/schemas/Boost'
     TermRangeQuery:
       type: object
+      additionalProperties: false
       properties:
         min:
           type: string
@@ -38582,6 +38590,7 @@ components:
           $ref: '#/components/schemas/Boost'
     DateRangeStringQuery:
       type: object
+      additionalProperties: false
       properties:
         start:
           type: string
@@ -38605,6 +38614,41 @@ components:
           $ref: '#/components/schemas/Boost'
         datetime_parser:
           type: string
+    BoolQueryClause:
+      oneOf:
+        - $ref: '#/components/schemas/Query'
+        - type: array
+          items:
+            $ref: '#/components/schemas/Query'
+    BoolQueryBody:
+      type: object
+      additionalProperties: false
+      properties:
+        must:
+          $ref: '#/components/schemas/BoolQueryClause'
+        should:
+          $ref: '#/components/schemas/BoolQueryClause'
+        must_not:
+          $ref: '#/components/schemas/BoolQueryClause'
+        filter:
+          $ref: '#/components/schemas/BoolQueryClause'
+        minimum_should_match:
+          type: integer
+          format: uint32
+          minimum: 0
+          description: Minimum optional clauses required; omission follows the runtime's required-clause
+            defaults.
+        boost:
+          $ref: '#/components/schemas/Boost'
+    BoolQuery:
+      type: object
+      additionalProperties: false
+      required:
+        - bool
+      description: Canonical Boolean wrapper. Must clauses score; filter clauses constrain without scoring.
+      properties:
+        bool:
+          $ref: '#/components/schemas/BoolQueryBody'
     ConjunctionQuery:
       type: object
       properties:
@@ -38636,6 +38680,7 @@ components:
         - disjuncts
     BooleanQuery:
       type: object
+      additionalProperties: false
       properties:
         must:
           $ref: '#/components/schemas/ConjunctionQuery'
@@ -38842,6 +38887,7 @@ components:
         - $ref: '#/components/schemas/NumericRangeQuery'
         - $ref: '#/components/schemas/TermRangeQuery'
         - $ref: '#/components/schemas/DateRangeStringQuery'
+        - $ref: '#/components/schemas/BoolQuery'
         - $ref: '#/components/schemas/BooleanQuery'
         - $ref: '#/components/schemas/ConjunctionQuery'
         - $ref: '#/components/schemas/DisjunctionQuery'
