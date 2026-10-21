@@ -172,10 +172,7 @@ test "HBC recall covers Go fixture sets" {
         const dataset_path = try convertedDatasetPathAlloc(std.testing.allocator, case.dataset);
         defer std.testing.allocator.free(dataset_path);
 
-        std.Io.Dir.cwd().access(std.testing.io, dataset_path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return error.SkipZigTest,
-            else => return err,
-        };
+        try requireDataset(dataset_path);
 
         const actual = try runHBCCase(dataset_path, case, null, &truth_cache);
 
@@ -200,10 +197,7 @@ test "HBC recall recursive bulk build covers worst fixture" {
     const dataset_path = try convertedDatasetPathAlloc(std.testing.allocator, case.dataset);
     defer std.testing.allocator.free(dataset_path);
 
-    std.Io.Dir.cwd().access(std.testing.io, dataset_path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return error.SkipZigTest,
-        else => return err,
-    };
+    try requireDataset(dataset_path);
 
     const actual = try runHBCCase(dataset_path, case, .recursive, &truth_cache);
     var failed = false;
@@ -229,7 +223,29 @@ fn convertedDatasetPathAlloc(alloc: std.mem.Allocator, gob_name: []const u8) ![]
         try std.fmt.allocPrint(alloc, "{s}.pbvec", .{gob_name});
     defer alloc.free(converted);
 
-    return std.fs.path.join(alloc, &.{ "testdata", "vectorsets", converted });
+    return std.fs.path.join(alloc, &.{ vectorsetsDir(), converted });
+}
+
+/// `zig build antfly-recall-conformance` fetches the hash-pinned datasets and
+/// points ANTFLY_VECTORSETS_DIR at them. Without it, fall back to the legacy
+/// in-tree location so ad hoc runs from `zig/` keep working.
+fn vectorsetsDir() []const u8 {
+    return std.testing.environ.getPosix("ANTFLY_VECTORSETS_DIR") orelse "testdata/vectorsets";
+}
+
+/// Missing datasets skip the test in ad hoc runs, but fail when the recall
+/// conformance target requires them so CI cannot pass by skipping.
+fn requireDataset(dataset_path: []const u8) !void {
+    std.Io.Dir.cwd().access(std.testing.io, dataset_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            if (std.testing.environ.getPosix("ANTFLY_VECTORSETS_REQUIRED") != null) {
+                std.debug.print("missing recall dataset {s}; run `zig build antfly-recall-conformance`\n", .{dataset_path});
+                return error.RecallDatasetMissing;
+            }
+            return error.SkipZigTest;
+        },
+        else => return err,
+    };
 }
 
 fn runHBCCase(dataset_path: []const u8, case: RecallCase, bulk_algo: ?hbc.BulkBuildAlgo, truth_cache: *TruthCache) !MetricStats {
