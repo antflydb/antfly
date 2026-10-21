@@ -4132,3 +4132,64 @@ hashes, fixture hashes, raw HTTP trials, ingestion CPU and wall time, and
 source-reader work. Process restarts do not establish cold-storage performance.
 The execution design and cache-proof limitations are recorded in
 [logical field queries](../../../docs/design/logical-field-queries.md).
+
+
+The [incremental execution qualification](bench/results/grep-execution-followup-validation.json)
+records the frozen baseline and candidate binaries, raw trials, source hashes,
+work counters, integration checks and unsuccessful admission attempts. Both
+servers pass 19 integration/upgrade cases, with five opt-in profiling cases
+skipped during correctness runs. Linux correctness and verification/concurrency
+profiles use a 1 GiB limit. The CLI suites run 253 cases on each platform, with
+two macOS skips and 32 Linux platform skips. Debug and ReleaseFast each pass 75
+logical-query and 144 query-contract tests.
+
+These are warm-filesystem measurements on one shared Apple Silicon host; Linux
+runs native ARM64 instructions in a VM. Two alternating rounds retain 18 fresh
+verification trials per corpus and 18/72 request samples for one/four clients.
+HTTP medians in milliseconds are:
+
+| Workload | macOS baseline → candidate | Linux, two CPUs/1 GiB, baseline → candidate |
+|---|---:|---:|
+| Tiny values | 9.42 → 9.73 | 8.99 → 8.44 |
+| Selected 4 KiB values | 11.47 → 11.79 | 13.34 → 13.46 |
+| Dominant selected 16 KiB values | 7.84 → 8.16 | 7.68 → 7.91 |
+| Unselected escaped arrays | 9.41 → 9.41 | 8.56 → 7.68 |
+| Nested source contract | 10.37 → 7.63 | 9.06 → 9.86 |
+| One concurrent client | 6.35 → 5.89 | 9.47 → 9.42 |
+| Four concurrent clients | 9.24 → 8.43 | 39.43 → 38.86 |
+
+The one-CPU Linux control changes one/four-client medians from 9.57/89.05 to
+9.84/88.04 ms. These results are mixed; they do not establish a general latency
+win. Required source-reader exploration is bounded to ten completed provider
+calls under stable caps, and scalar read counts fall from about 16 to 3–4 in
+these workloads. Refused/truncated reads remain untrained, and later probes
+continue to adapt. Direct warm retained counts consume an immutable bitmap lease
+and subtract deletions without allocating a result bitmap or reading sources;
+zero-byte allocator tests and HTTP verification counters cover this component,
+not complete request cost.
+
+For 180 KiB high-distinctness input, matched streamed-token construction changes
+from 9.35 to 8.65 ms on macOS and 11.91 to 11.00 ms on Linux. Maximum tracked
+construction allocation changes from 24.32 to 22.65 MB and 24.18 to 23.48 MB,
+respectively. Other construction cases change little. Every variant preserves
+identical postings digests. These construction-only counters exclude the rest
+of index publication and are distinct from process RSS.
+
+Full substring ingestion remains mixed: macOS repetitive/source-like/distinct
+HTTP medians change from 136.78/119.93/1181.88 to 131.23/122.64/1174.97 ms;
+Linux changes from 204.54/208.57/1418.74 to 231.94/228.53/1467.42 ms.
+The Linux ingestion stress comparison uses equal 8 GiB node envelopes. The
+frozen baseline exhausted its default full-text build slice at 1 and 2 GiB;
+the candidate also failed that stress case at 1 GiB. Both small-node envelopes
+keep this slice at its 128 MiB floor. Raising the node envelope admits a larger
+build slice for timing; it does not establish that the process requires 8 GiB
+RSS or fix low-memory ingestion admission. All failed attempts remain recorded.
+
+The API review retains `remote_snapshot`, including hierarchy-child resumption,
+and `autocomplete`. Verification controls now use `execution.value_verification`
+and profiles use `profile.value_verification`; freshness uses `read_requirements`.
+Removed public lake aliases and `value_search_execution` are rejected. SDKs and
+MCP schemas are regenerated. Complete cached predicate facts remain memory-only;
+validated whole-generation owner proofs allow reuse across equivalent cuts.
+Writes invalidate those proofs. Finer reuse across writes requires maintained
+per-segment source-binding certificates.

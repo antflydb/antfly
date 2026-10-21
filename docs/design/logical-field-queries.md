@@ -616,3 +616,13 @@ without the term representation proving that change. Any source/publication
 change invalidates this whole-generation proof. Reusing unrelated segments across
 such a change requires separate, maintained per-segment source-binding
 certificates; this change does not infer those certificates from segment IDs.
+
+
+The [incremental execution qualification](../../zig/pkg/antfly-grep/bench/results/grep-execution-followup-validation.json)
+retains the corresponding native/VM artifacts and alternating before/after
+measurements. Direct-count tests establish zero result-bitmap allocation;
+complete HTTP requests retain parsing, authorization and snapshot-validation
+costs. Timing improvements vary by input and platform. The full ingestion stress
+case also reaches the default per-index build allowance on small nodes despite
+lower token-construction allocation, so component memory measurements must not
+be presented as end-to-end ingestion admission guarantees.
