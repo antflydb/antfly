@@ -4314,8 +4314,8 @@ pub const AntflyApiHandler = struct {
             error.InferenceRequestTooLarge => 413,
             error.ConnectionCapabilityMissing, error.PublicInferenceDisabled => 403,
             error.ModelNotFound, error.ConnectionNotFound, error.InferenceSessionNotFound => 404,
-            error.InferenceCapacityUnavailable, error.DecisionRateLimited, error.InferenceUpstreamRateLimited, error.AttemptLimitExceeded => 429,
-            error.InferenceUpstreamUnavailable => 503,
+            error.InferenceCapacityUnavailable, error.DecisionRateLimited, error.InferenceUpstreamRateLimited, error.RateLimit, error.AttemptLimitExceeded => 429,
+            error.InferenceUpstreamUnavailable, error.ServiceUnavailable => 503,
             error.DecisionRefused => 422,
             error.Timeout => 504,
             error.EmbeddingIdentityMismatch => 409,
@@ -19264,6 +19264,78 @@ test "httpx inference gateway hosted legacy embedding parts produce one result p
     for (0..2) |_| try upstream.handleOne();
     try group.await(io_impl.io());
     if (failure) |err| return err;
+}
+
+test "httpx inference gateway typed vendor failures preserve transient HTTP status and retry guidance" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Provider = generating_runtime.Provider;
+    const Case = struct { upstream: u16, expected: u16, code: []const u8 };
+    const cases = [_]Case{
+        .{ .upstream = 429, .expected = 429, .code = "RateLimit" },
+        .{ .upstream = 502, .expected = 503, .code = "ServiceUnavailable" },
+        .{ .upstream = 503, .expected = 503, .code = "ServiceUnavailable" },
+        .{ .upstream = 504, .expected = 504, .code = "Timeout" },
+        .{ .upstream = 401, .expected = 502, .code = "GenerateRequestFailed" },
+        // Empty successful output stays terminal; it is not unavailability.
+        .{ .upstream = 200, .expected = 502, .code = "GenerateRequestFailed" },
+    };
+    for ([_]Provider{ .gemini, .vertex }) |provider| {
+        for (cases) |case| {
+            errdefer std.debug.print("gateway provider={s} upstream={d}\n", .{ @tagName(provider), case.upstream });
+            var upstream = try httpx.TestServer.start(a, io, &.{.{
+                .method = .POST,
+                .path = if (provider == .gemini) "/models/backend:generateContent" else "/projects/fixture/locations/us-central1/publishers/google/models/backend:generateContent",
+                .respond = .{ .status = case.upstream, .body = "{}" },
+            }});
+            defer upstream.deinit();
+            var config = try common_config.Config.parseFromSlice(a, "{\"public_inference\":{\"enabled\":true}}");
+            defer config.deinit();
+            try config.registry.registerGeneratorConfig("vendor", .{
+                .provider = provider,
+                .model = "backend",
+                .url = upstream.baseUrl(),
+                .api_key = "fixture",
+                .project_id = if (provider == .vertex) "fixture" else null,
+            });
+            var source = AuthStatusSource{};
+            var server = ApiHttpServer.init(a, .{ .node_config = &config, .imported_runtime_io = .{ .api = io, .api_network = io } }, source.iface(), null, null);
+            defer server.deinit();
+            var handler = AntflyApiHandler{ .api_server = &server };
+            const Serve = struct {
+                fn run(peer: *httpx.TestServer, failure: *?anyerror) std.Io.Cancelable!void {
+                    peer.handleOne() catch |err| {
+                        failure.* = err;
+                    };
+                }
+            };
+            var failure: ?anyerror = null;
+            var group = std.Io.Group.init;
+            try group.concurrent(io, Serve.run, .{ &upstream, &failure });
+            defer group.cancel(io);
+            var request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/generate");
+            defer request.deinit();
+            request.body = "{\"model\":\"generators/vendor\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}";
+            var ctx = httpx.Context.init(a, io, &request);
+            defer ctx.deinit();
+            var response = try handler.gatewayRequest(&ctx, .generate);
+            defer response.deinit();
+            try std.testing.expectEqual(case.expected, response.status.code);
+            const retry_after = response.header("retry-after");
+            if (case.expected == 429 or case.expected == 503) {
+                try std.testing.expectEqualStrings("1", retry_after orelse return error.TestUnexpectedResult);
+            } else try std.testing.expect(retry_after == null);
+            const parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings(case.code, parsed.value.object.get("error").?.object.get("code").?.string);
+            try group.await(io);
+            if (failure) |err| return err;
+            try std.testing.expectEqual(@as(usize, 1), upstream.route_hits[0]);
+            try std.testing.expectEqual(@as(usize, 0), server.inferenceAdmissionStats().in_flight);
+        }
+    }
 }
 
 test "httpx inference gateway request errors remain client errors without reclassifying upstream decoding" {
