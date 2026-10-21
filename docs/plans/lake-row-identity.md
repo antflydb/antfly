@@ -166,8 +166,8 @@ so collision verification retains authenticated paths across rows.
 
 Reuse proofs compare authenticated tree ranges and skip identical copy-on-write
 subtrees. Equal authenticated page contents can skip evidence reads even when
-upload attempt addresses differ. Changes to tree shape use an exact ordered comparison. Unchanged
-per-index input trees therefore need no repeated leaf scan. Compact maps for
+upload attempt addresses differ. Changes to tree shape use an exact ordered
+comparison. Unchanged per-index input trees therefore need no repeated leaf scan. Compact maps for
 multiple original coordinate spaces share one attempt-private current-rank tree;
 only the final maps and their embedded ranks enter the publication closure.
 The rank cache reserves 8 MiB of node retained state and one quarter of the
@@ -198,9 +198,10 @@ Existing physical public IDs remain unchanged; the logical ID codec is internal
 and does not introduce a public stable-ID promise. Added or removed logical IDs
 still require complete index rebase after relocation. Identity maps themselves
 remain incremental, but reusing native index postings across a changed logical ID
-set needs explicit membership/delta support in each consumer. Mapping metadata
-and proof comparisons still scale with row count; cross-file rewrite savings
-must be measured against this verification/publication cost.
+set needs explicit membership/delta support in each consumer. Worst-case map
+publication and proof comparisons still scale with row count; unchanged
+authenticated subtrees skip verification reads. Cross-file rewrite savings must
+be measured against this verification/publication cost.
 
 ## Staged extensions
 
