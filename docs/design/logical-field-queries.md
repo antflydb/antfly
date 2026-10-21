@@ -441,3 +441,29 @@ Run the same driver on native hosts or inside CPU/memory constrained containers.
 
 
 On Linux, `--advise-file-cache` adds `fsync` and `POSIX_FADV_DONTNEED` advice only for regular files in the isolated fixture's own temporary root while its server is stopped. Symlinks and caller-supplied directories are ineligible. Each restart records advised file counts/bytes and process I/O counters before/after the first query and each warm group, including startup I/O. The advice is not a guarantee of device-cache eviction, and startup can reload pages. This supplies reproducible cache controls without a global cache-drop operation or a claim of physical cold-storage qualification.
+
+The [source-reader qualification](../../zig/pkg/antfly-grep/bench/results/logical-source-validation.json)
+records 60 final configurations over pinned `cf71262234` artifacts: two reversed
+rounds of default, full-original, scalar and fixed-16/32/64 controls on macOS and
+a one-CPU/1 GiB native ARM64 Linux VM, followed by a two-CPU concurrency repeat.
+Every timed verification covers its complete corpus with fresh predicate facts.
+All raw latency, first-byte, process CPU, window, memory and I/O observations are
+retained, along with preceding diagnostics and cross-version artifact identities.
+
+Nested `grep.content` verification falls from 107.47 to 8.60 ms on macOS and
+105.19 to 10.52 ms in the one-CPU VM; unused escaped arrays improve about 2.2×
+and 2.1×. The initial dominant-value regression motivated required-parse byte
+feedback and bounded metadata backoff. The final dominant-value path tracks the
+same-binary full-reader control. Small cases remain mixed against the preserved
+baseline, with substantial reverse-round idle/parser variation also visible in
+the full-reader control. Default admitted windows stay below 0.8 MiB in these
+corpora; retained capacity stays capped at 512 KiB and live admission at 8 MiB.
+Sampled RSS is not a peak allocation bound or a uniform memory guarantee.
+
+Both optimized servers pass 18 real HTTP/CLI integration and upgrade cases,
+including DPD1 migration without re-ingestion, restart, old-reader rollback and
+write, and re-upgrade. The full Linux correctness suite uses 4 GiB because its
+expanded substring-index fixture exceeds smaller automatic build budgets; the
+preserved baseline exhibits the same 1 GiB limitation. The timed query matrix
+uses 1 GiB. The shared-host VM and fixture-only file advice remain distinct from
+independent physical Linux, device-cold storage and Windows runtime qualification.

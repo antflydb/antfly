@@ -3935,6 +3935,14 @@ or legacy authority wakes bounded maintenance only on writable owners. Read-only
 retained cuts preserve their immutable fallback. Source matching and the public
 document contract remain unchanged.
 
+Table capabilities group known logical sources by `field`, with `kind`,
+`value_operations`, resolved sort availability and nested `representations`.
+Concrete names, analyzers, index-relative query modes and coverage belong to
+those representations. Antfly resolves compatible views for logical operations
+and sorting. Reserved `_id`, conditional computed `_score`, templates and unknown
+source associations remain explicit. SDKs use this grouped response; migration
+details are in the [logical-field design](../../../docs/design/logical-field-queries.md).
+
 The source tuner now attributes scalar fallbacks correctly, excludes truncated
 batches from full-arm samples, and measures batch preparation/allocation as well
 as provider time. Representation changes restart learning without attributing
@@ -3969,3 +3977,63 @@ files before restart. The report records advised files and startup/query process
 I/O. It leaves global caches alone; advice and restart do not guarantee cold
 storage, and startup can warm data again. Use this with the concurrent or both
 suites, including inside CPU/memory constrained Linux containers.
+
+The [source-reader qualification](bench/results/logical-source-validation.json)
+pins implementation `cf71262234`, merged main `f322acc4de`, compiler and binary
+identities, all 60 final configurations, and the preceding diagnostic runs.
+Each scalable comparison below combines 18 warm HTTP trials across two rounds
+with reversed configuration order. Every request verifies the complete corpus;
+predicate membership is fresh. The Linux VM has a one-CPU quota and 1 GiB limit.
+
+| Corpus | macOS baseline | macOS default | Linux baseline | Linux default |
+|---|---:|---:|---:|---:|
+| Tiny values, 4,096 documents | 6.78 ms | 7.98 ms | 8.52 ms | 9.13 ms |
+| Selected 4 KiB strings, 4,096 documents | 9.27 ms | 10.15 ms | 14.38 ms | 14.48 ms |
+| Dominant selected 16 KiB strings, 1,024 documents | 5.57 ms | 6.82 ms | 7.43 ms | 7.47 ms |
+| Unused escaped arrays, 1,024 documents | 16.82 ms | 7.58 ms | 18.91 ms | 8.98 ms |
+| Nested content and 1,024 regions per document, 1,024 documents | 107.47 ms | 8.60 ms | 105.19 ms | 10.52 ms |
+
+The nested-source case improves about **12.5× on macOS and 10.0× in the VM**;
+unused arrays improve **2.2× and 2.1×**. The same-binary full-original control
+isolates the reader path: nested medians are 104.19/105.87 ms and unused-array
+medians 16.73/18.69 ms respectively. Nested mean process CPU falls from
+110.3 to 7.4 ms on macOS and 106.1 to 11.1 ms in the VM.
+
+The initial implementation repeatedly inspected metadata when selected values
+filled the original. Required-parse feedback and bounded backoff remove that
+penalty: final dominant-value latency is close to the same-binary complete
+reader (6.69 ms on macOS, 6.85 ms in the VM). Small and selected-full cases have
+higher macOS medians than the preserved baseline. Their full-original controls
+show similar increases; unchanged parser timings and pre-ingestion idle CPU
+also vary between rounds. The report preserves that variation, including the
+earlier regression. These measurements establish gains on the shown workloads.
+
+Concurrent request medians, with one and four simultaneous clients, are:
+
+| Environment | One client, baseline → default | Four clients, baseline → default |
+|---|---:|---:|
+| macOS | 16.29 → 5.63 ms | 18.02 → 9.60 ms |
+| ARM64 Linux VM, one CPU / 1 GiB | 23.41 → 10.98 ms | 118.78 → 86.80 ms |
+| ARM64 Linux VM, two CPUs / 1 GiB | 22.01 → 10.83 ms | 69.38 → 41.65 ms |
+
+Default admitted windows peak below 0.8 MiB in both scalable suites, within the
+8 MiB hard ceiling and 512 KiB retained-arena cap. Window and process-memory
+changes are mixed: nested sampled RSS changes from 676.7 to 662.5 MiB on macOS
+and 381.4 to 371.1 MiB in the VM; the tiny macOS case rises slightly. Process
+samples include ingestion state, caches and mappings and are not allocation
+bounds. Raw first-byte, CPU, throughput, window, RSS and process-I/O observations
+and scalar/fixed-window controls accompany every configuration.
+
+Both final optimized servers pass 18 HTTP/CLI integration and process-upgrade
+cases, including grouped capabilities, logical sorting, retained revisions,
+original-byte budgets, DPD1 migration, rollback writes and re-upgrade. Four
+optional benchmark cases are exercised separately. Native logical tests pass
+63 cases in Debug and ReleaseFast, alongside 144 query contracts. The complete
+Linux correctness suite uses 4 GiB: its repetitive substring-index fixture
+exceeds automatic build budgets at 1/2 GiB; the preserved baseline also fails
+that fixture at 1 GiB. Those failures are retained separately from the successful
+1 GiB query benchmarks.
+
+The Linux runs execute native ARM64 instructions in a VM on the same shared
+Apple host. File-cache advice is limited to isolated fixture files; process
+restarts and advice do not establish device-cold or independent-hardware results.
