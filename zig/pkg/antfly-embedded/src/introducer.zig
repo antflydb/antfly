@@ -1073,7 +1073,7 @@ fn writeTextSegmentWithScratch(
                         const tf = text_doc.text_fields[index];
                         if (profile) |p| p.text_field_count +|= 1;
                         const analyzer = try cachedFieldAnalyzer(alloc, &analyzer_cache, tf, default_analyzer, text_analysis);
-                        try accumulateAnalyzedField(doc_alloc, &field_maps, tf.field_name, analyzer, tf.text, profile, profile_timings);
+                        try accumulateAnalyzedField(doc_alloc, alloc, &field_maps, tf.field_name, analyzer, tf.text, profile, profile_timings);
                     }
                     const hit_materialize_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
                     scratch.hits.clearRetainingCapacity();
@@ -1273,8 +1273,8 @@ const FieldAcc = struct {
     term_chunk: []u8 = &.{},
     term_used: usize = 0,
     term_map: std.StringHashMapUnmanaged(TermAcc) = .empty,
-    fn init(a: Allocator) FieldAcc {
-        return .{ .scratch = @import("sql/memory_budget.zig").reclaimingAllocator(a) };
+    fn init(scratch: Allocator) FieldAcc {
+        return .{ .scratch = scratch };
     }
     // Keys have document lifetime; pack short borrowed terms into arena slabs
     // instead of invoking the arena allocator for every distinct suffix.
@@ -1598,7 +1598,7 @@ fn addSingleTextFieldToBuilders(
 ) !void {
     if (profile) |p| p.text_field_count +|= 1;
     const analyzer = try cachedFieldAnalyzer(alloc, analyzer_cache, field, default_analyzer, text_analysis);
-    var field_acc = FieldAcc.init(doc_alloc);
+    var field_acc = FieldAcc.init(alloc);
     defer field_acc.deinit();
     if (if (field.text.len >= 128) analyzer.tokenStream(field.text) else null) |producer| {
         const started = if (profile_timings) platform_time.monotonicNs() else 0;
@@ -1697,11 +1697,11 @@ fn accumulateTokenStream(a: Allocator, field: *FieldAcc, input: analysis_mod.Tok
     field.token_offset = try std.math.add(u32, base, count);
     return count;
 }
-fn accumulateAnalyzedField(a: Allocator, fields: *std.StringHashMapUnmanaged(FieldAcc), name: []const u8, analyzer: *const analysis_mod.Analyzer, text: []const u8, profile: ?*BuildTextProfile, timings: bool) !void {
+fn accumulateAnalyzedField(a: Allocator, scratch: Allocator, fields: *std.StringHashMapUnmanaged(FieldAcc), name: []const u8, analyzer: *const analysis_mod.Analyzer, text: []const u8, profile: ?*BuildTextProfile, timings: bool) !void {
     if (if (text.len >= 128) analyzer.tokenStream(text) else null) |stream| {
         const started = if (timings) platform_time.monotonicNs() else 0;
         const existing = fields.getPtr(name);
-        var fresh = FieldAcc.init(a);
+        var fresh = FieldAcc.init(scratch);
         var transferred = false;
         defer if (existing == null and !transferred) fresh.deinit();
         const count = try accumulateTokenStream(a, existing orelse &fresh, stream);
@@ -1728,7 +1728,7 @@ fn accumulateAnalyzedField(a: Allocator, fields: *std.StringHashMapUnmanaged(Fie
     const slot = try fields.getOrPut(a, name);
     if (!slot.found_existing) {
         slot.key_ptr.* = name;
-        slot.value_ptr.* = .init(a);
+        slot.value_ptr.* = .init(scratch);
     }
     const field = slot.value_ptr;
     const base = field.token_offset;
@@ -4509,7 +4509,7 @@ test "introducer.substring streaming preserves repeated field postings and bound
     defer streamed_arena.deinit();
     var owned_arena = std.heap.ArenaAllocator.init(a);
     defer owned_arena.deinit();
-    var streamed = FieldAcc.init(streamed_arena.allocator());
+    var streamed = FieldAcc.init(a);
     defer streamed.deinit();
     var owned: LegacyFieldFixture = .{};
     for ([_][]const u8{ "Needle café_NEEDLE", "ab--cd café ééééééééééééééééééééééééééééééééééé" }) |text| {
@@ -4532,7 +4532,7 @@ test "introducer.substring streaming preserves repeated field postings and bound
     var budget = @import("sql/memory_budget.zig"){ .backing = a, .limit = 8 * 1024 * 1024 };
     var arena = std.heap.ArenaAllocator.init(budget.allocator());
     defer arena.deinit();
-    var field = FieldAcc.init(arena.allocator());
+    var field = FieldAcc.init(budget.allocator());
     defer field.deinit();
     const count = try accumulateTokenStream(arena.allocator(), &field, analysis_mod.substring_analyzer.tokenStream(text).?);
     try std.testing.expect(count > 100_000);
@@ -4546,7 +4546,7 @@ test "introducer.substring streaming allocation failures unwind document ownersh
         fn run(a: Allocator) !void {
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
-            var field = FieldAcc.init(arena.allocator());
+            var field = FieldAcc.init(a);
             defer field.deinit();
             _ = try accumulateTokenStream(arena.allocator(), &field, analysis_mod.substring_analyzer.tokenStream("Needle café_needle xy").?);
         }
@@ -4588,7 +4588,7 @@ test "introducer.substring streaming benchmark" {
                 var budget = @import("sql/memory_budget.zig"){ .backing = a, .limit = 512 * 1024 * 1024 };
                 var arena = std.heap.ArenaAllocator.init(budget.allocator());
                 const started = platform_time.monotonicNs();
-                var field = FieldAcc.init(arena.allocator());
+                var field = FieldAcc.init(budget.allocator());
                 var legacy: LegacyFieldFixture = .{};
                 if (variant == 0) {
                     try legacy.add(arena.allocator(), text);
@@ -4624,13 +4624,13 @@ test "introducer.substring stream admits only nonempty field contributions" {
         while (entries.next()) |entry| entry.deinit();
     }
     for ([_]*const analysis_mod.Analyzer{ &analysis_mod.substring_analyzer, &analysis_mod.default_analyzer }) |analyzer| {
-        try accumulateAnalyzedField(a, &fields, "empty", analyzer, "", null, false);
-        try accumulateAnalyzedField(a, &fields, "punctuation", analyzer, "...", null, false);
+        try accumulateAnalyzedField(a, std.testing.allocator, &fields, "empty", analyzer, "", null, false);
+        try accumulateAnalyzedField(a, std.testing.allocator, &fields, "punctuation", analyzer, "...", null, false);
         try std.testing.expectEqual(@as(u32, 0), fields.count());
     }
-    try accumulateAnalyzedField(a, &fields, "source", &analysis_mod.substring_analyzer, "NEEDLE", null, false);
+    try accumulateAnalyzedField(a, std.testing.allocator, &fields, "source", &analysis_mod.substring_analyzer, "NEEDLE", null, false);
     const before = fields.get("source").?.token_offset;
-    try accumulateAnalyzedField(a, &fields, "source", &analysis_mod.substring_analyzer, "", null, false);
+    try accumulateAnalyzedField(a, std.testing.allocator, &fields, "source", &analysis_mod.substring_analyzer, "", null, false);
     try std.testing.expectEqual(before, fields.get("source").?.token_offset);
     try std.testing.expectEqual(@as(u32, 1), fields.count());
 }
@@ -4771,4 +4771,125 @@ test "grouped physical fields preserve interleaved contribution positions and no
     var second = try (try other.lookup("second")).?.iterator(a);
     defer second.deinit();
     try std.testing.expectEqualSlices(u32, &.{1}, (try second.next()).?.positions);
+}
+
+test "bounded postings schema projection fits small node allowance" {
+    const a = std.testing.allocator;
+    const schema_api = @import("schema/mod.zig");
+    const runtime_schema = @import("storage/schema.zig");
+    const mapper = @import("storage/db/document_mapper.zig");
+    var parsed = try schema_api.parseValidatedTableSchema(a,
+        \\{ "default_type":"doc", "document_schemas":{"doc":{"schema":{"type":"object","properties":{"content":{"type":"string","x-antfly-types":["text","substring"]}}}}} }
+    );
+    defer parsed.deinit(a);
+    const schema = try schema_api.deriveRuntimeTableSchema(a, parsed);
+    defer runtime_schema.freeSchema(a, schema);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const text = if (@import("antfly_platform").env.getenv("ANTFLY_BENCH_POSTINGS_CORPUS")) |path|
+        try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, arena.allocator(), .limited(1024 * 1024))
+    else blk: {
+        const bytes = try arena.allocator().alloc(u8, 180 * 1024);
+        var random = std.Random.DefaultPrng.init(0x51ff1c);
+        for (bytes) |*byte| byte.* = 'a' + random.random().uintLessThan(u8, 26);
+        break :blk bytes;
+    };
+    var root: std.json.ObjectMap = .empty;
+    try root.put(arena.allocator(), "content", .{ .string = text });
+    var docs: [8]mapper.TextProjectionSourceDoc = undefined;
+    for (&docs, 0..) |*doc, i| doc.* = .{ .key = "row", .stored_data = "{}", .root = .{ .object = root }, .typed_source = .{ .object = root }, .doc_ordinal = @intCast(i + 1) };
+    const projection = try mapper.buildTextProjectionBatchFromSource(arena.allocator(), &docs, .{}, schema, null);
+    for (projection.docs[0].text_fields) |field| std.debug.print("SCHEMA_FIELD name={s} bytes={d} stream={}\n", .{ field.field_name, field.text.len, if (field.analyzer) |analyzer| analyzer.tokenStream(field.text) != null else false });
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(directory);
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.full_text_build_working_set)] = .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 128 * 1024 * 1024 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var output = segment_mod.MemorySegmentSink.init(a);
+    defer output.deinit();
+    var sink = output.sink();
+    var profile: BuildTextProfile = .{};
+    mapper.writeTextSegmentFromProjectionBatchToSink(textBuildScratchAllocator(), projection, .{}, .{
+        .resource_manager = &manager,
+        .postings_run_io = std.testing.io,
+        .postings_run_directory = directory,
+        .store_document_source = false,
+        .profile = &profile,
+        .profile_timings = false,
+        .profile_working_set = false,
+    }, &sink) catch |err| {
+        std.debug.print("SCHEMA_FAILURE fields={d} hits={d} runs={d} peak={d} err={s}\n", .{ profile.text_field_count, profile.term_hit_count, profile.postings_run_count, manager.sliceStats(.full_text_build_working_set).peak_bytes, @errorName(err) });
+        return err;
+    };
+    std.debug.print("SCHEMA_SPILL fields={d} peak_bytes={d} runs={d}\n", .{ profile.text_field_count, manager.sliceStats(.full_text_build_working_set).peak_bytes, profile.postings_run_count });
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.full_text_build_working_set).used_bytes);
+    var reader = try segment_mod.SegmentReader.init(a, output.out.items);
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(u32, 8), reader.doc_count);
+}
+
+test "bounded postings field maps use explicit reclaiming scratch behind opaque term regions" {
+    const a = std.testing.allocator;
+    const Budget = @import("sql/memory_budget.zig");
+    const Opaque = @import("storage/lite/test_allocator.zig").NoResizeAllocator;
+    const text = try a.alloc(u8, 180 * 1024);
+    defer a.free(text);
+    var random = std.Random.DefaultPrng.init(0x51ff1c);
+    for (text) |*byte| byte.* = 'a' + random.random().uintLessThan(u8, 26);
+    var peaks: [2]usize = undefined;
+    var digests: [2][32]u8 = undefined;
+    for (0..2) |variant| {
+        var budget = Budget{ .backing = a, .limit = 128 * 1024 * 1024 };
+        {
+            var arena = std.heap.ArenaAllocator.init(budget.allocator());
+            defer arena.deinit();
+            var region_wrapper = Opaque{ .backing = arena.allocator() };
+            // Inferring scratch through an unknown region wrapper retains old
+            // hash tables. Production passes its reclaiming budget explicitly.
+            var field = FieldAcc.init(if (variant == 0) region_wrapper.allocator() else budget.allocator());
+            defer field.deinit();
+            _ = try accumulateTokenStream(region_wrapper.allocator(), &field, analysis_mod.substring_analyzer.tokenStream(text).?);
+            digests[variant] = postingsFixtureDigest(field);
+            peaks[variant] = budget.peak;
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+    }
+    try std.testing.expectEqualSlices(u8, &digests[0], &digests[1]);
+    try std.testing.expect(peaks[1] < peaks[0]);
+    try std.testing.expect(peaks[1] < 32 * 1024 * 1024);
+    std.debug.print("EXPLICIT_FIELD_SCRATCH region_peak={d} reclaiming_peak={d}\n", .{ peaks[0], peaks[1] });
+}
+
+test "bounded postings prepared segment owners unwind partial allocation failures" {
+    const Scenario = struct {
+        fn run(a: Allocator) !void {
+            const mapper = @import("storage/db/document_mapper.zig");
+            const Stable = @import("storage/lite/test_allocator.zig").NoResizeAllocator;
+            var output_owner = Stable{ .backing = a };
+            var scratch_owner = Stable{ .backing = a };
+            const output_alloc = output_owner.allocator();
+            const docs = [_]TextDocument{
+                .{ .id = "a", .stored_data = "{}", .text_fields = &.{.{ .field_name = "body", .text = "common alpha" }}, .typed_fields = &.{} },
+                .{ .id = "b", .stored_data = "{}", .text_fields = &.{.{ .field_name = "body", .text = "common beta" }}, .typed_fields = &.{} },
+            };
+            const segments = try mapper.buildTextSegmentsFromProjectionBatch(output_alloc, .{ .docs = &docs }, .{}, .{
+                .scratch_allocator = scratch_owner.allocator(),
+                .target_segment_bytes = 1,
+            });
+            defer mapper.freeTextSegments(output_alloc, segments);
+            try std.testing.expectEqual(@as(usize, 2), segments.len);
+            for (segments) |bytes| {
+                var reader = try segment_mod.SegmentReader.init(a, bytes);
+                defer reader.deinit();
+                try std.testing.expectEqual(@as(u32, 1), reader.doc_count);
+                var field = (try reader.invertedIndexScoped(a, "body")).?;
+                defer field.deinit();
+                try std.testing.expect((try field.lookup("common")) != null);
+            }
+        }
+    };
+    try Scenario.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
 }

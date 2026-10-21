@@ -668,6 +668,16 @@ contribution position. Discovery costs O(fields log fields); each group retains
 its original token offsets and combined norm, releases its analysis scratch, and
 can spill before the next physical field. Splitting a repeated field into
 independent document postings would corrupt its positions and is forbidden.
+Field maps and position vectors receive the build's reclaiming allocator
+explicitly; only packed copied term bytes use the document region. Opaque
+allocator wrappers do not change scratch ownership. Both native publication
+preparation and direct sink builds enable the same private postings spool.
+Publication preparation keeps its encoded result allocator separate from
+transient construction, releases scratch before publication, and retains the
+existing producer-credit ownership of finished segment bytes. Failure paths
+release unadopted encoded results as well as private runs. A native preparation
+regression exercises the path used by ordinary derived writes under a 128 MiB
+build allowance; testing only direct sink construction does not cover it.
 Fresh large dictionaries reserve capacity once, and terms with
 a single occurrence and at most one position stay inline in a tagged posting
 accumulator. Promotion allocates owned arrays only when another occurrence
