@@ -876,6 +876,7 @@ pub const Detail = enum(c_int) {
     value_search_requires_scan,
     value_search_limit_exceeded,
     invalid_embedding_identity,
+    graph_start_identity_required,
 };
 
 pub const Status = extern struct {
@@ -1422,6 +1423,7 @@ pub fn statusFromError(err: anyerror) Status {
         // Preserve the append-only runtime detail code while the public error
         // name reflects that unsupported exact modes are not topology-specific.
         error.GraphQueryModeUnsupported => status(.unsupported, .graph_cross_range_mode_unsupported),
+        error.GraphStartIdentityRequired => status(.unsupported, .graph_start_identity_required),
         error.QueryEmbeddingInputTooLarge => status(.invalid_argument, .query_embedding_input_too_large),
         error.QueryEmbeddingOverloaded => status(.unavailable, .query_embedding_overloaded),
         error.EmbedRateLimited => status(.retryable, .embed_rate_limited),
@@ -2476,6 +2478,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .graph_anchor_filter_requires_index => "GraphAnchorFilterRequiresIndex",
         .graph_match_operation_limit_exceeded => "GraphMatchOperationLimitExceeded",
         .graph_cross_range_mode_unsupported => "GraphQueryModeUnsupported",
+        .graph_start_identity_required => "GraphStartIdentityRequired",
         .graph_work_budget_exceeded => "GraphWorkBudgetExceeded",
         .graph_min_weight_domain_violation => "GraphMinWeightDomainViolation",
         .graph_max_weight_domain_violation => "GraphMaxWeightDomainViolation",
@@ -2965,4 +2968,10 @@ test "resolver namespace rejection retains its conflict identity across runtime 
     const value = statusFromError(error.ResolverCurationConflict);
     try std.testing.expectEqual(@backingInt(Code.conflict), value.code);
     try std.testing.expectEqual(error.ResolverCurationConflict, errorFromStatus(value));
+}
+
+test "graph start identity requirement retains its semantic identity" {
+    const value = statusFromError(error.GraphStartIdentityRequired);
+    try std.testing.expectEqual(@backingInt(Code.unsupported), value.code);
+    try std.testing.expectEqual(error.GraphStartIdentityRequired, errorFromStatus(value));
 }

@@ -17,6 +17,7 @@ const std = @import("std");
 const graph_query = @import("antfly_local_sources").graph_query;
 
 pub const Reason = enum {
+    qualified_start_identity_required,
     legacy_graph_searches_not_supported,
     request_control_not_supported,
     external_alias_document_filter_not_supported,

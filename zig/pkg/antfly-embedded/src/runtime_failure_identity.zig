@@ -634,6 +634,7 @@ const mappings = [_]Mapping{
     .{ .status = .graph_min_weight_domain_violation, .err = error.GraphMinWeightDomainViolation },
     .{ .status = .graph_path_weight_overflow, .err = error.GraphPathWeightOverflow },
     .{ .status = .graph_query_mode_unsupported, .err = error.GraphQueryModeUnsupported },
+    .{ .status = .graph_start_identity_required, .err = error.GraphStartIdentityRequired },
     .{ .status = .graph_reverse_variable_path_unsupported, .err = error.GraphReverseVariablePathUnsupported },
     .{ .status = .graph_work_budget_exceeded, .err = error.GraphWorkBudgetExceeded },
     .{ .status = .invalid_graph_edges, .err = error.InvalidGraphEdges },
@@ -1108,4 +1109,11 @@ test "logical value query policy errors retain identity across compiled storage 
         try std.testing.expect(statusFromError(err) != .internal);
         try std.testing.expectError(err, statusToError(statusFromError(err)));
     }
+}
+
+test "graph start identity requirement survives the compiled query boundary" {
+    const failure = failureFromError(error.GraphStartIdentityRequired, .local_query, abi.abi_version, 4);
+    try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+    try std.testing.expectError(error.GraphStartIdentityRequired, statusToError(failure.status));
+    try std.testing.expectEqualStrings("GraphStartIdentityRequired", failure.errorName());
 }

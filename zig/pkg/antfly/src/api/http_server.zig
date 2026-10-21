@@ -14173,6 +14173,7 @@ pub const ApiHttpServer = struct {
             error.GraphAnchorFilterRequiresIndex => return error.GraphAnchorFilterRequiresIndex,
             error.GraphMatchOperationLimitExceeded => return error.GraphMatchOperationLimitExceeded,
             error.GraphQueryModeUnsupported => return error.GraphQueryModeUnsupported,
+            error.GraphStartIdentityRequired => return error.GraphStartIdentityRequired,
             error.GraphExternalAliasDocumentFilterUnsupported => return error.GraphExternalAliasDocumentFilterUnsupported,
             error.GraphExternalAliasSourceUnsupported => return error.GraphExternalAliasSourceUnsupported,
             error.GraphReverseVariablePathUnsupported => return error.GraphReverseVariablePathUnsupported,
@@ -14519,6 +14520,7 @@ pub const ApiHttpServer = struct {
                 error.GraphAnchorFilterRequiresIndex,
                 error.GraphMatchOperationLimitExceeded,
                 error.GraphQueryModeUnsupported,
+                error.GraphStartIdentityRequired,
                 error.GraphExternalAliasDocumentFilterUnsupported,
                 error.GraphExternalAliasSourceUnsupported,
                 error.GraphReverseVariablePathUnsupported,
@@ -14591,6 +14593,7 @@ pub const ApiHttpServer = struct {
             error.GraphAnchorFilterRequiresIndex,
             error.GraphMatchOperationLimitExceeded,
             error.GraphQueryModeUnsupported,
+            error.GraphStartIdentityRequired,
             error.GraphExternalAliasDocumentFilterUnsupported,
             error.GraphExternalAliasSourceUnsupported,
             error.GraphReverseVariablePathUnsupported,
@@ -14708,6 +14711,7 @@ pub const ApiHttpServer = struct {
             error.GraphAnchorFilterRequiresIndex,
             error.GraphMatchOperationLimitExceeded,
             error.GraphQueryModeUnsupported,
+            error.GraphStartIdentityRequired,
             error.GraphExternalAliasDocumentFilterUnsupported,
             error.GraphExternalAliasSourceUnsupported,
             error.GraphReverseVariablePathUnsupported,
@@ -22190,6 +22194,11 @@ pub const ApiHttpServer = struct {
             error.GraphMatchOperationLimitExceeded => contextual_operations.jsonWithStatus(
                 422,
                 try public_table_http.graphMatchOperationLimitExceededBody(self.alloc, body),
+                false,
+            ),
+            error.GraphStartIdentityRequired => contextual_operations.jsonWithStatus(
+                422,
+                try public_table_http.graphQueryCapabilityUnsupportedBody(self.alloc, body, "qualified_start_identity_required"),
                 false,
             ),
             error.GraphQueryModeUnsupported => contextual_operations.jsonWithStatus(
@@ -58221,6 +58230,7 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
         stress_reads: usize = 0,
         incompatible_last_page: bool = false,
         destination_cut_changed: bool = false,
+        destination_cut_failures: u8 = 0,
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
@@ -58274,6 +58284,10 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
             const input = call.resolver_catalog_read;
             if (input.expected_revision) |revision| try std.testing.expectEqual(self.commits, revision);
             if (self.destination_cut_changed and input.mode == .table and std.mem.eql(u8, input.table_name, "entities")) return error.CatalogGenerationChanged;
+            if (input.mode == .table and std.mem.eql(u8, input.table_name, "entities") and self.destination_cut_failures != 0) {
+                self.destination_cut_failures -= 1;
+                return error.CatalogGenerationChanged;
+            }
             const wire = @import("../metadata/resolver_catalog_read.zig");
             if (input.mode == .table and std.mem.eql(u8, input.table_name, "source")) {
                 if (self.observation_failure) |err| return err;
@@ -58368,7 +58382,12 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
         server.source = source.narrowIface();
     }
     try Run.call(&server, .list, "source", "", "", "", 200);
+    // A transient destination-cut race retries from a fresh source cut, while
+    // persistent races above fail closed and explicit curation conflicts do
+    // not retry. Exactly one mutation commits.
+    source.destination_cut_failures = 1;
     try Run.call(&server, .merge, "source", "concepts", "", "{\"from\":\"concept/a\",\"to\":\"concept/b\"}", 202);
+    try std.testing.expectEqual(@as(u8, 0), source.destination_cut_failures);
     try Run.call(&server, .merge, "source", "concepts", "", "{\"from\":\"concept/a\",\"to\":\"concept/b\"}", 202);
     try std.testing.expectEqual(@as(u64, 1), source.commits);
     try Run.call(&server, .suppress, "source", "concepts", "", "{\"keys\":[\"concept/b\"]}", 400);

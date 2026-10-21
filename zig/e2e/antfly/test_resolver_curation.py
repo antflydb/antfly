@@ -231,7 +231,7 @@ def test_curator_review_decisions_survive_restart(request, monkeypatch, raft, pr
         )
         reviews = []
 
-        def pending_review():
+        def pending_review(reviews=reviews):
             reviews[:] = all_reviews()
             return bool(reviews)
 
@@ -246,7 +246,30 @@ def test_curator_review_decisions_survive_restart(request, monkeypatch, raft, pr
         assert accepted["replay_sequence_kind"] == "source_journal", accepted
         assert accepted["replay_sequence"] > last_sequence, accepted
         last_sequence = accepted["replay_sequence"]
-        assert accepted["applied"], accepted
+
+        # The operation is durable even when its bounded HTTP observation
+        # returns 202. Await the exact journal cut on detached workers rather
+        # than assuming Raft, replay and catalog reads finish in five seconds.
+        def decision_applied(accepted=accepted):
+            progress = api.get(resolver)["progress"]
+            return bool(progress["shards"]) and all(
+                row["available"]
+                and row["fresh"]
+                and row["resolution"]["applied_sequence"] >= accepted["replay_sequence"]
+                and (
+                    not promote
+                    or row["promotion"]["applied_sequence"]
+                    >= accepted["replay_sequence"]
+                )
+                for row in progress["shards"]
+            )
+
+        assert accepted["applied"] or wait_until(
+            decision_applied, timeout_s=30, interval_s=0.1
+        ), (
+            json.dumps({"accepted": accepted, "resolver": api.get(resolver)})
+            + api.debug_logs()[-16000:]
+        )
         assert all_reviews() == []
     api.restart_server()
     assert all_reviews() == []
@@ -416,3 +439,144 @@ def test_entity_merge_adopts_matching_local_policy(request, monkeypatch, raft, p
                 {"text": "A", "label": "concept"},
             )
             assert rendered["key"] == "concept/b", rendered
+
+
+@pytest.mark.parametrize("action", ["merge", "suppress"])
+def test_runtime_entity_curation_preserves_future_promotion(stateful_api, action):
+    """Curation before any destination row exists must retain a usable sink."""
+    from helpers import wait_until
+
+    api = stateful_api
+    suffix = uuid4().hex[:8]
+    destination, source = f"live_entities_{suffix}", f"live_notes_{suffix}"
+    api.create_table(destination)
+    api.create_table(
+        source,
+        indexes={
+            "knowledge": {
+                "type": "graph",
+                "source": {
+                    "artifact": "kg",
+                    "format": "extraction_graph",
+                    "mention_edge_type": "mentions",
+                },
+                "artifact": {
+                    "name": "kg",
+                    "kind": "asset",
+                    "source": {"type": "field", "value": "kg"},
+                    "content_type": "application/json",
+                },
+                "edge_types": [{"name": "mentions"}],
+                "resolvers": [
+                    {
+                        "name": "concepts",
+                        "table": destination,
+                        "source_artifact": "kg",
+                        "resolution_artifact": "resolved",
+                        "key_template": "concept/{{uslug _entity.text}}",
+                    }
+                ],
+            }
+        },
+    )
+    path = f"/tables/{destination}/entities/{quote('concept/alpha', safe='')}:{action}"
+    decision = api.post(
+        path,
+        {
+            "wait": {"timeout_ms": 5000},
+            **({"into": "concept/canonical"} if action == "merge" else {}),
+        },
+    )
+    assert decision["complete"] and decision["applied"], decision
+    for i in range(2):
+        api.batch_write(
+            source,
+            inserts={
+                f"note-{i}": {
+                    "kg": {
+                        "entities": [
+                            {"id": "a", "text": "Alpha", "label": "concept"},
+                            {"id": "b", "text": f"Healthy {i}", "label": "concept"},
+                        ]
+                    }
+                }
+            },
+            sync_level="write",
+        )
+        expected = {f"concept/healthy_{n}" for n in range(i + 1)}
+        if action == "merge":
+            expected.add("concept/canonical")
+
+        def promoted(expected=expected):
+            response = api.query_table(
+                destination, {"query": {"match_all": {}}, "limit": 20}
+            )
+            hits = response["responses"][0]["hits"]["hits"]
+            ids = {hit["_id"] for hit in hits}
+            return expected <= ids and "concept/alpha" not in ids
+
+        assert wait_until(promoted, timeout_s=60), api.get(
+            f"/tables/{source}/resolvers/concepts"
+        )
+    assert (
+        "promotion catch-up failed: EntityCurationUnavailable"
+        not in api._server.debug_logs()
+    )
+
+    # Table qualification is accepted by server and embedded traversal. A bare
+    # incoming key on a resolver graph must not silently select the source table.
+    def traversal(start, deduplicate=True):
+        return api._request(
+            "POST",
+            f"/tables/{source}/query",
+            {
+                "graph_queries": {
+                    "incoming": {
+                        "index": "knowledge",
+                        "traverse": {
+                            "start": start,
+                            "direction": "in",
+                            "edge_types": ["mentions"],
+                            "max_depth": 1,
+                            "include_paths": True,
+                            "deduplicate_nodes": deduplicate,
+                        },
+                    }
+                }
+            },
+        )
+
+    seed = "concept/canonical" if action == "merge" else "concept/healthy_0"
+    for start in ({"keys": [seed]}, {"identities": [{"key": seed}]}):
+        bare = traversal(start)
+        assert bare.status_code == 422, bare.text
+        assert bare.json()["reason"] == "qualified_start_identity_required", bare.text
+    qualified = {"identities": [{"table": destination, "key": seed}]}
+    reached = traversal(qualified)
+    assert reached.ok, reached.text
+    nodes = reached.json()["responses"][0]["graph_results"]["incoming"]["nodes"]
+    assert {node["key"] for node in nodes} == (
+        {"note-0", "note-1"} if action == "merge" else {"note-0"}
+    ), nodes
+    multiple_seeds = {"identities": list(qualified["identities"])}
+    expected_paths = [(seed, "note-0")]
+    if action == "merge":
+        multiple_seeds["identities"].append(
+            {"table": destination, "key": "concept/healthy_0"}
+        )
+        expected_paths += [(seed, "note-1"), ("concept/healthy_0", "note-0")]
+    no_dedup = traversal(multiple_seeds, False)
+    if no_dedup.status_code == 422:
+        # A coordinator cannot retain per-seed paths through its deduplicated
+        # frontier. Report that constraint, never reject the incoming direction.
+        assert no_dedup.json()["reason"] == "deduplicate_nodes_must_be_true", (
+            no_dedup.text
+        )
+    else:
+        # Complete local execution supports this shape. Verify both paths to
+        # the shared document survive rather than silently deduplicating them.
+        assert no_dedup.ok, no_dedup.text
+        nodes = no_dedup.json()["responses"][0]["graph_results"]["incoming"]["nodes"]
+        assert sorted(
+            (node["path"][0]["key"], node["key"]) for node in nodes
+        ) == sorted(expected_paths), nodes
