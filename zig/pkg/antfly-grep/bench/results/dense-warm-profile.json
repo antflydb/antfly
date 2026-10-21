@@ -1,0 +1,14 @@
+{
+  "binary_sha256": "81af76c5bf21d78fbdd1b1892ff16d5660f5ef8575aeba2569e37cd075890d59",
+  "binary_kind": "ReleaseFast, symbols retained for sampling",
+  "host": "Darwin arm64",
+  "files": 2048,
+  "repeated_search_roots": 20,
+  "sample_returncode": 0,
+  "search_returncode": 0,
+  "elapsed_seconds": 4.483627959,
+  "sample_output": "Sampling process 64693 for 1 second with 1 millisecond of run time between samples\nSampling completed, processing symbols...\nSample analysis of process 64693 written to file /Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/feat-native-antfly-grep/zig/pkg/antfly-grep/bench/results/dense-warm-profile.sample.txt\n",
+  "limitations": "One warm synthetic source corpus, constant-score native fixture; repeated roots keep the process alive for sampling; not a throughput benchmark or provider-quality evaluation.",
+  "stage": "Intermediate profile after initial V5 storage and shared cwd, before hash-prefix reuse and final routing-index compaction",
+  "source_sha256": "16106165ee19f04ecb1acb8c401c5f9846bdc6cb94eea7a6cd95e2c7ad2e0e76"
+}

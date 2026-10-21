@@ -1,0 +1,30 @@
+{
+  "complete": true,
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "load_average": [
+    9.8310546875,
+    10.849609375,
+    10.75244140625
+  ],
+  "binary_sha256": "03dede6a8868ce15f4c0d74fa2ceaef18177fa4a5c13e676fd68f3e51d9cc9ed",
+  "subject_sha256": "4d880aac07108c9cd3c0a06f1c2bec9d0ac2d3c8e2d8b8b2b4e6c2b2408ea7eb",
+  "subject_bytes": 293601280,
+  "seconds_requested": 1,
+  "version": "antfly-grep 0.1.0\nZig 0.17.0 fast\nnative regex, PCRE-style VM/JIT, streaming compression, encoding\ntarget aarch64-macos-none dynamic",
+  "command": [
+    "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/feat-native-antfly-grep/zig/zig-out/bin/antfly-grep",
+    "-P",
+    "-o",
+    "--color=never",
+    "-e",
+    "(2026)-(10)-(16) (info) (worker) (request) id=(123456) status=(success)",
+    "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/feat-native-antfly-grep/zig/.zig-cache/profiles/cli-captures.log"
+  ],
+  "exit": 0,
+  "elapsed_seconds": 1.519003375,
+  "sampler_exit": 0,
+  "sampler_diagnostic": "Sampling process 10443 for 1 second with 1 millisecond of run time between samples\nSampling completed, processing symbols...\nSample analysis of process 10443 written to file zig/pkg/antfly-grep/bench/results/macos-arm64-cli-capture-sample.sample.txt\n",
+  "stderr": "",
+  "stack_file": "macos-arm64-cli-capture-sample.sample.txt",
+  "stack_sha256": "1a33630a543dd3708fac908b3e576ee8107b645c5cf4204235c7e4a5edceb3c9"
+}

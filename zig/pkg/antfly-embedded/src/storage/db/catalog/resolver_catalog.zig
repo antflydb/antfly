@@ -33,6 +33,9 @@ const matcher = @import("antfly_matcher");
 /// Durable resolver-backfill cursors. They live with the resolver catalog
 /// metadata so catalog mutations can mark backfill dirty in the same store
 /// transaction that publishes the catalog change.
+// Durable key spelling belongs to the catalog contract, not the physical DB.
+pub const drop_marker_prefix = "\x00\x00__metadata__:resolver_curation_drop:";
+
 pub const reresolve_resume_key = "\x00\x00__metadata__:resolution_reresolve_resume";
 pub const reresolve_repair_resume_key = "\x00\x00__metadata__:resolution_reresolve_repair_resume";
 

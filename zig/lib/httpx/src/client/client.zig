@@ -1835,6 +1835,14 @@ pub const Client = struct {
     }
 
     fn connectHostDirect(self: *Self, host: []const u8, port: u16) !Socket {
+        var socket = try self.connectHostAddress(host, port);
+        // HTTP headers and bodies may be separate writes. Nagle plus delayed
+        // ACK otherwise adds a timer per request on persistent H1 sockets.
+        // Match H2's existing low-latency policy, including direct/TLS paths.
+        socket.setNoDelay(true) catch {};
+        return socket;
+    }
+    fn connectHostAddress(self: *Self, host: []const u8, port: u16) !Socket {
         if (self.config.address_filter != null) {
             const address = try resolveAddressFiltered(self.io, host, port, self.config.address_filter);
             return try Socket.connect(address, self.io);
@@ -6744,4 +6752,19 @@ test "requestToWriter duplex upload observes response chunks before upload EOF a
             try std.testing.expectEqual(@as(usize, 2), state.reads);
         }
     }
+}
+
+test "H1 direct connections disable Nagle" {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const io = std.testing.io;
+    var listener = try @import("../net/socket.zig").TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var client = Client.init(std.testing.allocator, io);
+    defer client.deinit();
+    var socket = try client.connectHostDirect("127.0.0.1", listener.getLocalAddress().getPort());
+    defer socket.close();
+    var value: c_int = 0;
+    var size: std.posix.socklen_t = @sizeOf(c_int);
+    try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(std.posix.system.getsockopt(socket.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, @ptrCast(&value), &size)));
+    try std.testing.expect(value != 0);
 }

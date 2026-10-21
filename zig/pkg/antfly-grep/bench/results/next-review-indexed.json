@@ -1,0 +1,67 @@
+{
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "binary_sha256": "35bf31914c3c109050358836dc36c773f498eae538b39c02e20e3170a7c30048",
+  "fixture_sha256": "db2e034461ea8fc94d704cd2a057abe24ccc94e8b3289ff58ff829676d94abd5",
+  "delay_ms_per_request": 40,
+  "limitations": "Synthetic equal HTTP/provider latency; no live provider or storage service.",
+  "runs": {
+    "sequential": [
+      {
+        "seconds": 0.9602948750000002,
+        "requests": 17,
+        "output_sha256": "bf981bc10301137305e68b2c2730c9a5da404fffa3cc8ef4461f69246243112a"
+      },
+      {
+        "seconds": 0.9844465000000002,
+        "requests": 17,
+        "output_sha256": "bf981bc10301137305e68b2c2730c9a5da404fffa3cc8ef4461f69246243112a"
+      },
+      {
+        "seconds": 0.9702053749999999,
+        "requests": 17,
+        "output_sha256": "bf981bc10301137305e68b2c2730c9a5da404fffa3cc8ef4461f69246243112a"
+      },
+      {
+        "seconds": 0.9706727500000003,
+        "requests": 17,
+        "output_sha256": "bf981bc10301137305e68b2c2730c9a5da404fffa3cc8ef4461f69246243112a"
+      },
+      {
+        "seconds": 0.9587712499999999,
+        "requests": 17,
+        "output_sha256": "bf981bc10301137305e68b2c2730c9a5da404fffa3cc8ef4461f69246243112a"
+      }
+    ],
+    "prefetch": [
+      {
+        "seconds": 0.5182505420000001,
+        "requests": 17,
+        "output_sha256": "bf981bc10301137305e68b2c2730c9a5da404fffa3cc8ef4461f69246243112a"
+      },
+      {
+        "seconds": 0.5173154580000001,
+        "requests": 17,
+        "output_sha256": "bf981bc10301137305e68b2c2730c9a5da404fffa3cc8ef4461f69246243112a"
+      },
+      {
+        "seconds": 0.5136605830000001,
+        "requests": 17,
+        "output_sha256": "bf981bc10301137305e68b2c2730c9a5da404fffa3cc8ef4461f69246243112a"
+      },
+      {
+        "seconds": 0.522958708,
+        "requests": 17,
+        "output_sha256": "bf981bc10301137305e68b2c2730c9a5da404fffa3cc8ef4461f69246243112a"
+      },
+      {
+        "seconds": 0.5187496669999998,
+        "requests": 17,
+        "output_sha256": "bf981bc10301137305e68b2c2730c9a5da404fffa3cc8ef4461f69246243112a"
+      }
+    ]
+  },
+  "median_seconds": {
+    "sequential": 0.9702053749999999,
+    "prefetch": 0.5182505420000001
+  }
+}

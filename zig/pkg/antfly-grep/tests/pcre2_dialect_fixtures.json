@@ -1,0 +1,862 @@
+{
+  "oracle": "ripgrep 15.2.0 (rev e89fff89ac)\n\nfeatures:+pcre2\nsimd(compile):+SSE2,-SSSE3,-AVX2\nsimd(runtime):+SSE2,+SSSE3,+AVX2\n\nPCRE2 10.45 is available (JIT is available)\n",
+  "oracle_sha256": "e62198eb19b136b88c330af83647b5a962cb99b6b1f066758568f12de1974849",
+  "cases": [
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?<=a|ba)(c)"
+      ],
+      "input": "YmFjCg==",
+      "code": 0,
+      "stdout": "Ywo="
+    },
+    {
+      "args": [
+        "-P",
+        "-r",
+        "$1|$2|$0",
+        "-o",
+        "--color=never",
+        "(?<=(a)|(ba))c"
+      ],
+      "input": "YmFjCg==",
+      "code": 0,
+      "stdout": "YXx8Ywo="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?<=\u00e9{1,3})x"
+      ],
+      "input": "w6nDqXgK",
+      "code": 0,
+      "stdout": "eAo="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?<!a{1,3})x"
+      ],
+      "input": "YXggYngK",
+      "code": 0,
+      "stdout": "eAo="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?(?<=ab)c|d)"
+      ],
+      "input": "YWJjIGQK",
+      "code": 0,
+      "stdout": "YwpkCg=="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?<=a*)b"
+      ],
+      "input": "YWFiCg==",
+      "code": 2,
+      "stdout": ""
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?<=a{1,256})b"
+      ],
+      "input": "YWIK",
+      "code": 2,
+      "stdout": ""
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?<=\\X)b"
+      ],
+      "input": "YWIK",
+      "code": 2,
+      "stdout": ""
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?<=\\R)b"
+      ],
+      "input": "YWIK",
+      "code": 1,
+      "stdout": ""
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?<=\\C)b"
+      ],
+      "input": "YWIK",
+      "code": 2,
+      "stdout": ""
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?<=a{256})b"
+      ],
+      "input": "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWIK",
+      "code": 0,
+      "stdout": "Ygo="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?i)[[:upper:]]+"
+      ],
+      "input": "w6nihKrFv0FCQyB4eXoK",
+      "code": 0,
+      "stdout": "4oSqCkFCQwo="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?i)\\p{Lu}+"
+      ],
+      "input": "w6nihKrFv0FCQyB4eXoK",
+      "code": 0,
+      "stdout": "w6nihKrFv0FCQwp4eXoK"
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?i)\\P{Ll}+"
+      ],
+      "input": "QUJDIGFiYyAxMjMK",
+      "code": 0,
+      "stdout": "IAogMTIzCg=="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?ai)[[:upper:]]+"
+      ],
+      "input": "4oSqxb9BQkMgeHl6Cg==",
+      "code": 0,
+      "stdout": "QUJDCnh5ego="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?r)(?i)[a-z]+"
+      ],
+      "input": "4oSqxb9BQkMgeHl6Cg==",
+      "code": 0,
+      "stdout": "QUJDCnh5ego="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?aD)\\d+"
+      ],
+      "input": "MTIzIO+8ke+8ku+8kyDZodmiCg==",
+      "code": 0,
+      "stdout": "MTIzCg=="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?aW)\\w+"
+      ],
+      "input": "w6lBQkNf77yR77ySCg==",
+      "code": 0,
+      "stdout": "QUJDXwo="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?aP)[[:alpha:]]+"
+      ],
+      "input": "w6lBQkPihKoK",
+      "code": 0,
+      "stdout": "QUJDCg=="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?[ [a-z] - [aeiou] ])+"
+      ],
+      "input": "YWxsIGJyb3duIGZveGVzCg==",
+      "code": 0,
+      "stdout": "bGwKYnIKd24KZgp4CnMK"
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?[ \\p{L} & ! [a-z] ])+"
+      ],
+      "input": "w6kgQUJDIO+8ke+8kgo=",
+      "code": 0,
+      "stdout": "w6kKQUJDCg=="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?[ [ab] ^ [bc] ])+"
+      ],
+      "input": "YWJjIGFiYwo=",
+      "code": 0,
+      "stdout": "YQpjCmEKYwo="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "[a&&b]+"
+      ],
+      "input": "YSZiIGMK",
+      "code": 0,
+      "stdout": "YSZiCg=="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "[\\Q-[]\\E]+"
+      ],
+      "input": "LVtdIGFiYwo=",
+      "code": 0,
+      "stdout": "LVtdCg=="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?xx)[a b]+"
+      ],
+      "input": "YWJhYiBiIGEK",
+      "code": 0,
+      "stdout": "YWJhYgpiCmEK"
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "\\o{141}\\N{U+62}\\x{ 63 }"
+      ],
+      "input": "YWJjCg==",
+      "code": 0,
+      "stdout": "YWJjCg=="
+    },
+    {
+      "args": [
+        "-P",
+        "-r",
+        "$1|$2|$0",
+        "-o",
+        "--color=never",
+        "\\123"
+      ],
+      "input": "UyAxMjMK",
+      "code": 0,
+      "stdout": "fHxTCg=="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "[\\123]"
+      ],
+      "input": "Uwo=",
+      "code": 0,
+      "stdout": "Uwo="
+    },
+    {
+      "args": [
+        "-P",
+        "-r",
+        "$1|$2|$0",
+        "-o",
+        "--color=never",
+        "(?<\u00e9>a)\\k<\u00e9>"
+      ],
+      "input": "YWEK",
+      "code": 0,
+      "stdout": "YXx8YWEK"
+    },
+    {
+      "args": [
+        "-P",
+        "-r",
+        "$1|$2|$0",
+        "-o",
+        "--color=never",
+        "(?J)(?<n>a)|(?<n>b)\\k<n>"
+      ],
+      "input": "YSBiYiBiCg==",
+      "code": 0,
+      "stdout": "YXx8YQp8YnxiYgo="
+    },
+    {
+      "args": [
+        "-P",
+        "-r",
+        "$1|$2|$0",
+        "-o",
+        "--color=never",
+        "(?J)(?<n>a)?(?<n>b)?\\k<n>"
+      ],
+      "input": "YWEgYmIgYWJiCg==",
+      "code": 0,
+      "stdout": "YXx8YWEKfGJ8YmIKfGJ8YmIK"
+    },
+    {
+      "args": [
+        "-P",
+        "-r",
+        "$1|$2|$0",
+        "-o",
+        "--color=never",
+        "(a|b)(?1)"
+      ],
+      "input": "YWIgYmEK",
+      "code": 0,
+      "stdout": "YXx8YWIKYnx8YmEK"
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?(DEFINE)(?<n>a))(?&n)"
+      ],
+      "input": "YQo=",
+      "code": 0,
+      "stdout": "YQo="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(a)(?+1)(b)"
+      ],
+      "input": "YWJiCg==",
+      "code": 0,
+      "stdout": "YWJiCg=="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?<n>a(?(R&n)b|(?&n)))"
+      ],
+      "input": "YWFiCg==",
+      "code": 0,
+      "stdout": "YWFiCg=="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?(VERSION>=10.0)a|b)"
+      ],
+      "input": "YSBiCg==",
+      "code": 0,
+      "stdout": "YQo="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?(VERSION>=99.0)a|b)"
+      ],
+      "input": "YSBiCg==",
+      "code": 0,
+      "stdout": "Ygo="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "a{,3}b"
+      ],
+      "input": "YWFhYiBhYiBiCg==",
+      "code": 0,
+      "stdout": "YWFhYgphYgpiCg=="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?U)a++a"
+      ],
+      "input": "YWFhCg==",
+      "code": 1,
+      "stdout": ""
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "a{ 2 , 3 }"
+      ],
+      "input": "YWFhCg==",
+      "code": 0,
+      "stdout": "YWFhCg=="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?^i)a"
+      ],
+      "input": "QSBhCg==",
+      "code": 0,
+      "stdout": "QQphCg=="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(*sr:\\S+)"
+      ],
+      "input": "YWJjIM6xzrIgYWJjzrEg5pel5pys44Kr44OKIO2VnOq4gOOCq+ODiiDZodmiINmhMgo=",
+      "code": 0,
+      "stdout": "YWJjCs6xzrIKYWJjCs6xCuaXpeacrOOCq+ODigrtlZzquIAK44Kr44OKCtmh2aIK2aEKMgo="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(*asr:a|ab)c"
+      ],
+      "input": "YWJjIGFjCg==",
+      "code": 0,
+      "stdout": "YWMK"
+    },
+    {
+      "args": [
+        "-P",
+        "-r",
+        "$1|$2|$0",
+        "-o",
+        "--color=never",
+        "(*sr:a|ab)c"
+      ],
+      "input": "YWJjIGFjCg==",
+      "code": 0,
+      "stdout": "fHxhYmMKfHxhYwo="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(a+)(*scs:(1)a+)"
+      ],
+      "input": "YWFhCg==",
+      "code": 0,
+      "stdout": "YWFhCg=="
+    },
+    {
+      "args": [
+        "-P",
+        "-r",
+        "$1|$2|$0",
+        "-o",
+        "--color=never",
+        "(?<x>ab)(*scan_substring:(<x>)a)"
+      ],
+      "input": "YWIK",
+      "code": 0,
+      "stdout": "YWJ8fGFiCg=="
+    },
+    {
+      "args": [
+        "-P",
+        "-r",
+        "$1|$2|$0",
+        "-o",
+        "--color=never",
+        "(a)(b)(*scs:(2,1)b)"
+      ],
+      "input": "YWIK",
+      "code": 0,
+      "stdout": "YXxifGFiCg=="
+    },
+    {
+      "args": [
+        "-P",
+        "-r",
+        "$1|$2|$0",
+        "-o",
+        "--color=never",
+        "(?*(a|ab))\\1c"
+      ],
+      "input": "YWJjIGFjCg==",
+      "code": 0,
+      "stdout": "YWJ8fGFiYwphfHxhYwo="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?<*(a)|(ba))c"
+      ],
+      "input": "YmFjCg==",
+      "code": 0,
+      "stdout": "Ywo="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(*napla:(a|ab))\\1c"
+      ],
+      "input": "YWJjIGFjCg==",
+      "code": 0,
+      "stdout": "YWJjCmFjCg=="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "a(*COMMIT)b|ac"
+      ],
+      "input": "YWMgYWIK",
+      "code": 1,
+      "stdout": ""
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "a(*PRUNE)b|ac"
+      ],
+      "input": "YWMgYWIK",
+      "code": 0,
+      "stdout": "YWIK"
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "a(*THEN)b|ac"
+      ],
+      "input": "YWMgYWIK",
+      "code": 0,
+      "stdout": "YWMKYWIK"
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "a(*SKIP)b|ac"
+      ],
+      "input": "YWMgYWIK",
+      "code": 0,
+      "stdout": "YWIK"
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?>(a(*COMMIT)))b|ac"
+      ],
+      "input": "YWMgYWIK",
+      "code": 0,
+      "stdout": "YWMKYWIK"
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?=a(*COMMIT))b|a"
+      ],
+      "input": "YQo=",
+      "code": 0,
+      "stdout": "YQo="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?*a(*COMMIT))b|a"
+      ],
+      "input": "YQo=",
+      "code": 1,
+      "stdout": ""
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?:(a+)(*THEN)b|a+c)"
+      ],
+      "input": "YWFhYyBhYWFiCg==",
+      "code": 0,
+      "stdout": "YWFhYwphYWFiCg=="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "a(*MARK:x)b(*SKIP:x)c|ab"
+      ],
+      "input": "YWIgYWJjCg==",
+      "code": 0,
+      "stdout": "YWJjCg=="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?=a(*MARK:x))a(*SKIP:x)b|a"
+      ],
+      "input": "YSBhYgo=",
+      "code": 0,
+      "stdout": "YQphYgo="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?(?!a(*ACCEPT))x|a)"
+      ],
+      "input": "YQo=",
+      "code": 0,
+      "stdout": "YQo="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?<=a(*ACCEPT)b)c"
+      ],
+      "input": "YWMgYWJjCg==",
+      "code": 0,
+      "stdout": "Ywo="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "\\p{Greek}+"
+      ],
+      "input": "zrHNhSDCtwo=",
+      "code": 0,
+      "stdout": "zrHNhQrCtwo="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "\\p{sc:Greek}+"
+      ],
+      "input": "zrHNhSDCtwo=",
+      "code": 0,
+      "stdout": "zrEK"
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "\\p{Xwd}+"
+      ],
+      "input": "YcyBXyAxMgo=",
+      "code": 0,
+      "stdout": "YcyBXwoxMgo="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "\\p{Xuc}+"
+      ],
+      "input": "QSAkIMOpCg==",
+      "code": 0,
+      "stdout": "JArDqQo="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "[[:<:]]a[[:>:]]"
+      ],
+      "input": "YSBhYQo=",
+      "code": 0,
+      "stdout": "YQo="
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "\\b\\w+\\b"
+      ],
+      "input": "YcyBXyBmb28K",
+      "code": 0,
+      "stdout": "YcyBXwpmb28K"
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?i)k\u017f"
+      ],
+      "input": "S8W/IGtTIOKEqnMK",
+      "code": 0,
+      "stdout": "S8W/CmtTCuKEqnMK"
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?i)\\p{sc:Lu}+"
+      ],
+      "input": "QSBhCg==",
+      "code": 2,
+      "stdout": ""
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?-u)a"
+      ],
+      "input": "YQo=",
+      "code": 2,
+      "stdout": ""
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "\\u0061"
+      ],
+      "input": "YQo=",
+      "code": 2,
+      "stdout": ""
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?<x>a)(?<x>b)"
+      ],
+      "input": "YWIK",
+      "code": 2,
+      "stdout": ""
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?(DEFINE)a|b)"
+      ],
+      "input": "YWIK",
+      "code": 2,
+      "stdout": ""
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?999999999999999999999999)"
+      ],
+      "input": "YQo=",
+      "code": 2,
+      "stdout": ""
+    },
+    {
+      "args": [
+        "-P",
+        "-o",
+        "--color=never",
+        "(?<=a{65536})b"
+      ],
+      "input": "YWIK",
+      "code": 2,
+      "stdout": ""
+    }
+  ]
+}

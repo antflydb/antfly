@@ -1,0 +1,521 @@
+{
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "rounds": 15,
+  "limitations": "Paired warm preparation, incremental decisions and indexed projection fixtures.\n\nNo model quality, real-provider tokens, storage-service latency or billing is\nmeasured. Request counts, projected wire bytes and executable hashes are exact.\n",
+  "binaries": {
+    "antfly-grep": {
+      "sha256": "d42e9b2babcdc9a7411f24b2aadf371209a069a91257b64270bec618e8aab1a8",
+      "bytes": 6594936
+    },
+    "baseline": {
+      "sha256": "a0c151c3fcfa004971b9bdea3b0468b3303a8db97062ef2a429b96e6d8266b08",
+      "bytes": 6562104
+    }
+  },
+  "cases": {
+    "rebatching": {
+      "antfly-grep": {
+        "requests": 0,
+        "questions": 0,
+        "output_sha256": "42c87858dd6f88def175972f8e190a12bfc2f7badc16737c8ccb0a9ea540e963"
+      },
+      "baseline": {
+        "requests": 11,
+        "questions": 32,
+        "output_sha256": "42c87858dd6f88def175972f8e190a12bfc2f7badc16737c8ccb0a9ea540e963"
+      }
+    },
+    "one-changed-line": {
+      "antfly-grep": {
+        "requests": 1,
+        "questions": 1,
+        "output_sha256": "539d90565a707253ce34650876b7e9fae97408179747f8c922a7facd87d58ce7"
+      },
+      "baseline": {
+        "requests": 1,
+        "questions": 8,
+        "output_sha256": "539d90565a707253ce34650876b7e9fae97408179747f8c922a7facd87d58ce7"
+      }
+    },
+    "indexed-listing": {
+      "antfly-grep": {
+        "response_bytes": 261,
+        "output_sha256": "42964c16c8413ef1be6d4d28b6ca54843b0d39779b0b558c9839a54fc2d617f7"
+      },
+      "baseline": {
+        "response_bytes": 4981035,
+        "output_sha256": "42964c16c8413ef1be6d4d28b6ca54843b0d39779b0b558c9839a54fc2d617f7"
+      }
+    },
+    "warm-source-preparation": {
+      "antfly-grep": {
+        "runs": [
+          {
+            "seconds": 0.012304833000000015,
+            "peak_rss_kib": 8864.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.004308,
+            "system_seconds": 0.0031479999999999998,
+            "minor_faults": 813,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.009565041999999968,
+            "peak_rss_kib": 8928.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.0046559999999999995,
+            "system_seconds": 0.003146,
+            "minor_faults": 814,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.009457166999999989,
+            "peak_rss_kib": 8928.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.004692,
+            "system_seconds": 0.0028309999999999997,
+            "minor_faults": 817,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.008873083999999976,
+            "peak_rss_kib": 8896.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.004484999999999999,
+            "system_seconds": 0.002133,
+            "minor_faults": 817,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.009879209,
+            "peak_rss_kib": 8928.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.004602,
+            "system_seconds": 0.002976,
+            "minor_faults": 817,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.010033957999999954,
+            "peak_rss_kib": 8864.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.004458,
+            "system_seconds": 0.003323,
+            "minor_faults": 810,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.01214874999999993,
+            "peak_rss_kib": 8960.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.004641,
+            "system_seconds": 0.0038439999999999998,
+            "minor_faults": 817,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.009992875000000012,
+            "peak_rss_kib": 8880.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.004972,
+            "system_seconds": 0.002763,
+            "minor_faults": 812,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.00842987499999992,
+            "peak_rss_kib": 8864.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.0042699999999999995,
+            "system_seconds": 0.002379,
+            "minor_faults": 809,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.008441083000000016,
+            "peak_rss_kib": 8864.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.004298,
+            "system_seconds": 0.002167,
+            "minor_faults": 811,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.009184292000000038,
+            "peak_rss_kib": 8880.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.0044919999999999995,
+            "system_seconds": 0.002484,
+            "minor_faults": 809,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.008979958000000066,
+            "peak_rss_kib": 8928.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.004548,
+            "system_seconds": 0.0025499999999999997,
+            "minor_faults": 815,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.009852790999999916,
+            "peak_rss_kib": 8864.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.004922999999999999,
+            "system_seconds": 0.002742,
+            "minor_faults": 809,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.009071999999999969,
+            "peak_rss_kib": 8912.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.004226,
+            "system_seconds": 0.002316,
+            "minor_faults": 812,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.009256667000000052,
+            "peak_rss_kib": 8912.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.004578,
+            "system_seconds": 0.00226,
+            "minor_faults": 813,
+            "major_faults": 0,
+            "provider_requests": 0
+          }
+        ],
+        "median_seconds": 0.009457166999999989,
+        "source_cache_hits": 1,
+        "requests": 0,
+        "output_sha256": "64bfcdf3eaea84866a51b8620b84f3d5dc3a8b9f51a38389bdecc2f146f4ff1a"
+      },
+      "baseline": {
+        "runs": [
+          {
+            "seconds": 0.011796250000000008,
+            "peak_rss_kib": 12816.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.006408,
+            "system_seconds": 0.004055,
+            "minor_faults": 1065,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.011564041000000025,
+            "peak_rss_kib": 12864.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.0065119999999999996,
+            "system_seconds": 0.003539,
+            "minor_faults": 1075,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.012005083000000027,
+            "peak_rss_kib": 12784.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.006809,
+            "system_seconds": 0.0035689999999999997,
+            "minor_faults": 1061,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.011638207999999983,
+            "peak_rss_kib": 12880.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.006229999999999999,
+            "system_seconds": 0.004209,
+            "minor_faults": 1070,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.01157770800000002,
+            "peak_rss_kib": 12896.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.006255,
+            "system_seconds": 0.0036109999999999996,
+            "minor_faults": 1066,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.01142920899999994,
+            "peak_rss_kib": 12864.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.006235999999999999,
+            "system_seconds": 0.004135,
+            "minor_faults": 1063,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.015443832999999962,
+            "peak_rss_kib": 12848.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.006784,
+            "system_seconds": 0.004996,
+            "minor_faults": 1061,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.011256374999999985,
+            "peak_rss_kib": 12848.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.006077,
+            "system_seconds": 0.004196,
+            "minor_faults": 1077,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.01276895900000008,
+            "peak_rss_kib": 12832.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.006474,
+            "system_seconds": 0.004729,
+            "minor_faults": 1069,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.010747415999999954,
+            "peak_rss_kib": 12816.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.006148,
+            "system_seconds": 0.00297,
+            "minor_faults": 1072,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.011449040999999993,
+            "peak_rss_kib": 12768.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.006461,
+            "system_seconds": 0.0038919999999999996,
+            "minor_faults": 1069,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.010989166999999966,
+            "peak_rss_kib": 12832.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.006104999999999999,
+            "system_seconds": 0.003565,
+            "minor_faults": 1067,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.012465542000000052,
+            "peak_rss_kib": 12880.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.006797,
+            "system_seconds": 0.0037449999999999996,
+            "minor_faults": 1063,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.011473375000000008,
+            "peak_rss_kib": 12848.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.006392999999999999,
+            "system_seconds": 0.003469,
+            "minor_faults": 1064,
+            "major_faults": 0,
+            "provider_requests": 0
+          },
+          {
+            "seconds": 0.01120687499999995,
+            "peak_rss_kib": 12848.0,
+            "exit": 0,
+            "load_average": [
+              14.7666015625,
+              16.34814453125,
+              16.2646484375
+            ],
+            "user_seconds": 0.006362,
+            "system_seconds": 0.003475,
+            "minor_faults": 1072,
+            "major_faults": 0,
+            "provider_requests": 0
+          }
+        ],
+        "median_seconds": 0.011564041000000025,
+        "source_cache_hits": 0,
+        "requests": 0,
+        "output_sha256": "64bfcdf3eaea84866a51b8620b84f3d5dc3a8b9f51a38389bdecc2f146f4ff1a"
+      }
+    }
+  },
+  "source_path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/feat-native-antfly-grep/zig/e2e/antfly/test_auth.py",
+  "source_sha256": "e3548e62b7d9d3d0496caadc7c5cc4f5c37090c967f60ec7202fbfe3545dfeb8"
+}

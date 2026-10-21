@@ -791,6 +791,8 @@ pub const Status = enum(u32) {
     unsupported_media_token_budget = 832,
     grouped_source_topology_unavailable = 833,
     grouped_source_owner_changed = 834,
+    value_search_requires_scan = 835,
+    value_search_limit_exceeded = 836,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

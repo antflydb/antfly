@@ -1,0 +1,1383 @@
+{
+  "schema_version": 1,
+  "implementation_commit": "f5160168d6906139aee57632856e27a5141439a7",
+  "merged_main": "6b1ec00ae064b2643681a462ddfb7898d236e3b4",
+  "qualified_at_utc": "2026-10-20T03:29:19.257349+00:00",
+  "compiler": {
+    "version": "0.17.0",
+    "sha256": "1c5f706db0ed6d55451940f31dc05a6177d05696bc1fa5d853696d04c718b523"
+  },
+  "artifacts": {
+    "server_debug": "55698ab4f89bf0ef89ea8384bde219441614adc42d6d5efce07847aa386310d6",
+    "cli_release_fast": {
+      "binary_sha256": "f13c84cb68d68d29bb7a7aea22ab43e46260bcec4314664e4abd8a898afa0824",
+      "unchanged_during_tests": true,
+      "exit_code": 0,
+      "version": "antfly-grep 0.1.0-dev\nZig 0.17.0 fast\nnative regex, PCRE-style VM/JIT, streaming compression, encoding\ntarget aarch64-macos-none dynamic"
+    },
+    "inference_fixture": "40a8320bd83a7332dd0eb1a5f84c40019a12a78099c5c5b8409915c94336928a"
+  },
+  "source_files_sha256": {
+    "specs/openapi/antfly/metadata.yaml": "5750ef9a1d65b038f9a8a5947f9aa7a512ca625fe48935d5dbf329f46cb4a413",
+    "openapi.yaml": "bbd627a67998dc60e92b941c1dfcd1b78f504f5c2ce71e51304f1f3271e86adf",
+    "go/pkg/sdk/oapi/client.gen.go": "0e461e79123524720b6f62dea3ccc0f5ef65fbd2b171ec36044d31aeddac9388",
+    "ts/packages/sdk/src/public-api.d.ts": "a1a5ce0cde01f0eeb42e2da330903e198808ed78682c21d4d764c7cf4a7daa0a",
+    "py/packages/sdk/src/antfly/client_generated/models/query_profile_value_search_plans_item_verification.py": "981e08884c61b45c9c3fa6aa0dabef4fe39618448ac076d419c94c185fa1b7a0",
+    "zig/pkg/antfly-embedded/src/search/value_query.zig": "77534d200c8bb7456bc731a78e70f5f9dce3155ca07184d41cca719ad046e331",
+    "zig/pkg/antfly-embedded/src/search/value_membership.zig": "2d38dccce60c5667a265ae2c9f5c8ac5e4582d95275e93c6e1222802d99dc2f2",
+    "zig/pkg/antfly-embedded/src/search/value_literals.zig": "517514a7ee1e589f714ac1a4844b9d250a8b0131fb00ab26bef6250fe3b69844",
+    "zig/pkg/antfly-embedded/src/storage/schema.zig": "bcb079c5333d7c6b42642b85feac644b204ac0be4b1e1dee265e7dd8953aa66b",
+    "zig/pkg/antfly-embedded/src/storage/db/types.zig": "128e610c7822c9a6321d93730c8e1d6ed43b5c648abf7d106bc60ef36af7d636",
+    "zig/pkg/antfly-embedded/src/storage/db/db.zig": "13b1b889e305fb5b6e2a068bc07950591cf9f9097ec1495ff61128dffeff1214",
+    "zig/pkg/antfly-embedded/src/storage/db/query/search_exec.zig": "ed087c2e221b73f1712897dffd02a562abc9898cbfbaf37c5a71c891e1803bdd",
+    "zig/pkg/antfly-embedded/src/storage/db/derived/apply_state.zig": "77a94342738f995190eb8b0bb5c02e2231d3a46285342a80d840fabfc2110985",
+    "zig/pkg/antfly/src/api/tables.zig": "96881a131bdb472e3fe494d029b55dd6d54140a4c012589f859b786d19a8fcff",
+    "zig/pkg/antfly/build/tests.zig": "07b12de0882614387d4e62e54e765c63e57eefbbce6715780a4ac63d6e3ad8e2",
+    "zig/e2e/antfly/test_grep_indexed.py": "1009ee4a75fb85d051c607ba0ae962ef09d238462c2800bc1d42e26c15a7cb4a"
+  },
+  "checks_sha256": {
+    "qualified-final-build.log": "6121f19a07e39495cddfb1138c267572f290c13f118d180cff711ba29aa45be6",
+    "http-qualified.log": "08972da5e3c55eb0608bbec28c1a7bc8f5512ca6f977a5b54efa845410157847",
+    "cli-qualified.log": "e30b912da2856cef0d0f44f85d0ecc9d7c065ec91c78c159583167883b269d44",
+    "generate.log": "9c0a5aeec28152e1274782265351700f87f231f28a950263c488bb7156e2a79d",
+    "merge-generate.log": "8bad4352ce96e4fae14f486e2aacaa8019bc3fd0f5f93a58f02009f202bd8a55",
+    "sdk-go.log": "7bdc8b6b9d5662fafc60192843a796aa577df216ecb73564905a79c4a639b6f6",
+    "sdk-ts.log": "e3cd242915b8c4515b33bb726c751da703d6390d64b5fc05554337a0d46d8e1a",
+    "sdk-python.log": "db02314e3891b06721a92a16132ead92e0b383348acaa1083e8cb0752f60132e",
+    "sdk-profile.log": "069d592b4f63917c964f229ca171ebfa94f90e14038717843fedadf1dcb435fc",
+    "boundary-merged.log": "197cb97123f3043b58af0818a940b9e2f8d414336175c17553233e464864e2a0",
+    "headers-merged.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "compatibility.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "validation": {
+    "native_logical_storage": {
+      "passed": 31,
+      "leaked": 0
+    },
+    "native_query_contracts": {
+      "passed": 143,
+      "leaked": 0
+    },
+    "schema_owner_checks": {
+      "passed": 8,
+      "leaked": 0
+    },
+    "real_server_http": 14,
+    "cli": {
+      "run": 253,
+      "skipped": 2
+    },
+    "go_sdk": "pass",
+    "typescript_sdk": "pass",
+    "python_capabilities": 3,
+    "python_lossless_profile_roundtrip": "pass",
+    "generation": "pass",
+    "apache_boundary_sources": 2354,
+    "compatibility": "pass"
+  },
+  "commands": {
+    "native": "zig build --build-file zig/build.zig -Doptimize=Debug antfly logical-field-query-test query-contract-test antfly-schema-contract-test -j2",
+    "http": "ANTFLY_BIN=output/logical-reuse/server/antfly ANTFLY_GREP_BIN=zig/zig-out/bin/antfly-grep ANTFLY_LOGICAL_REUSE_REPORT=output/logical-reuse/after.json uv run --project zig/e2e/antfly pytest -q zig/e2e/antfly/test_grep_indexed.py",
+    "cli": "python3 zig/pkg/antfly-grep/tests/test_cli.py zig/zig-out/bin/antfly-grep zig/zig-out/lib/libantfly-grep-inference-fixture.dylib",
+    "generation": "make generate; make -C zig engine-errors-generate source-catalog-generate"
+  },
+  "before": {
+    "qualification": "logical-field-validation.json",
+    "implementation_commit": "24bbaaf2df558420d597ce899a253f1e46a2fbde",
+    "workload": {
+      "binary_sha256": "c9717707dcb0bb7f3237a6c277f234e6b383b7bc1426cd01f9ae63c6cb0cdc47",
+      "host": "macOS-27.0.1-arm64-arm-64bit",
+      "cpu_count": 14,
+      "documents": 128,
+      "source_sha256": "83ecdf0b22a6460a943b4a5b5ac6ea4f5380b26340101ecb34e3a4df323eed12",
+      "records": [
+        {
+          "name": "page_0",
+          "elapsed_ns": 131206792,
+          "value_search": {
+            "documents": 128,
+            "bytes": 1052416,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "page_1",
+          "elapsed_ns": 41212417,
+          "value_search": {
+            "documents": 128,
+            "bytes": 1052416,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "page_2",
+          "elapsed_ns": 39156291,
+          "value_search": {
+            "documents": 128,
+            "bytes": 1052416,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "page_3",
+          "elapsed_ns": 40914833,
+          "value_search": {
+            "documents": 128,
+            "bytes": 1052416,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "page_4",
+          "elapsed_ns": 45187000,
+          "value_search": {
+            "documents": 128,
+            "bytes": 1052416,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "page_5",
+          "elapsed_ns": 39552917,
+          "value_search": {
+            "documents": 128,
+            "bytes": 1052416,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "page_6",
+          "elapsed_ns": 38341333,
+          "value_search": {
+            "documents": 128,
+            "bytes": 1052416,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "page_7",
+          "elapsed_ns": 39705375,
+          "value_search": {
+            "documents": 128,
+            "bytes": 1052416,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "literal_or",
+          "elapsed_ns": 31166584,
+          "value_search": {
+            "documents": 384,
+            "bytes": 3157248,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "mixed_or",
+          "elapsed_ns": 29082709,
+          "value_search": {
+            "documents": 256,
+            "bytes": 2104832,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "matches",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "literal_or",
+          "elapsed_ns": 27950042,
+          "value_search": {
+            "documents": 384,
+            "bytes": 3157248,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "mixed_or",
+          "elapsed_ns": 20443250,
+          "value_search": {
+            "documents": 256,
+            "bytes": 2104832,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "matches",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "literal_or",
+          "elapsed_ns": 27841667,
+          "value_search": {
+            "documents": 384,
+            "bytes": 3157248,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "mixed_or",
+          "elapsed_ns": 20040166,
+          "value_search": {
+            "documents": 256,
+            "bytes": 2104832,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "matches",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "literal_or",
+          "elapsed_ns": 28949250,
+          "value_search": {
+            "documents": 384,
+            "bytes": 3157248,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "mixed_or",
+          "elapsed_ns": 20971083,
+          "value_search": {
+            "documents": 256,
+            "bytes": 2104832,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "matches",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "literal_or",
+          "elapsed_ns": 35550583,
+          "value_search": {
+            "documents": 384,
+            "bytes": 3157248,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "mixed_or",
+          "elapsed_ns": 21706792,
+          "value_search": {
+            "documents": 256,
+            "bytes": 2104832,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "matches",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "literal_or",
+          "elapsed_ns": 27699459,
+          "value_search": {
+            "documents": 384,
+            "bytes": 3157248,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "mixed_or",
+          "elapsed_ns": 20231250,
+          "value_search": {
+            "documents": 256,
+            "bytes": 2104832,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "matches",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "literal_or",
+          "elapsed_ns": 28376125,
+          "value_search": {
+            "documents": 384,
+            "bytes": 3157248,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "mixed_or",
+          "elapsed_ns": 20215042,
+          "value_search": {
+            "documents": 256,
+            "bytes": 2104832,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "matches",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        }
+      ],
+      "limitations": "Debug server, shared macOS host, warm caches; work counters are exact, wall times include HTTP and host contention."
+    }
+  },
+  "after": {
+    "workload": {
+      "binary_sha256": "55698ab4f89bf0ef89ea8384bde219441614adc42d6d5efce07847aa386310d6",
+      "host": "macOS-27.0.1-arm64-arm-64bit",
+      "cpu_count": 14,
+      "documents": 128,
+      "source_sha256": "83ecdf0b22a6460a943b4a5b5ac6ea4f5380b26340101ecb34e3a4df323eed12",
+      "records": [
+        {
+          "name": "page_0",
+          "elapsed_ns": 80299584,
+          "value_search": {
+            "documents": 128,
+            "bytes": 1052416,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "page_1",
+          "elapsed_ns": 21563125,
+          "value_search": {
+            "documents": 0,
+            "bytes": 0,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "page_2",
+          "elapsed_ns": 21546541,
+          "value_search": {
+            "documents": 0,
+            "bytes": 0,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "page_3",
+          "elapsed_ns": 24917209,
+          "value_search": {
+            "documents": 0,
+            "bytes": 0,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "page_4",
+          "elapsed_ns": 22037750,
+          "value_search": {
+            "documents": 0,
+            "bytes": 0,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "page_5",
+          "elapsed_ns": 21324250,
+          "value_search": {
+            "documents": 0,
+            "bytes": 0,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "page_6",
+          "elapsed_ns": 21183208,
+          "value_search": {
+            "documents": 0,
+            "bytes": 0,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "page_7",
+          "elapsed_ns": 21042292,
+          "value_search": {
+            "documents": 0,
+            "bytes": 0,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "literal_or",
+          "elapsed_ns": 16553750,
+          "value_search": {
+            "documents": 128,
+            "bytes": 1052416,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "mixed_or",
+          "elapsed_ns": 13032584,
+          "value_search": {
+            "documents": 128,
+            "bytes": 1052416,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "matches",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "literal_or",
+          "elapsed_ns": 12477833,
+          "value_search": {
+            "documents": 128,
+            "bytes": 1052416,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "mixed_or",
+          "elapsed_ns": 12781167,
+          "value_search": {
+            "documents": 128,
+            "bytes": 1052416,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "matches",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "literal_or",
+          "elapsed_ns": 12175500,
+          "value_search": {
+            "documents": 128,
+            "bytes": 1052416,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "mixed_or",
+          "elapsed_ns": 14922417,
+          "value_search": {
+            "documents": 128,
+            "bytes": 1052416,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "matches",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "literal_or",
+          "elapsed_ns": 17476875,
+          "value_search": {
+            "documents": 128,
+            "bytes": 1052416,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "mixed_or",
+          "elapsed_ns": 12370125,
+          "value_search": {
+            "documents": 128,
+            "bytes": 1052416,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "matches",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "literal_or",
+          "elapsed_ns": 12231041,
+          "value_search": {
+            "documents": 128,
+            "bytes": 1052416,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "mixed_or",
+          "elapsed_ns": 12789584,
+          "value_search": {
+            "documents": 128,
+            "bytes": 1052416,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "matches",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "literal_or",
+          "elapsed_ns": 11970792,
+          "value_search": {
+            "documents": 128,
+            "bytes": 1052416,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "mixed_or",
+          "elapsed_ns": 12700583,
+          "value_search": {
+            "documents": 128,
+            "bytes": 1052416,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "matches",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "literal_or",
+          "elapsed_ns": 12927125,
+          "value_search": {
+            "documents": 128,
+            "bytes": 1052416,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "mixed_or",
+          "elapsed_ns": 12634125,
+          "value_search": {
+            "documents": 128,
+            "bytes": 1052416,
+            "plans": [
+              {
+                "operation": "contains",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              },
+              {
+                "operation": "matches",
+                "field": "title",
+                "candidate_field": null,
+                "index": "full_text_index_v0",
+                "verification": "original_value",
+                "fallback_reason": "no_safe_indexed_constraint"
+              }
+            ]
+          }
+        }
+      ],
+      "limitations": "Debug server, shared macOS host, warm caches; work counters are exact, wall times include HTTP and host contention."
+    }
+  },
+  "comparisons": {
+    "resume_pages": {
+      "trials": 7,
+      "before_median_ms": 39.705375,
+      "after_median_ms": 21.546541,
+      "elapsed_speedup": 1.842772582383409,
+      "before_verification_documents": [
+        128,
+        128,
+        128,
+        128,
+        128,
+        128,
+        128
+      ],
+      "after_verification_documents": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "before_verification_bytes": [
+        1052416,
+        1052416,
+        1052416,
+        1052416,
+        1052416,
+        1052416,
+        1052416
+      ],
+      "after_verification_bytes": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "literal_or": {
+      "trials": 7,
+      "before_median_ms": 28.376125,
+      "after_median_ms": 12.477833,
+      "elapsed_speedup": 2.2741228384768415,
+      "before_verification_documents": [
+        384,
+        384,
+        384,
+        384,
+        384,
+        384,
+        384
+      ],
+      "after_verification_documents": [
+        128,
+        128,
+        128,
+        128,
+        128,
+        128,
+        128
+      ],
+      "before_verification_bytes": [
+        3157248,
+        3157248,
+        3157248,
+        3157248,
+        3157248,
+        3157248,
+        3157248
+      ],
+      "after_verification_bytes": [
+        1052416,
+        1052416,
+        1052416,
+        1052416,
+        1052416,
+        1052416,
+        1052416
+      ]
+    },
+    "mixed_or": {
+      "trials": 7,
+      "before_median_ms": 20.44325,
+      "after_median_ms": 12.781167,
+      "elapsed_speedup": 1.599482269498552,
+      "before_verification_documents": [
+        256,
+        256,
+        256,
+        256,
+        256,
+        256,
+        256
+      ],
+      "after_verification_documents": [
+        128,
+        128,
+        128,
+        128,
+        128,
+        128,
+        128
+      ],
+      "before_verification_bytes": [
+        2104832,
+        2104832,
+        2104832,
+        2104832,
+        2104832,
+        2104832,
+        2104832
+      ],
+      "after_verification_bytes": [
+        1052416,
+        1052416,
+        1052416,
+        1052416,
+        1052416,
+        1052416,
+        1052416
+      ]
+    }
+  },
+  "memory_contract": {
+    "retained_bitmap_cache_bytes": 16777216,
+    "retained_entries": 128,
+    "retained_entry_bytes": 2097152,
+    "decoded_source_cache_bytes_per_request": 8388608,
+    "decoded_source_entries_per_request": 4096,
+    "literal_transition_storage_max_bytes": 1048576,
+    "persistent_cache_writes": false
+  },
+  "qualification_scope": [
+    "Synthetic 128-document, approximately 1 MiB source corpus with exact-count OR requests and eight retained pages. The seven resumed pages and seven OR trials provide the reported medians; the single initial capture is retained as raw data only.",
+    "Debug servers on a shared macOS host with warm caches. End-to-end wall time includes HTTP, snapshot admission, host contention, and merged-main changes; this is not an isolated microbenchmark of one optimization.",
+    "Verification documents/bytes measure predicate source work; response hydration, authorization, retained admission and index work remain. A cache hit is not a zero-cost API call.",
+    "No production-scale RSS, cold-storage or independent native Linux hardware benchmark is claimed. New server paths have no Linux/Windows runtime qualification in this report.",
+    "Decision/provider checks use local fixtures and establish no live model relevance or cost result. Full upstream PCRE2/JIT and exhaustive ripgrep parity remain outside these results.",
+    "GitHub PR CI still requires maintainer approval."
+  ]
+}

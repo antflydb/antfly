@@ -3085,6 +3085,8 @@ const DocumentPrimaryReadWindow = struct {
 const GraphReplacementProgress = struct { job: index_manager_mod.GraphReplacementBuild, checkpoint_ns: u64 };
 
 pub const DB = struct {
+    /// Installed only after immutable query-cut admission. Never persisted.
+    retained_value_scope: ?@import("../../search/value_membership.zig").Scope = null,
     retained_query_lease: ?@import("native_query_cut.zig").Guard = null,
     retained_remote_query_lease: ?@import("native_query_cut_repository.zig").StorageLease = null,
     native_query_warming: @import("native_query_warming.zig").Owner = .{},
@@ -20313,6 +20315,7 @@ pub const DB = struct {
                 });
                 errdefer readonly.close();
                 try control.token().check();
+                readonly.retained_value_scope = @import("../../search/value_membership.zig").Scope.init(self.core.path, request.id, origin, request.expires_ms);
                 readonly.retained_remote_query_lease = lease;
                 return readonly;
             }
@@ -20339,6 +20342,7 @@ pub const DB = struct {
         });
         errdefer readonly.close();
         try control.token().check();
+        readonly.retained_value_scope = @import("../../search/value_membership.zig").Scope.init(self.core.path, request.id, origin, request.expires_ms);
         readonly.retained_query_lease = reader;
         transferred = true;
         return readonly;
@@ -41155,6 +41159,71 @@ pub const DB = struct {
 
     fn searchLockedWithExecutionContextImpl(self: *DB, alloc: Allocator, req: types.SearchRequest, exec_ctx: types.ExecutionContext, externalize_artifact_ids: bool, dense_profile_sink: ?*db_query_search.DenseSearchProfile) !types.SearchResult {
         var request = req;
+        // A caller cannot promote a mutable DB into an immutable cache scope.
+        request.value_search_scope = self.retained_value_scope;
+        if (requestHasLogicalValues(req)) if (self.core.textIndexEntry(req.index_name)) |entry| {
+            // A declared mapping is not a completeness proof. Do not let a
+            // lagging or partial projection exclude a newer primary value.
+            if (!entry.coversPrimaryDocuments() or entry.backfill_active.load(.acquire) != 0) return error.IndexRebuilding;
+            // Retained/restored owners may have a persisted checkpoint newer
+            // than a newly attached worker's in-memory observation.
+            var applied = try self.core.loadAppliedSequence(alloc, entry.config.name);
+            if (self.executor.appliedSequence(entry.config.name)) |live| applied = @max(applied, live);
+            if (applied < self.core.nextDerivedSequence() and self.retained_remote_query_lease != null) {
+                if (self.primary_lsm_storage) |storage| {
+                    const checkpoint_path = try apply_state.checkpointPathAlloc(alloc, self.core.path);
+                    defer alloc.free(checkpoint_path);
+                    const retained = apply_state.loadProjectionCheckpointFromStorage(alloc, storage, checkpoint_path, entry.config.name) catch |err| switch (err) {
+                        error.FileNotFound => null,
+                        else => return err,
+                    };
+                    if (retained) |checkpoint| applied = @max(applied, checkpoint.applied_sequence);
+                }
+            }
+            // The global tail also includes work for unrelated projections.
+            // Match the existing readiness/debt contract: inspect replay hints
+            // only on the slow path where a global sequence gap exists.
+            const target = if (applied >= self.core.nextDerivedSequence()) applied else try self.probeDerivedReplayTargetSequence(
+                alloc,
+                self.core.replaySource(),
+                .{ .name = entry.config.name, .kind = .full_text },
+                applied,
+            );
+            if (applied < target) {
+                // Empty replicated batches can advance a text replay hint
+                // without producing an index commit/checkpoint. Require both
+                // source and index emptiness; a stale index with deleted rows
+                // must still fail closed, including under boolean negation.
+                const primary_count = try range_cardinality.loadOrProveEmpty(alloc, self.core.store);
+                const empty_projection = if (primary_count != null and primary_count.? == 0) empty: {
+                    const empty_snapshot = entry.persistent.acquireSnapshot();
+                    defer empty_snapshot.release();
+                    break :empty empty_snapshot.liveDocCount() == 0;
+                } else false;
+                if (!empty_projection) {
+                    std.log.debug("logical value index checkpoint behind index={s} applied={d} target={d}", .{ entry.config.name, applied, target });
+                    return error.IndexRebuilding;
+                }
+            }
+        };
+        var logical_planning = std.heap.ArenaAllocator.init(alloc);
+        defer logical_planning.deinit();
+        if (self.core.schema) |schema| {
+            var changed = false;
+            for (req.order_by) |field| if (schema_mod.resolveLogicalDocValues(schema, field.field)) |resolved| {
+                if (!std.mem.eql(u8, resolved.field, field.field)) changed = true;
+            };
+            if (changed) {
+                const fields = try logical_planning.allocator().dupe(types.SortField, req.order_by);
+                for (fields) |*field| if (schema_mod.resolveLogicalDocValues(schema, field.field)) |resolved| {
+                    field.field = resolved.field;
+                };
+                request.order_by = fields;
+            }
+        }
+        var value_work: @import("../../search/value_query.zig").Work = .{};
+        defer value_work.deinit(alloc);
+        if (request.value_search_work == null) request.value_search_work = &value_work;
         var projection: ?@import("document_query.zig").SpanProjectionPlan = null;
         defer if (projection) |*plan| plan.deinit();
         const projection_opts: types.LookupOptions = .{ .fields = req.fields, .include_all_fields = req.include_all_fields };
@@ -41165,6 +41234,9 @@ pub const DB = struct {
         }
         var result = try self.searchLockedWithExecutionContextRaw(alloc, request, exec_ctx, externalize_artifact_ids, dense_profile_sink);
         errdefer result.deinit();
+        if (req.profile and req.value_search_work == null) {
+            result.value_search_profile_json = try value_work.profileAlloc(alloc);
+        }
         try self.attachDistributedDocumentAuthority(alloc, req, &result);
         return result;
     }
@@ -42224,6 +42296,9 @@ pub const DB = struct {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         if (try self.composedRequestTouchesChunkBackedMemberModeArm(alloc, req)) return null;
         return try db_query_search.resolveStructuredDocFilterForComposedAlloc(alloc, req, .{
+            .load_stored = loadStoredSearchDocumentCallback,
+            .load_many_stored_values = loadStoredSearchDocumentManyCallback,
+            .open_logical_sources = openStoredLogicalSourcesCallback,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
@@ -42243,6 +42318,9 @@ pub const DB = struct {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         if (try self.composedRequestTouchesChunkBackedMemberModeArm(alloc, req)) return null;
         return try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, req, .{
+            .load_stored = loadStoredSearchDocumentCallback,
+            .load_many_stored_values = loadStoredSearchDocumentManyCallback,
+            .open_logical_sources = openStoredLogicalSourcesCallback,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
@@ -42474,7 +42552,92 @@ pub const DB = struct {
         };
     }
 
+    fn searchLogicalValuesWithoutTextIndex(self: *DB, alloc: Allocator, req: types.SearchRequest, query: types.TextQuery) !types.SearchResult {
+        const values = @import("../../search/value_query.zig");
+        if (!req.value_search_execution.allow_scan) return error.ValueSearchRequiresScan;
+        var preparation = std.heap.ArenaAllocator.init(alloc);
+        defer preparation.deinit();
+        const must = try preparation.allocator().alloc(types.TextQuery, if (req.filter_text != null) 2 else 1);
+        must[0] = query;
+        if (req.filter_text) |filter| must[1] = filter;
+        const must_not = try preparation.allocator().alloc(types.TextQuery, if (req.exclusion_text != null) 1 else 0);
+        if (req.exclusion_text) |filter| must_not[0] = filter;
+        var tree = try values.Tree.prepare(preparation.allocator(), types.TextQuery{ .bool_query = .{ .must = must, .must_not = must_not } });
+        if (req.profile) if (req.value_search_work) |work| try recordLogicalScanPlans(alloc, work, query);
+
+        const Scan = struct {
+            db: *DB,
+            a: Allocator,
+            req: types.SearchRequest,
+            tree: *values.Tree,
+            projection: ?@import("../../search/value_source.zig").Plan = null,
+            projection_attempted: bool = false,
+            allowed: ?*const std.StringHashMapUnmanaged(void) = null,
+            ids: std.ArrayListUnmanaged([]const u8) = .empty,
+            local_work: values.Work = .{},
+            fn consume(raw: ?*anyopaque, candidate: db_query_search.MatchAllCandidate) anyerror!void {
+                const value_scan: *@This() = @ptrCast(@alignCast(raw.?));
+                var owned = candidate;
+                defer owned.deinit(value_scan.a);
+                if (value_scan.allowed) |allowed| if (!allowed.contains(owned.id)) return;
+                if (value_scan.req.cancellation) |token| try token.check();
+                const work = value_scan.req.value_search_work orelse &value_scan.local_work;
+                try values.Work.charge(&work.documents, 1, value_scan.req.value_search_execution.max_documents);
+                var scratch = std.heap.ArenaAllocator.init(@import("../../sql/memory_budget.zig").reclaimingAllocator(value_scan.a));
+                defer scratch.deinit();
+                const read_start = if (value_scan.req.profile) platform_time.monotonicNs() else 0;
+                const stored = try value_scan.db.loadStoredSearchDocumentProbe(scratch.allocator(), owned.id);
+                if (value_scan.req.profile) {
+                    _ = work.source_read_ns.fetchAdd(platform_time.monotonicNs() - read_start, .monotonic);
+                    _ = work.source_scalar_reads.fetchAdd(1, .monotonic);
+                }
+                const bytes = stored orelse return;
+                try values.Work.charge(&work.bytes, bytes.len, value_scan.req.value_search_execution.max_bytes);
+                if (bytes.len >= 1024 and !value_scan.projection_attempted) {
+                    value_scan.projection_attempted = true;
+                    value_scan.projection = value_scan.tree.sourcePlan(value_scan.a) catch null;
+                }
+                const parse_start = if (value_scan.req.profile) platform_time.monotonicNs() else 0;
+                const parsed = try @import("../../search/value_source.zig").parse(scratch.allocator(), bytes, if (value_scan.projection) |*plan| plan else null);
+                if (value_scan.req.profile) {
+                    _ = work.source_parse_ns.fetchAdd(platform_time.monotonicNs() - parse_start, .monotonic);
+                    if (parsed.projected) _ = work.projected_sources.fetchAdd(1, .monotonic);
+                }
+                if (!try value_scan.tree.matches(parsed.value)) return;
+                const id = try value_scan.a.dupe(u8, owned.id);
+                errdefer value_scan.a.free(id);
+                try value_scan.ids.append(value_scan.a, id);
+            }
+        };
+        var allowed = std.StringHashMapUnmanaged(void).empty;
+        defer allowed.deinit(alloc);
+        for (req.filter_doc_ids) |id| try allowed.put(alloc, id, {});
+        var value_scan = Scan{ .db = self, .a = alloc, .req = req, .tree = &tree, .allowed = if (req.filter_doc_ids_positive or req.filter_doc_ids.len != 0) &allowed else null };
+        defer value_scan.local_work.deinit(alloc);
+        defer if (value_scan.projection) |*plan| plan.deinit();
+        tree.bindWork(req.value_search_work orelse &value_scan.local_work, req.value_search_execution);
+        defer {
+            for (value_scan.ids.items) |id| alloc.free(id);
+            value_scan.ids.deinit(alloc);
+        }
+        // Reuse the primary identity stream: no expanded index payloads, no
+        // artifacts mistaken for documents, and bounded source lifetimes.
+        _ = try streamSearchMatchAllCandidatesCallback(self, alloc, req, .{}, &value_scan, Scan.consume);
+        var next = req;
+        next.full_text = null;
+        next.filter_text = null;
+        next.exclusion_text = null;
+        next.query = .{ .match_all = {} };
+        next.filter_doc_ids = value_scan.ids.items;
+        next.filter_doc_ids_positive = true;
+        return self.searchMatchAll(alloc, next);
+    }
+
     fn searchTextQuery(self: *DB, alloc: Allocator, req: types.SearchRequest, text_query: types.TextQuery) !types.SearchResult {
+        if (self.core.textIndexEntry(req.index_name) == null and (textQueryHasLogicalValues(text_query) or (if (req.filter_text) |filter| textQueryHasLogicalValues(filter) else false) or (if (req.exclusion_text) |filter| textQueryHasLogicalValues(filter) else false))) {
+            return self.searchLogicalValuesWithoutTextIndex(alloc, req, text_query);
+        }
+
         // A primary-document projection may also contain generated members.
         // For a plain source-parent match_all those members cannot add a parent
         // or improve its constant score. Read the primary population directly,
@@ -42557,6 +42720,9 @@ pub const DB = struct {
             null
         else
             try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, execution_req, .{
+                .load_stored = loadStoredSearchDocumentCallback,
+                .load_many_stored_values = loadStoredSearchDocumentManyCallback,
+                .open_logical_sources = openStoredLogicalSourcesCallback,
                 .ctx = self,
                 .text_index_entry = textIndexEntryCallback,
                 .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
@@ -42591,6 +42757,8 @@ pub const DB = struct {
             .search_match_all = searchMatchAllCallback,
             .project_stored_search = projectStoredBytesForSearchCallback,
             .load_stored = loadStoredSearchDocumentCallback,
+            .load_many_stored_values = loadStoredSearchDocumentManyCallback,
+            .open_logical_sources = openStoredLogicalSourcesCallback,
             .load_projected_documents = loadProjectedSearchDocumentManyCallback,
             .is_expired_key = isNonvisibleStoredSearchKeyCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
@@ -43910,6 +44078,9 @@ pub const DB = struct {
 
     fn searchRequestWithDynamicStructuredDocFilterAlloc(self: *DB, req: types.SearchRequest) !?AlgebraicDocFilterRequest {
         var resolved = (try db_query_search.resolveStructuredDocFilterForComposedAlloc(self.alloc, req, .{
+            .load_stored = loadStoredSearchDocumentCallback,
+            .load_many_stored_values = loadStoredSearchDocumentManyCallback,
+            .open_logical_sources = openStoredLogicalSourcesCallback,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
@@ -131669,6 +131840,64 @@ fn loadStoredSearchDocumentCallback(
     return try self.loadStoredSearchDocumentProbe(alloc, key);
 }
 
+/// Lazily pin one source epoch for the complete logical verification. Reuse
+/// it across windows; never clone mutable LSM state once per batch. All proof,
+/// directory, range and legacy reads share this exact captured generation.
+const StoredLogicalSources = struct {
+    a: Allocator,
+    db: *DB,
+    view: ?schema_registry_mod.SchemaView,
+    txn: docstore_mod.DocStore.Txn,
+    repair_requested: bool = false,
+    fn close(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.txn.abort();
+        if (self.view) |*v| v.release();
+        const a = self.a;
+        a.destroy(self);
+    }
+    fn load(raw: *anyopaque, alloc: Allocator, ids: []const []const u8, roots: []const []const u8) anyerror![]db_query_search.LogicalSourceRow {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (ids.len > 64) return error.InvalidBatch;
+        var scratch = std.heap.ArenaAllocator.init(@import("../../sql/memory_budget.zig").reclaimingAllocator(alloc));
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var keys: [64][]const u8 = undefined;
+        for (ids, keys[0..ids.len]) |id, *key| key.* = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self.db, a, id, self.view);
+        var scope = try self.txn.openReadScope(a);
+        defer scope.close();
+        // Empty roots deliberately load complete bodies from this same cut.
+        // Authentication here authorizes omitted ranges, not primary reads;
+        // skipped metadata must not masquerade as missing authority to repair.
+        const rows = try @import("../logical_source.zig").load(alloc, a, &scope, keys[0..ids.len], ids, roots, roots.len != 0 and self.db.core.store.valuesAreAuthenticated());
+        if (!self.repair_requested and !openModeRequiresReadOnlyBackends(self.db.open_mode)) {
+            for (rows) |row| if (row.repair_authority) {
+                self.repair_requested = true;
+                // Wake the existing bounded authority migration; the read path
+                // never repairs storage or bypasses leader/apply ownership.
+                self.db.document_authority_backfill_requested.store(true, .release);
+                break;
+            };
+        }
+        return rows;
+    }
+};
+fn openStoredLogicalSourcesCallback(ctx: ?*anyopaque, a: Allocator) anyerror!?db_query_search.LogicalSourceReader {
+    const db: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    if (getenv("ANTFLY_BENCH_VALUE_SOURCE_FULL_READ")) |v| if (std.mem.eql(u8, v, "1")) return null;
+    // Ordinal rows retain their existing schema-versioned decoding path.
+    var view = db.core.acquireSchemaView();
+    errdefer if (view) |*v| v.release();
+    if (view) |v| if (v.storageMode() != .document) {
+        view.?.release();
+        return null;
+    };
+    const owner = try a.create(StoredLogicalSources);
+    errdefer a.destroy(owner);
+    owner.* = .{ .a = a, .db = db, .view = view, .txn = try db.core.store.beginReadTxn() };
+    return .{ .ctx = owner, .load = StoredLogicalSources.load, .close = StoredLogicalSources.close };
+}
+
 fn loadStoredSearchDocumentManyCallback(
     ctx: ?*anyopaque,
     alloc: Allocator,
@@ -141164,6 +141393,139 @@ test "public graph metric borrowed wire document scan producers preserve project
     visitor = .{ .fail = true };
     try std.testing.expectError(error.Canceled, db.scanVisit(a, "", "", opts, .{ .context = &visitor, .visit = Visitor.visit, .borrow_documents = true }));
     try std.testing.expectEqual(@as(usize, 1), visitor.count);
+}
+
+fn textQueryHasLogicalValues(query: types.TextQuery) bool {
+    return switch (query) {
+        .value => true,
+        .bool_query => |b| blk: {
+            for (b.must) |child| if (textQueryHasLogicalValues(child)) break :blk true;
+            for (b.should) |child| if (textQueryHasLogicalValues(child)) break :blk true;
+            for (b.must_not) |child| if (textQueryHasLogicalValues(child)) break :blk true;
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+test "logical query primary and indexed searches preserve exact pages filters counts and budgets" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("logical-query");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    const query: types.TextQuery = .{ .value = .{ .kind = .contains, .field = "content", .text = "connection-refused" } };
+    try db.batch(.{ .writes = &.{
+        .{ .key = "a", .value = "{\"content\":\"Connection refused\"}" },
+        .{ .key = "b", .value = "{\"content\":\"connection refused\"}" },
+        .{ .key = "c", .value = "{\"content\":\"connection-refused\"}" },
+        .{ .key = "d", .value = "{\"content\":\"connection-refused twice\"}" },
+    }, .sync_level = .full_index });
+    try std.testing.expectError(error.ValueSearchRequiresScan, db.search(alloc, .{ .full_text = query }));
+    {
+        var result = try db.search(alloc, .{ .full_text = query, .value_search_execution = .{ .allow_scan = true }, .order_by = &.{.{ .field = "_id" }}, .limit = 1 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        try std.testing.expectEqualStrings("c", result.hits[0].id);
+    }
+    try db.setSchema(.{ .full_text_documents = &.{.{ .name = "_default", .fields = &.{
+        .{ .path = "content", .emitted_name = "content", .analyzer = "standard" },
+        .{ .path = "content", .emitted_name = "content._substring", .analyzer = "substring" },
+    } }} });
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{
+        .{ .key = "a", .value = "{\"content\":\"Connection refused\"}" },
+        .{ .key = "b", .value = "{\"content\":\"connection refused\"}" },
+        .{ .key = "c", .value = "{\"content\":\"connection-refused\"}" },
+        .{ .key = "d", .value = "{\"content\":\"connection-refused twice\"}" },
+    }, .sync_level = .full_index });
+    {
+        var result = try db.search(alloc, .{ .full_text = query, .order_by = &.{.{ .field = "_id" }}, .limit = 1 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        try std.testing.expectEqualStrings("c", result.hits[0].id);
+    }
+    {
+        var result = try db.search(alloc, .{ .full_text = query, .count_only = true, .profile = true });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+        try std.testing.expect(result.value_search_profile_json != null);
+    }
+    {
+        var result = try db.search(alloc, .{ .full_text = .{ .match_all = {} }, .filter_text = query, .count_only = true });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    }
+    try std.testing.expectError(error.ValueSearchLimitExceeded, db.search(alloc, .{ .full_text = query, .value_search_execution = .{ .max_documents = 1 } }));
+}
+
+fn recordLogicalScanPlans(a: Allocator, work: *@import("../../search/value_query.zig").Work, query: types.TextQuery) anyerror!void {
+    switch (query) {
+        .value => |spec| try work.record(a, spec, null, null, "no_text_index", "original_value"),
+        .bool_query => |b| {
+            for (b.must) |child| try recordLogicalScanPlans(a, work, child);
+            for (b.should) |child| try recordLogicalScanPlans(a, work, child);
+            for (b.must_not) |child| try recordLogicalScanPlans(a, work, child);
+        },
+        else => {},
+    }
+}
+
+fn requestHasLogicalValues(req: types.SearchRequest) bool {
+    if (req.full_text) |query| if (textQueryHasLogicalValues(query)) return true;
+    if (req.filter_text) |query| if (textQueryHasLogicalValues(query)) return true;
+    if (req.exclusion_text) |query| if (textQueryHasLogicalValues(query)) return true;
+    for (req.full_text_queries) |named| if (textQueryHasLogicalValues(named.query)) return true;
+    return false;
+}
+
+test "logical query sort resolves raw keyword doc values without changing source fields" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("logical-sort");
+    defer directory.cleanup();
+    var db = try DB.open(a, std.mem.span(directory.path().ptr), .{});
+    defer db.close();
+    try db.setSchema(.{ .exact_fields = &.{
+        .{ .source_field = "title", .field = "title", .mapping = .{ .field_type = .text, .analyzer = "standard" } },
+        .{ .source_field = "title", .field = "title._keyword", .mapping = .{ .field_type = .keyword, .analyzer = "keyword", .doc_values = true, .sortable = true } },
+    } });
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{
+        .{ .key = "a", .value = "{\"title\":\"zebra\"}" },
+        .{ .key = "b", .value = "{\"title\":\"Apple\"}" },
+    }, .sync_level = .full_index });
+    var result = try db.search(a, .{ .order_by = &.{.{ .field = "title" }}, .limit = 2 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("b", result.hits[0].id);
+    try std.testing.expectEqualStrings("a", result.hits[1].id);
+}
+
+test "logical query readiness distinguishes unrelated replay from unapplied text work" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("logical-readiness");
+    defer directory.cleanup();
+    var db = try DB.open(a, std.mem.span(directory.path().ptr), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    const unrelated = db.core.nextDerivedSequence() + 1;
+    const payload = try change_journal_mod.encodeRecord(a, .{ .sequence = unrelated, .changed_doc_keys = &.{"doc:a"}, .target_hints = &.{.enrichment} });
+    defer a.free(payload);
+    try db.core.store.appendReplayOpaque(a, unrelated, payload);
+    const request: types.SearchRequest = .{ .full_text = .{ .value = .{ .kind = .contains, .field = "content", .text = "needle" } }, .value_search_execution = .{ .allow_scan = true }, .count_only = true };
+    var result = try db.search(a, request);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 0), result.total_hits);
+    const relevant = try change_journal_mod.encodeRecord(a, .{ .sequence = unrelated + 1, .changed_doc_keys = &.{"doc:a"}, .target_hints = &.{.full_text} });
+    defer a.free(relevant);
+    try db.core.store.appendReplayOpaque(a, unrelated + 1, relevant);
+    var empty = try db.search(a, request);
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(u32, 0), empty.total_hits);
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"content\":\"needle\"}" }}, .sync_level = .write });
+    try std.testing.expectError(error.IndexRebuilding, db.search(a, request));
 }
 
 test "grouped sources production publishes private units incrementally across delete and reopen" {
