@@ -31,6 +31,8 @@ const DecisionProvenance = struct { principal: []const u8, recorded_at: i64, con
 // Causal inference inputs are conjunctive retention/authorization dependencies,
 // independent of the alternative factual support selected by a producer.
 const GenerationProvenance = struct { operation_id: []const u8, config_generation: u64, evidence_ids: []const []const u8 };
+const StoredOutcome = struct { outcome: t.Outcome, owner: []const u8, recorded_at: i64 };
+const DependencyWork = struct { kind: []const u8, id: []const u8, revision: u64, cursor: ?[]const u8 = null };
 const EntityPolicy = struct { state: curation.State = .{}, redirects: []const curation.Redirect = &.{} };
 // Free-text audit content has its own retention lifecycle. Identity origins
 // retain only attribution/revision, so forgetting can scrub content without
@@ -1161,6 +1163,7 @@ const Run = struct {
         try t.validateId(value.id);
         if (try self.read(bool, try key(self.a, "forgotten-entity", value.id)) != null) return error.MemoryForgotten;
         try t.validateId(value.name);
+        if (value.evidence.len > t.max_items) return error.MemoryInputTooLarge;
         if (!try self.supportVisible(value.evidence, &.{}, 0)) return error.MemoryEvidenceRequired;
         for (value.evidence) |ref| {
             const source = (try self.evidence(ref.id)).?;
@@ -1395,15 +1398,24 @@ const Run = struct {
         try self.put("cleanup", .{ .cursor = @as(?[]const u8, null) });
     }
     fn outcome(self: *Run, request: t.Outcome) !void {
+        if (try self.read(bool, "forgotten-all") != null) return error.MemoryForgotten;
         try t.validateId(request.id);
         try t.validateId(request.task_id);
-        if (request.used_memory_ids.len > t.max_items) return error.MemoryInputTooLarge;
+        if (request.used_memory_ids.len > t.max_items or request.detail.len > t.max_text_bytes) return error.MemoryInputTooLarge;
+        if (!std.unicode.utf8ValidateSlice(request.detail)) return error.InvalidMemoryRequest;
+        if (try self.read(bool, try key(self.a, "forgotten-outcome", request.id)) != null) return error.MemoryForgotten;
+        const path = try key(self.a, "outcome", request.id);
+        if (try self.read(StoredOutcome, path)) |old| {
+            try self.authorize(old.owner, .private);
+            if (!eql(u8, try self.encode(old.outcome), try self.encode(request))) return error.MemoryOutcomeConflict;
+            return;
+        }
         for (request.used_memory_ids) |id| {
             const record = (try self.assertion(id)) orelse return error.MemoryNotFound;
             try self.authorize(record.owner, record.assertion.visibility);
             if (!try self.evidenceVisible(record)) return error.MemoryNotFound;
         }
-        try self.put(try key(self.a, "outcome", request.id), .{ .outcome = request, .owner = self.service.context.principal, .recorded_at = self.service.context.now_ms });
+        try self.put(path, StoredOutcome{ .outcome = request, .owner = self.service.context.principal, .recorded_at = self.service.context.now_ms });
     }
     fn advance(self: *Run, id: []const u8, receipt: *t.Operation) !void {
         if (id.len == 0) return self.maintenance();
@@ -1594,27 +1606,18 @@ const Run = struct {
         // the shared temporal support traversal; it is never global staleness.
         const work = try self.service.backend.scan(self.service.backend.ptr, self.a, "dependency/work/", null, 1);
         if (work.rows.len > 0) {
-            const item = try parse(struct { kind: []const u8, id: []const u8, revision: u64, cursor: ?[]const u8 = null }, self.a, work.rows[0].json);
+            const item = try parse(DependencyWork, self.a, work.rows[0].json);
             const prefix = try std.fmt.allocPrint(self.a, "dependency/{s}/{s}/", .{ item.kind, try hash(self.a, item.id) });
             const page = try self.service.backend.scan(self.service.backend.ptr, self.a, prefix, item.cursor, 64);
+            var position = item.cursor;
             for (page.rows) |row| {
-                const child = try parse(struct { child: []const u8 }, self.a, row.json);
-                if (try self.assertion(child.child)) |value| {
-                    var record = value;
-                    if (!try self.retained(record, 0)) {
-                        try self.retireAssertion(child.child);
-                    } else if (!record.stale and record.revision <= item.revision and eql(u8, item.kind, "entity")) {
-                        // Identity changes invalidate opaque derived artifacts;
-                        // ordinary support changes do not rewrite factual history.
-                        // A delayed event cannot invalidate a regenerated artifact.
-                        record.stale = true;
-                        record.revision = self.state.revision;
-                        try self.putAssertion(record);
-                        try self.invalidate("assertion", child.child);
-                    }
+                if (!try self.maintenanceStep(maintainChild, .{ row, item })) {
+                    try self.put(work.rows[0].key, DependencyWork{ .kind = item.kind, .id = item.id, .revision = item.revision, .cursor = position });
+                    return;
                 }
+                position = row.key;
             }
-            if (page.next) |cursor| try self.put(work.rows[0].key, .{ .kind = item.kind, .id = item.id, .revision = item.revision, .cursor = cursor }) else try self.remove(work.rows[0].key);
+            if (page.next) |cursor| try self.put(work.rows[0].key, DependencyWork{ .kind = item.kind, .id = item.id, .revision = item.revision, .cursor = cursor }) else try self.remove(work.rows[0].key);
         }
         if (try self.read(struct { cursor: ?[]const u8 = null }, "cleanup")) |cleanup| {
             // Include history appended by this quantum's invalidation work;
@@ -1623,75 +1626,111 @@ const Run = struct {
             var continuation = page.next;
             var position = cleanup.cursor;
             var deferred = false;
-            const forgetting_all = try self.read(bool, "forgotten-all") != null;
             for (page.rows) |row| {
-                if (eql(u8, row.key, "entity-policy")) {
-                    // Also scrub policy rows left by earlier implementations
-                    // or a restored pre-cleanup snapshot of a forgotten space.
-                    if (try self.read(bool, "forgotten-all") != null) try self.remove(row.key);
-                } else if (std.mem.startsWith(u8, row.key, "evidence/")) {
-                    const source = try parse(t.StoredEvidence, self.a, row.json);
-                    const expires = self.evidenceExpiry(source);
-                    if (expires) |time| if (time > self.service.context.now_ms and (self.state.next_expiry_at == null or time < self.state.next_expiry_at.?)) {
-                        self.state.next_expiry_at = time;
-                    };
-                    if (!try self.evidenceRetained(source)) {
-                        try self.remove(row.key);
-                        try self.put(try key(self.a, "forgotten-evidence", source.evidence.id), true);
-                    }
-                } else if (std.mem.startsWith(u8, row.key, "entity-curation/")) {
-                    // At most two entities, each with 256 direct evidence refs
-                    // and 512 admitted generation inputs. Yield before a new
-                    // artifact can exhaust this quantum's shared work quota.
-                    const reserve = 2 * (t.max_items + 2 * t.max_items);
-                    if (!forgetting_all and self.support_work > max_support_work - reserve) {
-                        continuation = position;
-                        deferred = true;
-                        break;
-                    }
-                    const provenance = try parse(EntityCurationProvenance, self.a, row.json);
-                    if (!try self.curationProvenanceRetained(provenance)) try self.remove(row.key);
-                } else if (std.mem.startsWith(u8, row.key, "entity/")) {
-                    const stored = try parse(t.EntityRecord, self.a, row.json);
-                    if (try self.read(bool, "forgotten-all") != null or !try self.entityVisible(stored)) {
-                        try self.put(try key(self.a, "forgotten-entity", stored.entity.id), true);
-                        try self.remove(try self.generationKey("entity", stored.entity.id));
-                        try self.remove(row.key);
-                    }
-                } else if (std.mem.startsWith(u8, row.key, "decision/")) {
-                    const decision = try parse(DecisionProvenance, self.a, row.json);
-                    if (try self.assertion(decision.assertion_id) == null) try self.remove(row.key);
-                } else if (std.mem.startsWith(u8, row.key, "reason-binding/")) {
-                    var parts = std.mem.splitScalar(u8, row.key, '/');
-                    _ = parts.next();
-                    const id_hash = parts.next() orelse return error.MemoryCorruptState;
-                    if (try self.read(std.json.Value, try std.fmt.allocPrint(self.a, "assertion/{s}", .{id_hash})) == null) try self.remove(row.key);
-                } else if (std.mem.startsWith(u8, row.key, "generation-input/")) {
-                    const owner_key = row.key["generation-input/".len..];
-                    if (try self.read(std.json.Value, owner_key) == null) try self.remove(row.key);
-                } else if (std.mem.startsWith(u8, row.key, "vector/")) {
-                    const projection = try parse(VectorProjection, self.a, row.json);
-                    const record = try self.assertion(projection.assertion_id);
-                    const serving = self.state.config.features.semantic_recall and projection.generation == self.state.config.embedding_generation;
-                    const staging = if (self.state.pending_config) |pending| projection.generation == pending.embedding_generation else false;
-                    if ((!serving and !staging) or record == null or !try self.retained(record.?, 0)) try self.remove(row.key);
-                } else if (std.mem.startsWith(u8, row.key, "outcome/")) {
-                    const stored = try parse(struct { outcome: t.Outcome, owner: []const u8, recorded_at: i64 }, self.a, row.json);
-                    var remove_outcome = try self.read(bool, "forgotten-all") != null;
-                    for (stored.outcome.used_memory_ids) |used| {
-                        const parent = try self.assertion(used);
-                        if (parent == null or !try self.evidenceVisible(parent.?)) remove_outcome = true;
-                    }
-                    if (remove_outcome) try self.remove(row.key);
-                } else if (std.mem.startsWith(u8, row.key, "assertion/") or std.mem.startsWith(u8, row.key, "history/")) {
-                    const record = (try self.read(t.StoredAssertion, row.key)) orelse continue;
-                    if (!try self.retained(record, 0)) {
-                        if (std.mem.startsWith(u8, row.key, "assertion/")) try self.retireAssertion(record.assertion.id) else try self.remove(row.key);
-                    } else try self.put(row.key, try self.publicRecord(record));
+                if (!try self.maintenanceStep(maintainRow, .{row})) {
+                    continuation = position;
+                    deferred = true;
+                    break;
                 }
                 position = row.key;
             }
             if (deferred or continuation != null) try self.put("cleanup", .{ .cursor = continuation }) else try self.remove("cleanup");
+        }
+    }
+    // Each artifact is atomic, while a quantum commits all completed artifacts.
+    // Work exhaustion on a later artifact yields its cursor instead of rolling
+    // back earlier progress. Restore overlay/state in case admission wrote before
+    // evaluating a later provenance branch; cache entries cannot survive rollback.
+    fn maintenanceStep(self: *Run, comptime handler: anytype, args: anytype) !bool {
+        const work_before = self.support_work;
+        const checkpoint = try self.a.dupe(Change, self.changes.items);
+        const state_before = self.state;
+        @call(.auto, handler, .{self} ++ args) catch |err| {
+            if (err != error.MemoryWorkLimit or work_before == 0) return err;
+            self.changes.clearRetainingCapacity();
+            try self.changes.appendSlice(self.a, checkpoint);
+            self.state = state_before;
+            self.views.clearRetainingCapacity();
+            self.historical.clearRetainingCapacity();
+            return false;
+        };
+        return true;
+    }
+    fn maintainChild(self: *Run, row: Row, item: DependencyWork) anyerror!void {
+        const child = try parse(struct { child: []const u8 }, self.a, row.json);
+        if (try self.assertion(child.child)) |value| {
+            var record = value;
+            if (!try self.retained(record, 0)) {
+                try self.retireAssertion(child.child);
+            } else if (!record.stale and record.revision <= item.revision and eql(u8, item.kind, "entity")) {
+                // Identity changes invalidate opaque derived artifacts;
+                // ordinary support changes do not rewrite factual history.
+                // A delayed event cannot invalidate a regenerated artifact.
+                record.stale = true;
+                record.revision = self.state.revision;
+                try self.putAssertion(record);
+                try self.invalidate("assertion", child.child);
+            }
+        }
+    }
+    fn maintainRow(self: *Run, row: Row) anyerror!void {
+        if (eql(u8, row.key, "entity-policy")) {
+            // Also scrub policy rows left by earlier implementations
+            // or a restored pre-cleanup snapshot of a forgotten space.
+            if (try self.read(bool, "forgotten-all") != null) try self.remove(row.key);
+        } else if (std.mem.startsWith(u8, row.key, "evidence/")) {
+            const source = try parse(t.StoredEvidence, self.a, row.json);
+            const expires = self.evidenceExpiry(source);
+            if (expires) |time| if (time > self.service.context.now_ms and (self.state.next_expiry_at == null or time < self.state.next_expiry_at.?)) {
+                self.state.next_expiry_at = time;
+            };
+            if (!try self.evidenceRetained(source)) {
+                try self.remove(row.key);
+                try self.put(try key(self.a, "forgotten-evidence", source.evidence.id), true);
+            }
+        } else if (std.mem.startsWith(u8, row.key, "entity-curation/")) {
+            const provenance = try parse(EntityCurationProvenance, self.a, row.json);
+            if (!try self.curationProvenanceRetained(provenance)) try self.remove(row.key);
+        } else if (std.mem.startsWith(u8, row.key, "entity/")) {
+            const stored = try parse(t.EntityRecord, self.a, row.json);
+            if (try self.read(bool, "forgotten-all") != null or !try self.entityVisible(stored)) {
+                try self.put(try key(self.a, "forgotten-entity", stored.entity.id), true);
+                try self.remove(try self.generationKey("entity", stored.entity.id));
+                try self.remove(row.key);
+            }
+        } else if (std.mem.startsWith(u8, row.key, "decision/")) {
+            const decision = try parse(DecisionProvenance, self.a, row.json);
+            if (try self.assertion(decision.assertion_id) == null) try self.remove(row.key);
+        } else if (std.mem.startsWith(u8, row.key, "reason-binding/")) {
+            var parts = std.mem.splitScalar(u8, row.key, '/');
+            _ = parts.next();
+            const id_hash = parts.next() orelse return error.MemoryCorruptState;
+            if (try self.read(std.json.Value, try std.fmt.allocPrint(self.a, "assertion/{s}", .{id_hash})) == null) try self.remove(row.key);
+        } else if (std.mem.startsWith(u8, row.key, "generation-input/")) {
+            const owner_key = row.key["generation-input/".len..];
+            if (try self.read(std.json.Value, owner_key) == null) try self.remove(row.key);
+        } else if (std.mem.startsWith(u8, row.key, "vector/")) {
+            const projection = try parse(VectorProjection, self.a, row.json);
+            const record = try self.assertion(projection.assertion_id);
+            const serving = self.state.config.features.semantic_recall and projection.generation == self.state.config.embedding_generation;
+            const staging = if (self.state.pending_config) |pending| projection.generation == pending.embedding_generation else false;
+            if ((!serving and !staging) or record == null or !try self.retained(record.?, 0)) try self.remove(row.key);
+        } else if (std.mem.startsWith(u8, row.key, "outcome/")) {
+            const stored = try parse(StoredOutcome, self.a, row.json);
+            var remove_outcome = try self.read(bool, "forgotten-all") != null;
+            for (stored.outcome.used_memory_ids) |used| {
+                const parent = try self.assertion(used);
+                if (parent == null or !try self.evidenceVisible(parent.?)) remove_outcome = true;
+            }
+            if (remove_outcome) {
+                try self.put(try key(self.a, "forgotten-outcome", stored.outcome.id), true);
+                try self.remove(row.key);
+            }
+        } else if (std.mem.startsWith(u8, row.key, "assertion/") or std.mem.startsWith(u8, row.key, "history/")) {
+            const record = (try self.read(t.StoredAssertion, row.key)) orelse return;
+            if (!try self.retained(record, 0)) {
+                if (std.mem.startsWith(u8, row.key, "assertion/")) try self.retireAssertion(record.assertion.id) else try self.remove(row.key);
+            } else try self.put(row.key, try self.publicRecord(record));
         }
     }
     fn encodeCursor(self: *Run, prefix: []const u8, position: ?[]const u8) !?[]const u8 {

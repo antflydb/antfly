@@ -17989,6 +17989,27 @@ test "native memory HTTP and MCP share persistent storage and private provenance
     defer accepted.deinit();
     if (accepted.status.code != 200) std.debug.print("memory HTTP: {s}\n", .{accepted.body orelse ""});
     try std.testing.expectEqual(@as(u16, 200), accepted.status.code);
+    const outcome_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/outcomes", .{base});
+    defer a.free(outcome_url);
+    const feedback =
+        \\{"id":"feedback","task_id":"deployment","success":true,"used_memory_ids":["a1"],"detail":"Deployment succeeded"}
+    ;
+    const outcome_headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ "idempotency-key", "feedback" } };
+    var recorded = try requestWithRetry(&client, threaded.io(), .POST, outcome_url, feedback, &outcome_headers, 20);
+    defer recorded.deinit();
+    try std.testing.expectEqual(@as(u16, 200), recorded.status.code);
+    const changed_feedback =
+        \\{"id":"feedback","task_id":"deployment","success":false,"used_memory_ids":["a1"],"detail":"Changed result"}
+    ;
+    const changed_headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ "idempotency-key", "changed-feedback" } };
+    var conflict = try requestWithRetry(&client, threaded.io(), .POST, outcome_url, changed_feedback, &changed_headers, 20);
+    defer conflict.deinit();
+    try std.testing.expectEqual(@as(u16, 409), conflict.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, conflict.body.?, "MemoryOutcomeConflict") != null);
+    const retry_headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ "idempotency-key", "retry-feedback" } };
+    var retried = try requestWithRetry(&client, threaded.io(), .POST, outcome_url, feedback, &retry_headers, 20);
+    defer retried.deinit();
+    try std.testing.expectEqual(@as(u16, 200), retried.status.code);
     var visible = try api.executeMemoryService("team", .{ .action = .get, .id = "a1" }, null, .{});
     defer visible.deinit(a);
     try std.testing.expectEqual(@as(u16, 200), visible.status);

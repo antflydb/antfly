@@ -1025,3 +1025,24 @@ exponent forms within bounds; fractional, negative and overflowing values reject
 rather than truncate or silently default. Regressions cover values beyond binary64
 precision, extreme exponents, deep nesting, exact JSON-RPC IDs, and an actual MCP
 memory assertion round trip.
+
+
+### Bounded cleanup and outcome ownership
+
+Entity admission accepts at most 256 direct evidence references, through the same
+native gate for external observations and managed publication. Cleanup evaluates
+one artifact atomically within the shared 65,536-unit work budget. If a later
+artifact exhausts the remaining budget, it rolls back only that artifact's overlay
+and state, commits the completed prefix, and resumes at the prior cursor. Both
+full-table scrubbing and dependency propagation use this rule; fixed page sizes
+alone do not bound support traversal. Earlier oversized entity rows can therefore
+be scrubbed without rejecting every attempt at the same page.
+
+Outcomes are immutable, principal-owned feedback records. An identical retry
+preserves the original owner and recorded time; changed content under the same ID
+returns `MemoryOutcomeConflict` (HTTP 409 / embedded version conflict). A different
+unauthorized principal cannot overwrite a prior outcome. Detail text is UTF-8 and
+bounded to 64 KiB. Retiring an outcome records a durable ID fence before removing
+its content, so source retirement cannot silently release its identity for reuse.
+The global forgetting fence rejects new outcomes, including empty-citation
+feedback. Receipt replay remains content-free and cannot recreate retired records.

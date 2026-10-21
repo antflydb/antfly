@@ -2136,3 +2136,137 @@ test "memory legacy forgotten identity policy is scrubbed and unrelated retireme
     try std.testing.expect(store.values.get("cleanup") == null);
     try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "entity-curation/", null, 256)).rows.len);
 }
+
+fn fixtureKey(a: A, prefix: []const u8, id: []const u8) ![]const u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, id, .{}), &digest, .{});
+    return std.fmt.allocPrint(a, "{s}/{s}", .{ prefix, std.fmt.bytesToHex(digest, .lower) });
+}
+
+test "memory entity support admission rejects oversized evidence atomically" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try discard(&store, .create, "", "{}", "create", 1);
+    const evidence: m.types.Evidence = .{ .id = "e", .source_id = "keep", .source_version = "1", .text = "Keep" };
+    const refs = try a.alloc(m.types.EvidenceRef, m.types.max_items + 1);
+    @memset(refs, .{ .id = "e" });
+    var entity: m.types.Entity = .{ .id = "large", .name = "Large", .evidence = refs };
+    const before = store.revision;
+    try std.testing.expectError(error.MemoryInputTooLarge, store.service("alice", true, 2).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{evidence}, .entities = &.{entity} }, .{}), "reject"));
+    try std.testing.expectEqual(before, store.revision);
+    try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "evidence/", null, 256)).rows.len);
+    entity.evidence = refs[0..m.types.max_items];
+    try discard(&store, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{evidence}, .entities = &.{entity} }, .{}), "accept", 3);
+    try std.testing.expectEqual(@as(usize, 1), (try Store.scan(&store, a, "entity/", null, 256)).rows.len);
+}
+
+test "memory cleanup yields and resumes across expensive legacy entities without losing forget debt" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try discard(&store, .create, "", "{}", "create", 1);
+    try discard(&store, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"keep\",\"source_version\":\"1\",\"text\":\"Keep\"},{\"id\":\"retire\",\"source_id\":\"retire\",\"source_version\":\"1\",\"text\":\"PRIVATE_RETIRED_TEXT\"}]}", "sources", 2);
+    const refs = try a.alloc(m.types.EvidenceRef, 10000);
+    @memset(refs, .{ .id = "e" });
+    for (0..7) |i| {
+        const id = try std.fmt.allocPrint(a, "legacy-{d}", .{i});
+        // Simulate rows admitted before the per-entity limit. Each artifact
+        // fits a work quantum, but their first page exceeds the shared quota.
+        try store.values.put(a, try fixtureKey(a, "entity", id), try std.json.Stringify.valueAlloc(a, m.types.EntityRecord{ .owner = "alice", .entity = .{ .id = id, .name = id, .evidence = refs } }, .{}));
+    }
+    try discard(&store, .forget, "", "{\"source_ids\":[\"retire\"]}", "forget", 3);
+    try discard(&store, .advance, "", "{}", "first", 4);
+    const debt = try std.json.parseFromSliceLeaky(std.json.Value, a, store.values.get("cleanup").?, .{});
+    try std.testing.expect(debt.object.get("cursor").? == .string);
+    for (0..16) |i| try discard(&store, .advance, "", "{}", try std.fmt.allocPrint(a, "resume-{d}", .{i}), 5);
+    try std.testing.expect(store.values.get("cleanup") == null);
+    try std.testing.expect(store.values.get(try fixtureKey(a, "evidence", "retire")) == null);
+    try std.testing.expect(store.values.get(try fixtureKey(a, "evidence", "e")) != null);
+    try std.testing.expectEqual(@as(usize, 7), (try Store.scan(&store, a, "entity/", null, 256)).rows.len);
+}
+
+test "memory outcomes are immutable owned records with exact retries and bounded detail" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try discard(&store, .create, "", "{}", "create", 1);
+    const original: m.types.Outcome = .{ .id = "result", .task_id = "task", .success = true, .used_memory_ids = &.{}, .detail = "Alice feedback" };
+    const body = try std.json.Stringify.valueAlloc(a, original, .{});
+    try discard(&store, .outcome, "", body, "alice", 2);
+    const path = try fixtureKey(a, "outcome", original.id);
+    const stored = try a.dupe(u8, store.values.get(path).?);
+    const before = store.revision;
+    try std.testing.expectError(error.Forbidden, store.service("bob", false, 3).execute(a, .outcome, "", body, "bob"));
+    try std.testing.expectEqual(before, store.revision);
+    var changed = original;
+    changed.success = false;
+    try std.testing.expectError(error.MemoryOutcomeConflict, store.service("alice", true, 3).execute(a, .outcome, "", try std.json.Stringify.valueAlloc(a, changed, .{}), "changed"));
+    try std.testing.expectEqual(before, store.revision);
+    try discard(&store, .outcome, "", body, "new-retry", 4);
+    try std.testing.expectEqualStrings(stored, store.values.get(path).?);
+    changed.id = "oversized";
+    changed.detail = try a.alloc(u8, m.types.max_text_bytes + 1);
+    @memset(@constCast(changed.detail), 'x');
+    try std.testing.expectError(error.MemoryInputTooLarge, store.service("alice", true, 5).execute(a, .outcome, "", try std.json.Stringify.valueAlloc(a, changed, .{}), "oversized"));
+    try std.testing.expect(store.values.get(try fixtureKey(a, "outcome", changed.id)) == null);
+}
+
+test "memory outcomes reject global forget before and after cleanup and preserve content-free receipt replay" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try discard(&store, .create, "", "{}", "create", 1);
+    const body = "{\"id\":\"result\",\"task_id\":\"task\",\"success\":true,\"used_memory_ids\":[],\"detail\":\"PRIVATE_FEEDBACK\"}";
+    try discard(&store, .outcome, "", body, "original", 2);
+    try discard(&store, .forget, "", "{\"all\":true}", "forget", 3);
+    try std.testing.expectError(error.MemoryForgotten, store.service("alice", true, 4).execute(a, .outcome, "", body, "new-before"));
+    for (0..12) |i| try discard(&store, .advance, "", "{}", try std.fmt.allocPrint(a, "cleanup-{d}", .{i}), 4);
+    try std.testing.expect(store.values.get("cleanup") == null);
+    try std.testing.expectError(error.MemoryForgotten, store.service("alice", true, 5).execute(a, .outcome, "", body, "new-after"));
+    try discard(&store, .outcome, "", body, "original", 6);
+    try std.testing.expect(store.values.get(try fixtureKey(a, "outcome", "result")) == null);
+    var it = store.values.iterator();
+    while (it.next()) |entry| try std.testing.expect(std.mem.indexOf(u8, entry.value_ptr.*, "PRIVATE_FEEDBACK") == null);
+}
+
+test "memory retired outcome IDs cannot be reused after source forgetting" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    try discard(&store, .assertions, "", helm, "claim", 3);
+    const body = "{\"id\":\"result\",\"task_id\":\"task\",\"success\":true,\"used_memory_ids\":[\"helm\"],\"detail\":\"PRIVATE_FEEDBACK\"}";
+    try discard(&store, .outcome, "", body, "original", 4);
+    try discard(&store, .forget, "", "{\"source_ids\":[\"runbook\"]}", "forget", 5);
+    for (0..20) |i| try discard(&store, .advance, "", "{}", try std.fmt.allocPrint(a, "cleanup-{d}", .{i}), 6);
+    try std.testing.expect(store.values.get("cleanup") == null);
+    try std.testing.expect(store.values.get(try fixtureKey(a, "outcome", "result")) == null);
+    try std.testing.expect(store.values.get(try fixtureKey(a, "forgotten-outcome", "result")) != null);
+    try std.testing.expectError(error.MemoryForgotten, store.service("alice", true, 7).execute(a, .outcome, "", "{\"id\":\"result\",\"task_id\":\"other\",\"success\":false,\"used_memory_ids\":[],\"detail\":\"Replacement\"}", "reuse"));
+}
+
+test "memory dependency maintenance commits its cursor before yielding expensive children" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try discard(&store, .create, "", "{}", "create", 1);
+    try discard(&store, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"keep\",\"source_version\":\"1\",\"text\":\"Keep\"}]}", "source", 2);
+    const refs = try a.alloc(m.types.EvidenceRef, 10000);
+    @memset(refs, .{ .id = "e" });
+    const prefix = try fixtureKey(a, "dependency/evidence", "e");
+    for (0..7) |i| {
+        const id = try std.fmt.allocPrint(a, "legacy-{d}", .{i});
+        const claim: m.types.StoredAssertion = .{ .assertion = .{ .id = id, .subject = "s", .predicate = "p", .value = "v", .statement = "Still supported", .evidence = refs }, .owner = "alice", .recorded_from = 2, .revision = 3, .config_generation = 1 };
+        try store.values.put(a, try fixtureKey(a, "assertion", id), try std.json.Stringify.valueAlloc(a, claim, .{}));
+        try store.values.put(a, try fixtureKey(a, prefix, id), try std.json.Stringify.valueAlloc(a, .{ .child = id }, .{}));
+    }
+    const work = "dependency/work/fixture";
+    try store.values.put(a, work, "{\"kind\":\"evidence\",\"id\":\"e\",\"revision\":3}");
+    try discard(&store, .advance, "", "{}", "first", 3);
+    const deferred = try std.json.parseFromSliceLeaky(std.json.Value, a, store.values.get(work).?, .{});
+    try std.testing.expect(deferred.object.get("cursor").? == .string);
+    try discard(&store, .advance, "", "{}", "second", 4);
+    try std.testing.expect(store.values.get(work) == null);
+    try std.testing.expectEqual(@as(usize, 7), (try Store.scan(&store, a, "assertion/", null, 256)).rows.len);
+}

@@ -62,7 +62,7 @@ pub fn status(err: anyerror) u16 {
         error.Unauthorized => 401,
         error.Forbidden, error.MemoryVisibilityConflict, error.MemoryRowPolicyUnsupported => 403,
         error.MethodNotAllowed => 405,
-        error.MemoryRevisionConflict, error.MemorySpaceBindingChanged, error.MemoryCursorStale, error.MemorySpaceExists, error.MemoryIdempotencyConflict, error.MemoryEvidenceConflict, error.MemoryAssertionConflict, error.MemoryProducerConflict, error.MemoryEntityConflict, error.MemoryConfigurationTransition, error.MemoryForgotten, error.MemoryConfigurationChanged => 409,
+        error.MemoryRevisionConflict, error.MemorySpaceBindingChanged, error.MemoryCursorStale, error.MemorySpaceExists, error.MemoryIdempotencyConflict, error.MemoryEvidenceConflict, error.MemoryAssertionConflict, error.MemoryOutcomeConflict, error.MemoryProducerConflict, error.MemoryEntityConflict, error.MemoryConfigurationTransition, error.MemoryForgotten, error.MemoryConfigurationChanged => 409,
         error.MemoryInputTooLarge, error.MemoryWorkLimit => 413,
         error.MemoryModelRequired, error.MemoryCapabilityUnavailable, error.MemoryExecutionIdentityRequired, error.MemoryModelRevisionUnavailable, error.MemoryModelRevisionMismatch => 422,
         error.MemoryRetryNotReady, error.MemoryRetryExhausted, error.MemoryOverloaded => 429,

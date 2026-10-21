@@ -9955,3 +9955,52 @@ test "capi native memory curation content is physically scrubbed across reopen" 
         if (cursor == null) break;
     }
 }
+
+test "capi native memory outcome conflicts and retirement fences survive reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-memory-outcome-reopen");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const path = try std.fmt.allocPrintSentinel(alloc, "{s}/db.aflite", .{directory.path()}, 0);
+    const memory = @import("../memory/service.zig");
+    var id: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &id));
+    defer if (id != null) antfly_db_close(id);
+    _ = try nativeMemoryTestCall(id, alloc, "alice", .create, memory.types.Config{ .retention_ms = std.math.maxInt(u64) }, "create", "");
+    const evidence: memory.types.Evidence = .{ .id = "e", .source_id = "source", .source_version = "1", .text = "Task evidence" };
+    _ = try nativeMemoryTestCall(id, alloc, "alice", .observe, .{ .evidence = &.{evidence} }, "evidence", "");
+    const claim: memory.types.Assertion = .{ .id = "claim", .subject = "s", .predicate = "p", .value = "v", .statement = "Task assertion", .evidence = &.{.{ .id = "e" }} };
+    _ = try nativeMemoryTestCall(id, alloc, "alice", .assertions, .{ .assertions = &.{claim} }, "claim", "");
+    const outcome: memory.types.Outcome = .{ .id = "result", .task_id = "task", .success = true, .used_memory_ids = &.{"claim"}, .detail = "PRIVATE_FEEDBACK" };
+    _ = try nativeMemoryTestCall(id, alloc, "alice", .outcome, outcome, "outcome", "");
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    var changed = outcome;
+    changed.success = false;
+    const conflicting = try std.json.Stringify.valueAlloc(alloc, .{ .action = "outcome", .principal = "alice", .body = changed, .idempotency_key = "changed" }, .{});
+    var output: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.version_conflict, antfly_db_memory_json(id, .fromSlice("personal"), .fromSlice(conflicting), &output));
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(capi.lastErrorDetail()), "MemoryOutcomeConflict") != null);
+    _ = try nativeMemoryTestCall(id, alloc, "alice", .forget, .{ .source_ids = &[_][]const u8{"source"} }, "forget", "");
+    for (0..20) |step| _ = try nativeMemoryTestCall(id, alloc, "alice", .advance, .{}, try std.fmt.allocPrint(alloc, "cleanup-{d}", .{step}), "");
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    changed.used_memory_ids = &.{};
+    const reuse = try std.json.Stringify.valueAlloc(alloc, .{ .action = "outcome", .principal = "alice", .body = changed, .idempotency_key = "reuse" }, .{});
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_memory_json(id, .fromSlice("personal"), .fromSlice(reuse), &output));
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(capi.lastErrorDetail()), "MemoryForgotten") != null);
+    // A new ID with no citations must also respect the permanent global fence.
+    _ = try nativeMemoryTestCall(id, alloc, "alice", .forget, .{ .all = true }, "all", "");
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    changed.id = "new-result";
+    const late = try std.json.Stringify.valueAlloc(alloc, .{ .action = "outcome", .principal = "alice", .body = changed, .idempotency_key = "late" }, .{});
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_memory_json(id, .fromSlice("personal"), .fromSlice(late), &output));
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(capi.lastErrorDetail()), "MemoryForgotten") != null);
+}
