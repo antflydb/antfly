@@ -22178,3 +22178,46 @@ source-input hashes remained unchanged. Generated-error and whitespace checks
 passed. V1 passed 47 DB, 88 DocStore and 112 transaction/memory tests; its
 prepared-root compile exposed a generic fake-view optional inference issue,
 corrected before the final run.
+
+### Semantic registry restart integrity (2026-10-21)
+
+The durable semantic registry from `dd35823f94` now has an explicit DB-open
+audit. Before core startup metadata initialization, it scans even an apparently
+empty registry so a missing aggregate cannot hide imported orphan predicates.
+For active entries it checks aggregate quotas, namespace, permanent reader-16
+eligibility, retained effect/observation/requirement/transaction binding and the
+durable observation envelope. It replays the accepted observations and compares
+the resulting canonical predicates with the retained registry bytes. A valid
+checksum alone cannot authorize an imported registry with weaker protection.
+Both the registry snapshot and observation replay retain the shared native
+writer gate; audit failure releases every cursor, snapshot, arena and gate.
+
+Logical source-vector references require payload ownership, which core resource
+open has not installed yet. Only `VectorMigrationReadEpochChanged` may defer that
+record's early replay. A mandatory second audit after table storage initialization
+finishes every replay without deferral, before index loading, optional runtimes,
+transaction replay or public access. Other early errors propagate unchanged.
+This preserves valid vector-backed restart and membership-only payload updates.
+Ordinary mutation paths retain their existing no-registry cursor-free fast path.
+No layouts, wire versions, reader floors or default activation settings change.
+
+`semantic-registry-open-audit-v2.json/log` in the cumulative integration receipts
+records 70/70 native build steps and 208 fresh executions: 53 required-preparation
+DB, 104 prepared-effects and 43/1/7 error-contract tests. All four commands exited
+zero, with no failures, skips or leaks and unchanged source hashes. New cases
+cover nine damaged imports through writable and read-only open, all allocation
+failures, continued ACK progress after failed audits, legal membership updates,
+and logical vector references through writer, no-replay, query and status open.
+V1 passed 52 DB and 51 contract tests before the payload-ordering refinement;
+the final V2 supersedes it. Pinned-compiler format, generated-error and diff
+checks pass.
+
+This audits retained native registry integrity, not arbitrary live raw-writer
+authority or complete restore/migration/peer eligibility. In-range control and
+counter dependency refinement, complete live authority capture, pure pre-vote
+physical/replay assembly, executable recovery resources and derived-log quota,
+lifetime ownership, normal required PREPARE drivers and broader scheduler,
+session, tenant, whole-node and remote rollout remain open. Strong required
+providers remain disabled; the full goal remains active. Performance across all
+engines is unproven. Full Linux qualification remains waived; Linux builds still
+require the pinned Nix/glibc Zig toolchain.

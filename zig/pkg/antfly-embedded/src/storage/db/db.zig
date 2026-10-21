@@ -4254,6 +4254,7 @@ pub const DB = struct {
             const table_storage_started_ns = monotonicTimeNs();
             try db.initializeTableStorage(opts.table_storage);
             profile.table_storage_ns = elapsedSince(table_storage_started_ns);
+            try @import("../prepared_read_guards.zig").validateReady(alloc, db.core.store);
             if (!openModeRequiresReadOnlyBackends(opts.open_mode) and
                 opts.physical_root_mode == .filesystem_managed)
             {
@@ -146711,6 +146712,9 @@ const SemanticReadGuardFixture = struct {
         try sealOwner(db, membership, id);
     }
     fn sealOwner(db: *DB, membership: bool, owner_id: transactions_mod.TxnId) !void {
+        try sealOwnerWithExtraRead(db, membership, owner_id, null);
+    }
+    fn sealOwnerWithExtraRead(db: *DB, membership: bool, owner_id: transactions_mod.TxnId, extra: ?[]const u8) !void {
         const a = std.testing.allocator;
         const reads = @import("prepared_read_set.zig");
         const effects = @import("prepared_transaction_effects.zig");
@@ -146730,6 +146734,10 @@ const SemanticReadGuardFixture = struct {
         defer observed.deinit();
         if (!membership) {
             const value = try reads.observe(db.core.store, &observed).get(a, point);
+            a.free(value);
+        }
+        if (extra) |selected| {
+            const value = try reads.observe(db.core.store, &observed).get(a, selected);
             a.free(value);
         }
         const page = try reads.observe(db.core.store, &observed).scanPrefixKeysPage(a, "\x01semantic/", null, 10);
@@ -146877,6 +146885,155 @@ test "db prepared transaction effects required semantic registry excludes all na
     defer read.abort();
     try std.testing.expectEqual(@as(u64, 0), (try guards.loadState(&read)).records);
     try std.testing.expectEqual(@as(u64, 0), (try @import("../publication_backlog.zig").load(&read)).?.bytes);
+}
+
+test "db prepared transaction effects required semantic registry audits imported recovery state before writable or readonly open" {
+    const a = std.testing.allocator;
+    const F = SemanticReadGuardFixture;
+    const guards = @import("../prepared_read_guards.zig");
+    const versions = @import("catalog/reader_versions.zig");
+    for (0..9) |damage| {
+        var directory = try TestDirectory.init("semantic-read-registry-import-audit");
+        defer directory.cleanup();
+        var db = try DB.open(a, directory.path(), F.options);
+        var live = true;
+        defer if (live) db.close();
+        try F.seal(&db, false);
+        try F.register(&db);
+        // Simulate a raw import/restore, which bypasses DocStore enforcement.
+        {
+            var raw = try db.core.store.runtime_store.beginBatch();
+            errdefer raw.abort();
+            switch (damage) {
+                0 => try raw.delete(guards.state_key),
+                1 => try raw.put(&guards.key(@splat(194)), "orphan"),
+                2 => {
+                    var read = try db.core.store.beginReadTxn();
+                    defer read.abort();
+                    var state = try guards.loadState(&read);
+                    state.bytes += 1;
+                    try raw.put(guards.state_key, &state.encode());
+                },
+                3 => try raw.put(versions.minimum_reader_key, "15"),
+                4 => try raw.delete(&transactions_mod.makePreparedEffectsKey(F.id)),
+                5 => try raw.put(&internal_keys.identity_namespace_key, &@as([24]u8, @splat(17))),
+                6 => try raw.put(F.point, "unprotected-import"),
+                7 => {
+                    const original = try db.core.store.get(a, &guards.key(F.id));
+                    defer a.free(original);
+                    var record = try guards.decode(a, original, null);
+                    defer record.deinit();
+                    record.predicates.spans = &.{};
+                    const weakened = try guards.encode(a, &record, null);
+                    defer a.free(weakened);
+                    const state: guards.State = .{ .records = 1, .bytes = weakened.len, .predicates = record.count() };
+                    try raw.put(&guards.key(F.id), weakened);
+                    try raw.put(guards.state_key, &state.encode());
+                },
+                8 => try raw.put(versions.replacement_reader_base_key, "15"),
+                else => unreachable,
+            }
+            try raw.commit();
+        }
+        db.close();
+        live = false;
+        const expected: anyerror = switch (damage) {
+            0, 1, 2, 7 => error.InvalidTxnRecord,
+            3, 8 => error.PreparedTransactionProtocolDisabled,
+            4 => error.NotFound,
+            5 => error.PreparedEffectsMismatch,
+            6 => error.PreparedReadSetChanged,
+            else => unreachable,
+        };
+        for ([_]OpenMode{ .writer, .query_readonly }) |mode| {
+            var options = F.options;
+            options.open_mode = mode;
+            try std.testing.expectError(expected, DB.open(a, directory.path(), options));
+        }
+    }
+}
+
+test "db prepared transaction effects required semantic registry recovery audit owns cleanup and permits membership payload changes" {
+    const a = std.testing.allocator;
+    const F = SemanticReadGuardFixture;
+    const guards = @import("../prepared_read_guards.zig");
+    var directory = try TestDirectory.init("semantic-read-registry-audit-cleanup");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), F.options);
+    var live = true;
+    defer if (live) db.close();
+    try F.seal(&db, true);
+    try F.register(&db);
+    try db.core.store.put(F.point, "legal-payload-change");
+    var completed = false;
+    for (0..512) |index| {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = index });
+        if (guards.validateReady(failing.allocator(), db.core.store)) |_| {
+            completed = true;
+        } else |cause| try std.testing.expectEqual(error.OutOfMemory, cause);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        // Every failed audit must release its gate and read/cursor owners.
+        try db.core.store.put("\x00\x00__txn_participant_ack__:peer", "ack");
+        if (completed) break;
+    }
+    try std.testing.expect(completed);
+    db.close();
+    live = false;
+    for ([_]OpenMode{ .writer, .writer_no_replay, .query_readonly, .status_only }) |mode| {
+        var options = F.options;
+        options.open_mode = mode;
+        var reopened = try DB.open(a, directory.path(), options);
+        reopened.close();
+    }
+    db = try DB.open(a, directory.path(), F.options);
+    live = true;
+    try std.testing.expectError(error.IntentConflict, db.core.store.put(F.gap, "still-protected"));
+    try F.resolve(&db, .aborted);
+}
+
+test "db prepared transaction effects required semantic registry recovery waits for logical vector payload ownership" {
+    const a = std.testing.allocator;
+    const F = SemanticReadGuardFixture;
+    const guards = @import("../prepared_read_guards.zig");
+    var directory = try TestDirectory.init("semantic-read-registry-vector-reopen");
+    defer directory.cleanup();
+    var options = F.options;
+    options.table_storage = .{ .dense_embeddings = .vector_store };
+    var db = try DB.open(a, directory.path(), options);
+    var live = true;
+    defer if (live) db.close();
+    const selected = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "semantic-vector", "model");
+    defer a.free(selected);
+    const value = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, 11, &.{ 1, 2, 3 });
+    defer a.free(value);
+    try db.core.store.put(selected, value);
+    {
+        var raw = try db.core.store.runtime_store.beginRead();
+        defer raw.abort();
+        try std.testing.expect(@import("../artifact_payload.zig").isReference(try raw.get(selected)));
+    }
+    try F.sealOwnerWithExtraRead(&db, false, F.id, selected);
+    try F.register(&db);
+    db.core.store.configurePayloadPolicy(null, false, null);
+    try guards.validateOpen(a, db.core.store);
+    try std.testing.expectError(error.VectorMigrationReadEpochChanged, guards.validateReady(a, db.core.store));
+    db.core.store.configurePayloadPolicy(db.local_execution.source_vectors.load(.acquire).?.interface(), false, null);
+    try guards.validateReady(a, db.core.store);
+    db.close();
+    live = false;
+    for ([_]OpenMode{ .writer, .writer_no_replay, .query_readonly, .status_only }) |mode| {
+        var reopen_options = F.options;
+        reopen_options.open_mode = mode;
+        var reopened = try DB.open(a, directory.path(), reopen_options);
+        defer reopened.close();
+        const actual = try reopened.core.store.get(a, selected);
+        defer a.free(actual);
+        try std.testing.expectEqualSlices(u8, value, actual);
+    }
+    db = try DB.open(a, directory.path(), F.options);
+    live = true;
+    try std.testing.expectError(error.IntentConflict, db.core.store.delete(selected));
+    try F.resolve(&db, .aborted);
 }
 
 test "db prepared transaction effects required semantic registry distinguishes membership changes and retires with commit" {

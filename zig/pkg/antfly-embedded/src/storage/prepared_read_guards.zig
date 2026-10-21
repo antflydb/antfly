@@ -194,6 +194,60 @@ pub fn loadState(txn: anytype) !State {
     const raw = txn.get(state_key) catch |err| return if (err == error.NotFound) .{} else err;
     return State.decode(raw);
 }
+
+/// Run before startup can initialize metadata, replay, or expose the store.
+/// Imports and restarts must not treat a missing aggregate as an empty registry.
+/// Hold the same gate as native writers while checking the retained assumptions;
+/// the registry snapshot and the observation compiler must describe one state.
+pub fn validateOpen(a: A, store: anytype) !void {
+    try validateRecovery(a, store, true);
+}
+
+/// Source-vector references need their logical payload owner installed first.
+/// Finish this check after table storage initialization, before replay, index
+/// workers, optional runtimes, or public access can observe the opened DB.
+pub fn validateReady(a: A, store: anytype) !void {
+    try validateRecovery(a, store, false);
+}
+
+fn validateRecovery(a: A, store: anytype, defer_payload: bool) !void {
+    const gate = store.runtime_store.publication_gate orelse &store.publication_backlog_mutex;
+    if (!gate.tryLock()) return error.Backpressured;
+    defer gate.unlock();
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    var capture: Capture = .{};
+    defer capture.deinit(a);
+    try capture.loadRegistry(a, &txn, null);
+    try capture.auditEmpty(&txn, null);
+    if (capture.state.records == 0) return;
+    try requireFloors(&txn);
+    for (capture.records.items) |*record| {
+        try bundleMatches(&txn, record, null);
+        const inspection = try effects.inspect(try txn.get(&transactions.makePreparedEffectsKey(record.receipt.txn_id)), null);
+        var observed = try reads.Durable.decode(a, try txn.get(&transactions.makePreparedReadObservationsKey(record.receipt.txn_id)), .{
+            .contract = inspection.contract,
+            .participant = record.receipt.binding,
+            .namespace = record.namespace,
+            .frame_digest = record.receipt.frame_digest,
+        }, null);
+        defer observed.deinit();
+        var compiled = reads.Footprint.compile(a, &observed, store, null) catch |cause| {
+            // Early open has no payload policy yet. Only this exact rejection
+            // can be deferred, and the ready check must subsequently succeed.
+            if (defer_payload and cause == error.VectorMigrationReadEpochChanged) continue;
+            return cause;
+        };
+        defer compiled.deinit();
+        // A checksummed registry is insufficient: importing fewer predicates
+        // must not weaken the protection of the accepted observations.
+        var expected = record.*;
+        expected.predicates = compiled;
+        const canonical = try encode(a, &expected, null);
+        defer a.free(canonical);
+        if (!std.mem.eql(u8, canonical, try txn.get(&key(record.receipt.txn_id)))) return error.InvalidTxnRecord;
+    }
+}
 pub const Record = struct {
     receipt: effects.BoundReceipt,
     namespace: [24]u8,
@@ -395,6 +449,9 @@ pub const Capture = struct {
     fn loadInner(self: *Capture, a: A, txn: anytype, debt: anytype, gate: ?*std.atomic.Mutex, control: ?admission.Port) !void {
         try checkpoint(control);
         try debt.acquireMutationGate(gate);
+        try self.loadRegistry(a, txn, control);
+    }
+    fn loadRegistry(self: *Capture, a: A, txn: anytype, control: ?admission.Port) !void {
         if (self.loaded) return;
         self.state = try loadState(txn);
         // Ordinary unguarded writes must not rotate/pin a physical cursor.

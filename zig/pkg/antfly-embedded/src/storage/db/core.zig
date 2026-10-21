@@ -3295,6 +3295,7 @@ pub fn openCoreResourcesFromPrimaryStore(
     const store = try alloc.create(docstore_mod.DocStore);
     store.* = opened_primary.store;
     owned_store = store;
+    try @import("../prepared_read_guards.zig").validateOpen(alloc, store);
     if (!read_only) {
         try @import("../artifact_footprint.zig").initializeEmpty(store);
         try @import("../artifact_replay_inventory.zig").initialize(store);
