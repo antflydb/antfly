@@ -24,10 +24,15 @@ parser.add_argument("--check", action="store_true")
 args = parser.parse_args()
 root = Path(__file__).resolve().parents[1]
 manifest = json.loads((root / "compatibility.json").read_text())
+archive = json.loads((root / "bench/results/archive-manifest.json").read_text())
+archived_names = {entry["name"] for entry in archive["files"]}
 for area in manifest["areas"]:
     for path in area["evidence"]:
         if not (root / path).is_file():
             raise ValueError(f"missing compatibility evidence: {path}")
+    for name in area.get("archived_evidence", []):
+        if name not in archived_names:
+            raise ValueError(f"missing archived compatibility evidence: {name}")
 counts = {
     name: len(json.loads((root / "tests" / name).read_text())["cases"])
     for name in (
@@ -48,6 +53,11 @@ lines = [
 ]
 for area in manifest["areas"]:
     evidence = ", ".join(f"[{Path(path).name}]({path})" for path in area["evidence"])
+    historical = ", ".join(
+        f"[{name}](bench/results/README.md)"
+        for name in area.get("archived_evidence", [])
+    )
+    evidence = ", ".join(part for part in (evidence, historical) if part)
     lines.append(
         f"| {area['area']} | {area['status']} | {evidence}. {area['limits']} |"
     )

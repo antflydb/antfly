@@ -53,7 +53,7 @@ def main():
     parser.add_argument("--clients", default="1,4")
     parser.add_argument(
         "--suite",
-        choices=("scalable", "concurrency", "ingestion", "both", "all"),
+        choices=("scalable", "concurrency", "ingestion", "hints", "both", "all"),
         default="both",
     )
     parser.add_argument(
@@ -111,7 +111,7 @@ def main():
             ],
         ]
     suites = (
-        ("scalable", "concurrency", "ingestion")
+        ("scalable", "concurrency", "ingestion", "hints")
         if args.suite == "all"
         else ("scalable", "concurrency")
         if args.suite == "both"
@@ -136,6 +136,10 @@ def main():
                     "ingestion": (
                         "ANTFLY_LOGICAL_INGESTION_REPORT",
                         "logical_substring_ingestion_profile",
+                    ),
+                    "hints": (
+                        "ANTFLY_LOGICAL_HINT_REPORT",
+                        "logical_retained_source_hint_profile",
                     ),
                 }[suite]
                 binary = binaries["baseline" if label == "baseline" else "candidate"]

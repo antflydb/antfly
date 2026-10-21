@@ -1009,7 +1009,7 @@ def test_logical_retained_boolean_counts_need_no_source_work(stateful_api, num_s
             },
             timeout=60,
         )
-        assert counted.status_code == 200, counted.text
+        assert counted.status_code == 200, (expression, counted.text)
         result = counted.json()["responses"][0]
         assert result["hits"]["total"]["value"] == expected, result
         assert result["profile"]["value_verification"]["documents"] == 0, result
@@ -2180,3 +2180,107 @@ def test_native_grep_nested_authority_keeps_retained_revisions(stateful_api, tmp
     current = requests.post(url, json=fresh, timeout=60)
     assert current.status_code == 200, current.text
     assert current.json()["responses"][0]["hits"]["total"]["value"] == 1, current.text
+
+
+def test_logical_retained_source_hint_profile(stateful_api):
+    """Opt-in repeated reader calibration with distinct, uncached predicates."""
+    import hashlib
+    import platform
+
+    report = os.environ.get("ANTFLY_LOGICAL_HINT_REPORT")
+    if not report:
+        pytest.skip("Set ANTFLY_LOGICAL_HINT_REPORT to capture provider calibration")
+    words = [f"needle{i:02}" for i in range(12)]
+    title = "seed " + " ".join(words) + " " + "x" * 1024
+    documents = {f"{i:06}": {"title": title, "unused": "z" * 16384} for i in range(512)}
+    table = f"logical_hint_profile_{time.time_ns()}"
+    stateful_api.create_table(table)
+    for start in range(0, len(documents), 128):
+        keys = list(documents)[start : start + 128]
+        stateful_api.batch_write(
+            table,
+            inserts={key: documents[key] for key in keys},
+            sync_level="full_index",
+        )
+    url = stateful_api.url + f"/tables/{table}/query"
+    policy = {"value_verification": {"allow_scan": True}}
+    warm = requests.post(
+        url,
+        json=qualification_query(
+            {
+                "query": {"contains": "seed", "field": "title"},
+                "execution": policy,
+                "order_by": [{"field": "_id", "desc": False}],
+                "limit": 1,
+            }
+        ),
+        timeout=90,
+    )
+    assert warm.status_code == 200, warm.text
+    snapshot = warm.json()["responses"][0]["remote_snapshot"]
+    assert stateful_api._server is not None
+    read_process = logical_process_reader(stateful_api._server.proc.pid)
+    runs = []
+    for word in words:
+        before = read_process()
+        start = time.perf_counter_ns()
+        response = requests.post(
+            url,
+            json=qualification_query(
+                {
+                    "query": {"contains": word, "field": "title"},
+                    "execution": policy,
+                    "remote_snapshot": snapshot,
+                    "count": True,
+                    "fields": [],
+                    "limit": 0,
+                    "profile": True,
+                }
+            ),
+            timeout=90,
+        )
+        elapsed = (time.perf_counter_ns() - start) / 1_000_000
+        after = read_process()
+        assert response.status_code == 200, response.text
+        result = response.json()["responses"][0]
+        assert result["hits"]["total"]["value"] == len(documents), result
+        profile = qualification_verification(result)
+        # Every predicate is new: membership reuse must not make calibration
+        # look cheaper by skipping the provider reads being measured.
+        assert profile["documents"] == len(documents), profile
+        runs.append(
+            {
+                "predicate": word,
+                "http_ms": elapsed,
+                "cpu_ms": (after["cpu_ns"] - before["cpu_ns"]) / 1_000_000,
+                "process_before": before,
+                "process_after": after,
+                "profile": profile,
+            }
+        )
+    destination = Path(report)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(
+            {
+                "protocol": 1,
+                "platform": platform.platform(),
+                "binary_sha256": hashlib.sha256(
+                    Path(os.environ["ANTFLY_BIN"]).read_bytes()
+                ).hexdigest(),
+                "scope": "Warm retained source, distinct unindexed predicates; every measured request verifies the entire corpus. Latency includes HTTP and host contention. No predicate-hit speedup is included.",
+                "records": [
+                    {
+                        "name": "retained_distinct_predicates",
+                        "documents": len(documents),
+                        "corpus_sha256": hashlib.sha256(
+                            json.dumps(documents, sort_keys=True).encode()
+                        ).hexdigest(),
+                        "runs": runs,
+                    }
+                ],
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    )

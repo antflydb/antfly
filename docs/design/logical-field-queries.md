@@ -713,3 +713,20 @@ limitations. The grep benchmark archive manifest names every removed historical
 report with its original Git blob and SHA-256 digest. Its restoration command
 checks original bytes. This removes checkout clutter without rewriting history
 or removing the differential, parser and dictionary fixtures used by tests.
+
+
+Public canonical Boolean lowering preserves an explicit
+`minimum_should_match`, including zero and thresholds greater than one. Required
+non-scoring filters affect omission defaults, but cannot erase an explicit
+positive threshold. Public request parsing and internal worker serialization
+must preserve the same requirement; exercising only a nested DSL parser is
+insufficient coverage. Real-server retained-count tests use one and three shards
+and combine conjunction, disjunction, exclusion, nesting and threshold queries.
+
+
+The borrowed Boolean word executor visits absent document words only when the
+completed expression can match with every input bitmap empty. A match-all child
+intersected with a sparse predicate therefore iterates the sparse union of
+nonzero input words. A complement still visits the required universe. A regression
+counts one sparse match in the maximum document-number universe in one word
+step, and checks bounded complement coverage separately.

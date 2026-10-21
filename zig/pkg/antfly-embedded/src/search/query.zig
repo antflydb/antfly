@@ -2321,7 +2321,7 @@ const BorrowedCount = struct {
     pin_count: usize = 0,
     controls: [32]ExecutionControl = undefined,
     control_count: usize = 0,
-    universe: bool = false,
+    word_steps: ?*usize = null, // Test instrumentation; no production increments.
     fn deinit(self: *@This()) void {
         for (self.pins[0..self.pin_count]) |*pin| pin.deinit();
     }
@@ -2333,10 +2333,7 @@ const BorrowedCount = struct {
     fn compile(self: *@This(), filter: Filter, offset: u32, count: u32, depth: usize) anyerror!void {
         if (depth == 32) return error.BorrowedCountUnavailable;
         switch (filter) {
-            .match_all => {
-                self.universe = true;
-                try self.append(.all);
-            },
+            .match_all => try self.append(.all),
             .match_none => try self.append(.none),
             .doc_num => |f| {
                 const producer = f.producer orelse return error.BorrowedCountUnavailable;
@@ -2468,6 +2465,12 @@ const BorrowedCount = struct {
                 return left_live - intersection + right_live;
             }
         }
+        // Only visit absent words if the *result* can match with all inputs
+        // empty. An all-documents child intersected with a sparse predicate
+        // does not require walking the entire segment's document universe.
+        const empty_inputs: [64]u64 = @splat(0);
+        const universe = self.evaluate(empty_inputs[0..self.pin_count]) != 0;
+        if (self.op_count == 1 and self.ops[0] == .all) return count - (if (deleted) |d| d.rangeCardinality(0, count) else 0);
         var iterators: [64]roaring.RoaringBitmap.WordIterator = undefined;
         var current: [64]?roaring.RoaringBitmap.Word = @splat(null);
         for (self.pins[0..self.pin_count], 0..) |pin, i| {
@@ -2480,13 +2483,16 @@ const BorrowedCount = struct {
         var total: usize = 0;
         var steps: usize = 0;
         while (true) {
-            var next: u64 = if (self.universe) universe_base else count;
+            var next: u64 = if (universe) universe_base else count;
             for (current[0..self.pin_count]) |word| if (word) |value| {
                 next = @min(next, value.base);
             };
             if (next >= count) break;
             if (steps % 256 == 0) for (self.controls[0..self.control_count]) |control| try control.check();
             steps += 1;
+            if (@import("builtin").is_test) if (self.word_steps) |counter| {
+                counter.* += 1;
+            };
             var inputs: [64]u64 = @splat(0);
             for (current[0..self.pin_count], 0..) |word, i| if (word) |value| {
                 if (value.base == next) {
@@ -4753,4 +4759,27 @@ test "logical value borrowed boolean dense threshold and sparse high words" {
     try testing.expectEqual(@as(usize, 39000), try program.cardinality(140003, &deleted));
     program.ops[2] = .{ .threshold = .{ .count = 2, .required = 1 } };
     try testing.expectEqual(@as(usize, 124000), try program.cardinality(140003, &deleted));
+}
+
+test "logical value borrowed sparse conjunction skips absent universe words" {
+    var bitmap = roaring.RoaringBitmap.init(testing.allocator);
+    defer bitmap.deinit();
+    try bitmap.add(3);
+    const Release = struct {
+        fn call(_: [2]*anyopaque) void {}
+    };
+    var steps: usize = 0;
+    var program: BorrowedCount = .{ .word_steps = &steps };
+    program.pin_count = 1;
+    program.pins[0] = .{ .bitmap = &bitmap, .context = .{ &bitmap, &bitmap }, .release = Release.call };
+    defer program.deinit();
+    try program.append(.all);
+    try program.append(.{ .input = 0 });
+    try program.append(.intersect);
+    try testing.expectEqual(@as(usize, 1), try program.cardinality(std.math.maxInt(u32), null));
+    try testing.expectEqual(@as(usize, 1), steps);
+    program.ops[2] = .subtract;
+    steps = 0;
+    try testing.expectEqual(@as(usize, 126), try program.cardinality(127, null));
+    try testing.expectEqual(@as(usize, 2), steps);
 }
