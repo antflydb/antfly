@@ -28,11 +28,30 @@ const platform_time = @import("antfly_platform").time;
 pub const GeneratedRead = struct { key: revisions.Key, revision: u64 };
 pub const TransformRead = struct { key: []const u8, value: ?[]u8, expected_version: u64, revision: ?GeneratedRead = null };
 pub const TransformPredicate = struct { key: []const u8, expected_version: u64, revision: ?GeneratedRead };
+
+/// Cached facts consulted by the in-apply assembler. Capture under apply before
+/// assembly, not later when retaining its result. These are optimistic inputs;
+/// they do not exclude unrelated progress or replace commit-owned counter deltas.
+pub const CoreFacts = struct {
+    table_catalog: @import("table_catalog.zig").Catalog,
+    visibility: ?@import("doc_identity.zig").VisibilitySummary,
+    discard_storage_writes: bool,
+
+    pub fn capture(core: anytype) CoreFacts {
+        return .{
+            .table_catalog = core.table_catalog,
+            .visibility = core.identity_visibility.summary,
+            .discard_storage_writes = core.discard_storage_writes,
+        };
+    }
+};
 pub const Sources = struct {
     // Observe these before preparation; never rebind an old view to a newer
     // catalog or database namespace just because its contents look compatible.
     schema_namespace: u64,
     catalog_revision: u64,
+    core_facts: CoreFacts,
+    payload_policy_generation: u64,
     schema_view: ?schema.SchemaView,
     require_current_schema: bool,
     write_plan: ?indexes.IndexManager.WritePlanSnapshotView,
@@ -51,6 +70,8 @@ pub const Owned = struct {
     schema_namespace: u64,
     import_revision: u64,
     catalog_revision: u64,
+    core_facts: CoreFacts,
+    payload_policy_generation: u64,
     range_start: []const u8 = &.{},
     range_end: []const u8 = &.{},
     schema_view: ?schema.SchemaView = null,
@@ -86,6 +107,8 @@ pub const Owned = struct {
             .schema_namespace = source.schema_namespace,
             .import_revision = try core.store.portableImportRevision(),
             .catalog_revision = source.catalog_revision,
+            .core_facts = source.core_facts,
+            .payload_policy_generation = source.payload_policy_generation,
             .require_current_schema = source.require_current_schema,
             .write_plan_generation = if (source.write_plan) |view| view.generation() else core.index_manager.writePlanGeneration(),
         };
@@ -151,6 +174,7 @@ pub const Owned = struct {
             self.root_generation != core.root_generation or !self.identity_namespace.eql(core.identity_namespace) or
             self.schema_namespace != core.schemaNamespaceGeneration() or
             core.store.portableImportPublicationInProgress() or self.import_revision != try core.store.portableImportRevision()) return error.PreparedGenerationChanged;
+        if (self.payload_policy_generation != try core.store.payloadPolicyGeneration(control)) return error.PreparedGenerationChanged;
         const range = core.byteRange();
         if (!std.mem.eql(u8, self.range_start, range.start) or !std.mem.eql(u8, self.range_end, range.end)) return error.PreparedGenerationChanged;
         if (!core.store.resolver_catalog_revision.matches(self.catalog_revision)) return error.PreparedGenerationChanged;
@@ -167,6 +191,9 @@ pub const Owned = struct {
         if (!core.relational_indexes.isCurrent(self.relational_indexes)) return error.PreparedGenerationChanged;
         if (self.policy_lease) |*lease| try lease.checkAt(nowSeconds());
         try validateExplicitReads(core, self.generated_reads, self.transform_reads, control);
+        // Keep specific read conflicts ahead of the broader cached-fact fence:
+        // a primary ABA may change both its revision and the visibility cache.
+        if (!std.meta.eql(self.core_facts, CoreFacts.capture(core))) return error.PreparedGenerationChanged;
         if (self.preapply_reads) |*reads| try reads.validate(core.store, control);
         if (self.metadata_reads) |*reads| try reads.validate(core.store, control);
         if (control) |original| try original.checkpoint();

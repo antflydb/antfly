@@ -1723,6 +1723,19 @@ pub const DocStore = struct {
         self.payload_migration_allowance = migration_allowance;
     }
 
+    /// Observe before preparation reads, then validate before publishing their
+    /// detached postimages. Comparing policy values cannot detect A -> B -> A.
+    /// This is a generation witness, not a payload-store lifetime lease.
+    pub fn payloadPolicyGeneration(self: *DocStore, control: ?@import("../common/read_admission.zig").Port) !u64 {
+        if (control) |original|
+            try @import("../common/bounded_mutex.zig").lock(&self.payload_policy_mutex, payloadPolicyIo(), original)
+        else
+            self.lockPayloadPolicy();
+        defer self.unlockPayloadPolicy();
+        if (self.payload_policy_generation == std.math.maxInt(u64)) return error.PayloadPolicyGenerationExhausted;
+        return self.payload_policy_generation;
+    }
+
     fn createPayloadSession(self: *DocStore) !?*artifact_payload.Session {
         if (self.payload_recovery_required.load(.acquire)) return error.VectorMigrationRecoveryRequired;
         const store = self.payload_store orelse return null;
@@ -7162,6 +7175,51 @@ test "public graph metric borrowed wire content authority shares txn batch appen
             try std.testing.expectError(error.NotFound, deleted.get(key));
         }
     }
+}
+
+test "prepared transaction effects payload policy generation preserves original wait and acquired-lock rejection" {
+    const a = std.testing.allocator;
+    const admission = @import("../common/read_admission.zig");
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    const Controls = struct {
+        store: *DocStore,
+        waits: usize = 0,
+        acquired: usize = 0,
+        cause: ?anyerror = null,
+        fn check(_: *anyopaque) !void {}
+        fn lifetime(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(!self.store.payload_policy_mutex.tryLock());
+            self.acquired += 1;
+            if (self.cause) |cause| return cause;
+        }
+        fn wait(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.waits += 1;
+            self.store.unlockPayloadPolicy();
+        }
+    };
+    var control = Controls{ .store = &store };
+    var payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Controls.check, .check_lifetime = Controls.lifetime, .wait_for_progress = Controls.wait } };
+    store.lockPayloadPolicy();
+    try std.testing.expectEqual(@as(u64, 0), try store.payloadPolicyGeneration(admission.Port.init(&payload)));
+    try std.testing.expectEqual(@as(usize, 1), control.waits);
+    try std.testing.expectEqual(@as(usize, 1), control.acquired);
+    for ([_]anyerror{ error.NotFound, error.OutOfMemory, error.DeadlineExceeded }) |cause| {
+        control.cause = cause;
+        try std.testing.expectError(cause, store.payloadPolicyGeneration(admission.Port.init(&payload)));
+        try std.testing.expect(store.payload_policy_mutex.tryLock());
+        store.unlockPayloadPolicy();
+    }
+    store.lockPayloadPolicy();
+    store.payload_policy_generation = std.math.maxInt(u64);
+    store.unlockPayloadPolicy();
+    try std.testing.expectError(error.PayloadPolicyGenerationExhausted, store.payloadPolicyGeneration(null));
+    try std.testing.expect(store.payload_policy_mutex.tryLock());
+    store.unlockPayloadPolicy();
 }
 
 pub fn qualifyPayloadPolicyCapture() !void {

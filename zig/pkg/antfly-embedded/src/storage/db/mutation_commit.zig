@@ -372,6 +372,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var preparation_admission: mutation_admission.IntentCollection = .{};
             metadata_reads.control = preparation_admission.bind(initial_controls, S.ownerField(self, "core").*.apply_mutex.io);
             const preparation_store = @import("prepared_read_set.zig").observe(S.ownerField(self, "core").*.store, metadata_reads);
+            const prepared_payload_policy_generation = try S.ownerField(self, "core").*.store.payloadPolicyGeneration(metadata_reads.control);
 
             // Resolve request ordering and transforms before row preparation. A
             // transform that reads durable state carries an optimistic version
@@ -981,6 +982,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var apply_mutex_held = true;
             const apply_lock_acquired_ns = monotonicTimeNs();
             errdefer if (apply_mutex_held) unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
+            const prepared_core_facts = @import("prepared_mutation_dependencies.zig").CoreFacts.capture(S.ownerField(self, "core").*);
+            if (prepared_payload_policy_generation != try S.ownerField(self, "core").*.store.payloadPolicyGeneration(publication_control)) return error.PreparedGenerationChanged;
             // Trusted bulk state is a mutable allocation cache, not a retained
             // read witness. Observe the persistent ordinal inputs before voting.
             if (preparation_observations != null and S.ownerField(self, "bulk_identity").*.enabled) self.clearBulkIngestIdentityAllNewLocked();
@@ -3200,6 +3203,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (prepared_physical) |*plan| try plan.retainDependencies(preparation_alloc, S.ownerField(self, "core").*, .{
                 .schema_namespace = schema_namespace,
                 .catalog_revision = prepared_catalog_revision orelse return error.PreparedGenerationChanged,
+                .core_facts = prepared_core_facts,
+                .payload_policy_generation = prepared_payload_policy_generation,
                 .schema_view = if (apply_schema_view) |view| view else request_schema_view,
                 .require_current_schema = request_schema_binding == null,
                 .write_plan = write_plan_snapshot,

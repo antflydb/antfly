@@ -145658,6 +145658,8 @@ const PreparedDependencyTest = struct {
         return .{
             .schema_namespace = db.core.schemaNamespaceGeneration(),
             .catalog_revision = db.core.store.resolver_catalog_revision.read() orelse return error.PreparedGenerationChanged,
+            .core_facts = deps.CoreFacts.capture(db.core),
+            .payload_policy_generation = try db.core.store.payloadPolicyGeneration(null),
             .schema_view = view,
             .require_current_schema = true,
             .write_plan = plan,
@@ -145745,6 +145747,132 @@ test "db prepared transaction effects required owned dependencies retain schema 
     defer historical.deinit();
     try H.validate(&db, &historical);
     try std.testing.expectEqual(@as(u32, 1), historical.schema_view.?.version());
+}
+
+test "db prepared transaction effects required owned dependencies bind cached table facts at assembly rather than retention" {
+    const a = std.testing.allocator;
+    const H = PreparedDependencyTest;
+    var directory = try TestDirectory.init("prepared-cached-core-facts");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .start_independent_maintenance = false });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "row", .value = "{}" }} });
+    db.core.lockApply();
+    defer db.core.unlockApply();
+    var source = try H.source(&db, null, &.{}, &.{});
+    defer H.release(&source);
+    var owned = try H.deps.Owned.capture(a, db.core, source, null);
+    defer owned.deinit();
+    const facts = H.deps.CoreFacts.capture(db.core);
+    defer {
+        db.core.table_catalog = facts.table_catalog;
+        db.core.identity_visibility.summary = facts.visibility;
+        db.core.discard_storage_writes = facts.discard_storage_writes;
+    }
+    for (0..9) |change| {
+        switch (change) {
+            0 => db.core.table_catalog.transaction_admission_bytes += 1,
+            1 => db.core.table_catalog.row_policy_generation += 1,
+            2 => db.core.table_catalog.row_policy_catalog_epoch += 1,
+            3 => db.core.table_catalog.row_policy_phase = .preparing,
+            4 => db.core.table_catalog.active_schema_version += 1,
+            5 => db.core.table_catalog.generation += 1,
+            6 => db.core.table_catalog.row_count ^= 1,
+            7 => db.core.identity_visibility.summary.?.live_ordinals += 1,
+            8 => db.core.discard_storage_writes = !db.core.discard_storage_writes,
+            else => unreachable,
+        }
+        try std.testing.expectError(error.PreparedGenerationChanged, owned.validate(db.core, null));
+        // Retaining later must not bless assembly performed with stale inputs.
+        try std.testing.expectError(error.PreparedGenerationChanged, H.deps.Owned.capture(a, db.core, source, null));
+        db.core.table_catalog = facts.table_catalog;
+        db.core.identity_visibility.summary = facts.visibility;
+        db.core.discard_storage_writes = facts.discard_storage_writes;
+        try owned.validate(db.core, null);
+    }
+    db.core.identity_visibility.summary = null;
+    try std.testing.expectError(error.PreparedGenerationChanged, owned.validate(db.core, null));
+    db.core.identity_visibility.summary = facts.visibility;
+    try owned.validate(db.core, null);
+    // Unrelated durable control progress is not fenced by these observations.
+    try db.core.store.put("\x00\x00__txn_participant_ack__:peer", "ack");
+    try owned.validate(db.core, null);
+}
+
+test "db prepared transaction effects required owned dependencies reject identical payload policy replacement and ABA" {
+    const a = std.testing.allocator;
+    const H = PreparedDependencyTest;
+    var directory = try TestDirectory.init("prepared-payload-policy-aba");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .start_independent_maintenance = false });
+    defer db.close();
+    db.core.lockApply();
+    defer db.core.unlockApply();
+    var source = try H.source(&db, null, &.{}, &.{});
+    defer H.release(&source);
+    var owned = try H.deps.Owned.capture(a, db.core, source, null);
+    defer owned.deinit();
+    db.core.store.configurePayloadPolicy(null, true, 1);
+    db.core.store.configurePayloadPolicy(null, false, null);
+    try std.testing.expectError(error.PreparedGenerationChanged, owned.validate(db.core, null));
+    try std.testing.expectError(error.PreparedGenerationChanged, H.deps.Owned.capture(a, db.core, source, null));
+    var fresh = try H.source(&db, null, &.{}, &.{});
+    defer H.release(&fresh);
+    var current = try H.deps.Owned.capture(a, db.core, fresh, null);
+    defer current.deinit();
+    try current.validate(db.core, null);
+    db.core.store.configurePayloadPolicy(null, false, null);
+    try std.testing.expectError(error.PreparedGenerationChanged, current.validate(db.core, null));
+}
+
+test "db prepared transaction effects required ordinary assembly rejects concurrent payload policy ABA before publishing" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("prepared-payload-policy-concurrent-aba");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .start_independent_maintenance = false });
+    defer db.close();
+    var hook: PortableRuntimeBatchPrelockTestHook = .{};
+    test_portable_runtime_batch_prelock_hook = &hook;
+    defer test_portable_runtime_batch_prelock_hook = null;
+    const Worker = struct {
+        db: *DB,
+        err: ?anyerror = null,
+        fn run(self: *@This()) void {
+            var guard = PreparedRowAllocator{ .child = std.testing.allocator, .io = std.testing.io };
+            var memo = GeneratedEmbeddingMemo.init(guard.allocator());
+            defer memo.deinit();
+            // Exactly one assembly attempt: a stale attempt must publish
+            // nothing before the ordinary outer layer can choose to retry.
+            self.db.batchInternalPrepared(.{ .writes = &.{.{ .key = "row", .value = "{}" }} }, null, .{}, &memo, &guard) catch |cause| {
+                self.err = cause;
+            };
+        }
+    };
+    var worker: Worker = .{ .db = &db };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var joined = false;
+    defer if (!joined) {
+        hook.release.store(true, .release);
+        thread.join();
+    };
+    const deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
+    while (!hook.entered.load(.acquire) and monotonicTimeNs() < deadline) @import("antfly_platform").time.yieldNow();
+    try std.testing.expect(hook.entered.load(.acquire));
+    test_portable_runtime_batch_prelock_hook = null;
+    db.core.lockApply();
+    db.core.store.configurePayloadPolicy(null, true, 1);
+    db.core.store.configurePayloadPolicy(null, false, null);
+    db.core.unlockApply();
+    hook.release.store(true, .release);
+    thread.join();
+    joined = true;
+    try std.testing.expectEqual(@as(?anyerror, error.PreparedGenerationChanged), worker.err);
+    try std.testing.expect((try db.get(a, "row")) == null);
+    try db.batch(.{ .writes = &.{.{ .key = "row", .value = "{}" }} });
+    const published = (try db.get(a, "row")).?;
+    defer a.free(published);
+    try std.testing.expectEqualStrings("{}", published);
 }
 
 test "db prepared transaction effects required owned dependencies preserve explicit reads after input retirement and reject ABA" {

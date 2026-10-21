@@ -22221,3 +22221,47 @@ session, tenant, whole-node and remote rollout remain open. Strong required
 providers remain disabled; the full goal remains active. Performance across all
 engines is unproven. Full Linux qualification remains waived; Linux builds still
 require the pinned Nix/glibc Zig toolchain.
+
+### Cached core facts and payload-policy preparation witnesses (2026-10-21)
+
+The mutation assembler now records the payload-policy generation before its
+preparation reads and revalidates it after acquiring apply ownership. It retains
+that exact generation with the physical plan, rejecting identical policy
+replacement and A-to-B-to-A transitions. The generation accessor uses the
+original bounded wait authority, performs only lifetime checks after mutex
+acquisition, releases the mutex on rejection and refuses an exhausted clock.
+It creates no payload session or new lifetime authority.
+
+Retained dependencies also own the complete fixed-size table catalog, optional
+identity visibility summary and discard-writes flag observed at the beginning
+of in-apply assembly. Retaining the plan later validates these original values;
+it cannot bless postimages assembled from older cached facts by sampling fresh
+facts at retention. These checks are optimistic inputs, not durable exclusion
+of control metadata. Explicit read/revision conflicts keep their existing
+PreparedReadSetChanged priority ahead of the broader cached-fact rejection.
+
+Four new cases cover stale cached facts at validation and retention, visibility
+summary absence, continued unrelated ACK progress, policy replacement/ABA,
+original acquired-lock rejection and cleanup, exhausted policy clocks, and an
+actual concurrent one-attempt batch whose policy changes between preparation
+and apply. That stale attempt publishes no document; a subsequent fresh batch
+succeeds. Existing allocation/checkpoint sweeps, transform ABA, historical-schema,
+authored-vector, accepted-resolution and reopen tests remain in the native run.
+
+`prepared-core-policy-witness-v2.json/log` records 70/70 build steps and 212
+executions (56 required-preparation DB, 105 prepared-effects and 43/1/7 error
+contracts). All four commands exit zero, with no skips, failures or leaks and
+unchanged source hashes. V1 exposed changed conflict priority and a fixture
+cleanup method error; both are corrected in V2. Pinned format, generated-error
+and whitespace checks pass. No shared owner layouts, wire formats, reader floors
+or activation defaults change.
+
+This closes these cached-fact and payload-policy inputs, not the complete live
+execution authority or DB lifetime. Preparation still assembles during local
+resolution. Moving complete owned assembly before the global vote, refining
+control/counter dependencies or implementing commit-owned deltas, executable
+recovery RAM/CPU/I/O/dependency ownership, derived-log quota, raw/import/restore/
+migration/peer eligibility, normal required PREPARE drivers and the broader
+scheduler/session/tenant/whole-node/remote rollout remain open. The full goal
+remains active; strong required providers remain disabled. Full Linux
+qualification remains waived, and cross-engine performance is unproven.
