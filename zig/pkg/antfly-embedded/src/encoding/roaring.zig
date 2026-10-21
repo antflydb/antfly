@@ -795,6 +795,40 @@ pub const RoaringBitmap = struct {
         return copied;
     }
 
+    /// Bounded immutable owners admit storage before evicting useful entries.
+    /// Includes worst-case alignment padding for every exact clone allocation.
+    pub fn cloneStorageBound(self: *const RoaringBitmap) usize {
+        var bytes = self.keys.items.len * @sizeOf(u16) + self.containers.items.len * @sizeOf(Container) + 32;
+        for (self.containers.items) |container| bytes += 16 + switch (container) {
+            .array => |values| values.items.len * @sizeOf(u16),
+            .bitmap => |words| words.len * @sizeOf(u64),
+        };
+        return bytes;
+    }
+
+    pub fn cloneExact(self: *const RoaringBitmap, alloc: Allocator) !RoaringBitmap {
+        var copied = RoaringBitmap.init(alloc);
+        errdefer copied.deinit();
+        try copied.keys.ensureTotalCapacityPrecise(alloc, self.keys.items.len);
+        try copied.containers.ensureTotalCapacityPrecise(alloc, self.containers.items.len);
+        for (self.keys.items, self.containers.items) |key, container| {
+            const owned = try cloneContainer(alloc, &container);
+            copied.keys.appendAssumeCapacity(key);
+            copied.containers.appendAssumeCapacity(owned);
+        }
+        return copied;
+    }
+
+    /// Immutable cached membership may be much broader than the current input.
+    /// Copy the smaller storage operand before intersecting, never the corpus.
+    pub fn intersectionClone(self: *const RoaringBitmap, alloc: Allocator, other: *const RoaringBitmap) !RoaringBitmap {
+        if (self.keys.items.len == 0 or other.keys.items.len == 0) return RoaringBitmap.init(alloc);
+        const smaller = self.cloneStorageBound() <= other.cloneStorageBound();
+        var result = try (if (smaller) self else other).cloneExact(alloc);
+        result.andWith(if (smaller) other else self);
+        return result;
+    }
+
     pub fn eql(self: *const RoaringBitmap, other: *const RoaringBitmap) bool {
         if (!std.mem.eql(u16, self.keys.items, other.keys.items)) return false;
         if (self.containers.items.len != other.containers.items.len) return false;
@@ -2512,4 +2546,22 @@ test "external lake bounded WAL roaring intersections canonicalize empty array a
         try left.prepareRead();
         try std.testing.expectEqual(@as(?u32, null), left.read_rank.?.select(0));
     }
+}
+
+test "logical value immutable intersection clones only the smaller operand" {
+    const a = std.testing.allocator;
+    var broad = RoaringBitmap.init(a);
+    defer broad.deinit();
+    try broad.addRange(0, 15_000_000);
+    var narrow = RoaringBitmap.init(a);
+    defer narrow.deinit();
+    try narrow.add(7);
+    try narrow.add(20_000_000);
+    var storage: [256]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&storage);
+    var intersection = try broad.intersectionClone(bounded.allocator(), &narrow);
+    defer intersection.deinit();
+    try std.testing.expectEqual(@as(usize, 1), intersection.cardinality());
+    try std.testing.expect(intersection.contains(7));
+    try std.testing.expect(narrow.contains(20_000_000) and broad.contains(14_999_999));
 }

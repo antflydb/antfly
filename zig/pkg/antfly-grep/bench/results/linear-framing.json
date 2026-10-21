@@ -1,0 +1,117 @@
+{
+  "measurement": "Isolate JSONL framing cost with deterministic fragmented reads.\n\nCompare a pinned repository reader with the working reader. Both use stdlib\nJSON, identical byte chunks and mocked transport; these are CPU controls, not\nend-to-end pipe/producer measurements. Every run verifies the decoded payload.\n",
+  "host": "macOS-27.0.1-arm64-arm-64bit",
+  "baseline": "168a2b04e1",
+  "baseline_reader_sha256": "bd2a684b95508f510dd193838d702be9470d3e1c292e35f60c8ecf6d3af47f73",
+  "current_reader_sha256": "8b066a9e80a25ddab707749cb0a500a36535ac11254516a490ba2b41c25a8da0",
+  "chunk_bytes": 65536,
+  "trials": {
+    "dense": [
+      {"current":{"seconds":0.023176792,"cpu_seconds":0.022119},"baseline":{"seconds":0.02351129199999999,"cpu_seconds":0.023312}},
+      {"baseline":{"seconds":0.024245958000000012,"cpu_seconds":0.02357400000000001},"current":{"seconds":0.020136582999999986,"cpu_seconds":0.020110000000000017}},
+      {"current":{"seconds":0.019844250000000008,"cpu_seconds":0.019776000000000016},"baseline":{"seconds":0.02562624999999996,"cpu_seconds":0.024788000000000032}},
+      {"baseline":{"seconds":0.024231249999999982,"cpu_seconds":0.023819999999999952},"current":{"seconds":0.022372375,"cpu_seconds":0.021851999999999983}},
+      {"current":{"seconds":0.022318833000000038,"cpu_seconds":0.021816000000000002},"baseline":{"seconds":0.023223249999999973,"cpu_seconds":0.023057999999999967}},
+      {"baseline":{"seconds":0.025240541000000005,"cpu_seconds":0.024090999999999974},"current":{"seconds":0.022546290999999996,"cpu_seconds":0.020833000000000046}},
+      {"current":{"seconds":0.020928124999999964,"cpu_seconds":0.020318000000000003},"baseline":{"seconds":0.024324541999999894,"cpu_seconds":0.023860000000000048}},
+      {"baseline":{"seconds":0.024230833000000063,"cpu_seconds":0.023580000000000045},"current":{"seconds":0.021170542000000014,"cpu_seconds":0.020699000000000023}},
+      {"current":{"seconds":0.020929167000000026,"cpu_seconds":0.020576999999999956},"baseline":{"seconds":0.02513279200000007,"cpu_seconds":0.02445699999999995}}
+    ],
+    "1": [
+      {"current":{"seconds":0.0009881250000000064,"cpu_seconds":0.0009760000000000879},"baseline":{"seconds":0.0011362910000000115,"cpu_seconds":0.0011359999999999149}},
+      {"baseline":{"seconds":0.0010953340000000589,"cpu_seconds":0.0010949999999999571},"current":{"seconds":0.0009122500000000588,"cpu_seconds":0.0009129999999999416}},
+      {"current":{"seconds":0.0009205840000000576,"cpu_seconds":0.0009199999999999209},"baseline":{"seconds":0.001115832999999955,"cpu_seconds":0.0011160000000000059}},
+      {"baseline":{"seconds":0.0010900000000000354,"cpu_seconds":0.0010900000000000354},"current":{"seconds":0.0009138340000000023,"cpu_seconds":0.0009139999999999704}},
+      {"current":{"seconds":0.0009096669999999474,"cpu_seconds":0.0009099999999999664},"baseline":{"seconds":0.0019717919999999722,"cpu_seconds":0.0019719999999999738}},
+      {"baseline":{"seconds":0.001275250000000061,"cpu_seconds":0.0012389999999999901},"current":{"seconds":0.0011020419999999698,"cpu_seconds":0.0010890000000000066}},
+      {"current":{"seconds":0.0012330839999999954,"cpu_seconds":0.0011839999999999629},"baseline":{"seconds":0.0017022079999999828,"cpu_seconds":0.0016570000000000196}},
+      {"baseline":{"seconds":0.0010818340000000592,"cpu_seconds":0.0010820000000000274},"current":{"seconds":0.0009186660000000124,"cpu_seconds":0.0009180000000000854}},
+      {"current":{"seconds":0.0009509169999999401,"cpu_seconds":0.0009520000000000639},"baseline":{"seconds":0.0018517499999999298,"cpu_seconds":0.0018380000000000063}}
+    ],
+    "4": [
+      {"current":{"seconds":0.0044067910000000765,"cpu_seconds":0.004305999999999921},"baseline":{"seconds":0.007152125000000065,"cpu_seconds":0.007112000000000007}},
+      {"baseline":{"seconds":0.0072088750000000035,"cpu_seconds":0.007009999999999961},"current":{"seconds":0.004166833999999953,"cpu_seconds":0.0041680000000000605}},
+      {"current":{"seconds":0.0056401660000000575,"cpu_seconds":0.00481100000000001},"baseline":{"seconds":0.006200125000000001,"cpu_seconds":0.006187999999999971}},
+      {"baseline":{"seconds":0.0064186669999999335,"cpu_seconds":0.0062950000000000506},"current":{"seconds":0.004247708999999933,"cpu_seconds":0.0042079999999999895}},
+      {"current":{"seconds":0.004862707999999993,"cpu_seconds":0.0047200000000000575},"baseline":{"seconds":0.006545040999999974,"cpu_seconds":0.006394000000000011}},
+      {"baseline":{"seconds":0.008966499999999988,"cpu_seconds":0.00844199999999995},"current":{"seconds":0.004035874999999911,"cpu_seconds":0.003854999999999942}},
+      {"current":{"seconds":0.005032958000000032,"cpu_seconds":0.00477099999999997},"baseline":{"seconds":0.007472915999999996,"cpu_seconds":0.007344000000000017}},
+      {"baseline":{"seconds":0.007139167000000057,"cpu_seconds":0.006964000000000081},"current":{"seconds":0.004300583999999996,"cpu_seconds":0.004302000000000028}},
+      {"current":{"seconds":0.0034546250000000445,"cpu_seconds":0.003454999999999986},"baseline":{"seconds":0.006505165999999951,"cpu_seconds":0.006345000000000045}}
+    ],
+    "16": [
+      {"current":{"seconds":0.02150216599999999,"cpu_seconds":0.02136300000000002},"baseline":{"seconds":0.06701683300000005,"cpu_seconds":0.063145}},
+      {"baseline":{"seconds":0.05777945799999995,"cpu_seconds":0.055772000000000044},"current":{"seconds":0.019687082999999994,"cpu_seconds":0.018424999999999914}},
+      {"current":{"seconds":0.017869542000000127,"cpu_seconds":0.017411000000000065},"baseline":{"seconds":0.06439070899999999,"cpu_seconds":0.06054399999999993}},
+      {"baseline":{"seconds":0.06494566600000007,"cpu_seconds":0.060051999999999994},"current":{"seconds":0.021739583000000007,"cpu_seconds":0.01957299999999984}},
+      {"current":{"seconds":0.02154558299999998,"cpu_seconds":0.02038300000000004},"baseline":{"seconds":0.08516495800000001,"cpu_seconds":0.07168599999999992}},
+      {"baseline":{"seconds":0.06402854099999988,"cpu_seconds":0.059925000000000006},"current":{"seconds":0.023209666000000073,"cpu_seconds":0.020947999999999967}},
+      {"current":{"seconds":0.033572500000000005,"cpu_seconds":0.023713000000000095},"baseline":{"seconds":0.06200612499999991,"cpu_seconds":0.06026900000000013}},
+      {"baseline":{"seconds":0.060808834000000145,"cpu_seconds":0.05856799999999995},"current":{"seconds":0.019117457999999976,"cpu_seconds":0.01828200000000013}},
+      {"current":{"seconds":0.016962457999999847,"cpu_seconds":0.01683100000000004},"baseline":{"seconds":0.060085667000000065,"cpu_seconds":0.05834399999999995}}
+    ],
+    "64": [
+      {"current":{"seconds":0.09217454199999997,"cpu_seconds":0.08190799999999987},"baseline":{"seconds":0.8532137909999999,"cpu_seconds":0.800379}},
+      {"baseline":{"seconds":0.8215872910000002,"cpu_seconds":0.7554450000000004},"current":{"seconds":0.07855691600000014,"cpu_seconds":0.07591199999999976}},
+      {"current":{"seconds":0.06831533300000014,"cpu_seconds":0.06767900000000004},"baseline":{"seconds":0.8168963749999998,"cpu_seconds":0.7813290000000004}},
+      {"baseline":{"seconds":0.7646463749999999,"cpu_seconds":0.7339979999999997},"current":{"seconds":0.06812912499999957,"cpu_seconds":0.06645299999999921}},
+      {"current":{"seconds":0.0679195410000002,"cpu_seconds":0.06646299999999972},"baseline":{"seconds":0.7940666670000001,"cpu_seconds":0.7521340000000007}},
+      {"baseline":{"seconds":0.915706082999999,"cpu_seconds":0.7945060000000002},"current":{"seconds":0.08031924999999873,"cpu_seconds":0.07843399999999967}},
+      {"current":{"seconds":0.07139712500000073,"cpu_seconds":0.06879800000000014},"baseline":{"seconds":0.8038281250000008,"cpu_seconds":0.7509959999999998}},
+      {"baseline":{"seconds":0.7568177080000016,"cpu_seconds":0.7333940000000005},"current":{"seconds":0.06419933299999947,"cpu_seconds":0.06348699999999852}},
+      {"current":{"seconds":0.06727799999999995,"cpu_seconds":0.06507200000000068},"baseline":{"seconds":0.7867806249999987,"cpu_seconds":0.7384830000000004}}
+    ]
+  },
+  "median": {
+    "dense": {
+      "baseline": {
+        "seconds": 0.024245958000000012,
+        "cpu_seconds": 0.023819999999999952
+      },
+      "current": {
+        "seconds": 0.021170542000000014,
+        "cpu_seconds": 0.020699000000000023
+      }
+    },
+    "1": {
+      "baseline": {
+        "seconds": 0.0011362910000000115,
+        "cpu_seconds": 0.0011359999999999149
+      },
+      "current": {
+        "seconds": 0.0009205840000000576,
+        "cpu_seconds": 0.0009199999999999209
+      }
+    },
+    "4": {
+      "baseline": {
+        "seconds": 0.007139167000000057,
+        "cpu_seconds": 0.006964000000000081
+      },
+      "current": {
+        "seconds": 0.004300583999999996,
+        "cpu_seconds": 0.004302000000000028
+      }
+    },
+    "16": {
+      "baseline": {
+        "seconds": 0.06402854099999988,
+        "cpu_seconds": 0.060051999999999994
+      },
+      "current": {
+        "seconds": 0.02150216599999999,
+        "cpu_seconds": 0.01957299999999984
+      }
+    },
+    "64": {
+      "baseline": {
+        "seconds": 0.8038281250000008,
+        "cpu_seconds": 0.7521340000000007
+      },
+      "current": {
+        "seconds": 0.06831533300000014,
+        "cpu_seconds": 0.06767900000000004
+      }
+    }
+  }
+}

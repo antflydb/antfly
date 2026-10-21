@@ -739,7 +739,7 @@ pub fn keyInNamespace(template: []const u8, key: []const u8) bool {
     return key.len >= prefix.len + suffix.len and std.mem.startsWith(u8, key, prefix) and std.mem.endsWith(u8, key, suffix);
 }
 
-pub const drop_marker_prefix = "\x00\x00__metadata__:resolver_curation_drop:";
+pub const drop_marker_prefix = catalog.drop_marker_prefix;
 
 pub fn planDropMetadata(a: std.mem.Allocator, indexes_json: []const u8, name: []const u8) !MetadataPlan {
     var root = try std.json.parseFromSliceLeaky(std.json.Value, a, indexes_json, .{});

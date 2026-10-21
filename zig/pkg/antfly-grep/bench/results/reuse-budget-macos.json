@@ -1,0 +1,2143 @@
+{
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "binaries": {
+    "baseline": "42c0e244e64c1e97d6ec8a19d46ae23e06826dc8fd5d9f47537f40f5e89a445b",
+    "candidate": "077d18d4790d22d661714a5911b00c3fa1d29a3da2c27a22b056b699b63d00c7"
+  },
+  "median_seconds": {
+    "baseline": {
+      "True": 0.08937970793340355,
+      "False": 0.0001474169548600912
+    },
+    "candidate": {
+      "True": 0.00020895793568342924,
+      "False": 0.0001324580516666174
+    }
+  },
+  "trials": [
+    {
+      "binary": "baseline",
+      "cache": true,
+      "seconds": 0.08972258307039738,
+      "load_average": [
+        5.02587890625,
+        7.2685546875,
+        10.21728515625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 89550625,
+            "human": "0.089551s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "candidate",
+      "cache": true,
+      "seconds": 0.0003819999983534217,
+      "load_average": [
+        5.02587890625,
+        7.2685546875,
+        10.21728515625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 163791,
+            "human": "0.000164s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "query_cache_hits": 0,
+          "file_evaluation_cache_hits": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "baseline",
+      "cache": false,
+      "seconds": 0.0001494159223511815,
+      "load_average": [
+        5.02587890625,
+        7.2685546875,
+        10.21728515625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 28709,
+            "human": "0.000029s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "candidate",
+      "cache": false,
+      "seconds": 0.00011087500024586916,
+      "load_average": [
+        5.02587890625,
+        7.2685546875,
+        10.21728515625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 27208,
+            "human": "0.000027s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "query_cache_hits": 0,
+          "file_evaluation_cache_hits": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "candidate",
+      "cache": true,
+      "seconds": 0.00012250000145286322,
+      "load_average": [
+        5.02587890625,
+        7.2685546875,
+        10.21728515625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 28875,
+            "human": "0.000029s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "query_cache_hits": 0,
+          "file_evaluation_cache_hits": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "baseline",
+      "cache": true,
+      "seconds": 0.08937970793340355,
+      "load_average": [
+        5.02587890625,
+        7.2685546875,
+        10.21728515625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 89240875,
+            "human": "0.089241s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "candidate",
+      "cache": false,
+      "seconds": 0.000316083081997931,
+      "load_average": [
+        5.02587890625,
+        7.2685546875,
+        10.21728515625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 74542,
+            "human": "0.000075s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "query_cache_hits": 0,
+          "file_evaluation_cache_hits": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "baseline",
+      "cache": false,
+      "seconds": 0.00017158302944153547,
+      "load_average": [
+        5.02587890625,
+        7.2685546875,
+        10.21728515625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 43500,
+            "human": "0.000044s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "baseline",
+      "cache": true,
+      "seconds": 0.08939670794643462,
+      "load_average": [
+        5.02587890625,
+        7.2685546875,
+        10.21728515625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 89250375,
+            "human": "0.089250s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "candidate",
+      "cache": true,
+      "seconds": 0.0002347499830648303,
+      "load_average": [
+        5.02587890625,
+        7.2685546875,
+        10.21728515625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 40875,
+            "human": "0.000041s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "query_cache_hits": 0,
+          "file_evaluation_cache_hits": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "baseline",
+      "cache": false,
+      "seconds": 0.0001501670340076089,
+      "load_average": [
+        5.02587890625,
+        7.2685546875,
+        10.21728515625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 29416,
+            "human": "0.000029s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "candidate",
+      "cache": false,
+      "seconds": 0.0001224169973284006,
+      "load_average": [
+        5.02587890625,
+        7.2685546875,
+        10.21728515625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 21708,
+            "human": "0.000022s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "query_cache_hits": 0,
+          "file_evaluation_cache_hits": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "candidate",
+      "cache": true,
+      "seconds": 0.00013804202899336815,
+      "load_average": [
+        5.02587890625,
+        7.2685546875,
+        10.21728515625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 27125,
+            "human": "0.000027s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "query_cache_hits": 0,
+          "file_evaluation_cache_hits": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "baseline",
+      "cache": true,
+      "seconds": 0.08882941596675664,
+      "load_average": [
+        5.02587890625,
+        7.2685546875,
+        10.21728515625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 88702292,
+            "human": "0.088702s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "candidate",
+      "cache": false,
+      "seconds": 0.000196542008779943,
+      "load_average": [
+        5.02587890625,
+        7.2685546875,
+        10.21728515625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 46958,
+            "human": "0.000047s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "query_cache_hits": 0,
+          "file_evaluation_cache_hits": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "baseline",
+      "cache": false,
+      "seconds": 0.00014916702639311552,
+      "load_average": [
+        5.02587890625,
+        7.2685546875,
+        10.21728515625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 36791,
+            "human": "0.000037s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "baseline",
+      "cache": true,
+      "seconds": 0.08855395799037069,
+      "load_average": [
+        5.02587890625,
+        7.2685546875,
+        10.21728515625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 88445125,
+            "human": "0.088445s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "candidate",
+      "cache": true,
+      "seconds": 0.0002292089629918337,
+      "load_average": [
+        5.02587890625,
+        7.2685546875,
+        10.21728515625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 35958,
+            "human": "0.000036s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "query_cache_hits": 0,
+          "file_evaluation_cache_hits": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "baseline",
+      "cache": false,
+      "seconds": 0.00011662498582154512,
+      "load_average": [
+        5.02587890625,
+        7.2685546875,
+        10.21728515625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 25792,
+            "human": "0.000026s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "candidate",
+      "cache": false,
+      "seconds": 9.420805145055056e-05,
+      "load_average": [
+        5.02587890625,
+        7.2685546875,
+        10.21728515625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 23250,
+            "human": "0.000023s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "query_cache_hits": 0,
+          "file_evaluation_cache_hits": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "candidate",
+      "cache": true,
+      "seconds": 9.545893408358097e-05,
+      "load_average": [
+        5.02587890625,
+        7.2685546875,
+        10.21728515625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 21916,
+            "human": "0.000022s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "query_cache_hits": 0,
+          "file_evaluation_cache_hits": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "baseline",
+      "cache": true,
+      "seconds": 0.08969187492039055,
+      "load_average": [
+        5.02587890625,
+        7.2685546875,
+        10.21728515625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 89577209,
+            "human": "0.089577s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "candidate",
+      "cache": false,
+      "seconds": 0.00020954199135303497,
+      "load_average": [
+        5.02587890625,
+        7.2685546875,
+        10.21728515625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 45083,
+            "human": "0.000045s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "query_cache_hits": 0,
+          "file_evaluation_cache_hits": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "baseline",
+      "cache": false,
+      "seconds": 0.00013699999544769526,
+      "load_average": [
+        5.02587890625,
+        7.2685546875,
+        10.21728515625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 31167,
+            "human": "0.000031s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "baseline",
+      "cache": true,
+      "seconds": 0.08987066696863621,
+      "load_average": [
+        4.943359375,
+        7.2138671875,
+        10.1806640625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 89745500,
+            "human": "0.089746s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "candidate",
+      "cache": true,
+      "seconds": 0.00026541692204773426,
+      "load_average": [
+        4.943359375,
+        7.2138671875,
+        10.1806640625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 49833,
+            "human": "0.000050s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "query_cache_hits": 0,
+          "file_evaluation_cache_hits": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "baseline",
+      "cache": false,
+      "seconds": 0.0001474169548600912,
+      "load_average": [
+        4.943359375,
+        7.2138671875,
+        10.1806640625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 27709,
+            "human": "0.000028s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "candidate",
+      "cache": false,
+      "seconds": 0.0001324580516666174,
+      "load_average": [
+        4.943359375,
+        7.2138671875,
+        10.1806640625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 26375,
+            "human": "0.000026s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "query_cache_hits": 0,
+          "file_evaluation_cache_hits": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "candidate",
+      "cache": true,
+      "seconds": 0.0001369159435853362,
+      "load_average": [
+        4.943359375,
+        7.2138671875,
+        10.1806640625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 32125,
+            "human": "0.000032s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "query_cache_hits": 0,
+          "file_evaluation_cache_hits": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "baseline",
+      "cache": true,
+      "seconds": 0.08911045792046934,
+      "load_average": [
+        4.943359375,
+        7.2138671875,
+        10.1806640625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 88975584,
+            "human": "0.088976s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "candidate",
+      "cache": false,
+      "seconds": 0.0001829999964684248,
+      "load_average": [
+        4.943359375,
+        7.2138671875,
+        10.1806640625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 31750,
+            "human": "0.000032s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "query_cache_hits": 0,
+          "file_evaluation_cache_hits": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "baseline",
+      "cache": false,
+      "seconds": 0.00012791703920811415,
+      "load_average": [
+        4.943359375,
+        7.2138671875,
+        10.1806640625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 25459,
+            "human": "0.000025s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "baseline",
+      "cache": true,
+      "seconds": 0.08922112500295043,
+      "load_average": [
+        4.943359375,
+        7.2138671875,
+        10.1806640625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 89105042,
+            "human": "0.089105s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "candidate",
+      "cache": true,
+      "seconds": 0.00020895793568342924,
+      "load_average": [
+        4.943359375,
+        7.2138671875,
+        10.1806640625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 37625,
+            "human": "0.000038s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "query_cache_hits": 0,
+          "file_evaluation_cache_hits": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "baseline",
+      "cache": false,
+      "seconds": 0.0001313339453190565,
+      "load_average": [
+        4.943359375,
+        7.2138671875,
+        10.1806640625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 25709,
+            "human": "0.000026s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    },
+    {
+      "binary": "candidate",
+      "cache": false,
+      "seconds": 0.00010583293624222279,
+      "load_average": [
+        4.943359375,
+        7.2138671875,
+        10.1806640625
+      ],
+      "summary": {
+        "type": "summary",
+        "data": {
+          "elapsed_total": {
+            "secs": 0,
+            "nanos": 23041,
+            "human": "0.000023s"
+          },
+          "stats": {
+            "elapsed": {
+              "secs": 0,
+              "nanos": 0,
+              "human": "0.000000s"
+            },
+            "searches": 1,
+            "searches_with_match": 0,
+            "bytes_searched": 94208,
+            "bytes_printed": 565,
+            "matched_lines": 0,
+            "matches": 0
+          }
+        },
+        "stats": {
+          "index_requests": 0,
+          "query_cache_hits": 0,
+          "file_evaluation_cache_hits": 0,
+          "source_cache_hits": 1,
+          "source_parses": 0,
+          "files": 1,
+          "bytes": 94208,
+          "matches": 0,
+          "reading_leads": 0,
+          "occurrences": 0,
+          "occurrences_exact": true,
+          "files_with_matches": 0,
+          "regions_considered": 4096,
+          "regions_evaluated": 0,
+          "errors": 1,
+          "skipped_paths": 0,
+          "invalid_utf8_files": 0,
+          "complete": false
+        },
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "request_bytes": 0,
+        "request_inputs": 0,
+        "peak_request_bytes": 0,
+        "cache_hits": 0
+      }
+    }
+  ]
+}

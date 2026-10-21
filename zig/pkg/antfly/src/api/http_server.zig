@@ -10591,7 +10591,7 @@ pub const ApiHttpServer = struct {
         const runtime_schema = try schema_mod.deriveRuntimeTableSchema(self.alloc, parsed_schema);
         defer storage_schema.freeSchema(self.alloc, runtime_schema);
 
-        const physical_sort_fields = try publicPhysicalSortFieldsAlloc(self.alloc, query_req.order_by);
+        const physical_sort_fields = try publicPhysicalSortFieldsAlloc(self.alloc, query_req.order_by, runtime_schema);
         defer if (physical_sort_fields.len > 0) self.alloc.free(physical_sort_fields);
         // External lake sorts are validated against their pinned native column
         // source. A local shard's full-text index is neither the owner nor
@@ -15457,6 +15457,8 @@ pub const ApiHttpServer = struct {
             error.EmbedRateLimited => return error.EmbedRateLimited,
             error.EmbedTransientFailure => return error.EmbedTransientFailure,
             error.EmbedUpstreamFailure => return error.EmbedUpstreamFailure,
+            error.ValueSearchRequiresScan => return error.ValueSearchRequiresScan,
+            error.ValueSearchLimitExceeded => return error.ValueSearchLimitExceeded,
             error.DecisionLimitExceeded => return error.DecisionLimitExceeded,
             error.RerankRateLimited => return error.RerankRateLimited,
             error.RerankTransientFailure => return error.RerankTransientFailure,
@@ -23874,6 +23876,8 @@ pub const ApiHttpServer = struct {
             error.EmbedRateLimited => try contextualQueryDependencyErrorResponse(self.alloc, 429, "query_embedding_rate_limited", "query embedding rate limited", true),
             error.EmbedTransientFailure => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .query_embedding_temporarily_unavailable),
             error.EmbedUpstreamFailure => try contextualQueryDependencyErrorResponse(self.alloc, 502, "query_embedding_upstream_failure", "query embedding provider failed", false),
+            error.ValueSearchRequiresScan => try contextualQueryDependencyErrorResponse(self.alloc, 422, "value_search_requires_scan", "no compatible indexed candidate plan; explicitly permit scans with value_search_execution.allow_scan", false),
+            error.ValueSearchLimitExceeded => try contextualQueryDependencyErrorResponse(self.alloc, 422, "value_search_limit_exceeded", "logical value search exceeded its verification budget", false),
             error.DecisionLimitExceeded => try contextualQueryDependencyErrorResponse(self.alloc, 422, "decision_limit_exceeded", "decision evaluation budget exceeded", false),
             error.UnknownDecider, error.InvalidDeciderConfig, error.InvalidDecisionSpecification, error.InvalidFunctionExpression, error.FunctionTypeMismatch, error.UnknownFunctionBinding, error.CyclicFunctionBinding, error.UnknownQueryFunction => try contextualQueryDependencyErrorResponse(self.alloc, 400, "invalid_decision_evaluation", "invalid decision evaluation", false),
             error.DecisionProviderUnavailable, error.MissingDecisionApiKey => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .decision_provider_unavailable),
@@ -27585,12 +27589,16 @@ fn validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(
         if (std.mem.eql(u8, field.field, "_id")) continue;
         if (std.mem.eql(u8, field.field, "_score")) continue;
 
-        if (storage_schema.resolveDeclaredFieldType(runtime_schema, field.field)) |mapping| {
+        const physical = if (storage_schema.resolveLogicalDocValues(runtime_schema, field.field)) |resolved|
+            resolved.field
+        else
+            field.field;
+        if (storage_schema.resolveDeclaredFieldType(runtime_schema, physical)) |mapping| {
             try validatePublicMappedSortField(field.field, mapping);
             if (try validatePublicSortCapabilityEvidence(
                 observed_dynamic_capability_sets,
                 query_req.primary_text_index_name orelse query_req.index_name,
-                field.field,
+                physical,
                 mapping.field_type,
             ) == null) {
                 if (physical_evidence_available) try validatePublicMappedSortCoverage(field.field, mapping);
@@ -27602,7 +27610,7 @@ fn validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(
         if (try validatePublicSortCapabilityEvidence(
             observed_dynamic_capability_sets,
             query_req.primary_text_index_name orelse query_req.index_name,
-            field.field,
+            physical,
             null,
         )) |field_type| {
             if (cursor.len > 0) try validatePublicMappedSortCursor(field.field, field_type, cursor[i]);
@@ -27666,6 +27674,7 @@ fn publicSearchRequestHasSortPageControls(query_req: db_mod.types.SearchRequest)
 fn publicPhysicalSortFieldsAlloc(
     alloc: std.mem.Allocator,
     order_by: []const db_mod.types.SortField,
+    runtime_schema: storage_schema.TableSchema,
 ) ![]const []const u8 {
     var fields = std.ArrayListUnmanaged([]const u8).empty;
     defer fields.deinit(alloc);
@@ -27673,14 +27682,18 @@ fn publicPhysicalSortFieldsAlloc(
         if (std.mem.eql(u8, sort_field.field, "_id") or
             std.mem.eql(u8, sort_field.field, "_score") or
             std.mem.eql(u8, sort_field.field, "_hierarchy.position")) continue;
+        const physical = if (storage_schema.resolveLogicalDocValues(runtime_schema, sort_field.field)) |resolved|
+            resolved.field
+        else
+            sort_field.field;
         var duplicate = false;
         for (fields.items) |field| {
-            if (std.mem.eql(u8, field, sort_field.field)) {
+            if (std.mem.eql(u8, field, physical)) {
                 duplicate = true;
                 break;
             }
         }
-        if (!duplicate) try fields.append(alloc, sort_field.field);
+        if (!duplicate) try fields.append(alloc, physical);
     }
     return try fields.toOwnedSlice(alloc);
 }
@@ -30678,9 +30691,8 @@ pub fn normalizeQueryEmbeddingOperationalError(err: anyerror) ?anyerror {
 }
 
 pub fn normalizeQueryOperationalError(err: anyerror) ?anyerror {
-    if (err == error.MetricNotReady or err == error.MetricStale or err == error.DecisionLimitExceeded) return err;
+    if (err == error.ValueSearchRequiresScan or err == error.ValueSearchLimitExceeded or err == error.MetricNotReady or err == error.MetricStale or err == error.DecisionLimitExceeded) return err;
     if (err == error.RemoteOutcomeUncertain or err == error.RemoteAttemptCapacity) return error.DistributedQueryUnavailable;
-    if (err == error.MetricNotReady or err == error.MetricStale) return err;
     if (normalizeQueryEmbeddingOperationalError(err)) |normalized| return normalized;
     return switch (reranking_runtime.normalizeOperationalError(err)) {
         error.RerankRateLimited,
@@ -34461,11 +34473,24 @@ test "api http exact sort observation selects only unique physical fields" {
         .{ .field = "_id" },
         .{ .field = "_hierarchy.position" },
     };
-    const fields = try publicPhysicalSortFieldsAlloc(std.testing.allocator, &order);
+    const fields = try publicPhysicalSortFieldsAlloc(std.testing.allocator, &order, .{});
     defer if (fields.len > 0) std.testing.allocator.free(fields);
     try std.testing.expectEqual(@as(usize, 2), fields.len);
     try std.testing.expectEqualStrings("price", fields[0]);
     try std.testing.expectEqualStrings("quantity", fields[1]);
+}
+
+test "api http public sort capability gate resolves logical keyword fields" {
+    const schema = storage_schema.TableSchema{ .exact_fields = &.{
+        .{ .source_field = "title", .field = "title", .mapping = .{ .field_type = .text, .analyzer = "standard" } },
+        .{ .source_field = "title", .field = "title.keyword", .mapping = .{ .field_type = .keyword, .analyzer = "keyword", .doc_values = true, .sortable = true } },
+    } };
+    const order = [_]db_mod.types.SortField{.{ .field = "title" }};
+    const fields = try publicPhysicalSortFieldsAlloc(std.testing.allocator, &order, schema);
+    defer std.testing.allocator.free(fields);
+    try std.testing.expectEqualStrings("title.keyword", fields[0]);
+    // Routed admission validates the same physical mapping as the shard.
+    try validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(.{ .order_by = &order }, schema, &.{}, false);
 }
 
 test "api http public sort gate accepts synthetic hierarchy child positions" {

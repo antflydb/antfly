@@ -1,0 +1,13 @@
+{
+  "platform": "darwin-arm64",
+  "complete": true,
+  "seed": 1151,
+  "oracle": "ripgrep 15.2.0 (rev e89fff89ac)\n\nfeatures:+pcre2\nsimd(compile):+NEON\nsimd(runtime):+NEON\n\nPCRE2 10.45 is available (JIT is available)\n",
+  "pcre2_runtime": "PCRE2 10.45 is available (JIT is available)\n",
+  "binary_sha256": "57c92be2c6df4b95255b0614c7934a6fe466275e9a49b272a310f5f43ca781f4",
+  "oracle_sha256": "27d09e29c478fddbfc750a2cb5fd06965bad0ea223e776f8667160a0de63c6e4",
+  "cases": 1000,
+  "failures": [],
+  "timeouts": [],
+  "oracle_mode": "live-pinned-oracle"
+}

@@ -1924,6 +1924,13 @@ pub const Client = struct {
     }
 
     fn connectHostDirect(self: *Self, host: []const u8, port: u16, original: ?socket_mod.WriteControl) !Socket {
+        var socket = try self.connectHostAddress(host, port, original);
+        // Preserve H1 low latency for direct and TLS connections too.
+        socket.setNoDelay(true) catch {};
+        return socket;
+    }
+
+    fn connectHostAddress(self: *Self, host: []const u8, port: u16, original: ?socket_mod.WriteControl) !Socket {
         const control = original orelse socket_mod.WriteControl{};
         var rejected = false;
         try control.check();
@@ -8032,4 +8039,19 @@ test "HTTPS client uploads large immutable packs without truncation" {
         try std.testing.expectEqualStrings("ok", response.body orelse "");
     }
     std.debug.print("TLS buffer boundary verified protocol_versions={d}\n", .{version_count});
+}
+
+test "H1 direct connections disable Nagle" {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const io = std.testing.io;
+    var listener = try @import("../net/socket.zig").TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var client = Client.init(std.testing.allocator, io);
+    defer client.deinit();
+    var socket = try client.connectHostDirect("127.0.0.1", listener.getLocalAddress().getPort());
+    defer socket.close();
+    var value: c_int = 0;
+    var size: std.posix.socklen_t = @sizeOf(c_int);
+    try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(std.posix.system.getsockopt(socket.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, @ptrCast(&value), &size)));
+    try std.testing.expect(value != 0);
 }

@@ -86,6 +86,12 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
         .optimize = .safe,
         .single_threaded = true,
     });
+    wasm_tokenizer_mod.addImport("antfly_grapheme", b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/tokenizer/src/grapheme.zig" })),
+        .target = wasm_target,
+        .optimize = .safe,
+        .single_threaded = true,
+    }));
     const wasm_hf_tokenizer_mod = b.createModule(.{
         .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/tokenizer/src/hf_root.zig" })),
         .target = wasm_target,

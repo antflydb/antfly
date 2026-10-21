@@ -622,6 +622,27 @@ fn Result(comptime name: []const u8) type {
     const Wire = @typeInfo(Function).@"fn".return_type.?;
     return anyerror!@FieldType(Wire, "value");
 }
+// libc's allocation family is process-wide, but each native compilation owns
+// a distinct std allocator vtable. Canonicalize only that exact stateless root
+// so owner-local optional admission can recognize it. Never peel a quota,
+// tracking, arena, failure or other custom allocator at this boundary.
+extern fn antfly_storage_engine_c_allocator_v1() callconv(.c) ?*const Allocator;
+fn ownerAllocator(value: Allocator) Allocator {
+    if (comptime enabled and @import("builtin").link_libc) {
+        if (value.vtable == std.heap.c_allocator.vtable) {
+            if (antfly_storage_engine_c_allocator_v1()) |owned| return owned.*;
+        }
+    }
+    return value;
+}
+
+test "logical query engine allocator normalization preserves custom quotas" {
+    var constrained = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const input = constrained.allocator();
+    const output = ownerAllocator(input);
+    try std.testing.expect(input.ptr == output.ptr and input.vtable == output.vtable);
+}
+
 pub fn call(comptime name: []const u8, args: anytype) Result(name) {
     const descriptor = antfly_storage_engine_get_descriptor_v29();
     try validateDescriptor(descriptor);
@@ -634,7 +655,9 @@ pub fn call(comptime name: []const u8, args: anytype) Result(name) {
     var wire_args: Args = undefined;
     inline for (@typeInfo(Args).@"struct".field_names, @typeInfo(Args).@"struct".field_types) |field, T| {
         const value = @field(args, field);
-        @field(wire_args, field) = if (comptime T == native.IoBorrow and @TypeOf(value) == std.Io)
+        @field(wire_args, field) = if (comptime T == Allocator)
+            ownerAllocator(value)
+        else if (comptime T == native.IoBorrow and @TypeOf(value) == std.Io)
             native.IoBorrow.init(&value)
         else if (comptime T == ?native.IoBorrow and @TypeOf(value) == ?std.Io)
             if (value) |io| native.IoBorrow.init(&io) else null
