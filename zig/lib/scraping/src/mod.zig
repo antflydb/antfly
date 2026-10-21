@@ -28,6 +28,17 @@ const default_download_timeout_ms: u64 = 30_000;
 /// one operation context without coupling this library to an application.
 pub const CancellationToken = objectstore.CancellationToken;
 
+/// Supported media transports. Shared with offline dependency inspection so
+/// destination evidence cannot enable a protocol this runtime cannot execute.
+pub const ContentScheme = enum { http, https, file, s3, data };
+
+pub fn contentScheme(scheme: []const u8) error{UnsupportedUrlScheme}!ContentScheme {
+    inline for (@typeInfo(ContentScheme).@"enum".field_names) |name| {
+        if (std.ascii.eqlIgnoreCase(scheme, name)) return @field(ContentScheme, name);
+    }
+    return error.UnsupportedUrlScheme;
+}
+
 pub const DownloadedContent = struct {
     content_type: []u8,
     data: []u8,
@@ -323,28 +334,30 @@ fn downloadContentOutcomeAllocImpl(
     }
 
     const parsed = try std.Uri.parse(uri);
-    if (std.ascii.eqlIgnoreCase(parsed.scheme, "http") or std.ascii.eqlIgnoreCase(parsed.scheme, "https")) {
-        try validateUrlSecurity(parsed, security);
-        if (maybe_context) |context| return downloadHttpOutcomeAlloc(alloc, context, uri, security, http_headers);
-        var io_impl = std.Io.Threaded.init(alloc, .{});
-        defer io_impl.deinit();
-        return downloadHttpOutcomeAlloc(alloc, .{ .io = io_impl.io() }, uri, security, http_headers);
+    switch (try contentScheme(parsed.scheme)) {
+        .http, .https => {
+            try validateUrlSecurity(parsed, security);
+            if (maybe_context) |context| return downloadHttpOutcomeAlloc(alloc, context, uri, security, http_headers);
+            var io_impl = std.Io.Threaded.init(alloc, .{});
+            defer io_impl.deinit();
+            return downloadHttpOutcomeAlloc(alloc, .{ .io = io_impl.io() }, uri, security, http_headers);
+        },
+        .file => {
+            if (parsed.host) |host| {
+                if (host.percent_encoded.len > 0 and !std.ascii.eqlIgnoreCase(host.percent_encoded, "localhost"))
+                    return error.InvalidHost;
+            }
+            const path_buf = try alloc.dupe(u8, parsed.path.percent_encoded);
+            defer alloc.free(path_buf);
+            const path = std.Uri.percentDecodeInPlace(path_buf);
+            if (maybe_context) |context| return .{ .ok = try downloadFileAllocWithContext(alloc, context, path, security) };
+            return .{ .ok = try downloadFileAlloc(alloc, path, security) };
+        },
+        .s3 => {
+            return .{ .ok = try downloadS3Alloc(alloc, maybe_context, parsed, security, s3_credentials) };
+        },
+        .data => unreachable, // Handled before URI parsing.
     }
-    if (std.ascii.eqlIgnoreCase(parsed.scheme, "file")) {
-        if (parsed.host) |host| {
-            if (host.percent_encoded.len > 0 and !std.ascii.eqlIgnoreCase(host.percent_encoded, "localhost"))
-                return error.InvalidHost;
-        }
-        const path_buf = try alloc.dupe(u8, parsed.path.percent_encoded);
-        defer alloc.free(path_buf);
-        const path = std.Uri.percentDecodeInPlace(path_buf);
-        if (maybe_context) |context| return .{ .ok = try downloadFileAllocWithContext(alloc, context, path, security) };
-        return .{ .ok = try downloadFileAlloc(alloc, path, security) };
-    }
-    if (std.ascii.eqlIgnoreCase(parsed.scheme, "s3")) {
-        return .{ .ok = try downloadS3Alloc(alloc, maybe_context, parsed, security, s3_credentials) };
-    }
-    return error.UnsupportedUrlScheme;
 }
 
 pub fn isEmptyContentSecurity(value: ContentSecurityConfig) bool {

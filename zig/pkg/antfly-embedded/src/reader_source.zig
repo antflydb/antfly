@@ -111,6 +111,41 @@ pub fn parseText(alloc: Allocator, source_text: []const u8) !Source {
     return try singleReaderImage(alloc, source_text);
 }
 
+/// Parse known JSON structure without choosing values for substitutions.
+/// The NUL marker remains in decoded locator strings, including its position.
+/// Unknown JSON structure/escapes return null instead of inventing a URL list.
+pub fn parseTemplate(alloc: Allocator, text: []const u8, max_bytes: usize) !?Source {
+    var normalized: std.ArrayList(u8) = .empty;
+    defer normalized.deinit(alloc);
+    var in_string = false;
+    var escaped = false;
+    for (text) |byte| {
+        if (byte == 0) {
+            if (!in_string or escaped) return null;
+            if (6 > max_bytes -| normalized.items.len) return error.StreamTooLong;
+            try normalized.appendSlice(alloc, "\\u0000");
+            continue;
+        }
+        if (normalized.items.len >= max_bytes) return error.StreamTooLong;
+        try normalized.append(alloc, byte);
+        if (escaped) {
+            escaped = false;
+        } else if (in_string and byte == '\\') {
+            escaped = true;
+        } else if (byte == '"') in_string = !in_string;
+    }
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, normalized.items, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    defer parsed.deinit();
+    return switch (parsed.value) {
+        .string => |url| try singleReaderImage(alloc, url),
+        .array => |array| try parseArray(alloc, array.items),
+        else => null,
+    };
+}
+
 fn singleReaderImage(alloc: Allocator, url: []const u8) !Source {
     const images = try alloc.alloc([]const u8, 1);
     errdefer alloc.free(images);
@@ -151,4 +186,29 @@ test "backup preflight shared reader source precedence and fallback" {
             try std.testing.expectEqualStrings(expected, source.prompt.?);
         } else try std.testing.expect(source.prompt == null);
     }
+}
+
+test "backup preflight reader JSON templates preserve unknown string positions and reject unknown structure" {
+    const a = std.testing.allocator;
+    const Case = struct { text: []const u8, expected: ?[]const []const u8 };
+    for ([_]Case{
+        .{ .text = "[\"file:///static\",\"https://example.org/\x00\"]", .expected = &.{ "file:///static", "https://example.org/\x00" } },
+        .{ .text = "[\"https://\x00\",\"file:///static\"]", .expected = &.{ "https://\x00", "file:///static" } },
+        .{ .text = "\"https:\\/\\/localhost\\u002f\x00\"", .expected = &.{"https://localhost/\x00"} },
+        .{ .text = "[\"https://\x00:\x00/\x00\"]", .expected = &.{"https://\x00:\x00/\x00"} },
+        .{ .text = "[{\"url\":\"file:///ignored/\x00\"},123,null,\"https://example.org/static\"]", .expected = &.{"https://example.org/static"} },
+        .{ .text = "[\x00,\"file:///static\"]", .expected = null },
+        .{ .text = "\"file:///\\\x00\"", .expected = null },
+        .{ .text = "\"file:///\\u00\x00\"", .expected = null },
+        .{ .text = "[\"file:///\x00\"", .expected = null },
+    }) |case| {
+        var parsed = try parseTemplate(a, case.text, 4096);
+        defer if (parsed) |*source| source.deinit(a);
+        if (case.expected) |expected| {
+            const source = parsed orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(expected.len, source.images.len);
+            for (expected, source.images) |want, actual| try std.testing.expectEqualStrings(want, actual);
+        } else try std.testing.expect(parsed == null);
+    }
+    try std.testing.expectError(error.StreamTooLong, parseTemplate(a, "\"\x00\"", 7));
 }

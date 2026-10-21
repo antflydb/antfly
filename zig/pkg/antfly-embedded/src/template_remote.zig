@@ -246,7 +246,7 @@ pub fn renderJsonToPartsWithConfig(
     return try template_mod.textToParts(alloc, rendered);
 }
 
-fn validateRenderedTemplate(alloc: Allocator, rendered: []const u8) !void {
+pub fn validateRenderedTemplate(alloc: Allocator, rendered: []const u8) !void {
     const directives = try template_mod.parseErrorDirectives(alloc, rendered);
     defer template_mod.freeErrorDirectives(alloc, directives);
     if (directives.len == 0) return;

@@ -880,30 +880,25 @@ pub const Inspector = struct {
     }
 
     fn directivesKnown(self: *@This(), text: []const u8, doc: []const u8, field: []const u8, definition: bool) !void {
-        const prefix = "<<<dotprompt:media:url ";
-        var pos: usize = 0;
-        while (std.mem.indexOfPos(u8, text, pos, prefix)) |start| {
-            const begin = start + prefix.len;
-            const end = std.mem.indexOfPos(u8, text, begin, ">>>") orelse {
-                // Unknown substitutions may supply the closing delimiter too.
-                if (definition and std.mem.indexOfScalar(u8, text[begin..], 0) != null) {
-                    try self.templateLocator(text[begin..], doc, field, true);
-                    return;
-                }
-                try self.report.add(self.options, .source_unresolved, "media_directive", doc, field, 0);
-                return;
-            };
-            const reference = text[begin..end];
-            if (std.mem.indexOfScalar(u8, reference, 0) != null) {
-                if (definition) {
-                    try self.templateLocator(reference, doc, field, true);
-                    pos = end + 3;
-                    continue;
-                }
-                try self.report.add(self.options, .dynamic_loader, "composed_media", doc, field, 0);
-            } else try self.locator(reference, doc, field);
-            pos = end + 3;
-        }
+        const cleaned = try template_runtime.stripErrorDirectives(self.allocator, text);
+        defer self.allocator.free(cleaned);
+        var parts: template_runtime.TextPartIterator = .{ .text = cleaned };
+        while (parts.next()) |part| switch (part) {
+            .media_url => |reference| {
+                if (!definition and std.mem.indexOfScalar(u8, reference, 0) != null) {
+                    try self.report.add(self.options, .dynamic_loader, "composed_media", doc, field, 0);
+                } else try self.templateLocator(reference, doc, field, definition);
+            },
+            .text => |value| {
+                const prefix = "<<<dotprompt:media:url ";
+                if (definition) if (std.mem.indexOf(u8, value, prefix)) |start| {
+                    const reference = value[start + prefix.len ..];
+                    if (std.mem.indexOfScalar(u8, reference, 0) != null)
+                        try self.templateLocator(reference, doc, field, true);
+                };
+            },
+            .binary => unreachable,
+        };
     }
 
     fn templatePathSupported(path: hbs.Node) bool {
@@ -928,11 +923,13 @@ pub const Inspector = struct {
         };
     }
 
-    fn templateHelper(self: *@This(), eval: *hbs.Eval, expression: *const hbs.Node, doc: []const u8, field: []const u8, definition: bool, locator_mode: bool) !bool {
+    const HelperOutput = enum { empty, formatter, remote };
+
+    fn templateHelper(self: *@This(), eval: *hbs.Eval, expression: *const hbs.Node, doc: []const u8, field: []const u8, definition: bool, locator_mode: bool) !?HelperOutput {
         const expr = expression.expression;
         const name = expr.path.path.original;
-        if (!(eq(name, "media") or eq(name, "remoteMedia") or eq(name, "remoteText") or eq(name, "remotePDF"))) return false;
-        if (expr.params.len != 0) return false;
+        if (!(eq(name, "media") or eq(name, "remoteMedia") or eq(name, "remoteText") or eq(name, "remotePDF"))) return null;
+        if (expr.params.len != 0) return null;
         var url: ?*const hbs.Node = null;
         var credential: ?*const hbs.Node = null;
         if (expr.hash) |hash_node| for (hash_node.hash.pairs) |pair_node| {
@@ -941,22 +938,34 @@ pub const Inspector = struct {
                 url = pair.value;
             } else if (!eq(name, "media") and eq(pair.key, template_runtime.remote_credentials_argument)) {
                 credential = pair.value;
-            } else return false;
+            } else return null;
         };
         // Match runtime: no URL means the helper returns an empty value.
-        const source = url orelse return true;
+        const source = url orelse return .empty;
+        var reference: ?[]const u8 = null;
+        if (source.* == .string_literal) {
+            reference = source.string_literal.value;
+        } else if (templatePathSupported(source.*)) {
+            if (!definition) {
+                const value = eval.resolvePath(&source.path);
+                reference = if (value == .string) value.string else return .empty;
+            }
+        } else return null;
+        if (reference) |text| if (text.len == 0) return .empty;
+        // Runtime checks the URL before resolving credentials. Empty calls
+        // cannot fetch, fail credential lookup, or produce opaque output.
         if (credential) |binding| {
-            if (try self.templateArgument(eval, binding, doc, field, definition)) |reference| {
-                if (reference.len == 0) {
+            if (try self.templateArgument(eval, binding, doc, field, definition)) |binding_name| {
+                if (binding_name.len == 0) {
                     try self.report.add(self.options, .source_unresolved, "template_credential", doc, field, 0);
-                } else try self.report.add(self.options, .connection, reference, doc, field, 0);
+                } else try self.report.add(self.options, .connection, binding_name, doc, field, 0);
             } else if (!definition) try self.report.add(self.options, .source_unresolved, "template_credential", doc, field, 0);
         }
         // The pure media helper is rendered with the runtime implementation.
         if (locator_mode or !eq(name, "media")) {
-            if (try self.templateArgument(eval, source, doc, field, definition)) |reference| try self.locator(reference, doc, field);
+            if (reference) |text| try self.locator(text, doc, field);
         }
-        return true;
+        return if (eq(name, "media")) .formatter else .remote;
     }
 
     fn compileTemplate(self: *@This(), text: []const u8, field: []const u8) !?hbs.Template {
@@ -1012,18 +1021,18 @@ pub const Inspector = struct {
                     const name = expr.path.path.original;
                     const known_helper = eq(name, "media") or eq(name, "remoteMedia") or eq(name, "remoteText") or eq(name, "remotePDF");
                     if (known_helper or expr.params.len > 0 or expr.hash != null) {
-                        if (!try self.templateHelper(&eval, expression, doc, field, definition, locator_mode)) {
+                        const helper_output = (try self.templateHelper(&eval, expression, doc, field, definition, locator_mode)) orelse {
                             try self.report.add(self.options, .dynamic_loader, "template", doc, field, 0);
                             return;
-                        }
-                        has_helper = true;
-                        if (!eq(name, "media")) {
+                        };
+                        has_helper = has_helper or helper_output != .empty;
+                        if (helper_output != .formatter) {
                             // Fetch results can contain or complete media markers. Keep
                             // known surrounding output for inventory, but never certify
                             // an opaque result, even with destination URL evidence.
-                            if (input.interpretsTemplateOutput()) try self.report.add(self.options, .dynamic_loader, "helper_output", doc, field, 0);
+                            if (helper_output == .remote and input.interpretsTemplateOutput()) try self.report.add(self.options, .dynamic_loader, "helper_output", doc, field, 0);
                             const literal = try a.create(hbs.Node);
-                            literal.* = .{ .string_literal = .{ .value = "\x00" } };
+                            literal.* = .{ .string_literal = .{ .value = if (helper_output == .remote) "\x00" else "" } };
                             const inert = try a.create(hbs.Node);
                             inert.* = .{ .expression = .{ .path = literal } };
                             safe_node.mustache.expression = inert;
@@ -1060,6 +1069,11 @@ pub const Inspector = struct {
             try output.appendSlice(self.allocator, fragment);
             strip_next = strip.close;
         }
+        @import("../../template_remote.zig").validateRenderedTemplate(self.allocator, output.items) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            try self.report.add(self.options, .source_unresolved, "template_error", doc, field, 0);
+            return;
+        };
         if (input == .reader) {
             try self.readerTemplate(output.items, doc, field, definition);
         } else if (locator_mode and has_helper) {
@@ -1107,9 +1121,18 @@ pub const Inspector = struct {
                 return;
             }
             const trimmed = std.mem.trimStart(u8, text, &std.ascii.whitespace);
-            // An open JSON list/string must not be completed with invented
-            // values or misclassified as a local filename.
-            if (trimmed.len > 0 and (trimmed[0] == '[' or trimmed[0] == '"')) return;
+            if (trimmed.len > 0 and (trimmed[0] == '[' or trimmed[0] == '"')) {
+                var source = (@import("../../reader_source.zig").parseTemplate(self.allocator, text, self.options.max_document_bytes) catch |err| switch (err) {
+                    error.StreamTooLong => return error.PreflightLimitExceeded,
+                    else => return err,
+                }) orelse {
+                    try self.report.add(self.options, .dynamic_loader, "reader_json_template", doc, field, 0);
+                    return;
+                };
+                defer source.deinit(self.allocator);
+                for (source.images) |image| try self.templateLocator(image, doc, field, true);
+                return;
+            }
             return self.templateLocator(text, doc, field, true);
         }
         try self.readerText(text, doc, field);
@@ -1135,9 +1158,12 @@ pub const Inspector = struct {
         const scheme = std.Uri.parse(prefix[0 .. colon + 1]) catch return;
         if (std.ascii.eqlIgnoreCase(scheme.scheme, "file") or scheme.scheme.len == 1 or std.ascii.eqlIgnoreCase(scheme.scheme, "data"))
             return self.locator(prefix[0 .. colon + 1], doc, field);
-        const hierarchical = std.ascii.eqlIgnoreCase(scheme.scheme, "http") or std.ascii.eqlIgnoreCase(scheme.scheme, "https") or
-            std.ascii.eqlIgnoreCase(scheme.scheme, "s3") or std.ascii.eqlIgnoreCase(scheme.scheme, "gs") or std.ascii.eqlIgnoreCase(scheme.scheme, "gcs");
-        if (!hierarchical) return self.locator(prefix[0 .. colon + 1], doc, field);
+        const source_scheme = @import("antfly_scraping").contentScheme(scheme.scheme) catch
+            return self.locator(prefix[0 .. colon + 1], doc, field);
+        switch (source_scheme) {
+            .http, .https, .s3 => {},
+            .file, .data => unreachable, // Classified above.
+        }
         if (!std.mem.startsWith(u8, prefix[colon + 1 ..], "//")) return;
         const authority = prefix[colon + 3 ..];
         if (std.mem.indexOfAny(u8, authority, "/?#") == null) {
@@ -1209,23 +1235,31 @@ pub const Inspector = struct {
         const path = try uri.path.toRawMaybeAlloc(a);
         const path_complete = complete or uri.query != null or uri.fragment != null;
         if (eq(uri.scheme, "zip") or (path_complete and (std.mem.endsWith(u8, path, ".zip") or std.mem.endsWith(u8, path, ".tar") or std.mem.endsWith(u8, path, ".tgz"))) or std.mem.indexOf(u8, path, ".zip/") != null or std.mem.indexOf(u8, path, ".zip!") != null or std.mem.indexOf(u8, path, "!/") != null) try self.report.add(self.options, .archive_retrieval, "archive_member", doc, field, 0);
-        if (eq(uri.scheme, "http") or eq(uri.scheme, "https")) {
-            if (host.len == 0) {
-                try self.report.add(self.options, .source_unresolved, "missing_host", doc, field, 0);
-                return;
-            }
-            // Object-storage authorities name buckets, not network gateways.
-            // A valid single-label S3/GCS bucket must not be classified as a
-            // local HTTP host merely because it has no dot.
-            if (isLocalHost(host)) try self.report.add(self.options, .source_local, "local_gateway", doc, field, 0);
-            // Origin scope is deliberately hashed; no path, query, userinfo or
-            // credential value is ever included in an example or log.
-            const origin = try std.fmt.allocPrint(a, "{s}://{s}:{d}", .{ uri.scheme, host, uri.port orelse if (eq(uri.scheme, "https")) @as(u16, 443) else @as(u16, 80) });
-            try self.report.add(self.options, .source_external, origin, doc, field, 0);
-        } else if (eq(uri.scheme, "s3") or eq(uri.scheme, "gs") or eq(uri.scheme, "gcs")) {
-            const origin = try std.fmt.allocPrint(a, "{s}://{s}", .{ uri.scheme, host });
-            try self.report.add(self.options, .connection, origin, doc, field, 0);
-        } else try self.report.add(self.options, .source_unresolved, "unsupported_scheme", doc, field, 0);
+        const source_scheme = @import("antfly_scraping").contentScheme(uri.scheme) catch {
+            try self.report.add(self.options, .source_unresolved, "unsupported_scheme", doc, field, 0);
+            return;
+        };
+        switch (source_scheme) {
+            .http, .https => {
+                if (host.len == 0) {
+                    try self.report.add(self.options, .source_unresolved, "missing_host", doc, field, 0);
+                    return;
+                }
+                // Object-storage authorities name buckets, not network gateways.
+                // A valid single-label S3 bucket must not be classified as a
+                // local HTTP host merely because it has no dot.
+                if (isLocalHost(host)) try self.report.add(self.options, .source_local, "local_gateway", doc, field, 0);
+                // Origin scope is deliberately hashed; no path, query, userinfo or
+                // credential value is ever included in an example or log.
+                const origin = try std.fmt.allocPrint(a, "{s}://{s}:{d}", .{ uri.scheme, host, uri.port orelse if (eq(uri.scheme, "https")) @as(u16, 443) else @as(u16, 80) });
+                try self.report.add(self.options, .source_external, origin, doc, field, 0);
+            },
+            .s3 => {
+                const origin = try std.fmt.allocPrint(a, "{s}://{s}", .{ uri.scheme, host });
+                try self.report.add(self.options, .connection, origin, doc, field, 0);
+            },
+            .file, .data => unreachable, // Classified before retrieval inspection.
+        }
     }
 };
 
@@ -1580,8 +1614,8 @@ test "backup preflight bucket authorities are not local HTTP gateways" {
     defer report.deinit();
     var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
     defer inspector.deinit();
-    for ([_][]const u8{ "s3://bucket/object", "gs://bucket/object", "gcs://bucket.local/object" }) |uri| try inspector.locator(uri, "d", "media");
-    try std.testing.expectEqual(@as(u64, 3), count(report, .connection));
+    for ([_][]const u8{ "s3://bucket/object", "s3://bucket.local/object" }) |uri| try inspector.locator(uri, "d", "media");
+    try std.testing.expectEqual(@as(u64, 2), count(report, .connection));
     try std.testing.expectEqual(@as(u64, 0), count(report, .source_local));
     for (report.requirements.items) |*r| {
         const caps = [_]Capability{.{ .requirement_sha256 = &r.sha256, .supported = true }};
@@ -2878,7 +2912,6 @@ test "backup preflight reader selection follows media precedence and JSON locato
         .{ .template = "[\"https://{{host}}/page.png\"]", .document = "{\"host\":\"example.org\"}", .external = 1 },
         .{ .template = "<<<dotprompt:media:url https://example.org/{{{tail}}}", .document = "{\"tail\":\"page.png>>>\"}", .external = 2 },
         .{ .template = "<<<dotprompt:media:url data:image/png;base64,AQID>>>", .embedded = 2 },
-        .{ .template = "<<<error:message=<<<dotprompt:media:url file:///private/ignored>>> <<<dotprompt:media:url https://example.org/page.png>>>", .external = 2 },
         .{ .document = "{\"body\":[\"https://example.org/page.png\",\"file:///private/page.png\"]}", .local = 1, .external = 1 },
         .{ .document = "{\"body\":\"[\\\"https://example.org/page.png\\\",\\\"file:///private/page.png\\\"]\"}", .local = 1, .external = 1 },
         .{ .document = "{\"body\":\"\\\"https://example.org/page.png\\\"\"}", .external = 1 },
@@ -2898,4 +2931,187 @@ test "backup preflight reader selection follows media precedence and JSON locato
         try std.testing.expectEqual(case.embedded, count(report, .embedded));
         try std.testing.expect(report.analysis_complete);
     }
+}
+
+test "backup preflight partial reader lists retain static local sources" {
+    const a = std.testing.allocator;
+    const producer = "{\"type\":\"reader\",\"config\":{\"provider\":\"antfly\",\"model\":\"mock\"}}";
+    const source_template = "[\"file:///private/static.png\",\"https://example.org/{{id}}\"]";
+    try @import("../db/enrichment/config_validation.zig").validatePublicConfig(a, .{ .name = "reader", .kind = .asset, .template = source_template, .producer_json = producer });
+    var report: Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    const metadata = try std.json.Stringify.valueAlloc(a, .{ .name = "reader", .kind = "asset", .source_template = source_template, .producer_json = producer }, .{});
+    defer a.free(metadata);
+    try inspector.metadataJson(metadata);
+    const caps = try a.alloc(Capability, report.requirements.items.len);
+    defer a.free(caps);
+    for (report.requirements.items, caps) |*r, *cap| cap.* = .{ .requirement_sha256 = &r.sha256, .supported = true, .query_embedding = true, .future_ingestion = true, .model_revision_verified = true, .preprocessing_verified = true, .vector_space_verified = true, .dimensions = r.dimensions };
+    const evidence = try std.json.Stringify.valueAlloc(a, Destination{ .version = 1, .configuration_id = "all-model-capabilities", .requirements = caps }, .{});
+    defer a.free(evidence);
+    const json = try report.jsonAlloc(evidence);
+    defer a.free(json);
+    try std.testing.expectEqual(@as(u64, 1), count(report, .source_local));
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"compatibility\":{\"verdict\":\"blocked\"") != null);
+}
+
+test "backup preflight unsupported GCS helper schemes cannot be certified" {
+    const a = std.testing.allocator;
+    var incorrectly_compatible = false;
+    for ([_][]const u8{ "gs", "gcs" }) |scheme| {
+        const uri = try std.fmt.allocPrint(a, "{s}://bucket/source.txt", .{scheme});
+        defer a.free(uri);
+        try std.testing.expectError(error.UnsupportedUrlScheme, @import("antfly_scraping").downloadContentAlloc(a, uri, null, null));
+        const source_template = try std.fmt.allocPrint(a, "{{{{remoteText url=\"{s}\"}}}}", .{uri});
+        defer a.free(source_template);
+        const producer = "{\"type\":\"copy\",\"config\":{}}";
+        try @import("../db/enrichment/config_validation.zig").validatePublicConfig(a, .{ .name = "copy", .kind = .asset, .template = source_template, .producer_json = producer });
+        try std.testing.expectError(error.TransientPromptFailure, @import("../../template_remote.zig").renderJsonToValidatedTextWithConfig(a, source_template, "{}", .{}));
+        var report: Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        const metadata = try std.json.Stringify.valueAlloc(a, .{ .name = "copy", .kind = "asset", .source_template = source_template, .producer_json = producer }, .{});
+        defer a.free(metadata);
+        try inspector.metadataJson(metadata);
+        try inspector.document("doc", "{}", "");
+        const caps = try a.alloc(Capability, report.requirements.items.len);
+        defer a.free(caps);
+        for (report.requirements.items, caps) |*r, *cap| cap.* = .{ .requirement_sha256 = &r.sha256, .supported = true };
+        const evidence = try std.json.Stringify.valueAlloc(a, Destination{ .version = 1, .configuration_id = "bucket-access", .requirements = caps }, .{});
+        defer a.free(evidence);
+        const json = try report.jsonAlloc(evidence);
+        defer a.free(json);
+        const compatible = std.mem.indexOf(u8, json, "\"compatibility\":{\"verdict\":\"compatible\"") != null;
+        try std.testing.expect(!report.analysis_complete);
+        incorrectly_compatible = incorrectly_compatible or compatible;
+    }
+    try std.testing.expect(!incorrectly_compatible);
+}
+
+test "backup preflight partial reader JSON definitions keep known origins and fail closed on unknown structure" {
+    const a = std.testing.allocator;
+    const Case = struct { text: []const u8, local: u64 = 0, external: u64 = 0, expiring: u64 = 0, dynamic: u64 = 0 };
+    for ([_]Case{
+        .{ .text = "[\"file:///private/{{id}}\"]", .local = 1 },
+        .{ .text = "[\"https://example.org/{{id}}\"]", .external = 1 },
+        .{ .text = "[\"{{host}}\",\"file:///private/fixed\"]", .local = 1 },
+        .{ .text = "\"https://example.org/{{id}}?token=fixed\"", .external = 1 },
+        .{ .text = "\"https://example.org/file?token={{token}}\"", .external = 1, .expiring = 1 },
+        .{ .text = "[\"https://{{host}}/{{id}}\"]" },
+        .{ .text = "[{{urls}}]", .dynamic = 1 },
+        .{ .text = "\"file:///\\{{escape}}\"", .local = 1 },
+        .{ .text = "\"file:///\\u00{{escape}}\"", .dynamic = 1 },
+    }) |case| {
+        var report: Report = .{ .allocator = a };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        const metadata = try std.json.Stringify.valueAlloc(a, .{ .name = "reader", .kind = "asset", .source_template = case.text, .producer = .{ .type = "reader" } }, .{});
+        defer a.free(metadata);
+        try inspector.metadataJson(metadata);
+        if (case.local != count(report, .source_local) or case.external != count(report, .source_external) or case.dynamic != count(report, .dynamic_loader))
+            std.debug.print("partial reader definition mismatch: {s}\n", .{case.text});
+        try std.testing.expectEqual(case.local, count(report, .source_local));
+        try std.testing.expectEqual(case.external, count(report, .source_external));
+        try std.testing.expectEqual(case.expiring, count(report, .source_expiring));
+        try std.testing.expectEqual(case.dynamic, count(report, .dynamic_loader));
+        try std.testing.expectEqual(case.dynamic == 0, report.analysis_complete);
+    }
+}
+
+test "backup preflight static template error directives match execution for every input mode" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "copy", "reader", "generator" }) |producer_type| {
+        const source_template = "<<<error:message=source unavailable>>>";
+        try std.testing.expectError(error.TransientPromptFailure, @import("../../template_remote.zig").renderJsonToValidatedTextWithConfig(a, source_template, "{}", .{}));
+        const producer = try std.json.Stringify.valueAlloc(a, .{ .type = producer_type, .config = .{ .provider = "antfly", .model = "mock" } }, .{});
+        defer a.free(producer);
+        try @import("../db/enrichment/config_validation.zig").validatePublicConfig(a, .{ .name = "asset", .kind = .asset, .template = source_template, .producer_json = producer });
+        var report: Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        const metadata = try std.json.Stringify.valueAlloc(a, .{ .name = "asset", .kind = "asset", .source_template = source_template, .producer_json = producer }, .{});
+        defer a.free(metadata);
+        try inspector.metadataJson(metadata);
+        try inspector.document("doc", "{}", "");
+        const caps = try a.alloc(Capability, report.requirements.items.len);
+        defer a.free(caps);
+        for (report.requirements.items, caps) |*r, *cap| cap.* = .{ .requirement_sha256 = &r.sha256, .supported = true, .future_ingestion = true, .model_revision_verified = true };
+        const evidence = try std.json.Stringify.valueAlloc(a, Destination{ .version = 1, .configuration_id = "all-capabilities", .requirements = caps }, .{});
+        defer a.free(evidence);
+        const json = try report.jsonAlloc(evidence);
+        defer a.free(json);
+        try std.testing.expectEqual(@as(u64, 2), count(report, .source_unresolved));
+        try std.testing.expect(!report.analysis_complete);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"compatibility\":{\"verdict\":\"blocked\"") != null);
+    }
+}
+
+test "backup preflight incomplete media syntax remains literal text like execution" {
+    const a = std.testing.allocator;
+    const source_template = "Explain <<<dotprompt:media:url file:///private/unfinished";
+    const parts = try template_runtime.textToParts(a, source_template);
+    defer template_runtime.freeContentParts(a, parts);
+    for (parts) |part| try std.testing.expect(part == .text);
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    const metadata = try std.json.Stringify.valueAlloc(a, .{ .name = "generator", .kind = "asset", .source_template = source_template, .producer = .{ .type = "generator" } }, .{});
+    defer a.free(metadata);
+    try inspector.metadataJson(metadata);
+    try inspector.document("doc", "{}", "");
+    try std.testing.expectEqual(@as(u64, 0), count(report, .source_unresolved));
+    try std.testing.expectEqual(@as(u64, 0), count(report, .source_local));
+    try std.testing.expect(report.analysis_complete);
+}
+
+test "backup preflight known empty helper calls neither fetch nor invent opaque output" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "Hello {{remoteText}}",
+        "Hello {{remoteText url=\"\"}}",
+        "Hello {{remoteText url=\"\" credentials=\"\"}}",
+        "Hello {{remoteMedia}}",
+        "Hello {{remoteMedia url=\"\"}}",
+        "Hello {{remotePDF}}",
+        "Hello {{remotePDF credentials=\"\"}}",
+        "Hello {{media}}",
+        "Hello {{media url=\"\"}}",
+    }) |source_template| {
+        const rendered = try @import("../../template_remote.zig").renderJsonToValidatedTextWithConfig(a, source_template, "{}", .{});
+        defer a.free(rendered);
+        try std.testing.expectEqualStrings("Hello ", rendered);
+        var report: Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        const metadata = try std.json.Stringify.valueAlloc(a, .{ .name = "generator", .kind = "asset", .source_template = source_template, .producer = .{ .type = "generator", .config = .{ .provider = "antfly", .model = "mock" } } }, .{});
+        defer a.free(metadata);
+        try inspector.metadataJson(metadata);
+        try inspector.document("doc", "{}", "");
+        for (report.requirements.items) |r| try std.testing.expect(r.kind == .producer_model);
+        try std.testing.expect(report.analysis_complete);
+        const caps = try a.alloc(Capability, report.requirements.items.len);
+        defer a.free(caps);
+        for (report.requirements.items, caps) |*r, *cap| cap.* = .{ .requirement_sha256 = &r.sha256, .supported = true, .future_ingestion = true, .model_revision_verified = true };
+        const evidence = try std.json.Stringify.valueAlloc(a, Destination{ .version = 1, .configuration_id = "all-models", .requirements = caps }, .{});
+        defer a.free(evidence);
+        const json = try report.jsonAlloc(evidence);
+        defer a.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"compatibility\":{\"verdict\":\"compatible\"") != null);
+    }
+    // Empty helpers embedded in a locator must preserve its known text.
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    try inspector.metadataJson(
+        \\{"kind":"asset","source_template":"https://example.org/{{remoteText url=\"\"}}","producer":{"type":"document_extraction"}}
+    );
+    try std.testing.expectEqual(@as(u64, 1), count(report, .source_external));
+    try std.testing.expect(report.analysis_complete);
 }

@@ -111,9 +111,12 @@ locators; text producers inspect media directives rather than treating every
 URL in prose as a fetch. Reader templates select rendered media parts before
 falling back to their rendered locator text, so surrounding prompt text does
 not become a source. Reader locator fallback shares execution's parser for
-plain URLs, JSON strings and JSON URL lists; non-string list elements are inert. Copy producers preserve literal text, including
-media-looking markers. Their template helper fetches are inventoried independently of the
-copied output. Configured artifact consumers inspect their stored
+plain URLs, JSON strings and JSON URL lists; non-string list elements are inert.
+At definition time, unknown fragments inside JSON strings retain their positions,
+so static list entries and known origins still contribute dependencies. Unknown
+JSON structure or escape sequences remain uninspectable. Copy producers preserve
+literal text, including media-looking markers. Their template helper fetches
+are inventoried independently of the copied output. Configured artifact consumers inspect their stored
 asset/chunk input stream. Core validation also covers artifact envelopes and
 retained provenance; a historical source string is not by itself an active
 fetch requirement.
@@ -159,9 +162,13 @@ even on empty tables; known local paths, credentials and retrieval selections
 also remain dependencies. Open hosts, ports, query keys and filename suffixes
 are not completed with invented values. Concrete documents supply their values,
 while independent static fetches are still inventoried. The pure `media` formatter
-is shared with runtime; remote helpers are never called. Remote helpers use
+and media segmentation are shared with runtime; remote helpers are never called.
+Unfinished media markers remain literal text, as they do in execution. Known
+error directives use the runtime validator and block compatibility before any
+producer can run, including copy producers. Remote helpers use
 `credentials="name"` (or a supported field reference); quoting and argument order
-follow the runtime parser.
+follow the runtime parser. Helpers with a known empty or absent URL return empty
+output without fetching or resolving credentials, matching runtime execution.
 
 When output is interpreted as media or a locator, remote helper output is
 opaque: it can contain or complete media directives even when the fetch URL is
@@ -174,9 +181,11 @@ and credentials still require destination evidence; structured model chunker med
 and source references follow the shared runtime parser. Unsupported
 helper syntax, opaque output in interpreted positions, and custom loaders are
 reported as `dependency_uninspectable`. This deliberately does not claim to
-interpret all Handlebars programs. Unsupported schemes and structured locators
-are `source_unresolved`. Local paths/gateways and credential-bearing or expiring
-URLs block compatibility. Archive-member and page/fragment selection generate
+interpret all Handlebars programs. The supported media schemes (`http`, `https`,
+`file`, `data` and `s3`) are shared with the runtime transport. Unsupported schemes, including `gs` and
+`gcs`, and structured locators are `source_unresolved`; destination attestations
+cannot enable an unsupported transport. Local paths/gateways and
+credential-bearing or expiring URLs block compatibility. Archive-member and page/fragment selection generate
 separate destination retrieval requirements. URL credentials use the shared
 credential policy, including API keys, bearer tokens, and fragment parameters.
 Query parameters are split before
