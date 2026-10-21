@@ -135,7 +135,7 @@ pub const Shared = struct {
 pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     const api_bench_standalone = b.option(bool, "api-bench-standalone", "Build only the API benchmark for an existing server process") orelse false;
     const conformance_fetch = b.option(bool, "conformance-fetch", "Fetch missing external conformance fixtures") orelse true;
-    const conformance_fixtures = b.option([]const u8, "conformance-fixtures", "Cache directory for external conformance fixtures") orelse "/tmp";
+    const conformance_fixtures = b.option([]const u8, "conformance-fixtures", "Cache directory for external conformance fixtures (default: $XDG_CACHE_HOME/antfly/conformance-fixtures)") orelse defaultConformanceFixturesDir(b);
     // On Linux, an implicit native target can cause Zig 0.16.0 to discover and
     // link against the host distro's crt startup objects. Newer glibc/binutils
     // builds may include .sframe sections with relocation types that Zig's
@@ -1430,6 +1430,20 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .antfly_imports = antfly_imports,
         .production_antfly_imports = production_antfly_imports,
     };
+}
+
+/// External conformance fixtures are immutable downloads shared by every
+/// worktree, so they live in one per-user cache rather than in each checkout
+/// or in /tmp (which agents and `make gc` treat as scratch space).
+fn defaultConformanceFixturesDir(b: *std.Build) []const u8 {
+    const env = &b.graph.environ_map;
+    if (env.get("XDG_CACHE_HOME")) |cache| {
+        if (cache.len != 0) return b.pathJoin(&.{ cache, "antfly", "conformance-fixtures" });
+    }
+    if (env.get("HOME")) |home| {
+        if (home.len != 0) return b.pathJoin(&.{ home, ".cache", "antfly", "conformance-fixtures" });
+    }
+    return "/tmp";
 }
 
 fn buildArguments(b: *std.Build) ?[]const []const u8 {

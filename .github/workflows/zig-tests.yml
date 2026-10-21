@@ -699,6 +699,7 @@ jobs:
           tools/test_run_test_partitions.py
           tools/test_retain_test_process.py
           tools/test_run_recall_checks.py
+          tools/test_fetch_vectorsets.py
           tools/test_test_runner.py
           tools/test_local_test_partitions.py
           tools/test_sync_generated.py
@@ -1233,6 +1234,7 @@ jobs:
           tools/test_run_test_partitions.py
           tools/test_retain_test_process.py
           tools/test_run_recall_checks.py
+          tools/test_fetch_vectorsets.py
           tools/test_test_runner.py
           tools/test_local_test_partitions.py
           tools/test_sync_generated.py
@@ -1461,12 +1463,28 @@ jobs:
           antfly-integration-test
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
-      - name: Run Zig recall checks
+      # Recall datasets are hash-pinned in zig/testdata/vectorsets.manifest.json
+      # and cached on the runner PVC, so they download once per manifest.
+      - name: Run Zig recall conformance
         working-directory: zig
         run: >-
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
-          antfly-recall-test
+          antfly-recall-conformance
+          -Dconformance-fixtures=/mnt/cache/antfly/conformance-fixtures
+          --maxrss ${{ steps.cpus.outputs.max_rss }}
+
+      # Library conformance fetches upstream corpora (toon, image, audio), so
+      # run it nightly rather than on every push.
+      - name: Run Zig library conformance
+        if: github.event.schedule == '0 8 * * *'
+        timeout-minutes: 45
+        working-directory: zig
+        run: >-
+          taskset -c ${{ steps.cpus.outputs.list }}
+          python3 tools/run_bounded_zig_build.py --zig zig -- build
+          conformance-test
+          -Dconformance-fixtures=/mnt/cache/antfly/conformance-fixtures
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
       - name: Run Zig chaos tests
