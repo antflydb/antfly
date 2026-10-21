@@ -5674,6 +5674,8 @@ pub fn searchPublicQueryJson(
         request_json.bytes(),
     ) catch |err| return capi.mapError(err);
     defer owned.deinit(handle.alloc);
+    owned.req.graph_owning_table = table_name;
+    owned.req.graph_index_complete_snapshot = true;
 
     const DbSearchQuery = struct {
         const Result = db_mod.types.SearchResult;

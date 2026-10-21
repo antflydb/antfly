@@ -793,6 +793,7 @@ pub const Status = enum(u32) {
     grouped_source_owner_changed = 834,
     value_verification_requires_scan = 835,
     value_verification_limit_exceeded = 836,
+    graph_start_identity_required = 837,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

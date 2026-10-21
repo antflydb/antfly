@@ -879,7 +879,7 @@ def test_inline_aggregate_catalog_exceeds_legacy_declaration_limit(tmp_path):
         assert response.ok, response.text
         assert response.json()["rows"] == [["3"]]
 
-        def contribution_ids(document):
+        def contribution_bindings(document):
             records = list(document.get("file_contributions", []))
             for page in document.get("contribution_pages", []):
                 candidates = (server.root / "artifacts").rglob(page["checksum"])
@@ -936,30 +936,56 @@ def test_inline_aggregate_catalog_exceeds_legacy_declaration_limit(tmp_path):
 
             if document.get("contribution_index"):
                 contribution_tree(document["contribution_index"])
-            return {item["artifact"]["artifact_id"] for item in records}
+            # Identical payloads intentionally share a content address. Count
+            # recipe/file bindings, then verify each retained binding's artifact.
+            bindings = {
+                (tuple(item["file"]), tuple(item["recipe"]), item["name"]): item[
+                    "artifact"
+                ]["artifact_id"]
+                for item in records
+            }
+            assert len(bindings) == len(records), "Duplicate contribution binding"
+            return bindings
 
-        directory_found = False
-        old_contribution_ids = set()
-        for path in (server.root / "artifacts").rglob("*"):
-            if not path.is_file():
-                continue
-            data = path.read_bytes()
-            marker = data.find(b'"format":"native-lake-index-directory-v')
-            if marker >= 0:
-                document = json.loads(data[marker - 1 :])
-                if len(document["declarations"]) == 320:
-                    ids = contribution_ids(document)
-                    # Retained immutable objects include checkpoint directories
-                    # written before contribution publication completes.
-                    if len(ids) != 320:
+        def await_directory(declarations, minimum_contributions):
+            # Queryable checkpoints can precede the final contribution tree.
+            # Authenticate the immutable publication this test actually needs;
+            # inspect each content-addressed object only once while it arrives.
+            inspected = set()
+            deadline = time.monotonic() + 60
+            while True:
+                for path in (server.root / "artifacts").rglob("*"):
+                    # Only installed, content-addressed payloads are immutable.
+                    # Atomic staging files and upload journals can still change.
+                    if (
+                        path in inspected
+                        or len(path.name) not in (62, 64)
+                        or any(c not in "0123456789abcdef" for c in path.name)
+                        or not path.is_file()
+                    ):
                         continue
-                    directory_found = True
-                    old_contribution_ids = ids
-                    break
-        assert directory_found, (
-            "320 declarations were not published through an immutable directory"
-        )
-        assert len(old_contribution_ids) == 320
+                    try:
+                        data = path.read_bytes()
+                    except FileNotFoundError:
+                        continue  # An obsolete checkpoint was retired mid-scan.
+                    inspected.add(path)
+                    marker = data.find(b'"format":"native-lake-index-directory-v')
+                    if marker < 0:
+                        continue
+                    document = json.loads(data[marker - 1 :])
+                    if len(document["declarations"]) != declarations:
+                        continue
+                    ids = contribution_bindings(document)
+                    if len(ids) >= minimum_contributions:
+                        return ids
+                assert time.monotonic() < deadline, (
+                    f"No immutable directory for {declarations} declarations "
+                    f"and {minimum_contributions} contributions\n" + server.debug_logs()
+                )
+                time.sleep(0.1)
+
+        old_contributions = await_directory(320, 320)
+        assert len(old_contributions) == 320
         pq.write_table(pa.table({"amount": [4, 5]}), tmp_path / "append.parquet")
         appended = (tmp_path / "append.parquet").read_bytes()
         (objects / "part2.parquet").write_bytes(
@@ -1008,24 +1034,10 @@ def test_inline_aggregate_catalog_exceeds_legacy_declaration_limit(tmp_path):
         )
         assert response.ok, response.text
         assert response.json()["rows"] == [["5"]]
-        reused = False
-        for path in (server.root / "artifacts").rglob("*"):
-            if not path.is_file():
-                continue
-            data = path.read_bytes()
-            marker = data.find(b'"format":"native-lake-index-directory-v')
-            if marker >= 0:
-                document = json.loads(data[marker - 1 :])
-                if len(document["declarations"]) == 321:
-                    ids = contribution_ids(document)
-                    # Both source files need every declaration. The immutable
-                    # index may also retain contributions from earlier views.
-                    if len(ids) < 2 * 321:
-                        continue
-                    assert old_contribution_ids <= ids
-                    reused = True
-                    break
-        assert reused, "Append rebuild did not retain unchanged file contributions"
+        ids = await_directory(321, 2 * 321)
+        assert old_contributions.items() <= ids.items(), (
+            "Append rebuild did not retain unchanged file contributions"
+        )
         failed = False
     finally:
         server.stop(test_failed=failed)
