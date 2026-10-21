@@ -1325,6 +1325,10 @@ pub const TextRun = struct {
     ascent: f64 = 0,
     descent: f64 = 0,
     paint_order: usize = 0,
+    /// The originating text-showing operator contains authored whitespace.
+    /// Reconstruction combines this provenance with the local TJ fragment
+    /// shape before treating a positioning adjustment as glyph tracking.
+    text_show_has_explicit_whitespace: bool = false,
     paint_phase: usize = 0,
     output_span: ?TextOutputSpan = null,
 
@@ -1364,6 +1368,7 @@ const LayoutTextRun = struct {
     ascent: f64 = 0,
     descent: f64 = 0,
     paint_order: usize = 0,
+    text_show_has_explicit_whitespace: bool = false,
     output_span: ?TextOutputSpan = null,
 
     pub fn deinit(self: *LayoutTextRun, alloc: Allocator) void {
@@ -3089,6 +3094,18 @@ const ShadingStitchingFunction = struct {
     }
 };
 
+fn markTextShowRunsExplicitWhitespace(runs: anytype) void {
+    var has_explicit_whitespace = false;
+    for (runs) |run| {
+        if (std.mem.indexOfAny(u8, run.text, &std.ascii.whitespace) != null) {
+            has_explicit_whitespace = true;
+            break;
+        }
+    }
+    if (!has_explicit_whitespace) return;
+    for (runs) |*run| run.text_show_has_explicit_whitespace = true;
+}
+
 const PositionedTextOutput = union(enum) {
     layout: *std.ArrayList(LayoutTextRun),
     analysis: *std.ArrayList(TextRun),
@@ -3099,6 +3116,13 @@ const PositionedTextOutput = union(enum) {
             .layout => |out| out.items.len,
             .analysis, .render => |out| out.items.len,
         };
+    }
+
+    fn markTextShowExplicitWhitespace(self: PositionedTextOutput, start: usize) void {
+        switch (self) {
+            .layout => |out| markTextShowRunsExplicitWhitespace(out.items[start..]),
+            .analysis, .render => |out| markTextShowRunsExplicitWhitespace(out.items[start..]),
+        }
     }
 
     fn isTextOnly(self: PositionedTextOutput) bool {
@@ -15383,6 +15407,7 @@ fn applyTextRunOperator(
         if (operands.len == 0) return;
         const last = &operands[operands.len - 1];
         if (last.* != .array) return;
+        const start_len = out.len();
         for (last.array) |item| {
             switch (item) {
                 .string => try appendTextRunDecodedString(alloc, out, state, current_clip_points.items, current_clip_fill_rule.*, fonts, paint_order.*, item.string),
@@ -15397,6 +15422,7 @@ fn applyTextRunOperator(
                 else => {},
             }
         }
+        out.markTextShowExplicitWhitespace(start_len);
         paint_order.* += 1;
         return;
     }
@@ -18000,6 +18026,18 @@ fn endsWithColon(text: []const u8) bool {
     return text.len > 0 and text[text.len - 1] == ':';
 }
 
+fn textHasSingleNonWhitespaceCodepoint(text: []const u8) bool {
+    var view = std.unicode.Utf8View.init(text) catch return false;
+    var iterator = view.iterator();
+    var found = false;
+    while (iterator.nextCodepoint()) |codepoint| {
+        if (codepoint <= 0x7f and std.ascii.isWhitespace(@intCast(codepoint))) continue;
+        if (found) return false;
+        found = true;
+    }
+    return found;
+}
+
 fn reconstructTextFromRunsAlloc(alloc: Allocator, runs: anytype) ![]u8 {
     return reconstructTextFromRunsCancelableAlloc(alloc, runs, .{});
 }
@@ -18033,7 +18071,18 @@ fn reconstructTextFromRunsCancelableAlloc(alloc: Allocator, runs: anytype, cance
                     startsWithAsciiUpper(run.text);
                 // A text-showing operator boundary can split a single word.
                 // Infer separators from geometry, not content-stream chunking.
-                if (gap > word_gap or caption_boundary) {
+                // An explicitly spaced TJ operator may also carry per-glyph
+                // tracking wider than an ordinary space. Suppress that local
+                // false boundary only for adjacent glyph-sized fragments.
+                // Em-sized gaps and larger fragments still delimit words.
+                const tracked_glyph_fragments =
+                    prior.paint_order == run.paint_order and
+                    prior.text_show_has_explicit_whitespace and
+                    run.text_show_has_explicit_whitespace and
+                    gap < font_scale * @abs(prior.horizontal_scale) and
+                    textHasSingleNonWhitespaceCodepoint(prior.text) and
+                    textHasSingleNonWhitespaceCodepoint(run.text);
+                if ((!tracked_glyph_fragments and gap > word_gap) or caption_boundary) {
                     try out.append(alloc, ' ');
                 }
             }
@@ -21881,6 +21930,28 @@ test "reader preserves scaled word gaps without splitting adjacent operators" {
         defer alloc.free(text);
         try std.testing.expectEqualStrings("Hello World\n", text);
     }
+}
+
+test "reader distinguishes TJ glyph tracking from geometric word gaps" {
+    const alloc = std.testing.allocator;
+    const content =
+        "BT /F1 12 Tf 1 0 0 1 10 90 Tm\n" ++
+        "[(H) -250 (e) -250 (l) -250 (l) -250 (o) -250 ( ) -250 (W) -250 (o) -250 (r) -250 (l) -250 (d)] TJ\n" ++
+        "0 -20 Td [(No) -278 (Space)] TJ\n" ++
+        "0 -20 Td [(Hello World) -1200 (Next)] TJ\n" ++
+        "0 -20 Td [(Item ) -1200 (A) -1200 (B)] TJ ET\n";
+    const sample = try buildTextOrderingTestPdfAlloc(alloc, content);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(alloc);
+    try std.testing.expectEqualStrings("Hello World\nNo Space\nHello World Next\nItem A B\n", analysis.text);
+
+    const text = try reader.extractPageTextAlloc(1);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("Hello World\nNo Space\nHello World Next\nItem A B\n", text);
 }
 
 test "reader clamps reconstructed spans after trimming line whitespace" {

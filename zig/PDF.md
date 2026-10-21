@@ -143,6 +143,12 @@ replayed; deadlines, transforms, page identities, and output caps stay in force.
 
 ## Extraction and decoder correctness
 
+Text reconstruction preserves authored spaces within a tracked `TJ` operation
+instead of inferring a word boundary between every adjusted glyph. This applies
+only to adjacent single-codepoint fragments with sub-em gaps in an explicitly
+spaced operation; larger geometric gaps and independent operations retain their
+existing separation rules.
+
 The macOS compatibility renderer uses the native planner's admitted integer
 canvas. Its drawing transform is computed in logical page coordinates, then
 scaled explicitly, including translation and quarter-turn rotation. Rendering
