@@ -226,7 +226,7 @@ fn assessWithRuntimeFacts(
 
     // The LightOn profile selects the integrated resident vision tower and
     // hybrid decoder. Keep generic Qwen3.5 and unsupported GGUF routes gated.
-    if (man.isLightOnOcr3() and man.safetensors_path != null and !man.usesGgufWeights())
+    if (man.isLightOnOcr3() and (man.safetensors_path != null or man.safetensors_index_path != null) and !man.usesGgufWeights())
         return makeCompatible(architecture, "LightOnOCR-3 integrated safetensors OCR runtime");
 
     if (man.model_type == .generator)
@@ -877,6 +877,11 @@ test "LightOnOCR3 compatibility enables only the explicit safetensors reader pro
     try std.testing.expectEqual(Level.compatible, assess(&man, "qwen3_5").level);
     allocator.free(man.safetensors_path.?);
     man.safetensors_path = null;
+    try std.testing.expectEqual(Level.incompatible, assess(&man, "qwen3_5").level);
+    man.safetensors_index_path = try allocator.dupe(u8, "model.safetensors.index.json");
+    try std.testing.expectEqual(Level.compatible, assess(&man, "qwen3_5").level);
+    allocator.free(man.safetensors_index_path.?);
+    man.safetensors_index_path = null;
     man.gguf_path = try allocator.dupe(u8, "unsupported.gguf");
     try std.testing.expectEqual(Level.incompatible, assess(&man, "qwen3_5").level);
 }
