@@ -45,12 +45,31 @@ connection and catalog-scope flags are not accepted. The draft
   Each requirement has a stable reason code and remediation.
 
 The default library limits are 64 GiB input, 128 GiB scratch/expansion admission,
-4,096 selectors and requirement groups, 16 MiB retained selector bytes, 64 MiB
-per materialized document, and 32 total examples (at most four per group).
-Exceeding a limit produces an incomplete report. Examples identify affected
-fields and document IDs; unsafe/long identifiers become `sha256:...` labels.
+4,096 selectors and requirement groups, 16 MiB per metadata key or value,
+16 MiB of retained selector bytes, 64 MiB per materialized document, and 32 total
+examples (at most four per group).
+Metadata keys and values are admitted before catalog/schema decoding on every
+validation and inspection pass. Batch traversal borrows source bytes, so a rejected
+record is not cloned first; a batch of individually bounded records may exceed
+the per-record limit.
+The document limit bounds logical JSON before output allocation, including
+streamed zstd decompression and measured relational-row reconstruction. It also
+bounds retained asset/chunk values before validation or dependency callbacks.
+Artifact traversal borrows source bytes; vector and resolution artifacts retain
+their own format and block limits rather than the document limit.
+The expansion budget includes per-document compression inside decoded portable
+blocks and is checked before dependency callbacks. Block readers enforce the
+remaining output budget while decompressing, rather than materializing an
+over-budget block first. Exceeding a limit produces an incomplete report. Examples
+identify affected fields and document IDs; unsafe/long identifiers become
+`sha256:...` labels.
 Source URLs, query strings, passwords, producer configuration and credentials
-are never emitted. Digests are identity bindings, not encrypted secret storage.
+are never emitted. Credential inventory uses the shared credential-field
+policy, including bearer and capability tokens, and requires separate destination
+evidence in addition to endpoint and model evidence. Digests are identity
+bindings, not encrypted secret storage. Canonical identity hashing traverses
+nested JSON with heap-backed frames, preserving sorted keys and exact numeric
+normalization without depending on the process call-stack depth.
 
 The inspector uses the restore format readers and schema decoders. It validates
 all portable records, primes metadata before visiting rows, and decodes
@@ -89,19 +108,93 @@ Only fields selected by executable index/enrichment definitions are source
 inputs. Ordinary document paths and URLs are not dependencies. Reader,
 transcriber, document-extraction and PDF-page embedding inputs are media
 locators; text producers inspect media directives rather than treating every
-URL in prose as a fetch. Configured artifact consumers inspect their stored
+URL in prose as a fetch. Reader templates select rendered media parts before
+falling back to their rendered locator text, so surrounding prompt text does
+not become a source. Reader locator fallback shares execution's parser for
+plain URLs, JSON strings and JSON URL lists; non-string list elements are inert.
+At definition time, unknown fragments inside JSON strings retain their positions,
+so static list entries and known origins still contribute dependencies. Unknown
+JSON structure or escape sequences remain uninspectable. Copy producers preserve
+literal text, including media-looking markers. Their template helper fetches
+are inventoried independently of the copied output. Configured artifact consumers inspect their stored
 asset/chunk input stream. Core validation also covers artifact envelopes and
 retained provenance; a historical source string is not by itself an active
 fetch requirement.
 
+Model-aware chunking uses the execution path's source-input parser. Immutable
+source references contribute their URI's access requirements; inline media
+remains embedded. Its model requirement binds the enclosing chunk definition,
+including the source selector, chunk policy, embedding target and dimensions.
+Source references use the range transport's shared offline validation for immutable
+pins, version kinds, supported schemes and URI bounds. Invalid contracts remain
+unresolved even when destination capabilities attest support. No transport or
+credential lookup is needed for this validation. Unrecognized or incomplete
+structured inputs remain unresolved.
+
+Active resolver catalogs include frozen adjudication models and credentials.
+Their model evidence binds the complete resolver policy. A resolver's
+`name_embedding` reference into another table does not establish that table's
+model revision or preprocessing contract and remains `model_contract_unknown`.
+Retired resolver identities retain historical state without executing it and
+do not contribute active dependencies.
+
+Prior-context render templates inventory executed helper fetches. Their output
+is appended as literal text, including media-looking markers. Their named
+retained artifacts are inspected as single values,
+arrays, or `items` envelopes using the execution path's collection selection.
+Unsupported helpers remain uninspectable even when no prior artifact exists.
+
+Grouped chunk and embedding consumers follow the execution planner's upstream
+group resolution, including dependencies declared before their group. The
+inspector selects synthesized unit text from retained group assets and private
+unit documents. Grouped model evidence also binds the group source definition,
+including its source field, filtering, ordering and window policy.
+
 Simple field paths, simple substitutions and static `media`, `remoteMedia`,
-`remoteText` and `remotePDF` URL arguments are analyzed without execution.
-Unsupported helper syntax, composed locators and custom loaders are reported as
-`dependency_uninspectable`. This deliberately does not claim to interpret all
-Handlebars programs. Unsupported schemes and structured locators are
-`source_unresolved`. Local paths/gateways and credential-bearing or expiring
-URLs block compatibility. Archive-member and page/fragment selection generate
-separate destination retrieval requirements. No resolver or URL rewrite occurs.
+`remoteText` and `remotePDF` URL arguments are analyzed without fetching resources.
+The inspector uses the runtime's Handlebars parser and path lookup, and combines
+supported literal/substitution output before scanning media directives, using
+the same whitespace-control functions as execution. Numeric substitutions
+preserve the runtime's exact JSON number tokens.
+Document-dependent URL components stay unknown during definition inspection.
+A fully known scheme and authority still contribute their origin requirements,
+even on empty tables; known local paths, credentials and retrieval selections
+also remain dependencies. Open hosts, ports, query keys and filename suffixes
+are not completed with invented values. Concrete documents supply their values,
+while independent static fetches are still inventoried. The pure `media` formatter
+and media segmentation are shared with runtime; remote helpers are never called.
+Unfinished media markers remain literal text, as they do in execution. Known
+error directives use the runtime validator and block compatibility before any
+producer can run, including copy producers. Remote helpers use
+`credentials="name"` (or a supported field reference); quoting and argument order
+follow the runtime parser. Helpers with a known empty or absent URL return empty
+output without fetching or resolving credentials, matching runtime execution.
+
+When output is interpreted as media or a locator, remote helper output is
+opaque: it can contain or complete media directives even when the fetch URL is
+known. Its dependencies remain incomplete and cannot be certified by destination
+evidence. Copy output, fixed chunker input, model chunker text, and template-free
+generator or text embedding inputs do not interpret media markers. Locator
+consumers still inventory source URLs, and templates that produce media parts
+remain subject to directive inspection. Executed template helper fetch URLs
+and credentials still require destination evidence; structured model chunker media
+and source references follow the shared runtime parser. Unsupported
+helper syntax, opaque output in interpreted positions, and custom loaders are
+reported as `dependency_uninspectable`. This deliberately does not claim to
+interpret all Handlebars programs. The supported media schemes (`http`, `https`,
+`file`, `data` and `s3`) are shared with the runtime transport. Unsupported schemes, including `gs` and
+`gcs`, and structured locators are `source_unresolved`; destination attestations
+cannot enable an unsupported transport. S3 authority and object-key structure
+use the downloader's shared offline validator. Complete references need both;
+known template authorities can still contribute access requirements while their
+keys remain unknown. Invalid references stay unresolved despite destination
+evidence. Endpoint-style bucket/key selection also rejects empty keys at runtime.
+Local paths/gateways and credential-bearing or expiring URLs block compatibility. Archive-member and page/fragment selection generate
+separate destination retrieval requirements. URL credentials use the shared
+credential policy, including API keys, bearer tokens, and fragment parameters.
+Query parameters are split before
+percent-decoding their names; encoded delimiters inside values do not create
+credential or retrieval parameters. No resolver or URL rewrite occurs.
 
 ## Destination capability input
 
