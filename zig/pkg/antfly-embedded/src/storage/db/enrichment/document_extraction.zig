@@ -1316,11 +1316,28 @@ pub fn assessOcrQuality(text: []const u8, config: OcrQualityConfig) OcrQuality {
     var sampled_words: usize = 0;
     var suspicious_words: usize = 0;
     var words = std.mem.tokenizeAny(u8, trimmed, &std.ascii.whitespace);
-    while (words.next()) |word| {
-        word_count += 1;
-        if (sampled_words >= config.garbled_sample_words) continue;
-        sampled_words += 1;
-        if (word.len == 1 and std.mem.indexOfScalar(u8, ".-Xxv:", word[0]) == null) suspicious_words += 1;
+    while (words.next() != null) word_count += 1;
+    // A spaced heading must not condemn an otherwise readable page, and a
+    // clean heading must not hide corruption later in it. Take one sample
+    // per word interval without retaining token slices. Deterministic jitter
+    // avoids aliasing repeated rows or sentences at a fixed word stride.
+    if (config.garbled_sample_words > 0 and word_count > 0) {
+        const stride = word_count / config.garbled_sample_words +
+            @intFromBool(word_count % config.garbled_sample_words != 0);
+        var random = std.Random.DefaultPrng.init(0);
+        var interval_start: usize = 0;
+        var next_sample = random.random().uintLessThan(usize, @min(stride, word_count));
+        var word_index: usize = 0;
+        words = std.mem.tokenizeAny(u8, trimmed, &std.ascii.whitespace);
+        while (words.next()) |word| : (word_index += 1) {
+            if (word_index != next_sample) continue;
+            sampled_words += 1;
+            if (word.len == 1 and std.mem.indexOfScalar(u8, ".-Xxv:", word[0]) == null) suspicious_words += 1;
+            if (stride >= word_count - interval_start) break;
+            interval_start += stride;
+            next_sample = interval_start +
+                random.random().uintLessThan(usize, @min(stride, word_count - interval_start));
+        }
     }
     if (sampled_words > 0) out.single_char_word_ratio = @as(f64, @floatFromInt(suspicious_words)) / @as(f64, @floatFromInt(sampled_words));
     out.garbled = word_count >= config.garbled_min_words and out.single_char_word_ratio > config.max_single_char_word_ratio;
@@ -1504,6 +1521,26 @@ pub fn mergeOcrWithEmbeddedNumericRowsAlloc(alloc: Allocator, embedded_text: []c
     );
 }
 
+fn isReliableEmbeddedNumericRow(line: []const u8) bool {
+    const config = OcrQualityConfig{ .min_content_chars = 0 };
+    const quality = assessOcrQuality(line, config);
+    if (quality.font_corrupted or quality.replacement_corrupted) return false;
+    if (!quality.garbled) return true;
+    // Single-digit table cells are legitimate. Broken alphabetic words are
+    // not reliable row context, and their split digits are not trusted values.
+    var words = std.mem.tokenizeAny(u8, line, &std.ascii.whitespace);
+    var word_count: usize = 0;
+    var single_letters: usize = 0;
+    while (words.next()) |word| {
+        word_count += 1;
+        if (word.len == 1 and std.ascii.isAlphabetic(word[0]) and
+            std.mem.indexOfScalar(u8, "Xxv", word[0]) == null)
+            single_letters += 1;
+    }
+    return word_count == 0 or
+        @as(f64, @floatFromInt(single_letters)) / @as(f64, @floatFromInt(word_count)) <= config.max_single_char_word_ratio;
+}
+
 fn mergeOcrWithEmbeddedNumericRowsWithLimitsAlloc(
     alloc: Allocator,
     embedded_text: []const u8,
@@ -1514,17 +1551,22 @@ fn mergeOcrWithEmbeddedNumericRowsWithLimitsAlloc(
     var candidate_counts = std.StringHashMapUnmanaged(u32).empty;
     defer candidate_counts.deinit(alloc);
     var reference_occurrences: usize = 0;
-    var tokens = std.mem.tokenizeAny(u8, embedded_text, &std.ascii.whitespace);
-    while (tokens.next()) |raw| {
-        const token = normalizedNumericToken(raw) orelse continue;
-        reference_occurrences +|= 1;
-        if (reference_occurrences > max_token_occurrences)
-            return try appendOcrWithEmbeddedNumericRowsAlloc(alloc, ocr_text, embedded_text);
-        const entry = try candidate_counts.getOrPut(alloc, token);
-        if (!entry.found_existing) {
-            if (candidate_counts.count() > max_unique_tokens)
+    var tokens = std.mem.tokenizeAny(u8, "", &std.ascii.whitespace);
+    var reference_lines = std.mem.splitScalar(u8, embedded_text, '\n');
+    while (reference_lines.next()) |line| {
+        if (!isReliableEmbeddedNumericRow(line)) continue;
+        tokens = std.mem.tokenizeAny(u8, line, &std.ascii.whitespace);
+        while (tokens.next()) |raw| {
+            const token = normalizedNumericToken(raw) orelse continue;
+            reference_occurrences +|= 1;
+            if (reference_occurrences > max_token_occurrences)
                 return try appendOcrWithEmbeddedNumericRowsAlloc(alloc, ocr_text, embedded_text);
-            entry.value_ptr.* = 0;
+            const entry = try candidate_counts.getOrPut(alloc, token);
+            if (!entry.found_existing) {
+                if (candidate_counts.count() > max_unique_tokens)
+                    return try appendOcrWithEmbeddedNumericRowsAlloc(alloc, ocr_text, embedded_text);
+                entry.value_ptr.* = 0;
+            }
         }
     }
     var candidate_occurrences: usize = 0;
@@ -1545,6 +1587,12 @@ fn mergeOcrWithEmbeddedNumericRowsWithLimitsAlloc(
     var lines = std.mem.splitScalar(u8, embedded_text, '\n');
     while (lines.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (!isReliableEmbeddedNumericRow(line)) {
+            previous_line = null;
+            previous_line_has_numeric = false;
+            previous_appended = false;
+            continue;
+        }
         var numeric_count: usize = 0;
         var missing_count: usize = 0;
         tokens = std.mem.tokenizeAny(u8, line, &std.ascii.whitespace);
@@ -1612,23 +1660,28 @@ fn numericTokenRecallAllocWithLimits(
     var remaining = std.StringHashMapUnmanaged(u32).empty;
     defer remaining.deinit(alloc);
     var reference_count: usize = 0;
-    var tokens = std.mem.tokenizeAny(u8, reference, &std.ascii.whitespace);
-    while (tokens.next()) |raw| {
-        const token = normalizedNumericToken(raw) orelse continue;
-        reference_count +|= 1;
-        if (reference_count > max_token_occurrences)
-            return .{ .reference_count = reference_count, .recall = 0, .complete = false };
-        // Keys borrow from `reference`, which outlives this page-local map.
-        // Avoid one allocation per table cell while preserving duplicate
-        // counts for recall.
-        const entry = try remaining.getOrPut(alloc, token);
-        if (!entry.found_existing) {
-            if (remaining.count() > max_unique_tokens)
+    var tokens = std.mem.tokenizeAny(u8, "", &std.ascii.whitespace);
+    var reference_lines = std.mem.splitScalar(u8, reference, '\n');
+    while (reference_lines.next()) |line| {
+        if (!isReliableEmbeddedNumericRow(line)) continue;
+        tokens = std.mem.tokenizeAny(u8, line, &std.ascii.whitespace);
+        while (tokens.next()) |raw| {
+            const token = normalizedNumericToken(raw) orelse continue;
+            reference_count +|= 1;
+            if (reference_count > max_token_occurrences)
                 return .{ .reference_count = reference_count, .recall = 0, .complete = false };
-            entry.key_ptr.* = token;
-            entry.value_ptr.* = 0;
+            // Keys borrow from `reference`, which outlives this page-local map.
+            // Avoid one allocation per table cell while preserving duplicate
+            // counts for recall.
+            const entry = try remaining.getOrPut(alloc, token);
+            if (!entry.found_existing) {
+                if (remaining.count() > max_unique_tokens)
+                    return .{ .reference_count = reference_count, .recall = 0, .complete = false };
+                entry.key_ptr.* = token;
+                entry.value_ptr.* = 0;
+            }
+            entry.value_ptr.* +|= 1;
         }
-        entry.value_ptr.* +|= 1;
     }
     if (reference_count == 0) return .{ .reference_count = 0, .recall = 1.0 };
 
@@ -4986,6 +5039,31 @@ test "OCR quality fallback covers born digital scanned garbled and encoding fail
     }).failureCount());
 }
 
+test "OCR quality distinguishes a spaced heading from corruption throughout the body" {
+    const Text = struct {
+        fn repeat(comptime text: []const u8, comptime count: usize) [text.len * count]u8 {
+            var out: [text.len * count]u8 = undefined;
+            for (0..count) |i| @memcpy(out[i * text.len ..][0..text.len], text);
+            return out;
+        }
+    };
+    const config = OcrQualityConfig{};
+    const sentence = "The report documents completed deliveries and verified records for every district. ";
+    const readable_body = Text.repeat(sentence, 24);
+    const decorated_page = Text.repeat("D E C O R A T I V E ", 4) ++ "\n" ++ readable_body;
+    const decorated = assessOcrQuality(decorated_page, config);
+    try std.testing.expect(!decorated.needsFallback());
+
+    // Fixed-stride sampling must not repeatedly select only "I".
+    const repeated_prose = Text.repeat("The report says I am prepared today ", 50);
+    try std.testing.expect(!assessOcrQuality(&repeated_prose, config).needsFallback());
+
+    // The first fifty words are ordinary prose; most subsequent words are
+    // broken glyphs, so prefix-only sampling would miss the damaged body.
+    const damaged_page = Text.repeat(sentence, 5) ++ "\n" ++ Text.repeat("b c d e f g h j k l m n ", 40);
+    try std.testing.expect(assessOcrQuality(damaged_page, config).garbled);
+}
+
 test "OCR pending metadata construction is allocation-failure safe" {
     const Runner = struct {
         fn run(alloc: Allocator) !void {
@@ -5059,7 +5137,33 @@ test "OCR text selection preserves dense embedded numeric tables" {
     try std.testing.expect(std.mem.startsWith(u8, merged, missing_cells));
     try std.testing.expect(std.mem.indexOf(u8, merged, "Q1 101 81 20") != null);
     try std.testing.expect(std.mem.indexOf(u8, merged, "Q4 140 100 40") != null);
-    try std.testing.expect(std.mem.indexOf(u8, merged, "numeric accuracy") != null);
+}
+
+test "numeric recovery rejects broken prose but preserves readable rows and single-digit cells" {
+    const alloc = std.testing.allocator;
+    const broken = "T h e s e r v i c e n e t t e d 1 2 0 t i c k e t s a t $ 5 0 e a c h";
+    const ocr = "The service netted 120 tickets at $50 each. The transcription preserves the complete sentence.";
+    const config = OcrQualityConfig{};
+    try std.testing.expectEqual(OcrTextChoice.ocr, try chooseOcrTextForContentAlloc(
+        alloc,
+        broken,
+        ocr,
+        assessOcrQuality(broken, config),
+        assessOcrQuality(ocr, config),
+    ));
+    const without_broken = try mergeOcrWithEmbeddedNumericRowsAlloc(alloc, broken, ocr);
+    defer alloc.free(without_broken);
+    try std.testing.expectEqualStrings(ocr, without_broken);
+
+    const digit_cells = "A 1 2 3 4 5 6 7 8 9 1 2 3 4 5 6 7 8 9 1 2 3 4 5";
+    const amounts = "Fees -12 -12 $500";
+    const embedded = broken ++ "\nAccount Charges Credits\n" ++ digit_cells ++ "\n" ++ amounts;
+    const merged = try mergeOcrWithEmbeddedNumericRowsAlloc(alloc, embedded, ocr);
+    defer alloc.free(merged);
+    try std.testing.expect(std.mem.indexOf(u8, merged, broken) == null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "Account Charges Credits\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, digit_cells) != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, amounts) != null);
 }
 
 test "numeric recall limits preserve embedded text without exhausting scratch memory" {

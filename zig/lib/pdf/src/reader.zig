@@ -499,6 +499,7 @@ const CodeSpaceRange = struct {
 
 const FontDecoder = struct {
     code_bytes: usize = 1,
+    simple_font: bool = false,
     base_encoding: text_encoding.NamedEncoding = .pdf_doc,
     differences: [256]?[]u8 = @as([256]?[]u8, @splat(null)),
     difference_codepoints: [256]?u21 = @as([256]?u21, @splat(null)),
@@ -572,6 +573,9 @@ const FontDecoder = struct {
     }
 
     fn detectCodeWidth(self: *const FontDecoder, remaining: []const u8) usize {
+        // Simple-font codes are one byte even when a producer declares an
+        // oversized ToUnicode codespace. Do not consume adjacent glyphs.
+        if (self.simple_font) return 1;
         if (self.codespace_ranges.len == 0) return self.code_bytes;
 
         var len: usize = 1;
@@ -11202,7 +11206,8 @@ pub const Reader = struct {
     }
 
     fn buildFontDecoder(self: *const Reader, font_obj: *const syntax.Object) !FontDecoder {
-        var decoder = FontDecoder{};
+        const subtype_name = if (font_obj.get("Subtype")) |value| value.asName() orelse "" else "";
+        var decoder = FontDecoder{ .simple_font = !std.mem.eql(u8, subtype_name, "Type0") };
         errdefer decoder.deinit(self.alloc);
 
         if (font_obj.get("Encoding") == null) {
@@ -31063,4 +31068,51 @@ fn z17RepeatArray(comptime array: anytype, comptime repetitions: usize) [array.l
     var result: [array.len * repetitions]@TypeOf(array[0]) = undefined;
     for (0..repetitions) |i| @memcpy(result[i * array.len ..][0..array.len], &array);
     return result;
+}
+
+test "simple font character codes stay single byte with oversized ToUnicode codespaces" {
+    const alloc = std.testing.allocator;
+    const content = "BT\n/F1 12 Tf\n(ABCD) Tj\nET\n";
+    const cmap =
+        "begincmap\n" ++
+        "1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n" ++
+        "3 beginbfchar\n<41> <0041>\n<42> <0042>\n<43> <00660069>\nendbfchar\n" ++
+        "endcmap\n";
+    for ([_][]const u8{ "Type1", "TrueType" }) |subtype| {
+        const objects = [_][]const u8{
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+            "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+            try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content }),
+            try std.fmt.allocPrint(alloc, "5 0 obj\n<< /Type /Font /Subtype /{s} /Encoding /WinAnsiEncoding /ToUnicode 6 0 R >>\nendobj\n", .{subtype}),
+            try std.fmt.allocPrint(alloc, "6 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ cmap.len, cmap }),
+        };
+        defer alloc.free(objects[3]);
+        defer alloc.free(objects[4]);
+        defer alloc.free(objects[5]);
+        var prefix = std.ArrayList(u8).empty;
+        defer prefix.deinit(alloc);
+        try prefix.appendSlice(alloc, "%PDF-1.7\n");
+        var offsets: [objects.len]usize = undefined;
+        for (objects, 0..) |obj_src, i| {
+            offsets[i] = prefix.items.len;
+            try prefix.appendSlice(alloc, obj_src);
+        }
+        const xref_offset = prefix.items.len;
+        try prefix.appendSlice(alloc, "xref\n0 7\n0000000000 65535 f \n");
+        for (offsets) |off| {
+            const line = try std.fmt.allocPrint(alloc, "{d:0>10} 00000 n \n", .{off});
+            defer alloc.free(line);
+            try prefix.appendSlice(alloc, line);
+        }
+        try prefix.appendSlice(alloc, "trailer\n<< /Size 7 /Root 1 0 R >>\n");
+        const sample = try std.fmt.allocPrint(alloc, "{s}startxref\n{d}\n%%EOF\n", .{ prefix.items, xref_offset });
+        defer alloc.free(sample);
+        var reader = try Reader.init(alloc, sample);
+        defer reader.deinit();
+        const text = try reader.extractPlainTextAlloc();
+        defer alloc.free(text);
+        // C expands to a ligature; D exercises WinAnsi fallback.
+        try std.testing.expectEqualStrings("ABfiD\n", text);
+    }
 }
