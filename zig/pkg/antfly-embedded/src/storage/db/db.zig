@@ -15279,6 +15279,20 @@ pub const DB = struct {
         );
     }
 
+    fn retireServiceableInitialBuild(self: *DB, alloc: Allocator, repair_id: u128, intent: index_repair_state.IndexRepairIntent) !bool {
+        if (!try self.managedAdmissionGenerationIsServiceable(alloc, intent)) return false;
+        try self.ensureManagedAdmissionCanonicalWorker(alloc, intent);
+        if (intent.kind == .full_text) {
+            const text = self.core.textIndexEntry(intent.index_name) orelse return error.IndexNotFound;
+            try self.core.index_manager.rebuildState(.full_text, text.rebuild_root_path, text.config).clearWithIo(self.core.index_manager.checkpointIo());
+        }
+        if (intent.candidate_relative_path != null) {
+            try self.discardInactiveIndexRepairCandidate(alloc, repair_id);
+        }
+        try self.removeIndexRepairIntentAndPin(alloc, repair_id);
+        return true;
+    }
+
     /// Executes one repair quantum while `active_index_repairs[index_name]` is
     /// held by the caller. Keeping the lease outside every phase makes pause,
     /// cancel, deletion, rollback, and activation share one ownership domain.
@@ -15293,6 +15307,11 @@ pub const DB = struct {
         var result = IndexRepairAdvanceResult{ .repair_id = repair_id };
         var effective_options = options;
         if (effective_options.capacity_source == null) effective_options.capacity_source = self.capacity_source;
+
+        if (effective_options.source_replay_only and !IndexRepairSchedulerDirectory.sourceRecoveryIntent(entry.intent)) {
+            result.deferred = true;
+            return result;
+        }
 
         if (entry.intent.root_generation != self.core.root_generation or
             entry.intent.group_id != self.localRepairGroupId())
@@ -15409,6 +15428,13 @@ pub const DB = struct {
             return result;
         }
 
+        if (effective_options.source_replay_only and entry.intent.source_replay_state == .pending and self.enrichment_runtime == null) {
+            // An unconstructed optional driver is not evidence that source
+            // discovery is complete. Retain its durable cursor for a live owner.
+            result.deferred = true;
+            return result;
+        }
+
         if (entry.intent.phase == .detected and entry.intent.source_replay_state == .pending) {
             // Managed DDL installs the generator for future writes under the
             // synchronous structural fence, but existing-row discovery belongs
@@ -15429,7 +15455,10 @@ pub const DB = struct {
                 true,
                 entry.intent.source_replay_resume_key,
                 128,
-                .{},
+                .{
+                    .deadline_ns = if (effective_options.source_replay_only) self.graphReplacementWorkNow() +| 25 * std.time.ns_per_ms else null,
+                    .min_records_before_deadline = if (effective_options.source_replay_only) 1 else 0,
+                },
             );
             defer page.deinit(alloc);
             try self.updateIndexRepairIntent(alloc, repair_id, .{
@@ -15527,6 +15556,14 @@ pub const DB = struct {
             return result;
         }
 
+        if (effective_options.source_replay_only) {
+            if (try self.retireServiceableInitialBuild(alloc, repair_id, entry.intent)) {
+                result.attempted = true;
+                result.repaired = true;
+            } else result.deferred = true;
+            return result;
+        }
+
         // A managed admission can become queryable before its exact physical
         // cardinality is known. Publish that identity proof before either
         // queryability exit below: the snapshot is ordered with foreground
@@ -15568,16 +15605,7 @@ pub const DB = struct {
         // runtime while this managed admission is already complete. Letting
         // unrelated producer work win here keeps a healthy durable intent at
         // the head of a one-slot repair queue forever.
-        if (try self.managedAdmissionGenerationIsServiceable(alloc, entry.intent)) {
-            try self.ensureManagedAdmissionCanonicalWorker(alloc, entry.intent);
-            if (entry.intent.kind == .full_text) {
-                const text = self.core.textIndexEntry(entry.intent.index_name) orelse return error.IndexNotFound;
-                try self.core.index_manager.rebuildState(.full_text, text.rebuild_root_path, text.config).clearWithIo(self.core.index_manager.checkpointIo());
-            }
-            if (entry.intent.candidate_relative_path != null) {
-                try self.discardInactiveIndexRepairCandidate(alloc, repair_id);
-            }
-            try self.removeIndexRepairIntentAndPin(alloc, repair_id);
+        if (try self.retireServiceableInitialBuild(alloc, repair_id, entry.intent)) {
             result.attempted = true;
             result.repaired = true;
             return result;
@@ -16028,17 +16056,22 @@ pub const DB = struct {
     }
 
     fn selectIndexRepairSchedulerQuantumForIndex(self: *DB, alloc: Allocator, execution_limit: usize, target_index_name: ?[]const u8) !IndexRepairSchedulerSelection {
+        return self.selectIndexRepairSchedulerQuantumScoped(alloc, execution_limit, target_index_name, false);
+    }
+
+    fn selectIndexRepairSchedulerQuantumScoped(self: *DB, alloc: Allocator, execution_limit: usize, target_index_name: ?[]const u8, source_replay_only: bool) !IndexRepairSchedulerSelection {
         try self.ensureIndexRepairSchedulerDirectory(alloc);
         var selection: IndexRepairSchedulerSelection = .{};
         errdefer selection.deinit(alloc);
         lockAtomic(&self.async_context.index_repair_scheduler_mutex);
         defer self.async_context.index_repair_scheduler_mutex.unlock();
         const directory = &self.async_context.index_repair_scheduler;
+        if (source_replay_only and directory.sourceRecoveryCountForIndex(target_index_name) == 0) return selection;
         const summary = directory.summaryForIndex(target_index_name);
-        selection.terminal = summary.terminal;
-        selection.deferred = summary.paused;
-        selection.remaining = summary.runnable + summary.paused + summary.terminal;
-        selection.next_retry_at_ms = summary.earliest_retry_at_ms;
+        selection.terminal = if (source_replay_only) 0 else summary.terminal;
+        selection.deferred = if (source_replay_only) 0 else summary.paused;
+        selection.remaining = if (source_replay_only) directory.sourceRecoveryCountForIndex(target_index_name) else summary.runnable + summary.paused + summary.terminal;
+        selection.next_retry_at_ms = if (source_replay_only) 0 else summary.earliest_retry_at_ms;
         const target_index = if (target_index_name) |name| directory.by_name.get(name) else null;
         if (target_index_name != null and target_index == null) return selection;
         const inspection = if (target_index) |index| IndexRepairInspectionWindow{ .start = index, .budget = @min(execution_limit, 1) } else indexRepairInspectionWindow(
@@ -16048,11 +16081,12 @@ pub const DB = struct {
         );
         try selection.repairs.ensureTotalCapacity(alloc, inspection.budget);
         const now_ms = self.indexRepairNowMs();
+        var next_source_cursor: ?usize = null;
         while (selection.inspected < inspection.budget) : (selection.inspected += 1) {
             const record_index = (inspection.start + selection.inspected) % directory.records.items.len;
             const record = directory.records.items[record_index];
             if (target_index_name == null) directory.cursor = (record_index + 1) % directory.records.items.len;
-            if (record.class != .runnable) continue;
+            if (record.class != .runnable or (source_replay_only and !record.source_recovery)) continue;
             if (record.next_retry_at_ms > now_ms) {
                 selection.deferred += 1;
                 if (selection.next_retry_at_ms == 0 or record.next_retry_at_ms < selection.next_retry_at_ms) {
@@ -16078,7 +16112,14 @@ pub const DB = struct {
                 .revision = record.revision,
                 .audit_due = record.audit_wait_armed,
             });
+            if (source_replay_only and target_index_name == null and next_source_cursor == null)
+                next_source_cursor = (record_index + 1) % directory.records.items.len;
         }
+        // Inspection can wrap over a small directory while execution consumes
+        // only its first material slot. Advance after that selected source,
+        // not after the whole inspected window, so a long source migration
+        // cannot repeatedly win ahead of another index in the same table.
+        if (next_source_cursor) |next| directory.cursor = next;
         return selection;
     }
 
@@ -16093,7 +16134,7 @@ pub const DB = struct {
     ) !StartupIndexRepairResult {
         if (comptime storage_engine.enabled) return storage_engine.call("repairRecoverableStartupIndexFailures", .{ self, alloc, limit, options });
         var result: StartupIndexRepairResult = .{};
-        const discovery = try self.discoverRecoverableStartupIndexFailures(alloc, limit);
+        const discovery = if (options.source_replay_only) StartupIndexRepairDiscovery{} else try self.discoverRecoverableStartupIndexFailures(alloc, limit);
         result.discovered = discovery.discovered;
         result.automatic_discovery_pending = discovery.automaticDiscoveryPending();
         // Existing terminal intents are counted from the durable state below.
@@ -16101,7 +16142,7 @@ pub const DB = struct {
         // exists, avoiding double-counting checkpointed failures.
         result.terminal = if (options.target_index_name == null) discovery.terminal - discovery.existing_terminal else 0;
 
-        var selection = try self.selectIndexRepairSchedulerQuantumForIndex(alloc, limit, options.target_index_name);
+        var selection = try self.selectIndexRepairSchedulerQuantumScoped(alloc, limit, options.target_index_name, options.source_replay_only);
         defer selection.deinit(alloc);
         result.terminal += selection.terminal;
         result.deferred += selection.deferred;
@@ -16142,8 +16183,8 @@ pub const DB = struct {
         lockAtomic(&self.async_context.index_repair_scheduler_mutex);
         const directory = &self.async_context.index_repair_scheduler;
         const summary = directory.summaryForIndex(options.target_index_name);
-        result.remaining = summary.runnable + summary.paused + summary.terminal;
-        result.wake = summary.wake;
+        result.remaining = if (options.source_replay_only) directory.sourceRecoveryCountForIndex(options.target_index_name) else summary.runnable + summary.paused + summary.terminal;
+        result.wake = if (options.source_replay_only) (if (result.remaining != 0) .immediate else .empty) else summary.wake;
         result.next_retry_at_ms = result.wake.retryAtMs();
         self.async_context.index_repair_scheduler_mutex.unlock();
         return result;
@@ -35225,6 +35266,9 @@ pub const DB = struct {
     };
 
     const GeneratedEnrichmentReplayScanOptions = struct {
+        // Source recovery must advance a physical key even when a cold read
+        // consumes its soft time slice before the first visitor is called.
+        min_records_before_deadline: usize = 0,
         max_records: usize = 4096,
         max_bytes: usize = 4 * 1024 * 1024,
         deadline_ns: ?u64 = null,
@@ -35264,7 +35308,7 @@ pub const DB = struct {
 
             fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
                 const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-                if (state.options.deadline_ns) |end| if (state.database.graphReplacementWorkNow() >= end) {
+                if (state.options.deadline_ns) |end| if (state.records >= state.options.min_records_before_deadline and state.database.graphReplacementWorkNow() >= end) {
                     state.yielded = true;
                     return .stop;
                 };
@@ -105435,6 +105479,18 @@ test "db managed vector admission durably seeds missing enrichment artifacts" {
         })) orelse return error.TestUnexpectedResult;
         try std.testing.expect(repair_id != 0);
 
+        {
+            const driver = db.enrichment_runtime;
+            db.enrichment_runtime = null;
+            defer db.enrichment_runtime = driver;
+            const unavailable = try db.advanceIndexRepairIntent(alloc, repair_id, .{ .source_replay_only = true });
+            try std.testing.expect(!unavailable.attempted and !unavailable.repaired);
+            var retained = try db.loadIndexRepairEntryById(alloc, repair_id);
+            defer retained.deinit(alloc);
+            try std.testing.expect(retained.intent.source_replay_state == .pending);
+            try std.testing.expect(retained.intent.source_replay_resume_key == null);
+        }
+
         // Admission installs the generator and durable repair owner, but does
         // no corpus-sized source scan while holding structural ownership.
         try std.testing.expectEqual(before_admission, db.core.nextDerivedSequence());
@@ -106852,6 +106908,33 @@ fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff,
     }));
 }
 
+test "source recovery scheduler rotates source jobs within one table" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("db");
+    defer directory.cleanup();
+    var db = try DB.open(a, std.mem.span(directory.path().ptr), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    const left = types.IndexConfig{ .name = "left", .kind = .full_text, .config_json = "{\"field\":\"body\"}" };
+    const right = types.IndexConfig{ .name = "right", .kind = .full_text, .config_json = "{\"field\":\"body\"}" };
+    try db.addIndex(left);
+    try db.addIndex(right);
+    const first = try db.createGenerationRepairIntentAtTarget(a, left, .replay_artifact_unavailable, 0, 0, null, null, .pending, .initial_build);
+    const second = try db.createGenerationRepairIntentAtTarget(a, right, .replay_artifact_unavailable, 0, 0, null, null, .pending, .initial_build);
+    var one = try db.selectIndexRepairSchedulerQuantumScoped(a, 1, null, true);
+    defer one.deinit(a);
+    var two = try db.selectIndexRepairSchedulerQuantumScoped(a, 1, null, true);
+    defer two.deinit(a);
+    try std.testing.expect(one.repairs.items[0].repair_id != two.repairs.items[0].repair_id);
+    try std.testing.expect(one.repairs.items[0].repair_id == first or one.repairs.items[0].repair_id == second);
+    try std.testing.expect(two.repairs.items[0].repair_id == first or two.repairs.items[0].repair_id == second);
+    try std.testing.expect(one.inspected <= DB.index_repair_inspections_per_execution_slot);
+    try std.testing.expect(two.inspected <= DB.index_repair_inspections_per_execution_slot);
+}
+
 test "producer readiness local receipt migration retires only after source and checkpoint proof" {
     const alloc = std.testing.allocator;
     var directory = try TestDirectory.init("db");
@@ -106927,6 +107010,17 @@ test "producer readiness local receipt migration retires only after source and c
     defer alloc.free(key);
     try db.core.store.delete(key);
     try std.testing.expect(!try db.localArtifactSourceRecoveryIsServiceable(alloc, entry.intent));
+    const held = try db.repairRecoverableStartupIndexFailures(alloc, 1, .{ .source_replay_only = true });
+    try std.testing.expect(held.repaired == 0 and held.attempted == 0);
+    var pending = try db.loadIndexRepairEntryById(alloc, id);
+    defer pending.deinit(alloc);
+    try std.testing.expect(pending.intent.candidate_relative_path == null);
+    // Restoring the exact receipt proof permits retirement without rebuilding
+    // or invoking any provider from this connection-owned control turn.
+    try db.core.store.put(key, &std.mem.toBytes(std.mem.nativeToLittle(u64, 2)));
+    const finished = try db.repairRecoverableStartupIndexFailures(alloc, 1, .{ .source_replay_only = true });
+    try std.testing.expect(finished.repaired == 1);
+    try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
 }
 
 test "db empty managed index does not invent generated coverage recovery debt" {
@@ -140097,7 +140191,7 @@ test "inline resolver replacement producer pages bound physical records bytes an
     try std.testing.expect(!expired.complete);
     try std.testing.expectEqual(@as(usize, 0), expired.documents_scanned);
     try std.testing.expect(expired.next_resume_key == null);
-    for ([_]DB.GeneratedEnrichmentReplayScanOptions{ .{ .max_records = 2 }, .{ .max_bytes = 1 } }) |budget| {
+    for ([_]DB.GeneratedEnrichmentReplayScanOptions{ .{ .max_records = 2 }, .{ .max_bytes = 1 }, .{ .deadline_ns = 100, .min_records_before_deadline = 1 } }) |budget| {
         var page_resume: ?[]u8 = null;
         defer if (page_resume) |key| a.free(key);
         var documents: usize = 0;
