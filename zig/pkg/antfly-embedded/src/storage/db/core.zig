@@ -2519,6 +2519,31 @@ pub const DBCore = struct {
         return .{ .namespace = namespace, .receipt = receipt, .predicates = try @import("prepared_read_set.zig").Footprint.compile(alloc, &observed, self.store, control) };
     }
 
+    /// Caller retains apply/catalog/route ownership. Acquire the physical gate
+    /// before accepting read assumptions; publish predicates in the same batch.
+    /// Requires persisted namespace identity and permanent reader-16 eligibility.
+    pub fn registerPreparedReadGuards(self: *DBCore, txn_id: transactions_mod.TxnId, binding: @import("prepared_transaction_effects.zig").Binding, original: ?@import("../../common/read_admission.zig").Port) !void {
+        var trace: transactions_mod.MutationAdmissionTrace = .{};
+        self.registerPreparedReadGuardsInner(txn_id, binding, trace.bind(original)) catch |err| return trace.failure orelse err;
+    }
+    fn registerPreparedReadGuardsInner(self: *DBCore, txn_id: transactions_mod.TxnId, binding: @import("prepared_transaction_effects.zig").Binding, control: ?@import("../../common/read_admission.zig").Port) !void {
+        var batch = try self.store.beginWriteBatch();
+        errdefer batch.abort();
+        try batch.setReadGuardScope(.{ .txn_id = txn_id, .phase = .admission });
+        try batch.prepareReadGuardRegistration(control);
+        try @import("../prepared_read_guards.zig").requireFloors(batch.asTxn());
+        var compiled = try self.compilePreparedReadFootprint(self.alloc, txn_id, binding, control);
+        defer compiled.deinit();
+        const catalog = try self.preparedEffectsCatalogDigest(control);
+        if (!std.meta.eql(catalog, compiled.receipt.catalog_digest)) return error.PreparedGenerationChanged;
+        const raw = try batch.asTxn().get(&transactions_mod.makePreparedReadObservationsKey(txn_id));
+        const hash = try @import("../prepared_read_guards.zig").observationsDigest(raw, control);
+        const record: @import("../prepared_read_guards.zig").Record = .{ .namespace = compiled.namespace, .receipt = compiled.receipt, .observations_digest = hash, .predicates = compiled.predicates };
+        try batch.installPreparedReadGuards(&record, control);
+        if (control) |port| try port.checkpoint();
+        try batch.commit();
+    }
+
     pub fn resolveTransactionIntentsWithAcceptedEffects(self: *DBCore, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, commit_version: u64, extra_batch: transactions_mod.ResolutionExtraBatch, accepted: ?*const transactions_mod.PreparedEffects, control: ?@import("../../common/read_admission.zig").Port) !transactions_mod.ResolutionOutcome {
         var manager = try self.initTxnManager();
         defer manager.deinit();

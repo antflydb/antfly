@@ -55,7 +55,7 @@ pub const default_max_bytes: u64 = 256 * 1024 * 1024;
 pub fn isObligation(key: []const u8) bool {
     // Conservatively include malformed v2 keys: corruption must not escape
     // accounting simply because recovery cannot decode its kind or identity.
-    return replay_credit.isObligation(key) or std.mem.startsWith(u8, key, preparation_requirement_prefix) or
+    return replay_credit.isObligation(key) or std.mem.startsWith(u8, key, @import("prepared_read_guards.zig").prefix) or std.mem.startsWith(u8, key, preparation_requirement_prefix) or
         std.mem.startsWith(u8, key, prepared_effects_prefix) or std.mem.startsWith(u8, key, prepared_observations_prefix) or
         std.mem.startsWith(u8, key, transaction_credit_prefix) or
         std.mem.startsWith(u8, key, transaction_batch_prefix) or
@@ -116,7 +116,7 @@ fn hasObligations(txn: anytype) !bool {
     }
     if (try cursor.seekAtOrAfter(outbox.replication_outbox_v2_prefix)) |entry|
         if (std.mem.startsWith(u8, entry.key, outbox.replication_outbox_v2_prefix)) return true;
-    for ([_][]const u8{ transaction_credit_prefix, transaction_batch_prefix, prepared_effects_prefix, prepared_observations_prefix, preparation_requirement_prefix, replay_credit.grant_prefix, replay_credit.claim_prefix, replay_credit.owner_prefix }) |prefix| {
+    for ([_][]const u8{ @import("prepared_read_guards.zig").prefix, transaction_credit_prefix, transaction_batch_prefix, prepared_effects_prefix, prepared_observations_prefix, preparation_requirement_prefix, replay_credit.grant_prefix, replay_credit.claim_prefix, replay_credit.owner_prefix }) |prefix| {
         if (try cursor.seekAtOrAfter(prefix)) |entry| if (std.mem.startsWith(u8, entry.key, prefix)) return true;
     }
     return false;

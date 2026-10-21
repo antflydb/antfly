@@ -146700,3 +146700,253 @@ test "db prepared transaction effects required observation seal validates before
     defer read.abort();
     try std.testing.expectEqual(@as(u64, 0), (try @import("../publication_backlog.zig").load(&read)).?.bytes);
 }
+
+const SemanticReadGuardFixture = struct {
+    const id: transactions_mod.TxnId = @splat(193);
+    const binding: @import("prepared_transaction_effects.zig").Binding = .{ .group_id = 11, .topology_epoch = 7, .participant_digest = @splat(13), .route_digest = @splat(17) };
+    const options: OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .start_independent_maintenance = false };
+    const point = "\x01semantic/a";
+    const gap = "\x01semantic/b";
+    fn seal(db: *DB, membership: bool) !void {
+        try sealOwner(db, membership, id);
+    }
+    fn sealOwner(db: *DB, membership: bool, owner_id: transactions_mod.TxnId) !void {
+        const a = std.testing.allocator;
+        const reads = @import("prepared_read_set.zig");
+        const effects = @import("prepared_transaction_effects.zig");
+        try db.enablePreparedTransactionProtocol();
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        try doc_identity.writeNamespaceToStore(db.core.store, db.core.identity_namespace);
+        try db.core.index_manager.aggregateAuthoritativeReaderVersion(db.core.store, @import("catalog/reader_versions.zig").prepared_read_guards_reader_version);
+        _ = try db.core.beginTransactionRequiringPreparedEffectsWithBinding(owner_id, 1, 1, &.{}, false, true, .{ .mode = .deferred }, binding, .{}, null);
+        if (db.core.store.get(a, point)) |existing| {
+            a.free(existing);
+        } else |cause| {
+            if (cause != error.NotFound) return cause;
+            try db.core.store.put(point, "before");
+        }
+        var observed = reads.Owned.init(a, null);
+        defer observed.deinit();
+        if (!membership) {
+            const value = try reads.observe(db.core.store, &observed).get(a, point);
+            a.free(value);
+        }
+        const page = try reads.observe(db.core.store, &observed).scanPrefixKeysPage(a, "\x01semantic/", null, 10);
+        defer {
+            for (page) |key_| a.free(key_);
+            a.free(page);
+        }
+        try observed.finish();
+        var manager = try db.core.initTxnManager();
+        defer manager.deinit();
+        try manager.writeIntents(owner_id, &.{.{ .key = if (owner_id[0] == 193) "result" else "second-result", .value = "{}" }}, &.{});
+        const catalog = try db.core.preparedEffectsCatalogDigest(null);
+        const frame = try effects.encode(a, .{ .contract = try manager.preparedEffectsContract(owner_id, catalog, .deferred, null), .effects = .{} }, null);
+        defer a.free(frame);
+        try db.core.sealPreparedTransactionEffectsWithReadObservations(owner_id, frame, .deferred, binding, &observed, null, null);
+    }
+    fn register(db: *DB) !void {
+        try registerOwner(db, id);
+    }
+    fn registerOwner(db: *DB, owner_id: transactions_mod.TxnId) !void {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        try db.core.registerPreparedReadGuards(owner_id, binding, null);
+    }
+    fn resolve(db: *DB, status: transactions_mod.TxnStatus) !void {
+        try resolveOwner(db, status, id);
+    }
+    fn resolveOwner(db: *DB, status: transactions_mod.TxnStatus, owner_id: transactions_mod.TxnId) !void {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        var manager = try db.core.initTxnManager();
+        defer manager.deinit();
+        if (status == .aborted) return manager.resolveIntents(owner_id, status, 2);
+        var accepted = (try manager.loadPreparedEffects(std.testing.allocator, owner_id, null)).?;
+        defer accepted.deinit();
+        _ = try manager.resolvePreparedIntents(owner_id, 2, &accepted, .{}, null);
+    }
+};
+
+test "db prepared transaction effects required semantic registry excludes all native mutation paths and survives reopen" {
+    const a = std.testing.allocator;
+    const F = SemanticReadGuardFixture;
+    const guards = @import("../prepared_read_guards.zig");
+    var directory = try TestDirectory.init("semantic-read-registry-reopen");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), F.options);
+    var open = true;
+    defer if (open) db.close();
+    try std.testing.expectError(error.PreparedTransactionProtocolDisabled, F.register(&db));
+    try F.seal(&db, false);
+    // A batch opened before registration must observe guards at first mutation.
+    var earlier = try db.core.store.beginWriteBatch();
+    var earlier_live = true;
+    defer if (earlier_live) earlier.abort();
+    try F.register(&db);
+    try F.register(&db);
+    try earlier.asTxn().put(F.point, "bad");
+    try std.testing.expectError(error.IntentConflict, earlier.commit());
+    try std.testing.expectError(error.IntentConflict, earlier.commit());
+    earlier.abort();
+    earlier_live = false;
+    for (0..5) |path| {
+        if (path < 2) {
+            var txn = try db.core.store.beginWriteTxn();
+            defer txn.abort();
+            if (path == 0) try txn.put(F.point, "bad") else try txn.delete(F.point);
+            try std.testing.expectError(error.IntentConflict, txn.commit());
+        } else {
+            var batch = try db.core.store.beginWriteBatch();
+            defer batch.abort();
+            switch (path) {
+                2 => try batch.asTxn().put(F.point, "bad"),
+                3 => try batch.asTxn().delete(F.point),
+                4 => try batch.asTxn().appendPut(F.point, "bad"),
+                else => unreachable,
+            }
+            try std.testing.expectError(error.IntentConflict, batch.commit());
+        }
+    }
+    {
+        var pending = try db.core.store.beginWriteBatch();
+        defer pending.abort();
+        try pending.setReadGuardScope(.{ .txn_id = F.id, .phase = .resolution });
+        try pending.retirePreparedReadGuards(F.id);
+        try pending.retirePreparedReadGuards(F.id);
+        try pending.asTxn().put(F.point, "pending-owner-bypass");
+        try std.testing.expectError(error.InvalidTxnRecord, pending.commit());
+    }
+    {
+        var wrong = try db.core.store.beginWriteBatch();
+        defer wrong.abort();
+        try wrong.setReadGuardScope(.{ .txn_id = @splat(194), .phase = .resolution });
+        try std.testing.expectError(error.InvalidTxnRecord, wrong.retirePreparedReadGuards(F.id));
+        try std.testing.expectError(error.InvalidTxnRecord, wrong.commit());
+    }
+    // Empty gaps and bound bundles are protected, while ACK progress is independent.
+    try std.testing.expectError(error.IntentConflict, db.core.store.put(F.gap, "phantom"));
+    try std.testing.expectError(error.InvalidTxnRecord, db.core.store.delete(&guards.key(F.id)));
+    try std.testing.expectError(error.IntentConflict, db.core.store.delete(&transactions_mod.makePreparedReadObservationsKey(F.id)));
+    try std.testing.expectError(error.IntentConflict, db.core.store.delete(&transactions_mod.makePreparedEffectsKey(F.id)));
+    try std.testing.expectError(error.IntentConflict, db.core.store.delete(&internal_keys.identity_namespace_key));
+    try std.testing.expectError(error.IntentConflict, db.core.store.put(@import("catalog/reader_versions.zig").minimum_reader_key, "15"));
+    try db.core.store.put(@import("catalog/reader_versions.zig").minimum_reader_key, "16");
+    {
+        const namespace = try db.core.store.get(a, &internal_keys.identity_namespace_key);
+        defer a.free(namespace);
+        try db.core.store.put(&internal_keys.identity_namespace_key, namespace);
+    }
+    // Failing capture allocation must leave no owned keys/arenas or grant writes.
+    var completed = false;
+    for (0..64) |index| {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = index });
+        var capture: guards.Capture = .{};
+        var writer = try db.core.store.beginWriteBatch();
+        defer writer.abort();
+        const checked = capture.touch(failing.allocator(), writer.asTxn(), &writer.publication_backlog, db.core.store.runtime_store.publication_gate orelse &db.core.store.publication_backlog_mutex, F.point, "attempt");
+        if (checked) |_| {
+            try std.testing.expectError(error.IntentConflict, capture.validate(failing.allocator(), writer.asTxn()));
+            completed = true;
+        } else |cause| {
+            try std.testing.expectEqual(error.OutOfMemory, cause);
+            try std.testing.expectError(error.OutOfMemory, capture.check());
+        }
+        capture.deinit(failing.allocator());
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        if (completed) break;
+    }
+    try std.testing.expect(completed);
+    try db.core.store.put("\x00\x00__txn_participant_ack__:peer", "ack");
+    db.close();
+    open = false;
+    db = try DB.open(a, directory.path(), F.options);
+    open = true;
+    try std.testing.expectError(error.IntentConflict, db.core.store.put(F.point, "bad"));
+    const second_id: transactions_mod.TxnId = @splat(194);
+    try F.sealOwner(&db, false, second_id);
+    try F.registerOwner(&db, second_id);
+    try F.resolve(&db, .aborted);
+    try std.testing.expectError(error.IntentConflict, db.core.store.put(F.point, "other-owner-still-protects"));
+    try F.resolveOwner(&db, .aborted, second_id);
+    try db.core.store.put(F.point, "after-abort");
+    try db.core.store.put(F.gap, "after-abort");
+    try std.testing.expectError(error.NotFound, db.core.store.get(a, &guards.key(F.id)));
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqual(@as(u64, 0), (try guards.loadState(&read)).records);
+    try std.testing.expectEqual(@as(u64, 0), (try @import("../publication_backlog.zig").load(&read)).?.bytes);
+}
+
+test "db prepared transaction effects required semantic registry distinguishes membership changes and retires with commit" {
+    const a = std.testing.allocator;
+    const F = SemanticReadGuardFixture;
+    var directory = try TestDirectory.init("semantic-read-registry-membership");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), F.options);
+    defer db.close();
+    try F.seal(&db, true);
+    try F.register(&db);
+    try db.core.store.put(F.point, "payload-update");
+    try F.register(&db);
+    try std.testing.expectError(error.IntentConflict, db.core.store.delete(F.point));
+    try std.testing.expectError(error.IntentConflict, db.core.store.put(F.gap, "phantom"));
+    try db.core.store.put("\x01unrelated", "allowed");
+    try F.resolve(&db, .committed);
+    try db.core.store.delete(F.point);
+    try db.core.store.put(F.gap, "after-commit");
+}
+
+test "db prepared transaction effects required semantic registry checks gate receipt floors and stale observations before admission" {
+    const a = std.testing.allocator;
+    const F = SemanticReadGuardFixture;
+    const versions = @import("catalog/reader_versions.zig");
+    var directory = try TestDirectory.init("semantic-read-registry-admission");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), F.options);
+    defer db.close();
+    try F.seal(&db, false);
+    {
+        var writer = try db.core.store.beginWriteBatch();
+        defer writer.abort();
+        try writer.asTxn().put(F.point, "pending");
+        try std.testing.expectError(error.Backpressured, F.register(&db));
+    }
+    // A temporary minimum fence cannot replace permanent reader eligibility.
+    try db.core.store.put(versions.replacement_reader_base_key, "15");
+    try std.testing.expectError(error.PreparedTransactionProtocolDisabled, F.register(&db));
+    try db.core.store.delete(versions.replacement_reader_base_key);
+    var wrong = F.binding;
+    wrong.route_digest[0] ^= 1;
+    try std.testing.expectError(error.PreparationContractConflict, db.core.registerPreparedReadGuards(F.id, wrong, null));
+    try db.core.store.put(versions.minimum_reader_key, "15");
+    try std.testing.expectError(error.PreparedTransactionProtocolDisabled, F.register(&db));
+    try db.core.store.put(versions.minimum_reader_key, "16");
+    {
+        const namespace = try db.core.store.get(a, &internal_keys.identity_namespace_key);
+        defer a.free(namespace);
+        try db.core.store.put(&internal_keys.identity_namespace_key, &@as([24]u8, @splat(17)));
+        try std.testing.expectError(error.PreparedEffectsMismatch, F.register(&db));
+        try db.core.store.put(&internal_keys.identity_namespace_key, namespace);
+    }
+    try db.core.store.put(F.point, "stale");
+    try std.testing.expectError(error.PreparedReadSetChanged, F.register(&db));
+    try std.testing.expectError(error.NotFound, db.core.store.get(a, &@import("../prepared_read_guards.zig").key(F.id)));
+    // Imported orphan entries cannot masquerade as an empty registry at admission.
+    const orphan = @import("../prepared_read_guards.zig").key(@splat(194));
+    {
+        var raw = try db.core.store.runtime_store.beginBatch();
+        errdefer raw.abort();
+        try raw.put(&orphan, "orphan");
+        try raw.commit();
+    }
+    try std.testing.expectError(error.InvalidTxnRecord, F.register(&db));
+    {
+        var raw = try db.core.store.runtime_store.beginBatch();
+        errdefer raw.abort();
+        try raw.delete(&orphan);
+        try raw.commit();
+    }
+    try F.resolve(&db, .aborted);
+}

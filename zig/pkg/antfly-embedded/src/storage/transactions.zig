@@ -2164,6 +2164,7 @@ pub const TxnManager = struct {
         if (try readHasPrefix(&read, intents_prefix) or
             try readHasPrefix(&read, intent_locks_prefix) or
             try readHasPrefix(&read, read_guards_prefix) or
+            try readHasPrefix(&read, @import("prepared_read_guards.zig").prefix) or
             try readHasPrefix(&read, read_members_prefix) or
             try readHasPrefix(&read, hot_standby_batch_outbox_prefix) or
             try readHasPrefix(&read, hot_standby_replay_outbox_prefix))
@@ -3646,6 +3647,7 @@ pub const TxnManager = struct {
         const scope: ?writer_read_guards.Scope = if (transition) |decision| .{ .txn_id = decision.id, .phase = .resolution } else guard_scope;
         if (scope) |selected| {
             if (self.store.capabilities().owned_read_guard_mutations) try batch.setReadGuardScope(selected);
+            if (selected.phase == .resolution and self.store.capabilities().prepared_read_guard_mutations) try batch.retirePreparedReadGuards(selected.txn_id);
         }
         if (transition) |decision| {
             // The authoritative decision was checked before this writer opened.
@@ -4034,6 +4036,17 @@ pub fn validateReadGuardOwner(txn: anytype, scope: writer_read_guards.Scope) !vo
         .admission => if (record.status != .pending or (record.intents_resolved_known and record.intents_resolved)) return error.InvalidTxnRecord,
         .resolution => if (record.status == .pending or !record.intents_resolved_known or !record.intents_resolved) return error.InvalidTxnRecord,
     }
+}
+
+/// Bind unresolved protection and completed retirement to the accepted owner.
+pub fn validatePreparedReadGuardRecord(txn: anytype, receipt: prepared_effects.BoundReceipt, resolved: bool) !void {
+    const record = try decodeRecord(try txn.get(&makeRecordKey(receipt.txn_id)));
+    if (!std.meta.eql(record.preparation_binding, @as(?prepared_effects.Binding, receipt.binding)) or
+        !std.meta.eql(record.preparation_requirement, @as(?prepared_effects.Requirement, receipt.requirement)) or
+        record.intent_revision != receipt.intent_revision or !record.prepared) return error.PreparedEffectsMismatch;
+    if (resolved) {
+        if (record.status == .pending or !record.intents_resolved_known or !record.intents_resolved) return error.InvalidTxnRecord;
+    } else if (record.intents_resolved_known and record.intents_resolved) return error.InvalidTxnRecord;
 }
 
 fn decodeRecord(raw: []const u8) !TxnRecord {

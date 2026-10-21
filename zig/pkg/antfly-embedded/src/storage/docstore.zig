@@ -34,6 +34,7 @@ const change_journal_mod = @import("db/derived/change_journal.zig");
 const internal_keys = @import("internal_keys.zig");
 const retained_effects = @import("retained_effects.zig");
 const transaction_read_guards = @import("transaction_read_guards.zig");
+const prepared_read_guards = @import("prepared_read_guards.zig");
 const artifact_replay_inventory = @import("artifact_replay_inventory.zig");
 const artifact_payload = @import("artifact_payload.zig");
 const lsm_backend = @import("lsm_backend.zig");
@@ -560,6 +561,7 @@ pub const DocStore = struct {
     pub const Txn = struct {
         range_mutation: @import("range_protection.zig").Mutation = .{},
         read_guards: transaction_read_guards.Capture = .{},
+        prepared_guards: prepared_read_guards.Capture = .{},
         retained: retained_effects.Capture = .{},
         artifact_inputs: @import("artifact_input_capture.zig").Capture = .{},
         artifact_footprint: @import("artifact_footprint.zig").Capture = .{},
@@ -628,6 +630,7 @@ pub const DocStore = struct {
 
         pub fn abort(self: *Txn) void {
             self.read_guards.deinit(self.alloc);
+            self.prepared_guards.deinit(self.alloc);
             self.retained.deinit(self.alloc);
             self.artifact_inputs.deinit(self.alloc);
             self.document_revisions.deinit(self.alloc);
@@ -652,6 +655,7 @@ pub const DocStore = struct {
 
         pub fn commit(self: *Txn) !void {
             try self.read_guards.check();
+            try self.prepared_guards.check();
             if (self.columnar_owner) |owner| _ = owner.query_generation_revision.fetchAdd(1, .release);
             errdefer self.retained.poisoned = true;
             // A backend error need not prove that its commit was absent.
@@ -677,6 +681,7 @@ pub const DocStore = struct {
             if (payload_session) |session| try session.stageReferenceEpoch(self);
             try self.publication_backlog.stage(self);
             try self.read_guards.validate(self.alloc, self);
+            try self.prepared_guards.validate(self.alloc, self);
             if (payload_session) |session| try session.prepareCommit();
             const catalog_owner = if (self.resolver_catalog_mutated) self.columnar_owner else null;
             if (catalog_owner) |owner| owner.resolver_catalog_revision.beginWrite();
@@ -692,6 +697,7 @@ pub const DocStore = struct {
                 session.release();
             }
             self.read_guards.deinit(self.alloc);
+            self.prepared_guards.deinit(self.alloc);
             self.retained.deinit(self.alloc);
             self.artifact_inputs.deinit(self.alloc);
             self.document_revisions.deinit(self.alloc);
@@ -872,6 +878,7 @@ pub const DocStore = struct {
 
         pub fn put(self: *Txn, key: []const u8, value: []const u8) anyerror!void {
             try self.read_guards.touch(self.alloc, self, &self.publication_backlog, if (self.columnar_owner) |owner| owner.runtime_store.publication_gate orelse &owner.publication_backlog_mutex else null, key);
+            try self.prepared_guards.touch(self.alloc, self, &self.publication_backlog, if (self.columnar_owner) |owner| owner.runtime_store.publication_gate orelse &owner.publication_backlog_mutex else null, key, value);
             errdefer if (artifact_replay_inventory.isTrackedKey(key)) {
                 self.artifact_inventory.poisoned = true;
             };
@@ -917,6 +924,7 @@ pub const DocStore = struct {
 
         fn deleteInventoryTracked(self: *Txn, key: []const u8) anyerror!void {
             try self.read_guards.touch(self.alloc, self, &self.publication_backlog, if (self.columnar_owner) |owner| owner.runtime_store.publication_gate orelse &owner.publication_backlog_mutex else null, key);
+            try self.prepared_guards.touch(self.alloc, self, &self.publication_backlog, if (self.columnar_owner) |owner| owner.runtime_store.publication_gate orelse &owner.publication_backlog_mutex else null, key, null);
             try self.trackArtifactInventory(key, false, null);
             errdefer if (@import("publication_backlog.zig").isObligation(key)) {
                 self.publication_backlog.poisoned = true;
@@ -955,8 +963,20 @@ pub const DocStore = struct {
         /// Derive costs/roots from canonical request preparation and the exact
         /// durable frame. The caller must hold its request/catalog intent witness.
         /// Complete recovery working resources remain a separate prerequisite.
+        pub fn prepareReadGuardRegistration(self: *Txn, control: ?@import("../common/read_admission.zig").Port) !void {
+            try self.prepared_guards.ensureLoaded(self.alloc, self, &self.publication_backlog, if (self.columnar_owner) |owner| owner.runtime_store.publication_gate orelse &owner.publication_backlog_mutex else null, control);
+            try self.prepared_guards.auditEmpty(self, control);
+        }
+        pub fn installPreparedReadGuards(self: *Txn, record: *const prepared_read_guards.Record, control: ?@import("../common/read_admission.zig").Port) !void {
+            try self.prepared_guards.install(self.alloc, self, record, control);
+        }
+        pub fn retirePreparedReadGuards(self: *Txn, id: [16]u8) !void {
+            try self.prepared_guards.retire(self.alloc, self, &self.publication_backlog, if (self.columnar_owner) |owner| owner.runtime_store.publication_gate orelse &owner.publication_backlog_mutex else null, id);
+        }
+
         pub fn setReadGuardScope(self: *Txn, scope: transaction_read_guards.Scope) !void {
             try self.read_guards.setScope(scope);
+            try self.prepared_guards.setScope(scope);
         }
 
         pub fn reservePreparedReplayPlan(self: *Txn, expected: @import("db/prepared_transaction_effects.zig").Contract, request: @import("db/derived/derived_types.zig").DerivedBatch, original: ?@import("../common/read_admission.zig").Port) !void {
@@ -1076,6 +1096,7 @@ pub const DocStore = struct {
     pub const Batch = struct {
         range_mutation: @import("range_protection.zig").Mutation = .{},
         read_guards: transaction_read_guards.Capture = .{},
+        prepared_guards: prepared_read_guards.Capture = .{},
         retained: retained_effects.Capture = .{},
         artifact_inputs: @import("artifact_input_capture.zig").Capture = .{},
         artifact_footprint: @import("artifact_footprint.zig").Capture = .{},
@@ -1100,6 +1121,7 @@ pub const DocStore = struct {
         pub const BatchTxn = struct {
             range_mutation: *@import("range_protection.zig").Mutation,
             read_guards: *transaction_read_guards.Capture,
+            prepared_guards: *prepared_read_guards.Capture,
             retained: *retained_effects.Capture,
             artifact_inputs: *@import("artifact_input_capture.zig").Capture,
             artifact_footprint: *@import("artifact_footprint.zig").Capture,
@@ -1155,6 +1177,7 @@ pub const DocStore = struct {
 
             pub fn put(self: @This(), key: []const u8, value: []const u8) anyerror!void {
                 try self.read_guards.touch(self.alloc, self, self.publication_backlog, self.publication_gate, key);
+                try self.prepared_guards.touch(self.alloc, self, self.publication_backlog, self.publication_gate, key, value);
                 errdefer if (artifact_replay_inventory.isTrackedKey(key)) {
                     self.artifact_inventory.poisoned = true;
                 };
@@ -1203,6 +1226,7 @@ pub const DocStore = struct {
 
             fn appendPutInventoryTracked(self: @This(), key: []const u8, value: []const u8, retirement_checked: bool) anyerror!void {
                 try self.read_guards.touch(self.alloc, self, self.publication_backlog, self.publication_gate, key);
+                try self.prepared_guards.touch(self.alloc, self, self.publication_backlog, self.publication_gate, key, value);
                 if (@import("publication_backlog.zig").isObligation(key)) return self.put(key, value);
                 if (std.mem.startsWith(u8, key, internal_keys.graph_endpoint_cleanup_prefix) and self.unordered_bulk_append_puts) return error.Unsupported;
                 try updateGraphOwningTable(self, key, value);
@@ -1260,6 +1284,7 @@ pub const DocStore = struct {
 
             fn deleteInventoryTracked(self: @This(), key: []const u8) anyerror!void {
                 try self.read_guards.touch(self.alloc, self, self.publication_backlog, self.publication_gate, key);
+                try self.prepared_guards.touch(self.alloc, self, self.publication_backlog, self.publication_gate, key, null);
                 try self.trackArtifactInventory(key, false, null);
                 errdefer if (@import("publication_backlog.zig").isObligation(key)) {
                     self.publication_backlog.poisoned = true;
@@ -1304,8 +1329,20 @@ pub const DocStore = struct {
             /// Derive costs/roots from canonical request preparation and the exact
             /// durable frame. The caller must hold its request/catalog intent witness.
             /// Complete recovery working resources remain a separate prerequisite.
+            pub fn prepareReadGuardRegistration(self: @This(), control: ?@import("../common/read_admission.zig").Port) !void {
+                try self.prepared_guards.ensureLoaded(self.alloc, self, self.publication_backlog, self.publication_gate, control);
+                try self.prepared_guards.auditEmpty(self, control);
+            }
+            pub fn installPreparedReadGuards(self: @This(), record: *const prepared_read_guards.Record, control: ?@import("../common/read_admission.zig").Port) !void {
+                try self.prepared_guards.install(self.alloc, self, record, control);
+            }
+            pub fn retirePreparedReadGuards(self: @This(), id: [16]u8) !void {
+                try self.prepared_guards.retire(self.alloc, self, self.publication_backlog, self.publication_gate, id);
+            }
+
             pub fn setReadGuardScope(self: @This(), scope: transaction_read_guards.Scope) !void {
                 try self.read_guards.setScope(scope);
+                try self.prepared_guards.setScope(scope);
             }
 
             pub fn reservePreparedReplayPlan(self: @This(), expected: @import("db/prepared_transaction_effects.zig").Contract, request: @import("db/derived/derived_types.zig").DerivedBatch, original: ?@import("../common/read_admission.zig").Port) !void {
@@ -1391,6 +1428,7 @@ pub const DocStore = struct {
 
         pub fn abort(self: *Batch) void {
             self.read_guards.deinit(self.alloc);
+            self.prepared_guards.deinit(self.alloc);
             self.retained.deinit(self.alloc);
             self.artifact_inputs.deinit(self.alloc);
             self.document_revisions.deinit(self.alloc);
@@ -1407,6 +1445,7 @@ pub const DocStore = struct {
 
         pub fn commit(self: *Batch) !void {
             try self.read_guards.check();
+            try self.prepared_guards.check();
             if (self.columnar_owner) |owner| _ = owner.query_generation_revision.fetchAdd(1, .release);
             errdefer self.retained.poisoned = true;
             errdefer if (self.columnar_owner) |owner| owner.committed_replay_next_cached.store(0, .release);
@@ -1428,6 +1467,7 @@ pub const DocStore = struct {
             if (payload_session) |session| try session.stageReferenceEpoch(self);
             try self.publication_backlog.stage(self.asTxn());
             try self.read_guards.validate(self.alloc, self.asTxn());
+            try self.prepared_guards.validate(self.alloc, self.asTxn());
             if (payload_session) |session| try session.prepareCommit();
             const catalog_owner = if (self.resolver_catalog_mutated) self.columnar_owner else null;
             if (catalog_owner) |owner| owner.resolver_catalog_revision.beginWrite();
@@ -1441,6 +1481,7 @@ pub const DocStore = struct {
                 session.release();
             }
             self.read_guards.deinit(self.alloc);
+            self.prepared_guards.deinit(self.alloc);
             self.retained.deinit(self.alloc);
             self.artifact_inputs.deinit(self.alloc);
             self.document_revisions.deinit(self.alloc);
@@ -1450,8 +1491,19 @@ pub const DocStore = struct {
             if (columnar_owner) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
         }
 
+        pub fn prepareReadGuardRegistration(self: *Batch, control: ?@import("../common/read_admission.zig").Port) !void {
+            try self.asTxn().prepareReadGuardRegistration(control);
+        }
+        pub fn installPreparedReadGuards(self: *Batch, record: *const prepared_read_guards.Record, control: ?@import("../common/read_admission.zig").Port) !void {
+            try self.asTxn().installPreparedReadGuards(record, control);
+        }
+        pub fn retirePreparedReadGuards(self: *Batch, id: [16]u8) !void {
+            try self.asTxn().retirePreparedReadGuards(id);
+        }
+
         pub fn setReadGuardScope(self: *Batch, scope: transaction_read_guards.Scope) !void {
             try self.read_guards.setScope(scope);
+            try self.prepared_guards.setScope(scope);
         }
 
         pub fn reservePreparedReplayPlan(self: *Batch, expected: @import("db/prepared_transaction_effects.zig").Contract, request: @import("db/derived/derived_types.zig").DerivedBatch, original: ?@import("../common/read_admission.zig").Port) !void {
@@ -1468,6 +1520,7 @@ pub const DocStore = struct {
             return .{
                 .range_mutation = &self.range_mutation,
                 .read_guards = &self.read_guards,
+                .prepared_guards = &self.prepared_guards,
                 .retained = &self.retained,
                 .artifact_inputs = &self.artifact_inputs,
                 .artifact_footprint = &self.artifact_footprint,
@@ -1563,6 +1616,7 @@ pub const DocStore = struct {
         var capabilities = self.runtime_store.capabilities();
         capabilities.accounted_prepared_observations = true;
         capabilities.owned_read_guard_mutations = true;
+        capabilities.prepared_read_guard_mutations = true;
         return capabilities;
     }
 
@@ -7755,7 +7809,8 @@ test "docstore artifact replay inventory shared gate and ignored allocation fail
             var refused = try second.beginWriteBatch();
             defer refused.abort();
             try std.testing.expectError(error.Backpressured, refused.put(other, "refused"));
-            try std.testing.expectError(error.InvalidArtifactReplayInventory, refused.commit());
+            // The predicate gate rejects first; commit preserves that original refusal.
+            try std.testing.expectError(error.Backpressured, refused.commit());
         }
         try accepted.commit();
     }
