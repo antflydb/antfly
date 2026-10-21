@@ -1990,7 +1990,10 @@ read requests a shallow primitive-element proof. Successful and failed proofs
 are charged and shared once per immutable parameter for that execution. Planning
 an ordinary COUNT(*) does not scan an otherwise unobserved parameter list.
 Binding-type snapshots are immutable across UNWIND shadowing and child exports;
-dummy NULL schema values never supply type evidence.
+dummy NULL schema values never supply type evidence. Builtin signatures describe
+successful result domains. Arithmetic and argument-dependent builtins compose
+lazy primitive proofs, so derived keys can share domains without scanning
+unused parameter lists or skipping their original producer evaluations.
 
 An independent pure zero-or-one-row CALL also preserves a compressed axis. Each
 child executes with one unit input, so filtering, DISTINCT, windows and global
@@ -1998,9 +2001,21 @@ empty-input reducers retain their invocation-local semantics before the caller's
 multiplicity is applied. This composes with exact range and immutable-list
 COUNT/MIN/MAX/integer-SUM certificates. The proof checks reads and output names,
 including implicit names and nested CALL joins: exporting the axis binding can
-conflict even when the child never reads it. Wildcards, correlated children,
-effects and expanding bodies keep ordinary execution. Floating SUM/AVG retain
-their sequential contribution order.
+conflict even when the child never reads it. Wildcards, correlated children
+and effects keep ordinary execution. Pure expanding children also preserve an
+unobserved axis for commutative COUNT/MIN/MAX consumers. Each complete child
+bag retains local filters, DISTINCT, ordering, windows and empty-input reducers;
+its emitted weights multiply the caller weight only after successful binding.
+Observed-axis uniqueness and integer-SUM proofs still require singleton children.
+Floating SUM/AVG and order-sensitive consumers retain sequential contributions.
+
+Bounded COUNT group windows accept pure expanding children using dynamic emitted
+weight certificates. Both materialized and streamed child boundaries check the
+combined caller/child multiplicity; terminal contributions and cached reducer
+packets retain their independent bounds. A failed bound retries ordinary deferred
+reduction before publishing results, preserving overflow and middle-stage error
+precedence. CALL plan output counts include the logical multiplicity of successful
+joins on materialized, memoized and streamed paths, only on the recording pass.
 
 An intermediate ORDER BY can share one sorted inner domain only after proving a
 unique outer source, unchanged partition lineage in every DISTINCT and grouping
@@ -2115,10 +2130,13 @@ allocator-dependent metadata arena growth from retaining extra payload space.
 A scalar COUNT projection ordered directly by grouping keys can retain just
 SKIP + LIMIT groups while consuming the input. Its stable max heap owns each
 selected group's arena and recycles hash collision links on eviction. Rejected
-rows still evaluate COUNT arguments. This proof requires unit multiplicities
-and a scalar-row work bound that rules out count overflow; weighted producers,
-fallible reducer outputs, aggregate-ranked order, and post-group predicates
-retain general aggregation. Heap comparison metadata has scratch lifetime so
+rows still evaluate COUNT arguments. Each charged contribution must certify a
+logical count no greater than maxInt(i64) divided by the work budget, ruling out
+COUNT overflow even for discarded groups. Weighted producers and cached reducer
+packets carry exact bounds; an unproved weight retries general aggregation before
+publishing results. Argument failures also retry deferred reduction so later
+middle-stage errors retain precedence. Aggregate-ranked order and post-group
+predicates retain general aggregation. Heap comparison metadata has scratch lifetime so
 recycled group allocations cannot enter the statement's identity caches.
 
 Unproved length predicates, length grouping keys, non-extremum DISTINCT

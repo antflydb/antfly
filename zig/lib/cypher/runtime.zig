@@ -2868,7 +2868,9 @@ const Engine = struct {
         primitive_items,
         items: *ListType,
         element: *ListType,
+        derived: *PrimitiveType,
     };
+    const PrimitiveType = struct { dependencies: []const ScalarType, plain: ?bool = null };
     const ListType = struct { items: []const v.Value, plain: ?bool = null };
     const ScalarTypes = std.StringHashMapUnmanaged(ScalarType);
     fn listType(self: *Engine, items: []const v.Value) !ScalarType {
@@ -2900,6 +2902,35 @@ const Engine = struct {
     fn plainBinding(self: *Engine, known: ?ScalarType) !bool {
         const kind = known orelse return false;
         if (kind == .primitive) return true;
+        if (kind == .derived) {
+            // Proofs form an immutable DAG across forwarding projections.
+            // Resolve iteratively and memoize each node, avoiding exponential
+            // revisits and native-stack growth through long alias chains.
+            const Frame = struct { proof: *PrimitiveType, index: usize = 0 };
+            var stack: std.ArrayList(Frame) = .empty;
+            defer stack.deinit(self.scratch_allocator);
+            try stack.append(self.scratch_allocator, .{ .proof = kind.derived });
+            while (stack.items.len != 0) {
+                const frame = &stack.items[stack.items.len - 1];
+                if (frame.proof.plain != null) {
+                    _ = stack.pop();
+                    continue;
+                }
+                if (frame.index == frame.proof.dependencies.len) {
+                    frame.proof.plain = true;
+                    continue;
+                }
+                const dependency = frame.proof.dependencies[frame.index];
+                try self.state();
+                if (dependency == .derived and dependency.derived.plain == null) {
+                    try stack.append(self.scratch_allocator, .{ .proof = dependency.derived });
+                    continue;
+                }
+                const valid = if (dependency == .derived) dependency.derived.plain.? else try self.plainBinding(dependency);
+                if (!valid) frame.proof.plain = false else frame.index += 1;
+            }
+            return kind.derived.plain.?;
+        }
         if (kind != .element) return false;
         const certificate = kind.element;
         if (certificate.plain) |certified| return certified;
@@ -2923,10 +2954,15 @@ const Engine = struct {
                 // once per immutable parameter across all nested CALLs.
                 break :blk if (value == .list) try self.listType(value.list) else null;
             },
-            .unary => |u| if (knownPrimitive(try self.scalarType(u.operand, types))) .primitive else null,
-            .binary => |b| if (knownPrimitive(try self.scalarType(b.left, types)) and knownPrimitive(try self.scalarType(b.right, types))) .primitive else null,
+            .unary => |u| try self.derivedPrimitive(&.{u.operand}, types),
+            .binary => |b| try self.derivedPrimitive(&.{ b.left, b.right }, types),
             .call => |call_value| blk: {
-                if (std.ascii.eqlIgnoreCase(call_value.name, "range")) break :blk .primitive_items;
+                if (@import("functions.zig").lookup(call_value.name)) |signature| switch (signature.result) {
+                    .primitive => break :blk .primitive,
+                    .primitive_items => break :blk .primitive_items,
+                    .arguments => break :blk try self.derivedPrimitive(call_value.args, types),
+                    .unknown => {},
+                };
                 for ([_][]const u8{ "count", "sum", "avg" }) |name| if (std.ascii.eqlIgnoreCase(call_value.name, name)) break :blk .primitive;
                 break :blk null;
             },
@@ -2936,6 +2972,21 @@ const Engine = struct {
             },
             else => null,
         };
+    }
+    // Compose success-result proofs without inspecting parameter elements.
+    // Resolve the dependencies only when eliminating an actual dead read.
+    fn derivedPrimitive(self: *Engine, expressions: []const *const ast.Expr, types: ScalarTypes) !?ScalarType {
+        const dependencies = try self.a.alloc(ScalarType, expressions.len);
+        var resolved = true;
+        for (expressions, dependencies) |expression, *dependency| {
+            dependency.* = (try self.scalarType(expression, types)) orelse return null;
+            if (dependency.* != .primitive and dependency.* != .element and dependency.* != .derived) return null;
+            resolved = resolved and dependency.* == .primitive;
+        }
+        if (resolved) return .primitive;
+        const proof = try self.a.create(PrimitiveType);
+        proof.* = .{ .dependencies = dependencies };
+        return .{ .derived = proof };
     }
     /// Expand bound wildcard columns without changing expression evaluation
     /// or CALL scope. A single scalar seed gives every stage one static schema.
@@ -3854,6 +3905,10 @@ const Engine = struct {
                             var merged = row;
                             for (child) |entry| merged = (try engine.bind(merged, entry.name, entry.value)) orelse return error.CypherVariableConflict;
                             fold.weight = try prior.multiply(engine.a, weight);
+                            // A child bag may encode many logical rows in one
+                            // emission. Certify it before consuming any suffix.
+                            _ = try fold.permitsWindowProduct(engine, 1);
+                            if (fold.record_rows) fold.stage_counts[index + 1] +|= @as(usize, @intCast(fold.weight.cap(std.math.maxInt(usize))));
                             try fold.expand(engine, merged, index + 1);
                         }
                     },
@@ -3887,7 +3942,6 @@ const Engine = struct {
                 const weight = next.parent.weight;
                 next.parent.weight = if (next.apply != null) try weight.multiply(engine.a, fold.weight) else fold.weight;
                 defer next.parent.weight = weight;
-                if (next.parent.record_rows) next.parent.stage_counts[next.index] +|= @as(usize, @intCast(next.parent.weight.cap(std.math.maxInt(usize))));
                 var output = row;
                 if (next.apply) |parent| {
                     const projected = try engine.projectUnordered(&.{row}, fold.projection, false);
@@ -3896,6 +3950,8 @@ const Engine = struct {
                     output = parent;
                     for (projected[0]) |entry| output = (try engine.bind(output, entry.name, entry.value)) orelse return error.CypherVariableConflict;
                 }
+                _ = try next.parent.permitsWindowProduct(engine, 1);
+                if (next.parent.record_rows) next.parent.stage_counts[next.index] +|= @as(usize, @intCast(next.parent.weight.cap(std.math.maxInt(usize))));
                 if (next.returned) |returned| returned.* = true;
                 return next.parent.expand(engine, output, next.index);
             }
@@ -4070,7 +4126,10 @@ const Engine = struct {
                     if (!independentExpressions(u.expression, alias)) return false;
                     fanout = true;
                 },
-                .subquery => |inner| if (!try engine.independentUnitCall(inner, alias)) return false,
+                .subquery => |inner| {
+                    if (!try engine.independentCall(inner, alias)) return false;
+                    fanout = fanout or !unitReturningCall(inner);
+                },
                 else => return false,
             };
             if (fanout) {
@@ -4866,7 +4925,10 @@ const Engine = struct {
     /// local to that unit input. A returned axis alias would join against the
     /// actual input value even without reading it, so cannot use a representative.
     fn independentUnitCall(self: *Engine, inner: []const ast.Clause, alias: []const u8) anyerror!bool {
-        if (!unitReturningCall(inner) or !independentExpressions(inner, alias)) return false;
+        return unitReturningCall(inner) and try self.independentCall(inner, alias);
+    }
+    fn independentCall(self: *Engine, inner: []const ast.Clause, alias: []const u8) anyerror!bool {
+        if (!axisReturningCall(inner) or !independentExpressions(inner, alias)) return false;
         for (inner) |clause| switch (clause.operation) {
             .project => |step| {
                 if (step.value.wildcard) return false;
@@ -4875,7 +4937,8 @@ const Engine = struct {
                     if (std.mem.eql(u8, name, alias)) return false;
                 }
             },
-            .subquery => |child| if (!try self.independentUnitCall(child, alias)) return false,
+            .subquery => |child| if (!try self.independentCall(child, alias)) return false,
+            .unwind => |u| if (std.mem.eql(u8, u.alias, alias)) return false,
             else => return false,
         };
         return true;
@@ -5214,7 +5277,7 @@ const Engine = struct {
             if (input_weights) |weights| for (weights) |weight| if (!weight.isOne()) break :blk false;
             for (middle) |clause| switch (clause.operation) {
                 .project, .unwind => {},
-                .subquery => |inner| if (!unitReturningCall(inner)) break :blk false,
+                .subquery => |inner| if (!axisReturningCall(inner)) break :blk false,
                 else => break :blk false,
             };
             break :blk true;

@@ -15,34 +15,35 @@
 
 //! Shared scalar signatures for compile-time validation and execution.
 const std = @import("std");
-pub const Signature = struct { name: []const u8, minimum: usize = 1, maximum: usize = 1, repeatable: bool = false };
+pub const Result = enum { unknown, primitive, primitive_items, arguments };
+pub const Signature = struct { result: Result = .unknown, name: []const u8, minimum: usize = 1, maximum: usize = 1, repeatable: bool = false };
 pub const signatures = [_]Signature{
-    .{ .repeatable = true, .name = "coalesce", .maximum = std.math.maxInt(usize) },
-    .{ .repeatable = true, .name = "antfly.documentKey" },
-    .{ .repeatable = true, .name = "elementId" },
-    .{ .repeatable = true, .name = "labels" },
-    .{ .repeatable = true, .name = "type" },
+    .{ .repeatable = true, .result = .arguments, .name = "coalesce", .maximum = std.math.maxInt(usize) },
+    .{ .repeatable = true, .result = .primitive, .name = "antfly.documentKey" },
+    .{ .repeatable = true, .result = .primitive, .name = "elementId" },
+    .{ .repeatable = true, .result = .primitive_items, .name = "labels" },
+    .{ .repeatable = true, .result = .primitive, .name = "type" },
     .{ .repeatable = true, .name = "properties" },
     .{ .repeatable = true, .name = "nodes" },
     .{ .repeatable = true, .name = "relationships" },
-    .{ .repeatable = true, .name = "length" },
-    .{ .repeatable = true, .name = "size" },
+    .{ .repeatable = true, .result = .primitive, .name = "length" },
+    .{ .repeatable = true, .result = .primitive, .name = "size" },
     .{ .repeatable = true, .name = "head" },
     .{ .repeatable = true, .name = "last" },
-    .{ .repeatable = true, .name = "toLower" },
-    .{ .repeatable = true, .name = "toUpper" },
-    .{ .repeatable = true, .name = "abs" },
-    .{ .repeatable = true, .name = "keys" },
+    .{ .repeatable = true, .result = .primitive, .name = "toLower" },
+    .{ .repeatable = true, .result = .primitive, .name = "toUpper" },
+    .{ .repeatable = true, .result = .primitive, .name = "abs" },
+    .{ .repeatable = true, .result = .primitive_items, .name = "keys" },
     .{ .repeatable = true, .name = "reverse" },
-    .{ .repeatable = true, .name = "trim" },
-    .{ .repeatable = true, .name = "ltrim" },
-    .{ .repeatable = true, .name = "rtrim" },
-    .{ .repeatable = true, .name = "toString" },
-    .{ .repeatable = true, .name = "toInteger" },
-    .{ .repeatable = true, .name = "toFloat" },
-    .{ .repeatable = true, .name = "toBoolean" },
-    .{ .repeatable = true, .name = "range", .minimum = 2, .maximum = 3 },
-    .{ .repeatable = true, .name = "substring", .minimum = 2, .maximum = 3 },
+    .{ .repeatable = true, .result = .primitive, .name = "trim" },
+    .{ .repeatable = true, .result = .primitive, .name = "ltrim" },
+    .{ .repeatable = true, .result = .primitive, .name = "rtrim" },
+    .{ .repeatable = true, .result = .primitive, .name = "toString" },
+    .{ .repeatable = true, .result = .primitive, .name = "toInteger" },
+    .{ .repeatable = true, .result = .primitive, .name = "toFloat" },
+    .{ .repeatable = true, .result = .primitive, .name = "toBoolean" },
+    .{ .repeatable = true, .result = .primitive_items, .name = "range", .minimum = 2, .maximum = 3 },
+    .{ .repeatable = true, .result = .primitive, .name = "substring", .minimum = 2, .maximum = 3 },
 };
 pub fn lookup(name: []const u8) ?Signature {
     for (signatures) |signature| if (std.ascii.eqlIgnoreCase(name, signature.name)) return signature;

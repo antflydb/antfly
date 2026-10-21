@@ -6299,14 +6299,19 @@ def test_count_window_retry_keeps_exact_large_counts_and_publishes_stages_once(g
         ("UNWIND [1,3,2] AS i UNWIND [CASE WHEN i=3 THEN 0 ELSE 1 END] AS x", 1),
     ],
 )
-def test_call_count_window_keeps_middle_error_before_return_argument_error(graph_db, source, limit):
+@pytest.mark.parametrize(
+    "body",
+    [
+        "RETURN CASE WHEN i=2 THEN true+1 ELSE 1 END AS y",
+        "UNWIND [0,1] AS k RETURN CASE WHEN i=2 THEN true+1 ELSE k END AS y",
+        "UNWIND [0,1] AS k RETURN DISTINCT CASE WHEN i=2 THEN true+1 ELSE k END AS y",
+    ],
+)
+def test_call_count_window_keeps_middle_error_before_return_argument_error(graph_db, source, limit, body):
     with pytest.raises(af.AntflyError, match="CypherTypeMismatch"):
         graph_db.cypher_json(
             "g",
-            {
-                "query": source + " CALL {RETURN CASE WHEN i=2 THEN true+1 ELSE 1 END AS y} "
-                f"RETURN i,count(1/x) ORDER BY i LIMIT {limit}"
-            },
+            {"query": source + f" CALL {{{body}}} RETURN i,count(1/x) ORDER BY i LIMIT {limit}"},
         )
 
 
@@ -6360,3 +6365,95 @@ def test_independent_singleton_calls_preserve_symbolic_axis_domains(graph_db, bo
 def test_independent_call_axis_compression_retains_output_binding_conflicts(graph_db, body):
     with pytest.raises(af.AntflyError, match="CypherVariableConflict"):
         graph_db.cypher_json("g", {"query": f"UNWIND [7,8] AS x CALL {{{body}}} RETURN count(*)"})
+
+
+@pytest.mark.parametrize(
+    "source,expression",
+    [("range(1,30)", "toInteger(i)"), ("$groups", "i+1"), ("range(1,30)", "size(range(1,i))")],
+)
+def test_derived_primitive_keys_share_call_domains(graph_db, source, expression):
+    prefix = f"UNWIND {source} AS i WITH i,{expression} AS j UNWIND $xs AS x "
+    outputs = [
+        graph_db.cypher_json(
+            "g",
+            {
+                "query": prefix + f"CALL {{{body}}} RETURN i,avg(y) ORDER BY i",
+                "parameters": {"groups": list(range(1, 31)), "xs": list(range(1000))},
+                "limits": {"intermediate_states": 100000, "memory_bytes": 2 << 20},
+            },
+        )
+        for body in ("WITH j,avg(x) AS y RETURN y", "WITH avg(x) AS y RETURN y")
+    ]
+    assert outputs[0]["rows"] == outputs[1]["rows"]
+    assert len(outputs[0]["rows"]) == 30
+    assert outputs[0]["stats"]["intermediate_states"] < 50000
+
+
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        ("UNWIND [7,8] AS y RETURN y", [2000000, 7, 8]),
+        ("UNWIND [7,8,7] AS y RETURN DISTINCT y ORDER BY y DESC SKIP 1 LIMIT 1", [1000000, 7, 7]),
+        ("UNWIND [] AS y RETURN count(*) AS y", [1000000, 0, 0]),
+        ("CALL {UNWIND [7,8] AS z RETURN z} RETURN z AS y", [2000000, 7, 8]),
+    ],
+)
+def test_independent_expanding_calls_preserve_compressed_bags(graph_db, body, expected):
+    result = graph_db.cypher_json(
+        "g",
+        {
+            "query": f"UNWIND range(1,1000000) AS x CALL {{{body}}} RETURN count(*),min(y),max(y)",
+            "limits": {"intermediate_states": 2000, "memory_bytes": 1 << 20},
+        },
+    )
+    assert [[int(cell["value"]) for cell in row] for row in result["rows"]] == [expected]
+    assert result["stats"]["intermediate_states"] < 500
+    assert result["plan"][1]["output_rows"] == expected[0]
+
+
+def test_expanding_call_count_window_retains_bounded_memory(graph_db):
+    results = [
+        graph_db.cypher_json(
+            "g",
+            {
+                "query": "UNWIND range(1,10000) AS i UNWIND [0,1] AS x "
+                + middle
+                + " RETURN i,count(y) ORDER BY i LIMIT 5",
+                "limits": {"memory_bytes": 2 << 20, "intermediate_states": 300000},
+            },
+        )
+        for middle in ("CALL {UNWIND [x,x+1] AS k RETURN k AS y}", "UNWIND [x,x+1] AS y")
+    ]
+    assert results[0]["rows"] == results[1]["rows"]
+    assert len(results[0]["rows"]) == 5
+    assert results[0]["stats"]["memory_bytes"] < 200000
+
+
+@pytest.mark.parametrize(
+    "body,expected",
+    [("RETURN 7 AS y", 3), ("UNWIND [7,8] AS y RETURN y", 6), ("RETURN 7 AS y LIMIT 0", 0)],
+)
+@pytest.mark.parametrize("projection", ["count(*)", "count(*),min(x)"])
+def test_call_plan_counts_emitted_child_multiplicity(graph_db, body, expected, projection):
+    result = graph_db.cypher_json("g", {"query": f"UNWIND range(1,3) AS x CALL {{{body}}} RETURN {projection}"})
+    assert int(result["rows"][0][0]["value"]) == expected
+    assert result["plan"][1]["output_rows"] == expected
+    assert result["plan"][2]["input_rows"] == expected
+
+
+@pytest.mark.parametrize(
+    "middle",
+    [
+        "UNWIND range(0,CASE WHEN i=2 THEN 9223372036854775807 ELSE 0 END) AS x CALL {UNWIND [7,8] AS y RETURN y}",
+        "CALL {UNWIND range(0,CASE WHEN i=2 THEN 9223372036854775807 ELSE 0 END) AS x RETURN 7 AS y}",
+    ],
+)
+def test_expanding_call_window_retains_overflow_from_rejected_groups(graph_db, middle):
+    with pytest.raises(af.AntflyError, match="CypherNumericOverflow"):
+        graph_db.cypher_json(
+            "g",
+            {
+                "query": f"UNWIND [1,2] AS i {middle} RETURN i,count(y) ORDER BY i LIMIT 1",
+                "limits": {"intermediate_states": 2000},
+            },
+        )

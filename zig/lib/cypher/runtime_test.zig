@@ -5815,6 +5815,8 @@ test "COUNT group windows require logical multiplicity certificates" {
         "UNWIND [1,2] AS i UNWIND range(0,CASE WHEN i=2 THEN 9223372036854775807 ELSE 0 END) AS x RETURN i,count(*) ORDER BY i LIMIT 1",
         "UNWIND [1,2] AS i UNWIND range(0,CASE WHEN i=2 THEN 9223372036854775807 ELSE 0 END) AS x RETURN i,count(*) ORDER BY i LIMIT 0",
         "UNWIND [1,2] AS i UNWIND range(0,CASE WHEN i=2 THEN 9223372036854775807 ELSE 0 END) AS x CALL {RETURN 7 AS y} RETURN i,count(y) ORDER BY i LIMIT 1",
+        "UNWIND [1,2] AS i UNWIND range(0,CASE WHEN i=2 THEN 9223372036854775807 ELSE 0 END) AS x CALL {UNWIND [7,8] AS y RETURN y} RETURN i,count(y) ORDER BY i LIMIT 1",
+        "UNWIND [1,2] AS i CALL {UNWIND range(0,CASE WHEN i=2 THEN 9223372036854775807 ELSE 0 END) AS x RETURN 7 AS y} RETURN i,count(y) ORDER BY i LIMIT 1",
         "UNWIND [1,2] AS i UNWIND range(1,1000000000000000) AS x UNWIND range(1,1000000000000000) AS y RETURN i,count(*) ORDER BY i LIMIT 1",
         "UNWIND [1,2] AS i UNWIND range(-9223372036854775807-1,9223372036854775807) AS x RETURN i,count(*) ORDER BY i LIMIT 1",
     }) |text| {
@@ -5911,6 +5913,9 @@ test "parameter primitive certificates share child domains through forwarding an
     const parameters: []const v.Entry = &.{ .{ .name = "groups", .value = .{ .list = &groups } }, .{ .name = "xs", .value = .{ .list = &xs } }, .{ .name = "unused", .value = .{ .string = "primitive" } } };
     for ([_][]const u8{
         "UNWIND $groups AS i UNWIND $xs AS x CALL {WITH i,avg(x) AS y RETURN y} RETURN i,avg(y) ORDER BY i",
+        "UNWIND $groups AS i WITH i,i+1 AS j UNWIND $xs AS x CALL {WITH j,avg(x) AS y RETURN y} RETURN i,avg(y) ORDER BY i",
+        "UNWIND range(1,30) AS i WITH i,toInteger(i) AS j UNWIND $xs AS x CALL {WITH j,avg(x) AS y RETURN y} RETURN i,avg(y) ORDER BY i",
+        "UNWIND range(1,30) AS i WITH i,size(range(1,i)) AS j UNWIND $xs AS x CALL {WITH j,avg(x) AS y RETURN y} RETURN i,avg(y) ORDER BY i",
         "WITH $groups AS gs UNWIND gs AS i UNWIND $xs AS x CALL {WITH i AS j,x CALL {WITH j,avg(x) AS y RETURN y} RETURN y} RETURN i,avg(y) ORDER BY i",
         "WITH $unused AS unused UNWIND $groups AS i UNWIND $xs AS x CALL {WITH * WITH i,avg(x) AS y RETURN y} RETURN i,avg(y) ORDER BY i",
     }) |text| {
@@ -5972,6 +5977,7 @@ test "singleton axis proofs retain binding conflicts fallible reads and floating
     for ([_][]const u8{
         "UNWIND [1,0] AS x CALL {RETURN 1/x AS y} RETURN count(y)",
         "UNWIND range(1,1000000) AS x CALL {RETURN 1/0 AS y LIMIT 0} RETURN count(*)",
+        "UNWIND range(1,1000000) AS x CALL {UNWIND [7,8] AS z RETURN 1/0 AS y LIMIT 0} RETURN count(*)",
         "UNWIND range(1,1000000) AS x CALL {RETURN 1/0 AS y} RETURN count(*) LIMIT 0",
     }) |text| {
         var diagnostic: c.Diagnostic = .{};
@@ -6001,11 +6007,13 @@ test "parameter certificates and independent CALL compression release failed all
     };
     for ([_][]const u8{
         "WITH $groups AS gs UNWIND gs AS i UNWIND [1,2] AS x CALL {WITH i,avg(x) AS y RETURN y} RETURN i,avg(y)",
+        "UNWIND $groups AS i WITH i,i+1 AS j UNWIND [1,2] AS x CALL {WITH j,avg(x) AS y RETURN y} RETURN i,avg(y)",
+        "UNWIND [1,2] AS i CALL {UNWIND [7,8] AS y RETURN y} RETURN i,count(*) ORDER BY i LIMIT 1",
         "UNWIND range(1,100) AS x CALL {CALL {RETURN 7 AS z} RETURN z AS y} RETURN count(x),min(x),sum(x)",
     }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{text});
 }
 
-test "independent singleton CALL certificates match enumerated child invocations" {
+test "independent CALL certificates match enumerated child invocations" {
     const a = std.testing.allocator;
     for ([_][]const u8{ "[]", "[null]", "[7,8]", "[1,1.0,null,-2,3]", "range(1,20)" }) |source| {
         for ([_][]const u8{
@@ -6020,8 +6028,15 @@ test "independent singleton CALL certificates match enumerated child invocations
             "RETURN 1/0 AS y",
             "RETURN CASE WHEN x=8 THEN 1/0 ELSE 7 END AS y",
             "RETURN 7 AS x,7 AS y",
+            "UNWIND [7,8,7] AS y RETURN y",
+            "UNWIND [7,8,7] AS y RETURN DISTINCT y ORDER BY y DESC SKIP 1 LIMIT 1",
+            "UNWIND [] AS y RETURN count(*) AS y",
+            "UNWIND [7,8] AS z CALL {RETURN z AS y} RETURN y",
+            "UNWIND [7,8] AS y RETURN y WHERE y=7",
+            "UNWIND [7,8] AS z RETURN 7 AS x,z AS y",
+            "UNWIND [7,8] AS z RETURN CASE WHEN x=8 THEN 1/0 ELSE z END AS y",
         }) |body| {
-            for ([_][]const u8{ "count(*),min(y),max(y)", "count(x),count(DISTINCT x),min(x),max(x),sum(x)" }) |projection| {
+            for ([_][]const u8{ "count(*),min(y),max(y)", "count(x),count(DISTINCT x),min(x),max(x),sum(x)", "collect(y),sum(y),avg(y)" }) |projection| {
                 const query = try std.fmt.allocPrint(a, "UNWIND {s} AS x CALL {{{s}}} RETURN {s}", .{ source, body, projection });
                 defer a.free(query);
                 const control = try std.fmt.allocPrint(a, "UNWIND {s} AS x CALL {{MATCH (__guard:Document) WHERE __guard.id='a' {s}}} RETURN {s}", .{ source, body, projection });
@@ -6033,8 +6048,13 @@ test "independent singleton CALL certificates match enumerated child invocations
                 defer slow.deinit();
                 var fixture: Fixture = .{};
                 var actual = runtime.execute(a, fixture.backend(), graph, &fast, &.{}, .{}) catch |err| {
-                    try std.testing.expectError(err, runtime.execute(a, fixture.backend(), graph, &slow, &.{}, .{}));
-                    continue;
+                    var control_result = runtime.execute(a, fixture.backend(), graph, &slow, &.{}, .{}) catch |control_error| {
+                        try std.testing.expectEqual(err, control_error);
+                        continue;
+                    };
+                    defer control_result.deinit();
+                    std.debug.print("CALL oracle disagreement ({s}): {s}\n", .{ @errorName(err), query });
+                    return error.TestExpectedError;
                 };
                 defer actual.deinit();
                 var expected = try runtime.execute(a, fixture.backend(), graph, &slow, &.{}, .{});
@@ -6091,4 +6111,66 @@ test "immutable list type certificates key the actual parameter domain" {
     var callbacks = fixture.backend().vtable.*;
     callbacks.project_node = Host.project;
     try std.testing.expectError(error.CypherInvalidArgument, runtime.execute(a, .{ .ptr = &fixture, .vtable = &callbacks }, graph, &compiled, parameters, .{}));
+}
+
+test "pure expanding CALL bags preserve compressed counts and bounded group windows" {
+    for ([_]struct { text: []const u8, expected: []const u8, states: usize = 2000 }{
+        .{ .text = "UNWIND range(1,1000000) AS x CALL {UNWIND [7,8] AS y RETURN y} RETURN count(*),min(y),max(y)", .expected = "[[2000000,7,8]]" },
+        .{ .text = "UNWIND range(1,1000000) AS x CALL {UNWIND [7,8,7] AS y RETURN DISTINCT y ORDER BY y DESC SKIP 1 LIMIT 1} RETURN count(*),min(y)", .expected = "[[1000000,7]]" },
+        .{ .text = "UNWIND range(1,1000000) AS x CALL {UNWIND [] AS y RETURN count(*) AS y} RETURN count(*),min(y)", .expected = "[[1000000,0]]" },
+        .{ .text = "UNWIND range(1,1000000) AS x CALL {CALL {UNWIND [7,8] AS z RETURN z} RETURN z AS y} RETURN count(*),min(y),max(y)", .expected = "[[2000000,7,8]]" },
+        .{ .text = "UNWIND range(1,10000) AS i UNWIND [0,1] AS x CALL {UNWIND [x,x+1] AS k RETURN k AS y} RETURN i,count(y) ORDER BY i LIMIT 5", .expected = "[[1,4],[2,4],[3,4],[4,4],[5,4]]", .states = 300000 },
+    }) |case| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, case.text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = case.states, .memory_bytes = 2 << 20 });
+        defer result.deinit();
+        const json = try std.json.Stringify.valueAlloc(std.testing.allocator, result.rows, .{});
+        defer std.testing.allocator.free(json);
+        try std.testing.expectEqualStrings(case.expected, json);
+    }
+}
+
+test "CALL stage cardinalities count materialized memoized and compressed child bags" {
+    for ([_]struct { body: []const u8, count: usize }{
+        .{ .body = "RETURN 7 AS y", .count = 3 },
+        .{ .body = "UNWIND [7,8] AS y RETURN y", .count = 6 },
+        .{ .body = "UNWIND [7,8,7] AS y RETURN DISTINCT y", .count = 6 },
+        .{ .body = "UNWIND [7,8] AS y RETURN y LIMIT 0", .count = 0 },
+    }) |case| {
+        const text = try std.fmt.allocPrint(std.testing.allocator, "UNWIND range(1,3) AS x CALL {{{s}}} RETURN count(*),min(x)", .{case.body});
+        defer std.testing.allocator.free(text);
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, @intCast(case.count)), result.rows[0][0].integer);
+        try std.testing.expectEqual(@as(usize, 3), result.stages.len);
+        try std.testing.expectEqualStrings("subquery", result.stages[1].operation);
+        try std.testing.expectEqual(case.count, result.stages[1].output_rows);
+        try std.testing.expectEqual(case.count, result.stages[2].input_rows);
+    }
+}
+
+test "derived primitive proof DAGs share dependencies through long alias chains" {
+    const a = std.testing.allocator;
+    var text: std.Io.Writer.Allocating = .init(a);
+    defer text.deinit();
+    try text.writer.writeAll("UNWIND $groups AS i WITH i,i AS j ");
+    for (0..80) |_| try text.writer.writeAll("WITH i,j=j AS j ");
+    try text.writer.writeAll("UNWIND range(1,100) AS x CALL {WITH j,avg(x) AS y RETURN y} RETURN i,avg(y) ORDER BY i");
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(a, text.written(), .{}, &diagnostic);
+    defer compiled.deinit();
+    const groups = [_]v.Value{ .{ .integer = 1 }, .{ .integer = 2 } };
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{.{ .name = "groups", .value = .{ .list = &groups } }}, .{ .intermediate_states = 20000 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqual(@as(f64, 50.5), result.rows[0][1].number);
+    try std.testing.expectEqual(@as(f64, 50.5), result.rows[1][1].number);
 }
