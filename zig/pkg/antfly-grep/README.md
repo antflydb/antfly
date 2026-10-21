@@ -4270,3 +4270,119 @@ grants and maintained per-segment source-binding certificates. Current budgets
 remain per shard request, and writes invalidate whole-generation proofs. The
 [execution design](../../../docs/design/logical-field-queries.md) records ownership,
 fallback behavior, and the required fences for those remaining changes.
+
+### Postings runs and retained result pages
+
+The [postings/page qualification](bench/results/grep-postings-pages-summary.json)
+compares matched ReleaseFast, stripped server builds with the same compiler.
+It supersedes the preceding server qualification for these changes; the
+standalone CLI and its dependency sources are unchanged. Raw trials and logs
+remain local ignored artifacts. These measurements use a warm filesystem on
+one shared Apple Silicon host and its ARM64 Linux VM.
+
+Default postings runs retain the 8 MiB trigger on small managed build slices.
+Larger slices can use up to 64 MiB, based on advisory live headroom; ordinary
+resource admission still governs allocations. Pressure spills the largest fields
+first and retains tiny companions. The private run's lazy read cache increases
+from 64 to 512 KiB, with four-way lookup. The sixteen-cursor component regression
+performs 2,048 logical reads with 32 physical reads. This work bound is separate
+from end-to-end ingestion performance. Runs remain temporary disk scratch,
+unlinked while open on POSIX; query membership facts remain memory-only.
+
+Complete immutable memberships remain borrowed through constant-score pages,
+ranked include/exclude gates, and native sorted pagination. Captured deletion
+masks are subtracted word by word; sparse iteration seeks over unrelated mask
+ranges, and dense deletion skips check cancellation. Misses and unsupported
+Boolean shapes retain owned execution. Consumers still allocate requested
+output and capture deletion state. This removes avoidable bitmap copies, not
+the cost of parsing, authorization, read-cut validation, and presentation.
+
+Source windows use their already-leased segment reader for identity lookup.
+Separate opt-in diagnostic runs attribute key lookup, provider work, revision
+lookup, directory reads/planning, selected ranges, reconstruction, and fallback.
+For reproduction, pass frozen server binaries to the benchmark driver:
+
+```sh
+python3 zig/pkg/antfly-grep/bench/logical_sources.py \
+  --baseline /path/to/reference/antfly --candidate /path/to/candidate/antfly \
+  --grep /path/to/antfly-grep --suite all --rounds 2 \
+  --output output/grep-postings-paired
+python3 zig/pkg/antfly-grep/bench/logical_sources.py \
+  --baseline /path/to/reference/antfly --candidate /path/to/candidate/antfly \
+  --grep /path/to/antfly-grep --suite hints --source-phases --rounds 1 \
+  --output output/grep-postings-phase-diagnostic
+```
+
+Use a separate directory for each run; the driver refuses to overwrite evidence.
+Run the `pages` diagnostic suite separately to inspect membership ownership.
+Ordinary benchmark requests enable the public query profile, including the
+top-level lookup/ownership counters. Extra physical-source phase clocks and log
+capture are opt-in; those diagnostic timings are not pooled with ordinary
+latency trials. The
+retained-page fixture covers early, middle, and final dense/sparse pages over
+16,384 documents and requires zero source re-verification on measured pages.
+
+Maintained source-binding certificates across writes and coordinator-owned
+verification grants remain unimplemented. Existing whole-generation proofs and
+per-shard request budgets remain authoritative. The
+[execution design](../../../docs/design/logical-field-queries.md) records the
+publication, mutation, repair, restart, capacity, and lifetime fences needed for
+those changes.
+
+Qualification passes 21 integration/upgrade cases on each platform (seven opt-in
+skips), 215 selected search/storage tests in both Debug and ReleaseFast (one
+skip), 89 logical-query and 144 query-contract cases in Debug, and 46 introducer
+cases in both modes. Allocation-failure and ownership checks report no leaks.
+The separate Linux ingestion check passes with two CPUs, 1 GiB RAM and swap
+disabled. Paired Linux retrieval uses two CPUs/1 GiB; paired ingestion uses equal
+8 GiB envelopes with swap disabled.
+
+Two alternating primary rounds produce these HTTP medians in milliseconds:
+
+| Workload | macOS reference → candidate | Linux reference → candidate |
+|---|---:|---:|
+| Tiny values | 11.74 → 12.49 | 12.73 → 13.63 |
+| Selected 4 KiB values | 14.71 → 19.68 | 24.13 → 23.86 |
+| Dominant selected values | 8.94 → 10.36 | 10.41 → 14.59 |
+| Unselected escaped arrays | 11.47 → 11.24 | 14.70 → 12.05 |
+| Nested source | 11.78 → 12.64 | 15.90 → 15.24 |
+| One concurrent client | 8.35 → 8.23 | 15.34 → 15.25 |
+| Four concurrent clients | 18.13 → 16.30 | 69.91 → 67.85 |
+| Fresh distinct predicates | 82.12 → 69.00 | 85.45 → 78.85 |
+| Repetitive ingestion | 259.29 → 184.80 | 1093.69 → 728.92 |
+| Source-like ingestion | 213.83 → 197.79 | 1561.50 → 846.28 |
+| Distinct-word ingestion | 2522.38 → 2118.94 | 7344.83 → 3470.95 |
+
+Linux distinct-word ingestion reduces process read characters from 205.9 to
+128.4 MB and process write bytes from 96.6 to 75.3 MB (about 38% and 22%). Its
+process CPU median falls from 3.71 to 2.95 seconds. These are process I/O
+counters on a warm filesystem, not cold-device bandwidth measurements.
+Ingestion improves in these trials; retrieval remains mixed, including slower
+selected-value cases. No general latency or RSS improvement is established.
+
+The primary cached-page trials were also mixed and showed some larger macOS
+slowdowns. A post-hoc four-round page repeat, kept separate from those primary
+trials, produced the following HTTP medians. It did not reproduce the large
+late-page slowdown, and it does not establish a consistent page-latency win.
+
+| Cached page | macOS reference → candidate | Linux reference → candidate |
+|---|---:|---:|
+| Dense, first | 153.86 → 169.17 | 216.30 → 218.55 |
+| Dense, middle | 162.54 → 162.55 | 225.58 → 219.74 |
+| Dense, final | 154.98 → 152.31 | 218.20 → 222.35 |
+| Sparse, first | 23.51 → 27.37 | 20.20 → 19.31 |
+| Sparse, middle | 24.15 → 22.86 | 20.33 → 20.41 |
+| Sparse, final | 24.63 → 25.82 | 19.14 → 20.24 |
+
+On each platform, the candidate page diagnostics record 90 successful segment
+borrows across 18 page requests, zero membership copies, and zero source
+re-verification. This establishes the ownership/work bound independently of
+latency. Dense-deletion regressions check a million-document domain, wordwise
+skipping, cancellation, sparse seeks and upper-bound clipping.
+
+Fresh-predicate diagnostics identify revision lookup (median component times
+27.3–27.5 ms) and selected-range reads (15.8–18.1 ms) as the main source costs in
+that fixture. Identity lookup is only 30–51 μs; directory reads take 6.3–6.7 ms.
+These component medians are diagnostic observations, not additive attribution
+of every workload. Batched revision/source validation and maintained binding
+certificates are better next targets than enlarging an identity cache.

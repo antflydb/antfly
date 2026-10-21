@@ -787,7 +787,9 @@ reader directly, instead of resolving and leasing the same segment per row.
 key lookup, provider work, revision lookup, directory reads/planning, selected
 ranges, reconstruction and full-body fallback. They log aggregate timings and
 membership borrow/copy counts without document identifiers, bytes or capabilities.
-Instrumented trials remain separate from normal latency qualification. Public
+Ordinary profiled requests collect the top-level lookup/ownership counters.
+Extra physical-source phase clocks and diagnostic log capture are opt-in; those
+trials remain separate from normal latency qualification. Public
 query semantics, verification controls and freshness options are unchanged.
 
 ### Remaining source-certificate ownership
