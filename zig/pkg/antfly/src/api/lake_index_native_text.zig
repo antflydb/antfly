@@ -2052,7 +2052,7 @@ fn flushWithOptions(compactor: *Compactor, batch: mapper.TextProjectionBatch, an
             fn run(self: *Job, io: std.Io) anyerror!Compactor.Owned {
                 defer self.execution.pause();
                 self.execution.checkpoint = .{ .ptr = self, .check = check };
-                try self.execution.enter(io);
+                try self.token.check();
                 var phase: stores.ExecutionIo = .{ .execution = &self.execution, .io = io };
                 self.store.io_phase = phase.capability();
                 var budget: local.sql_memory_budget = .{ .backing = self.a, .limit = 32 * 1024 * 1024 };
@@ -2095,6 +2095,7 @@ fn flushWithOptions(compactor: *Compactor, batch: mapper.TextProjectionBatch, an
             const phase = self.compactor.store.io_phase.?;
             phase.park.?(phase.ptr);
             const result = job.future.?.await(phase.io);
+            job.execution.pause(); // Also covers cancellation before start.
             var owned = result catch |err| {
                 try phase.resume_cpu.?(phase.ptr);
                 if (err == error.OutOfMemory) return try self.inlineEncode(job.chunk, job.options);
@@ -2117,15 +2118,20 @@ fn flushWithOptions(compactor: *Compactor, batch: mapper.TextProjectionBatch, an
                     var transferred = false;
                     defer if (!transferred) scheduler.releasePull(1, reservation);
                     if (self.compactor.a.create(Job)) |job| {
-                        job.* = .{ .a = self.compactor.a, .manager = self.compactor.capture_manager.?, .output_manager = self.compactor.output_manager.?, .store = self.compactor.store.*, .chunk = chunk, .analysis = self.analysis, .options = options, .execution = .{ .scheduler = scheduler, .bytes = 32 * 1024 * 1024 }, .token = self.compactor.cancellation, .threshold = self.compactor.encoding_memory_bytes };
+                        job.* = .{ .a = self.compactor.a, .manager = self.compactor.capture_manager.?, .output_manager = self.compactor.output_manager.?, .store = self.compactor.store.*, .chunk = chunk, .analysis = self.analysis, .options = options, .execution = .{ .scheduler = scheduler, .bytes = 8 * 1024 * 1024 }, .token = self.compactor.cancellation, .threshold = self.compactor.encoding_memory_bytes };
                         job.store.io_phase = null;
-                        if (phase.?.io.concurrent(Job.run, .{ job, phase.?.io })) |future| {
+                        if (!job.execution.tryEnter()) {
+                            job.a.destroy(job);
+                        } else if (phase.?.io.concurrent(Job.run, .{ job, phase.?.io })) |future| {
                             job.future = future;
                             self.job = job;
                             if (@import("builtin").is_test) self.compactor.test_ahead_count += 1;
                             transferred = true;
                             return;
-                        } else |_| self.compactor.a.destroy(job);
+                        } else |_| {
+                            job.execution.pause();
+                            self.compactor.a.destroy(job);
+                        }
                     } else |_| {}
                 }
             }
@@ -2150,6 +2156,7 @@ fn flushWithOptions(compactor: *Compactor, batch: mapper.TextProjectionBatch, an
                 // Cancellation drains the child before borrowed projection data
                 // or its spill manager can be released. It never resumes CPU.
                 const result = job.future.?.cancel(self.compactor.io.?);
+                job.execution.pause(); // Also covers cancellation before start.
                 if (result) |value| value.deinit(self.compactor.a) else |_| {}
                 job.execution.scheduler.releasePull(1, reservation);
                 job.a.destroy(job);
@@ -2723,7 +2730,7 @@ test "external lake publication encoding lookahead spill and direct contribution
     var expected_summaries: []const ?statistics.Ref = &.{};
     var expected_global: ?statistics.Ref = null;
     var expected_directory: term_directory.Roots = .{};
-    for (0..5) |mode| {
+    for (0..7) |mode| {
         var memory: local.sql_memory_budget = .{ .backing = a, .limit = 128 * 1024 * 1024 };
         const ma = memory.allocator();
         var context: u8 = 0;
@@ -2737,11 +2744,16 @@ test "external lake publication encoding lookahead spill and direct contribution
         defer global.deinit();
         var terms = term_directory.Builder.init(ma, &reducer_scratch);
         defer terms.deinit();
-        var scheduler: local.sql_parallel_scheduler.Scheduler = .{ .max_workers = 2, .max_io_workers = 1, .max_bytes = 128 * 1024 * 1024, .max_pull_bytes = 128 * 1024 * 1024 };
-        var execution: local.sql_parallel_scheduler.Execution = .{ .scheduler = &scheduler, .bytes = 32 * 1024 * 1024 };
+        var scheduler: local.sql_parallel_scheduler.Scheduler = .{ .max_workers = if (mode == 5) 3 else 2, .max_io_workers = 1, .max_bytes = if (mode >= 5) 64 * 1024 * 1024 else 128 * 1024 * 1024, .max_pull_bytes = 128 * 1024 * 1024 };
+        // A related producer retains its CPU lane while waiting for this
+        // consumer. Lookahead must fit beside it or decline immediately.
+        var producer: local.sql_parallel_scheduler.Execution = .{ .scheduler = &scheduler, .bytes = 8 * 1024 * 1024 };
+        defer producer.pause();
+        if (mode >= 5) try producer.enter(std.testing.io);
+        var execution: local.sql_parallel_scheduler.Execution = .{ .scheduler = &scheduler, .bytes = if (mode >= 5) 8 * 1024 * 1024 else 32 * 1024 * 1024 };
         defer execution.pause();
         var phase: stores.ExecutionIo = .{ .execution = &execution, .io = std.testing.io };
-        if (mode == 2 or mode == 4) {
+        if (mode == 2 or mode >= 4) {
             try execution.enter(std.testing.io);
             store.io_phase = phase.capability();
         }
@@ -2774,7 +2786,7 @@ test "external lake publication encoding lookahead spill and direct contribution
         try compactor.finish();
         store.vtable = original_vtable;
         try std.testing.expectEqual(@as(usize, 2), segments.items.len);
-        try std.testing.expectEqual(@as(usize, if (mode == 2) 9 else 0), compactor.test_ahead_count);
+        try std.testing.expectEqual(@as(usize, if (mode == 2 or mode == 5) 9 else 0), compactor.test_ahead_count);
         try std.testing.expectEqual(@as(u64, 0), scratch.live_bytes);
         try std.testing.expectEqual(@as(usize, 0), scratch.files);
         try std.testing.expectEqual(@as(u64, 0), output_scratch.live_bytes);

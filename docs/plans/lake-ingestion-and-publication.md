@@ -3560,7 +3560,11 @@ Within a projection batch, one independently admitted encoder can prepare the
 next chunk while the serial owner merges and publishes the preceding chunk.
 Admission requires known construction headroom, a separate 48 MiB node retained
 reservation, and a scheduler with more than one CPU worker. The encoder has a
-32 MiB private workspace budget and its own CPU/I/O phase bridge. Joining parks
+32 MiB private workspace budget and its own CPU/I/O phase bridge. CPU admission
+uses the publication workers' 8 MiB scheduling allowance and is tried atomically
+before launch; saturated CPU/slot admission stays inline rather than queueing
+behind a related producer. The separate retained reservation covers encoder
+workspace/output memory. Joining parks
 the owner's CPU execution without reserving an I/O slot, so a child can finish
 scratch writes even with one configured I/O lane. The owner adopts outputs in
 input order and replaces child-local capabilities before releasing the child.

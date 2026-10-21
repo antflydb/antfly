@@ -142,7 +142,11 @@
     "canonical_optional_summary_spill_quota_bytes": 268435456,
     "serving_segment_output_spill_quota_bytes": 100663296,
     "serving_optional_summary_spill_quota_bytes": 33554432,
-    "optional_summary_and_required_segment_quotas": "independent pools within unchanged total caps"
+    "optional_summary_and_required_segment_quotas": "independent pools within unchanged total caps",
+    "encoder_lookahead_cpu_scheduling_allowance_bytes": 8388608,
+    "encoder_lookahead_cpu_admission": "immediate atomic try; saturated dependencies stay inline",
+    "encoder_related_producer_test_cpu_budget_bytes": 33554432,
+    "encoder_related_producer_test_retained_cpu_bytes": 8388608
   },
   "qualification_outstanding": [
     "Controlled identical-fixture base/head HN one-file and 1024-file latency and post-GC footprint",

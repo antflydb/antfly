@@ -265,6 +265,14 @@ pub const Execution = struct {
         self.active = false;
         self.scheduler.releaseClass(.cpu, self.bytes);
     }
+    /// Optional dependent work must not queue behind CPU admission held by
+    /// the producer it will unblock. Retained-state admission is independent.
+    pub fn tryEnter(self: *Execution) bool {
+        std.debug.assert(!self.active);
+        if (!self.scheduler.acquireClassReserved(.cpu, self.bytes, true)) return false;
+        self.active = true;
+        return true;
+    }
     pub fn enter(self: *Execution, io: std.Io) !void {
         std.debug.assert(!self.active);
         try self.waitAdmission(io, .cpu, 1);
