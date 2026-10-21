@@ -3636,7 +3636,10 @@ selection threshold; missing coverage, partial indexes and larger selections use
 the physical batched reader. Integrity errors remain errors. Results own their
 payloads independently of decoded-cache leases. Tests remove the source object
 in process and damage data pages across public API restart while retaining the
-source identity/footer, proving that successful delivery uses index values.
+source identity, footer and embedded pruning structures. The public fixture is
+large enough for sparse metadata discovery; small-file discovery can legitimately
+read and authenticate the whole object before hydration. Successful delivery
+therefore proves that index values supply the result fields.
 
 ### Shared SQL memory ownership
 
@@ -3650,7 +3653,10 @@ concurrent queries cannot each treat the full host budget as free memory.
 Portable result/stream ownership keeps allocator callbacks alive beyond an
 Adapter stack frame and releases the owner only after all execution allocations.
 Host admission failures are distinguishable from genuine backing allocator OOM
-inside nested SQL budgets and at the transport boundary. Stream decline, errors,
+inside nested SQL budgets and at the transport boundary. HTTP delivery and
+Postgres-wire suspended cursors use the same ownership. Shared headroom remains
+visible to optional execution planning without bypassing opaque caller quotas
+or claiming arena frees refund capacity. Stream decline, errors,
 allocation failures and independent concurrent-owner release have regression
 coverage.
 

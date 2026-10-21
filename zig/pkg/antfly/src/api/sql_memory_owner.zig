@@ -31,6 +31,10 @@ const Owner = struct {
         self.budget.deinit();
         control.destroy(self);
     }
+    fn available(raw: *anyopaque) usize {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return std.math.cast(usize, self.budget.reservation.manager.availableAdmissionBytes(.sql_execution_working_set)) orelse std.math.maxInt(usize);
+    }
     fn exhausted(raw: *anyopaque) bool {
         const self: *@This() = @ptrCast(@alignCast(raw));
         return if (self.budget.allocationFailureThreadSafe()) |failure| failure.cause == .admission else false;
@@ -39,8 +43,8 @@ const Owner = struct {
 
 pub fn create(control: std.mem.Allocator, backing: std.mem.Allocator, manager: *resources.ResourceManager) !runtime.MemoryOwner {
     const self = try control.create(Owner);
-    self.* = .{ .control = control, .budget = resources.BudgetedAllocator.initReclaiming(manager, .sql_execution_working_set, backing, 1) };
-    return .{ .allocator = self.budget.threadSafeAllocator(), .pressure = .{ .ptr = self, .exhausted = Owner.exhausted }, .ptr = self, .release = Owner.release };
+    self.* = .{ .control = control, .budget = resources.BudgetedAllocator.initReclaiming(manager, .sql_execution_working_set, local.sql_memory_budget.reclaimingAllocator(backing), 1) };
+    return .{ .allocator = self.budget.threadSafeAllocator(), .pressure = .{ .ptr = self, .exhausted = Owner.exhausted, .capacity = .{ .backing = self.budget.backing, .available = Owner.available } }, .ptr = self, .release = Owner.release };
 }
 
 test "SQL shared memory owners reclaim cache capacity and retain host admission until delivery ends" {
@@ -62,19 +66,33 @@ test "SQL shared memory owners reclaim cache capacity and retain host admission 
     defer cache.retained.release();
     const id = try manager.registerReclaimer(.lite_native_page_cache, &cache, Cache.reclaim);
     defer manager.unregisterReclaimer(id);
-    const first = try create(a, a, &manager);
-    const second = try create(a, a, &manager);
-    const left = try first.allocator.alloc(u8, 1024);
-    const right = try second.allocator.alloc(u8, 1024);
-    try std.testing.expect(cache.calls > 0);
-    try std.testing.expect(manager.sliceStats(.sql_execution_working_set).used_bytes >= 2048);
-    try std.testing.expectError(error.OutOfMemory, second.allocator.alloc(u8, 3 * 1024 * 1024));
-    try std.testing.expectEqual(error.SqlWorkingMemoryLimitExceeded, second.mapError(error.OutOfMemory));
-    // Owners are independently released, including their retained credit.
-    first.allocator.free(left);
-    first.deinit();
-    try std.testing.expect(manager.sliceStats(.sql_execution_working_set).used_bytes > 0);
-    second.allocator.free(right);
-    second.deinit();
+    {
+        const second = try create(a, a, &manager);
+        defer second.deinit();
+        const right = try second.allocator.alloc(u8, 1024);
+        defer second.allocator.free(right);
+        {
+            const first = try create(a, a, &manager);
+            defer first.deinit();
+            const left = try first.allocator.alloc(u8, 1024);
+            defer first.allocator.free(left);
+            try std.testing.expect(cache.calls > 0);
+            try std.testing.expect(manager.sliceStats(.sql_execution_working_set).used_bytes >= 2048);
+            try std.testing.expectError(error.OutOfMemory, second.allocator.alloc(u8, 3 * 1024 * 1024));
+            try std.testing.expectEqual(error.SqlWorkingMemoryLimitExceeded, second.mapError(error.OutOfMemory));
+        }
+        // Owners independently release their live bytes and retained credit.
+        try std.testing.expect(manager.sliceStats(.sql_execution_working_set).used_bytes > 0);
+        var workspace: local.sql_memory_budget = .{ .backing = second.allocator, .limit = 2 * 1024 * 1024, .pressure = second.pressure };
+        const headroom = local.sql_memory_budget.reusableHeadroom(workspace.allocator()).?;
+        try std.testing.expect(headroom > 0);
+        try std.testing.expectEqual(@min(@as(u64, workspace.limit), manager.availableAdmissionBytes(.sql_execution_working_set)), headroom);
+        // Opaque caller quotas remain opaque even through shared admission.
+        var unknown_backing = std.testing.FailingAllocator.init(a, .{});
+        const third = try create(a, unknown_backing.allocator(), &manager);
+        defer third.deinit();
+        var unknown: local.sql_memory_budget = .{ .backing = third.allocator, .limit = 2 * 1024 * 1024, .pressure = third.pressure };
+        try std.testing.expect(local.sql_memory_budget.reusableHeadroom(unknown.allocator()) == null);
+    }
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.sql_execution_working_set).used_bytes);
 }

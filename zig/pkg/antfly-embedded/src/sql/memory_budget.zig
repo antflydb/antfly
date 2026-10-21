@@ -19,7 +19,13 @@ const std = @import("std");
 const Budget = @This();
 /// Transport-neutral classification of shared host admission. This callback
 /// never raises local limits and runs outside the budget's accounting lock.
-pub const Pressure = struct { ptr: *anyopaque, exhausted: *const fn (*anyopaque) bool };
+pub const Pressure = struct {
+    ptr: *anyopaque,
+    exhausted: *const fn (*anyopaque) bool,
+    /// Expose a known shared admission layer without hiding the original
+    /// allocator's quotas or refund semantics from optional work planning.
+    capacity: ?struct { backing: std.mem.Allocator, available: *const fn (*anyopaque) usize } = null,
+};
 pressure: ?Pressure = null,
 backing: std.mem.Allocator,
 limit: usize,
@@ -120,9 +126,14 @@ pub fn headroom(a: std.mem.Allocator) ?usize {
     if (a.vtable.alloc != alloc and a.vtable.alloc != scratchAlloc) return null;
     const self: *Budget = @ptrCast(@alignCast(a.ptr));
     self.lock();
-    const available = self.limit -| if (self.monotonic) self.spent else self.live;
-    const backing = self.backing;
+    var available = self.limit -| if (self.monotonic) self.spent else self.live;
+    var backing = self.backing;
+    const pressure = self.pressure;
     self.mutex.unlock();
+    if (pressure) |shared| if (shared.capacity) |capacity| {
+        available = @min(available, capacity.available(shared.ptr));
+        backing = capacity.backing;
+    };
     // Scratch forwards through reclaimed arena backings; admission introspection
     // must follow that same allocator path rather than stopping at the region.
     const actual = if (a.vtable.alloc == scratchAlloc) reclaimingAllocator(backing) else backing;
@@ -135,9 +146,17 @@ pub fn optionalLocalHeadroom(a: std.mem.Allocator) ?struct { available: usize, b
     if (a.vtable.alloc != alloc and a.vtable.alloc != scratchAlloc) return null;
     const self: *Budget = @ptrCast(@alignCast(a.ptr));
     self.lock();
-    defer self.mutex.unlock();
-    if (self.admission != null) return null;
-    return .{ .available = self.limit -| if (self.monotonic) self.spent else self.live, .backing = self.backing };
+    const admitted = self.admission != null;
+    var available = self.limit -| if (self.monotonic) self.spent else self.live;
+    var backing = self.backing;
+    const pressure = self.pressure;
+    self.mutex.unlock();
+    if (admitted) return null;
+    if (pressure) |shared| if (shared.capacity) |capacity| {
+        available = @min(available, capacity.available(shared.ptr));
+        backing = capacity.backing;
+    };
+    return .{ .available = available, .backing = backing };
 }
 /// Optional acceleration must not speculate through an opaque quota wrapper.
 /// Recognize only our complete budget chain and standard unbounded backings;
@@ -173,10 +192,20 @@ pub fn reusableHeadroom(a: std.mem.Allocator) ?usize {
         const self: *Budget = @ptrCast(@alignCast(actual.ptr));
         self.lock();
         const reusable = !self.monotonic and self.admission == null;
-        const available = self.limit -| self.live;
-        const backing = self.backing;
+        var available = self.limit -| self.live;
+        var backing = self.backing;
+        const pressure = self.pressure;
         self.mutex.unlock();
         if (!reusable) return null;
+        if (pressure) |shared| if (shared.capacity) |capacity| {
+            available = @min(available, capacity.available(shared.ptr));
+            backing = capacity.backing;
+            const reclaimed = reclaimingAllocator(backing);
+            // Allocation still goes through the shared owner's actual backing.
+            // An arena hidden there cannot promise refunds merely because
+            // introspection could unwrap it.
+            if (reclaimed.ptr != backing.ptr or reclaimed.vtable != backing.vtable) return null;
+        };
         return @min(available, reusableHeadroom(backing) orelse return null);
     }
     if (comptime @import("builtin").is_test) {

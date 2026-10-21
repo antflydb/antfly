@@ -446,7 +446,7 @@ const OwnedRead = struct {
         if (plan.compiled().uses_current_setting) stream_backend.setting_capture = self.native_adapter.settingCapture();
         // Stream.open captures the owner view once; loadSettings validates the
         // prepared epoch on that same snapshot before binding or reading rows.
-        const opened = try Pull.Stream.open(alloc, stream_backend, plan.compiled(), parameters, .{ .result_rows = request.limit, .page_rows = 256, .parameter_cells = request.parameter_cells, .parameter_owner = request.parameter_owner });
+        const opened = try Pull.Stream.openOwned(try @import("sql_memory_owner.zig").create(adapter.server.alloc, alloc, adapter.server.shared_resource_manager orelse &adapter.server.local_resource_manager), stream_backend, plan.compiled(), parameters, .{ .result_rows = request.limit, .page_rows = 256, .parameter_cells = request.parameter_cells, .parameter_owner = request.parameter_owner });
         if (opened == null) {
             self.identity.?.deinit(server.alloc);
             self.arena.deinit();
