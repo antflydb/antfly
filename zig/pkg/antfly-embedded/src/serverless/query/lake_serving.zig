@@ -399,6 +399,8 @@ pub const ServingSource = struct {
         translate_many: ?*const fn (*anyopaque, std.mem.Allocator, []const @import("../../storage/rowsource/types.zig").RowRef, bool) anyerror![]const @import("../../storage/rowsource/types.zig").RowRef = null,
         bind_index: ?*const fn (*anyopaque, []const u8) anyerror!RowResolver = null,
         relocated: bool = true,
+        /// Authenticated identity for compressed index-space intersections.
+        coordinate_space: ?[32]u8 = null,
         close: *const fn (*anyopaque) void,
     };
     pub const FileVersions = struct { etag: []u8, version_id: []u8 };

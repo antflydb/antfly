@@ -339,6 +339,10 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                 dict(text, filter_query={"term": {"path": "/id", "value": base + 17}}),
                 dict(
                     text,
+                    filter_query={"range": {"path": "/id", "gte": base + 17}},
+                ),
+                dict(
+                    text,
                     full_text_index="all_text",
                     order_by=[{"field": "id", "desc": True}],
                 ),

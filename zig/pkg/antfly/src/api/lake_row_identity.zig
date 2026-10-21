@@ -449,18 +449,7 @@ pub fn proveIndexReuse(a: A, out: A, pages: *pages_api.PageStore, previous: Root
     try previous.validate(a);
     try next.validate(a);
     if (previous.values_format != next.values_format or !std.mem.eql(u8, &previous.domain, &next.domain) or !std.mem.eql(u8, &previous.namespace, &next.namespace) or !std.mem.eql(u8, &previous.values_recipe, &next.values_recipe) or previous.current.rows != next.current.rows or !std.mem.eql(u8, previous.current.source, next.current.source)) return &.{};
-    var old = tree.Cursor.init(a, pages.store(), previous.current.by_id, "", null) catch |err| return derivedReadFailure(err);
-    defer old.deinit();
-    var current = tree.Cursor.init(a, pages.store(), next.current.by_id, "", null) catch |err| return derivedReadFailure(err);
-    defer current.deinit();
-    var seen: u64 = 0;
-    while (old.next() catch |err| return derivedReadFailure(err)) |left| {
-        const right = (current.next() catch |err| return derivedReadFailure(err)) orelse return error.InvalidLogicalRowIdentity;
-        if (left.key.len != 32 or right.key.len != 32 or left.value.len != 56 or right.value.len != 56) return error.InvalidLogicalRowIdentity;
-        if (!std.mem.eql(u8, left.key, right.key)) return &.{};
-        seen += 1;
-    }
-    if ((current.next() catch |err| return derivedReadFailure(err)) != null or seen != next.current.rows) return error.InvalidLogicalRowIdentity;
+    if (!(tree.equivalent(a, pages.store(), previous.current.by_id, next.current.by_id, .{ .compare_values = false, .key_bytes = 32, .value_bytes = 56 }) catch |err| return derivedReadFailure(err))) return &.{};
     var reusable: std.ArrayList(ReusedIndex) = .empty;
     for (next.current.input_recipes) |recipe| {
         if (!recipe.reusable) continue;
@@ -493,19 +482,7 @@ fn equivalentInputs(a: A, pages: *pages_api.PageStore, previous: Space, next: Sp
         }
         upper[i] = 0;
     }
-    var old = tree.Cursor.init(a, pages.store(), previous.input_versions, &recipe, if (have_upper) &upper else null) catch |err| return derivedReadFailure(err);
-    defer old.deinit();
-    var current = tree.Cursor.init(a, pages.store(), next.input_versions, &recipe, if (have_upper) &upper else null) catch |err| return derivedReadFailure(err);
-    defer current.deinit();
-    var count: u64 = 0;
-    while (old.next() catch |err| return derivedReadFailure(err)) |left| {
-        const right = (current.next() catch |err| return derivedReadFailure(err)) orelse return error.InvalidLogicalRowIdentity;
-        if (left.key.len != 64 or right.key.len != 64 or left.value.len != 32 or right.value.len != 32) return error.InvalidLogicalRowIdentity;
-        if (!std.mem.eql(u8, left.key, right.key) or !std.mem.eql(u8, left.value, right.value)) return false;
-        count += 1;
-    }
-    if ((current.next() catch |err| return derivedReadFailure(err)) != null or count != next.rows) return error.InvalidLogicalRowIdentity;
-    return true;
+    return tree.equivalent(a, pages.store(), previous.input_versions, next.input_versions, .{ .lower = &recipe, .upper = if (have_upper) &upper else null, .key_bytes = 64, .value_bytes = 32 }) catch |err| return derivedReadFailure(err);
 }
 
 pub fn publish(a: A, store: *stores.ArtifactStore, root: Root, token: Token) !Ref {

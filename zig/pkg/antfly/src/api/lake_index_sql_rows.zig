@@ -577,6 +577,17 @@ pub const Predicate = struct {
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
         return !owner.isRelocated() and owner.reader.root.predicates != null;
     }
+    /// A retained predicate may keep its compressed native blocks when the
+    /// consuming text index proves the exact same original coordinate space.
+    pub fn blocksMatch(self: Predicate, target: ?local.serverless_query_lake_serving.ServingSource.RowResolver) bool {
+        if (self.scan) return false;
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        if (owner.reader.root.predicates == null) return false;
+        const left = owner.row_resolver orelse return target == null;
+        const right = target orelse return !left.relocated;
+        if (left.coordinate_space) |space| if (right.coordinate_space) |other| return std.mem.eql(u8, &space, &other);
+        return false;
+    }
     pub fn nextBlocks(self: *Predicate, a: A) ![]const ordered.predicate_blocks.Block {
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
         try owner.read_context.ensureActive();
@@ -2123,4 +2134,30 @@ test "external lake covering result gathers retain typed values independently of
     };
     try Run.run(a, table, root, block, ref);
     try std.testing.checkAllAllocationFailures(a, Run.run, .{ table, root, block, ref });
+}
+
+test "external lake compressed predicates require the exact authenticated coordinate space" {
+    const Resolver = local.serverless_query_lake_serving.ServingSource.RowResolver;
+    // Only block-routing fields are inspected; no source or reader is opened.
+    var owner: Owner = undefined;
+    owner.reader.root.predicates = .{ .digest = @splat(1), .bytes = 64, .height = 0, .records = 2 };
+    var resolver: Resolver = undefined;
+    resolver.relocated = true;
+    resolver.coordinate_space = @splat(7);
+    owner.row_resolver = resolver;
+    const predicate: Predicate = .{ .cursor = .{ .ptr = &owner, .next = undefined, .close = undefined } };
+    try std.testing.expect(!predicate.hasBlocks());
+    try std.testing.expect(predicate.blocksMatch(resolver));
+    var other = resolver;
+    other.coordinate_space = @splat(8);
+    try std.testing.expect(!predicate.blocksMatch(other));
+    other.coordinate_space = null;
+    try std.testing.expect(!predicate.blocksMatch(other));
+    try std.testing.expect(!predicate.blocksMatch(null));
+    resolver.relocated = false;
+    owner.row_resolver = resolver;
+    try std.testing.expect(predicate.hasBlocks());
+    try std.testing.expect(predicate.blocksMatch(null));
+    owner.reader.root.predicates = null;
+    try std.testing.expect(!predicate.blocksMatch(resolver));
 }

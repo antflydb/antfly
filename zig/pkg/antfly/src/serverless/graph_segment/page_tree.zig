@@ -1138,6 +1138,56 @@ pub const BestFirst = struct {
     }
 };
 
+/// Compare an authenticated range while pruning unchanged copy-on-write
+/// subtrees. Rebalanced boundaries use ordered cursors, so tree shape is never
+/// treated as logical equality. Memory remains bounded by the tree height.
+pub const Equivalence = struct {
+    lower: []const u8 = "",
+    upper: ?[]const u8 = null,
+    compare_values: bool = true,
+    key_bytes: ?usize = null,
+    value_bytes: ?usize = null,
+};
+pub fn equivalent(alloc: Allocator, store: Store, left: ?Ref, right: ?Ref, options: Equivalence) anyerror!bool {
+    try store.check(store.ptr);
+    if (left == null or right == null) return left == null and right == null;
+    try left.?.validate();
+    try right.?.validate();
+    // Attempt tokens locate objects; authenticated content hashes establish
+    // semantic equality. Rewritten leaves can have identical bytes in a new
+    // upload attempt, and need no second evidence scan.
+    if (left.?.bytes == right.?.bytes and left.?.height == right.?.height and left.?.records == right.?.records and std.mem.eql(u8, &left.?.digest, &right.?.digest)) return true;
+    if (left.?.height == right.?.height and left.?.height != 0) {
+        var l = try readPage(alloc, store, left.?);
+        defer l.deinit(alloc);
+        var r = try readPage(alloc, store, right.?);
+        defer r.deinit(alloc);
+        const aligned = if (l.entries.len != r.entries.len) false else blk: {
+            for (l.entries, r.entries) |le, re| if (!std.mem.eql(u8, le.key, re.key)) break :blk false;
+            break :blk true;
+        };
+        if (aligned) {
+            for (l.entries, r.entries, 0..) |le, re, i| {
+                if (options.upper) |upper| if (!less(le.key, upper)) break;
+                if (i + 1 < l.entries.len and !less(options.lower, l.entries[i + 1].key)) continue;
+                if (!try equivalent(alloc, store, le.child, re.child, options)) return false;
+            }
+            return true;
+        }
+    }
+    var l = try Cursor.init(alloc, store, left, options.lower, options.upper);
+    defer l.deinit();
+    var r = try Cursor.init(alloc, store, right, options.lower, options.upper);
+    defer r.deinit();
+    while (try l.next()) |le| {
+        const re = (try r.next()) orelse return false;
+        if (options.key_bytes) |width| if (le.key.len != width or re.key.len != width) return error.InvalidGraphPage;
+        if (options.value_bytes) |width| if (le.value.len != width or re.value.len != width) return error.InvalidGraphPage;
+        if (!std.mem.eql(u8, le.key, re.key) or (options.compare_values and !std.mem.eql(u8, le.value, re.value))) return false;
+    }
+    return (try r.next()) == null;
+}
+
 /// Ordered half-open range scan. Memory is bounded by (height + 1) pages, not
 /// degree or graph size. Returned records borrow the cursor until next/deinit.
 pub const Cursor = struct {
@@ -2723,4 +2773,39 @@ test "serverless graph interval merge preserves interleaved keys and authenticat
     var page = try readPage(a, backing, root);
     defer page.deinit(a);
     try std.testing.expectEqual(sum, std.mem.readInt(u64, page.aggregate[0..8], .little));
+}
+
+test "external lake range equivalence skips unchanged COW branches and handles rebalancing" {
+    const a = std.testing.allocator;
+    var backing: TestStore = .{ .alloc = a };
+    defer backing.deinit();
+    const count = 2000;
+    const names = try a.alloc([8]u8, count + 1);
+    defer a.free(names);
+    const changes = try a.alloc(Mutation, count);
+    defer a.free(changes);
+    const value: [128]u8 = @splat(42);
+    for (names, 0..) |*name, i| std.mem.writeInt(u64, name, i, .big);
+    for (changes, names[0..count]) |*change, *name| change.* = .{ .key = name, .value = &value };
+    const root = (try apply(a, backing.store(), null, changes)).?;
+    const altered: [128]u8 = @splat(43);
+    const updated = (try apply(a, backing.store(), root, &.{.{ .key = &names[1000], .value = &altered }})).?;
+    backing.reads = 0;
+    try std.testing.expect(try equivalent(a, backing.store(), root, updated, .{ .compare_values = false, .key_bytes = 8, .value_bytes = 128 }));
+    try std.testing.expect(backing.reads < 20);
+    try std.testing.expect(!try equivalent(a, backing.store(), root, updated, .{}));
+    try std.testing.expect(try equivalent(a, backing.store(), root, updated, .{ .upper = &names[1000] }));
+    const appended = (try apply(a, backing.store(), updated, &.{.{ .key = &names[count], .value = &value }})).?;
+    try std.testing.expect(!try equivalent(a, backing.store(), root, appended, .{ .compare_values = false }));
+    try std.testing.expect(try equivalent(a, backing.store(), root, appended, .{ .upper = &names[1000] }));
+    backing.reads = 0;
+    try std.testing.expect(try equivalent(a, backing.store(), root, root, .{}));
+    try std.testing.expectEqual(@as(usize, 0), backing.reads);
+    var relocated = root;
+    relocated.attempt = @splat(9);
+    try std.testing.expect(!root.eql(relocated));
+    try std.testing.expect(try equivalent(a, backing.store(), root, relocated, .{}));
+    try std.testing.expectEqual(@as(usize, 0), backing.reads);
+    backing.canceled = true;
+    try std.testing.expectError(error.Canceled, equivalent(a, backing.store(), root, root, .{}));
 }

@@ -83,7 +83,9 @@ pub const Builder = struct {
                 }
                 try removed.append(a, .{ .slot = slot, .name = try ma.dupe(u8, record.value) });
             }
-            for (removed.items) |file| try self.eraseFile(file.slot, file.name);
+            // No retained file means there is no old row state to merge or
+            // erase. Rebuild the seven maps from the fresh sorted stream.
+            if (self.unchanged.count() != 0) for (removed.items) |file| try self.eraseFile(file.slot, file.name);
         }
         var available: u32 = 0;
         for (files, self.slots, self.scan) |file, *slot, changed| {
@@ -159,6 +161,15 @@ pub const Builder = struct {
         var inverse: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
         defer inverse.deinit(self.a);
         for (self.files, self.slots) |name, slot| try inverse.put(self.a, slot, name);
+        // Only unchanged files can conflict with the incoming ID stream. Keep
+        // one ordered cursor: restarting a point lookup per row rereads every
+        // ancestor, even for a complete rewrite with no retained membership.
+        var retained = if (self.prior != null and self.unchanged.count() != 0)
+            (tree.Cursor.init(self.a, self.pages.store(), self.prior.?.current.by_id, "", null) catch |err| return identity.derivedReadFailure(err))
+        else
+            null;
+        defer if (retained) |*cursor| cursor.deinit();
+        var candidate: ?tree.Cursor.Record = null;
         while (true) {
             _ = scratch.reset(.retain_capacity);
             const a = scratch.allocator();
@@ -168,9 +179,17 @@ pub const Builder = struct {
             const value = row.values[0].value.string;
             if (previous_id) |previous| if (std.mem.eql(u8, &previous, id)) return error.DuplicateLogicalRowKey;
             previous_id = id[0..32].*;
-            if (self.prior) |old| {
-                var reader: identity.Reader = .{ .root = old, .pages = self.pages };
-                if (try reader.byId(a, old.current, id[0..32].*)) |existing| if (self.unchanged.contains(existing.coordinate.file)) return error.DuplicateLogicalRowKey;
+            if (retained) |*cursor| {
+                if (candidate == null or std.mem.order(u8, candidate.?.key, id) == .lt) {
+                    cursor.seekForward(id) catch |err| return identity.derivedReadFailure(err);
+                    candidate = cursor.next() catch |err| return identity.derivedReadFailure(err);
+                }
+                if (candidate) |existing| if (std.mem.eql(u8, existing.key, id)) {
+                    if (existing.value.len != 56) return error.InvalidLogicalRowIdentity;
+                    const coordinate = try Coordinate.decode(existing.value[0..16]);
+                    if (coordinate.file >= self.prior.?.current.file_count or std.mem.readInt(u64, existing.value[48..56], .big) >= self.prior.?.current.rows or std.mem.allEqual(u8, existing.value[16..48], 0)) return error.InvalidLogicalRowIdentity;
+                    if (self.unchanged.contains(coordinate.file)) return error.DuplicateLogicalRowKey;
+                };
             }
             const coordinate = try Coordinate.decode(value[0..16]);
             const name = inverse.get(coordinate.file) orelse return error.InvalidLogicalRowIdentity;
@@ -192,7 +211,7 @@ pub const Builder = struct {
                 try self.edits[6].addRecord(&input_key, value[48 + i * 32 ..][0..32]);
             }
         }
-        const old = if (self.prior) |prior| prior.current else self.space;
+        const old = if (self.prior != null and self.unchanged.count() != 0) self.prior.?.current else self.space;
         self.space.files = try self.edits[0].finish(old.files);
         self.space.file_slots = try self.edits[1].finish(old.file_slots);
         self.space.by_id = try self.edits[2].finish(old.by_id);
@@ -264,6 +283,17 @@ test "external lake identity deltas reuse untouched rows and slots across append
     try std.testing.expect((try reader.byLocation(a, final.current, "a", 0, 17)) == null);
     const rank = try reader.canonicalRank(a, final.current, moved);
     try std.testing.expect(rank < final.current.rows);
+    // Complete rewrites must not open old row maps: there is no retained
+    // membership to collide with or merge. Keep only the small file census.
+    for ([_]?tree.Ref{ final.current.by_id, final.current.by_location, final.current.by_file, final.current.by_order }) |ref| if (ref) |root| try store.delete(&try Pages.identity(pages.domain, root));
+    const fourth = try Builder.create(a, &manager, &pages, &.{"z"}, final, null, &.{}, "source", "four");
+    defer fourth.deinit();
+    try std.testing.expectEqual(@as(usize, 0), fourth.unchanged.count());
+    try fourth.add(.{ .id = @splat(9), .values = @splat(10) }, .{ .file = fourth.slots[0], .group = 0, .row = 2 });
+    const rebuilt = try fourth.finish(@splat(1), @splat(2), @splat(6));
+    try std.testing.expectEqual(@as(u64, 1), rebuilt.current.rows);
+    reader.root = rebuilt;
+    try std.testing.expect((try reader.byId(a, rebuilt.current, @splat(9))) != null);
 }
 
 test "external lake index input proofs preserve only unchanged index dependencies" {

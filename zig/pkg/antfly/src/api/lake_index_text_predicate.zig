@@ -416,6 +416,10 @@ pub const Identities = struct {
     /// admitted native window. Keep each temporary bitmap within one 2^20 block.
     pub fn bitmapForPhysical(self: Identities, a: A, selected: *const @import("lake_index_physical_set.zig").Set, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead) anyerror!Bitmap {
         if (self.row_resolver) |resolver| {
+            var window_rows: usize = 0;
+            for (self.spans) |item| window_rows +|= item.span.upper - item.span.lower;
+            if (window_rows != 0 and selected.boundedCardinality(window_rows) == null)
+                return self.bitmapForCurrentCandidates(a, selected, store, cached, resolver);
             var mapped = try indexSelectionCut(a, resolver.current_source, resolver.current_snapshot, resolver, selected);
             defer mapped.deinit();
             var direct = self;
@@ -440,6 +444,41 @@ pub const Identities = struct {
                 var sliced = try bitmap.sliceRebased(a, lower, @as(u64, lower) + (1 << corpus.physical.shift));
                 defer sliced.deinit();
                 if (!sliced.isEmpty()) try self.addBlock(a, a, &cache, store, cached, .{ .file = item.file, .group = block.group, .base = physical_base, .selection = .{ .bitmap = sliced } }, &result);
+            }
+        }
+        return result;
+    }
+    /// A broad mask is probed from this window's candidates. Each archive row
+    /// is translated at most once across disjoint windows; the compressed
+    /// query-wide mask never expands into a second archive-sized selection.
+    fn bitmapForCurrentCandidates(self: Identities, a: A, selected: *const @import("lake_index_physical_set.zig").Set, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, resolver: local.serverless_query_lake_serving.ServingSource.RowResolver) !Bitmap {
+        var result = Bitmap.init(a);
+        errdefer result.deinit();
+        var direct = self;
+        direct.row_resolver = null;
+        var live: LiveRowsCache = .{ .backing = a };
+        defer live.deinit(a);
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        var refs: [256]local.storage_rowsource_types.RowRef = undefined;
+        var docs: [256]u32 = undefined;
+        for (self.spans) |item| {
+            var begin = item.span.lower;
+            while (begin < item.span.upper) {
+                try cached.context.ensureActive();
+                _ = scratch.reset(.retain_capacity);
+                const count = @min(refs.len, item.span.upper - begin);
+                for (refs[0..count], docs[0..count], begin..) |*ref, *doc, ordinal_| {
+                    doc.* = @intCast(ordinal_);
+                    ref.* = try direct.physicalRow(scratch.allocator(), &live, store, cached, doc.*, resolver.source, resolver.snapshot);
+                }
+                const mapped = if (resolver.translate_many) |translate| try translate(resolver.ptr, scratch.allocator(), refs[0..count], true) else blk: {
+                    const translated = try scratch.allocator().alloc(local.storage_rowsource_types.RowRef, count);
+                    for (translated, refs[0..count]) |*row, ref| row.* = try resolver.from_index(resolver.ptr, scratch.allocator(), ref);
+                    break :blk translated;
+                };
+                for (mapped, docs[0..count]) |ref, doc| if (selected.contains(ref.external.file_id, ref.external.row_group_ordinal, ref.external.row_ordinal)) try result.add(doc);
+                begin += @intCast(count);
             }
         }
         return result;
@@ -1242,7 +1281,14 @@ fn PredicateResolver(comptime Set: type) type {
             defer bitmap_cache.deinit(a);
             var window = std.heap.ArenaAllocator.init(a);
             defer window.deinit();
-            if (predicate.hasBlocks()) {
+            const direct_blocks = if (Set == Bitmap) predicate.blocksMatch(self.identities.row_resolver) else false;
+            if (predicate.hasBlocks() or direct_blocks) {
+                // Choose translation once for the complete compressed mask.
+                // Per-block candidate probes would rescan the same window
+                // once for every block in the archive.
+                const mixed_blocks = Set == Bitmap and !direct_blocks and self.identities.row_resolver != null;
+                var physical = PhysicalSet.init(a);
+                defer physical.deinit();
                 while (true) {
                     try self.context.ensureActive();
                     _ = window.reset(.free_all);
@@ -1252,11 +1298,21 @@ fn PredicateResolver(comptime Set: type) type {
                         if (Set == PhysicalSet) {
                             try result.addBlock(block);
                         } else {
+                            if (mixed_blocks) {
+                                try physical.addBlock(block);
+                                continue;
+                            }
                             const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store_identity, .context = self.read_context };
-                            try self.identities.addBlock(a, window.allocator(), &bitmap_cache, self.store, cached, block, &result);
+                            var identities = self.identities;
+                            if (direct_blocks) identities.row_resolver = null;
+                            try identities.addBlock(a, window.allocator(), &bitmap_cache, self.store, cached, block, &result);
                         }
                     }
                 }
+                if (comptime Set == Bitmap) if (mixed_blocks) {
+                    const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store_identity, .context = self.read_context };
+                    return self.identities.bitmapForPhysical(a, &physical, self.store, cached);
+                };
                 return result;
             }
             while (true) {
@@ -1931,8 +1987,14 @@ test "external lake rebuilt predicate blocks translate into retained text coordi
             result.external.row_ordinal = 3 - row.external.row_ordinal;
             return result;
         }
-        fn forward(_: *anyopaque, _: A, _: Ref) !Ref {
-            return error.TestUnexpectedResult;
+        fn forward(raw: *anyopaque, _: A, row: Ref) !Ref {
+            const calls: *u8 = @ptrCast(@alignCast(raw));
+            calls.* += 1;
+            if (!std.mem.eql(u8, row.external.file_id, "old") or row.external.row_ordinal >= 4) return error.TestUnexpectedResult;
+            var result = row;
+            result.external.file_id = "new";
+            result.external.row_ordinal = 3 - row.external.row_ordinal;
+            return result;
         }
         fn file(_: *anyopaque, _: A, _: []const u8) !?[]const u8 {
             return error.TestUnexpectedResult;
@@ -1964,4 +2026,12 @@ test "external lake rebuilt predicate blocks translate into retained text coordi
     defer single.deinit();
     try std.testing.expectEqual(@as(u64, 1), single.cardinality());
     try std.testing.expect(single.contains(2));
+    // A four-row mask over a two-row window must use just two forward probes.
+    identities.spans = &.{.{ .file = "old", .span = .{ .lower = 0, .upper = 2, .rows = &blocks } }};
+    try selection.addBlock(.{ .file = "new", .group = 0, .base = 0, .selection = .{ .interval = .{ .lower = 0, .count = 4 } } });
+    var broad = try identities.bitmapForPhysical(a, &selection, store, cached);
+    defer broad.deinit();
+    try std.testing.expectEqual(@as(u64, 2), broad.cardinality());
+    try std.testing.expect(broad.contains(0) and broad.contains(1));
+    try std.testing.expectEqual(@as(u8, 2), marker);
 }

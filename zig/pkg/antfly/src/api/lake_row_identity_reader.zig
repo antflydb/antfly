@@ -187,7 +187,16 @@ const Binding = struct {
     }
     fn close(_: *anyopaque) void {}
     fn capability(self: *Binding) Source.RowResolver {
-        return .{ .ptr = self, .source = self.space.source, .snapshot = self.space.snapshot, .current_source = self.owner.reader.root.current.source, .current_snapshot = self.owner.reader.root.current.snapshot, .rows = self.owner.reader.root.current.rows, .relocated = self.relocated, .from_index = fromIndex, .to_index = toIndex, .file = file, .digest = digest, .tie_rank = tieRank, .translate_many = translateMany, .close = close };
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("native-lake-coordinate-space-v1");
+        hash.update(&self.owner.reader.root.domain);
+        if (self.space.by_location) |ref| {
+            hash.update(&ref.digest);
+            hash.update(&ref.attempt);
+        }
+        var space: [32]u8 = undefined;
+        hash.final(&space);
+        return .{ .ptr = self, .source = self.space.source, .snapshot = self.space.snapshot, .current_source = self.owner.reader.root.current.source, .current_snapshot = self.owner.reader.root.current.snapshot, .rows = self.owner.reader.root.current.rows, .relocated = self.relocated, .coordinate_space = space, .from_index = fromIndex, .to_index = toIndex, .file = file, .digest = digest, .tie_rank = tieRank, .translate_many = translateMany, .close = close };
     }
 };
 fn sameCut(space: identity.Space, ref: RowRef) bool {

@@ -148,10 +148,32 @@ Forward hydration, reverse predicate membership, covering/highlight fields,
 dense/sparse retrieval and SQL consumers all use the selected index view. Fresh
 indexes in a mixed directory retain normal pruning and ordering fast paths.
 Compressed predicate blocks from a fresh metadata index are batch-translated
-before applying a retained text index’s ordinal kernels.
+before applying a retained text index’s ordinal kernels. Blocks are collected
+into one compressed mask before selecting the translation direction. A broad
+mask probes only candidates from the admitted text window; a small mask uses
+reverse translation. Thus broad overlay masks do not expand and repeat across
+all windows. Metadata and text indexes with the same authenticated coordinate
+space intersect their compressed blocks directly, including retained indexes;
+different original spaces always use the translation path.
 Selective predicate pack proofs use shared encoded spill runs to avoid repeatedly
 merging an ever-growing prefix. Predicate block directories use shared multi-key
 runs too, preserving sibling file capacity without repeated prefix rewrites.
+
+Complete rewrites with no retained files rebuild identity trees directly from the
+fresh stream. They neither erase old per-file row memberships nor point-probe old
+IDs. Partial rewrites compare incoming sorted IDs with one forward-only cursor,
+so collision verification retains authenticated paths across rows.
+
+Reuse proofs compare authenticated tree ranges and skip identical copy-on-write
+subtrees. Equal authenticated page contents can skip evidence reads even when
+upload attempt addresses differ. Changes to tree shape use an exact ordered comparison. Unchanged
+per-index input trees therefore need no repeated leaf scan. Compact maps for
+multiple original coordinate spaces share one attempt-private current-rank tree;
+only the final maps and their embedded ranks enter the publication closure.
+The rank cache reserves 8 MiB of node retained state and one quarter of the
+configured translation spill allowance; map sorting uses the remaining three
+quarters. Admission failure retires this optional scratch and keeps the ID-map
+reader fallback. Rank-cache buffers never borrow a completed worker's allocator.
 
 A bounded optional construction pass joins verified IDs into compact forward and
 reverse trees keyed by 16-byte coordinates. Forward entries also store canonical
@@ -188,6 +210,14 @@ must be measured against this verification/publication cost.
 - Accept independently authenticated, snapshot-bound writer mapping proofs.
 - Extend per-index reuse across added/deleted logical IDs with explicit native
   membership and delta state; never retain stale aggregates or deleted postings.
+  This remains unimplemented. The required persisted shape is an index-local
+  stable address space, a publication-bound live membership/version tree, and
+  immutable delta runs. Stable addresses cannot be inferred from the current
+  source's file offsets. New, changed and removed inputs must update text DF and
+  collection statistics, ordered/covering tuples, dense/sparse membership and
+  algebraic reductions under one commit. Reader protocol, resolver views, GC,
+  cloud closure proofs and restart must adopt the same membership epoch before
+  enabling reuse; the current whole-index rebase remains the execution path.
 - Enable stable logical public IDs only with complete lookup, overlay, cursor,
   filtering and compatibility coverage.
 
