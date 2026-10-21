@@ -83,6 +83,16 @@ def test_restart_admission_and_pending_visibility_require_success(clock):
     assert api.calls[0][1]["sync_level"] == "enrichments"
 
 
+def test_startup_retry_preserves_invalid_membership_rejection(clock):
+    failure = http_error(400, "invalid batch request")
+    api = Api([http_error(503, "write unavailable"), failure])
+    with pytest.raises(requests.HTTPError) as rejected:
+        write(api)
+    assert rejected.value is failure
+    assert len(api.calls) == 2
+    assert api.calls[0] == api.calls[1]
+
+
 @pytest.mark.parametrize(
     "failure",
     [
