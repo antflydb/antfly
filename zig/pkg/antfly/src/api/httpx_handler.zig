@@ -9246,14 +9246,16 @@ pub const AntflyApiHandler = struct {
         return self.proposeCuration(ctx, table_name);
     }
 
-    pub fn listCurationProposals(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+    pub fn listCurationProposals(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, params: anytype) !httpx.Response {
+        // The shared resolver path parses the original query, including pages.
+        _ = params;
         return self.resolverRequest(ctx, .proposals, table_name, "", "");
     }
 
-    pub fn namespaceListCurationProposals(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+    pub fn namespaceListCurationProposals(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, params: anytype) !httpx.Response {
         _ = database_name;
         _ = namespace_name;
-        return self.listCurationProposals(ctx, table_name);
+        return self.listCurationProposals(ctx, table_name, params);
     }
 
     pub fn getCurationProposal(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, proposal_id: []const u8) !httpx.Response {
