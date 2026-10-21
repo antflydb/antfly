@@ -33567,6 +33567,10 @@ pub const DB = struct {
     /// proof; otherwise a finite load depends on unrelated future writes.
     pub fn finalizeDenseProjectionLifecycleForIdle(self: *DB) !bool {
         if (comptime storage_engine.enabled) return storage_engine.call("finalizeDenseProjectionLifecycleForIdle", .{self});
+        // A final graph-only replay window may leave a coalesced dense no-op
+        // watermark below the publication cut. Flush it when no dense session
+        // is active; continuous ingestion retains its ordinary deferral.
+        try self.flushAppliedSequences(false);
         // The recurring owner may construct files, but never while holding
         // the shared apply lease used by the small certification below.
         _ = try self.publishVectorBlockBasesOnline(.{});
@@ -33610,6 +33614,10 @@ pub const DB = struct {
     }
 
     fn flushAppliedSequencesForIdle(self: *DB) !void {
+        return self.flushAppliedSequences(true);
+    }
+
+    fn flushAppliedSequences(self: *DB, force: bool) !void {
         var lifecycle_completed = false;
         const published = blk: {
             var seq_lock = lockAtomicWithBackoffProfiled(
@@ -33617,7 +33625,7 @@ pub const DB = struct {
                 &self.async_context.stats.applied_sequence_mutex,
             );
             defer seq_lock.unlock();
-            break :blk try flushPendingAppliedSequencesLocked(self.async_context, true, &lifecycle_completed);
+            break :blk try flushPendingAppliedSequencesLocked(self.async_context, force, &lifecycle_completed);
         };
         if (lifecycle_completed) {
             notifyQueryVisibilityHook(self.async_context, .publish_blocking);
@@ -111577,6 +111585,10 @@ test "db inline dense generation remains rebuilding until outcomes cover the liv
     // finalizer must retry the same rebuilding checkpoint without requiring a
     // new source write or session-close callback.
     try CounterFixture.write(alloc, db.core.store, config.name, generation, .{ 1, 1, 0 });
+    // A no-op replay callback may leave its last cut coalesced. The recurring
+    // owner must flush that cut as well as retry the lifecycle certificate.
+    try db.async_context.applied_sequence_coalescer.note(alloc, config.name, applied);
+    try std.testing.expectEqual(@as(usize, 1), db.async_context.applied_sequence_coalescer.pending.count());
     const deadline = monotonicTimeNs() +| 10 * std.time.ns_per_s;
     while (true) {
         _ = try DB.independentMaintenanceRun(&db, .repair);
@@ -111588,6 +111600,7 @@ test "db inline dense generation remains rebuilding until outcomes cover the liv
     checkpoint = try db.core.loadProjectionCheckpoint(alloc, config.name);
     try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
     try std.testing.expectEqual(@as(u64, 10), checkpoint.generation);
+    try std.testing.expectEqual(@as(usize, 0), db.async_context.applied_sequence_coalescer.pending.count());
 }
 
 test "db inline dense coverage counters rebase with range ownership" {

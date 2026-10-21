@@ -258,7 +258,8 @@ def test_bulk_dense_replay_and_reopen(batch_size, storage_engine):
                 lambda: call("GET", "/tables/docs/resolvers/concepts"),
                 timeout_s=60,
                 ready_when=lambda value: (
-                    bool(value["progress"]["shards"])
+                    value["progress"]["applied"]
+                    and bool(value["progress"]["shards"])
                     and all(
                         row["available"] and row["fresh"]
                         for row in value["progress"]["shards"]
@@ -304,7 +305,12 @@ def test_bulk_dense_replay_and_reopen(batch_size, storage_engine):
                     node.get("document", {}).get("canonical_name")
                     for node in graph["nodes"]
                     if node.get("table") == "concepts"
-                } == {f"Orchard {ordinal}", "Harvest"}, graph
+                } == {f"Orchard {ordinal}", "Harvest"}, {
+                    "graph": graph,
+                    "index": call("GET", "/tables/docs/indexes/knowledge"),
+                    "resolver": call("GET", "/tables/docs/resolvers/concepts"),
+                    "logs": server.debug_logs(),
+                }
 
         for offset in range(0, 608, batch_size):
             write(offset, min(offset + batch_size, 608))
