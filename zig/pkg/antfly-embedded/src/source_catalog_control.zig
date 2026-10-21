@@ -674,6 +674,7 @@ pub const storage_db_replay_vector_collectors = @import("storage/db/replay_vecto
 pub const storage_db_owned_keys = @import("storage/db/owned_keys.zig");
 pub const storage_db_read_projection = @import("storage/db/read_projection.zig");
 pub const storage_db_graph_endpoint_resolutions = @import("storage/db/graph_endpoint_resolutions.zig");
+pub const storage_db_graph_mention_projection = @import("storage/db/graph_mention_projection.zig");
 pub const storage_db_graph_field_plan = @import("storage/db/graph_field_plan.zig");
 pub const storage_db_managed_admission_owner = @import("storage/db/managed_admission_owner.zig");
 pub const storage_db_result_collectors = @import("storage/db/result_collectors.zig");

@@ -595,6 +595,9 @@ components:
             - $ref: "#/components/schemas/CohereEmbedderConfig"
             - $ref: "#/components/schemas/AntflyEmbedderConfig"
         - properties:
+            sparse:
+              type: boolean
+              description: This named embedder produces sparse index/value vectors.
             rate_limit:
               x-go-type-skip-optional-pointer: false
               $ref: "../shared/provider.yaml#/components/schemas/RateLimitConfig"

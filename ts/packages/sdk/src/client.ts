@@ -798,6 +798,34 @@ export class AntflyClient {
     return data;
   }
 
+  /** Named inference uses the same authentication as database requests.
+   * Mutations are issued once; callers control retry policy and cancellation.
+   * A streamed Response remains owned by its caller until consumed/canceled.
+   */
+  inference = {
+    models: async (signal?: AbortSignal): Promise<InferenceGatewayCatalog> => {
+      const response = await fetch(this.url("/ai/v1/models"), {
+        headers: this.requestHeaders({ Accept: "application/json" }),
+        signal,
+      });
+      if (!response.ok) throw new Error(`Inference catalog failed (${response.status})`);
+      const { text, truncated } = await readLimitedResponseText(response, 16 << 20);
+      if (truncated) throw new Error("Inference catalog exceeded its size limit");
+      return JSON.parse(text) as InferenceGatewayCatalog;
+    },
+    invoke: (
+      operation: InferenceGatewayOperation,
+      body: Record<string, unknown>,
+      signal?: AbortSignal
+    ): Promise<Response> =>
+      fetch(this.url(operation === "predict" ? "/ml/v1/predict" : `/ai/v1/${operation}`), {
+        method: "POST",
+        headers: this.requestHeaders(),
+        body: JSON.stringify(body),
+        signal,
+      }),
+  };
+
   connections = {
     /**
      * List configured external connections (inference providers, web search,
@@ -3621,4 +3649,40 @@ export class ChatGPTConnectionError extends Error {
     super(code);
     this.name = "ChatGPTConnectionError";
   }
+}
+
+export type InferenceGatewayOperation =
+  | "chat/completions"
+  | "decisions"
+  | "embeddings"
+  | "embed"
+  | "rerank"
+  | "chunk"
+  | "read"
+  | "extract"
+  | "rewrite"
+  | "transcribe"
+  | "dictate"
+  | "synthesize"
+  | "predict"
+  | "generate"
+  | "generate/batch";
+export interface InferenceGatewayModel {
+  id: string;
+  object: "model";
+  task?: string;
+  /** Known supported tasks; task is omitted when discovery is ambiguous. */
+  tasks?: string[];
+  connection?: string;
+  backend_model?: string;
+  availability?: string;
+  freshness?: string;
+  gateway_capabilities?: Record<string, "supported" | "unsupported" | "unknown">;
+}
+export interface InferenceGatewayCatalog {
+  /** Deployment policy; omitted by servers predating public inference controls. */
+  public_inference_enabled?: boolean;
+  object: "list";
+  data: InferenceGatewayModel[];
+  [group: string]: unknown;
 }

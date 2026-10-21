@@ -734,6 +734,17 @@ pub const Client = struct {
         return ApiResponse(types.InferenceRewriteResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Synthesize speech using a named text-to-speech configuration
+    /// POST /ai/v1/synthesize
+    pub fn synthesizeSpeech(self: *@This(), body: types.InferenceSynthesisRequest) !ApiResponse(std.json.Value) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/synthesize", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+    }
+
     /// Transcribe audio to text (speech-to-text)
     /// POST /ai/v1/transcribe
     pub fn transcribeAudio(self: *@This(), body: types.InferenceTranscribeRequest) !ApiResponse(types.InferenceTranscribeResponse) {
@@ -4910,6 +4921,15 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.InferencePredictResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// List predictor feature schemas through the gateway
+    /// GET /ml/v1/predictors
+    pub fn listGatewayPredictors(self: *@This()) !ApiResponse(types.InferencePredictorsResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ml/v1/predictors", .{self.base_url});
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.InferencePredictorsResponse).fromResponse(self.allocator, &resp);
     }
 
     fn authHeaders(self: *const @This()) ?[]const [2][]const u8 {

@@ -3176,6 +3176,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         return .ok;
     }
 
+    fn entitySupportsCuration(ptr: ?*anyopaque, supported: *u8) callconv(.c) abi.Status {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+        const sink = self.entity_sink orelse return .invalid_argument;
+        supported.* = @intFromBool(sink.supportsCuration() catch |err| return kernel_error_identity.statusFromError(err));
+        return .ok;
+    }
+
     fn entityUpsert(
         ptr: ?*anyopaque,
         table: abi.BorrowedBytes,
@@ -3206,6 +3213,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .key = source.key.slice(),
             .doc_json = source.doc_json.slice(),
             .delete = source.delete != 0,
+            .skip_if_missing = source.skip_if_missing != 0,
         };
         sink.upsertBatch(self.alloc, entries) catch |err|
             return kernel_error_identity.statusFromError(err);
@@ -3252,6 +3260,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .callback_ctx = self,
                 .upsert_fn = entityUpsert,
                 .upsert_batch_fn = entityUpsertBatch,
+                .supports_curation_fn = entitySupportsCuration,
             } else .{},
             .promotion_owner_ctx = if (self.promotion_leadership_source != null) self else null,
             .promotion_owner_fn = if (self.promotion_leadership_source != null) promotionOwner else null,
@@ -7651,4 +7660,37 @@ test "owner recovery bulk callback preserves bounded identities and uncertain st
     try std.testing.expectEqual(abi.Status.invalid_argument, ProvisionedKernelOwnerSource.transactionRecoveryAcknowledgeMany(&owner, &txn, .fromSlice("owner"), &participants, 65));
     try std.testing.expectEqual(abi.Status.invalid_argument, ProvisionedKernelOwnerSource.transactionRecoveryAcknowledgeMany(&owner, &txn, .fromSlice("owner"), null, 2));
     try std.testing.expectEqual(@as(usize, 4), recorder.calls);
+}
+
+test "storage owner entity sink bridge preserves curation capability and missing-row policy" {
+    const Fixture = struct {
+        supported: bool = true,
+        seen: bool = false,
+        fn supports(ptr: *anyopaque) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.supported;
+        }
+        fn upsert(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) anyerror!void {}
+        fn batch(ptr: *anyopaque, _: std.mem.Allocator, entries: []const runtime_callbacks.EntityUpsert) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(usize, 1), entries.len);
+            try std.testing.expect(entries[0].skip_if_missing);
+            try std.testing.expectEqualStrings("table:7", entries[0].storage_table.?);
+            self.seen = true;
+        }
+    };
+    var fixture: Fixture = .{};
+    var source = ProvisionedKernelOwnerSource.init(std.testing.allocator, "/unused", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+    _ = source.withRuntimeHooks(null, .{ .ptr = &fixture, .vtable = &.{ .upsert = Fixture.upsert, .upsert_batch = Fixture.batch, .supports_curation = Fixture.supports } }, null);
+    const hooks = source.runtimeHooksConfig();
+    var supported: u8 = 0;
+    try std.testing.expectEqual(abi.Status.ok, hooks.entity_sink.supports_curation_fn.?(hooks.entity_sink.callback_ctx, &supported));
+    try std.testing.expectEqual(@as(u8, 1), supported);
+    fixture.supported = false;
+    try std.testing.expectEqual(abi.Status.ok, hooks.entity_sink.supports_curation_fn.?(hooks.entity_sink.callback_ctx, &supported));
+    try std.testing.expectEqual(@as(u8, 0), supported);
+    const entries = [_]abi.EntityUpsert{.{ .table = .fromSlice("entities"), .storage_table = .fromSlice("table:7"), .key = .fromSlice("entity/retired"), .doc_json = .fromSlice("{}"), .skip_if_missing = 1 }};
+    try std.testing.expectEqual(abi.Status.ok, hooks.entity_sink.upsert_batch_fn.?(hooks.entity_sink.callback_ctx, &entries, entries.len));
+    try std.testing.expect(fixture.seen);
 }

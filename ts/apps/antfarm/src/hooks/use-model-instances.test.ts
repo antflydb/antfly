@@ -1,6 +1,10 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ModelInstanceError, useModelInstancesForModel } from "./use-model-instances";
+import {
+  ModelInstanceError,
+  modelInstanceTask,
+  useModelInstancesForModel,
+} from "./use-model-instances";
 
 const { inferenceApiUrlRef } = vi.hoisted(() => ({
   inferenceApiUrlRef: { current: "http://inference.test" },
@@ -29,6 +33,13 @@ describe("useModelInstancesForModel", () => {
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
+  });
+
+  it("maps discovery tasks to supported persistent instance tasks", () => {
+    expect(modelInstanceTask("decider")).toBe("classifier");
+    expect(modelInstanceTask("extractor")).toBe("extractor");
+    expect(modelInstanceTask("predictor")).toBeNull();
+    expect(modelInstanceTask("synthesizer")).toBeNull();
   });
 
   it("loads the local runtime inventory without changing cache activity", async () => {

@@ -79,12 +79,16 @@ import {
   type ModelInstancesForModel,
   type ModelInstance,
   useModelInstancesForModel,
+  modelInstanceTask,
 } from "@/hooks/use-model-instances";
 import { huggingFaceRepoId } from "@/lib/huggingface-model-ref";
 import { cn } from "@/lib/utils";
 
 // Icon mapping for model types
 const MODEL_TYPE_ICONS: Record<ModelType, React.FC<{ className?: string }>> = {
+  decider: Sparkles,
+  synthesizer: AudioLines,
+  predictor: Fingerprint,
   embedder: Fingerprint,
   reranker: ArrowUpDown,
   chunker: Scissors,
@@ -492,8 +496,8 @@ const ModelCard: React.FC<{
             </span>
           ) : providerManaged ? (
             <span className="inline-flex items-center gap-1">
-              <Cloud className="w-3 h-3" />
-              Provider-managed
+              <Zap className="w-3 h-3" />
+              {model.freshness === "configured" ? "Configured" : "Ready"}
             </span>
           ) : (
             <span className={cn("inline-flex items-center gap-1", status.tone)}>
@@ -641,7 +645,7 @@ const ModelDetailSheet: React.FC<{
               {model.inRegistry ? (
                 <span className="inline-flex items-center gap-1 px-2 py-1 rounded-none text-xs font-medium bg-success/10 text-success dark:text-success border border-success/20">
                   <Zap className="w-3 h-3" />
-                  Available
+                  {model.freshness === "configured" ? "Configured" : "Ready"}
                 </span>
               ) : (
                 <span className="inline-flex items-center gap-1 px-2 py-1 rounded-none text-xs bg-muted text-muted-foreground border border-border">
@@ -958,7 +962,17 @@ const ModelDetailSheet: React.FC<{
           </div>
 
           {/* Open in Playground button */}
-          {model.inRegistry && model.provider === "antfly" && MODEL_TYPE_PLAYGROUND[model.type] ? (
+          {model.connectionId === "named-inference" ? (
+            <Button
+              onClick={() =>
+                navigate(`/inference/gateway?model=${encodeURIComponent(model.source)}`)
+              }
+            >
+              Try in gateway
+            </Button>
+          ) : model.inRegistry &&
+            model.provider === "antfly" &&
+            MODEL_TYPE_PLAYGROUND[model.type] ? (
             <Button
               className="w-full"
               onClick={() => {
@@ -1122,6 +1136,9 @@ const ModelsPage: React.FC = () => {
 
   const modelsByType = useMemo(() => {
     const grouped: Record<ModelType, InferenceModel[]> = {
+      decider: [],
+      synthesizer: [],
+      predictor: [],
       embedder: [],
       reranker: [],
       chunker: [],
@@ -1141,6 +1158,9 @@ const ModelsPage: React.FC = () => {
 
   const modelCounts = useMemo(() => {
     const counts: Record<ModelType, number> = {
+      decider: 0,
+      synthesizer: 0,
+      predictor: 0,
       embedder: 0,
       reranker: 0,
       chunker: 0,
@@ -1444,7 +1464,9 @@ const ModelsPage: React.FC = () => {
         runtime={
           selectedModel ? runtime.runtimeFor(selectedModel.type, selectedModel.source) : undefined
         }
-        runtimeSupported={runtime.supported}
+        runtimeSupported={
+          runtime.supported && !!selectedModel && modelInstanceTask(selectedModel.type) !== null
+        }
         providerManaged={selectedModel?.connectionId !== "local-inference"}
         actionPending={runtime.actionPending}
         runtimeError={runtime.error}

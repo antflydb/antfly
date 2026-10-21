@@ -640,6 +640,7 @@ pub const InferenceRole = types.InferenceRole;
 pub const InferenceRuntimeConfig = types.InferenceRuntimeConfig;
 pub const InferenceSparseVector = types.InferenceSparseVector;
 pub const InferenceStyle = types.InferenceStyle;
+pub const InferenceSynthesisRequest = types.InferenceSynthesisRequest;
 pub const InferenceTextContent = types.InferenceTextContent;
 pub const InferenceTextContentPart = types.InferenceTextContentPart;
 pub const InferenceTextRegion = types.InferenceTextRegion;

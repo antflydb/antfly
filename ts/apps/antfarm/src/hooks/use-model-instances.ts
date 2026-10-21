@@ -17,6 +17,27 @@ type InstanceActionResponse =
   | ModelInstance
   | components["schemas"]["InferenceModelInstanceUnloadResponse"];
 
+// Discovery includes tasks that do not yet have persistent instance controls.
+// The classifier runtime is advertised as a decider in the public catalog.
+export function modelInstanceTask(task: string): ModelInstance["tasks"][number] | null {
+  switch (task) {
+    case "decider":
+      return "classifier";
+    case "embedder":
+    case "generator":
+    case "reranker":
+    case "chunker":
+    case "classifier":
+    case "rewriter":
+    case "reader":
+    case "transcriber":
+    case "extractor":
+      return task;
+    default:
+      return null;
+  }
+}
+
 export class ModelInstanceError extends Error {
   readonly code?: string;
   readonly status?: number;
@@ -220,8 +241,21 @@ export function useModelInstancesForModel(): ModelInstancesStateResult {
     error,
     supported,
     refresh,
-    load: useCallback((task, model) => mutate("load", { task, model }), [mutate]),
+    load: useCallback(
+      (task, model) => {
+        const instanceTask = modelInstanceTask(task);
+        if (!instanceTask)
+          return Promise.reject(
+            new ModelInstanceError("This task does not support model instance controls")
+          );
+        return mutate("load", { task: instanceTask, model });
+      },
+      [mutate]
+    ),
     unload: useCallback((runtimeId) => mutate("unload", { instance_id: runtimeId }), [mutate]),
-    runtimeFor: useCallback((task, model) => runtimeMap.get(`${task}\u0000${model}`), [runtimeMap]),
+    runtimeFor: useCallback(
+      (task, model) => runtimeMap.get(`${modelInstanceTask(task)}\u0000${model}`),
+      [runtimeMap]
+    ),
   };
 }

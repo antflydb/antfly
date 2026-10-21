@@ -68,6 +68,8 @@ pub const TraversalRules = struct {
     /// canonicalGraphNodeTable, so a self-table tag never stops expansion or
     /// splits node identity. Empty disables canonicalization.
     owning_table: []const u8 = "",
+    /// Explicit seed namespace; null retains the legacy unqualified selector.
+    start_table: ?[]const u8 = null,
     /// Opt-in single-index expansion THROUGH cross-table nodes: instead of
     /// treating a `target_table`-tagged node as a terminal, look its bare key
     /// up in this same index and keep expanding. Node identity (dedup,
@@ -99,6 +101,7 @@ pub const TraversalResult = struct {
     /// from distance for the legacy direct traversal response.
     total_weight: f64,
     path: ?[]const []const u8, // if include_paths
+    path_tables: ?[]const ?[]const u8 = null,
     path_edges: ?[]const paths_mod.PathEdge = null,
     /// Table of the reached node, when the edge that reached it declared a
     /// cross-table endpoint (`target_table` in its metadata). Owned.
@@ -253,7 +256,12 @@ pub fn traverseWithEdgeReader(
     }
 
     if (effective_rules.node_admission) |admission| {
-        if (!try startNodeAdmittedWithEdgeReader(alloc, edge_reader, start_key, effective_rules.direction, admission, work_budget)) {
+        const admitted = if (effective_rules.start_table) |table| blk: {
+            const mask = try admission.filterAlloc(alloc, &.{.{ .key = start_key, .table = table, .external = true }});
+            defer alloc.free(mask);
+            break :blk mask[0];
+        } else try startNodeAdmittedWithEdgeReader(alloc, edge_reader, start_key, effective_rules.direction, admission, work_budget);
+        if (!admitted) {
             return try results.toOwnedSlice(alloc);
         }
     }
@@ -274,7 +282,7 @@ pub fn traverseWithEdgeReader(
     // Seed with start node
     try work_budget.checkIntermediateStates(1, effective_rules.max_intermediate_states);
     try work_budget.consumeNode();
-    const start_ancestry = try ancestry.append(start_key, null, null, null);
+    const start_ancestry = try ancestry.append(start_key, effective_rules.start_table, null, null);
     try queue.append(alloc, .{
         .ancestry = start_ancestry,
         .depth = 0,
@@ -282,7 +290,7 @@ pub fn traverseWithEdgeReader(
     });
 
     if (effective_rules.deduplicate) {
-        _ = try putVisitedRetained(alloc, &visited, .{ .table = null, .key = start_key }, work_budget, &visited_retained_bytes);
+        _ = try putVisitedRetained(alloc, &visited, .{ .table = effective_rules.start_table, .key = start_key }, work_budget, &visited_retained_bytes);
     }
 
     while (queue_head < queue.items.len) {
@@ -318,7 +326,7 @@ pub fn traverseWithEdgeReader(
         // this index holds those nodes' edges (single-shard entity-sourced
         // topology; embedded Lite) opts into local expansion instead — node
         // identity stays table-qualified either way.
-        if (current.ancestry.target_table != null and !effective_rules.expand_cross_table_local) continue;
+        if (current.depth != 0 and current.ancestry.target_table != null and !effective_rules.expand_cross_table_local) continue;
 
         var stream = if (comptime @hasDecl(@TypeOf(edge_reader), "openEdgeStream"))
             try edge_reader.openEdgeStream(alloc, current.ancestry.key, effective_rules.edge_types, effective_rules.direction)
@@ -458,6 +466,26 @@ fn traversalResultFromQueueEntry(
         for (items) |item| alloc.free(item);
         alloc.free(items);
     };
+    const path_tables = if (include_path and ancestryHasTable(entry.ancestry)) blk: {
+        const path_len: usize = @as(usize, entry.depth) + 1;
+        const owned = try alloc.alloc(?[]const u8, path_len);
+        @memset(owned, null);
+        errdefer {
+            for (owned) |item| if (item) |table| alloc.free(table);
+            alloc.free(owned);
+        }
+        var cursor: ?*const TraversalAncestryNode = entry.ancestry;
+        var i = path_len;
+        while (cursor) |node| : (cursor = node.parent) {
+            i -= 1;
+            if (node.target_table) |table| owned[i] = try alloc.dupe(u8, table);
+        }
+        break :blk owned;
+    } else null;
+    errdefer if (path_tables) |items| {
+        for (items) |item| if (item) |table| alloc.free(table);
+        alloc.free(items);
+    };
     const path_edges = if (include_path) blk: {
         const owned = try alloc.alloc(paths_mod.PathEdge, entry.depth);
         var count: usize = 0;
@@ -487,11 +515,18 @@ fn traversalResultFromQueueEntry(
         .distance = @floatFromInt(entry.depth),
         .total_weight = entry.total_weight,
         .path = path,
+        .path_tables = path_tables,
         .path_edges = path_edges,
         .target_table = target_table,
         .retained_budget = returned_state_budget,
         .retained_state_bytes = retained_bytes,
     };
+}
+
+fn ancestryHasTable(ancestry: *const TraversalAncestryNode) bool {
+    var cursor: ?*const TraversalAncestryNode = ancestry;
+    while (cursor) |node| : (cursor = node.parent) if (node.target_table != null) return true;
+    return false;
 }
 
 fn traversalResultRetainedBytes(entry: QueueEntry, include_path: bool) !usize {
@@ -500,8 +535,11 @@ fn traversalResultRetainedBytes(entry: QueueEntry, include_path: bool) !usize {
     if (include_path) {
         const path_len: usize = @as(usize, entry.depth) + 1;
         total = try std.math.add(usize, total, try std.math.mul(usize, path_len, @sizeOf([]const u8)));
+        const has_tables = ancestryHasTable(entry.ancestry);
+        if (has_tables) total = try std.math.add(usize, total, try std.math.mul(usize, path_len, @sizeOf(?[]const u8)));
         var cursor: ?*const TraversalAncestryNode = entry.ancestry;
         while (cursor) |node| : (cursor = node.parent) {
+            if (node.target_table) |table| total = try std.math.add(usize, total, table.len);
             total = try std.math.add(usize, total, node.key.len);
             if (node.incoming_edge) |edge| total = try std.math.add(usize, total, paths_mod.pathEdgeOwnedBytes(edge));
         }
@@ -660,6 +698,10 @@ fn freeResult(alloc: Allocator, result: TraversalResult) void {
     if (result.path) |path| {
         for (path) |key| alloc.free(key);
         alloc.free(path);
+    }
+    if (result.path_tables) |tables| {
+        for (tables) |table| if (table) |value| alloc.free(value);
+        alloc.free(tables);
     }
     if (result.path_edges) |edges| paths_mod.freePathEdgesAlloc(alloc, edges);
     if (result.target_table) |table| alloc.free(table);

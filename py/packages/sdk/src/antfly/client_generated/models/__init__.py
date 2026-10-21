@@ -1043,6 +1043,8 @@ from .inference_runtime_config_model_strategies_additional_property import (
 )
 from .inference_sparse_vector import InferenceSparseVector
 from .inference_style import InferenceStyle
+from .inference_synthesis_request import InferenceSynthesisRequest
+from .inference_synthesis_request_format import InferenceSynthesisRequestFormat
 from .inference_text_content import InferenceTextContent
 from .inference_text_content_part import InferenceTextContentPart
 from .inference_text_content_part_type import InferenceTextContentPartType
@@ -2723,6 +2725,8 @@ __all__ = (
     "InferenceschemasConfig",
     "InferenceSparseVector",
     "InferenceStyle",
+    "InferenceSynthesisRequest",
+    "InferenceSynthesisRequestFormat",
     "InferenceTextContent",
     "InferenceTextContentPart",
     "InferenceTextContentPartType",

@@ -16,6 +16,9 @@ class ConnectedModel:
     """
     Attributes:
         name (str): Model identifier as reported by the provider.
+        id (str | Unset): Canonical public gateway identity when available.
+        availability (str | Unset): Availability observation independent of capability support.
+        freshness (str | Unset): Whether metadata is configured, live, or cached.
         display_name (str | Unset): Human-readable model name when the provider reports one.
         dimensions (int | Unset): Embedding output dimension when known.
         configured (bool | Unset): True when this model is referenced by a configured embedder, generator, reranker, or
@@ -25,6 +28,9 @@ class ConnectedModel:
     """
 
     name: str
+    id: str | Unset = UNSET
+    availability: str | Unset = UNSET
+    freshness: str | Unset = UNSET
     display_name: str | Unset = UNSET
     dimensions: int | Unset = UNSET
     configured: bool | Unset = UNSET
@@ -34,6 +40,12 @@ class ConnectedModel:
 
     def to_dict(self) -> dict[str, Any]:
         name = self.name
+
+        id = self.id
+
+        availability = self.availability
+
+        freshness = self.freshness
 
         display_name = self.display_name
 
@@ -56,6 +68,12 @@ class ConnectedModel:
                 "name": name,
             }
         )
+        if id is not UNSET:
+            field_dict["id"] = id
+        if availability is not UNSET:
+            field_dict["availability"] = availability
+        if freshness is not UNSET:
+            field_dict["freshness"] = freshness
         if display_name is not UNSET:
             field_dict["display_name"] = display_name
         if dimensions is not UNSET:
@@ -74,6 +92,12 @@ class ConnectedModel:
         d = dict(src_dict)
         name = d.pop("name")
 
+        id = d.pop("id", UNSET)
+
+        availability = d.pop("availability", UNSET)
+
+        freshness = d.pop("freshness", UNSET)
+
         display_name = d.pop("display_name", UNSET)
 
         dimensions = d.pop("dimensions", UNSET)
@@ -86,6 +110,9 @@ class ConnectedModel:
 
         connected_model = cls(
             name=name,
+            id=id,
+            availability=availability,
+            freshness=freshness,
             display_name=display_name,
             dimensions=dimensions,
             configured=configured,

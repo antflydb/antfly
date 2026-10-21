@@ -121,7 +121,7 @@ pub fn addConfigured(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
     unit_step.dependOn(&b.addRunArtifact(dictionary_tests).step);
     const harden_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-grep/tests/harden.zig"), .target = target, .optimize = .safe, .link_libc = true });
     const harden_regex = b.createModule(.{ .root_source_file = b.path("lib/regex/src/mod.zig"), .target = target, .optimize = .safe, .link_libc = true });
-    harden_regex.addImport("antfly_fst", fst);
+    harden_regex.addImport("antfly_fst", b.createModule(.{ .root_source_file = b.path("lib/fst/src/mod.zig"), .target = target, .optimize = .safe }));
     harden_regex.addImport("antfly_grapheme", b.createModule(.{ .root_source_file = b.path("lib/tokenizer/src/grapheme.zig"), .target = target, .optimize = .safe }));
     const harden_syntax = b.createModule(.{ .root_source_file = b.path("lib/syntax/src/root.zig"), .target = target, .optimize = .safe });
     harden_syntax.addImport("util", b.createModule(.{ .root_source_file = b.path("lib/syntax/src/vendor/yuku/util/root.zig"), .target = target, .optimize = .safe }));
