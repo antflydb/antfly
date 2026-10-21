@@ -4237,11 +4237,22 @@ pub const CompositeAssetsHandle = struct {
         return self.assets orelse unreachable;
     }
 
-    pub fn markStartupManaged(self: *CompositeAssetsHandle) void {
+    pub fn markStartupManaged(self: *CompositeAssetsHandle) !void {
         const assets = self.assets orelse return;
         self.manager.lockLoadedModels();
+        defer self.manager.unlockLoadedModels();
+        // Startup policy selects the default request backend for this artifact.
+        // Keep explicit backend acquisitions separate; never alias cache entries
+        // with different placement constraints or artifact generations.
+        if (assets.preferred_backends.len == 1) {
+            const result = try self.manager.composite_startup_backends.getOrPut(self.manager.allocator, assets.model_dir);
+            if (!result.found_existing) {
+                errdefer _ = self.manager.composite_startup_backends.remove(assets.model_dir);
+                result.key_ptr.* = try self.manager.allocator.dupe(u8, assets.model_dir);
+            }
+            result.value_ptr.* = assets.preferred_backends[0];
+        }
         assets.startup_managed = true;
-        self.manager.unlockLoadedModels();
     }
 
     pub fn release(self: *CompositeAssetsHandle) void {
@@ -4629,6 +4640,9 @@ pub const ModelManager = struct {
     tokenizer_cache_budget_source: TokenizerCacheBudgetSource = .none,
     loaded: std.StringHashMapUnmanaged(*LoadedModel),
     loaded_aliases: std.StringHashMapUnmanaged(*LoadedModel),
+    /// Strict startup backend policies, keyed by resolved model directory.
+    /// Values are copied under load_lock; request lookup is O(1).
+    composite_startup_backends: std.StringHashMapUnmanaged(backends.BackendType) = .{},
     runtime_epoch: u64,
     next_runtime_sequence: u64 = 1,
     /// Protects loaded-model maps and the in-flight registry. Expensive tokenizer,
@@ -6856,6 +6870,9 @@ pub const ModelManager = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.composite_assets.deinit(self.allocator);
+        var startup_keys = self.composite_startup_backends.keyIterator();
+        while (startup_keys.next()) |key| self.allocator.free(key.*);
+        self.composite_startup_backends.deinit(self.allocator);
         var it = self.loaded.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.*.deinit();
@@ -7409,6 +7426,20 @@ pub const ModelManager = struct {
         return hash.finalResult();
     }
 
+    fn defaultCompositeBackends(self: *ModelManager, model_dir: []const u8) []const backends.BackendType {
+        self.lockLoadedModels();
+        const configured = self.composite_startup_backends.get(model_dir);
+        self.unlockLoadedModels();
+        // Static slices outlive the lock and any later policy registration.
+        return switch (configured orelse return self.session_manager.preferred_backends) {
+            .native => &.{.native},
+            .metal => &.{.metal},
+            .cuda => &.{.cuda},
+            .pjrt => &.{.pjrt},
+            .wasm => &.{.wasm},
+        };
+    }
+
     /// Lazy, single-flight component runtime. The handle pins both sessions,
     /// tokenizer and metadata; callers must not close the borrowed sessions.
     pub fn acquireCompositeRuntime(
@@ -7421,7 +7452,7 @@ pub const ModelManager = struct {
         return self.acquireCompositeRuntimeWithPreferredBackends(
             model_dir,
             component_paths,
-            self.session_manager.preferred_backends,
+            self.defaultCompositeBackends(model_dir),
             if (kind == .seq2seq) .rewriter else .transcriber,
             kind,
             control,
@@ -7439,7 +7470,7 @@ pub const ModelManager = struct {
         return self.acquireCompositeRuntimeWithPreferredBackends(
             model_dir,
             component_paths,
-            self.session_manager.preferred_backends,
+            self.defaultCompositeBackends(model_dir),
             model_type,
             kind,
             control,
@@ -12314,7 +12345,7 @@ test "component compatibility validates explicit split ONNX graphs" {
     );
 }
 
-test "composite decoder selection qualifies optional merged artifacts and pins fallback" {
+test "composite decoder selection preserves startup backend policy and pins generation fallback" {
     const allocator = std.testing.allocator;
     var graph = ml.graph.Graph.init(allocator);
     defer graph.deinit();
@@ -12356,9 +12387,19 @@ test "composite decoder selection qualifies optional merged artifacts and pins f
         for (entry.*.dependencies) |dependency|
             try std.testing.expect(!std.mem.endsWith(u8, dependency, "decoder_model_merged.onnx"));
     }
+    // A startup-pinned native instance must stay the default even when the
+    // server's fallback list is broader. Explicit policies still have their
+    // own keys; default acquisition must reuse both sessions and the ID.
+    try first.markStartupManaged();
+    manager.session_manager.preferred_backends = &.{ .native, .metal };
     var second = try manager.acquireCompositeRuntime(root, &.{ paths.encoder, paths.decoder }, .seq2seq, null);
     defer second.release();
     try std.testing.expect(first.get() == second.get());
+    try std.testing.expectEqual(first.get().runtime_id, second.get().runtime_id);
+    try std.testing.expectEqual(@as(usize, 1), manager.composite_assets.count());
+    const strict_other = try manager.compositeRuntimeKey(root, &.{ paths.encoder, paths.decoder }, .seq2seq, &.{.metal}, .rewriter);
+    try std.testing.expect(!std.mem.eql(u8, &strict_other, &first.get().generation));
+
     try manager.validateCompositeAssetsCurrent(&first, root, &.{ paths.encoder, paths.decoder });
     // Invalid optional publication cannot displace the working ordinary graph.
     try dir.dir.writeFile(std.testing.io, .{ .sub_path = "decoder_model_merged.onnx", .data = "invalid" });

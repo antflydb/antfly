@@ -145,7 +145,7 @@ function copyToClipboard(text: string) {
 // --- Component ---
 
 const ReaderPlaygroundPage: React.FC = () => {
-  const { inferenceUrl, inferenceApiUrl, inferenceConnectionId } = useApiConfig();
+  const { inferenceUrl } = useApiConfig();
 
   // Shared state
   const [isLoading, setIsLoading] = useState(false);
@@ -189,6 +189,7 @@ const ReaderPlaygroundPage: React.FC = () => {
   });
 
   const isAppleOcr = selectedReaderModel === APPLE_OCR_READER;
+  const requestEndpoint = inferenceUrl(isAppleOcr ? "_antfarm/readers/apple" : "read");
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: model/backend identity invalidates in-flight results
   useEffect(() => {
@@ -201,7 +202,7 @@ const ReaderPlaygroundPage: React.FC = () => {
     setSelectedImageIndex(0);
     setOutputTab("text");
     return () => abortControllerRef.current?.abort();
-  }, [selectedReaderModel, inferenceApiUrl, inferenceConnectionId]);
+  }, [selectedReaderModel, requestEndpoint]);
 
   // Auto-set prompt based on selected model (only when prompt is empty or a known auto-value)
   useEffect(() => {
@@ -316,15 +317,12 @@ const ReaderPlaygroundPage: React.FC = () => {
           body.max_tokens = Number.parseInt(maxTokens, 10);
       }
 
-      const data = await fetchInferenceJson<ReadResponse>(
-        inferenceUrl(isAppleOcr ? "_antfarm/readers/apple" : "read"),
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-          signal: controller.signal,
-        }
-      );
+      const data = await fetchInferenceJson<ReadResponse>(requestEndpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
       if (abortControllerRef.current !== controller || controller.signal.aborted) return;
       setReadResult(data);
       setProcessingTime(performance.now() - startTime);

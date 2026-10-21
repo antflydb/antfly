@@ -130,7 +130,8 @@ The era of modern computing began with a flurry of development before and during
 };
 
 const ChunkingPlaygroundPage: React.FC = () => {
-  const { inferenceUrl, inferenceApiUrl, inferenceConnectionId } = useApiConfig();
+  const { inferenceUrl } = useApiConfig();
+  const requestEndpoint = inferenceUrl("chunk");
 
   // Restore state from localStorage
   const [inputText, setInputText] = useState(() => {
@@ -187,7 +188,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
     setError(null);
     setProcessingTime(null);
     return () => abortControllerRef.current?.abort();
-  }, [config.model, inferenceApiUrl, inferenceConnectionId]);
+  }, [config.model, requestEndpoint]);
 
   useEffect(() => {
     if (selectedModel && selectedModel !== config.model) {
@@ -212,7 +213,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
     try {
       const actualSeparator = config.separator.replace(/\\n/g, "\n").replace(/\\t/g, "\t");
 
-      const data = await fetchInferenceJson<ChunkResponse>(inferenceUrl("chunk"), {
+      const data = await fetchInferenceJson<ChunkResponse>(requestEndpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         signal: controller.signal,
@@ -250,7 +251,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
     } finally {
       if (finishAbortableRequest(abortControllerRef, controller)) setIsLoading(false);
     }
-  }, [inputText, config, inferenceUrl, modelsLoaded]);
+  }, [inputText, config, requestEndpoint, modelsLoaded]);
 
   // Cmd+Enter shortcut
   useEffect(() => {

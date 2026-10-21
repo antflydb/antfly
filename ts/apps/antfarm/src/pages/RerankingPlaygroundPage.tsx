@@ -70,7 +70,8 @@ const SAMPLE_DATA = {
 };
 
 const RerankingPlaygroundPage: React.FC = () => {
-  const { inferenceUrl, inferenceApiUrl, inferenceConnectionId } = useApiConfig();
+  const { inferenceUrl } = useApiConfig();
+  const requestEndpoint = inferenceUrl("rerank");
 
   // Restore state from localStorage
   const [query, setQuery] = useState(() => {
@@ -151,7 +152,7 @@ const RerankingPlaygroundPage: React.FC = () => {
     setError(null);
     setProcessingTime(null);
     return () => abortControllerRef.current?.abort();
-  }, [selectedModel, inferenceApiUrl, inferenceConnectionId]);
+  }, [selectedModel, requestEndpoint]);
 
   const handleRerank = useCallback(async () => {
     const nonEmptyDocs = documents.filter((d) => d.trim());
@@ -179,7 +180,7 @@ const RerankingPlaygroundPage: React.FC = () => {
     const startTime = performance.now();
 
     try {
-      const data = await fetchInferenceJson<RerankResponse>(inferenceUrl("rerank"), {
+      const data = await fetchInferenceJson<RerankResponse>(requestEndpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -208,7 +209,7 @@ const RerankingPlaygroundPage: React.FC = () => {
     } finally {
       if (finishAbortableRequest(abortControllerRef, controller)) setIsLoading(false);
     }
-  }, [query, documents, selectedModel, inferenceUrl]);
+  }, [query, documents, selectedModel, requestEndpoint]);
 
   // Cmd+Enter shortcut
   useEffect(() => {

@@ -315,3 +315,13 @@ instances may stream weights and do not promise full GPU residency.
 `active_handles` counts internal owners and load waiters, rather than HTTP
 requests. `unloadable` and `unload_blocked_reason` describe eviction eligibility
 at snapshot time; concurrent work can change it before an unload arrives.
+
+Startup backend overrides for split transcription models also select the backend
+for subsequent default requests. The pinned instance is reused across aliases
+and canonical paths; explicit backend policies and newly published artifact
+generations retain separate cache identities.
+
+Relation models may advertise `untyped_entities` in their model capabilities.
+These models emit generic `ENTITY` nodes and accept relation names without typed
+endpoints. Antfarm uses this capability for REBEL artifacts, including renamed
+installations, while preserving typed schemas for other relation models.

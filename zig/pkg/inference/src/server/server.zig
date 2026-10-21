@@ -6331,8 +6331,12 @@ pub const Node = struct {
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
-        const model_path = try self.resolveModelPath(io, model.name, "transcribers");
-        defer self.allocator.free(model_path);
+        const resolved_path = try self.resolveModelPath(io, model.name, "transcribers");
+        defer self.allocator.free(resolved_path);
+        // Requests use canonical paths, including when models_dir is relative
+        // or the installed artifact is reached through a symlink.
+        const model_path = try realPathExistingAlloc(allocator, io, resolved_path);
+        defer allocator.free(model_path);
         const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
         if (enc_dec_mod.findEncoderDecoderPaths(allocator, model_path)) |paths| {
             defer allocator.free(paths.encoder);
@@ -6350,7 +6354,7 @@ pub const Node = struct {
                 null,
             );
             defer handle.release();
-            handle.markStartupManaged();
+            try handle.markStartupManaged();
             return;
         } else |_| {}
         try self.warmLoadOnlyModel(allocator, model);
@@ -21539,6 +21543,7 @@ pub const Node = struct {
                         modelCatalogDecodedPixelCap(self, task),
                         false,
                         "compatible",
+                        false,
                     );
                     try listed_model_names.put(a, name, {});
                     model_count += 1;
@@ -21587,6 +21592,7 @@ pub const Node = struct {
                     modelCatalogDecodedPixelCap(self, task),
                     chat_template_failed,
                     listing.compatibility_level,
+                    std.mem.eql(u8, task, "extractors") and rebel_mod.isRebelModel(a, entry.path),
                 );
                 try appendQualifiedLimits(&body, a, &listing.manifest);
                 if (isOpenAiListTask(task)) {
@@ -21644,6 +21650,7 @@ pub const Node = struct {
                     modelCatalogDecodedPixelCap(self, task),
                     model.chat_template_failed,
                     @tagName(loaded_compatibility.level),
+                    std.mem.eql(u8, task, "extractors") and rebel_mod.isRebelModel(a, listing.canonical_model_dir),
                 );
                 try appendQualifiedLimits(&body, a, &model.manifest);
                 if (isOpenAiListTask(task)) {
@@ -24290,11 +24297,13 @@ fn appendModelInfo(
     chat_template_failed: bool,
     /// Artifact compatibility derived for the current build.
     compatibility_level: []const u8,
+    /// REBEL emits generic ENTITY nodes and accepts untyped relation names.
+    untyped_entities: bool,
 ) !void {
     const inferred_classification = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "classification") and !model_caps.hasCapability(capabilities, "classification");
     const inferred_zero_shot = zero_shot_classification and !model_caps.hasCapability(capabilities, "zero_shot");
     const inferred_multi_label = zero_shot_classification and !model_caps.hasCapability(capabilities, "multi_label");
-    const inferred_relations = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "relations") and !model_caps.hasCapability(capabilities, "relations");
+    const inferred_relations = (untyped_entities or model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "relations")) and !model_caps.hasCapability(capabilities, "relations");
     const inferred_extraction = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "extraction") and !model_caps.hasCapability(capabilities, "extraction");
     const effective_native_batch_read = executor_kind == .native_florence_reader and effectiveNativeReadBatchSize() > 1;
     const inferred_native_batch_read = effective_native_batch_read and !model_caps.hasCapability(capabilities, "native_batch_read");
@@ -24359,6 +24368,11 @@ fn appendModelInfo(
     if (inferred_relations) {
         if (cap_index > 0) try buf.append(allocator, ',');
         try jsonEncodeString(buf, allocator, "relations");
+        cap_index += 1;
+    }
+    if (untyped_entities and !model_caps.hasCapability(capabilities, "untyped_entities")) {
+        if (cap_index > 0) try buf.append(allocator, ',');
+        try jsonEncodeString(buf, allocator, "untyped_entities");
         cap_index += 1;
     }
     if (inferred_extraction) {
@@ -24545,6 +24559,39 @@ test "executor capability resolution never advertises raw documents" {
     try std.testing.expect(chunk.text and chunk.image and chunk.audio and !chunk.document);
 }
 
+test "REBEL catalog advertises generic entity schema independently of model names" {
+    var body = std.ArrayListUnmanaged(u8).empty;
+    defer body.deinit(std.testing.allocator);
+    try appendModelInfo(
+        &body,
+        std.testing.allocator,
+        "extractor",
+        "",
+        &.{},
+        &.{"text"},
+        false,
+        false,
+        false,
+        .compatibility,
+        null,
+        "extractors",
+        16 * 1024 * 1024,
+        32 * 1024 * 1024,
+        false,
+        "compatible",
+        true,
+    );
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body.items, .{});
+    defer parsed.deinit();
+    var generic = false;
+    var relations = false;
+    for (parsed.value.object.get("capabilities").?.array.items) |capability| {
+        generic = generic or std.mem.eql(u8, capability.string, "untyped_entities");
+        relations = relations or std.mem.eql(u8, capability.string, "relations");
+    }
+    try std.testing.expect(generic and relations);
+}
+
 test "reranker catalog advertises rerank documents" {
     var body = std.ArrayListUnmanaged(u8).empty;
     defer body.deinit(std.testing.allocator);
@@ -24565,6 +24612,7 @@ test "reranker catalog advertises rerank documents" {
         32 * 1024 * 1024,
         false,
         "compatible",
+        false,
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body.items, .{});
     defer parsed.deinit();
@@ -24594,6 +24642,7 @@ test "fixed chunk catalog advertises its multimodal transport truth" {
         32 * 1024 * 1024,
         false,
         "compatible",
+        false,
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body.items, .{});
     defer parsed.deinit();
@@ -25968,6 +26017,7 @@ test "standalone inference model catalog publishes resolved native reader batchi
         8 * 1024 * 1024,
         false,
         "compatible",
+        false,
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body.items, .{});
     defer parsed.deinit();
@@ -26212,6 +26262,7 @@ test "normalized inference capabilities cover every model family" {
             8 * 1024 * 1024,
             false,
             "compatible",
+            false,
         );
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body.items, .{});
         defer parsed.deinit();
@@ -29174,6 +29225,50 @@ test "Qwen3-VL read routing admits only generation bundles" {
     defer generic_generator.deinit();
     try std.testing.expect(!isQwen3VlReadModel(&generic_generator));
     try std.testing.expect(!manifestMatchesModelListingTask("readers", "generator", &generic_generator));
+}
+
+test "startup split Whisper backend is reused through canonical request paths" {
+    const allocator = std.testing.allocator;
+    const test_ml = @import("ml");
+    var graph = test_ml.graph.Graph.init(allocator);
+    defer graph.deinit();
+    var builder = test_ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("input", test_ml.graph.Shape.init(.f32, &.{4}));
+    const bias = try builder.tensorConst(&.{ 1, 1, 1, 1 }, test_ml.graph.Shape.init(.f32, &.{4}));
+    try graph.markOutput(try builder.add(input, bias));
+    const bytes = try @import("onnx_graph").exportGraph(allocator, &graph, .{});
+    defer allocator.free(bytes);
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.createDirPath(std.testing.io, "transcribers/owner/tiny");
+    for ([_][]const u8{ "encoder_model.onnx", "decoder_model.onnx" }) |name| {
+        const path = try std.fs.path.join(allocator, &.{ "transcribers/owner/tiny", name });
+        defer allocator.free(path);
+        try dir.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = bytes });
+    }
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "transcribers/owner/tiny/config.json", .data =
+        \\{"model_type":"whisper","vocab_size":4,"d_model":4,"decoder_start_token_id":0,"eos_token_id":0,"max_length":4}
+    });
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "transcribers/owner/tiny/tokenizer.json", .data =
+        \\{"version":"1.0","added_tokens":[{"id":0,"content":"<unk>","special":true},{"id":1,"content":"<|en|>","special":true},{"id":2,"content":"<|transcribe|>","special":true},{"id":3,"content":"<|notimestamps|>","special":true}],"model":{"type":"BPE","vocab":{"<unk>":0,"<|en|>":1,"<|transcribe|>":2,"<|notimestamps|>":3},"merges":[]}}
+    });
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer allocator.free(root);
+    var node = try Node.init(allocator, .{ .models_dir = root, .allow_unknown_models = true });
+    defer node.deinit();
+    try node.attachIo(std.testing.io);
+    node.model_manager.session_manager.preferred_backends = &.{ .native, .metal };
+    try node.warmTranscriber(allocator, .{ .kind = .transcriber, .name = "owner/tiny", .backend = .native });
+    const path = try node.resolveRequestModelPath(allocator, std.testing.io, "owner/tiny", "transcribers");
+    defer allocator.free(path);
+    const paths = try @import("../pipelines/encoder_decoder.zig").findEncoderDecoderPaths(allocator, path);
+    defer allocator.free(paths.encoder);
+    defer allocator.free(paths.decoder);
+    var handle = try node.model_manager.acquireCompositeRuntime(path, &.{ paths.encoder, paths.decoder }, .whisper, null);
+    defer handle.release();
+    try std.testing.expect(handle.get().startup_managed);
+    try std.testing.expectEqual(@as(usize, 1), node.model_manager.composite_assets.count());
+    try std.testing.expectEqualSlices(backends_mod.BackendType, &.{.native}, handle.get().preferred_backends);
 }
 
 test "runtime unload bypasses inference admission while load remains admitted" {

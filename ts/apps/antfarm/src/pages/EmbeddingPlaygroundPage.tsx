@@ -149,7 +149,8 @@ function SimilarityBar({ score, maxScore }: { score: number; maxScore: number })
 }
 
 const EmbeddingPlaygroundPage: React.FC = () => {
-  const { inferenceUrl, inferenceApiUrl, inferenceConnectionId } = useApiConfig();
+  const { inferenceUrl } = useApiConfig();
+  const requestEndpoint = inferenceUrl("embed");
   const [query, setQuery] = useState("");
   const [documents, setDocuments] = useState<string[]>([""]);
   const [isLoading, setIsLoading] = useState(false);
@@ -184,7 +185,7 @@ const EmbeddingPlaygroundPage: React.FC = () => {
     setError(null);
     setProcessingTime(null);
     return () => abortControllerRef.current?.abort();
-  }, [selectedModel, inferenceApiUrl, inferenceConnectionId]);
+  }, [selectedModel, requestEndpoint]);
 
   const handleEmbed = async () => {
     const nonEmptyDocs = documents.filter((d) => d.trim());
@@ -214,7 +215,7 @@ const EmbeddingPlaygroundPage: React.FC = () => {
     try {
       // Embed query and all documents in one call
       const allTexts = [query, ...nonEmptyDocs];
-      const response = await fetchInferenceJson<EmbedResponse>(inferenceUrl("embed"), {
+      const response = await fetchInferenceJson<EmbedResponse>(requestEndpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ model: selectedModel, input: allTexts }),

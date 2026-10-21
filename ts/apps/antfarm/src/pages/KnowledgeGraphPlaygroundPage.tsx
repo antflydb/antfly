@@ -183,8 +183,14 @@ function getNodeColor(type: string): string {
   return ENTITY_TYPE_COLORS[type.toLowerCase()] || ENTITY_TYPE_COLORS.default;
 }
 
+function untypedRelationName(label: string): string {
+  const parts = label.split("::");
+  return parts.length === 3 ? parts[1] : label;
+}
+
 const KnowledgeGraphPlaygroundPage: React.FC = () => {
-  const { inferenceUrl, inferenceApiUrl, inferenceConnectionId } = useApiConfig();
+  const { inferenceUrl } = useApiConfig();
+  const requestEndpoint = inferenceUrl("extract");
 
   // Restore state from localStorage
   const [inputText, setInputText] = useState(() => {
@@ -262,11 +268,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
   const connectionModels = useMemo(
     () =>
       modelsAcceptingInput(connectedModels, "text")
-        .filter(
-          (model) =>
-            !model.name.toLowerCase().includes("rebel") &&
-            (!model.capabilities || model.capabilities.includes("relations"))
-        )
+        .filter((model) => !model.capabilities || model.capabilities.includes("relations"))
         .map((model) => model.name),
     [connectedModels]
   );
@@ -277,6 +279,13 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
     defaultModel: storedModel,
     preserveRequestedModel: true,
   });
+
+  const selectedModelInfo = connectedModels.find((model) => model.name === selectedModel);
+  // Prefer server-resolved schema capabilities, including renamed artifacts.
+  // Older servers identify REBEL only by its conventional model basename.
+  const untypedEntities =
+    selectedModelInfo?.capabilities?.includes("untyped_entities") ||
+    selectedModel.split("/").at(-1)?.toLowerCase().includes("rebel") === true;
 
   // Persist state to localStorage
   useEffect(() => {
@@ -297,7 +306,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
     setError(null);
     setProcessingTime(null);
     return () => abortControllerRef.current?.abort();
-  }, [selectedModel, inferenceApiUrl, inferenceConnectionId]);
+  }, [selectedModel, requestEndpoint]);
 
   const unavailableReason = extractionUnavailableReason(
     selectedModel,
@@ -321,7 +330,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
       return;
     }
 
-    if (entityLabels.length === 0) {
+    if (!untypedEntities && entityLabels.length === 0) {
       setError("Please add at least one entity label");
       return;
     }
@@ -347,8 +356,10 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
         model: selectedModel,
         inputs: texts.map((content: string) => ({ content })),
         schema: {
-          relations: relationLabels.map((type) => ({ type })),
-          entities: entityLabels,
+          relations: relationLabels.map((type) => ({
+            type: untypedEntities ? untypedRelationName(type) : type,
+          })),
+          entities: untypedEntities ? ["ENTITY"] : entityLabels,
         },
         options: {
           include_confidence: true,
@@ -357,7 +368,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
         },
       };
 
-      const data = await fetchInferenceJson<ExtractResponse>(inferenceUrl("extract"), {
+      const data = await fetchInferenceJson<ExtractResponse>(requestEndpoint, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -388,10 +399,11 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
     inputText,
     selectedModel,
     unavailableReason,
+    untypedEntities,
     entityLabels,
     relationLabels,
     config,
-    inferenceUrl,
+    requestEndpoint,
   ]);
 
   // Cmd+Enter shortcut
@@ -699,8 +711,13 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
             {/* Entity Labels */}
             <div className="space-y-2">
               <Label>Entity Labels</Label>
+              {untypedEntities ? (
+                <p className="text-sm text-muted-foreground">
+                  This model emits generic ENTITY nodes. Relation names can be constrained below.
+                </p>
+              ) : null}
               <div className="flex flex-wrap gap-2 mb-2">
-                {entityLabels.map((label) => (
+                {(untypedEntities ? ["ENTITY"] : entityLabels).map((label) => (
                   <Badge
                     key={label}
                     style={{
@@ -712,6 +729,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                     {label}
                     <button
                       type="button"
+                      disabled={untypedEntities}
                       onClick={() => setEntityLabels(entityLabels.filter((l) => l !== label))}
                       className="ml-1 hover:opacity-70"
                     >
@@ -722,6 +740,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
               </div>
               <div className="flex gap-2">
                 <Input
+                  disabled={untypedEntities}
                   placeholder="Add entity label..."
                   value={newEntityLabel}
                   onChange={(e) => setNewEntityLabel(e.target.value)}
@@ -737,7 +756,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                   variant="outline"
                   size="sm"
                   onClick={handleAddEntityLabel}
-                  disabled={!newEntityLabel.trim()}
+                  disabled={untypedEntities || !newEntityLabel.trim()}
                 >
                   <Plus className="h-4 w-4" />
                 </Button>
@@ -750,7 +769,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
               <div className="flex flex-wrap gap-2 mb-2">
                 {relationLabels.map((label) => (
                   <Badge key={label} className="gap-1">
-                    {label}
+                    {untypedEntities ? untypedRelationName(label) : label}
                     <button
                       type="button"
                       onClick={() => setRelationLabels(relationLabels.filter((l) => l !== label))}

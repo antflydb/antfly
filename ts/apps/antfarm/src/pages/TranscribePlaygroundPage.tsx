@@ -126,7 +126,10 @@ function selectPlaceholder(loaded: boolean, count: number, typeName: string): st
 }
 
 const TranscribePlaygroundPage: React.FC = () => {
-  const { inferenceUrl, inferenceApiUrl, inferenceConnectionId } = useApiConfig();
+  const { inferenceUrl } = useApiConfig();
+  const requestEndpoint = inferenceUrl("transcribe");
+  const chunkEndpoint = inferenceUrl("chunk");
+  const generationEndpoint = inferenceUrl("generate");
   const { models: connectedTranscribers, loading: transcribersLoading } =
     useSelectedInferenceModels("transcriber");
   const { models: connectedChunkers, loading: chunkersLoading } =
@@ -372,7 +375,7 @@ const TranscribePlaygroundPage: React.FC = () => {
     setSegments([]);
     setError(null);
     setProcessingTime(null);
-  }, [selectedTranscriberModel, inferenceApiUrl, inferenceConnectionId]);
+  }, [selectedTranscriberModel, requestEndpoint, chunkEndpoint, generationEndpoint]);
 
   // Update a single segment by index
   const updateSegment = useCallback((index: number, updates: Partial<Segment>) => {
@@ -393,7 +396,7 @@ const TranscribePlaygroundPage: React.FC = () => {
       updateSegment(index, { status: "transcribing" });
 
       if (signal.aborted) return;
-      const result = await fetchInferenceJson<TranscriptionResponse>(inferenceUrl("transcribe"), {
+      const result = await fetchInferenceJson<TranscriptionResponse>(requestEndpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -411,7 +414,7 @@ const TranscribePlaygroundPage: React.FC = () => {
         updateSegment(index, { rawText, status: "cleaning" });
 
         try {
-          const genResult = await fetchInferenceJson<GenerationResponse>(inferenceUrl("generate"), {
+          const genResult = await fetchInferenceJson<GenerationResponse>(generationEndpoint, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -440,7 +443,7 @@ const TranscribePlaygroundPage: React.FC = () => {
         updateSegment(index, { rawText, status: "done" });
       }
     },
-    [inferenceUrl, updateSegment]
+    [requestEndpoint, generationEndpoint, updateSegment]
   );
 
   // Main pipeline
@@ -468,7 +471,7 @@ const TranscribePlaygroundPage: React.FC = () => {
     try {
       if (useVAD && selectedChunkerModel && audioDuration != null && audioDuration > 30) {
         // VAD pipeline: chunk -> transcribe each -> optionally clean up
-        const chunkResult = await fetchInferenceJson<ChunkResponse>(inferenceUrl("chunk"), {
+        const chunkResult = await fetchInferenceJson<ChunkResponse>(chunkEndpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -564,7 +567,7 @@ const TranscribePlaygroundPage: React.FC = () => {
     useLLMCleanup,
     vadConfig,
     processSegment,
-    inferenceUrl,
+    chunkEndpoint,
   ]);
 
   // Actions

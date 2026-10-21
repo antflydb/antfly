@@ -237,7 +237,8 @@ const EXTRACT_SAMPLES = {
 };
 
 const ExtractionPlaygroundPage: React.FC = () => {
-  const { inferenceUrl, inferenceApiUrl, inferenceConnectionId } = useApiConfig();
+  const { inferenceUrl } = useApiConfig();
+  const requestEndpoint = inferenceUrl("extract");
 
   // Restore state from localStorage
   const [mode, setMode] = useState<PlaygroundMode>(() => {
@@ -408,7 +409,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
     setError(null);
     setProcessingTime(null);
     return () => abortControllerRef.current?.abort();
-  }, [selectedModel, inferenceApiUrl, inferenceConnectionId]);
+  }, [selectedModel, requestEndpoint]);
 
   const getColorForLabel = (label: string) => {
     const normalizedLabel = label.toLowerCase();
@@ -465,7 +466,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
 
     try {
       if (mode === "entities") {
-        const data = await fetchInferenceJson<ExtractResponse>(inferenceUrl("extract"), {
+        const data = await fetchInferenceJson<ExtractResponse>(requestEndpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -490,7 +491,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
           };
         }
 
-        const data = await fetchInferenceJson<ExtractResponse>(inferenceUrl("extract"), {
+        const data = await fetchInferenceJson<ExtractResponse>(requestEndpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -529,7 +530,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
     inputText,
     selectedModel,
     labels,
-    inferenceUrl,
+    requestEndpoint,
     mode,
     schema,
     extractThreshold,
