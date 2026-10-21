@@ -382,6 +382,22 @@ pub const ServingSource = struct {
         }
     };
 
+    /// Query-owned translation for one verified, publication-bound index cut.
+    /// Parallel views borrow it until they have joined their parent source.
+    pub const RowResolver = struct {
+        ptr: *anyopaque,
+        source: []const u8,
+        snapshot: []const u8,
+        current_source: []const u8,
+        current_snapshot: []const u8,
+        rows: u64,
+        from_index: *const fn (*anyopaque, std.mem.Allocator, @import("../../storage/rowsource/types.zig").RowRef) anyerror!@import("../../storage/rowsource/types.zig").RowRef,
+        to_index: *const fn (*anyopaque, std.mem.Allocator, @import("../../storage/rowsource/types.zig").RowRef) anyerror!@import("../../storage/rowsource/types.zig").RowRef,
+        file: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!?[]const u8,
+        digest: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror![]const u8,
+        tie_rank: *const fn (*anyopaque, std.mem.Allocator, @import("../../storage/rowsource/types.zig").RowRef) anyerror!u64,
+        close: *const fn (*anyopaque) void,
+    };
     pub const FileVersions = struct { etag: []u8, version_id: []u8 };
     /// Query-owned authenticated selector pages retain independent native
     /// reader authority until source teardown. Caches contain data only.
@@ -391,6 +407,7 @@ pub const ServingSource = struct {
         close: *const fn (*anyopaque) void,
     };
     file_navigation: ?FileNavigation = null,
+    row_resolver: ?RowResolver = null,
     planner_statistics: []const external_source_api.types.ColumnStatistics = &.{},
     statistics_owner: ?struct { ptr: *anyopaque, close: *const fn (*anyopaque) void } = null,
     deferred_snapshot: ?DeferredSnapshot = null,
@@ -433,6 +450,20 @@ pub const ServingSource = struct {
     prepared_deletes: ?*@import("lake_prepared_deletes.zig").Prepared = null,
     delete_qualification: ?*@import("lake_delete_qualification.zig").Qualification = null,
     delete_qualification_owned: bool = false,
+
+    pub fn acceptsIndexCut(self: *const ServingSource, source: []const u8, snapshot: []const u8) bool {
+        const expected_source = if (self.row_resolver) |resolver| resolver.source else self.inventory.source_id;
+        const expected_snapshot = if (self.row_resolver) |resolver| resolver.snapshot else self.inventory.snapshot_id;
+        return std.mem.eql(u8, source, expected_source) and std.mem.eql(u8, snapshot, expected_snapshot);
+    }
+    pub fn fromIndex(self: *const ServingSource, a: std.mem.Allocator, ref: @import("../../storage/rowsource/types.zig").RowRef) !@import("../../storage/rowsource/types.zig").RowRef {
+        if (self.row_resolver) |resolver| return resolver.from_index(resolver.ptr, a, ref);
+        return ref;
+    }
+    pub fn toIndex(self: *const ServingSource, a: std.mem.Allocator, ref: @import("../../storage/rowsource/types.zig").RowRef) !@import("../../storage/rowsource/types.zig").RowRef {
+        if (self.row_resolver) |resolver| return resolver.to_index(resolver.ptr, a, ref);
+        return ref;
+    }
 
     /// Parent remains pinned and quiescent until every view joins. Immutable
     /// inventory/deletes/selector authority are borrowed; mutable version maps
@@ -1158,6 +1189,7 @@ pub const ServingSource = struct {
             self.alloc.destroy(reader);
         }
         if (self.verified_selector) |selector| selector.close(selector.ptr);
+        if (self.row_resolver) |resolver| resolver.close(resolver.ptr);
         if (self.plan_lease) |lease| lease.release() else if (self.private_snapshot == null) if (self.scanner.iceberg_delete_plan) |*value| value.deinit(self.alloc);
         if (self.partition_rules) |*rules| rules.deinit();
         if (self.iceberg_schema) |*value| value.deinit();

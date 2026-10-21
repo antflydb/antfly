@@ -215,6 +215,7 @@ pub const Identities = struct {
         }
     };
     const FileSpan = struct { file: []const u8, span: Span };
+    row_resolver: ?local.serverless_query_lake_serving.ServingSource.RowResolver = null,
     partial_inventory: bool = false,
     files: std.StringHashMapUnmanaged(Span) = .empty,
     spans: []const FileSpan = &.{},
@@ -374,6 +375,23 @@ pub const Identities = struct {
         errdefer result.deinit();
         var cache: LiveRowsCache = .{ .backing = a };
         defer cache.deinit(a);
+        if (self.row_resolver) |resolver| {
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            var files = selected.files.iterator();
+            while (files.next()) |file| {
+                var blocks = file.value_ptr.iterator();
+                while (blocks.next()) |block| {
+                    var iterator = block.value_ptr.iterator();
+                    while (iterator.next()) |low| {
+                        _ = scratch.reset(.retain_capacity);
+                        const ref: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = resolver.current_source, .snapshot_id = resolver.current_snapshot, .file_id = file.key_ptr.*, .row_group_ordinal = block.key_ptr.group, .row_ordinal = (@as(u64, block.key_ptr.high) << 32) | low } };
+                        if (try self.ordinal(scratch.allocator(), &cache, store, cached, ref)) |number| try result.add(number);
+                    }
+                }
+            }
+            return result;
+        }
         var file_it = self.files.iterator();
         while (file_it.next()) |entry| {
             const item: FileSpan = .{ .file = entry.key_ptr.*, .span = entry.value_ptr.* };
@@ -437,12 +455,15 @@ pub const Identities = struct {
     }
     pub fn ordinal(self: Identities, a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, row: local.storage_rowsource_types.RowRef) !?u32 {
         if (row != .external) return error.InvalidNativeLakeRowIndex;
-        const ref = row.external;
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const mapped = if (self.row_resolver) |resolver| try resolver.to_index(resolver.ptr, scratch.allocator(), row) else row;
+        const ref = mapped.external;
         const span = self.files.get(ref.file_id) orelse {
             if (self.partial_inventory) return null;
             return error.ExternalLakeSnapshotMismatch;
         };
-        return span.localOrdinal((try sourceRank(a, cache, store, cached, span, row)) orelse return null);
+        return span.localOrdinal((try sourceRank(a, cache, store, cached, span, mapped)) orelse return null);
     }
     pub fn sourceOrdinal(a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, physical: @import("lake_index_aggregate_artifact.zig").ChunkRef, count: u32, row: local.storage_rowsource_types.RowRef) !?u32 {
         const span: Span = .{ .lower = 0, .upper = count, .rows = &.{}, .manifest = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = physical.artifact_id, .checksum = physical.checksum, .byte_len = physical.byte_len }, .expected_rows = count };
@@ -590,7 +611,8 @@ pub const Identities = struct {
             const live = try liveRows(a, cache, store, cached, block);
             break :blk live.read_rank.?.select(rank) orelse return error.InvalidNativeLakeTextCorpus;
         } else try std.math.add(u32, block.lower, rank);
-        return .{ .external = .{ .source_id = source, .snapshot_id = snapshot, .file_id = file.file, .row_group_ordinal = block.group, .row_ordinal = (block.high << corpus.physical.shift) | low } };
+        const ref: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = if (self.row_resolver) |resolver| resolver.source else source, .snapshot_id = if (self.row_resolver) |resolver| resolver.snapshot else snapshot, .file_id = file.file, .row_group_ordinal = block.group, .row_ordinal = (block.high << corpus.physical.shift) | low } };
+        return if (self.row_resolver) |resolver| try resolver.from_index(resolver.ptr, a, ref) else ref;
     }
     pub fn sourcePhysicalRow(a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, span: corpus.source_spans.Span, ordinal_value: u32, source: []const u8, snapshot: []const u8) !local.storage_rowsource_types.RowRef {
         const item: FileSpan = .{ .file = span.file.id, .span = .{ .lower = 0, .upper = span.file_rows, .rows = &.{}, .manifest = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = span.physical.artifact_id, .checksum = span.physical.checksum, .byte_len = span.physical.byte_len }, .expected_rows = span.file_rows } };

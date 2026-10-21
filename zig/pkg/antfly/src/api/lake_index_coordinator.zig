@@ -138,6 +138,12 @@ fn durableDirectoryAvailable(a: A, store: *Store, ready: catalog.Publication, ca
         error.FileNotFound, error.NotFound, error.ObjectNotFound, error.ArtifactIntegrityMismatch, error.InvalidNativeLakeFileState, error.CloudGenerationMapUnavailable => return false,
         else => return err,
     };
+    if (ready.row_identity) |ref| {
+        _ = @import("lake_row_identity.zig").load(arena.allocator(), handle, ref, cancellation, null) catch |err| switch (err) {
+            error.FileNotFound, error.NotFound, error.ObjectNotFound, error.ArtifactIntegrityMismatch, error.InvalidLogicalRowIdentity, error.CloudGenerationMapUnavailable => return false,
+            else => return err,
+        };
+    }
     if (document.declarations.len != directory.count) return error.InvalidLakeIndexCatalog;
     // Definition/source signatures do not change when reader formats advance.
     // An intact obsolete directory is not a reason to skip the required build.

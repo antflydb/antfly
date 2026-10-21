@@ -60,11 +60,12 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
         };
         context = reader_lease.?.readContext();
     }
-    var selected = (@import("lake_index_selection.zig").selectCached(sa, sql_table, &source, &store, context, .required, &server.lake_read_cache) catch |err| {
+    var selected = (@import("lake_index_selection.zig").selectCachedWithLease(sa, sql_table, &source, &store, context, .required, &server.lake_read_cache, reader_lease) catch |err| {
         try context.ensureActive();
         if (err == error.OutOfMemory) return err;
         switch (err) {
             error.ExternalLakeIndexUnavailable,
+            error.InvalidLogicalRowIdentity,
             error.ExternalLakeIndexDefinitionChanged,
             error.ExternalLakeIndexSourceChanged,
             error.ExternalLakeSnapshotMismatch,

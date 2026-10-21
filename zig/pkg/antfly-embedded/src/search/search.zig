@@ -1931,7 +1931,11 @@ const FastTopK = struct {
     }
     fn collectAdmitted(self: *FastTopK, hit: scorer_mod.ScoredHit) !void {
         self.total_count += 1;
-        if (self.after) |cursor| if (!scorer_mod.betterWithRank(.{ .doc_id = cursor.doc_id, .score = cursor.score }, hit, self.tie_rank)) return;
+        if (self.after) |cursor| {
+            const boundary = try scorer_mod.prepareHit(self.alloc, .{ .doc_id = cursor.doc_id, .score = cursor.score }, self.tie_rank);
+            const candidate = try scorer_mod.prepareHit(self.alloc, hit, self.tie_rank);
+            if (!scorer_mod.betterWithRank(boundary, candidate, self.tie_rank)) return;
+        }
         if (self.minimum_competitive_score) |floor| if (hit.score < floor) return;
         try scorer_mod.offerTopKWithRank(self.alloc, &self.hits, self.k, hit, self.tie_rank);
     }
@@ -5952,11 +5956,13 @@ fn buildResult(
     if (request.tie_rank) |order| {
         const sorted = try alloc.dupe(scorer_mod.ScoredHit, scored);
         defer alloc.free(sorted);
+        for (sorted) |*hit| hit.* = try scorer_mod.prepareHit(alloc, hit.*, order);
         scorer_mod.sortScoredHitsWithRank(sorted, order);
         var start: usize = 0;
         if (request.search_after) |cursor| {
             start = sorted.len;
-            for (sorted, 0..) |hit, i| if (scorer_mod.betterWithRank(.{ .doc_id = cursor.doc_id, .score = cursor.score }, hit, order)) {
+            const boundary = try scorer_mod.prepareHit(alloc, .{ .doc_id = cursor.doc_id, .score = cursor.score }, order);
+            for (sorted, 0..) |hit, i| if (scorer_mod.betterWithRank(boundary, hit, order)) {
                 start = i;
                 break;
             };

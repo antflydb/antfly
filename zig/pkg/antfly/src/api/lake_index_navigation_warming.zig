@@ -217,6 +217,14 @@ pub fn warmPublicationWithin(a: A, server: *@import("http_server.zig").ApiHttpSe
     } else publication.declarations;
     var roots: [max_pages]Navigation = undefined;
     var count: usize = 0;
+    if (publication.row_identity) |ref| {
+        const identity = try @import("lake_row_identity.zig").load(state.arena.allocator(), store.artifactStore(), ref, token, cached);
+        for (@import("lake_row_identity.zig").dependencies(identity)) |root| if (root) |page| {
+            if (count == roots.len) break;
+            roots[count] = .{ .domain = identity.domain, .ref = page };
+            count += 1;
+        };
+    }
     for (declarations) |declaration| {
         try context.ensureActive();
         var arena = std.heap.ArenaAllocator.init(a);

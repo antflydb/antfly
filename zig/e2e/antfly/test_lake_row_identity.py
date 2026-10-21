@@ -1,0 +1,419 @@
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Elastic-2.0
+#
+# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+# except in compliance with the Elastic License 2.0. You may obtain a copy of
+# the Elastic License 2.0 at
+#
+#     https://www.antfly.io/licensing/ELv2-license
+#
+# Unless required by applicable law or agreed to in writing, software distributed
+# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# Elastic License 2.0 for the specific language governing permissions and
+# limitations.
+
+"""Verified native index relocation against independent Parquet/Iceberg writers."""
+
+import hashlib
+import json
+import os
+import struct
+import time
+
+import pytest
+import requests
+from conftest import (
+    AUTH_BOOTSTRAP_PASSWORD,
+    DEFAULT_ANTFLY_BIN,
+    StandaloneAntflyServer,
+    resolve_binary_path,
+)
+
+pytestmark = pytest.mark.fresh_antfly_process
+
+
+@pytest.mark.parametrize(
+    "file_format",
+    ["parquet", pytest.param("iceberg", marks=pytest.mark.iceberg_integration)],
+)
+def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format):
+    if not os.environ.get("ANTFLY_E2E_FULL_LAKE"):
+        pytest.importorskip("pyarrow")
+        if file_format == "iceberg":
+            pytest.importorskip("pyiceberg")
+            pytest.importorskip("fastavro")
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    count, base = 257, 9007199254740993
+    root = tmp_path / "lake"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    iceberg = None
+    if file_format == "iceberg":
+        from pyiceberg.catalog.sql import SqlCatalog
+        from pyiceberg.schema import Schema
+        from pyiceberg.types import LongType, NestedField, StringType
+        from test_iceberg_sql import _export_table
+
+        catalog = SqlCatalog(
+            "logical",
+            uri=f"sqlite:///{tmp_path}/catalog.db",
+            warehouse=(tmp_path / "warehouse").as_uri(),
+        )
+        catalog.create_namespace("e2e")
+        iceberg = catalog.create_table(
+            "e2e.logical",
+            schema=Schema(
+                NestedField(1, "id", LongType(), required=False),
+                *[
+                    NestedField(i, name, StringType(), required=False)
+                    for i, name in enumerate(
+                        ("body", "label", "dense_native", "sparse_native"), start=2
+                    )
+                ],
+            ),
+        )
+
+    def write(step):
+        order = (
+            list(range(count)) if step == 0 else [i * 73 % count for i in range(count)]
+        )
+        if step == 2:
+            order.reverse()
+        docs = [
+            {
+                "id": base + i,
+                "body": "changed word" if step == 3 and i == 17 else "needle same text",
+                "label": f"row-{i}",
+                "dense_native": json.dumps([1, i / count]),
+                "sparse_native": json.dumps({"1": i + 1}),
+            }
+            for i in order
+        ]
+        if step == 4:
+            docs = [
+                {
+                    "id": base + count,
+                    "body": "needle same text",
+                    "label": f"row-{count}",
+                    "dense_native": json.dumps([1, 1]),
+                    "sparse_native": json.dumps({"1": count + 1}),
+                }
+            ]
+        if iceberg is not None:
+            table = pa.Table.from_pylist(docs)
+            if step in (0, 4):
+                iceberg.append(table)
+            else:
+                iceberg.overwrite(table)
+            _export_table(iceberg, root)
+        else:
+            if step != 4:
+                for old in objects.glob("*.parquet"):
+                    old.unlink()
+            for part, begin in enumerate(range(0, len(docs), 129)):
+                path = tmp_path / (
+                    "added-first.parquet"
+                    if step == 4
+                    else f"part-{step}-{part}.parquet"
+                )
+                pq.write_table(
+                    pa.Table.from_pylist(docs[begin : begin + 129]),
+                    path,
+                    row_group_size=17,
+                    compression="snappy",
+                    use_dictionary=True,
+                    write_page_index=True,
+                    data_page_version="2.0",
+                )
+                payload = path.read_bytes()
+                (objects / path.name).write_bytes(
+                    b"AFOBJ001"
+                    + struct.pack("<QI", len(payload), 0)
+                    + hashlib.sha256(payload).hexdigest().encode()
+                    + payload
+                )
+
+    write(0)
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
+    )
+    failed = True
+    try:
+
+        def raw(method, path, body=None):
+            return requests.request(
+                method,
+                server.api_url + path,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=60,
+            )
+
+        def call(method, path, body=None):
+            response = raw(method, path, body)
+            assert response.ok, response.text + server.debug_logs()
+            value = response.json() if response.content else None
+            return (
+                value.get("responses", [value])[0] if isinstance(value, dict) else value
+            )
+
+        def attach(name, logical):
+            source = {
+                "kind": "external",
+                "table_id": "logical-source",
+                "format": file_format,
+                "uri": root.as_uri(),
+            }
+            if logical:
+                source["row_identity"] = {"key_columns": ["id"]}
+            call(
+                "POST",
+                f"/tables/{name}",
+                {
+                    "schema": {
+                        "storage_mode": "relational",
+                        "base_source": source,
+                        "default_type": "row",
+                        "document_schemas": {
+                            "row": {
+                                "schema": {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "id": {
+                                            "type": "integer",
+                                            "x-antfly-field": {
+                                                "type": "number",
+                                                "sortable": True,
+                                            },
+                                        },
+                                        "body": {
+                                            "type": "string",
+                                            "x-antfly-field": {"type": "text"},
+                                        },
+                                        "label": {"type": "string"},
+                                        "dense_native": {"type": "string"},
+                                        "sparse_native": {"type": "string"},
+                                    },
+                                }
+                            }
+                        },
+                        "relational_indexes": [
+                            {
+                                "name": f"{name}_id_idx",
+                                "keys": [{"column": "id"}],
+                                "include_columns": ["body", "label"],
+                            }
+                        ],
+                    },
+                    "indexes": {
+                        "text": {"type": "full_text", "field": "body"},
+                        "all_text": {"type": "full_text"},
+                        "dense_native": {
+                            "type": "embeddings",
+                            "external": True,
+                            "dimension": 2,
+                        },
+                        "sparse_native": {
+                            "type": "embeddings",
+                            "external": True,
+                            "sparse": True,
+                        },
+                        "stats": {
+                            "type": "algebraic",
+                            "derive_from_schema": True,
+                            "aggregates": [{"name": "rows", "op": "count"}],
+                        },
+                    },
+                },
+            )
+
+        text = {
+            "full_text_search": {"match": "needle", "field": "body"},
+            "full_text_index": "text",
+            "limit": 7,
+            "fields": ["id", "label"],
+            "highlight": {"fields": ["body"]},
+        }
+
+        def ready(name, after=None):
+            deadline = time.monotonic() + 90
+            while True:
+                # Fresh-source query failure schedules publication without a
+                # definition change, so it cannot disguise a rebuild as reuse.
+                response = raw("POST", f"/tables/{name}/query", text)
+                assert response.ok or response.status_code in (409, 503), (
+                    response.text + server.debug_logs()
+                )
+                indexes = call("GET", f"/tables/{name}/indexes")
+                assert all(
+                    i["status"]["readiness"]["state"] != "failed" for i in indexes
+                ), indexes
+                revision = next(
+                    i["status"].get("published_revision")
+                    for i in indexes
+                    if i["config"]["name"] == "text"
+                )
+                if (
+                    response.ok
+                    and revision is not None
+                    and revision != after
+                    and all(i["status"]["readiness"]["queryable"] for i in indexes)
+                ):
+                    return revision
+                assert time.monotonic() < deadline, str(indexes) + server.debug_logs()
+                time.sleep(0.1)
+
+        def states():
+            result = []
+            for path in (server.root / "artifacts").rglob("*"):
+                if not path.is_file():
+                    continue
+                payload = path.read_bytes()
+                begin = payload.find(b'{"version":')
+                if begin < 0:
+                    continue
+                try:
+                    value = json.loads(payload[begin:])
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                if (
+                    isinstance(value, dict)
+                    and "values_recipe" in value
+                    and "current" in value
+                ):
+                    result.append(value)
+            return result
+
+        attach("logical", True)
+        revision = ready("logical")
+        first = states()
+        assert first, "Logical identity state was not published"
+        original = next(root for root in first if root.get("indexes") is None)
+
+        for step in (1, 2, 3, 4):
+            write(step)
+            revision = ready("logical", revision)
+            candidates = states()
+            if step < 3:
+                assert any(
+                    root.get("indexes") is not None
+                    and root["artifacts"] == original["artifacts"]
+                    and root["indexes"]["snapshot"] == original["current"]["snapshot"]
+                    and root["current"]["snapshot"] != original["current"]["snapshot"]
+                    for root in candidates
+                ), "File rewrites rebuilt native index artifacts instead of relocating"
+            else:
+                assert any(
+                    root.get("indexes") is None
+                    and root["artifacts"] != original["artifacts"]
+                    for root in candidates
+                ), "Changed indexed values reused stale index state"
+            oracle = f"oracle{step}"
+            attach(oracle, False)
+            ready(oracle)
+            requests_ = [
+                text,
+                dict(text, filter_query={"term": {"path": "/id", "value": base + 17}}),
+                dict(
+                    text,
+                    full_text_index="all_text",
+                    order_by=[{"field": "id", "desc": True}],
+                ),
+                {
+                    "embeddings": {"dense_native": [1, 0]},
+                    "indexes": ["dense_native"],
+                    "fields": ["id", "label"],
+                    "limit": 7,
+                },
+                {
+                    "embeddings": {"sparse_native": {"indices": [1], "values": [2]}},
+                    "indexes": ["sparse_native"],
+                    "fields": ["id", "label"],
+                    "limit": 7,
+                },
+            ]
+            for request in requests_:
+                actual = call("POST", "/tables/logical/query", request)
+                expected = call("POST", f"/tables/{oracle}/query", request)
+
+                def normalize(response):
+                    return [
+                        (h["_id"], h["_source"], h.get("_highlights"))
+                        for h in response["hits"]["hits"]
+                    ]
+
+                assert normalize(actual) == normalize(expected), (actual, expected)
+                # Sparse posting blocks quantize weights to 8 bits. Rebuilding
+                # a different physical layout can choose different scales;
+                # identity, values and membership must still agree exactly.
+                score_error = (
+                    2 * (count + 1) / 255 + 1e-4
+                    if request.get("indexes") == ["sparse_native"]
+                    else 0
+                )
+                assert [h["_score"] for h in actual["hits"]["hits"]] == pytest.approx(
+                    [h["_score"] for h in expected["hits"]["hits"]],
+                    rel=1e-6,
+                    abs=score_error,
+                )
+            pages = []
+            for name in ("logical", oracle):
+                ordered = dict(
+                    text,
+                    order_by=[
+                        {"field": "_score", "desc": True},
+                        {"field": "_id", "desc": False},
+                    ],
+                    limit=5,
+                )
+                first = call("POST", f"/tables/{name}/query", ordered)
+                second = call(
+                    "POST",
+                    f"/tables/{name}/query",
+                    dict(
+                        ordered,
+                        search_after=first["hits"]["hits"][-1]["_sort"],
+                        remote_snapshot=first["remote_snapshot"],
+                    ),
+                )
+                previous = call(
+                    "POST",
+                    f"/tables/{name}/query",
+                    dict(
+                        ordered,
+                        search_before=second["hits"]["hits"][0]["_sort"],
+                        remote_snapshot=first["remote_snapshot"],
+                    ),
+                )
+                assert normalize(previous) == normalize(first)
+                pages.append([normalize(first), normalize(second)])
+            assert pages[0] == pages[1]
+            for statement in (
+                "SELECT id, label FROM {table} WHERE id >= "
+                + str(base + 17)
+                + " ORDER BY id DESC LIMIT 9",
+                "SELECT COUNT(*) FROM {table}",
+            ):
+                actual = call(
+                    "POST", "/sql", {"statement": statement.format(table="logical")}
+                )["rows"]
+                expected = call(
+                    "POST", "/sql", {"statement": statement.format(table=oracle)}
+                )["rows"]
+                assert actual == expected
+            if step == 2:
+                before = call("POST", "/tables/logical/query", text)
+                server.restart()
+                ready("logical")
+                assert normalize(
+                    call("POST", "/tables/logical/query", text)
+                ) == normalize(before)
+        failed = False
+    finally:
+        server.stop(test_failed=failed)

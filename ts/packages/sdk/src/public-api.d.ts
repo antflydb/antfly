@@ -16277,6 +16277,10 @@ export interface components {
              * @enum {integer}
              */
             readonly row_identity_version?: 1 | 2;
+            /** @description Optional verified stable identity for external rewrites. Keys must be non-null and unique in each published snapshot. Uses native typed equality; an unchanged key alone never authorizes index reuse. */
+            row_identity?: {
+                key_columns: string[];
+            };
             /** @default auto */
             schema_fingerprint?: string;
             /**

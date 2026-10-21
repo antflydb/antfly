@@ -142,6 +142,21 @@ pub const Collector = struct {
             const navigation = try @import("lake_source_navigation.zig").load(a, self.store, ref, self.cancellation(), null);
             for (@import("lake_source_navigation.zig").dependencies(navigation)) |root| try self.markPages(a, navigation.domain, root, false);
         }
+        if (publication.row_identity) |ref| {
+            _ = try self.mark(.{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len });
+            try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
+            const identity = try @import("lake_row_identity.zig").load(a, self.store, ref, self.cancellation(), null);
+            const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(self.table, self.identity, publication.namespace);
+            if (!std.mem.eql(u8, &identity.domain, &domain)) return error.InvalidLogicalRowIdentity;
+            for (@import("lake_row_identity.zig").dependencies(identity)) |page| try self.markPages(a, identity.domain, page, false);
+            for (@import("lake_row_identity.zig").navigationDependencies(identity)) |navigation_ref| if (navigation_ref) |ref_| {
+                _ = try self.mark(.{ .artifact_id = ref_.artifact_id, .checksum = ref_.checksum, .byte_len = ref_.byte_len });
+                try stores.chargeReadBudget(&self.remaining_reads, ref_.byte_len);
+                const navigation = try @import("lake_source_navigation.zig").load(a, self.store, ref_, self.cancellation(), null);
+                if (!std.mem.eql(u8, &navigation.domain, &domain)) return error.InvalidLogicalRowIdentity;
+                for (@import("lake_source_navigation.zig").dependencies(navigation)) |page| try self.markPages(a, navigation.domain, page, false);
+            };
+        }
         for (hydrated.declarations) |declaration| try self.markArtifact(a, declaration.artifact);
         for (hydrated.file_contributions) |contribution| try self.markArtifact(a, contribution.artifact);
 
@@ -731,6 +746,21 @@ test "external lake global frontier native GC retains shared aggregate blocks na
     try contribution_index.init(a, store, null, .none);
     defer contribution_index.deinit();
     const directory_one = try @import("lake_index_directory.zig").publishIndexed(ca, &store, &.{ .{ .name = "sum", .binding = binding, .artifact = root }, .{ .name = "old_sum", .binding = binding, .artifact = old_root }, .{ .name = "old_text", .binding = text_binding, .artifact = old_text_ref }, .{ .name = row_root.name, .binding = row_binding, .artifact = row_root }, .{ .name = "text", .binding = text_binding, .artifact = text_ref }, .{ .name = "sparse", .binding = sparse_binding, .artifact = sparse_ref } }, &.{.{ .file = @splat(1), .recipe = recipe.fingerprint(), .name = "sum", .artifact = root }}, &contribution_index, .none);
+    const logical_rows = @import("lake_row_identity.zig");
+    const logical_namespace: logical_rows.logical.Namespace = .{ .incarnation = namespace, .adapter = .stable_key, .recipe = @splat(5) };
+    var logical_reads: u64 = 32 * 1024 * 1024;
+    var logical_writes: u64 = 32 * 1024 * 1024;
+    var logical_pages: page_store.PageStore = .{ .domain = domain, .attempt = scope.attempt, .artifacts = &store, .remaining_read_bytes = &logical_reads, .remaining_write_bytes = &logical_writes };
+    const logical_state: logical_rows.logical.State = .{ .id = try logical_rows.logical.keyId(logical_namespace, "row"), .values = @splat(6) };
+    var logical_old = old: {
+        var builder = try logical_rows.Builder.init(a, &manager, &.{"nav-a"}, 64 * 1024, .{ .source = "nav-source", .snapshot = "first" });
+        defer builder.deinit();
+        try builder.add(logical_state, .{ .file = 0, .group = 0, .row = 0 });
+        break :old try builder.finish(&logical_pages, "nav-source", "first", logical_namespace.digest(), @splat(1), @splat(2));
+    };
+    logical_old.artifacts = @splat(7);
+    logical_old.current.navigation = nav_old.ref;
+    const logical_old_ref = try logical_rows.publish(ca, &store, logical_old, .none);
     var orphan = try store.put("abandoned build artifact");
     defer orphan.deinit(a);
     var second_orphan = try store.put("another abandoned build artifact");
@@ -740,6 +770,16 @@ test "external lake global frontier native GC retains shared aggregate blocks na
     nav_source.inventory.files = nav_files;
     nav_source.inventory.snapshot_id = @constCast("second");
     const nav_new = try navigation_api.build(a, ca, &store, &nav_provider, nav_old_root, .none);
+    logical_pages.attempt = second_scope.attempt;
+    var logical_new = rewritten: {
+        var builder = try logical_rows.Builder.init(a, &manager, &.{ "nav-b", "nav-a" }, 64 * 1024, .{ .source = "nav-source", .snapshot = "second" });
+        defer builder.deinit();
+        try builder.add(logical_state, .{ .file = 0, .group = 7, .row = 9 });
+        break :rewritten try builder.finish(&logical_pages, "nav-source", "second", logical_namespace.digest(), @splat(1), @splat(2));
+    };
+    logical_new.current.navigation = nav_new.ref;
+    try std.testing.expect(try logical_rows.proveReuse(a, &logical_pages, logical_old, &logical_new));
+    const logical_new_ref = try logical_rows.publish(ca, &store, logical_new, .none);
     const directory_two = try @import("lake_index_directory.zig").publishWithContributions(ca, &store, &.{ .{ .name = "sum", .binding = binding, .artifact = root }, .{ .name = row_root.name, .binding = row_binding, .artifact = row_root }, .{ .name = "text", .binding = text_binding, .artifact = text_ref }, .{ .name = "sparse", .binding = sparse_binding, .artifact = sparse_ref } }, &.{.{ .file = @splat(1), .recipe = recipe.fingerprint(), .name = "sum", .artifact = root }}, .none);
     var publication: local.metadata_lake_index_catalog.Publication = .{
         .reader_protocol = local.metadata_lake_index_catalog.native_reader_protocol,
@@ -752,6 +792,7 @@ test "external lake global frontier native GC retains shared aggregate blocks na
         .inventory = .{ .kind = .external_base_source, .artifact_id = inventory.artifact_id, .checksum = inventory.checksum, .byte_len = inventory.byte_len },
         .directory = directory_one,
         .source_navigation = nav_old.ref,
+        .row_identity = logical_old_ref,
     };
     const Harness = struct {
         a: A,
@@ -773,6 +814,7 @@ test "external lake global frontier native GC retains shared aggregate blocks na
     publication.token = second_scope.attempt;
     publication.directory = directory_two;
     publication.source_navigation = nav_new.ref;
+    publication.row_identity = logical_new_ref;
     harness.state = try harness.state.synchronize(ca, .{ .namespace = namespace, .generation = 2, .published = publication });
     const authority: lease_api.Authority = .{ .ptr = &harness, .context = .{}, .read = Harness.read, .mutate = Harness.mutate };
     var planner: Collector = .{ .a = a, .table = 4, .authority = authority, .store = store, .identity = identity, .context = .{}, .options = .{ .dry_run = true, .max_deleted = 1 }, .token = @splat(7) };
@@ -830,8 +872,21 @@ test "external lake global frontier native GC retains shared aggregate blocks na
     try std.testing.expect((try second.run()).deleted >= 2);
     try std.testing.expectEqual(@as(usize, 1), harness.state.publications.len);
     _ = try navigation_api.load(ca, store, nav_new.ref, .none, null);
-    try std.testing.expectError(error.FileNotFound, store.getAlloc(nav_old.ref.artifact_id));
-    for ([_]?tree.Ref{ nav_old_root.files, nav_old_root.public, nav_old_root.private }) |ref| try std.testing.expectError(error.FileNotFound, store.getAlloc(&try page_store.PageStore.identity(domain, ref.?)));
+    // The flattened current map owns original index-coordinate navigation.
+    // Retiring the old reader can collect its root document, but cannot collect
+    // the page roots or navigation still used by the current publication.
+    try std.testing.expectError(error.FileNotFound, store.getAlloc(logical_old_ref.artifact_id));
+    _ = try navigation_api.load(ca, store, nav_old.ref, .none, null);
+    const retained_logical = try logical_rows.load(ca, store, logical_new_ref, .none, null);
+    var logical_reader: logical_rows.Reader = .{ .root = retained_logical, .pages = &logical_pages };
+    const relocated_row = (try logical_reader.fromIndex(ca, "nav-a", 0, 0)).?;
+    try std.testing.expectEqual(@as(u32, 7), relocated_row.coordinate.group);
+    try std.testing.expectEqual(@as(u64, 9), relocated_row.coordinate.row);
+    for ([_]?tree.Ref{ nav_old_root.files, nav_old_root.public, nav_old_root.private }) |ref| {
+        const bytes = try store.getAlloc(&try page_store.PageStore.identity(domain, ref.?));
+        defer a.free(bytes);
+        try std.testing.expectEqual(ref.?.bytes, bytes.len);
+    }
     for ([_]tree.Ref{ global_statistics, segment_statistics, serving_inventory, serving_routes, term_branches, term_leaves }) |ref| {
         const retained_statistics = try store.getAlloc(&try page_store.PageStore.identity(domain, ref));
         defer a.free(retained_statistics);

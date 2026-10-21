@@ -152,14 +152,25 @@ const Owner = struct {
     fn nextEntries(self: *Owner, a: A, limit: usize) ![]const ordered.Reader.Entry {
         while (true) {
             const entries = try self.reader.nextEntries(a, limit);
-            if (entries.len != 0 or !try self.advanceProbe()) return entries;
+            if (entries.len != 0 or !try self.advanceProbe()) {
+                if (self.source.row_resolver == null) return entries;
+                const mapped = try a.dupe(ordered.Reader.Entry, entries);
+                for (mapped) |*entry| entry.ref = try self.source.fromIndex(a, entry.ref);
+                return mapped;
+            }
         }
     }
     fn nextRefs(self: *Owner, a: A, limit: usize) ![]const local.storage_rowsource_types.RowRef {
         while (true) {
             const refs = try self.reader.next(a, limit);
-            if (refs.len != 0 or !try self.advanceProbe()) return refs;
+            if (refs.len != 0 or !try self.advanceProbe()) return self.mapRefs(a, refs);
         }
+    }
+    fn mapRefs(self: *Owner, a: A, refs: []const local.storage_rowsource_types.RowRef) ![]const local.storage_rowsource_types.RowRef {
+        if (self.source.row_resolver == null) return refs;
+        const mapped = try a.alloc(local.storage_rowsource_types.RowRef, refs.len);
+        for (refs, mapped) |ref, *target| target.* = try self.source.fromIndex(a, ref);
+        return mapped;
     }
     fn prepare(self: *Owner) !bool {
         try self.read_context.ensureActive();
@@ -522,18 +533,22 @@ pub const Predicate = struct {
     pub fn contains(self: *Predicate, ref: local.storage_rowsource_types.RowRef) !bool {
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
         try owner.read_context.ensureActive();
-        return owner.reader.containsPhysical(ref, owner.predicate_lower, owner.predicate_upper);
+        var scratch = std.heap.ArenaAllocator.init(owner.a);
+        defer scratch.deinit();
+        const index_ref = try owner.source.toIndex(scratch.allocator(), ref);
+        return owner.reader.containsPhysical(index_ref, owner.predicate_lower, owner.predicate_upper);
     }
     pub fn intersectsPhysical(self: *Predicate, first: local.storage_rowsource_types.RowRef, last: local.storage_rowsource_types.RowRef) !?bool {
         if (self.scan) return null;
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
         try owner.read_context.ensureActive();
+        if (owner.source.row_resolver != null) return null;
         return owner.reader.intersectsPhysical(first, last, owner.predicate_lower, owner.predicate_upper);
     }
     pub fn hasBlocks(self: Predicate) bool {
         if (self.scan) return false;
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
-        return owner.reader.root.predicates != null;
+        return owner.source.row_resolver == null and owner.reader.root.predicates != null;
     }
     pub fn nextBlocks(self: *Predicate, a: A) ![]const ordered.predicate_blocks.Block {
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
@@ -544,7 +559,7 @@ pub const Predicate = struct {
         if (self.scan) return self.next(a, count);
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
         try owner.read_context.ensureActive();
-        return owner.reader.nextPhysical(a, count, owner.predicate_lower, owner.predicate_upper);
+        return owner.mapRefs(a, try owner.reader.nextPhysical(a, count, owner.predicate_lower, owner.predicate_upper));
     }
     pub fn next(self: *Predicate, a: A, count: usize) ![]const local.storage_rowsource_types.RowRef {
         if (self.scan) while (true) {
@@ -564,7 +579,7 @@ pub const Predicate = struct {
             if (owner.reader.exhausted) return &.{};
             return cursor.next(a, count);
         }
-        return owner.reader.next(a, count);
+        return owner.mapRefs(a, try owner.reader.next(a, count));
     }
 };
 /// Borrowed only for the lifetime of the outer query's publication lease.
@@ -640,7 +655,7 @@ fn gatherCoveringInner(a: A, out: A, server: *server_api.ApiHttpServer, table: c
         const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
         const root = owner.reader.root;
         if (root.reverse == null) continue;
-        if (!std.mem.eql(u8, root.source, source.inventory.source_id) or !std.mem.eql(u8, root.snapshot, source.inventory.snapshot_id)) return error.ExternalLakeSnapshotMismatch;
+        if (!source.acceptsIndexCut(root.source, root.snapshot)) return error.ExternalLakeSnapshotMismatch;
         const result = try out.alloc(?local.storage_db_types.ColumnSource, refs_.len);
         @memset(result, null);
         var transferred = false;
@@ -654,7 +669,7 @@ fn gatherCoveringInner(a: A, out: A, server: *server_api.ApiHttpServer, table: c
             try owner.read_context.ensureActive();
             _ = row_arena.reset(.retain_capacity);
             const ra = row_arena.allocator();
-            const entry = (try owner.reader.entryAtPhysical(ra, ref)) orelse return null;
+            const entry = (try owner.reader.entryAtPhysical(ra, try source.toIndex(ra, ref))) orelse return null;
             const reference = entry.cover orelse return null;
             const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &server.lake_read_cache, .scope = pinned.store_identity, .context = pinned.read_context };
             try @import("../serverless/artifacts/store.zig").chargeReadBudget(&owner.reader.remaining_reads, reference.block.byte_len);
@@ -988,6 +1003,7 @@ fn orderedCandidate(a: A, table: catalog.Table, index: local.storage_relational_
 
 fn preparePublicOrder(a: A, cursor: catalog.Cursor, definition: local.storage_relational_index.RelationalIndexDefinition, parsed: anytype, request: catalog.Scan, reverse: bool, search_order: SearchOrder) !bool {
     const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
+    if (owner.source.row_resolver != null) return false;
     if (owner.reader.root.tie_version != 1) return false;
     var equal: usize = 0;
     for (definition.keys) |key| {
@@ -1532,7 +1548,7 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
     const resident_metadata = if (identities_only) try @import("lake_index_decoded_metadata.zig").resident(ordered.VerifiedRoot, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context }, declaration.artifact) else false;
     owner.metadata = try @import("lake_index_decoded_metadata.zig").acquire(ordered.VerifiedRoot, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context }, owner.artifacts, declaration.artifact, cancel, ordered.VerifiedRoot.load);
     const root = owner.metadata.?.value.value;
-    if ((identities_only or dynamic != null) and (!std.mem.eql(u8, root.source, source.inventory.source_id) or !std.mem.eql(u8, root.snapshot, source.inventory.snapshot_id))) return error.ExternalLakeSnapshotMismatch;
+    if ((identities_only or dynamic != null) and !source.acceptsIndexCut(root.source, root.snapshot)) return error.ExternalLakeSnapshotMismatch;
     const domain = if (pinned) |shared| shared.domain else @import("lake_index_publication.zig").uploadDomainWithNamespace(table.id, owner.store_identity, selected.?.publication().namespace);
     if (!std.mem.eql(u8, &root.domain, &domain)) return error.InvalidNativeLakeRowIndex;
     const expected = native_rows.fingerprint(tuple, predicate, try native_rows.coverColumns(ca, definition));

@@ -3668,6 +3668,8 @@ Existing typed spill codecs remain the execution spill mechanism.
 
 ### Identity boundary for external file rewrites
 
+Decision and implementation contract: [Lake row identity and index reuse](lake-row-identity.md).
+
 Antfly-owned serving compaction retains canonical source coordinates and can
 reuse their immutable index artifacts. External Parquet/Iceberg rewrites cannot
 be inferred from file names, row counts or offsets. The intended extension has

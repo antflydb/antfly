@@ -175,6 +175,15 @@ fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_s
             try state.value.published.?.validate();
         }
     } else try @import("lake_index_directory.zig").hydrateLazy(state.arena.allocator(), artifacts, &state.value.published.?, normalized, cached);
+    if (published.row_identity) |ref| {
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const identity = try @import("lake_row_identity.zig").load(scratch.allocator(), artifacts, ref, normalized, cached);
+        const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(table.id, store.identity, published.namespace);
+        const publication_ = state.value.published.?;
+        try @import("lake_row_identity_reader.zig").validate(scratch.allocator(), identity, publication_, domain, source);
+        if (identity.indexes != null) try @import("lake_row_identity_reader.zig").install(source, store, publication_, identity, cached orelse return error.ExternalLakeIndexUnavailable, reader orelse return error.ExternalLakeIndexUnavailable);
+    }
     return .{ .state = state, .delete_objects = pinned_delete_objects, .inventory_lease = inventory_lease, .directory_lease = directory_lease };
 }
 

@@ -33534,6 +33534,22 @@ components:
           readOnly: true
           description: Server-assigned public row identity version, fixed when the source is attached
             and preserved across index creation and schema updates.
+        row_identity:
+          type: object
+          additionalProperties: false
+          required:
+            - key_columns
+          description: Optional verified stable identity for external rewrites. Keys must be non-null
+            and unique in each published snapshot. Uses native typed equality; an unchanged key alone
+            never authorizes index reuse.
+          properties:
+            key_columns:
+              type: array
+              minItems: 1
+              maxItems: 32
+              items:
+                type: string
+                minLength: 1
         schema_fingerprint:
           type: string
           default: auto

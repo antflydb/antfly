@@ -51,6 +51,9 @@ test {
     _ = @import("api/lake_index_ordered_rows.zig");
     _ = @import("api/lake_index_native_files.zig");
     _ = @import("api/lake_index_native_text.zig");
+    _ = @import("api/lake_row_identity.zig");
+    _ = @import("antfly_local_sources").storage_rowsource_identity.logical;
+    _ = @import("antfly_local_sources").search_scorer;
     _ = @import("api/lake_index_seekable_text.zig");
     _ = @import("api/lake_index_native_directory.zig");
     _ = @import("api/lake_index_metadata_ownership.zig");

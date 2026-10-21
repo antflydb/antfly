@@ -29,6 +29,9 @@ const inverted = @import("../section/inverted.zig");
 pub const TieRank = struct {
     ptr: *const anyopaque,
     rank: *const fn (*const anyopaque, u32) u64,
+    /// Relocated sources resolve bounded competitive hits through authenticated
+    /// navigation. Resolution happens before heap/sort comparisons and can fail.
+    resolve: ?*const fn (*const anyopaque, Allocator, u32) anyerror!u64 = null,
     pub fn value(self: @This(), doc: u32) u64 {
         return self.rank(self.ptr, doc);
     }
@@ -36,11 +39,20 @@ pub const TieRank = struct {
 pub fn betterWithRank(a: ScoredHit, b: ScoredHit, rank: ?TieRank) bool {
     if (a.score != b.score) return a.score > b.score;
     if (rank) |order| {
-        const left = order.value(a.doc_id);
-        const right = order.value(b.doc_id);
+        const left = if (order.resolve != null) a.resolved_tie else order.value(a.doc_id);
+        const right = if (order.resolve != null) b.resolved_tie else order.value(b.doc_id);
+        if (order.resolve != null) std.debug.assert(left != std.math.maxInt(u64) and right != std.math.maxInt(u64));
         if (left != right) return left < right;
     }
     return a.doc_id < b.doc_id;
+}
+pub fn prepareHit(a: Allocator, hit: ScoredHit, rank: ?TieRank) !ScoredHit {
+    var prepared = hit;
+    if (rank) |order| if (order.resolve) |resolve| {
+        if (prepared.resolved_tie == std.math.maxInt(u64)) prepared.resolved_tie = try resolve(order.ptr, a, hit.doc_id);
+        if (prepared.resolved_tie == std.math.maxInt(u64)) return error.InvalidSearchTieRank;
+    };
+    return prepared;
 }
 pub fn sortScoredHitsWithRank(hits: []ScoredHit, rank: ?TieRank) void {
     std.mem.sort(ScoredHit, hits, rank, struct {
@@ -52,6 +64,7 @@ pub fn sortScoredHitsWithRank(hits: []ScoredHit, rank: ?TieRank) void {
 pub const ScoredHit = struct {
     doc_id: u32,
     score: f32,
+    resolved_tie: u64 = std.math.maxInt(u64),
 };
 
 /// Whether total_count is exact or a lower bound.
@@ -166,8 +179,12 @@ pub fn insertTopK(
 pub fn offerTopK(alloc: Allocator, hits: *std.ArrayListUnmanaged(ScoredHit), k: u32, hit: ScoredHit) !void {
     return offerTopKWithRank(alloc, hits, k, hit, null);
 }
-pub fn offerTopKWithRank(alloc: Allocator, hits: *std.ArrayListUnmanaged(ScoredHit), k: u32, hit: ScoredHit, rank: ?TieRank) !void {
+pub fn offerTopKWithRank(alloc: Allocator, hits: *std.ArrayListUnmanaged(ScoredHit), k: u32, candidate: ScoredHit, rank: ?TieRank) !void {
     if (k == 0) return;
+    // Rejected scores need no remote identity work. Heap entries already own
+    // their compact rank, so comparisons never allocate or perform I/O.
+    if (hits.items.len >= k and candidate.score < hits.items[0].score) return;
+    const hit = try prepareHit(alloc, candidate, rank);
     if (hits.items.len < k) {
         try hits.append(alloc, hit);
         var child = hits.items.len - 1;
@@ -1428,4 +1445,34 @@ test "shared heap top k replacement benchmark" {
         try std.testing.expectEqualSlices(ScoredHit, linear.items, heap.items);
         std.debug.print("heap_topk k={d} candidates=40000 linear_ns={d} heap_ns={d}\n", .{ k, middle - start, finish - middle });
     }
+}
+
+test "native ranking resolves only competitive relocation ties and propagates navigation failures" {
+    const Context = struct {
+        calls: usize = 0,
+        fn rank(_: *const anyopaque, doc: u32) u64 {
+            return doc;
+        }
+        fn resolve(raw: *const anyopaque, _: Allocator, doc: u32) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (doc == 7) return error.ArtifactIntegrityMismatch;
+            return 16 - @as(u64, doc);
+        }
+    };
+    var context: Context = .{};
+    const rank: TieRank = .{ .ptr = &context, .rank = Context.rank, .resolve = Context.resolve };
+    var heap: std.ArrayListUnmanaged(ScoredHit) = .empty;
+    defer heap.deinit(std.testing.allocator);
+    try offerTopKWithRank(std.testing.allocator, &heap, 2, .{ .doc_id = 1, .score = 1 }, rank);
+    try offerTopKWithRank(std.testing.allocator, &heap, 2, .{ .doc_id = 2, .score = 1 }, rank);
+    try offerTopKWithRank(std.testing.allocator, &heap, 2, .{ .doc_id = 3, .score = 0.5 }, rank);
+    try offerTopKWithRank(std.testing.allocator, &heap, 2, .{ .doc_id = 4, .score = 1 }, rank);
+    try std.testing.expectEqual(@as(usize, 3), context.calls);
+    sortScoredHitsWithRank(heap.items, rank);
+    try std.testing.expectEqual(@as(u32, 4), heap.items[0].doc_id);
+    try std.testing.expectEqual(@as(u32, 2), heap.items[1].doc_id);
+    try std.testing.expectEqual(@as(usize, 3), context.calls);
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, offerTopKWithRank(std.testing.allocator, &heap, 2, .{ .doc_id = 7, .score = 2 }, rank));
+    try std.testing.expectEqual(@as(usize, 2), heap.items.len);
 }
