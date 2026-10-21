@@ -547,7 +547,18 @@ func (p *Proxy) handlePredictors(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "predictor catalog unavailable", http.StatusBadGateway)
 		return
 	}
+	// This adapter changes the catalog body, not its discovery metadata.
+	// Retain lease exposure and error retry guidance from the canonical handler;
+	// the transport must calculate a new length for the rewritten body.
+	copyMetadata := func() {
+		for name, values := range capture.Header() {
+			if !strings.EqualFold(name, "Content-Length") {
+				w.Header()[name] = append([]string(nil), values...)
+			}
+		}
+	}
 	if capture.statusCode >= 400 {
+		copyMetadata()
 		w.WriteHeader(capture.statusCode)
 		_, _ = w.Write(body)
 		return
@@ -564,11 +575,7 @@ func (p *Proxy) handlePredictors(w http.ResponseWriter, r *http.Request) {
 			delete(predictors, name)
 		}
 	}
-	for _, header := range []string{capabilityTokenHeader, capabilityRevisionHeader} {
-		if value := capture.Header().Get(header); value != "" {
-			w.Header().Set(header, value)
-		}
-	}
+	copyMetadata()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "predictors": predictors})
 }

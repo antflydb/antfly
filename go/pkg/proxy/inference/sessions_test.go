@@ -254,6 +254,79 @@ func TestFramedSessionFollowupsPreserveOwnerAndIncarnation(t *testing.T) {
 	}
 }
 
+func TestCatalogAdaptersPreserveDiscoveryMetadata(t *testing.T) {
+	for _, path := range []string{"/ai/v1/models", "/ml/v1/models", "/ml/v1/predictors"} {
+		for _, scenario := range []string{"unscoped", "scoped", "lease capacity", "expired deadline"} {
+			t.Run(path+"/"+scenario, func(t *testing.T) {
+				p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, Logger: zap.NewNop()})
+				p.registry.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+					return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"predictors":{"risk":{"task":"regression","num_features":2,"num_outputs":1}}}`)), Request: r}, nil
+				})}
+				const address = "http://runtime.internal"
+				p.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
+				advertiseModelOperation(p.registry, address, "predict", "risk")
+				if scenario == "lease capacity" {
+					endpoints := capabilityEndpointSet(p.registry, p.router.ResolveEndpointCandidates("risk", "primary", nil, "predict"))
+					for i := 0; i < maxCapabilityLeases; i++ {
+						if _, err := p.issueCapabilityLease("risk", "predict", "predict", p.router.RouteManager().Generation(), fmt.Sprintf("revision-%d", i), "", endpoints); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+				url := path
+				if scenario != "unscoped" {
+					url += "?model=risk&task=predict"
+				}
+				request := httptest.NewRequest("GET", url, nil)
+				request.Header.Set("Origin", "https://console.example")
+				if scenario == "expired deadline" {
+					request.Header.Set("X-Antfly-Inference-Timeout-Ms", "0")
+				}
+				w := httptest.NewRecorder()
+				if strings.HasPrefix(path, "/ml/") {
+					p.handlePredictors(w, request)
+				} else {
+					p.handleModels(w, request)
+				}
+				wantStatus := http.StatusOK
+				if scenario == "lease capacity" {
+					wantStatus = http.StatusServiceUnavailable
+				} else if scenario == "expired deadline" {
+					wantStatus = http.StatusGatewayTimeout
+				}
+				if w.Code != wantStatus {
+					t.Fatalf("discovery status=%d, want %d: %s", w.Code, wantStatus, w.Body.String())
+				}
+				exposed := make(map[string]bool)
+				for _, value := range w.Header().Values("Access-Control-Expose-Headers") {
+					for _, name := range strings.Split(value, ",") {
+						exposed[http.CanonicalHeaderKey(strings.TrimSpace(name))] = true
+					}
+				}
+				for _, name := range []string{capabilityTokenHeader, capabilityRevisionHeader} {
+					if scenario == "scoped" {
+						if w.Header().Get(name) == "" || !exposed[name] {
+							t.Errorf("lease header %s must be present and browser-readable: %v", name, w.Header())
+						}
+					} else if w.Header().Get(name) != "" || exposed[name] {
+						t.Errorf("%s catalog published lease metadata: %v", scenario, w.Header())
+					}
+				}
+				if wantStatus == http.StatusOK {
+					if w.Header().Get("Content-Type") != "application/json" {
+						t.Errorf("catalog content type: %v", w.Header())
+					}
+				} else if w.Header().Get("Content-Type") != "text/plain; charset=utf-8" || w.Header().Get("X-Content-Type-Options") != "nosniff" {
+					t.Errorf("error metadata lost: %v", w.Header())
+				}
+				if scenario == "lease capacity" && w.Header().Get("Retry-After") != "1" {
+					t.Errorf("capacity retry guidance lost: %v", w.Header())
+				}
+			})
+		}
+	}
+}
+
 func TestPredictorCatalogRequiresNativeCompatibleSchemas(t *testing.T) {
 	for _, model := range []string{"predictors/risk", "connections/remote/models/predictors/risk"} {
 		valid := `{"task":"regression","num_features":2,"num_outputs":1,"feature_names":["first","second"],"model_identity":"risk-v1"}`
